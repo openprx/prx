@@ -6,8 +6,6 @@ use crate::channels::traits::Channel;
 use crate::config::{DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric};
 use crate::providers;
-#[cfg(test)]
-use crate::providers::Provider;
 use crate::security::SecurityPolicy;
 use crate::session_worker::protocol::config_source_generation;
 use anyhow::Context as _;
@@ -51,7 +49,6 @@ impl SessionsSpawnTool {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         channel: Arc<dyn Channel>,
-        #[cfg(test)] provider: Arc<dyn Provider>,
         provider_name: impl Into<String>,
         model: impl Into<String>,
         temperature: f64,
@@ -65,8 +62,6 @@ impl SessionsSpawnTool {
     ) -> Self {
         Self::new_with_registry(
             channel,
-            #[cfg(test)]
-            provider,
             provider_name,
             model,
             temperature,
@@ -92,7 +87,6 @@ impl SessionsSpawnTool {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_registry(
         channel: Arc<dyn Channel>,
-        #[cfg(test)] provider: Arc<dyn Provider>,
         provider_name: impl Into<String>,
         model: impl Into<String>,
         _temperature: f64,
@@ -115,7 +109,7 @@ impl SessionsSpawnTool {
             test_worker_executable: None,
             channels: Arc::new(HashMap::new()),
             #[cfg(test)]
-            test_parent_provider: provider,
+            test_parent_provider: None,
             fallback_api_key_owner: provider_name.clone(),
             fallback_uses_root_connection: true,
             provider_name,

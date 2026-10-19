@@ -15,6 +15,17 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Upgrade compatibility: the decision accounting reservation journal now writes
+  `estimated_unsent_v1` when a durable dispatch receipt never reached transport.
+  Older binaries reject this event and refuse the entire cost ledger. Once it
+  has been written, a binary downgrade cannot safely reuse that workspace's
+  ledger; retain the upgraded binary and journal for recovery. Do not delete
+  ledger rows or reset spending limits to make an older binary start.
+
+- `causal_tree.policy.extra_token_ratio_limit` must now be finite and greater
+  than 0; a zero, negative or non-finite value is rejected at config load
+  instead of refusing every Agent turn at admission.
+
 - Fresh configurations now select `openrouter` with
   `anthropic/claude-sonnet-5`; `prx init` writes that pair, and the unset
   `Config` default follows the release catalog. Stable direct Gemini tariffs

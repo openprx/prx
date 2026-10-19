@@ -699,7 +699,6 @@ async fn default_causal_embedded_turn_runs_sealed_spawn_child_and_confirms_clean
     )?);
     let spawn = SessionsSpawnTool::new(
         Arc::new(SilentEntryChannel),
-        child_provider,
         &provider_name,
         PROBE_MODEL,
         0.0,
@@ -711,6 +710,7 @@ async fn default_causal_embedded_turn_runs_sealed_spawn_child_and_confirms_clean
         crate::providers::provider_runtime_options_from_config(&config),
         config.sessions_spawn.clone(),
     )
+    .with_test_parent_provider(child_provider)
     .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(&config))
     .with_model_catalog(model_catalog)
     .with_hint_config(&config)

@@ -111,6 +111,22 @@ impl ProposalStatus {
         )
     }
 
+    /// States of a proposal that can still go on to publication: pre-commit
+    /// and not a dead end (`Rejected`, `Cancelled`, `Stale`, `Failed`).
+    #[must_use]
+    pub const fn is_live(self) -> bool {
+        matches!(
+            self,
+            Self::Draft
+                | Self::SourceReviewed
+                | Self::Evaluating
+                | Self::Evaluated
+                | Self::Eligible
+                | Self::Inconclusive
+                | Self::PublicationAuthorized
+        )
+    }
+
     /// Whether the state machine allows moving from `self` to `next`.
     #[must_use]
     pub const fn can_become(self, next: Self) -> bool {
@@ -180,9 +196,16 @@ pub enum ProposalFailureKind {
     SuppressedByRejection,
     /// Every publication attempt of an authorized proposal aborted.
     PublicationAborted,
+    /// The deterministic source review found the candidate not applicable, not
+    /// bounded or not safe.
+    SourceReviewRefused,
+    /// The candidate asks for capabilities its baseline did not have.
+    CapabilityExpansion,
     /// The attempt was in flight when the process died or an operator gave up
     /// on it; the model may have been called, so the liability is unknown.
     Interrupted,
+    /// An operator closed an authorized proposal that could not be published.
+    OperatorClosed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +413,21 @@ pub(super) fn material_of(diff: Option<&BoundedDiff>) -> Vec<String> {
     texts
 }
 
+/// A proposal directory whose record could not be read or verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnreadableProposal {
+    pub proposal_id: String,
+    pub reason: String,
+}
+
+fn sort_proposals(proposals: &mut [SkillProposal]) {
+    proposals.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.proposal_id.cmp(&b.proposal_id))
+    });
+}
+
 pub(super) fn is_proposal_id(id: &str) -> bool {
     id.strip_prefix("prop-").is_some_and(|digest| {
         digest.len() == 32 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -438,6 +476,11 @@ impl SkillLifecycleStore {
 
     fn proposal_dir(&self, id: &str) -> PathBuf {
         self.proposals_dir().join(id)
+    }
+
+    /// Path of a file inside a proposal's directory.
+    pub(super) fn proposal_file(&self, id: &str, name: &str) -> PathBuf {
+        self.proposal_dir(id).join(name)
     }
 
     pub(super) fn lock_proposals(&self) -> Result<ProposalLock, LifecycleError> {
@@ -534,6 +577,41 @@ impl SkillLifecycleStore {
     /// Every proposal, oldest first. Unreadable records fail the listing: a
     /// proposal that cannot be verified is not silently skipped.
     pub fn list_proposals(&self) -> Result<Vec<SkillProposal>, LifecycleError> {
+        let mut proposals = Vec::new();
+        for id in self.proposal_ids()? {
+            if let Some(proposal) = self.read_proposal(&id)? {
+                proposals.push(proposal);
+            }
+        }
+        sort_proposals(&mut proposals);
+        Ok(proposals)
+    }
+
+    /// Like [`Self::list_proposals`], but a record that cannot be read or
+    /// verified is logged and returned in the second list instead of failing
+    /// the call, so one damaged proposal never blocks the others. Only the
+    /// directory scan itself can fail.
+    pub fn list_proposals_lenient(&self) -> Result<(Vec<SkillProposal>, Vec<UnreadableProposal>), LifecycleError> {
+        let mut proposals = Vec::new();
+        let mut unreadable = Vec::new();
+        for id in self.proposal_ids()? {
+            match self.read_proposal(&id) {
+                Ok(Some(proposal)) => proposals.push(proposal),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(proposal = %id, %error, "skipping an unreadable skill proposal record");
+                    unreadable.push(UnreadableProposal {
+                        proposal_id: id,
+                        reason: bounded(&error.to_string()),
+                    });
+                }
+            }
+        }
+        sort_proposals(&mut proposals);
+        Ok((proposals, unreadable))
+    }
+
+    fn proposal_ids(&self) -> Result<Vec<String>, LifecycleError> {
         let dir = self.proposals_dir();
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -555,18 +633,7 @@ impl SkillLifecycleStore {
             }
             ids.push(name);
         }
-        let mut proposals = Vec::new();
-        for id in ids {
-            if let Some(proposal) = self.read_proposal(&id)? {
-                proposals.push(proposal);
-            }
-        }
-        proposals.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.proposal_id.cmp(&b.proposal_id))
-        });
-        Ok(proposals)
+        Ok(ids)
     }
 
     /// The staged candidate bundle of a proposal, verified as a whole.
@@ -705,7 +772,7 @@ impl SkillLifecycleStore {
     /// Moves a pre-commit proposal to `Cancelled`. In-flight attempts are
     /// marked abandoned: their liability stays unknown. A staged candidate is
     /// kept (private) for audit; it can never be published from this state.
-    pub fn cancel_proposal(&self, id: &str, reason: &str) -> Result<SkillProposal, LifecycleError> {
+    pub(in crate::skills) fn cancel_proposal(&self, id: &str, reason: &str) -> Result<SkillProposal, LifecycleError> {
         let lock = self.lock_proposals()?;
         let mut proposal = self
             .read_proposal_record(id)?

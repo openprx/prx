@@ -1527,9 +1527,16 @@ mod tests {
             } else {
                 Arc::new(crate::memory::SqliteMemory::new(other_workspace.path()).unwrap())
             };
-            let router = RouterEngine::new(router_config, "openai".to_owned(), Vec::new(), memory, None)
-                .await
-                .unwrap();
+            let router = RouterEngine::new(
+                router_config,
+                "openai".to_owned(),
+                Vec::new(),
+                memory,
+                None,
+                &crate::config::schema::CostConfig::default(),
+            )
+            .await
+            .unwrap();
             let result = builder.router(router).build();
             if matching {
                 let agent = result.expect("matching source-bound Router must be supported");
@@ -2048,10 +2055,16 @@ mod tests {
         };
         config.router = router_config.clone();
         let memory = Arc::clone(builder.memory.as_ref().unwrap());
-        let router =
-            crate::router::RouterEngine::new(router_config, LABEL.into(), Vec::new(), Arc::clone(&memory), None)
-                .await
-                .expect("test: router");
+        let router = crate::router::RouterEngine::new(
+            router_config,
+            LABEL.into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .expect("test: router");
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut agent = builder
             .provider(Box::new(ModelSpy(Arc::clone(&calls), LABEL)))

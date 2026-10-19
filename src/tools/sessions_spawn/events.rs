@@ -1,3 +1,4 @@
+use super::delegation;
 use super::{SpawnLineage, SpawnScope, SubAgentStatus};
 use crate::memory::{MemoryFabric, MessageEventScope};
 use crate::runtime::envelope::RuntimeEnvelope;
@@ -39,60 +40,35 @@ pub(super) async fn record_spawn_request_event(
     scope: MessageEventScope,
     task: &str,
     mode: &str,
-    provider_name: &str,
-    model: &str,
+    selection: (&str, &str),
     lineage: &SpawnLineage,
+    grant: Option<&crate::runtime::child_source::IssuedChildGrant>,
 ) -> anyhow::Result<Option<Arc<crate::runtime::child_source::ChildInputReceipt>>> {
     let Some(fabric) = fabric else {
         return Ok(None);
     };
     // Durable records keep the endpoint, never a URL's `user:password@`.
-    let provider_name = crate::providers::redact_endpoint_userinfo(provider_name);
+    let provider_name = crate::providers::redact_endpoint_userinfo(selection.0);
     let task_event_scope = scope.clone();
     let task_id = task_event_scope
         .run_id
         .clone()
         .unwrap_or_else(|| "sessions_spawn:unknown".to_string());
-    let grant = crate::runtime::child_source::outgoing_grant();
-    let receipt = crate::runtime::child_source::record_child_input(
-        fabric,
-        scope,
-        task,
-        None,
-        Some(
-            json!({
-                "mode": mode,
-                "provider": provider_name,
-                "model": model,
-                "owner_id": lineage.owner_id,
-                "topic_id": lineage.topic_id,
-                "parent_task_id": lineage.parent_task_id,
-                "source_message_event_id": lineage.source_message_event_id
-            })
-            .to_string(),
-        ),
-        grant.as_deref(),
-    )
-    .await?;
+    let mut metadata = json!({
+        "mode": mode,
+        "provider": provider_name, "model": selection.1,
+        "owner_id": lineage.owner_id,
+        "topic_id": lineage.topic_id,
+        "parent_task_id": lineage.parent_task_id,
+        "source_message_event_id": lineage.source_message_event_id
+    });
+    delegation::append_metadata(&mut metadata, grant)?;
+    let receipt =
+        crate::runtime::child_source::record_child_input(fabric, scope, task, None, Some(metadata.to_string()), grant)
+            .await?;
+    delegation::append_task(&mut metadata, task)?;
     if let Err(error) = fabric
-        .record_task_event(
-            task_event_scope,
-            task_id,
-            "task.spawned",
-            Some(
-                json!({
-                    "task": task,
-                    "mode": mode,
-                    "provider": provider_name,
-                    "model": model,
-                    "owner_id": lineage.owner_id,
-                    "topic_id": lineage.topic_id,
-                    "parent_task_id": lineage.parent_task_id,
-                    "source_message_event_id": lineage.source_message_event_id
-                })
-                .to_string(),
-            ),
-        )
+        .record_task_event(task_event_scope, task_id, "task.spawned", Some(metadata.to_string()))
         .await
     {
         tracing::warn!("failed to record sessions_spawn task.spawned event: {error}");

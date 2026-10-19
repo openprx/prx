@@ -10,6 +10,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber as _;
 use uuid::Uuid;
 
 static TOOL_BARRIERS: LazyLock<parking_lot::Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>> =
@@ -381,7 +382,7 @@ impl DelegationExecutionTask {
     fn spawn(
         work: std::pin::Pin<Box<dyn std::future::Future<Output = crate::tools::ToolExecutionOutcome> + Send>>,
     ) -> Self {
-        Self(Some(tokio::spawn(work)))
+        Self(Some(tokio::spawn(work.with_current_subscriber())))
     }
 
     async fn join(mut self) -> Result<crate::tools::ToolExecutionOutcome> {

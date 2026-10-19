@@ -9,6 +9,8 @@
 //! - `steer` action: inject a message into a running sub-agent's context
 
 mod batch_journal;
+mod delegation;
+pub use delegation::SpawnDelegationStatus;
 mod process_terminal;
 mod task_control;
 mod task_terminal;
@@ -31,6 +33,8 @@ mod scope;
 mod spawn;
 mod task_mode;
 mod terminal_commit;
+#[cfg(test)]
+mod test_parent;
 #[cfg(test)]
 mod test_worker;
 mod tool;
@@ -225,6 +229,7 @@ pub struct SubAgentRun {
     pub parent_run_id: Option<String>,
     pub session_scope_key: String,
     pub spawn_depth: usize,
+    pub delegation: Option<SpawnDelegationStatus>,
     pub token_usage_records: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
     /// Liveness evidence for this run: the beat every progress event inside it
     /// stamps.
@@ -389,7 +394,7 @@ pub struct SessionsSpawnTool {
     /// Test-only parent provider injected at the admitted-source seam. Child
     /// providers always come from the production admitted binding.
     #[cfg(test)]
-    test_parent_provider: Arc<dyn Provider>,
+    test_parent_provider: Option<Arc<dyn Provider>>,
     /// Provider name (for logging/display).
     provider_name: String,
     /// Model to use for sub-agent calls.

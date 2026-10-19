@@ -343,6 +343,61 @@ always_exclude = []
 [skill_rag]
 top_k = 32
 
+# Skill lifecycle: learned revisions of skills are proposed, evaluated against an
+# operator-owned frozen suite, gated and only then published. Everything here is
+# operator-owned; no tool or model output can change it. The section is read at
+# process start (changing it needs a restart) and is validated when the
+# configuration loads. Off by default: nothing is offered to the agent and no
+# store is opened.
+#   mode = "draft_only"  drafts and reviews only (default)
+#   mode = "shadow"      adds bounded evaluation and gating, never publishes
+#   mode = "auto"        publishes an eligible proposal after every gate
+# A weaker publication policy is refused at load, not downgraded:
+# `require_holdout = false` and `min_cases_floor` below 3 do not load, and
+# neither does `allow_executable_proposals = true` (reviewed executable bundles
+# are not available yet). `storage_dir` only accepts the default, the location
+# `skill_read` and recovery use. `owner_scope` names the owner whose store this
+# installation manages and is required when enabled; an agent run from another
+# owner, or from a caller whose owner the runtime cannot derive, does not reach
+# the lifecycle actions of `skills_manage` (the refusal names both owner ids,
+# and `prx skills lifecycle status` shows the configured one). The runtime
+# derives the caller's owner id from its trusted scope: the scope's `owner_id`
+# when it has one (gateway, console and webhook turns carry it), otherwise
+# "owner:<workspace>:<channel>:<sender>" composed from the workspace path, the
+# channel the session runs on (terminal chat, the Web Console and each IM
+# channel have their own channel name, for example "telegram") and the sender
+# (the operator or chat user id). Set `owner_scope` to exactly that id for the
+# sessions that should manage skills. An owner-isolated caller without its own
+# owner id never matches. Each `suites`
+# entry registers the frozen suite (by SHA-256 digest) that governs one skill.
+# Operate it with `prx skills lifecycle status|list|inspect|publish|cancel|
+# rollback|force-close`. `force-close` (CLI only) closes an authorized proposal
+# stuck on a transaction conflict as failed or stale with a recorded reason; it
+# never publishes and leaves the active revision as it is (a publication that
+# turns out to be live is recorded Committed instead of closed). Proposing is not
+# wired yet, so a lifecycle with no proposals stays idle. With the daemon, an
+# enabled lifecycle runs a recovery sweep at start (retrying with backoff while
+# another process holds the store lock) and `status` lists any proposal it had
+# to skip. Publishing or rolling back through `skills_manage` needs a signed
+# one-shot approval grant bound to the proposal (or to skill, revision and
+# observed generation for a rollback), in every autonomy level; the grant is
+# spent on use.
+[skills_lifecycle]
+enabled = false
+mode = "draft_only"
+# owner_scope = "owner:workspace:cli:alice"
+storage_dir = "self/skill-lifecycle"
+require_holdout = true
+min_cases_floor = 3
+max_concurrent_evaluations = 1
+max_proposals_per_cycle = 1
+max_edit_tokens = 300
+max_edit_fraction = 0.20
+allow_executable_proposals = false
+# [[skills_lifecycle.suites]]
+# skill_id = "release-notes"
+# suite_digest = "<64 lowercase hex digits>"
+
 # Optional exact-model tool allowlists constrain decision-eligible tools.
 # Models without an entry keep the ordinary tool set. An empty list deliberately
 # exposes no tools. Quote model names containing `/` or `:` in TOML.
@@ -760,6 +815,23 @@ PRX treats `chat`, `agent`, `gateway`, `channel`, `delegate`, and `sessions_spaw
 
 For `sessions_spawn`, `task` runs an in-process sub-agent and `process` launches a worker process. Process mode uses a manifest with `memory_strategy`, `shared_memory_db_path`, and `worker_memory_db_path`; the default `shared_fabric` strategy writes worker events into the parent workspace fabric while still keeping the execution boundary explicit. Set `[sessions_spawn].process_memory_strategy = "isolated_private"` for a private worker DB. `hybrid` is fail-closed because no production merge consumer or merge/reject/ack/cleanup protocol exists; use `shared_fabric` or `isolated_private` instead.
 
+Recursive child delegation requires both an operator setting and an explicit
+`allow_delegation: true` spawn request:
+
+```toml
+[sessions_spawn]
+allow_recursive_delegation = false
+max_recursive_depth = 1
+```
+
+The permission defaults to false, including when loading an older config.
+When permission is enabled, `max_recursive_depth` must be positive and caps the
+additional levels an opted-in child can receive. Each child remains a proper
+subset of its authenticated parent, cannot replenish depth or budget, and keeps
+the selected provider/model pins through descendants. A request without the
+opt-in keeps the existing exact model-only scope. See [recursive child grants](tools.md)
+for admission, audit/status and rollback behavior.
+
 The two modes also differ in the credential a named agent's child uses when the agent's `provider` is the gateway's own provider (any spelling of the same identity). Task mode reuses the gateway's provider chain, with the root `api_key` at the root `api_url`, and ignores the agent's own `api_key`. Process mode passes the agent's `api_key` to the worker, which presents it to that provider's default catalog host, because an `[agents.<name>]` entry has no URL field. In both modes a key only goes to its own provider identity.
 
 ## Standalone Webhook Ingestion
@@ -805,7 +877,7 @@ effect) and its response carries the same `warning`.
 | `agent.concurrency_rollback_cancel_rate_threshold` | staged rollout retired |
 | `agent.concurrency_rollback_error_rate_threshold` | staged rollout retired |
 | `sessions_spawn.max_concurrent` | sub-agent fan-out is uncapped; use `prx tasks` to see and end runs |
-| `sessions_spawn.max_spawn_depth` | nesting is uncapped; depth is still reported |
+| `sessions_spawn.max_spawn_depth` | legacy global limit is ignored; explicit recursive grants use `max_recursive_depth` |
 | `sessions_spawn.max_children_per_agent` | per-session fan-out is uncapped |
 | `scheduler.max_concurrent` | due cron jobs all start at once; use `prx tasks` to see and end them |
 | `xin.max_concurrent` | due Xin work is no longer capped by an arbitrary configuration ceiling |
@@ -2003,6 +2075,8 @@ snapshot and recommended timeout. It also writes the catalog's recommended
 extra-latency budget when the policy still has its default value. Explicit
 command and policy values remain operator choices. Built-in decision-model
 pricing comes from the catalog; `[cost.prices]` is only an override.
+Automatic Router candidates and doctor use those configured price overrides
+when filtering active release rows with Router metadata.
 During migration, only schema-1's serialized 500 ms default becomes implicit.
 An unversioned pre-1.7 file used 300 ms as its default, so its stored 500 ms
 remains an explicit operator choice, as does 500 ms in schema 2. Loading an
@@ -2641,6 +2715,10 @@ files. A crash between those writes retains both the actual charge and the
 hold until reconciliation; matching replay does not
 append another transition. Settled actual cost still consumes the turn allowance.
 Recovery reconstructs accounting receipts without permitting another dispatch.
+Request token sizing can overlap a prior physical attempt's background ledger
+settlement. Preparation reuses only that request's sizing result and grants no
+allowance; the next physical send still requires the prior durable settlement
+and its own durable reservation within the original decision deadline.
 Missing or conflicting cost projections block admission. Estimated reservations
 record fully reported actual token counts and charges even when they exceed the
 estimate; they do not classify ordinary underestimation as legacy bound

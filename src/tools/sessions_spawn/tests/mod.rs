@@ -584,7 +584,7 @@ async fn dispatch_preconstruction_parent(
     let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
     cleanup
         .run(Box::pin(async move {
-            let provider = Arc::clone(&tool.test_parent_provider);
+            let provider = Arc::clone(tool.test_parent_provider());
             let security = Arc::clone(&tool.security);
             let workspace = config.workspace_dir.clone();
             // Q71 hybrid is deliberately invalid for persistence; publish the
@@ -638,7 +638,6 @@ fn make_tool_with_security_and_spawn_config(
 ) -> SessionsSpawnTool {
     SessionsSpawnTool::new(
         channel,
-        provider,
         "ollama",
         "prx-local-model",
         0.7,
@@ -650,6 +649,7 @@ fn make_tool_with_security_and_spawn_config(
         crate::providers::ProviderRuntimeOptions::default(),
         spawn_config,
     )
+    .with_test_parent_provider(provider)
 }
 
 /// FIX-P0-37: spawning is now a Medium-risk side effect, which requires an
@@ -688,7 +688,7 @@ fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
         channel: Arc::clone(&tool.channel),
         test_worker_executable: tool.test_worker_executable.clone(),
         channels: Arc::clone(&tool.channels),
-        test_parent_provider: Arc::clone(&tool.test_parent_provider),
+        test_parent_provider: tool.test_parent_provider.clone(),
         provider_name: tool.provider_name.clone(),
         model: tool.model.clone(),
         security: Arc::clone(&tool.security),
@@ -870,7 +870,7 @@ async fn execute_admitted_spawn_with_plane(
         .entry("ollama/prx-local-model".to_owned())
         .or_insert_with(fixture_price);
     let shared: Arc<dyn Tool> = Arc::new(admission_clone(tool));
-    let provider = Arc::clone(&tool.test_parent_provider);
+    let provider = Arc::clone(tool.test_parent_provider());
     let provider_name = tool.provider_name.clone();
     let model_name = tool.model.clone();
     let registry =
@@ -1052,6 +1052,7 @@ fn restore_test_run(id: &str, status: SubAgentStatus) -> SubAgentRun {
         parent_run_id: None,
         session_scope_key: "s".to_string(),
         spawn_depth: 0,
+        delegation: None,
         token_usage_records: Vec::new(),
     }
 }

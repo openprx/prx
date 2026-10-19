@@ -33,9 +33,6 @@ fn containment_tool(
     let (channel, _sent) = RecordingChannel::new();
     SessionsSpawnTool::new(
         Arc::new(channel),
-        Arc::new(EchoProvider {
-            response: "gateway".into(),
-        }),
         gateway_provider,
         crate::providers::credential_probe::PROBE_MODEL,
         0.0,
@@ -55,6 +52,9 @@ fn containment_tool(
         },
         crate::config::SessionsSpawnConfig::default(),
     )
+    .with_test_parent_provider(Arc::new(EchoProvider {
+        response: "gateway".into(),
+    }))
 }
 
 /// Finding 71: a named-agent override must retain the model fallback
@@ -485,10 +485,10 @@ async fn the_gateway_key_still_reaches_the_gateway_provider() {
         api_key: Some(SPAWN_ROOT_SENTINEL.to_string()),
         ..crate::config::Config::default()
     };
-    tool.test_parent_provider = Arc::from(
+    tool.test_parent_provider = Some(Arc::from(
         providers::create_provider_from_test_config(&gateway_config, &providers::ProviderRuntimeOptions::default())
             .expect("test: gateway chain builds"),
-    );
+    ));
     tool = tool.with_hint_config(&gateway_config);
 
     let result = execute_enabled_admitted_spawn(
@@ -558,7 +558,7 @@ async fn child_provider_root_branch_uses_resolved_root_credential_on_wire() {
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
         .with_cost_config(config.cost.clone());
     tool.model = "hint:fast".to_string();
-    tool.test_parent_provider = Arc::from(routed_provider);
+    tool.test_parent_provider = Some(Arc::from(routed_provider));
     let inherited = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe"})))
         .await
         .expect("test: inherited spawn result");
@@ -636,7 +636,7 @@ async fn child_provider_build_branch_uses_named_agent_credential_on_wire() {
         .with_model_catalog(catalog)
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
     tool.model = "hint:fast".to_string();
-    tool.test_parent_provider = Arc::from(routed_provider);
+    tool.test_parent_provider = Some(Arc::from(routed_provider));
     let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})))
         .await
         .expect("test: direct agent child result");
@@ -707,7 +707,7 @@ async fn f1_wire_a_respelled_gateway_child_reaches_only_the_root_url() {
     .expect("test: litellm gateway builds");
     let mut tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL))
         .with_hint_config(&gateway_config);
-    tool.test_parent_provider = Arc::from(gateway);
+    tool.test_parent_provider = Some(Arc::from(gateway));
 
     for (index, spelling) in ["litellm", "lite-llm", "LiteLLM"].into_iter().enumerate() {
         let result = execute_enabled_admitted_spawn(

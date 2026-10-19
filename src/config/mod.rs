@@ -8,6 +8,7 @@ pub mod manage;
 pub mod mcp_launch;
 pub mod schema;
 pub mod secret_paths;
+pub mod skills_lifecycle;
 
 pub use generation::{
     ConfigApplyReport, ConfigGeneration, ConfigGenerationAuditEvent, ConfigGenerationAuditSink, ConfigGenerationId,

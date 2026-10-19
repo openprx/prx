@@ -425,7 +425,6 @@ async fn model_spawn_within_turn_scope_captures_parent_run_id() -> anyhow::Resul
                 let (channel, _) = NamedRecordingChannel::new("terminal");
                 let tool = SessionsSpawnTool::new(
                     channel,
-                    Arc::clone(&provider),
                     "ollama",
                     "prx-parent-spawn-model",
                     0.7,
@@ -437,6 +436,7 @@ async fn model_spawn_within_turn_scope_captures_parent_run_id() -> anyhow::Resul
                     crate::providers::provider_runtime_options_from_config(config),
                     config.sessions_spawn.clone(),
                 )
+                .with_test_parent_provider(Arc::clone(&provider))
                 .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
                 .with_model_catalog(crate::providers::selection::catalog_for(config))
                 .with_hint_config(config)
@@ -534,7 +534,6 @@ async fn operator_spawn_without_ambient_context_uses_source_run_as_parent() -> a
             let (channel, _) = NamedRecordingChannel::new("terminal");
             let tool = SessionsSpawnTool::new(
                 channel,
-                Arc::clone(&provider),
                 "ollama",
                 "prx-local-model",
                 0.7,
@@ -546,6 +545,7 @@ async fn operator_spawn_without_ambient_context_uses_source_run_as_parent() -> a
                 crate::providers::provider_runtime_options_from_config(config),
                 config.sessions_spawn.clone(),
             )
+            .with_test_parent_provider(Arc::clone(&provider))
             .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
             .with_model_catalog(crate::providers::selection::catalog_for(config))
             .with_hint_config(config)

@@ -1,4 +1,7 @@
-use super::{HistoryEntry, PROCESS_TERMINATION_REQUEST_TIMEOUT_SECS, SpawnLineage, SubAgentRun, SubAgentStatus};
+use super::{
+    HistoryEntry, PROCESS_TERMINATION_REQUEST_TIMEOUT_SECS, SpawnDelegationStatus, SpawnLineage, SubAgentRun,
+    SubAgentStatus,
+};
 use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::{RwLock, watch};
@@ -16,6 +19,7 @@ pub(super) struct ProcessModeRunSeed<'a> {
     pub(super) parent_run_id: Option<String>,
     pub(super) session_scope_key: String,
     pub(super) spawn_depth: usize,
+    pub(super) delegation: Option<SpawnDelegationStatus>,
     pub(super) progress: Arc<crate::agent::idle::ProgressBeat>,
     pub(super) batch_id: Option<String>,
 }
@@ -45,6 +49,7 @@ pub(super) fn new_process_mode_run(seed: ProcessModeRunSeed<'_>) -> SubAgentRun 
         parent_run_id: seed.parent_run_id,
         session_scope_key: seed.session_scope_key,
         spawn_depth: seed.spawn_depth,
+        delegation: seed.delegation,
         token_usage_records: Vec::new(),
         progress: seed.progress,
         batch_id: seed.batch_id,

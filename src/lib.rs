@@ -242,6 +242,73 @@ pub enum SkillCommands {
         /// Skill name
         name: String,
     },
+    /// Inspect and operate the skill lifecycle (`[skills_lifecycle]`)
+    Lifecycle {
+        #[command(subcommand)]
+        command: SkillLifecycleCommands,
+    },
+}
+
+/// Skill lifecycle subcommands. Every mutation goes through the lifecycle
+/// service under the `[skills_lifecycle]` settings.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillLifecycleCommands {
+    /// Show the lifecycle mode, policy, proposal counts and startup recovery
+    Status,
+    /// List proposals, oldest first
+    List {
+        /// Only the proposals of this skill id
+        #[arg(long)]
+        skill: Option<String>,
+    },
+    /// Show one proposal
+    Inspect {
+        /// Proposal id
+        proposal_id: String,
+    },
+    /// Publish an eligible proposal (needs `mode = "auto"` and a valid policy)
+    Publish {
+        /// Proposal id
+        proposal_id: String,
+    },
+    /// Cancel a proposal that has not been published
+    Cancel {
+        /// Proposal id
+        proposal_id: String,
+        /// Why it is cancelled
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Re-activate an earlier revision (needs `mode = "auto"` and a valid policy)
+    Rollback {
+        /// Skill id
+        #[arg(long)]
+        skill: String,
+        /// Revision id to re-activate
+        #[arg(long)]
+        revision: String,
+        /// Active generation you observed
+        #[arg(long)]
+        expected_generation: u64,
+    },
+    /// Close an authorized proposal stuck on a transaction conflict, without publishing
+    ForceClose {
+        /// Proposal id
+        proposal_id: String,
+        /// Why it is closed (recorded on the proposal)
+        #[arg(long)]
+        reason: String,
+        /// Final state
+        #[arg(long = "as", value_enum, default_value = "failed")]
+        outcome: ForceCloseArg,
+    },
+}
+
+/// Final state of a force-closed proposal.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, clap::ValueEnum, Serialize, Deserialize)]
+pub enum ForceCloseArg {
+    Failed,
+    Stale,
 }
 
 /// Migration subcommands

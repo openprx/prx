@@ -88,8 +88,13 @@ impl SessionsSpawnTool {
                 let age = (Utc::now() - r.started_at).num_seconds();
                 let parent = r.parent_run_id.as_deref().unwrap_or("root");
                 let usage = format_run_usage(&r.token_usage_records);
+                let delegation = r.delegation.as_ref().map_or_else(
+                    || "none recorded".to_owned(),
+                    |grant| format!("requested={}, remaining_depth={}, provider={}, model={}, max_cost_cents={}",
+                        grant.requested, grant.remaining_depth, grant.provider, grant.model, grant.max_cost_cents),
+                );
                 format!(
-                    "• `{}` [source=runtime, manageable=true, usage={usage}, {age}s ago] {status}\n  task: {}\n  depth: {} | parent: {}",
+                    "• `{}` [source=runtime, manageable=true, usage={usage}, {age}s ago] {status}\n  task: {}\n  depth: {} | parent: {} | delegation: {delegation}",
                     r.id, r.task, r.spawn_depth, parent
                 )
             })

@@ -22,7 +22,7 @@ use crate::providers::{
 };
 use anyhow::{Context, Result, bail};
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -165,6 +165,7 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
         self_system: crate::config::SelfSystemConfig::default(),
         skills: crate::config::SkillsConfig::default(),
         skill_rag: crate::config::schema::SkillRagConfig::default(),
+        skills_lifecycle: crate::config::skills_lifecycle::SkillsLifecycleConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
         query_classification: crate::config::QueryClassificationConfig::default(),
@@ -234,6 +235,10 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
         style(spec.name()).cyan()
     );
 
+    if let Some((decision, Some(_))) = &decision {
+        decision.ensure_hosted_credential_free(&config.config_path)?;
+    }
+
     // The chosen default is an operator selection (D-034): a model the
     // evidence rules out is refused before anything is written; an
     // unverified one is accepted with a warning.
@@ -250,8 +255,13 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
     persist_workspace_selection(&config.config_path).await?;
 
     // ── Decision plane: the shared setup service, then a local test ──
-    if let Some(decision) = &decision {
-        decision.apply(config.clone()).await?;
+    if let Some((decision, secret)) = decision {
+        match secret {
+            Some(secret) => print!("{}", decision.apply_hosted(config.clone(), secret).await?),
+            None => {
+                decision.apply(config.clone()).await?;
+            }
+        }
         let written = Config::load_from_path(&config.config_path, config.workspace_dir.clone())?;
         let outcome = crate::causal_cli::test_configured_locally(&written).await?;
         println!(
@@ -487,6 +497,7 @@ async fn run_quick_setup_with_home(
         self_system: crate::config::SelfSystemConfig::default(),
         skills: crate::config::SkillsConfig::default(),
         skill_rag: crate::config::schema::SkillRagConfig::default(),
+        skills_lifecycle: crate::config::skills_lifecycle::SkillsLifecycleConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
         query_classification: crate::config::QueryClassificationConfig::default(),
@@ -1564,6 +1575,18 @@ fn setup_workspace(config_dir: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     Ok((workspace_dir, config_path))
 }
 
+/// The `config.toml` path quick setup writes for `config_dir`.
+///
+/// # Errors
+///
+/// When no home directory can be found.
+pub fn quick_setup_config_path(config_dir: Option<&str>) -> Result<PathBuf> {
+    let home = crate::config::user_home_dir().context("Could not find home directory")?;
+    Ok(config_dir
+        .map_or_else(|| default_user_config_dir(&home), PathBuf::from)
+        .join("config.toml"))
+}
+
 fn default_user_config_dir(home: &Path) -> PathBuf {
     home.join(".openprx")
 }
@@ -2460,16 +2483,22 @@ fn setup_memory() -> Result<MemoryConfig> {
 /// decision on this machine and changes nothing. A local System One
 /// endpoint is checked by the one decision check before anything is
 /// written, and tested locally once the configuration is written. A hosted
-/// service needs a credential and sends decision state off the machine, so
-/// it is set up with `prx causal config` after onboarding.
-fn setup_decision_plane() -> Result<Option<crate::causal_cli::DecisionSetup>> {
+/// service needs a credential: it is read hidden, stored as a credential
+/// reference and referenced in the same setup; remote processing stays off
+/// until `prx causal config enable-remote`.
+fn setup_decision_plane() -> Result<
+    Option<(
+        crate::causal_cli::DecisionSetup,
+        Option<crate::config::manage::credentials::SecretString>,
+    )>,
+> {
     print_bullet("The decision plane chooses between candidate actions before the model answers.");
     print_bullet("The builtin decides locally; nothing is sent anywhere.");
     println!();
     let options = [
         "Builtin (default): decisions stay on this machine",
         "A local System One endpoint (loopback)",
-        "A hosted service (TypeSafe or OpenRouter): set up after onboarding",
+        "A hosted service (TypeSafe or OpenRouter): needs a credential; remote stays off until enabled",
     ];
     let choice = Select::new()
         .with_prompt("  Decision backend")
@@ -2493,23 +2522,50 @@ fn setup_decision_plane() -> Result<Option<crate::causal_cli::DecisionSetup>> {
                 enable,
             };
             setup.check()?;
-            Ok(Some(setup))
+            Ok(Some((setup, None)))
         }
         2 => {
-            print_bullet("A hosted service receives decision state off this machine and needs a credential.");
-            for kind in [
+            print_bullet("A hosted service needs a credential. Decision state is sent to it only after you run");
+            print_bullet("`prx causal config enable-remote`; until then the builtin decides locally.");
+            let kinds = [
                 crate::decision::BackendKind::TypeSafe,
                 crate::decision::BackendKind::OpenRouter,
-            ] {
-                if let Some(owner) = crate::causal_cli::hosted_owner(kind) {
-                    print_bullet(&crate::causal_cli::hosted_setup_steps(kind, owner, None));
-                }
-            }
-            print_bullet(
-                "Each change prints its plan; apply it with --yes (and --confirm-high-risk <REVISION> when it \
-                 asks), then `prx causal config enable-remote`; `prx causal test --live` asks the service once.",
+            ];
+            let kind_labels = ["TypeSafe", "OpenRouter (Decisions API)"];
+            let kind = Select::new()
+                .with_prompt("  Hosted service")
+                .items(&kind_labels)
+                .default(0)
+                .interact()?;
+            let kind = kinds
+                .get(kind)
+                .copied()
+                .unwrap_or(crate::decision::BackendKind::TypeSafe);
+            let model: String = Input::new().with_prompt("  Model, one exact version").interact_text()?;
+            let enable = Confirm::new()
+                .with_prompt("  Turn the decision plane on now?")
+                .default(true)
+                .interact()?;
+            let secret = crate::config::manage::credentials::SecretString::new(
+                Password::new()
+                    .with_prompt("  Service credential (input hidden)")
+                    .interact()?,
             );
-            Ok(None)
+            if secret.expose().trim().is_empty() {
+                println!(
+                    "  {} No credential entered; the hosted backend is not set up.",
+                    style("→").dim()
+                );
+                return Ok(None);
+            }
+            let setup = crate::causal_cli::DecisionSetup {
+                kind,
+                endpoint: None,
+                model: Some(model.trim().to_string()),
+                enable,
+            };
+            setup.check_hosted()?;
+            Ok(Some((setup, Some(secret))))
         }
         _ => Ok(None),
     }

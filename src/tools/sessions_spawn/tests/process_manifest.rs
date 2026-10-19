@@ -37,7 +37,6 @@ async fn spawn_rejects_unknown_agent() -> anyhow::Result<()> {
             let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
             let tool = SessionsSpawnTool::new(
                 Arc::new(ch),
-                Arc::clone(&provider),
                 "ollama",
                 "prx-local-model",
                 0.7,
@@ -48,7 +47,8 @@ async fn spawn_rejects_unknown_agent() -> anyhow::Result<()> {
                 None,
                 crate::providers::ProviderRuntimeOptions::default(),
                 crate::config::SessionsSpawnConfig::default(),
-            );
+            )
+            .with_test_parent_provider(Arc::clone(&provider));
             let tools_handle = tool.tools_handle();
             let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(tool)]);
             assert!(tools_handle.set(&registry));
@@ -86,7 +86,6 @@ async fn spawn_rejects_spawn_disabled_agent() {
     agents.insert("alpha".to_string(), cfg);
     let tool = SessionsSpawnTool::new(
         Arc::new(ch),
-        Arc::new(EchoProvider { response: "ok".into() }),
         "ollama",
         "prx-local-model",
         0.7,
@@ -97,7 +96,8 @@ async fn spawn_rejects_spawn_disabled_agent() {
         None,
         crate::providers::ProviderRuntimeOptions::default(),
         crate::config::SessionsSpawnConfig::default(),
-    );
+    )
+    .with_test_parent_provider(Arc::new(EchoProvider { response: "ok".into() }));
     let workspace = tempfile::tempdir().expect("test: parent workspace");
     let config = preconstruction_parent_config(&tool, workspace.path());
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("test: parent memory"));
@@ -129,7 +129,6 @@ async fn spawn_agent_uses_identity_prompt() {
     let (ch, sent) = RecordingChannel::new();
     let tool = SessionsSpawnTool::new(
         Arc::new(ch),
-        Arc::new(EchoSystemProvider),
         "ollama",
         "prx-local-model",
         0.7,
@@ -140,7 +139,8 @@ async fn spawn_agent_uses_identity_prompt() {
         None,
         crate::providers::ProviderRuntimeOptions::default(),
         crate::config::SessionsSpawnConfig::default(),
-    );
+    )
+    .with_test_parent_provider(Arc::new(EchoSystemProvider));
     tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
     let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "t", "agent": "alpha"})))

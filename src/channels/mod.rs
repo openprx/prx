@@ -1935,20 +1935,21 @@ async fn handle_runtime_command_if_needed(
                 // The new provider is resolved with the sender's current model
                 // before anything is built or switched.
                 let catalog = providers::selection::catalog_for(&config_generation.effective);
-                let route = providers::selection::route_target(&catalog, &provider_name, &current.model)
-                    .ok()
-                    .flatten();
-                let refusal = providers::selection::check_with(
-                    &config_generation.effective,
-                    &catalog,
-                    &provider_name,
-                    &current.model,
-                    providers::selection::credential_for(&config_generation.effective, &provider_name),
-                    &providers::catalog::Requirement::chat(),
-                    providers::catalog::UnknownPolicy::Invocation,
-                )
-                .map_err(|refusal| providers::selection::route_refusal(route, refusal))
-                .err();
+                let refusal = match providers::selection::route_target(&catalog, &provider_name, &current.model) {
+                    Err(error) => Some(error.to_string()),
+                    Ok(route) => providers::selection::check_with(
+                        &config_generation.effective,
+                        &catalog,
+                        &provider_name,
+                        &current.model,
+                        providers::selection::credential_for(&config_generation.effective, &provider_name),
+                        &providers::catalog::Requirement::chat(),
+                        providers::catalog::UnknownPolicy::Invocation,
+                    )
+                    .map_err(|refusal| providers::selection::route_refusal(route, refusal))
+                    .err()
+                    .map(|refusal| refusal.to_string()),
+                };
                 if let Some(refusal) = refusal {
                     format!(
                         "{refusal}. Route unchanged; switch the model first with `/model <model-id>` or pick \
@@ -2040,6 +2041,13 @@ async fn handle_runtime_command_if_needed(
 /// Kept test-only because the runtime owns its context and outbound channel.
 #[cfg(test)]
 pub(crate) async fn broken_route_models_command_response(config: &Config) -> String {
+    route_command_response(config, "/models openai", "hint:broken").await.0
+}
+
+/// Send `command` for a sender whose current model is `model` and return the
+/// reply plus the sender's selected model afterwards.
+#[cfg(test)]
+pub(crate) async fn route_command_response(config: &Config, command: &str, model: &str) -> (String, String) {
     #[derive(Default)]
     struct RefusalChannel {
         sent: tokio::sync::Mutex<Vec<String>>,
@@ -2070,7 +2078,7 @@ pub(crate) async fn broken_route_models_command_response(config: &Config) -> Str
         id: "prx-broken-route-command".to_string(),
         sender: "prx_user".to_string(),
         reply_target: "prx_channel".to_string(),
-        content: "/models openai".to_string(),
+        content: command.to_string(),
         channel: "telegram".to_string(),
         ..traits::ChannelMessage::default()
     };
@@ -2081,20 +2089,22 @@ pub(crate) async fn broken_route_models_command_response(config: &Config) -> Str
         &key,
         ChannelRouteSelection {
             provider: providers::selection::default_provider(config).to_string(),
-            model: "hint:broken".to_string(),
+            model: model.to_string(),
         },
     );
     assert!(
         handle_runtime_command_if_needed(&ctx, &generation, &msg, Some(&channel)).await,
         "the production /models handler did not claim the command"
     );
-    channel_impl
+    let reply = channel_impl
         .sent
         .lock()
         .await
         .last()
         .cloned()
-        .expect("the production /models handler did not send a refusal")
+        .expect("the production runtime command did not send a reply");
+    let after = get_route_selection_for_generation(&ctx, &key, &generation);
+    (reply, after.model)
 }
 
 pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
@@ -3259,7 +3269,7 @@ async fn run_channel_turn(
         }
     };
     if let Some((recent_context, heuristic)) = smart_pre_gate_input {
-        let pre_gate = run_admitted_smart_pre_gate(
+        let mut pre_gate = run_admitted_smart_pre_gate(
             ctx.as_ref(),
             &config_generation,
             &mut decision_turn,
@@ -3275,11 +3285,7 @@ async fn run_channel_turn(
             enter_loop = pre_gate.outcome.should_enter_loop(),
             "admitted smart pre-gate decision"
         );
-        if !pre_gate.outcome.should_enter_loop() {
-            let Some(provider_outcome) = pre_gate.provider_outcome else {
-                tracing::warn!("smart pre-gate refused silence without a completed classifier outcome");
-                return;
-            };
+        if let Some(provider_outcome) = pre_gate.silence_provider_outcome() {
             if let Err(error) = decision_turn
                 .commit(crate::agent::terminal::TurnTerminalDraft {
                     decision: None,
@@ -3308,6 +3314,11 @@ async fn run_channel_turn(
                 pre_gate.outcome.path.as_str()
             );
             return;
+        }
+        if !pre_gate.outcome.should_enter_loop() {
+            tracing::warn!(
+                "smart pre-gate skip lacks a completed classifier outcome; failing open into the agent loop"
+            );
         }
     }
     match decision_turn.close_reply() {
@@ -3359,21 +3370,17 @@ async fn run_channel_turn(
         }
     }
     let mut vision_scope = None;
-    let decision_turn = if vision_required {
-        match decision_turn.vision_accounting() {
-            Ok(accounting) => {
-                let (turn, observation) = decision_turn.with_vision_observation(&accounting);
+    if vision_required && let Ok(accounting) = decision_turn.vision_accounting() {
+        match decision_turn.register_vision_observation(&accounting) {
+            Ok(observation) => {
                 vision_scope = Some(SignalVisionScope {
                     accounting,
                     observation,
                 });
-                turn
             }
-            Err(_) => decision_turn,
+            Err(error) => tracing::warn!(%error, "channel vision observation refused; using the uncertainty fallback"),
         }
-    } else {
-        decision_turn
-    };
+    }
     let preflight = if vision_required {
         if let Some(scope) = vision_scope.as_ref() {
             let provider = scope.accounting.provider();
@@ -4306,6 +4313,18 @@ struct AdmittedSmartPreGate {
     outcome: pre_gate::PreGateOutcome,
     provider_outcome: Option<crate::llm::route_decision::ProviderExecutionOutcome>,
     started_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl AdmittedSmartPreGate {
+    /// The completed classifier outcome that authorizes silence, or `None`
+    /// when the message must enter the loop (fail-open): either the gate
+    /// chose to enter, or it skipped without a settled classifier receipt.
+    const fn silence_provider_outcome(&mut self) -> Option<crate::llm::route_decision::ProviderExecutionOutcome> {
+        if self.outcome.should_enter_loop() {
+            return None;
+        }
+        self.provider_outcome.take()
+    }
 }
 
 /// Run the smart-group classifier only after the source decision exists. A
@@ -5802,8 +5821,6 @@ pub async fn start_channels_with_config(
         let spawn_channels_by_name = Arc::clone(&channels_registry);
         let spawn_tool = tools::SessionsSpawnTool::new(
             first_channel,
-            #[cfg(test)]
-            Arc::clone(&provider),
             &provider_name,
             &resolved_default_model(&config),
             temperature,

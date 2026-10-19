@@ -1,3 +1,4 @@
+use super::delegation;
 use super::{AnnounceOrigin, DEFAULT_HISTORY_ENTRY_MAX_CHARS, SessionsSpawnTool, parse_spawn_scope};
 use crate::channels::traits::Channel;
 use crate::security::policy::ApprovalGrant;
@@ -54,7 +55,7 @@ impl Tool for SessionsSpawnTool {
                     "tasks": {
                         "type": "array",
                         "minItems": 1,
-                        "description": "For 'spawn_batch': the tasks to launch together, unlimited in number. Each entry is a task string or an object {task, agent?, model?, provider?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
+                        "description": "For 'spawn_batch': the tasks to launch together, unlimited in number. Each entry is a task string or an object {task, agent?, model?, provider?, allow_delegation?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
                         "items": {
                             "anyOf": [
                                 {"type": "string", "minLength": 1},
@@ -90,6 +91,7 @@ impl Tool for SessionsSpawnTool {
                         "type": "string",
                         "description": "For 'spawn' and 'spawn_batch': provider override. Must be a provider the operator configured (the gateway provider, a named agent's provider, a fallback provider or a model route); any other provider, including an unconfigured 'custom:<url>', is refused. Defaults to the agent config provider, then the gateway provider."
                     },
+                    "allow_delegation": delegation::request_schema(),
                     "agent": {
                         "type": "string",
                         "description": format!(

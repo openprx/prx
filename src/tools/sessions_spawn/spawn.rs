@@ -1,3 +1,4 @@
+use super::delegation;
 use super::{
     AllowedToolProxy, AnnounceOrigin, DEFAULT_SUB_AGENT_SYSTEM_PROMPT, HistoryEntry, MemoryScope, OutboundNotice,
     PROCESS_OWNER_PANICKED_PREFIX, ProcessFinalization, ProcessModeRunSeed, ProcessRunControl, ProcessWorkerOutcome,
@@ -146,9 +147,9 @@ impl SessionsSpawnTool {
             .or_else(|| ordinary_publication.map(|publication| publication.security()))
             .or_else(|| operator_source.as_ref().map(|source| source.security()))
             .ok_or_else(|| anyhow::anyhow!("spawn admitted security policy missing"))?;
-        let provider_options = providers::provider_runtime_options_from_config(child_model_config);
-        let provider_options = &provider_options;
+        let provider_options = &providers::provider_runtime_options_from_config(child_model_config);
         let spawn_config = &child_model_config.sessions_spawn;
+        let allow_delegation = delegation::requested(args, spawn_config, child_grant.is_some())?;
         let agents = &child_model_config.agents;
         let task = args
             .get("task")
@@ -255,8 +256,8 @@ impl SessionsSpawnTool {
             },
         );
 
-        // This runtime caps neither how many sub-agents run at once, how deeply
-        // they nest, nor how many one session may own: an operator sees every
+        // The registry imposes no global fan-out or nesting limit. A child's
+        // sealed delegation grant independently bounds its depth. An operator sees every
         // live run in the runtime registry and ends it with `prx tasks kill`,
         // which is what makes an uncapped fan-out answerable rather than
         // unstoppable. Counting the live runs on the way in keeps that fan-out
@@ -662,6 +663,10 @@ impl SessionsSpawnTool {
                 ))
             })
             .transpose()?;
+        let child_grant = child_grant
+            .as_ref()
+            .map(|grant| grant.for_spawn_request(allow_delegation, &resolved_provider_name, &resolved_model))
+            .transpose()?;
         let process_child_grant = (mode == "process")
             .then(|| {
                 child_grant
@@ -672,6 +677,7 @@ impl SessionsSpawnTool {
             })
             .transpose()?
             .flatten();
+        let delegation_status = delegation::status(&process_child_grant, &child_grant);
         let event_workspace = memory_fabric.workspace_id();
         let mut spawn_scope_for_event = spawn_event_scope(
             event_workspace,
@@ -730,9 +736,9 @@ impl SessionsSpawnTool {
             spawn_scope_for_event.clone(),
             task,
             &mode,
-            &resolved_provider_name,
-            &resolved_model,
+            (&resolved_provider_name, &resolved_model),
             &run_lineage,
+            process_child_grant.as_deref().or(child_grant.as_deref()),
         )
         .await?;
 
@@ -810,6 +816,7 @@ impl SessionsSpawnTool {
                     parent_run_id: parent_run_id.clone(),
                     session_scope_key: session_scope_key.clone(),
                     spawn_depth,
+                    delegation: delegation_status.clone(),
                     progress: Arc::clone(&process_progress),
                     batch_id: batch_id.map(str::to_string),
                 }));
@@ -1644,6 +1651,7 @@ impl SessionsSpawnTool {
                 parent_run_id: parent_run_id.clone(),
                 session_scope_key: session_scope_key.clone(),
                 spawn_depth,
+                delegation: delegation_status.clone(),
                 token_usage_records: Vec::new(),
                 progress: Arc::clone(&task_progress),
                 batch_id: batch_id.map(str::to_string),

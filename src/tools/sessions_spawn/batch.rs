@@ -1,3 +1,4 @@
+use super::delegation;
 use super::{
     SessionsSpawnTool, SubAgentRun, SubAgentStatus, TerminationCause, batch_journal, boxed_spawn_field,
     parse_spawn_scope, termination_cause,
@@ -360,6 +361,7 @@ impl SessionsSpawnTool {
                 "agent": {"type": "string"},
                 "model": {"type": "string"},
                 "provider": {"type": "string"},
+                "allow_delegation": delegation::request_schema(),
                 "mode": {"type": "string", "enum": ["task", "process"]},
                 "recipient": {"type": "string"},
             },
@@ -496,6 +498,7 @@ impl SessionsSpawnTool {
             }
         }
 
+        delegation::validate_batch(&member_args, crate::runtime::child_source::outgoing_grant().as_deref())?;
         let prepared = if let Some(grant) = crate::runtime::child_source::outgoing_grant() {
             let fabric = grant.source_fabric().clone();
             Some(batch_journal::PreparedBatch::prepare(fabric, &grant, &batch_id, &member_args).await?)

@@ -59,10 +59,17 @@ fn a_catalog_override_without_its_own_credential_is_refused() {
     let outcome = resolve_agent_model_choice(&config, Some("mistral"), Some("mistral-large-latest"))
         .and_then(|choice| agent_provider_selection(&choice).build_provider(&config, &options));
 
-    let error = match outcome {
+    let typed = match outcome {
         Ok(_) => panic!("a catalog override must not build on the default provider's key"),
-        Err(error) => format!("{error:#}"),
+        Err(error) => error,
     };
+    assert!(
+        typed
+            .downcast_ref::<crate::providers::MissingProviderCredential>()
+            .is_some(),
+        "the refusal must be the typed missing-credential error: {typed:#}"
+    );
+    let error = format!("{typed:#}");
     assert!(error.contains("missing credential/api key"), "{error}");
     assert!(!error.contains(ROOT_SENTINEL), "{error}");
 }
@@ -89,6 +96,21 @@ fn the_configured_default_keeps_its_connection() {
             "{spelling:?}"
         );
     }
+}
+
+/// Finding 79(a): the construction-time attestation exists to catch a reload
+/// that changes the key under the same credential reference.
+#[test]
+fn a_changed_key_under_the_same_credential_reference_fails_the_attestation() {
+    let temp = tempfile::tempdir().expect("test: temp config dir");
+    let mut config = isolated_config(&temp);
+    let choice = resolve_agent_model_choice(&config, None, None).expect("test: the default provider is selectable");
+    assert!(choice.factory_credential_source_matches(&config));
+    config.api_key = Some("C0-AGENT-ROTATED-ROOT".to_string());
+    assert!(
+        !choice.factory_credential_source_matches(&config),
+        "a rotated key under the same reference must not attest"
+    );
 }
 
 /// T4: a model the selected provider cannot serve is refused before any

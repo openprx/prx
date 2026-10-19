@@ -40,6 +40,7 @@ const PARAMETER_ACTION_MATRIX: &[(&str, &[&str])] = &[
     ("max_chars_per_entry", &["history"]),
     ("model", &["spawn", "spawn_batch"]),
     ("provider", &["spawn", "spawn_batch"]),
+    ("allow_delegation", &["spawn", "spawn_batch"]),
     ("agent", &["spawn", "spawn_batch"]),
     ("mode", &["spawn", "spawn_batch"]),
     ("recipient", &["spawn", "spawn_batch"]),

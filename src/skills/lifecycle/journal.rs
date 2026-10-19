@@ -5,11 +5,12 @@
 //! COMMITTED after it. The binding carries the transaction id, so a record left
 //! PREPARED by a crash is resolved from the binding alone (see `recover`).
 //!
-//! Extension point for SL07/SL08 authorization: the gate/authorization receipt
-//! that allowed the transition is to be added to [`JournalEntry`] as one more
-//! pinned receipt hash field, written in the PREPARED record and re-verified
-//! under the publication lock before the binding swap. It is intentionally not
-//! present yet because no verifier exists to give it meaning.
+//! A publication that was authorized by a gate decision (SL08/SL09) pins the
+//! digest of that authorization in the PREPARED record
+//! ([`JournalEntry::authorization_digest`], spec 8.3 step 5). An entry written
+//! without it (an operator publication, a rollback, or an entry from before
+//! the field existed) is legacy: it carries no gate pin and is never matched
+//! against one.
 
 use super::generation::ensure_dir_synced;
 use super::store::{SkillLifecycleStore, check_private, read_record, record_bytes, sync_dir};
@@ -130,9 +131,22 @@ pub struct JournalEntry {
     /// written before this field existed were always enabled.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Digest of the publication authorization (proposal, gate decision and
+    /// candidate record) that allowed this transition, pinned when PREPARED.
+    /// `None` marks a legacy or operator transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_digest: Option<String>,
     pub state: TransactionState,
     pub prepared_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl JournalEntry {
+    /// Whether the entry carries no authorization pin (see the module header).
+    #[must_use]
+    pub const fn is_legacy(&self) -> bool {
+        self.authorization_digest.is_none()
+    }
 }
 
 impl SkillLifecycleStore {

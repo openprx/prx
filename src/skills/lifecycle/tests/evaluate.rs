@@ -37,12 +37,14 @@ pub(super) struct Fixture {
     pub(super) candidate: RevisionId,
 }
 
+/// Instruction text every fixture skill carries, so that a one-line edit stays
+/// inside the 20% edit budget the source review recomputes.
+fn padding() -> String {
+    "Follow the release notes style guide carefully.\n".repeat(40)
+}
+
 pub(super) fn write_revision(store: &SkillLifecycleStore, body: &str) -> (RevisionId, String) {
-    let bundle = Bundle::from_entries(vec![entry(
-        "SKILL.md",
-        format!("---\nname: release-notes\ndescription: Writes release notes\n---\n\n{body}\n").as_bytes(),
-    )])
-    .expect("test: bundle");
+    let bundle = candidate_bundle(body);
     let written = store
         .write_revision(&NewRevision::new(skill(), SourceKind::Operator), &bundle)
         .expect("test: write revision");
@@ -64,6 +66,39 @@ pub(super) fn fixture() -> Fixture {
         candidate: b.0,
     }
 }
+
+/// Revision A is active (generation 1); the candidate is only a bundle id: no
+/// revision B exists in the store. This is the state `propose_revision`
+/// leaves behind, so the lifecycle service must be the one to write it.
+pub(super) fn fixture_candidate_unwritten() -> (Fixture, Bundle) {
+    let tmp = TempDir::new().expect("test: tempdir");
+    let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
+    let a = write_revision(&store, "ANSWER=draft");
+    activate(&store, &skill(), &a, 0, true);
+    let bundle = candidate_bundle("ANSWER=report-v2");
+    let fx = Fixture {
+        tmp,
+        store,
+        baseline: a.0,
+        candidate: bundle.revision_id().clone(),
+    };
+    (fx, bundle)
+}
+
+/// The bundle of the fixture skill with the given body.
+pub(super) fn candidate_bundle(body: &str) -> Bundle {
+    Bundle::from_entries(vec![entry(
+        "SKILL.md",
+        format!(
+            "---\nname: release-notes\ndescription: Writes release notes\n---\n\n{}\n{body}\n",
+            padding()
+        )
+        .as_bytes(),
+    )])
+    .expect("test: bundle")
+}
+
+pub(super) const OWNER_FOR_TESTS: &str = OWNER;
 
 /// Like [`fixture`] but nothing is published yet (generation 0): a new skill.
 fn fixture_unpublished() -> Fixture {

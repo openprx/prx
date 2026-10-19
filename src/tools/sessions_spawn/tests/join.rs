@@ -235,7 +235,6 @@ fn tool_with_broken_agent(agent: &str) -> SessionsSpawnTool {
     agents.insert(agent.to_string(), cfg);
     SessionsSpawnTool::new(
         Arc::new(ch),
-        Arc::new(EchoProvider { response: "ok".into() }),
         "ollama",
         "prx-local-model",
         0.7,
@@ -247,6 +246,7 @@ fn tool_with_broken_agent(agent: &str) -> SessionsSpawnTool {
         crate::providers::ProviderRuntimeOptions::default(),
         crate::config::SessionsSpawnConfig::default(),
     )
+    .with_test_parent_provider(Arc::new(EchoProvider { response: "ok".into() }))
 }
 
 /// b2: a spawn that fails while preparing the sub-agent must leave nothing

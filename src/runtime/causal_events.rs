@@ -20,6 +20,9 @@ use crate::memory::{Memory, MemoryVisibility, MessageEventInput, MessageEventSou
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
 
+mod deferral;
+pub(super) use deferral::PersistenceGuard;
+
 enum QueueItem {
     Event(Box<CausalEvent>),
     Applied {
@@ -40,6 +43,7 @@ pub(crate) struct DurableCausalEventSink {
     revision: String,
     observer: Arc<dyn CausalEventSink>,
     queue: mpsc::Sender<QueueItem>,
+    deferral: Arc<deferral::PersistenceDeferral>,
 }
 
 impl DurableCausalEventSink {
@@ -57,18 +61,57 @@ impl DurableCausalEventSink {
         let replay_workspace = workspace_id.clone();
         let replay_revision = config_source_revision.clone();
         let worker_observer = Arc::clone(&observer);
+        let deferral = Arc::new(deferral::PersistenceDeferral::default());
+        let worker_deferral = Arc::clone(&deferral);
         handle.spawn(async move {
-            while let Some(item) = receiver.recv().await {
+            let mut pending = None;
+            loop {
+                let item = match pending.take() {
+                    Some(item) => item,
+                    None => match receiver.recv().await {
+                        Some(item) => item,
+                        None => break,
+                    },
+                };
                 match item {
                     QueueItem::Event(event) => {
-                        let input =
-                            to_message_input(&event, &workspace_id, config_generation_id, &config_source_revision);
-                        if memory.append_message_event(input).await.is_err() {
-                            report_incomplete(
-                                worker_observer.as_ref(),
-                                event.lineage.clone(),
-                                IncompleteReason::StoreFailed,
-                            );
+                        worker_deferral.wait().await;
+                        let mut batch = vec![event];
+                        while batch.len() < crate::memory::traits::MESSAGE_EVENT_BATCH_LIMIT {
+                            match receiver.try_recv() {
+                                Ok(QueueItem::Event(event)) => batch.push(event),
+                                Ok(boundary) => {
+                                    pending = Some(boundary);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let inputs = batch
+                            .iter()
+                            .map(|event| {
+                                to_message_input(event, &workspace_id, config_generation_id, &config_source_revision)
+                            })
+                            .collect();
+                        let results = memory.append_message_events(inputs).await;
+                        if results.len() != batch.len() {
+                            for event in batch {
+                                report_incomplete(
+                                    worker_observer.as_ref(),
+                                    event.lineage.clone(),
+                                    IncompleteReason::StoreFailed,
+                                );
+                            }
+                            continue;
+                        }
+                        for (event, result) in batch.into_iter().zip(results) {
+                            if result.is_err() {
+                                report_incomplete(
+                                    worker_observer.as_ref(),
+                                    event.lineage.clone(),
+                                    IncompleteReason::StoreFailed,
+                                );
+                            }
                         }
                     }
                     QueueItem::Drain(reply) => {
@@ -116,6 +159,7 @@ impl DurableCausalEventSink {
             }
         });
         Ok(Self {
+            deferral,
             observer,
             queue,
             memory: replay_memory,
@@ -123,6 +167,12 @@ impl DurableCausalEventSink {
             generation_id: config_generation_id,
             revision: replay_revision,
         })
+    }
+
+    /// Already-started I/O completes normally. New ordinary writes wait until
+    /// every guard drops; observers remain immediate and drain stays FIFO.
+    pub(super) fn defer_ordinary_persistence(&self) -> PersistenceGuard {
+        self.deferral.begin()
     }
 
     /// Wait at most until `deadline` for every event queued before this marker.

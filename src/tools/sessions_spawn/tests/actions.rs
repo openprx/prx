@@ -51,9 +51,6 @@ async fn spawn_action_obeys_readonly_resource_gate() {
     });
     let tool = SessionsSpawnTool::new(
         Arc::new(ch),
-        Arc::new(EchoProvider {
-            response: "done".into(),
-        }),
         probe.custom_provider(),
         crate::providers::credential_probe::PROBE_MODEL,
         0.7,
@@ -64,7 +61,10 @@ async fn spawn_action_obeys_readonly_resource_gate() {
         None,
         crate::providers::ProviderRuntimeOptions::default(),
         crate::config::SessionsSpawnConfig::default(),
-    );
+    )
+    .with_test_parent_provider(Arc::new(EchoProvider {
+        response: "done".into(),
+    }));
 
     let error = execute_enabled_admitted_spawn(&tool, task)
         .await
@@ -139,6 +139,7 @@ async fn kill_action_requires_resource_grant() {
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         });
     }
@@ -467,6 +468,7 @@ async fn process_mode_run_is_steerable_and_not_reported_as_legacy() {
         parent_run_id: None,
         session_scope_key: "test-session".to_string(),
         spawn_depth: 0,
+        delegation: None,
     });
     assert!(
         run.steer_tx.is_some(),
@@ -659,6 +661,7 @@ async fn steer_backpressures_when_full_without_dropping_or_holding_the_registry_
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         });
     }
@@ -744,6 +747,7 @@ async fn steer_action_persists_task_event() {
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         });
     }
@@ -861,6 +865,7 @@ async fn history_action_returns_tail_usage_and_truncation_controls() {
             parent_run_id: Some("parent".to_string()),
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: vec![crate::llm::route_decision::MeteredTokenUsageRecord {
                 settlement_id: None,
                 provider: "test-provider".to_string(),

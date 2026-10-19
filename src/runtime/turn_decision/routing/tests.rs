@@ -8,6 +8,7 @@ use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
 use crate::memory::embeddings::LocalHashEmbedding;
 use crate::memory::{Memory, RouterHistoryRead, RouterHistoryRow, SqliteMemory};
 
+mod metadata_bounds;
 mod observed_sqlite;
 mod paid_embedding;
 use crate::providers::traits::ChatTrace;
@@ -95,11 +96,18 @@ impl Fixture {
             }],
             ..RouterConfig::default()
         };
-        let router = RouterEngine::new(policy.clone(), "ollama".into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap()
-            .with_local_hash_history(Arc::new(LocalHashEmbedding::new("prx-local-hash-v1", 384)))
-            .unwrap();
+        let router = RouterEngine::new(
+            policy.clone(),
+            "ollama".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap()
+        .with_local_hash_history(Arc::new(LocalHashEmbedding::new("prx-local-hash-v1", 384)))
+        .unwrap();
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
         config.config_path = workspace.path().join("config.toml");
@@ -303,11 +311,14 @@ impl Fixture {
     async fn assert_read_closed(&mut self, expected_error: &str) {
         // A fixed refusal may be an Ok user-facing response or an error. The
         // durable stage and provider count distinguish it from unrelated errors.
-        let _result = self.turn().await;
+        let result = self.turn().await;
         assert_eq!(self.calls.load(Ordering::SeqCst), 1);
         {
             let observed = self.observed.observations.lock();
-            assert_eq!(observed.read_calls, 2);
+            assert_eq!(
+                observed.read_calls, 2,
+                "expected={expected_error}; actual turn={result:?}"
+            );
             let chain = observed.last_read.as_ref().unwrap().as_ref().unwrap_err();
             assert!(
                 chain.iter().any(|cause| cause == expected_error),
@@ -612,5 +623,17 @@ fn snapshot_digest_retains_every_v1_field_order_and_signed_zero_bit() {
         let expected = scalar_snapshot_digest(&changed);
         assert_ne!(expected, baseline, "the scalar v1 stream binds the changed field");
         assert_eq!(super::snapshot_digest(&changed), expected);
+    }
+}
+
+#[test]
+fn snapshot_digest_keeps_v1_bytes_at_batched_float_boundaries() {
+    for dimensions in [127, 128, 129, 255, 256, 257, 383, 384, 385, 2048] {
+        let read = snapshot_fixture(dimensions, 3);
+        assert_eq!(
+            super::snapshot_digest(&read),
+            scalar_snapshot_digest(&read),
+            "dimensions={dimensions}"
+        );
     }
 }

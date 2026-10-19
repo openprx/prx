@@ -9,6 +9,16 @@ use super::{SqliteMemory, init_approval_grant_schema};
 impl SqliteMemory {
     /// Initialize all tables: memories, FTS5, `embedding_cache`
     pub(super) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
+        // Initialization otherwise commits each DDL/backfill separately. Own
+        // one write transaction so concurrent turn admissions do not compete
+        // with a stream of partial schema commits from a newly opened store.
+        let transaction = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        Self::init_schema_in_transaction(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn init_schema_in_transaction(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "-- Core memories table
             CREATE TABLE IF NOT EXISTS memories (
@@ -1199,8 +1209,7 @@ impl SqliteMemory {
         }
 
         let rebuild = conn.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE message_events RENAME TO message_events_legacy_idempotency_scope;
+            "ALTER TABLE message_events RENAME TO message_events_legacy_idempotency_scope;
              CREATE TABLE message_events (
                  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                  event_id           TEXT NOT NULL UNIQUE,
@@ -1273,13 +1282,11 @@ impl SqliteMemory {
              CREATE INDEX idx_message_events_created_at
                  ON message_events(created_at);
              CREATE INDEX idx_message_events_config_generation
-                 ON message_events(workspace_id, config_generation_id, id);
-             COMMIT;",
+                 ON message_events(workspace_id, config_generation_id, id);",
         );
-        if let Err(error) = rebuild {
-            let _ = conn.execute_batch("ROLLBACK;");
-            return Err(error).context("failed to scope message event idempotency to workspace");
-        }
+        // The owning initialization transaction rolls the whole migration
+        // back on failure, including tables rebuilt before this step.
+        rebuild.context("failed to scope message event idempotency to workspace")?;
         Ok(())
     }
 
