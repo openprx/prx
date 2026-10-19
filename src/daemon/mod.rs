@@ -1462,7 +1462,7 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
         || crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config))
             .starts_with("wasm:")
     {
-        crate::plugins::init_plugin_runtime(&config.workspace_dir, None).await
+        crate::plugins::init_plugin_runtime(config, None).await
     } else {
         None
     };

@@ -344,6 +344,10 @@ pub struct Config {
     #[serde(default)]
     pub skill_rag: SkillRagConfig,
 
+    /// WASM plugin runtime switch (`[plugins]`), off by default.
+    #[serde(default)]
+    pub plugins: crate::config::plugins::PluginsConfig,
+
     /// Skill lifecycle (`[skills_lifecycle]`), off by default.
     #[serde(default)]
     pub skills_lifecycle: crate::config::skills_lifecycle::SkillsLifecycleConfig,
@@ -5911,6 +5915,7 @@ impl Default for Config {
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             skill_rag: SkillRagConfig::default(),
+            plugins: crate::config::plugins::PluginsConfig::default(),
             skills_lifecycle: crate::config::skills_lifecycle::SkillsLifecycleConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -8341,6 +8346,7 @@ min_chars = 12
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             skill_rag: SkillRagConfig::default(),
+            plugins: crate::config::plugins::PluginsConfig::default(),
             skills_lifecycle: crate::config::skills_lifecycle::SkillsLifecycleConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -8907,6 +8913,7 @@ low_priority_tools = ["sessions_spawn", "delegate"]
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             skill_rag: SkillRagConfig::default(),
+            plugins: crate::config::plugins::PluginsConfig::default(),
             skills_lifecycle: crate::config::skills_lifecycle::SkillsLifecycleConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),

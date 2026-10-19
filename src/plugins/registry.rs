@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::manifest::PluginManifest;
+use super::trust::TrustOutcome;
 
 /// Status of a loaded plugin.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -44,78 +45,45 @@ pub struct LoadedPlugin {
 }
 
 impl LoadedPlugin {
-    /// Permissions that are safe to auto-grant without user approval.
-    /// Sensitive permissions like network, filesystem, and shell access
-    /// require explicit approval via the plugin trust configuration.
-    const AUTO_GRANT_SAFE: &[&str] = &["log", "storage", "config", "kv"];
-
-    /// Create a new loaded plugin entry.
+    /// Create a loaded plugin entry from the operator's trust decision.
     ///
-    /// Only safe permissions (log, storage, config, kv) are auto-granted.
-    /// Sensitive permissions (http-outbound, network, filesystem, shell) are
-    /// denied by default and logged as warnings so administrators can review.
+    /// A trusted plugin holds exactly the permissions the trust record grants.
+    /// A refused plugin is kept in the registry as an `Error` entry so it shows
+    /// up in listings with the reason, holds no permissions and carries no
+    /// compiled component: it can never be instantiated.
     pub fn new(
         manifest: PluginManifest,
         source_dir: std::path::PathBuf,
         component: Option<wasmtime::component::Component>,
+        trust: TrustOutcome,
     ) -> Self {
-        let mut granted = Vec::new();
-        let mut denied = Vec::new();
-
-        for perm in &manifest.permissions.required {
-            if Self::AUTO_GRANT_SAFE.contains(&perm.as_str()) {
-                granted.push(perm.clone());
-            } else {
-                denied.push(perm.clone());
+        match trust {
+            TrustOutcome::Trusted { granted } => {
+                if !granted.is_empty() {
+                    tracing::info!(
+                        plugin = %manifest.plugin.name,
+                        permissions = ?granted,
+                        "plugin runs with the permissions in its trust record"
+                    );
+                }
+                Self {
+                    manifest,
+                    status: PluginStatus::Active,
+                    source_dir,
+                    component,
+                    granted_permissions: granted,
+                }
             }
-        }
-
-        if !denied.is_empty() {
-            tracing::warn!(
-                plugin = %manifest.plugin.name,
-                denied_permissions = ?denied,
-                granted_permissions = ?granted,
-                "plugin requests sensitive permissions that are not auto-granted; \
-                 add to trusted_plugins config to approve"
-            );
-        }
-
-        let status = if denied.is_empty() {
-            PluginStatus::Active
-        } else {
-            PluginStatus::Error(format!("required permissions not granted: {}", denied.join(", ")))
-        };
-
-        Self {
-            manifest,
-            status,
-            source_dir,
-            component,
-            granted_permissions: granted,
-        }
-    }
-
-    /// Create a loaded plugin with explicit trust -- all requested permissions
-    /// are granted. Use only for plugins listed in the trusted_plugins config.
-    pub fn new_trusted(
-        manifest: PluginManifest,
-        source_dir: std::path::PathBuf,
-        component: Option<wasmtime::component::Component>,
-    ) -> Self {
-        let granted = manifest.permissions.required.clone();
-        if !granted.is_empty() {
-            tracing::info!(
-                plugin = %manifest.plugin.name,
-                permissions = ?granted,
-                "granting all permissions to trusted plugin"
-            );
-        }
-        Self {
-            manifest,
-            status: PluginStatus::Active,
-            source_dir,
-            component,
-            granted_permissions: granted,
+            TrustOutcome::Refused(reason) => {
+                tracing::warn!(plugin = %manifest.plugin.name, reason = %reason, "plugin refused");
+                Self {
+                    manifest,
+                    status: PluginStatus::Error(reason),
+                    source_dir,
+                    component: None,
+                    granted_permissions: Vec::new(),
+                }
+            }
         }
     }
 
@@ -220,8 +188,8 @@ impl PluginRegistry {
 
     /// Get the granted (policy-filtered) permissions for a plugin.
     ///
-    /// These are the permissions that passed through `LoadedPlugin::new()`
-    /// security filtering, NOT the raw manifest permissions.
+    /// These are the permissions the operator's trust record granted, NOT the
+    /// raw manifest permissions.
     pub async fn get_granted_permissions(&self, name: &str) -> Option<Vec<String>> {
         let plugins = self.plugins.read().await;
         plugins.get(name).map(|p| p.granted_permissions.clone())
@@ -263,10 +231,16 @@ mod tests {
         }
     }
 
+    /// A plugin the operator trusted with everything it requires.
+    fn trusted_plugin(manifest: PluginManifest, dir: std::path::PathBuf) -> LoadedPlugin {
+        let granted = manifest.permissions.required.clone();
+        LoadedPlugin::new(manifest, dir, None, TrustOutcome::Trusted { granted })
+    }
+
     #[tokio::test]
     async fn register_and_list() {
         let registry = PluginRegistry::new();
-        let plugin = LoadedPlugin::new(test_manifest("test"), "/tmp".into(), None);
+        let plugin = trusted_plugin(test_manifest("test"), "/tmp".into());
         registry.register(plugin).await.unwrap();
 
         let list = registry.list().await;
@@ -277,8 +251,8 @@ mod tests {
     #[tokio::test]
     async fn duplicate_register_fails() {
         let registry = PluginRegistry::new();
-        let p1 = LoadedPlugin::new(test_manifest("test"), "/tmp".into(), None);
-        let p2 = LoadedPlugin::new(test_manifest("test"), "/tmp".into(), None);
+        let p1 = trusted_plugin(test_manifest("test"), "/tmp".into());
+        let p2 = trusted_plugin(test_manifest("test"), "/tmp".into());
         registry.register(p1).await.unwrap();
         assert!(registry.register(p2).await.is_err());
     }
@@ -286,7 +260,7 @@ mod tests {
     #[tokio::test]
     async fn unregister() {
         let registry = PluginRegistry::new();
-        let plugin = LoadedPlugin::new(test_manifest("test"), "/tmp".into(), None);
+        let plugin = trusted_plugin(test_manifest("test"), "/tmp".into());
         registry.register(plugin).await.unwrap();
         assert!(registry.unregister("test").await);
         assert!(!registry.unregister("test").await);
@@ -304,7 +278,7 @@ mod tests {
     async fn get_component_returns_none_when_no_component() {
         // LoadedPlugin created with component=None
         let registry = PluginRegistry::new();
-        let plugin = LoadedPlugin::new(test_manifest("no-wasm"), "/tmp".into(), None);
+        let plugin = trusted_plugin(test_manifest("no-wasm"), "/tmp".into());
         registry.register(plugin).await.unwrap();
         let component = registry.get_component("no-wasm").await;
         assert!(
@@ -327,7 +301,7 @@ mod tests {
         manifest.plugin.description = "A test plugin".to_string();
         manifest.permissions.required = vec!["log".to_string(), "config".to_string()];
 
-        let plugin = LoadedPlugin::new(manifest, "/opt/plugins/info-test".into(), None);
+        let plugin = trusted_plugin(manifest, "/opt/plugins/info-test".into());
         registry.register(plugin).await.unwrap();
 
         let info = registry.get_info("info-test").await.expect("should find plugin");
@@ -340,10 +314,15 @@ mod tests {
     }
 
     #[test]
-    fn denied_required_permission_is_not_active() {
+    fn a_refused_plugin_is_not_active_and_holds_nothing() {
         let mut manifest = test_manifest("untrusted");
         manifest.permissions.required = vec!["shell".to_string()];
-        let plugin = LoadedPlugin::new(manifest, "/tmp".into(), None);
+        let plugin = LoadedPlugin::new(
+            manifest,
+            "/tmp".into(),
+            None,
+            TrustOutcome::Refused("no trust record".to_string()),
+        );
         assert!(matches!(plugin.status, PluginStatus::Error(_)));
         assert!(plugin.granted_permissions.is_empty(), "expected an empty value");
     }
@@ -357,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn contains_returns_true_after_register() {
         let registry = PluginRegistry::new();
-        let plugin = LoadedPlugin::new(test_manifest("present"), "/tmp".into(), None);
+        let plugin = trusted_plugin(test_manifest("present"), "/tmp".into());
         registry.register(plugin).await.unwrap();
         assert!(registry.contains("present").await);
     }
@@ -365,11 +344,11 @@ mod tests {
     #[tokio::test]
     async fn replace_overwrites_existing_plugin() {
         let registry = PluginRegistry::new();
-        let p1 = LoadedPlugin::new(test_manifest("hot-reload"), "/tmp/v1".into(), None);
+        let p1 = trusted_plugin(test_manifest("hot-reload"), "/tmp/v1".into());
         registry.register(p1).await.unwrap();
 
         // Replace with a new version (different source_dir to distinguish).
-        let p2 = LoadedPlugin::new(test_manifest("hot-reload"), "/tmp/v2".into(), None);
+        let p2 = trusted_plugin(test_manifest("hot-reload"), "/tmp/v2".into());
         registry.replace(p2).await;
 
         // Should still have exactly 1 plugin.
@@ -384,7 +363,7 @@ mod tests {
     async fn list_returns_all_registered_plugins() {
         let registry = PluginRegistry::new();
         for name in ["alpha", "beta", "gamma"] {
-            let plugin = LoadedPlugin::new(test_manifest(name), "/tmp".into(), None);
+            let plugin = trusted_plugin(test_manifest(name), "/tmp".into());
             registry.register(plugin).await.unwrap();
         }
         let list = registry.list().await;
@@ -407,7 +386,7 @@ mod tests {
             events: vec![],
             schedule: None,
         }];
-        let plugin = LoadedPlugin::new(manifest, "/tmp".into(), None);
+        let plugin = trusted_plugin(manifest, "/tmp".into());
         registry.register(plugin).await.unwrap();
 
         let info = registry.get_info("cap-plugin").await.unwrap();

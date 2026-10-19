@@ -8,7 +8,11 @@
 //!
 //! `Component::deserialize_file` is `unsafe` because it trusts that the
 //! serialized bytes were produced by the same wasmtime build on the same
-//! platform. We generate all cache files ourselves, so this is acceptable.
+//! platform. We generate all cache files ourselves, in a directory outside the
+//! agent workspace (see `PluginPolicy::cache_dir`), so this is acceptable. A
+//! directory an agent could write would be a code-execution path around
+//! plugin trust. Only components that already passed the trust check are ever
+//! compiled into the cache.
 
 use std::path::PathBuf;
 use std::sync::Arc;

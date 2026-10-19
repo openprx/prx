@@ -308,13 +308,23 @@ pub fn launch_environment<S: std::hash::BuildHasher>(
 /// `hooks.json` and the MCP servers of `mcp.json`.
 const WORKSPACE_LAUNCH_FILES: &[&str] = &["hooks.json", "mcp.json"];
 
-/// Whether `target` (a resolved path) is a workspace launch definition
-/// (`hooks.json` or `mcp.json` at the root of `workspace_dir`), compared
-/// case-insensitively so a case-folding filesystem cannot hide it. A file
-/// tool's write there is classified high risk and named as such
+/// Workspace directory of WASM plugins. Everything under it is plugin code or
+/// plugin configuration that PRX loads and runs.
+const WORKSPACE_PLUGINS_DIR: &str = "plugins";
+
+/// Whether `target` (a resolved path) is a workspace launch definition: the
+/// `hooks.json` or `mcp.json` at the root of `workspace_dir`, or anything
+/// under its `plugins/` directory (WASM plugin code and manifests). Names are
+/// compared case-insensitively so a case-folding filesystem cannot hide them.
+/// A file tool's write there is classified high risk and named as such
 /// (HOOKS-ENV): it changes which programs run as PRX's user.
 #[must_use]
 pub fn is_workspace_launch_file(workspace_dir: &std::path::Path, target: &std::path::Path) -> bool {
+    let workspace = std::fs::canonicalize(workspace_dir).unwrap_or_else(|_| workspace_dir.to_path_buf());
+    is_root_launch_file(&workspace, target) || is_under_plugins_dir(&workspace, target)
+}
+
+fn is_root_launch_file(workspace: &std::path::Path, target: &std::path::Path) -> bool {
     let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -324,10 +334,43 @@ pub fn is_workspace_launch_file(workspace_dir: &std::path::Path, target: &std::p
     {
         return false;
     }
-    let workspace = std::fs::canonicalize(workspace_dir).unwrap_or_else(|_| workspace_dir.to_path_buf());
     target
         .parent()
         .is_some_and(|parent| std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()) == workspace)
+}
+
+/// Whether `target` lies at or under `<workspace>/plugins`. The deepest
+/// existing ancestor is canonicalised first, so a symlink cannot hide the
+/// directory, and the not-yet-existing tail is appended unchanged.
+fn is_under_plugins_dir(workspace: &std::path::Path, target: &std::path::Path) -> bool {
+    let mut existing = target;
+    let mut tail = Vec::new();
+    let resolved_base = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(path) => break path,
+            Err(_) => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    break existing.to_path_buf();
+                };
+                tail.push(name.to_os_string());
+                existing = parent;
+            }
+        }
+    };
+    let resolved = tail.iter().rev().fold(resolved_base, |mut path, part| {
+        path.push(part);
+        path
+    });
+    resolved
+        .strip_prefix(workspace)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|first| match first {
+            std::path::Component::Normal(name) => name
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(WORKSPACE_PLUGINS_DIR)),
+            _ => false,
+        })
 }
 
 /// Whether `path` is an existing real directory (`Ok(true)`), absent

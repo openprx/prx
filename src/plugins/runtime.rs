@@ -24,6 +24,7 @@ use super::error::{PluginError, PluginResult};
 use super::event_bus::EventBus;
 use super::manifest::PluginManifest;
 use super::registry::{PluginInfo, PluginStatus};
+use super::trust::{PluginMaterial, PluginPolicy};
 use crate::memory::traits::Memory;
 use crate::security::SecurityPolicy;
 use crate::security::op_id;
@@ -50,10 +51,11 @@ impl PluginGeneration {
     async fn build(
         id: u64,
         plugins_dir: PathBuf,
+        policy: PluginPolicy,
         memory: Option<Arc<dyn Memory>>,
         event_bus: Arc<EventBus>,
     ) -> PluginResult<Self> {
-        let manager = Arc::new(PluginManager::new(plugins_dir)?);
+        let manager = Arc::new(PluginManager::new(plugins_dir, policy)?);
         manager.load_all().await?;
 
         let tools_build = manager
@@ -120,6 +122,7 @@ impl PluginGeneration {
 /// Sole process-level owner of a workspace's plugin generation and event bus.
 pub struct PluginRuntime {
     plugins_dir: PathBuf,
+    policy: PluginPolicy,
     memory: parking_lot::RwLock<Option<Arc<dyn Memory>>>,
     event_bus: Arc<EventBus>,
     generation: ArcSwap<PluginGeneration>,
@@ -127,14 +130,28 @@ pub struct PluginRuntime {
 }
 
 impl PluginRuntime {
-    async fn new(workspace_dir: &Path, memory: Option<Arc<dyn Memory>>) -> PluginResult<Arc<Self>> {
+    async fn new(
+        workspace_dir: &Path,
+        policy: PluginPolicy,
+        memory: Option<Arc<dyn Memory>>,
+    ) -> PluginResult<Arc<Self>> {
+        if !policy.enabled() {
+            return Err(PluginError::Disabled);
+        }
         let plugins_dir = workspace_dir.join("plugins");
         std::fs::create_dir_all(&plugins_dir).map_err(PluginError::Io)?;
         let event_bus = Arc::new(EventBus::new());
-        let generation =
-            PluginGeneration::build(1, plugins_dir.clone(), memory.clone(), Arc::clone(&event_bus)).await?;
+        let generation = PluginGeneration::build(
+            1,
+            plugins_dir.clone(),
+            policy.clone(),
+            memory.clone(),
+            Arc::clone(&event_bus),
+        )
+        .await?;
         let runtime = Arc::new(Self {
             plugins_dir,
+            policy,
             memory: parking_lot::RwLock::new(memory),
             event_bus,
             generation: ArcSwap::from_pointee(generation),
@@ -178,8 +195,14 @@ impl PluginRuntime {
 
         let next_id = old.id.saturating_add(1);
         let memory = self.memory.read().clone();
-        let candidate =
-            PluginGeneration::build(next_id, self.plugins_dir.clone(), memory, Arc::clone(&self.event_bus)).await?;
+        let candidate = PluginGeneration::build(
+            next_id,
+            self.plugins_dir.clone(),
+            self.policy.clone(),
+            memory,
+            Arc::clone(&self.event_bus),
+        )
+        .await?;
         if candidate.manager.get_plugin(name).await.is_none() {
             return Err(PluginError::Runtime(format!(
                 "reload candidate did not contain plugin '{name}'"
@@ -393,8 +416,14 @@ impl PluginRuntime {
         let old = self.generation.load_full();
         let next_id = old.id.saturating_add(1);
         let memory = self.memory.read().clone();
-        let candidate =
-            PluginGeneration::build(next_id, self.plugins_dir.clone(), memory, Arc::clone(&self.event_bus)).await?;
+        let candidate = PluginGeneration::build(
+            next_id,
+            self.plugins_dir.clone(),
+            self.policy.clone(),
+            memory,
+            Arc::clone(&self.event_bus),
+        )
+        .await?;
         self.generation.store(Arc::new(candidate));
         tracing::info!(generation = next_id, "plugin generation atomically refreshed");
         Ok(next_id)
@@ -410,6 +439,7 @@ impl PluginRuntime {
         let candidate = PluginGeneration::build(
             next_id,
             self.plugins_dir.clone(),
+            self.policy.clone(),
             Some(Arc::clone(&memory)),
             Arc::clone(&self.event_bus),
         )
@@ -687,6 +717,12 @@ struct PluginManageTool {
     security: Arc<SecurityPolicy>,
 }
 
+/// The exact build an install or update is approved to trust.
+struct CandidateIdentity {
+    source: PathBuf,
+    record: super::trust::TrustRecord,
+}
+
 impl PluginManageTool {
     fn required_string<'a>(args: &'a serde_json::Value, key: &str) -> anyhow::Result<&'a str> {
         args.get(key)
@@ -701,20 +737,78 @@ impl PluginManageTool {
             "status" | "get" | "middleware_test" | "provider_chat" | "storage_health" | "storage_recall"
             | "storage_count" => return Ok(()),
             "refresh" | "enable" | "disable" => ResourceRiskLevel::Low,
-            "install" | "update" | "cron_run" | "storage_store" => ResourceRiskLevel::Medium,
-            "remove" | "storage_forget" => ResourceRiskLevel::High,
+            "cron_run" | "storage_store" => ResourceRiskLevel::Medium,
+            // Install, update and remove change which code the operator trusts.
+            "install" | "update" | "remove" | "storage_forget" => ResourceRiskLevel::High,
             _ => return Ok(()),
         };
-        let operation = format!("wasm_plugins_manage:{action}");
+        self.authorize_operation(&format!("wasm_plugins_manage:{action}"), risk, args)
+    }
+
+    fn authorize_operation(
+        &self,
+        operation: &str,
+        risk: ResourceRiskLevel,
+        args: &serde_json::Value,
+    ) -> Result<(), ToolResult> {
         let grant = ApprovalGrant::from_runtime_args("wasm_plugins_manage", args);
         SideEffectGate::new(self.security.as_ref())
-            .authorize_resource_operation("wasm_plugins_manage", &operation, risk, grant.as_ref())
+            .authorize_resource_operation("wasm_plugins_manage", operation, risk, grant.as_ref())
             .map(|_| ())
             .map_err(|error| ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(error),
             })
+    }
+
+    /// Identify, read-only, the exact build an install or update would trust,
+    /// and authorize that grant at high risk. The operation id names the plugin
+    /// name, the component hash, the manifest hash and the granted permissions,
+    /// so an approval cannot be reused for different bytes or a wider grant.
+    fn authorize_trust_grant(&self, action: &str, args: &serde_json::Value) -> Result<CandidateIdentity, ToolResult> {
+        let refuse = |error: String| ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(error),
+        };
+        let source = Self::required_string(args, "source").map_err(|error| refuse(error.to_string()))?;
+        let identity = self
+            .candidate_identity(source, args)
+            .map_err(|error| refuse(error.to_string()))?;
+        let permissions = identity.record.permissions.join("+");
+        let operation = op_id::op_id(
+            "wasm_plugins_manage",
+            &format!("{action}-trust"),
+            &[
+                &identity.record.name,
+                &identity.record.sha256,
+                &identity.record.manifest_sha256,
+                &permissions,
+            ],
+        );
+        self.authorize_operation(&operation, ResourceRiskLevel::High, args)?;
+        Ok(identity)
+    }
+
+    fn candidate_identity(&self, source: &str, args: &serde_json::Value) -> anyhow::Result<CandidateIdentity> {
+        let source = self.source_path(source)?;
+        let material = PluginMaterial::read(&source)?;
+        validate_plugin_name(&material.manifest.plugin.name)?;
+        let grant = match args.get("grant_permissions") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| anyhow::anyhow!("'grant_permissions' must be an array of strings"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            Some(_) => anyhow::bail!("'grant_permissions' must be an array of strings"),
+        };
+        let record = material.record_for(&grant)?;
+        Ok(CandidateIdentity { source, record })
     }
 
     fn workspace_dir(&self) -> anyhow::Result<&Path> {
@@ -752,7 +846,11 @@ impl PluginManageTool {
         Ok(source)
     }
 
-    fn copy_candidate(&self, source: &Path) -> anyhow::Result<(PathBuf, PluginManifest)> {
+    /// Copy the approved source into a staging directory, prove the staged
+    /// bytes are the approved ones, and prove they compile. Nothing is trusted
+    /// yet.
+    fn copy_candidate(&self, identity: &CandidateIdentity) -> anyhow::Result<PathBuf> {
+        let source = identity.source.as_path();
         let manifest = PluginManifest::from_file(&source.join("plugin.toml"))?;
         validate_plugin_name(&manifest.plugin.name)?;
         let wasm_relative = Path::new(&manifest.plugin.wasm);
@@ -779,25 +877,32 @@ impl PluginManageTool {
                 anyhow::bail!("plugin WASM must be a regular non-symlink file");
             }
             std::fs::copy(&wasm_source, stage.join(wasm_relative))?;
-            std::fs::write(stage.join(".prx-managed"), b"installed by wasm_plugins_manage\n")?;
             Ok(())
         })();
         if let Err(error) = copy_result {
             let _ = std::fs::remove_dir_all(&stage);
             return Err(error);
         }
-        // Compile and validate before the active directory is changed.
-        if let Err(error) = self.runtime.generation.load().manager.prepare_plugin(&stage) {
+        let verified = (|| -> anyhow::Result<()> {
+            let material = PluginMaterial::read(&stage)?;
+            let staged = material.record_for(&identity.record.permissions)?;
+            if staged != identity.record {
+                anyhow::bail!("the plugin source changed after it was approved; nothing was installed");
+            }
+            // Compile before the active directory or the trust file changes.
+            self.runtime.generation.load().manager.compile_candidate(&material)?;
+            Ok(())
+        })();
+        if let Err(error) = verified {
             let _ = std::fs::remove_dir_all(&stage);
-            return Err(error.into());
+            return Err(error);
         }
-        Ok((stage, manifest))
+        Ok(stage)
     }
 
-    async fn install_or_update(&self, source: &str, update: bool) -> anyhow::Result<serde_json::Value> {
-        let source = self.source_path(source)?;
-        let (stage, manifest) = self.copy_candidate(&source)?;
-        let name = manifest.plugin.name.clone();
+    async fn install_or_update(&self, identity: &CandidateIdentity, update: bool) -> anyhow::Result<serde_json::Value> {
+        let stage = self.copy_candidate(identity)?;
+        let name = identity.record.name.clone();
         let destination = self.plugin_path(&name)?;
         if update != destination.exists() {
             let _ = std::fs::remove_dir_all(&stage);
@@ -807,12 +912,39 @@ impl PluginManageTool {
             anyhow::bail!("plugin '{name}' is already installed; use update");
         }
 
+        // The operator's grant is recorded only now, after approval and a
+        // successful compile, and is undone with the installation on failure.
+        let policy = self.runtime.policy.clone();
+        let previous_record = policy.record_for_name(&name).unwrap_or_else(|error| {
+            tracing::warn!(plugin = %name, error = %error, "plugin trust file unreadable before install");
+            None
+        });
+        if let Err(error) = policy.record(identity.record.clone()) {
+            let _ = std::fs::remove_dir_all(&stage);
+            anyhow::bail!("could not record the operator's trust for '{name}': {error}");
+        }
+        let restore_trust = || {
+            if let Err(error) = policy.restore(&name, previous_record.clone()) {
+                tracing::error!(plugin = %name, error = %error, "could not roll back the plugin trust record");
+            }
+        };
+
         let backup = if destination.exists() {
-            let backup_root = self.workspace_dir()?.join(".plugin-backups");
-            std::fs::create_dir_all(&backup_root)?;
-            let path = backup_root.join(format!("{name}-{}", uuid::Uuid::new_v4()));
-            std::fs::rename(&destination, &path)?;
-            Some(path)
+            let moved = (|| -> anyhow::Result<PathBuf> {
+                let backup_root = self.workspace_dir()?.join(".plugin-backups");
+                std::fs::create_dir_all(&backup_root)?;
+                let path = backup_root.join(format!("{name}-{}", uuid::Uuid::new_v4()));
+                std::fs::rename(&destination, &path)?;
+                Ok(path)
+            })();
+            match moved {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    restore_trust();
+                    let _ = std::fs::remove_dir_all(&stage);
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
@@ -820,6 +952,7 @@ impl PluginManageTool {
             if let Some(backup) = &backup {
                 let _ = std::fs::rename(backup, &destination);
             }
+            restore_trust();
             let _ = std::fs::remove_dir_all(&stage);
             return Err(error.into());
         }
@@ -847,6 +980,7 @@ impl PluginManageTool {
                 if let Some(backup) = &backup {
                     let _ = std::fs::rename(backup, &destination);
                 }
+                restore_trust();
                 let _ = self.runtime.refresh_all().await;
                 if let Some(error) = refresh_error {
                     anyhow::bail!("plugin '{name}' refresh failed and installation was rolled back: {error}");
@@ -898,7 +1032,10 @@ impl PluginManageTool {
         if !source.is_dir() {
             anyhow::bail!("disabled plugin '{name}' was not found");
         }
-        self.runtime.generation.load().manager.prepare_plugin(&source)?;
+        let prepared = self.runtime.generation.load().manager.prepare_plugin(&source)?;
+        if let PluginStatus::Error(reason) = &prepared.status {
+            anyhow::bail!("plugin '{name}' cannot be enabled: {reason}");
+        }
         std::fs::rename(&source, &destination)?;
         let refresh = self.runtime.refresh_all().await;
         let loaded = self
@@ -959,6 +1096,11 @@ impl PluginManageTool {
         } else {
             None
         };
+        // A removed plugin keeps no standing trust: a copy restored later must
+        // be installed (and approved) again.
+        if let Err(error) = self.runtime.policy.restore(name, None) {
+            tracing::warn!(plugin = %name, error = %error, "could not revoke the removed plugin's trust record");
+        }
         Ok(serde_json::json!({
             "plugin": name,
             "removed": true,
@@ -1172,6 +1314,11 @@ pub(crate) fn plugin_manage_parameters_schema() -> serde_json::Value {
             },
             "name": {"type": "string", "minLength": 1, "description": "Plugin name or exported adapter name; required by 'get'/'enable'/'disable'/'remove'/'cron_run'/'provider_chat' and by every storage action ('storage_health'/'storage_store'/'storage_recall'/'storage_forget'/'storage_count')."},
             "source": {"type": "string", "description": "'install'/'update': plugin source directory in the workspace."},
+            "grant_permissions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "'install'/'update': host permissions the operator grants (must include every required permission of the plugin and only ones it declares). The approval is bound to the plugin name, WASM hash, manifest hash and this list; omitted means none."
+            },
             "stage": {"type": "string", "enum": ["inbound", "outbound", "llm_request", "llm_response"], "description": "'middleware_test': pipeline stage to exercise."},
             "data": {"description": "'middleware_test': the envelope passed to the stage."},
             "message": {"type": "string", "description": "'provider_chat': single user message."},
@@ -1240,9 +1387,17 @@ impl Tool for PluginManageTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = Self::required_string(&args, "action")?;
-        if let Err(result) = self.authorize(action, &args) {
-            return Ok(result);
-        }
+        let identity = if matches!(action, "install" | "update") {
+            match self.authorize_trust_grant(action, &args) {
+                Ok(identity) => Some(identity),
+                Err(result) => return Ok(result),
+            }
+        } else {
+            if let Err(result) = self.authorize(action, &args) {
+                return Ok(result);
+            }
+            None
+        };
         let result: anyhow::Result<serde_json::Value> = match action {
             "status" => Ok(serde_json::json!({
                 "generation": self.runtime.generation_id(),
@@ -1281,10 +1436,10 @@ impl Tool for PluginManageTool {
                 .await
                 .map(|generation| serde_json::json!({"refreshed": true, "generation": generation}))
                 .map_err(Into::into),
-            "install" | "update" => {
-                let source = Self::required_string(&args, "source")?;
-                self.install_or_update(source, action == "update").await
-            }
+            "install" | "update" => match &identity {
+                Some(identity) => self.install_or_update(identity, action == "update").await,
+                None => Err(anyhow::anyhow!("{action} was not authorized")),
+            },
             "enable" => self.enable(Self::required_string(&args, "name")?).await,
             "disable" => self.disable(Self::required_string(&args, "name")?).await,
             "remove" => self.remove(Self::required_string(&args, "name")?).await,
@@ -1553,8 +1708,36 @@ pub fn resolve_process_storage(name: &str) -> Option<Box<dyn Memory>> {
     })
 }
 
-/// Return the one process-level runtime for `workspace_dir`, creating it once.
-pub async fn init_plugin_runtime(workspace_dir: &Path, memory: Option<Arc<dyn Memory>>) -> Option<Arc<PluginRuntime>> {
+/// Return the one process-level runtime for the configured workspace, creating
+/// it once. `None` when `[plugins] enabled` is false (nothing is scanned or
+/// loaded then), or when the state directory cannot hold the trust file safely.
+pub async fn init_plugin_runtime(
+    config: &crate::config::Config,
+    memory: Option<Arc<dyn Memory>>,
+) -> Option<Arc<PluginRuntime>> {
+    if !config.plugins.enabled {
+        tracing::debug!("WASM plugins are disabled ([plugins] enabled = false); nothing is loaded");
+        return None;
+    }
+    let policy = match PluginPolicy::from_config(config) {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(error = %error, "WASM plugins stay off: the plugin trust location is unsafe");
+            return None;
+        }
+    };
+    init_plugin_runtime_with_policy(&config.workspace_dir, policy, memory).await
+}
+
+/// [`init_plugin_runtime`] with an explicit policy.
+pub async fn init_plugin_runtime_with_policy(
+    workspace_dir: &Path,
+    policy: PluginPolicy,
+    memory: Option<Arc<dyn Memory>>,
+) -> Option<Arc<PluginRuntime>> {
+    if !policy.enabled() {
+        return None;
+    }
     let key = std::fs::canonicalize(workspace_dir).unwrap_or_else(|_| workspace_dir.to_path_buf());
     let runtimes = PROCESS_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut runtimes = runtimes.lock().await;
@@ -1562,7 +1745,7 @@ pub async fn init_plugin_runtime(workspace_dir: &Path, memory: Option<Arc<dyn Me
         return Some(runtime);
     }
 
-    match PluginRuntime::new(&key, memory).await {
+    match PluginRuntime::new(&key, policy, memory).await {
         Ok(runtime) => {
             register_process_runtime(&runtime);
             runtimes.insert(key, Arc::downgrade(&runtime));
@@ -1575,10 +1758,51 @@ pub async fn init_plugin_runtime(workspace_dir: &Path, memory: Option<Arc<dyn Me
     }
 }
 
+/// Test policy: plugins on, trust file in `<workspace>/.prx-state` (outside
+/// `<workspace>/plugins`).
+#[cfg(test)]
+pub(crate) fn test_policy(workspace: &Path) -> PluginPolicy {
+    PluginPolicy::new(true, workspace.join(".prx-state").join(super::trust::TRUST_FILE_NAME))
+}
+
+/// Test stand-in for the operator: trust every plugin directory that is in the
+/// workspace right now with exactly the permissions its manifest requires.
+#[cfg(test)]
+pub(crate) fn trust_workspace_plugins(workspace: &Path) {
+    let policy = test_policy(workspace);
+    let Ok(entries) = std::fs::read_dir(workspace.join("plugins")) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if let Ok(material) = PluginMaterial::read(&entry.path()) {
+            let granted = material.manifest.permissions.required.clone();
+            if let Ok(record) = material.record_for(&granted) {
+                policy.record(record).expect("test: write the trust file");
+            }
+        }
+    }
+}
+
+/// Runtime over a test workspace whose current plugins the operator trusted.
+#[cfg(test)]
+pub(crate) async fn init_test_plugin_runtime(
+    workspace: &Path,
+    memory: Option<Arc<dyn Memory>>,
+) -> Option<Arc<PluginRuntime>> {
+    trust_workspace_plugins(workspace);
+    init_plugin_runtime_with_policy(workspace, test_policy(workspace), memory).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::trust::TRUST_FILE_NAME;
     use tempfile::TempDir;
+
+    /// Runtime over a workspace whose current plugins the operator trusted.
+    async fn init_plugin_runtime(workspace: &Path, memory: Option<Arc<dyn Memory>>) -> Option<Arc<PluginRuntime>> {
+        init_test_plugin_runtime(workspace, memory).await
+    }
 
     /// `wasm_plugins_manage` dispatches on `action` like `cron` and `xin`, so it
     /// owes the same contract: every parameter an action cannot be called
@@ -1766,7 +1990,8 @@ optional = []
         let installed = manage
             .execute(serde_json::json!({
                 "action": "install",
-                "source": "plugin-sources/voice-talk-realtime"
+                "source": "plugin-sources/voice-talk-realtime",
+                "grant_permissions": ["log", "config", "kv"]
             }))
             .await
             .unwrap();
@@ -1818,7 +2043,6 @@ optional = []
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/audit-hook");
         std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).unwrap();
         std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
-        std::fs::write(plugin_dir.join(".prx-managed"), "test fixture\n").unwrap();
 
         let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
         assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
@@ -2027,13 +2251,16 @@ max_execution_time_ms = 30000";
     /// `ONE_CALL_FUEL` carries a lower bound (it must fund a call once fuel is
     /// per invocation) and an upper bound (it must not fund instantiation plus
     /// several calls, or `middleware_fuel_is_metered_per_invocation` would pass
-    /// without discriminating). Only the lower bound is visible in that test, so
-    /// the upper bound is pinned here: instantiation alone eats more than
-    /// 48 000 of the 62 000 budget, leaving under 14 000 for a call that costs
-    /// roughly 10 000 — one call under a store-lifetime budget, never three.
-    /// A fixture or wasmtime change that cheapens instantiation therefore fails
-    /// this assertion instead of turning the other test green for the wrong
-    /// reason.
+    /// without discriminating). The lower bound is the one that test shows. This
+    /// test is meant to pin the upper bound: with `max_fuel` set to
+    /// `BELOW_INSTANTIATION_FUEL` (48 000), instantiating the fixture must
+    /// run out of fuel, i.e. instantiation must cost more than 48 000 units.
+    /// That figure is a measurement of one fixture build under one wasmtime
+    /// version, not a property of the code: when wasmtime or the fixture makes
+    /// instantiation cheaper, the adapter loads and this assertion fails (it
+    /// does so on the current tree, which is an open question about the
+    /// measurement, not a regression of per-invocation fuel). The number must
+    /// then be re-measured, not worked around.
     #[tokio::test]
     async fn the_per_invocation_fuel_bound_stays_discriminating() {
         let temp = TempDir::new().unwrap();
@@ -2612,7 +2839,6 @@ optional = []
             "pdk/rust/examples/audit-hook",
             &audit_hook_manifest(resources),
         );
-        std::fs::write(workspace.join("plugins/audit-hook/.prx-managed"), "test fixture\n").unwrap();
     }
 
     /// The guest JSON-parses the payload of `tool_call` events into a DOM, so
@@ -3286,5 +3512,323 @@ max_execution_time_ms = 30000";
             matches!(error.downcast_ref::<PluginError>(), Some(PluginError::ResourceLimit(_))),
             "{error:?}"
         );
+    }
+
+    // ── Finding 95: trust, switch, install binding ──────────────────────
+
+    /// Copy a committed example into `plugins/<example>` without trusting it.
+    fn plant_untrusted(workspace: &Path, example: &str) -> PathBuf {
+        install_example_fixture(workspace, example);
+        workspace.join("plugins").join(example)
+    }
+
+    async fn plugin_status(runtime: &PluginRuntime, name: &str) -> Option<PluginInfo> {
+        runtime
+            .list_plugins()
+            .await
+            .into_iter()
+            .find(|plugin| plugin.name == name)
+    }
+
+    #[tokio::test]
+    async fn the_managed_marker_no_longer_grants_trust() {
+        let temp = TempDir::new().unwrap();
+        let plugin_dir = plant_untrusted(temp.path(), "audit-hook");
+        // What the old code treated as full trust, and what an agent could
+        // create with one medium-risk file_write.
+        std::fs::write(plugin_dir.join(".prx-managed"), "installed by wasm_plugins_manage\n").unwrap();
+
+        let runtime = init_plugin_runtime_with_policy(temp.path(), test_policy(temp.path()), None)
+            .await
+            .unwrap();
+        let info = plugin_status(&runtime, "audit-hook")
+            .await
+            .expect("refused plugins stay listed");
+        assert!(matches!(info.status, PluginStatus::Error(_)), "{:?}", info.status);
+        assert!(info.permissions_granted.is_empty(), "{:?}", info.permissions_granted);
+        assert!(runtime.hook_diagnostics().is_empty(), "a refused hook must not run");
+        assert_eq!(runtime.adapter_errors().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_plugin_that_asks_for_nothing_is_still_refused() {
+        let temp = TempDir::new().unwrap();
+        plant_untrusted(temp.path(), "pipeline-middleware");
+        let runtime = init_plugin_runtime_with_policy(temp.path(), test_policy(temp.path()), None)
+            .await
+            .unwrap();
+        let info = plugin_status(&runtime, "pipeline-middleware").await.unwrap();
+        assert!(matches!(&info.status, PluginStatus::Error(reason) if reason.contains("not trusted")));
+        assert_eq!(runtime.middleware_diagnostics().len(), 0);
+        let output = runtime
+            .middleware()
+            .process(
+                super::super::capabilities::middleware::MiddlewareStage::Outbound,
+                r#"{"text":"hello"}"#,
+            )
+            .await;
+        assert!(!output.contains("[wasm-middleware]"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn a_trusted_plugin_whose_component_changed_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let plugin_dir = plant_untrusted(temp.path(), "pipeline-middleware");
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(matches!(
+            plugin_status(&runtime, "pipeline-middleware").await.unwrap().status,
+            PluginStatus::Active
+        ));
+        assert_eq!(runtime.middleware_diagnostics().len(), 1);
+
+        // The agent swaps the component after the operator trusted it.
+        let mut bytes = std::fs::read(plugin_dir.join("plugin.wasm")).unwrap();
+        bytes.extend_from_slice(b"\0tampered");
+        std::fs::write(plugin_dir.join("plugin.wasm"), bytes).unwrap();
+        runtime.refresh_all().await.unwrap();
+
+        let info = plugin_status(&runtime, "pipeline-middleware").await.unwrap();
+        assert!(
+            matches!(&info.status, PluginStatus::Error(reason) if reason.contains("hash")),
+            "{:?}",
+            info.status
+        );
+        assert!(runtime.middleware_diagnostics().is_empty(), "the swapped component ran");
+    }
+
+    #[tokio::test]
+    async fn a_trusted_plugin_whose_manifest_widened_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let plugin_dir = plant_untrusted(temp.path(), "pipeline-middleware");
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert_eq!(runtime.middleware_diagnostics().len(), 1);
+
+        let mut manifest = std::fs::read_to_string(plugin_dir.join("plugin.toml")).unwrap();
+        manifest = manifest.replace(
+            "required = []",
+            "required = []\nhttp_allowlist = [\"https://evil.example/*\"]",
+        );
+        std::fs::write(plugin_dir.join("plugin.toml"), manifest).unwrap();
+        runtime.refresh_all().await.ok();
+        let info = plugin_status(&runtime, "pipeline-middleware").await;
+        assert!(
+            info.is_none_or(|info| matches!(info.status, PluginStatus::Error(_))),
+            "an edited manifest kept its trust"
+        );
+        assert_eq!(runtime.middleware_diagnostics().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_unreadable_trust_file_trusts_nothing() {
+        let temp = TempDir::new().unwrap();
+        plant_untrusted(temp.path(), "pipeline-middleware");
+        let policy = test_policy(temp.path());
+        std::fs::create_dir_all(policy.trust_file().parent().unwrap()).unwrap();
+        std::fs::write(policy.trust_file(), "{ garbage").unwrap();
+        let runtime = init_plugin_runtime_with_policy(temp.path(), policy, None)
+            .await
+            .unwrap();
+        let info = plugin_status(&runtime, "pipeline-middleware").await.unwrap();
+        assert!(matches!(info.status, PluginStatus::Error(_)));
+        assert_eq!(runtime.middleware_diagnostics().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn with_the_switch_off_nothing_is_scanned_or_loaded() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        install_example_fixture(&workspace, "pipeline-middleware");
+        // Even a plugin the operator trusted must not load while the switch is off.
+        trust_workspace_plugins(&workspace);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.clone();
+        config.config_path = temp.path().join("config.toml");
+        assert!(!config.plugins.enabled, "the switch defaults to off");
+        assert!(crate::plugins::init_plugin_runtime(&config, None).await.is_none());
+        assert!(
+            !workspace.join(".prx-state/plugin-cache").exists(),
+            "a disabled runtime must not even prepare its cache"
+        );
+        // The policy form refuses too.
+        let off = PluginPolicy::new(false, workspace.join(".prx-state").join(TRUST_FILE_NAME));
+        assert!(
+            init_plugin_runtime_with_policy(&workspace, off.clone(), None)
+                .await
+                .is_none()
+        );
+        assert!(matches!(
+            PluginManager::new(workspace.join("plugins"), off).err(),
+            Some(PluginError::Disabled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_switch_on_with_an_unsafe_state_directory_stays_off() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.clone();
+        config.config_path = workspace.join("config.toml");
+        config.plugins.enabled = true;
+        assert!(crate::plugins::init_plugin_runtime(&config, None).await.is_none());
+    }
+
+    fn manage_for(
+        runtime: &Arc<PluginRuntime>,
+        workspace: &Path,
+        autonomy: crate::security::AutonomyLevel,
+    ) -> Box<dyn Tool> {
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        config.autonomy.level = autonomy;
+        runtime.manage_tool(crate::runtime::bootstrap::build_security_policy(&config))
+    }
+
+    fn source_for_install(workspace: &Path, example: &str) -> String {
+        let source = workspace.join("plugin-sources").join(example);
+        std::fs::create_dir_all(&source).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("pdk/rust/examples")
+            .join(example);
+        std::fs::copy(fixture.join("plugin.toml"), source.join("plugin.toml")).unwrap();
+        std::fs::copy(fixture.join("plugin.wasm"), source.join("plugin.wasm")).unwrap();
+        format!("plugin-sources/{example}")
+    }
+
+    #[tokio::test]
+    async fn install_records_trust_bound_to_name_hash_and_the_granted_permissions() {
+        let temp = TempDir::new().unwrap();
+        let source = source_for_install(temp.path(), "audit-hook");
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        let manage = manage_for(&runtime, temp.path(), crate::security::AutonomyLevel::Full);
+
+        // A grant that leaves out a required permission is refused up front.
+        let short = manage
+            .execute(serde_json::json!({"action": "install", "source": source, "grant_permissions": ["log"]}))
+            .await
+            .unwrap();
+        assert!(!short.success);
+        assert!(
+            short.error.unwrap_or_default().contains("requires"),
+            "required permission check"
+        );
+        // A grant of an undeclared permission is refused.
+        let wide = manage
+            .execute(serde_json::json!({
+                "action": "install",
+                "source": source,
+                "grant_permissions": ["log", "kv", "events", "shell"]
+            }))
+            .await
+            .unwrap();
+        assert!(!wide.success);
+        // Nothing was trusted by the failed attempts.
+        assert!(
+            test_policy(temp.path())
+                .records()
+                .unwrap()
+                .iter()
+                .all(|r| r.name != "audit-hook")
+        );
+
+        let installed = manage
+            .execute(serde_json::json!({
+                "action": "install",
+                "source": source,
+                "grant_permissions": ["events", "kv", "log"]
+            }))
+            .await
+            .unwrap();
+        assert!(installed.success, "{:?}", installed.error);
+        let records = test_policy(temp.path()).records().unwrap();
+        let record = records.iter().find(|r| r.name == "audit-hook").expect("trust recorded");
+        let wasm = std::fs::read(temp.path().join("plugins/audit-hook/plugin.wasm")).unwrap();
+        assert_eq!(record.sha256, crate::plugins::trust::sha256_hex(&wasm));
+        assert_eq!(record.permissions, vec!["events", "kv", "log"]);
+        assert!(!temp.path().join("plugins/audit-hook/.prx-managed").exists());
+        assert!(
+            !test_policy(temp.path())
+                .trust_file()
+                .starts_with(temp.path().join("plugins")),
+            "the trust file must live outside the agent-writable plugins directory"
+        );
+        assert_eq!(runtime.hook_diagnostics().len(), 1);
+
+        let removed = manage
+            .execute(serde_json::json!({"action": "remove", "name": "audit-hook"}))
+            .await
+            .unwrap();
+        assert!(removed.success, "{:?}", removed.error);
+        assert!(
+            test_policy(temp.path())
+                .records()
+                .unwrap()
+                .iter()
+                .all(|r| r.name != "audit-hook")
+        );
+    }
+
+    #[tokio::test]
+    async fn install_approval_is_bound_to_the_exact_build_and_grant() {
+        let temp = TempDir::new().unwrap();
+        let source = source_for_install(temp.path(), "audit-hook");
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        let manage = manage_for(&runtime, temp.path(), crate::security::AutonomyLevel::Supervised);
+
+        let denied = manage
+            .execute(serde_json::json!({
+                "action": "install",
+                "source": source,
+                "grant_permissions": ["log", "kv", "events"]
+            }))
+            .await
+            .unwrap();
+        assert!(!denied.success);
+        let error = denied.error.unwrap_or_default();
+        assert!(error.contains("runtime approval grant"), "{error}");
+        let wasm = std::fs::read(temp.path().join("plugin-sources/audit-hook/plugin.wasm")).unwrap();
+        assert!(
+            error.contains(&crate::plugins::trust::sha256_hex(&wasm)),
+            "the approval operation must name the component hash: {error}"
+        );
+        assert!(error.contains("audit-hook"), "{error}");
+        assert!(
+            error.contains("events"),
+            "the operation must name the granted permissions: {error}"
+        );
+        assert!(!temp.path().join("plugins/audit-hook").exists());
+        assert_eq!(test_policy(temp.path()).records().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn optional_permissions_are_granted_only_through_the_trust_record() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("plugins/optional-tool");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.toml"),
+            "[plugin]\nname = \"optional-tool\"\nversion = \"0.1.0\"\nwasm = \"missing.wasm\"\n\n\
+             [permissions]\nrequired = [\"log\"]\noptional = [\"memory\"]\n",
+        )
+        .unwrap();
+        let policy = test_policy(temp.path());
+        let material = PluginMaterial::read(&dir).unwrap();
+        policy
+            .record(material.record_for(&["log".to_string()]).unwrap())
+            .unwrap();
+        let runtime = init_plugin_runtime_with_policy(temp.path(), policy.clone(), None)
+            .await
+            .unwrap();
+        let info = plugin_status(&runtime, "optional-tool").await.unwrap();
+        assert_eq!(info.permissions_granted, vec!["log"]);
+
+        policy
+            .record(material.record_for(&["log".to_string(), "memory".to_string()]).unwrap())
+            .unwrap();
+        runtime.refresh_all().await.unwrap();
+        let info = plugin_status(&runtime, "optional-tool").await.unwrap();
+        assert_eq!(info.permissions_granted, vec!["log", "memory"]);
     }
 }

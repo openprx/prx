@@ -133,7 +133,7 @@ impl FileEditTool {
         ) {
             let error = if launch_file {
                 format!(
-                    "{error} (a workspace launch definition: hooks.json and mcp.json decide which programs run as \
+                    "{error} (a workspace launch definition: hooks.json, mcp.json and everything under plugins/ decide which programs run as \
                      PRX's user, so writing one is a high-risk operation of its own)"
                 )
             } else if git_control {

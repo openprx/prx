@@ -5396,7 +5396,7 @@ pub async fn start_channels_with_config(
         || memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config))
             .starts_with("wasm:")
     {
-        crate::plugins::init_plugin_runtime(&config.workspace_dir, None).await
+        crate::plugins::init_plugin_runtime(&config, None).await
     } else {
         None
     };
@@ -5440,7 +5440,7 @@ pub async fn start_channels_with_config(
             .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend in channels: {error}"))?;
         Some(runtime)
     } else {
-        crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await
+        crate::plugins::init_plugin_runtime(&config, Some(Arc::clone(&mem))).await
     };
     #[cfg(feature = "wasm-plugins")]
     if let Some(runtime) = &wasm_plugin_runtime {

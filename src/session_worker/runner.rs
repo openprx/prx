@@ -1541,7 +1541,7 @@ async fn run_owned_manifest(
     #[cfg(feature = "wasm-plugins")]
     let wasm_early_runtime =
         if manifest.provider_name.starts_with("wasm:") || configured_memory_backend.starts_with("wasm:") {
-            crate::plugins::init_plugin_runtime(&manifest.workspace_dir, None).await
+            crate::plugins::init_plugin_runtime(&config, None).await
         } else {
             None
         };
@@ -1590,7 +1590,7 @@ async fn run_owned_manifest(
             .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend in session-worker: {error}"))?;
         Some(runtime)
     } else {
-        crate::plugins::init_plugin_runtime(&manifest.workspace_dir, Some(Arc::clone(&memory))).await
+        crate::plugins::init_plugin_runtime(&config, Some(Arc::clone(&memory))).await
     };
     let memory_workspace_id = manifest
         .memory_workspace_id
