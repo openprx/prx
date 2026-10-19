@@ -18,8 +18,13 @@ nothing. The existing history deadline, domain, capacity and model readmission
 rules remain unchanged. Every actual paid attempt uses pinned PMM pricing and
 an owned estimated reservation; missing support, scope, pricing or budget refuses.
 
-Automix rules can request a premium attempt through the same original decision
-deadline and remaining allowance. The actual registered provider instance is
+Automix rules can request one premium attempt within a separate bounded
+escalation window, starting when the cheap reply returns.
+`router.automix.escalation_window_ms` defaults to 30,000 ms and must be between
+1 and 120,000 ms. Main settlement, premium reservation and premium transport
+all consume this same window; a retry cannot restart it. The original token
+and money balance and settlement gate remain shared. The decision budget
+remains 500 ms and the Router budget remains 100 ms. The actual registered provider instance is
 preserved. Known cheap usage is settled under its unchanged terminal ID before
 premium admission; partial or unknown main usage cannot be treated as zero to
 fund escalation. Premium physical usage settles separately. A failed or unknown
@@ -158,6 +163,7 @@ knn_k = 7
 confidence_threshold = 0.70
 cheap_model_tiers = ["cheap", "fast", "mini"]
 premium_model_id = "openai/gpt-4.1"
+escalation_window_ms = 30000
 
 [[router.models]]
 model_id = "gpt-4o-mini"
@@ -230,6 +236,9 @@ Operational note:
 - `confidence_threshold`: escalate when confidence `< threshold`
 - `cheap_model_tiers`: markers used to classify cheap-first targets
 - `premium_model_id`: escalation target model id (`provider/model` supported)
+- `escalation_window_ms`: premium window after the cheap reply, including main
+  settlement and physical reservation; default `30000`, hard maximum `120000`,
+  minimum `1`. Omitting this field in existing configuration uses the default.
 
 ## Security and Boundary Notes
 

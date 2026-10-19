@@ -510,6 +510,7 @@ async fn admit_chat_fixture_with_mode(
             security: policy,
         },
     )
+    .await
     .expect("actual chat decision service")
     .with_loop_runtime(crate::runtime::turn_decision::TurnLoopRuntime {
         hooks: Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),

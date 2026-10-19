@@ -345,6 +345,7 @@ impl TurnTerminalGuard {
         &self,
         outcome: &crate::llm::route_decision::ProviderExecutionOutcome,
         cancellation: &tokio_util::sync::CancellationToken,
+        cheap_reply_at: std::time::Instant,
     ) -> anyhow::Result<Option<SettledAutomixContinuation>> {
         use crate::llm::route_decision::TokenUsageSource;
         if cancellation.is_cancelled() || !self.claim_automix_continuation(outcome)? {
@@ -371,7 +372,9 @@ impl TurnTerminalGuard {
         else {
             return Ok(None);
         };
-        let deadline = self.context.auxiliary_deadline();
+        let deadline = self
+            .context
+            .begin_automix_window(cheap_reply_at, self.config.router.automix.escalation_window_ms)?;
         if std::time::Instant::now() >= deadline {
             return Ok(None);
         }

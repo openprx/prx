@@ -87,7 +87,8 @@ where
                         memory: Arc::clone(&memory),
                         security,
                     },
-                )?;
+                )
+                .await?;
                 let owning = Arc::get_mut(&mut service).expect("unshared parent service");
                 owning.factory = DecisionBackendFactory::from_slots(
                     vec![Box::new(ParentDelegateBackend {

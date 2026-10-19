@@ -60,6 +60,7 @@ impl LinkedFixture {
                 security,
             },
         )
+        .await
         .expect("actual recorded service");
         let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
             &generation,

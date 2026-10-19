@@ -132,7 +132,7 @@ async fn actual_compiler_binds_decision_model_before_real_http() {
             memory: Arc::clone(&memory),
             security,
         },
-    )
+    ).await
     .expect("source-owned actual builtin service");
     retained_service = Some(ModelBindingServiceDrain::new(Arc::clone(&service)));
     assert_eq!(

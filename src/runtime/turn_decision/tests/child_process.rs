@@ -414,7 +414,8 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
                 memory: Arc::clone(&memory),
                 security,
             },
-        )?;
+        )
+        .await?;
         let owning = Arc::get_mut(&mut service).expect("unshared parent service");
         owning.factory = DecisionBackendFactory::from_slots(
             vec![Box::new(ParentDelegateBackend {
@@ -1005,7 +1006,8 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
             memory: Arc::clone(&memory),
             security,
         },
-    )?;
+    )
+    .await?;
     let owning = Arc::get_mut(&mut service).expect("unshared parent service");
     owning.factory = DecisionBackendFactory::from_slots(
         vec![Box::new(ParentDelegateBackend {

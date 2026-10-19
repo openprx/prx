@@ -1,12 +1,16 @@
 //! Commit and read back an owned decision in one writer-queue operation.
+#[cfg(any(feature = "llm-router", test))]
+use super::{DecisionRecord, IncompleteReason, TrySendError, emit_incomplete, lineage_of, same_turn_chain};
 use super::{
-    DecisionRecord, DecisionReplayRecord, DecisionScope, DecisionStoreWriter, IncompleteReason, RecoveryReadBudget,
-    StoreError, TrySendError, WriterMessage, WriterThread, emit_incomplete, lineage_of, recovery_scope_bounds,
-    recovery_time_left, replay_record_on_connection_until, same_turn_chain,
+    DecisionReplayRecord, DecisionScope, DecisionStoreWriter, RecoveryReadBudget, StoreError, WriterMessage,
+    WriterThread, recovery_scope_bounds, recovery_time_left, replay_record_on_connection_until,
 };
-use std::{sync::Arc, time::Instant};
+#[cfg(any(feature = "llm-router", test))]
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::oneshot;
 
+#[cfg(any(feature = "llm-router", test))]
 pub(super) struct VerifiedDecision {
     record: DecisionRecord,
     scope: DecisionScope,
@@ -14,6 +18,7 @@ pub(super) struct VerifiedDecision {
     done: oneshot::Sender<Result<Option<DecisionReplayRecord>, StoreError>>,
 }
 
+#[cfg(any(feature = "llm-router", test))]
 impl DecisionStoreWriter {
     /// The returned row is decoded from SQLite after commit, with the same
     /// scope, digest and bounds as a recovery read. Queue admission is bounded;
@@ -57,6 +62,7 @@ impl DecisionStoreWriter {
     }
 }
 
+#[cfg(any(feature = "llm-router", test))]
 impl VerifiedDecision {
     pub(super) fn finish(self, thread: &mut WriterThread) {
         // This keeps the existing transaction, conflict handling, event and
