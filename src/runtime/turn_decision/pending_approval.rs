@@ -1585,6 +1585,10 @@ pub(super) struct ResumeGateEvidence {
 }
 
 impl AdmittedDecisionResume {
+    pub(super) fn original_run(&self) -> &str {
+        &self.prepared.approval.pending.record.run_id
+    }
+
     pub(super) fn claimed_event(&self) -> Option<&MessageEvent> {
         self.claimed.get()
     }

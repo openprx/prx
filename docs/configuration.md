@@ -837,7 +837,11 @@ When permission is enabled, `max_recursive_depth` must equal 1. Values above 1 a
 permission is enabled; the current strict tool-subset contract supports one
 additional level. Each child remains a proper
 subset of its authenticated parent, cannot replenish depth or budget, and keeps
-the selected provider/model pins through descendants. A request without the
+the selected provider/model pins through descendants. Recursive publication
+subtracts a strict half-share of the remaining monetary balance, rounded down
+to whole cents; the parent retains the rest. Approval resume keeps the original
+run's consumed child slot and balance; if that state is unavailable after a
+restart, further recursive grants are refused. A request without the
 opt-in keeps the existing exact model-only scope. See [recursive child grants](tools.md)
 for admission, audit/status and rollback behavior.
 

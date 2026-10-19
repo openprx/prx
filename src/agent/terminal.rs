@@ -982,6 +982,9 @@ async fn finalize_turn_impl(
         // keeps its experience `incomplete` (its pins died with the process).
         // Recorded as a known gap.
         let awaiting_approval = skill_awaiting_approval(&commit.decision, execution_trace.as_ref());
+        if !awaiting_approval {
+            commit.decision.context.retire_recursive_allowance();
+        }
         release_skill_lifecycle(
             workspace_dir,
             skill_owner,

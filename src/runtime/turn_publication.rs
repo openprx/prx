@@ -356,7 +356,8 @@ impl OperatorProcessDecisionPublication {
                 security: self.security,
             },
             self.runtime,
-        )?;
+        )
+        .await?;
         if let Err(error) = owner.retain_child_service(Arc::clone(&service)) {
             service
                 .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))

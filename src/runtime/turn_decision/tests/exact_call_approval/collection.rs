@@ -22,6 +22,41 @@ async fn exact_file_collection(edit: bool) {
 }
 
 async fn exact_file_collection_with_review(edit: bool, approved: bool) {
+    exact_file_collection_with_recursive_budget(edit, approved, RecursiveBudgetCase::Disabled).await;
+}
+
+#[tokio::test]
+async fn authenticated_approval_resume_keeps_the_original_runs_recursive_budget() {
+    Box::pin(exact_file_collection_with_recursive_budget(
+        false,
+        true,
+        RecursiveBudgetCase::Allocated,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn authenticated_resume_without_original_allowance_cannot_mint_a_child_slot() {
+    Box::pin(exact_file_collection_with_recursive_budget(
+        false,
+        true,
+        RecursiveBudgetCase::Missing,
+    ))
+    .await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecursiveBudgetCase {
+    Disabled,
+    Allocated,
+    Missing,
+}
+
+async fn exact_file_collection_with_recursive_budget(
+    edit: bool,
+    approved: bool,
+    recursive_budget: RecursiveBudgetCase,
+) {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().unwrap();
     let tool_name = if edit { "file_edit" } else { "file_write" };
@@ -44,6 +79,7 @@ async fn exact_file_collection_with_review(edit: bool, approved: bool) {
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
     config.causal_tree.enabled = true;
+    config.sessions_spawn.allow_recursive_delegation = recursive_budget != RecursiveBudgetCase::Disabled;
     assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
     config.autonomy.level = crate::security::AutonomyLevel::Supervised;
     config.cost.prices.insert(
@@ -146,6 +182,17 @@ async fn exact_file_collection_with_review(edit: bool, approved: bool) {
             .await
             .unwrap();
         assert_eq!(predictions.load(Ordering::SeqCst), 0, "collection is code-issued, no prediction action");
+        // This is an accounting-owner regression, not a manufactured child
+        // capability. The real grant publication is exercised in recursive_budget.
+        let initial_recursive_budget = (recursive_budget == RecursiveBudgetCase::Allocated).then(|| {
+            let owner = service.issue_recursive_allowance(proof.as_ref(), &context).unwrap();
+            let initial = owner.money().load(Ordering::Acquire);
+            let ceiling = u32::try_from(initial / 10_000).unwrap();
+            let (share, child) = owner.carve_child(ceiling).unwrap();
+            assert!(share > 0 && share < ceiling);
+            assert_eq!(owner.money().load(Ordering::Acquire) + child.money().load(Ordering::Acquire), initial);
+            owner
+        });
         let collection = context.approval_collection_proof().expect("real Chat write-only collection");
         let reference = collection.capability().clone();
         assert!(context.execution_refs().is_empty());
@@ -421,6 +468,22 @@ async fn exact_file_collection_with_review(edit: bool, approved: bool) {
             .decide_agent_resume(resume.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .unwrap();
+        if let Some(original) = initial_recursive_budget {
+            assert_ne!(proof.run_id(), resume.run_id(), "resume must use fresh source identity");
+            let retained = service.issue_recursive_allowance(resume.as_ref(), &resumed).unwrap();
+            assert!(Arc::ptr_eq(&original, &retained));
+            let reloaded_service_registry = super::super::super::recursive_allowance::RunAllowances::default();
+            assert!(Arc::ptr_eq(&original,
+                reloaded_service_registry.retain(resume.as_ref()).get().expect("reloaded service retains run")));
+            assert!(retained.carve_child(u32::MAX).is_err(), "a fresh resume cannot allocate a second child");
+            assert_eq!(original.money().load(Ordering::Acquire), retained.money().load(Ordering::Acquire));
+        }
+        if recursive_budget == RecursiveBudgetCase::Missing {
+            let unavailable = service.issue_recursive_allowance(resume.as_ref(), &resumed).unwrap();
+            assert!(unavailable.funded_money().is_none());
+            assert!(unavailable.carve_child(u32::MAX).is_err());
+            assert!(unavailable.ensure_available().is_err());
+        }
         let exact_candidates = match &resumed.engine.candidates {
             crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. } => candidates,
             _ => panic!("authenticated resume must retain a legal candidate set"),

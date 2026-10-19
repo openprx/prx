@@ -260,7 +260,7 @@ async fn request_preparation_overlaps_the_gate_without_authorizing_an_expired_se
     let remaining = scope.remaining.get_or_init(|| {
         Arc::new(RemainingBudgets {
             tokens: AtomicU64::new(budgets.tokens),
-            micro_usd: AtomicU64::new(budgets.micro_usd),
+            micro_usd: Arc::new(AtomicU64::new(budgets.micro_usd)),
             settlement_gate: Arc::new(tokio::sync::Mutex::new(())),
             settlement_failed: AtomicBool::new(false),
         })
@@ -317,4 +317,31 @@ async fn request_preparation_overlaps_the_gate_without_authorizing_an_expired_se
     assert_eq!(scope.remaining_budgets().micro_usd, budgets.micro_usd);
     assert!(!workspace.path().join("state/costs.reservations.jsonl").exists());
     Ok(())
+}
+
+#[test]
+fn binding_a_stricter_scope_can_only_reduce_the_original_money_owner() {
+    let config = Arc::new(Config::default());
+    let cleanup = Arc::new(CleanupTracker::default());
+    let money = Arc::new(AtomicU64::new(5000));
+    let scope = |micro_usd| {
+        AccountingScope::new(
+            Arc::clone(&config),
+            DecisionKey::ephemeral(),
+            Arc::clone(&cleanup),
+            [9; 32],
+            TurnBudgets {
+                tokens: 1000,
+                micro_usd,
+                latency_ms: 500,
+            },
+            Instant::now() + Duration::from_millis(500),
+        )
+        .with_money(Some(Arc::clone(&money)))
+    };
+    let stricter = scope(1000);
+    assert_eq!(stricter.remaining_budgets().micro_usd, 1000);
+    let older = scope(5000);
+    assert_eq!(older.remaining_budgets().micro_usd, 1000);
+    assert_eq!(money.load(Ordering::Acquire), 1000);
 }

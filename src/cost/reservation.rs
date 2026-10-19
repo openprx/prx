@@ -812,7 +812,8 @@ fn append_inner(workspace: &Path, events: &[Event]) -> Result<()> {
     file.sync_all()?;
     // Persist directory creation of the journal before returning authority.
     if created {
-        std::fs::File::from(state).sync_all()?;
+        let state = std::fs::File::from(state);
+        super::creation::sync_created_entry(&file, &state, std::ffi::OsStr::new(JOURNAL), &state)?;
     }
     Ok(())
 }

@@ -15,6 +15,15 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Ordinary causal telemetry reserves channel headroom for Applied/Drain controls.
+- Recursive child grants now subtract a strict half-share from the parent's
+  remaining monetary balance, rounded down to whole cents. Authenticated
+  approval resume keeps the original run's one-child slot and balance.
+- Operator-worker and admin store preparation runs off Tokio workers.
+- Workspace cost configuration views remain pinned across reloads.
+- Failed creation directory sync rolls back the new entry so retries cannot
+  skip that sync.
+
 - **Breaking: WASM plugins are off and need operator trust (finding 95).**
   `[plugins] enabled` defaults to `false`; nothing under `<workspace>/plugins`
   is scanned or loaded until it is set to `true` (restart required). Existing

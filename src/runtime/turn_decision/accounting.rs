@@ -79,14 +79,17 @@ impl<'a> TurnAccounting<'a> {
                     self.proof.config_source_revision().as_bytes(),
                 ],
             );
-            Some(Arc::new(AccountingScope::new(
-                self.service.generation.effective.clone(),
-                key.clone(),
-                cleanup,
-                scope_id,
-                self.budgets,
-                self.deadline,
-            )))
+            Some(Arc::new(
+                AccountingScope::new(
+                    self.service.generation.effective.clone(),
+                    key.clone(),
+                    cleanup,
+                    scope_id,
+                    self.budgets,
+                    self.deadline,
+                )
+                .with_money(self.service.recursive_money(self.proof)),
+            ))
         });
         scope.as_ref().map(Arc::clone).ok_or(DecisionError::BudgetExceeded)
     }
