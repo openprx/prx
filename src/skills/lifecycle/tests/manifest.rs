@@ -101,3 +101,80 @@ fn duplicate_and_overriding_frontmatter_keys_are_rejected() {
     let err = manifest_of(vec![entry("SKILL.md", nested)]).expect_err("test: nested override");
     assert!(matches!(err, ManifestError::AmbiguousFrontmatter), "{err}");
 }
+
+fn md_with_tools(line: &str) -> String {
+    format!("---\nname: Deploy\ndescription: Does deploys\n{line}\n---\n\nBody.\n")
+}
+
+#[test]
+fn required_tools_are_read_from_the_frontmatter_list() {
+    let info = manifest_of(vec![entry(
+        "SKILL.md",
+        md_with_tools("required-tools: [lint, \"deploy_check\", lint]").as_bytes(),
+    )])
+    .expect("test: valid");
+    assert_eq!(
+        info.required_tools,
+        vec!["deploy_check".to_string(), "lint".to_string()]
+    );
+    let none = manifest_of(vec![entry("SKILL.md", md("Deploy", "Does deploys").as_bytes())]).expect("test: valid");
+    assert!(none.required_tools.is_empty(), "nothing declared is nothing required");
+    let empty =
+        manifest_of(vec![entry("SKILL.md", md_with_tools("required-tools: []").as_bytes())]).expect("test: valid");
+    assert!(empty.required_tools.is_empty(), "an empty list declares nothing");
+    // An indented key belongs to another mapping and is not read.
+    let nested = manifest_of(vec![entry(
+        "SKILL.md",
+        md_with_tools("metadata:\n  required-tools: [x]").as_bytes(),
+    )])
+    .expect("test: valid");
+    assert!(nested.required_tools.is_empty(), "an indented key is not ours");
+}
+
+#[test]
+fn malformed_or_repeated_required_tools_are_rejected() {
+    for line in [
+        "required-tools: lint",
+        "required-tools: [a b]",
+        "required-tools: [a;b]",
+        "required-tools: [a, b",
+        "required-tools: [a]\nrequired-tools: [b]",
+    ] {
+        assert!(
+            manifest_of(vec![entry("SKILL.md", md_with_tools(line).as_bytes())]).is_err(),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn skill_md_and_skill_toml_must_agree_on_required_tools() {
+    let toml = |tools: &str| format!("{}{tools}", toml_for("Deploy", "Does deploys"));
+    let both = |md_line: &str, toml_tools: &str| {
+        manifest_of(vec![
+            entry("SKILL.md", md_with_tools(md_line).as_bytes()),
+            entry("SKILL.toml", toml(toml_tools).as_bytes()),
+        ])
+    };
+    // Equal lists, whatever their order, agree; one side alone is enough.
+    let agreed = both("required-tools: [b, a]", "required-tools = [\"a\", \"b\"]\n").expect("test: agree");
+    assert_eq!(agreed.required_tools, vec!["a".to_string(), "b".to_string()]);
+    let toml_only = both("", "required-tools = [\"a\"]\n").expect("test: toml only");
+    assert_eq!(toml_only.required_tools, vec!["a".to_string()]);
+    let markdown_only = both("required-tools: [a]", "").expect("test: markdown only");
+    assert_eq!(markdown_only.required_tools, vec!["a".to_string()]);
+    // A disagreement is refused; neither parser wins.
+    let err = both("required-tools: [a]", "required-tools = [\"b\"]\n").expect_err("test: conflict");
+    assert!(
+        matches!(
+            err,
+            ManifestError::Conflict {
+                field: "required-tools",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(both("required-tools: [a]", "required-tools = \"a\"\n").is_err());
+    assert!(both("required-tools: [a]", "required-tools = [1]\n").is_err());
+}

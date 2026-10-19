@@ -42,8 +42,38 @@ pub(crate) struct ExecutionTraceSnapshot {
     pub(crate) denied_attempts: u64,
     #[serde(default)]
     pub(crate) awaiting_approval_attempts: u64,
+    /// Failed attempts whose cause was an unavailable backend (also counted in
+    /// `failed_attempts`); argument and validation failures are not. Absent
+    /// when none, so older sealed payloads serialise unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unavailable_attempts: Option<u64>,
     pub(crate) unbound_attempts: u64,
     pub(crate) incomplete: bool,
+}
+
+/// Whether a tool failure says its backend could not be reached or served:
+/// connection, timeout, upstream 5xx or a down MCP server.
+fn backend_unavailable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "connection error",
+        "timed out",
+        "timeout",
+        "unreachable",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "broken pipe",
+        "mcp server",
+        "502",
+        "503",
+        "504",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 
 #[derive(Debug, Default)]
@@ -64,6 +94,7 @@ struct State {
     pending_attempts: u64,
     denied_attempts: u64,
     awaiting_approval_attempts: u64,
+    unavailable_attempts: u64,
     unbound_attempts: u64,
     incomplete: bool,
     sealed: Option<ExecutionTraceSnapshot>,
@@ -231,6 +262,7 @@ impl ExecutionTrace {
             pending_attempts: state.pending_attempts,
             denied_attempts: state.denied_attempts,
             awaiting_approval_attempts: state.awaiting_approval_attempts,
+            unavailable_attempts: (state.unavailable_attempts > 0).then_some(state.unavailable_attempts),
             unbound_attempts: state.unbound_attempts,
             incomplete,
         };
@@ -320,11 +352,16 @@ impl Drop for PendingProvider {
 }
 
 impl PendingExecution {
-    pub(crate) fn finish(mut self, status: ToolExecutionStatus) {
-        self.record(status);
+    pub(crate) fn finish(self, status: ToolExecutionStatus) {
+        self.finish_with_error(status, None);
+    }
+    /// Like [`Self::finish`], with the failure text so an unavailable backend
+    /// can be told from an argument or validation failure.
+    pub(crate) fn finish_with_error(mut self, status: ToolExecutionStatus, error: Option<&str>) {
+        self.record(status, error);
         self.active = false;
     }
-    fn record(&self, status: ToolExecutionStatus) {
+    fn record(&self, status: ToolExecutionStatus, error: Option<&str>) {
         let mut state = self.trace.0.lock();
         if state.sealed.is_some() {
             return;
@@ -356,6 +393,9 @@ impl PendingExecution {
             }
             _ => {
                 state.failed_attempts = state.failed_attempts.saturating_add(1);
+                if status == ToolExecutionStatus::Indeterminate || error.is_some_and(backend_unavailable) {
+                    state.unavailable_attempts = state.unavailable_attempts.saturating_add(1);
+                }
                 "failed"
             }
         };
@@ -367,7 +407,7 @@ impl PendingExecution {
 impl Drop for PendingExecution {
     fn drop(&mut self) {
         if self.active {
-            self.record(ToolExecutionStatus::Cancelled);
+            self.record(ToolExecutionStatus::Cancelled, None);
         }
     }
 }
@@ -576,5 +616,51 @@ mod silent_tests {
         drop(trace.begin_provider().expect("begin"));
         assert!(trace.record_authorized_silence().is_err());
         assert!(trace.seal().provider_attempts_incomplete);
+    }
+
+    /// A tool failure caused by an unavailable backend is counted apart from an
+    /// argument or validation failure; both stay `failed` calls.
+    #[test]
+    fn unavailable_backends_are_distinct_from_argument_failures() {
+        let trace = ExecutionTrace::default();
+        let run = |id: &str, status: ToolExecutionStatus, error: Option<&str>| {
+            trace
+                .begin(id, Some("native:local:probe"), false)
+                .finish_with_error(status, error);
+        };
+        run(
+            "a",
+            ToolExecutionStatus::Failed,
+            Some("connection refused (os error 111)"),
+        );
+        run(
+            "b",
+            ToolExecutionStatus::Failed,
+            Some("upstream returned 503 Service Unavailable"),
+        );
+        run("c", ToolExecutionStatus::Failed, Some("MCP server notes exited"));
+        run(
+            "d",
+            ToolExecutionStatus::Indeterminate,
+            Some("durable ledger is unavailable"),
+        );
+        run("e", ToolExecutionStatus::Failed, Some("request timed out after 30s"));
+        // The run's own errors are not infrastructure.
+        run("f", ToolExecutionStatus::InvalidArguments, Some("missing field `path`"));
+        run(
+            "g",
+            ToolExecutionStatus::Failed,
+            Some("validation failed: path must be relative"),
+        );
+        run("h", ToolExecutionStatus::Failed, None);
+        run("i", ToolExecutionStatus::UnknownTool, Some("no such tool"));
+        let snapshot = trace.seal();
+        assert_eq!(snapshot.unavailable_attempts, Some(5));
+        assert_eq!(snapshot.failed_attempts, 9, "unavailable failures are failures too");
+        assert!(snapshot.calls.iter().all(|call| call.status == "failed"));
+        // A snapshot without the counter serialises exactly as before.
+        let clean = ExecutionTrace::default().seal();
+        let value = serde_json::to_value(&clean).expect("test: serialise");
+        assert!(value.get("unavailable_attempts").is_none());
     }
 }

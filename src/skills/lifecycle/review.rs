@@ -474,6 +474,9 @@ impl SkillLifecycleStore {
                         {
                             applicability.push("the candidate changes the skill name or version".to_string());
                         }
+                        if before.required_tools != after.required_tools {
+                            applicability.push("the candidate changes the required tools".to_string());
+                        }
                     }
                     (_, Err(e)) => applicability.push(format!("the candidate manifest is invalid: {e}")),
                     (Err(e), _) => applicability.push(format!("the baseline manifest is invalid: {e}")),

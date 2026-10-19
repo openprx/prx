@@ -136,7 +136,7 @@ fn consolidate(f: &Fixture, statement: &str, class: FailureClass, evidence: &[&S
         .consolidate_pattern(&ConsolidationRequest {
             task_family: "deploy".to_string(),
             failure_class: class,
-            skill_id: Some(skill()),
+            skill_id: Some(f.pin.skill_id.clone()),
             scope: PatternScope {
                 environment: "local".to_string(),
                 capabilities: vec!["shell".to_string()],
@@ -169,7 +169,7 @@ fn budget() -> ProposerBudget {
 fn request(id: &str, patterns: &[&KnowledgePattern]) -> ProposeRequest {
     ProposeRequest {
         request_id: id.to_string(),
-        skill_id: skill(),
+        skill_id: patterns.first().and_then(|p| p.skill_id.clone()).unwrap_or_else(skill),
         pattern_ids: patterns.iter().map(|p| p.pattern_id.clone()).collect(),
         budget: budget(),
     }
@@ -1991,4 +1991,128 @@ async fn unverified_adherence_or_unknown_facts_keep_a_proposal_out() {
         let message = refused_for(&facts, None).await;
         assert!(message.contains("2 for unknown or unverified facts"), "{message}");
     }
+}
+
+/// A fixture whose baseline came in through the legacy import, from a real
+/// `SKILL.md` that does (or does not) carry `required-tools`.
+fn imported(required: Option<&str>) -> Fixture {
+    let tmp = TempDir::new().expect("test: tempdir");
+    let dir = tmp.path().join("skills/deploy-helper");
+    fs::create_dir_all(&dir).expect("test: mkdir");
+    let mut text = skill_md_with(20);
+    if let Some(list) = required {
+        text = text.replacen(
+            "description: Helps with deploys\n",
+            &format!("description: Helps with deploys\nrequired-tools: {list}\n"),
+            1,
+        );
+    }
+    fs::write(dir.join("SKILL.md"), text).expect("test: write");
+    let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
+    let plan = crate::skills::lifecycle::plan_migration(tmp.path(), Some(&store)).expect("test: plan");
+    let report = crate::skills::lifecycle::apply_migration(&store, tmp.path(), &plan);
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    let (imported_id, _) = report.imported.first().expect("test: one skill imported");
+    let pin = store
+        .pin_active(imported_id)
+        .expect("test: pin")
+        .expect("test: imported");
+    Fixture {
+        tmp,
+        store: Arc::new(store),
+        pin,
+    }
+}
+
+/// A failed run through the production terminal call-in: the skill is read,
+/// `observed` tools are called, the run ends clean.
+fn run_through_terminal(f: &Fixture, task: &str, observed: &[&str]) -> String {
+    use crate::skills::lifecycle::{
+        ObservedCallStatus, ObservedToolCall, ProviderEnd, TaskTerminal, TerminalObservations, on_task_terminal,
+    };
+    f.store
+        .record_hydration(task, &f.pin, "SKILL.md", b"x", &Correlation::default())
+        .expect("test: hydrate");
+    let observations = TerminalObservations {
+        tool_calls: observed
+            .iter()
+            .map(|name| ObservedToolCall {
+                capability_id: format!("shell:builtin:{name}"),
+                status: ObservedCallStatus::Succeeded,
+            })
+            .collect(),
+        complete: true,
+        provider: ProviderEnd::Served,
+        ..TerminalObservations::default()
+    };
+    on_task_terminal(
+        f.tmp.path(),
+        &owner(OWNER),
+        &TaskTerminal {
+            task_id: task,
+            terminal_receipt_id: "term",
+            outcome: ExperienceOutcome::Failure,
+            observations: Some(&observations),
+        },
+    )
+    .expect("test: terminal");
+    crate::skills::lifecycle::experience_id(f.store.owner_scope(), task)
+}
+
+#[tokio::test]
+async fn an_imported_skill_with_required_tools_qualifies_through_the_whole_chain() {
+    let f = imported(Some("[deploy_check]"));
+    let baseline = f
+        .store
+        .read_revision(&f.pin.skill_id, &f.pin.revision_id, None)
+        .expect("test: baseline");
+    assert_eq!(
+        baseline.revision.capability_requirements,
+        vec!["deploy_check".to_string()],
+        "the import filled the requirements from the frontmatter"
+    );
+    let a = run_through_terminal(&f, "chain-1", &["deploy_check"]);
+    let b = run_through_terminal(&f, "chain-2", &["deploy_check"]);
+    let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
+    let model = ScriptedModel::replying(&good_patch());
+    let ProposeOutcome::Staged(proposal) = run(&f, &model, request("chain", &[&pattern])).await else {
+        panic!("test: expected a staged proposal");
+    };
+    assert!(proposal.basis.adherence_verified);
+    assert_eq!(proposal.basis.failed_tasks_on_baseline, 2);
+}
+
+#[tokio::test]
+async fn failures_that_skipped_the_required_tool_or_come_from_undeclaring_skills_never_qualify() {
+    // Declared, but the runs never called the tool: not followed.
+    let f = imported(Some("[deploy_check]"));
+    let a = run_through_terminal(&f, "skip-1", &["other"]);
+    let b = run_through_terminal(&f, "skip-2", &["other"]);
+    let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
+    let model = ScriptedModel::replying(&good_patch());
+    let err = propose_revision(
+        Arc::clone(&f.store),
+        request("skip", &[&pattern]),
+        &model,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("test: not followed");
+    assert!(err.to_string().contains("2 for unknown or unverified facts"), "{err}");
+
+    // Nothing declared: adherence stays unknown, whatever was called.
+    let f = imported(None);
+    let a = run_through_terminal(&f, "bare-1", &["deploy_check"]);
+    let b = run_through_terminal(&f, "bare-2", &["deploy_check"]);
+    let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
+    let err = propose_revision(
+        Arc::clone(&f.store),
+        request("bare", &[&pattern]),
+        &model,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("test: undeclared");
+    assert!(err.to_string().contains("2 for unknown or unverified facts"), "{err}");
+    assert_eq!(model.calls(), 0);
 }

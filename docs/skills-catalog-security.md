@@ -87,3 +87,36 @@ and script output uses the shared bounded, cancellation-aware process adapter;
 HTTP declarations reuse `http_request` network restrictions. Unsupported kinds
 remain visible in `skills_list` as unsupported and are never exported as
 provider-callable ToolSpecs.
+
+## Required tools and learning evidence
+
+A skill may declare the tools a run must call to have followed it, with the
+optional top-level `SKILL.md` frontmatter key `required-tools`, a one-line list:
+
+```yaml
+---
+name: deploy-helper
+description: Helps with deploys
+required-tools: [deploy_check, lint]
+---
+```
+
+Names are 1-128 characters of letters, digits and `_ - . :`, at most 16. The
+same key may appear under `[skill]` in `SKILL.toml` as an array of strings
+(`required-tools = ["deploy_check"]`). When both files declare it, the lists
+must be equal; a disagreement is rejected when the revision is validated. The
+`[[tools]]` names of `SKILL.toml` count as declared tools too.
+
+The skill lifecycle records the declared tools of an imported, operator-written
+or upstream revision as its `capability_requirements`. A learned revision keeps
+exactly its baseline's list: a candidate that adds or removes a required tool,
+in the record or in its manifests, is refused at source review and at
+publication, because that would move the oracle its own evidence is judged by.
+
+At the end of a run the lifecycle compares the declared tools with the tools
+the run called. A failed run counts as evidence against the skill's guidance
+only when the declared tools were called, the provider and the tool backends
+were available (connection errors, timeouts, upstream 5xx and a down MCP server
+are infrastructure; argument and validation errors are not), and no tool call
+was refused by policy or approval. A skill that declares nothing has no
+verifiable adherence, so its failures are never used to propose a revision.

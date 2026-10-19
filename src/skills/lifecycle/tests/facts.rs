@@ -128,13 +128,19 @@ fn an_unavailable_provider_is_recorded_and_not_attributable() {
         ProviderEnd::Unknown
     );
 
-    // A tool that failed for an unclassified reason cannot prove the infrastructure fine.
+    // A tool whose backend was unavailable is infrastructure.
     let (tmp, store, pin) = setup();
-    let mut failed = clean(both_called());
-    failed.failed_attempts = 1;
-    let facts = terminal_facts(&tmp, &store, &pin, "tool-failed", Some(&failed));
-    assert_eq!(facts.infrastructure_unavailable, FactState::Unknown);
+    let mut backend = clean(both_called());
+    backend.unavailable_attempts = 1;
+    let facts = terminal_facts(&tmp, &store, &pin, "backend-down", Some(&backend));
+    assert_eq!(facts.infrastructure_unavailable, FactState::Present);
     assert!(!facts.failure_attributable_to(&pin.skill_id, &pin.revision_id));
+
+    // A tool that failed on its own (bad arguments) leaves a clean run clean.
+    let (tmp, store, pin) = setup();
+    let facts = terminal_facts(&tmp, &store, &pin, "bad-args", Some(&clean(both_called())));
+    assert_eq!(facts.infrastructure_unavailable, FactState::Absent);
+    assert!(facts.failure_attributable_to(&pin.skill_id, &pin.revision_id));
 }
 
 #[test]

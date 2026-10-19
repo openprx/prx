@@ -195,8 +195,10 @@ pub struct TerminalObservations {
     pub tool_calls: Vec<ObservedToolCall>,
     /// Tool attempts refused by policy or approval, from the runtime counters.
     pub denied_attempts: u64,
-    /// Tool attempts that failed for a reason the trace does not classify.
-    pub failed_attempts: u64,
+    /// Tool attempts that failed because their backend was unavailable
+    /// (connection, timeout, upstream 5xx, a down server). Argument and
+    /// validation failures are not counted: they are the run's own errors.
+    pub unavailable_attempts: u64,
     pub awaiting_approval_attempts: u64,
     /// The trace saw every attempt (nothing pending, unbound or over the bound).
     pub complete: bool,
@@ -205,11 +207,11 @@ pub struct TerminalObservations {
 
 impl TerminalObservations {
     fn infrastructure(&self) -> FactState {
-        if self.provider == ProviderEnd::Unavailable {
+        if self.provider == ProviderEnd::Unavailable || self.unavailable_attempts > 0 {
             FactState::Present
-        } else if self.provider == ProviderEnd::Served && self.complete && self.failed_attempts == 0 {
-            // A failed tool call could be a backend that was down or a bad
-            // call; the trace cannot tell which, so it is not "absent".
+        } else if self.provider == ProviderEnd::Served && self.complete {
+            // A tool that failed on its arguments or on its own is the run's
+            // error, not an unavailable backend: it does not hide a cause.
             FactState::Absent
         } else {
             FactState::Unknown

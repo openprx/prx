@@ -2281,7 +2281,7 @@ impl ToolExecutionService {
         // while it is pending.
         let outcome = Box::pin(self.execute_inner(command, context, cancellation)).await;
         if let Some(pending) = pending {
-            pending.finish(outcome.status);
+            pending.finish_with_error(outcome.status, outcome.error.as_deref());
         }
         outcome
     }

@@ -614,7 +614,7 @@ fn observations_from(
             })
             .collect(),
         denied_attempts: trace.denied_attempts,
-        failed_attempts: trace.failed_attempts,
+        unavailable_attempts: trace.unavailable_attempts.unwrap_or(0),
         awaiting_approval_attempts: trace.awaiting_approval_attempts,
         complete: !trace.incomplete && trace.pending_attempts == 0 && trace.unbound_attempts == 0,
         provider,
@@ -2856,6 +2856,7 @@ mod tests {
                 call("shell:builtin:odd", "no-such-code"),
             ],
             denied_attempts: 1,
+            unavailable_attempts: Some(2),
             ..ExecutionTraceSnapshot::default()
         };
         let down = ProviderExecutionOutcome::failed_for_decision(
@@ -2866,6 +2867,7 @@ mod tests {
         let seen = observations_from(&trace, Some(&down));
         assert_eq!(seen.provider, ProviderEnd::Unavailable);
         assert_eq!(seen.denied_attempts, 1);
+        assert_eq!(seen.unavailable_attempts, 2);
         assert!(seen.complete);
         assert_eq!(
             seen.tool_calls.iter().map(|c| c.status).collect::<Vec<_>>(),
