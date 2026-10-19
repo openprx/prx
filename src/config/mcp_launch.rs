@@ -321,7 +321,25 @@ const WORKSPACE_PLUGINS_DIR: &str = "plugins";
 #[must_use]
 pub fn is_workspace_launch_file(workspace_dir: &std::path::Path, target: &std::path::Path) -> bool {
     let workspace = std::fs::canonicalize(workspace_dir).unwrap_or_else(|_| workspace_dir.to_path_buf());
-    is_root_launch_file(&workspace, target) || is_under_plugins_dir(&workspace, target)
+    is_root_launch_file(&workspace, target) || is_under_plugins_dir(&workspace, target) || is_plugin_trust_state(target)
+}
+
+/// The operator's plugin trust file (and its lock and temporary files) and the
+/// compiled-component cache, wherever they are: they decide which WASM runs
+/// and with which permissions, so a file tool's write is high risk even when
+/// the path policy lets it leave the workspace.
+fn is_plugin_trust_state(target: &std::path::Path) -> bool {
+    let named = target.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+        let name = name.trim_start_matches('.').to_ascii_lowercase();
+        name.starts_with("plugin-trust.json")
+    });
+    named
+        || target.components().any(|component| match component {
+            std::path::Component::Normal(name) => name
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("plugin-cache")),
+            _ => false,
+        })
 }
 
 fn is_root_launch_file(workspace: &std::path::Path, target: &std::path::Path) -> bool {
@@ -738,5 +756,34 @@ mod tests {
             launch_server(&path(&["mcp", "servers", "a", "startup_timeout_ms"], None)),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod plugin_launch_tests {
+    use super::is_workspace_launch_file;
+    use std::path::Path;
+
+    #[test]
+    fn plugin_trust_state_is_high_risk_wherever_it_lives() {
+        let workspace = Path::new("/nonexistent-prx-test/ws");
+        for target in [
+            "/nonexistent-prx-test/state/plugin-trust.json",
+            "/nonexistent-prx-test/state/plugin-trust.json.lock",
+            "/nonexistent-prx-test/state/.plugin-trust.json.1234.tmp",
+            "/nonexistent-prx-test/state/Plugin-Trust.JSON",
+            "/nonexistent-prx-test/state/plugin-cache/abc.cwasm",
+            "/nonexistent-prx-test/ws/plugins/p/plugin.wasm",
+        ] {
+            assert!(is_workspace_launch_file(workspace, Path::new(target)), "{target}");
+        }
+        for target in [
+            "/nonexistent-prx-test/ws/notes.txt",
+            "/nonexistent-prx-test/ws/plugin-trust-notes.txt.bak/x",
+            "/nonexistent-prx-test/ws/docs/plugins/readme.md",
+        ] {
+            // `plugin-trust-notes` does not start with the trust file name.
+            assert!(!is_workspace_launch_file(workspace, Path::new(target)), "{target}");
+        }
     }
 }

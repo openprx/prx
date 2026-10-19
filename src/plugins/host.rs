@@ -151,7 +151,7 @@ pub struct HostState {
     http_requests_per_minute: Option<u32>,
 
     /// Start times of the outbound requests inside the rolling minute.
-    http_request_times: VecDeque<Instant>,
+    http_request_times: Arc<parking_lot::Mutex<VecDeque<Instant>>>,
 
     /// Namespaced in-memory KV store (plugin-isolated).
     pub kv_store: Arc<RwLock<HashMap<String, Vec<u8>>>>,
@@ -220,7 +220,7 @@ impl HostState {
             max_http_requests: 10,
             http_requests_this_call: 0,
             http_requests_per_minute: None,
-            http_request_times: VecDeque::new(),
+            http_request_times: Arc::default(),
             kv_store: Arc::new(RwLock::new(HashMap::new())),
             kv_quota_bytes,
             timeout_ms,
@@ -298,9 +298,16 @@ impl HostState {
     }
 
     /// Set the outbound request budget from the manifest `[resources]`.
-    pub const fn with_http_limits(mut self, per_call: u32, per_minute: Option<u32>) -> Self {
+    ///
+    /// The rolling-minute window is shared by every adapter and every rebuilt
+    /// store of the plugin (keyed by plugin name), so a trap-and-respawn loop
+    /// cannot reset it.
+    pub fn with_http_limits(mut self, per_call: u32, per_minute: Option<u32>) -> Self {
         self.max_http_requests = per_call;
         self.http_requests_per_minute = per_minute;
+        if per_minute.is_some() {
+            self.http_request_times = shared_http_window(&self.plugin_name);
+        }
         self
     }
 
@@ -325,21 +332,21 @@ impl HostState {
         }
         if let Some(limit) = self.http_requests_per_minute {
             let now = Instant::now();
-            while self
-                .http_request_times
+            let mut times = self.http_request_times.lock();
+            while times
                 .front()
                 .is_some_and(|started| now.duration_since(*started) >= Duration::from_secs(60))
             {
-                self.http_request_times.pop_front();
+                times.pop_front();
             }
-            let in_window = u32::try_from(self.http_request_times.len()).unwrap_or(u32::MAX);
+            let in_window = u32::try_from(times.len()).unwrap_or(u32::MAX);
             if in_window >= limit {
                 return Err(format!(
                     "plugin '{}' exceeded max_http_requests_per_minute ({limit})",
                     self.plugin_name
                 ));
             }
-            self.http_request_times.push_back(now);
+            times.push_back(now);
         }
         self.http_requests_this_call = self.http_requests_this_call.saturating_add(1);
         Ok(())
@@ -352,6 +359,15 @@ impl HostState {
         self.consume_http_request()?;
         Ok(parsed)
     }
+}
+
+/// Rolling-minute request windows, one per plugin name for the process.
+static HTTP_WINDOWS: std::sync::LazyLock<
+    parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<VecDeque<Instant>>>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+fn shared_http_window(plugin: &str) -> Arc<parking_lot::Mutex<VecDeque<Instant>>> {
+    Arc::clone(HTTP_WINDOWS.lock().entry(plugin.to_string()).or_default())
 }
 
 /// Largest HTTP response body a plugin receives.
@@ -910,6 +926,32 @@ mod tests {
         assert!(state.authorize_outbound("https://api.x.com/b", &["https"]).is_ok());
         state.begin_invocation();
         let error = state.authorize_outbound("https://api.x.com/c", &["https"]).unwrap_err();
+        assert!(error.contains("max_http_requests_per_minute"), "{error}");
+    }
+
+    #[test]
+    fn the_per_minute_window_survives_a_store_rebuild() {
+        let name = "window-shared-across-rebuilds";
+        let build = || {
+            HostState::new(
+                name.to_string(),
+                HashMap::new(),
+                HashSet::new(),
+                HashSet::new(),
+                vec!["https://api.x.com/*".to_string()],
+                5000,
+                10,
+            )
+            .with_http_limits(10, Some(2))
+        };
+        let mut first = build();
+        assert!(first.authorize_outbound("https://api.x.com/a", &["https"]).is_ok());
+        assert!(first.authorize_outbound("https://api.x.com/b", &["https"]).is_ok());
+        // A respawned store gets a fresh HostState but the same window.
+        let mut respawned = build();
+        let error = respawned
+            .authorize_outbound("https://api.x.com/c", &["https"])
+            .unwrap_err();
         assert!(error.contains("max_http_requests_per_minute"), "{error}");
     }
 

@@ -15,6 +15,25 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- **Breaking: WASM plugins are off and need operator trust (finding 95).**
+  `[plugins] enabled` defaults to `false`; nothing under `<workspace>/plugins`
+  is scanned or loaded until it is set to `true` (restart required). Existing
+  installs must set `[plugins] enabled = true` **and reinstall each plugin**
+  with `wasm_plugins_manage install` (passing `grant_permissions`; the approval
+  is high risk and bound to the plugin name, component hash, manifest hash and
+  permissions). The `.prx-managed` marker no longer confers trust, a plugin
+  without a record in `plugin-trust.json` (beside `config.toml`) is refused, and
+  an optional permission is granted only through that record. Outbound
+  `http-outbound` / `websocket-outbound`: an empty `http_allowlist` now denies
+  every URL, entries are URL patterns (`https://host/*`, `*.` subdomains; the
+  old string-prefix form `https://host*` is a manifest error), private,
+  loopback, link-local, CGNAT and metadata addresses are refused (also after DNS
+  and on redirects), and `max_http_requests_per_call` is enforced. Writing under
+  `plugins/` or to the trust file or cache with the file tools is a high-risk
+  operation. The precompile cache moved out of the workspace to `plugin-cache/`
+  beside the trust file and is keyed by SHA-256; old `plugins/.cwasm-cache` is
+  ignored. See `docs/configuration.md` (WASM plugins).
+
 - Upgrade compatibility: the decision accounting reservation journal now writes
   `estimated_unsent_v1` when a durable dispatch receipt never reached transport.
   Older binaries reject this event and refuse the entire cost ledger. Once it

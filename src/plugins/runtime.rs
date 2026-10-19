@@ -776,7 +776,13 @@ impl PluginManageTool {
         let identity = self
             .candidate_identity(source, args)
             .map_err(|error| refuse(error.to_string()))?;
-        let permissions = identity.record.permissions.join("+");
+        // Hash the sorted list: a joined, normalised string would collide for
+        // ["a", "b"] and ["a_b"].
+        let permissions = crate::plugins::trust::sha256_hex(
+            serde_json::to_string(&identity.record.permissions)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         let operation = op_id::op_id(
             "wasm_plugins_manage",
             &format!("{action}-trust"),
@@ -1080,6 +1086,11 @@ impl PluginManageTool {
         } else {
             anyhow::bail!("plugin '{name}' is not installed or disabled");
         };
+        // Trust is recorded under the manifest name, which need not equal the
+        // folder name; read it before the folder moves.
+        let manifest_name = PluginManifest::from_file(&source.join("plugin.toml"))
+            .ok()
+            .map(|manifest| manifest.plugin.name);
         let trash_root = self.trash_dir()?;
         std::fs::create_dir_all(&trash_root)?;
         let backup = trash_root.join(format!("{name}-{}", uuid::Uuid::new_v4()));
@@ -1098,8 +1109,10 @@ impl PluginManageTool {
         };
         // A removed plugin keeps no standing trust: a copy restored later must
         // be installed (and approved) again.
-        if let Err(error) = self.runtime.policy.restore(name, None) {
-            tracing::warn!(plugin = %name, error = %error, "could not revoke the removed plugin's trust record");
+        for trusted_name in std::iter::once(name).chain(manifest_name.as_deref().filter(|n| *n != name)) {
+            if let Err(error) = self.runtime.policy.restore(trusted_name, None) {
+                tracing::warn!(plugin = %trusted_name, error = %error, "could not revoke the removed plugin's trust record");
+            }
         }
         Ok(serde_json::json!({
             "plugin": name,
@@ -2234,18 +2247,24 @@ max_payload_bytes = 8388608";
 max_memory_mb = 8
 max_execution_time_ms = 30000";
 
-    /// Tuned once against the committed fixture: instantiating the component
-    /// costs roughly 48 000 fuel units and one `process` call roughly 10 400, so
-    /// 62 000 funds exactly one call while fuel is a store-lifetime budget and
-    /// comfortably funds every call once fuel is metered per invocation.
+    /// Tuned once against the committed fixture, under the wasmtime version of
+    /// that time: instantiation was measured at roughly 48 000 fuel units and
+    /// one `process` call at roughly 10 400, so 62 000 funds exactly one call
+    /// while fuel is a store-lifetime budget and comfortably funds every call
+    /// once fuel is metered per invocation. Those measurements are not
+    /// asserted anywhere except through
+    /// `the_per_invocation_fuel_bound_stays_discriminating`, which currently
+    /// fails (see its comment).
     const ONE_CALL_FUEL: u64 = 62_000;
 
-    /// Measured boundary for the committed fixture: instantiation alone costs
-    /// more than this, which `the_per_invocation_fuel_bound_stays_discriminating`
-    /// asserts. It measured under 50 000 fuel units, but nothing here asserts
-    /// that; the upper side is pinned only as `ONE_CALL_FUEL`, by
-    /// `middleware_fuel_is_metered_per_invocation`, whose adapter fails to load
-    /// if instantiation costs more than that.
+    /// Boundary assumed for the committed fixture: instantiation alone is
+    /// expected to cost more than this, which
+    /// `the_per_invocation_fuel_bound_stays_discriminating` asserts. The
+    /// original measurement was under 50 000 fuel units; on the current
+    /// wasmtime that assertion no longer holds (instantiation is cheaper), so
+    /// the boundary has to be re-measured. The upper side is pinned only as
+    /// `ONE_CALL_FUEL`, by `middleware_fuel_is_metered_per_invocation`, whose
+    /// adapter fails to load if instantiation costs more than that.
     const BELOW_INSTANTIATION_FUEL: u64 = 48_000;
 
     /// `ONE_CALL_FUEL` carries a lower bound (it must fund a call once fuel is
@@ -3794,9 +3813,10 @@ max_execution_time_ms = 30000";
             "the approval operation must name the component hash: {error}"
         );
         assert!(error.contains("audit-hook"), "{error}");
+        let grant_digest = crate::plugins::trust::sha256_hex(br#"["events","kv","log"]"#);
         assert!(
-            error.contains("events"),
-            "the operation must name the granted permissions: {error}"
+            error.contains(&grant_digest),
+            "the operation must carry the digest of the sorted grant: {error}"
         );
         assert!(!temp.path().join("plugins/audit-hook").exists());
         assert_eq!(test_policy(temp.path()).records().unwrap().len(), 0);

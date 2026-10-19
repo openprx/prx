@@ -340,10 +340,11 @@ pub fn authorize_url(allowlist: &OutboundAllowlist, raw: &str, schemes: &[&str])
     Ok(url)
 }
 
-/// Decide whether a redirect to `next` may be followed. Every hop must pass the
+/// Decide whether a redirect to `next` may be followed after
+/// `followed_redirects` earlier ones (at most [`MAX_REDIRECT_HOPS`] are allowed). Every hop must pass the
 /// same allowlist and address checks as the first request.
-pub fn check_redirect_hop(allowlist: &OutboundAllowlist, next: &Url, previous_hops: usize) -> Result<(), String> {
-    if previous_hops >= MAX_REDIRECT_HOPS {
+pub fn check_redirect_hop(allowlist: &OutboundAllowlist, next: &Url, followed_redirects: usize) -> Result<(), String> {
+    if followed_redirects >= MAX_REDIRECT_HOPS {
         return Err(format!("too many redirects (limit {MAX_REDIRECT_HOPS})"));
     }
     if !matches!(next.scheme(), "http" | "https") {
@@ -406,7 +407,10 @@ impl reqwest::dns::Resolve for GuardedResolver {
 #[must_use]
 pub fn redirect_policy(allowlist: Arc<OutboundAllowlist>) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
-        match check_redirect_hop(&allowlist, attempt.url(), attempt.previous().len()) {
+        // `previous()` includes the original request, so it holds one more
+        // entry than the redirects already followed.
+        let followed = attempt.previous().len().saturating_sub(1);
+        match check_redirect_hop(&allowlist, attempt.url(), followed) {
             Ok(()) => attempt.follow(),
             Err(error) => attempt.error(error),
         }
@@ -430,6 +434,7 @@ pub fn build_http_client(allowlist: Arc<OutboundAllowlist>, timeout: Duration) -
 mod tests {
     #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
     use super::*;
+    use std::fmt::Write as _;
 
     fn list(entries: &[&str]) -> OutboundAllowlist {
         OutboundAllowlist::parse_all(&entries.iter().map(ToString::to_string).collect::<Vec<_>>())
@@ -662,5 +667,101 @@ mod tests {
     fn the_client_builds_with_the_guards_installed() {
         let client = build_http_client(Arc::new(list(&["https://api.x.com/*"])), Duration::from_secs(1));
         assert!(client.is_ok());
+    }
+
+    // ── Real client against local servers ───────────────────────────────
+
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Local server answering every request with `response`; returns its port
+    /// and a counter of accepted connections.
+    fn local_server(response: String) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (port, hits)
+    }
+
+    fn ok_response() -> String {
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_string()
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    /// The resolver is the layer under the name check: an allowlisted name that
+    /// resolves to loopback must be refused when the client connects, and the
+    /// listening server must never see a connection.
+    #[tokio::test]
+    async fn the_real_client_refuses_an_allowlisted_name_that_resolves_to_loopback() {
+        let (port, hits) = local_server(ok_response());
+        let entry = format!("http://localhost:{port}/*");
+        let allowlist = Arc::new(list(&[entry.as_str()]));
+        let client = build_http_client(allowlist, Duration::from_secs(5)).unwrap();
+        let error = client
+            .get(format!("http://localhost:{port}/secret"))
+            .send()
+            .await
+            .expect_err("loopback resolution must be refused");
+        let mut text = format!("{error} {error:?}");
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            let _ = write!(text, " | {cause} {cause:?}");
+            source = cause.source();
+        }
+        assert!(text.contains("not reachable"), "{text}");
+        settle().await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "the server was contacted");
+    }
+
+    /// A redirect to loopback is refused on the hop, whether the target is off
+    /// the allowlist or on it; the target is never contacted.
+    #[tokio::test]
+    async fn the_real_client_does_not_follow_a_redirect_to_loopback() {
+        let (target_port, target_hits) = local_server(ok_response());
+        let (origin_port, origin_hits) = local_server(format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{target_port}/secret\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        ));
+        // The origin itself is reached through the client directly (an IP
+        // literal skips the resolver; the request-level literal check is
+        // `authorize_url`'s job), so the hop policy is what is under test.
+        let origin = format!("http://127.0.0.1:{origin_port}/start");
+
+        for entries in [
+            vec![format!("http://127.0.0.1:{origin_port}/*")],
+            vec![
+                format!("http://127.0.0.1:{origin_port}/*"),
+                format!("http://127.0.0.1:{target_port}/*"),
+            ],
+        ] {
+            let allowlist = Arc::new(OutboundAllowlist::parse_all(&entries).unwrap());
+            let client = build_http_client(allowlist, Duration::from_secs(5)).unwrap();
+            let error = client
+                .get(&origin)
+                .send()
+                .await
+                .expect_err("the redirect must not be followed");
+            assert!(error.is_redirect(), "{error:?}");
+            settle().await;
+            assert_eq!(
+                target_hits.load(Ordering::SeqCst),
+                0,
+                "the redirect target was contacted"
+            );
+        }
+        assert!(origin_hits.load(Ordering::SeqCst) >= 1);
     }
 }

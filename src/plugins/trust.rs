@@ -238,6 +238,28 @@ pub fn evaluate(records: &[TrustRecord], material: &PluginMaterial) -> TrustOutc
     TrustOutcome::Trusted { granted }
 }
 
+/// Canonicalise `path`, or its deepest existing ancestor with the missing tail
+/// appended. Fails when no ancestor can be resolved.
+fn resolve_existing(path: &Path) -> PluginResult<PathBuf> {
+    let mut existing = path;
+    let mut tail = Vec::new();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(resolved) => return Ok(tail.iter().rev().fold(resolved, |acc, part| acc.join(part))),
+            Err(error) => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return Err(PluginError::Runtime(format!(
+                        "cannot resolve {} ({error}); plugins stay off",
+                        path.display()
+                    )));
+                };
+                tail.push(name.to_os_string());
+                existing = parent;
+            }
+        }
+    }
+}
+
 /// Whether plugins run at all, and where the operator's trust file lives.
 #[derive(Debug, Clone)]
 pub struct PluginPolicy {
@@ -258,21 +280,28 @@ impl PluginPolicy {
     /// of `config.toml`). Fails when that directory is inside the workspace,
     /// because an agent can write there.
     pub fn from_config(config: &crate::config::Config) -> PluginResult<Self> {
+        // The state directory is where `config.toml` lives. Without a config
+        // path there is no operator-owned place to keep trust (falling back to
+        // the workspace parent could be a home directory), so plugins stay off.
         let state_dir = config
             .config_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .or_else(|| config.workspace_dir.parent().map(Path::to_path_buf))
             .ok_or_else(|| {
-                PluginError::Runtime("cannot locate the PRX state directory for plugin trust".to_string())
-            })?;
-        let resolve = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let workspace = resolve(&config.workspace_dir);
-        if resolve(&state_dir).starts_with(&workspace) {
+                PluginError::Runtime(
+                    "no config path: there is no operator-owned place for the plugin trust file".to_string(),
+                )
+            })?
+            .to_path_buf();
+        // Resolve symlinks and `/var` -> `/private/var` style aliases on both
+        // sides; if either cannot be resolved the comparison would be between
+        // different spellings, so fail closed.
+        let state = resolve_existing(&state_dir)?;
+        let workspace = resolve_existing(&config.workspace_dir)?;
+        if state.starts_with(&workspace) {
             return Err(PluginError::Runtime(format!(
                 "plugin trust file directory {} is inside the workspace {}; an agent could write it",
-                state_dir.display(),
+                state.display(),
                 workspace.display()
             )));
         }
@@ -346,6 +375,7 @@ impl PluginPolicy {
     /// Add or replace the record for `record.name`.
     pub fn record(&self, record: TrustRecord) -> PluginResult<()> {
         let _guard = TRUST_WRITE_LOCK.lock();
+        let _file_lock = self.lock_file()?;
         let mut records = self.records()?;
         records.retain(|existing| existing.name != record.name);
         records.push(record);
@@ -357,6 +387,7 @@ impl PluginPolicy {
     /// `previous` is `None`. Used to roll back a failed install.
     pub fn restore(&self, name: &str, previous: Option<TrustRecord>) -> PluginResult<()> {
         let _guard = TRUST_WRITE_LOCK.lock();
+        let _file_lock = self.lock_file()?;
         let mut records = self.records()?;
         records.retain(|existing| existing.name != name);
         records.extend(previous);
@@ -367,6 +398,30 @@ impl PluginPolicy {
     /// The record for `name`, if any.
     pub fn record_for_name(&self, name: &str) -> PluginResult<Option<TrustRecord>> {
         Ok(self.records()?.into_iter().find(|record| record.name == name))
+    }
+
+    /// Advisory exclusive lock on `<trust file>.lock`, held for one
+    /// read-modify-write so two PRX processes cannot lose each other's record.
+    /// Released when the returned file is dropped.
+    fn lock_file(&self) -> PluginResult<std::fs::File> {
+        use fs2::FileExt as _;
+        let parent = self
+            .trust_file
+            .parent()
+            .ok_or_else(|| PluginError::Runtime("plugin trust file has no parent directory".to_string()))?;
+        std::fs::create_dir_all(parent).map_err(PluginError::Io)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let lock = options
+            .open(self.trust_file.with_extension("json.lock"))
+            .map_err(PluginError::Io)?;
+        lock.lock_exclusive().map_err(PluginError::Io)?;
+        Ok(lock)
     }
 
     fn write(&self, records: &[TrustRecord]) -> PluginResult<()> {
@@ -562,6 +617,71 @@ mod tests {
         assert_eq!(policy.records().unwrap(), vec![first]);
         policy.restore("p", None).unwrap();
         assert_eq!(policy.records().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn from_config_requires_a_config_path() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = temp.path().join("workspace");
+        config.config_path = PathBuf::new();
+        config.plugins.enabled = true;
+        // No fallback to the workspace parent (which could be a home directory).
+        assert!(PluginPolicy::from_config(&config).is_err());
+        config.config_path = PathBuf::from("config.toml");
+        assert!(PluginPolicy::from_config(&config).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_config_compares_resolved_paths_not_spellings() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(real.join("workspace/state")).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mut config = crate::config::Config::default();
+        // The workspace is spelled through the alias, the state directory
+        // through the real path: a raw comparison would call them unrelated.
+        config.workspace_dir = alias.join("workspace");
+        config.config_path = real.join("workspace/state/config.toml");
+        config.plugins.enabled = true;
+        assert!(PluginPolicy::from_config(&config).is_err());
+        // A state directory that does not exist yet is judged by its resolved ancestor.
+        config.config_path = real.join("workspace/not-yet/config.toml");
+        assert!(PluginPolicy::from_config(&config).is_err());
+        config.config_path = real.join("elsewhere/config.toml");
+        assert!(PluginPolicy::from_config(&config).is_ok());
+    }
+
+    #[test]
+    fn an_unresolvable_path_fails_closed() {
+        assert!(resolve_existing(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn concurrent_writers_do_not_lose_records() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let policy = policy(temp.path());
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let policy = policy.clone();
+                std::thread::spawn(move || {
+                    policy
+                        .record(TrustRecord {
+                            name: format!("p{index}"),
+                            sha256: "a".repeat(64),
+                            manifest_sha256: "b".repeat(64),
+                            permissions: Vec::new(),
+                        })
+                        .unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(policy.records().unwrap().len(), 8);
     }
 
     #[test]
