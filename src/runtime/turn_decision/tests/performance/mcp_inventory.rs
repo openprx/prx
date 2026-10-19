@@ -100,6 +100,7 @@ async fn owned_mcp_inventory_catalog_growth_profile() {
                     security,
                 },
             )
+            .await
             .expect("actual published service");
             install_inventory_evidence_backend(&mut service);
             let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(

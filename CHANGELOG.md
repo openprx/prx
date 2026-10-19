@@ -15,6 +15,13 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Decision-store preparation runs off Tokio workers behind per-path gates;
+  SQLite migration and WAL fsync no longer hold the global store registry.
+  Cancelled publication retains preparation and queue cleanup ownership.
+  Runtime startup warms accounting tokenizers. Reservation and cost appends
+  reuse the workspace tracker and sync directories on journal creation,
+  retaining per-write file sync and existing security checks.
+
 - Causal telemetry deferral is now admission-local and expires at that
   admission's deadline. Applied events bypass deferred phases; drain flushes
   earlier events without waiting for unrelated admissions. No admission budget

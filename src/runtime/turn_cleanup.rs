@@ -19,8 +19,15 @@ struct State {
     next_id: u64,
     pending: BTreeMap<u64, CancellationToken>,
     services: Vec<Arc<TurnDecisionService>>,
+    prepared_stores: Vec<PreparedStoreQueues>,
     ingress_monitors: Vec<IngressMonitor>,
     ingress_lifetimes: BTreeMap<String, Arc<dyn crate::memory::ingress_recovery::IngressLifetime>>,
+}
+
+#[derive(Clone)]
+struct PreparedStoreQueues {
+    store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
+    events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
 }
 
 struct IngressMonitor(tokio::task::JoinHandle<()>);
@@ -84,7 +91,11 @@ impl CleanupTracker {
     }
 
     pub(crate) fn retain_service(&self, service: Arc<TurnDecisionService>) {
-        self.state.lock().services.push(service);
+        let mut state = self.state.lock();
+        state
+            .prepared_stores
+            .retain(|prepared| !service.owns_prepared_queues(prepared.store.as_ref(), prepared.events.as_ref()));
+        state.services.push(service);
     }
 
     /// Child publication must finish before its owner starts draining. Keeping
@@ -95,6 +106,9 @@ impl CleanupTracker {
             !state.closed && !state.failed,
             "child decision publication owner is closed or has unconfirmed failures"
         );
+        state
+            .prepared_stores
+            .retain(|prepared| !service.owns_prepared_queues(prepared.store.as_ref(), prepared.events.as_ref()));
         state.services.push(service);
         Ok(())
     }
@@ -120,7 +134,7 @@ impl CleanupTracker {
         for cancel in cancellations {
             cancel.cancel();
         }
-        let (services, failed) = loop {
+        let (services, prepared_stores, failed) = loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
@@ -130,7 +144,7 @@ impl CleanupTracker {
                     #[cfg(test)]
                     self.diagnostic
                         .record("pending_empty", 0, 0, state.failed, Some(!state.failed));
-                    break (state.services.clone(), state.failed);
+                    break (state.services.clone(), state.prepared_stores.clone(), state.failed);
                 }
             }
             tokio::time::timeout_at(deadline, changed).await.map_err(|_| {
@@ -154,6 +168,14 @@ impl CleanupTracker {
             self.diagnostic
                 .record("service_queues_drained", 0, 0, failed, Some(drained));
         }
+        for prepared in prepared_stores {
+            if let Some(writer) = prepared.store.and_then(|store| store.writer()) {
+                queues_drained &= writer.drain(deadline.into_std()).await;
+            }
+            if let Some(events) = prepared.events {
+                queues_drained &= events.drain(deadline.into_std()).await;
+            }
+        }
         #[cfg(test)]
         self.diagnostic
             .record("drain_completed", 0, 0, failed, Some(!failed && queues_drained));
@@ -164,6 +186,20 @@ impl CleanupTracker {
 }
 
 impl CleanupTicket {
+    /// Keep construction queues owned even if the awaiting publisher was
+    /// cancelled. This handoff precedes releasing its registered I/O ticket.
+    pub(crate) fn retain_prepared_store(
+        &self,
+        store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
+        events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
+    ) {
+        self.tracker
+            .state
+            .lock()
+            .prepared_stores
+            .push(PreparedStoreQueues { store, events });
+    }
+
     pub(crate) fn owner(&self) -> Arc<CleanupTracker> {
         Arc::clone(&self.tracker)
     }

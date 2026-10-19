@@ -19,6 +19,18 @@ const PREMIUM: &str = "prx-premium";
 const CHEAP_REPLY: &str = "I'm not sure, maybe the expression adds two integers.";
 const PREMIUM_REPLY: &str = "The Rust expression adds two integers and equals four.";
 
+fn original_turn_error(result: &std::thread::Result<anyhow::Result<()>>) -> String {
+    match result {
+        Ok(Ok(())) => "none".to_owned(),
+        Ok(Err(error)) => format!("{error:#}"),
+        Err(panic) => panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|message| (*message).to_owned()))
+            .unwrap_or_else(|| "non-string fixture panic".to_owned()),
+    }
+}
+
 struct ListenerOwner {
     cancel: CancellationToken,
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
@@ -263,7 +275,8 @@ async fn completed_main_after_original_deadline_does_not_reset_the_premium_allow
         }
         anyhow::ensure!(
             confirmed && listener_cleanup.is_ok(),
-            "expired continuation cleanup unconfirmed"
+            "expired continuation cleanup unconfirmed; original turn error={}",
+            original_turn_error(&result)
         );
         match result {
             Ok(result) => result,
@@ -688,7 +701,8 @@ async fn run_case_work(recording: bool) -> anyhow::Result<()> {
     if !agent_cleanup || listener_cleanup.is_err() {
         let retained = workspace.keep();
         anyhow::bail!(
-            "Automix cleanup unconfirmed; agent_confirmed={agent_cleanup}; listener_cleanup={listener_cleanup:?}; retained {}",
+            "Automix cleanup unconfirmed; agent_confirmed={agent_cleanup}; listener_cleanup={listener_cleanup:?}; original turn error={}; retained {}",
+            original_turn_error(&result),
             retained.display()
         );
     }
@@ -781,7 +795,8 @@ async fn run_dropped_premium_work() -> anyhow::Result<()> {
     if !confirmed || listener_cleanup.is_err() {
         let retained = workspace.keep();
         anyhow::bail!(
-            "Automix drop cleanup unconfirmed; agent_confirmed={confirmed}; listener_cleanup={listener_cleanup:?}; retained {}",
+            "Automix drop cleanup unconfirmed; agent_confirmed={confirmed}; listener_cleanup={listener_cleanup:?}; original turn error={}; retained {}",
+            original_turn_error(&result),
             retained.display()
         );
     }
@@ -1043,7 +1058,8 @@ async fn run_cheap_outcome_case_work(fail_premium: bool, turns: usize) -> anyhow
     if !confirmed || listener_cleanup.is_err() {
         let retained = workspace.keep();
         anyhow::bail!(
-            "Automix fixture cleanup unconfirmed; agent_confirmed={confirmed}; listener_cleanup={listener_cleanup:?}; retained {}",
+            "Automix fixture cleanup unconfirmed; agent_confirmed={confirmed}; listener_cleanup={listener_cleanup:?}; original turn error={}; retained {}",
+            original_turn_error(&result),
             retained.display()
         );
     }

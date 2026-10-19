@@ -636,3 +636,15 @@ require the full behavioral, cancellation, privacy and performance gates; existi
 historical events are not rewritten by this change.
 
 SQLite memory initialization applies schema creation, legacy upgrades and migration-checksum verification in one write transaction. A failed upgrade rolls back the entire initialization; a successful open commits once, reducing schema-write interference with active decision deadlines. Migration versions, checksums and durability settings are unchanged.
+
+Decision-store preparation runs on blocking workers before source admission.
+The process registry only locates per-path slots; SQLite open, WAL setup and
+migration never hold the global registry lock. A concurrent open of the same
+path shares its slot, while unrelated workspaces can prepare independently.
+Cancelled publication retains preparation tickets and prepared store/event
+queues under runtime cleanup until the actual work and drains complete.
+Accounting tokenizer tables initialize at runtime construction. Physical
+reservation and cost-ledger appends still sync every file write, but sync the
+directory only when creating its journal entry; existing journals keep their
+validated private-file and no-symlink checks. Physical accounting reuses the
+workspace cost tracker, retaining its locked reservation and settlement checks.

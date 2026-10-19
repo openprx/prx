@@ -20,7 +20,11 @@ pub(crate) mod selected_loader_fixture;
 
 mod accounting;
 mod auxiliary;
+mod build_error;
 mod issued;
+mod store_preparation;
+
+pub(crate) use build_error::TurnServiceBuildError;
 
 mod approval;
 mod child_recovery;
@@ -120,30 +124,6 @@ pub(crate) struct TurnServiceBuild<'a> {
     pub events: Arc<dyn CausalEventSink>,
     pub memory: Arc<dyn Memory>,
     pub security: Arc<SecurityPolicy>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum TurnServiceBuildError {
-    #[error("child service does not match its issued parent authority")]
-    ChildAuthority,
-    #[error("catalog sources do not match the pinned configuration generation")]
-    SourceGeneration,
-    #[error(transparent)]
-    Store(#[from] StoreError),
-    #[error(transparent)]
-    Catalog(#[from] CatalogError),
-    #[error(transparent)]
-    Parity(#[from] ParityError),
-    #[error(transparent)]
-    Factory(#[from] FactoryBuildError),
-    #[error("pinned decision policy cannot be fingerprinted")]
-    PolicyFingerprint(#[source] serde_json::Error),
-    #[error("durable causal events require an active runtime")]
-    EventRuntime(#[from] tokio::runtime::TryCurrentError),
-    #[error("enabled causal decisions require a durable message-event memory backend")]
-    EventStoreUnsupported,
-    #[error("enabled causal decisions require user message event recording")]
-    InboundEventsDisabled,
 }
 
 /// Actual ingress runtime instances associated with the published catalog.
@@ -3291,7 +3271,7 @@ impl TurnDecisionService {
 /// in-process children derive from `OrdinaryChildPublication` instead.
 /// The factory receives the persisted workspace key or `None`; an ephemeral
 /// state key never enables a remote backend or cross-process child authority.
-pub(crate) fn build_turn_decision_service(
+pub(crate) async fn build_turn_decision_service(
     surface: TurnSurfaceKind,
     build: TurnServiceBuild<'_>,
 ) -> Result<Arc<TurnDecisionService>, TurnServiceBuildError> {
@@ -3312,7 +3292,7 @@ pub(crate) fn build_turn_decision_service(
     }
     // `load_key` deliberately does not touch the workspace key while the
     // plane is disabled. An unavailable key leaves the factory builtin-only.
-    let workspace_key = FactoryDeps::load_key(config);
+    let workspace_key = store_preparation::load_key(Arc::clone(&build.generation)).await?;
     let durable_key = config.causal_tree.enabled && workspace_key.is_some();
     if let Some(grant) = &build.parent_grant {
         let key = workspace_key
@@ -3358,19 +3338,13 @@ pub(crate) fn build_turn_decision_service(
         || Arc::clone(&build.events),
         |events| Arc::clone(events) as Arc<dyn CausalEventSink>,
     );
-    let store = if durable_key {
-        CausalDecisionStore::open_shared(
-            &config.workspace_dir,
-            Retention::days(
-                config.causal_tree.store.retention_days,
-                config.self_system.fitness.retention_days,
-            ),
-            Arc::clone(&events),
-            StoreMode::ReadWrite,
-        )?
-    } else {
-        CausalDecisionStore::open_unshared_read_only(&config.workspace_dir)
-    };
+    let store = store_preparation::open_store(
+        Arc::clone(&build.generation),
+        Arc::clone(&events),
+        durable_events.clone(),
+        durable_key,
+    )
+    .await?;
     let state_key = workspace_key.clone().unwrap_or_else(DecisionKey::ephemeral);
     let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
         .map_err(TurnServiceBuildError::PolicyFingerprint)?;
@@ -4011,6 +3985,7 @@ mod tests {
                     security,
                 },
             )
+            .await
             .expect("source-owned fixture service");
             let predictions = Arc::new(AtomicUsize::new(0));
             let owning = Arc::get_mut(&mut service).expect("unshared fixture service");
@@ -4466,6 +4441,7 @@ mod tests {
                 security,
             },
         )
+        .await
         .expect("test service");
         let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let backend_entered = Arc::new(tokio::sync::Notify::new());
@@ -4625,6 +4601,7 @@ mod tests {
                     security,
                 },
             )
+            .await
             .expect("synthetic disabled service");
             let proof = crate::agent::entry::test_cli_agent_turn_proof_with_input(
                 &generation,
@@ -4741,6 +4718,7 @@ mod tests {
                     security,
                 },
             )
+            .await
             .expect("enabled synthetic service");
             let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof(&generation, memory).await;
             let (result, allocations) = crate::decision::builtin::allocation_counter::count_future(
@@ -4946,6 +4924,7 @@ mod tests {
                 security,
             },
         )
+        .await
         .expect("initial catalog parity");
         let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let backend_entered = Arc::new(tokio::sync::Notify::new());
@@ -5639,8 +5618,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn agent_budget_uses_pinned_route_and_read_only_spend_snapshot() {
+    #[tokio::test]
+    async fn agent_budget_uses_pinned_route_and_read_only_spend_snapshot() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
         config.causal_tree.enabled = false;
@@ -5664,7 +5643,7 @@ mod tests {
             .expect("prior spend");
         let generation = crate::config::new_shared(config.clone()).pin();
         let provider_catalog = ProviderCatalogView::from_config(&config);
-        let service = disabled_agent_service(&generation, &provider_catalog);
+        let service = disabled_agent_service(&generation, &provider_catalog).await;
         let proof = crate::agent::entry::test_cli_agent_turn_proof(&generation, "ollama", "prx-local-model");
         let snapshot = service.agent_budget_snapshot(&proof).expect("source-owned budget");
         assert_eq!(snapshot.budgets.tokens, 1_792);
@@ -5681,7 +5660,8 @@ mod tests {
         let mut other_config = config;
         other_config.agent.compaction.max_context_tokens = 15;
         let other_generation = crate::config::new_shared(other_config.clone()).pin();
-        let other_service = disabled_agent_service(&other_generation, &ProviderCatalogView::from_config(&other_config));
+        let other_service =
+            disabled_agent_service(&other_generation, &ProviderCatalogView::from_config(&other_config)).await;
         let other_proof =
             crate::agent::entry::test_cli_agent_turn_proof(&other_generation, "ollama", "prx-local-model");
         assert!(matches!(
@@ -5701,7 +5681,7 @@ mod tests {
         config.workspace_dir = workspace.path().to_path_buf();
         config.causal_tree.enabled = false;
         let generation = crate::config::new_shared(config.clone()).pin();
-        let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config));
+        let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config)).await;
         let proof = crate::agent::entry::test_cli_agent_turn_proof_with_input(
             &generation,
             "ollama",
@@ -5804,7 +5784,8 @@ mod tests {
                 &generation,
                 &ProviderCatalogView::from_config(&config),
                 Arc::clone(&memory),
-            );
+            )
+            .await;
             let proof = if enabled {
                 crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
                     &generation,
@@ -5910,7 +5891,7 @@ mod tests {
         config.workspace_dir = workspace.path().to_path_buf();
         config.causal_tree.backend.max_request_bytes = 4096;
         let generation = crate::config::new_shared(config.clone()).pin();
-        let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config));
+        let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config)).await;
         let raw = "PRX route evidence 01. ".repeat(1_000);
         let proof =
             crate::agent::entry::test_cli_agent_turn_proof_with_input(&generation, "ollama", "prx-local-model", &raw);
@@ -5925,7 +5906,7 @@ mod tests {
         let mut wide = config;
         wide.causal_tree.backend.max_request_bytes = 65_536;
         let wide_generation = crate::config::new_shared(wide.clone()).pin();
-        let wide_service = disabled_agent_service(&wide_generation, &ProviderCatalogView::from_config(&wide));
+        let wide_service = disabled_agent_service(&wide_generation, &ProviderCatalogView::from_config(&wide)).await;
         let wide_proof = crate::agent::entry::test_cli_agent_turn_proof_with_input(
             &wide_generation,
             "ollama",
@@ -6038,14 +6019,14 @@ mod tests {
         );
     }
 
-    fn disabled_agent_service(
+    pub(super) async fn disabled_agent_service(
         generation: &Arc<ConfigGeneration>,
         provider_catalog: &ProviderCatalogView,
     ) -> Arc<TurnDecisionService> {
-        agent_service_with_memory(generation, provider_catalog, Arc::new(NoneMemory::new()))
+        agent_service_with_memory(generation, provider_catalog, Arc::new(NoneMemory::new())).await
     }
 
-    fn agent_service_with_memory(
+    async fn agent_service_with_memory(
         generation: &Arc<ConfigGeneration>,
         provider_catalog: &ProviderCatalogView,
         memory: Arc<dyn Memory>,
@@ -6078,6 +6059,7 @@ mod tests {
                 security,
             },
         )
+        .await
         .expect("Agent fixture service")
     }
 
@@ -6155,6 +6137,7 @@ mod tests {
                 security,
             },
         )
+        .await
         .expect("SQLite-backed fixture service");
         let work = Box::pin(async {
             let proof_a = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
@@ -6737,6 +6720,7 @@ mod tests {
                 security,
             },
         )
+        .await
         .expect("SQLite-backed fixture service");
         let work = Box::pin(async {
             let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
@@ -6917,6 +6901,7 @@ mod tests {
                 security,
             },
         )
+        .await
         .expect("SQLite-backed fixture service");
         let work = Box::pin(async {
             let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
@@ -7040,8 +7025,8 @@ mod tests {
         ledger_probe::finish_service_fixture(&service, work).await
     }
 
-    #[test]
-    fn enabled_agent_rejects_memory_without_message_events_before_key_or_store() {
+    #[tokio::test]
+    async fn enabled_agent_rejects_memory_without_message_events_before_key_or_store() {
         for backend in ["none", "markdown"] {
             let workspace = tempfile::tempdir().expect("test workspace");
             let mut config = crate::config::Config::default();
@@ -7080,15 +7065,16 @@ mod tests {
                     memory,
                     security,
                 },
-            );
+            )
+            .await;
             assert!(matches!(result, Err(TurnServiceBuildError::EventStoreUnsupported)));
             assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
             assert!(!workspace.path().join("self/causal_tree/decisions.db").exists());
         }
     }
 
-    #[test]
-    fn enabled_agent_rejects_disabled_user_event_recording_before_key_or_store() {
+    #[tokio::test]
+    async fn enabled_agent_rejects_disabled_user_event_recording_before_key_or_store() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
@@ -7121,14 +7107,15 @@ mod tests {
                 memory: Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("SQLite memory")),
                 security,
             },
-        );
+        )
+        .await;
         assert!(matches!(result, Err(TurnServiceBuildError::InboundEventsDisabled)));
         assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
         assert!(!workspace.path().join("self/causal_tree/decisions.db").exists());
     }
 
-    #[test]
-    fn agent_hint_route_drift_is_refused_before_credential_resolution() {
+    #[tokio::test]
+    async fn agent_hint_route_drift_is_refused_before_credential_resolution() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
         config.causal_tree.enabled = false;
@@ -7142,7 +7129,7 @@ mod tests {
         });
         let generation = crate::config::new_shared(config.clone()).pin();
         let proof = crate::agent::entry::test_cli_agent_turn_proof(&generation, "ollama", "hint:fast");
-        let matching = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config));
+        let matching = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config)).await;
         assert!(matching.resolve_agent_model(&proof).is_ok());
         assert!(
             matching
@@ -7163,7 +7150,7 @@ mod tests {
 
         let mut foreign = config.clone();
         foreign.model_routes.first_mut().expect("configured route").model = "gpt-4o".to_string();
-        let stale = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&foreign));
+        let stale = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&foreign)).await;
         assert!(matches!(
             stale.resolve_agent_model(&proof),
             Err(TurnModelError::RouteDrift)
@@ -7177,7 +7164,7 @@ mod tests {
         let route = foreign.model_routes.first_mut().expect("configured route");
         route.model = "gpt-4o-mini".to_string();
         route.credential_ref = Some("cred-other".to_string());
-        let wrong_owner = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&foreign));
+        let wrong_owner = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&foreign)).await;
         assert!(matches!(
             wrong_owner.resolve_agent_model(&proof),
             Err(TurnModelError::RouteDrift)
@@ -7185,8 +7172,8 @@ mod tests {
         assert!(!wrong_owner.model_can_call_tools(&proof));
     }
 
-    #[test]
-    fn verified_native_tools_requires_matching_source_selection() {
+    #[tokio::test]
+    async fn verified_native_tools_requires_matching_source_selection() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
         config.causal_tree.enabled = false;
@@ -7208,7 +7195,7 @@ mod tests {
             });
         let generation = crate::config::new_shared(config.clone()).pin();
         let proof = crate::agent::entry::test_cli_agent_turn_proof(&generation, "ollama", "prx-local-model");
-        let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config));
+        let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config)).await;
         assert!(service.resolve_agent_model(&proof).is_ok());
         assert!(service.model_can_call_tools(&proof));
 
@@ -7219,12 +7206,12 @@ mod tests {
             .first_mut()
             .expect("configured model")
             .native_tools = Some(false);
-        let stale = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&foreign));
+        let stale = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&foreign)).await;
         assert!(!stale.model_can_call_tools(&proof));
     }
 
-    #[test]
-    fn disabled_service_keeps_workspace_key_absent_and_builtin_only() {
+    #[tokio::test]
+    async fn disabled_service_keeps_workspace_key_absent_and_builtin_only() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
         config.causal_tree.enabled = false;
@@ -7259,7 +7246,8 @@ mod tests {
                 memory: Arc::new(NoneMemory::new()),
                 security: Arc::new(SecurityPolicy::default()),
             },
-        );
+        )
+        .await;
         assert!(matches!(stale, Err(TurnServiceBuildError::SourceGeneration)));
         assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
         let bundle = TurnServiceBuild {
@@ -7275,7 +7263,9 @@ mod tests {
             memory: Arc::new(NoneMemory::new()),
             security: Arc::new(SecurityPolicy::default()),
         };
-        let first = build_turn_decision_service(TurnSurfaceKind::AgentLoop, bundle).expect("disabled service");
+        let first = build_turn_decision_service(TurnSurfaceKind::AgentLoop, bundle)
+            .await
+            .expect("disabled service");
         assert!(!first.durable_key);
         assert!(!first.recordable);
         let status = first.status();
@@ -7319,6 +7309,7 @@ mod tests {
                 security: Arc::new(SecurityPolicy::default()),
             },
         )
+        .await
         .expect("second disabled service");
         let parts: &[&[u8]] = &[b"prx_turn"];
         assert_ne!(
@@ -7327,8 +7318,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn disabled_service_uses_an_independent_read_only_view_when_a_writer_is_shared() {
+    #[tokio::test]
+    async fn disabled_service_uses_an_independent_read_only_view_when_a_writer_is_shared() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
         config.causal_tree.enabled = false;
@@ -7367,7 +7358,8 @@ mod tests {
                 memory: Arc::new(NoneMemory::new()),
                 security: Arc::new(SecurityPolicy::default()),
             },
-        );
+        )
+        .await;
         let disabled = result.expect("disabled service keeps a separate read-only view");
         assert_eq!(store.mode(), StoreMode::ReadWrite);
         assert_eq!(disabled.store.mode(), StoreMode::ReadOnly);
@@ -7376,8 +7368,8 @@ mod tests {
         assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
     }
 
-    #[test]
-    fn enabled_service_with_unavailable_key_does_not_open_a_writable_store() {
+    #[tokio::test]
+    async fn enabled_service_with_unavailable_key_does_not_open_a_writable_store() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let key_dir = workspace.path().join("self/causal_tree");
         std::fs::create_dir_all(&key_dir).expect("test key directory");
@@ -7413,6 +7405,7 @@ mod tests {
                 security: Arc::new(SecurityPolicy::default()),
             },
         )
+        .await
         .expect("builtin-only service");
         assert!(!service.durable_key);
         assert!(!service.recordable);
@@ -7473,6 +7466,7 @@ mod tests {
                 security,
             },
         )
+        .await
         .expect("recordable service");
         let request_ids = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let service_mut = Arc::get_mut(&mut service).expect("unshared service");
@@ -7584,6 +7578,7 @@ mod tests {
                 security,
             },
         )
+        .await
         .expect("recordable service");
         let request_ids = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -7683,6 +7678,7 @@ mod tests {
                 security,
             },
         )
+        .await
         .expect("recordable drift service");
         changed.store(true, Ordering::SeqCst);
         let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.path().to_string_lossy());
@@ -8062,6 +8058,7 @@ mod tests {
                 security,
             },
         )
+        .await
         .expect("recordable service");
         assert!(service.durable_key && service.recordable);
         let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof(&generation, Arc::clone(&memory)).await;
@@ -8689,6 +8686,7 @@ mod tests {
                 security: reopened_security,
             },
         )
+        .await
         .expect("reopened recordable service");
         // Reconstructed services read their own committed source marker.
         // There is no caller backend or workspace parameter to substitute.
@@ -8742,6 +8740,7 @@ mod tests {
                 security: foreign_security,
             },
         )
+        .await
         .expect("foreign recordable service");
         assert!(
             foreign_service
@@ -8871,8 +8870,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn disabled_service_ignores_an_unsafe_store_path_without_touching_it() {
+    #[tokio::test]
+    async fn disabled_service_ignores_an_unsafe_store_path_without_touching_it() {
         use std::os::unix::fs::symlink;
 
         let workspace = tempfile::tempdir().expect("test workspace");
@@ -8883,7 +8882,7 @@ mod tests {
         config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         let generation = crate::config::new_shared(config.clone()).pin();
-        let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config));
+        let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config)).await;
         assert_eq!(service.store.mode(), StoreMode::ReadOnly);
         assert!(!service.recordable);
         assert!(

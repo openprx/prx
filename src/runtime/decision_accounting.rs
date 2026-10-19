@@ -31,6 +31,14 @@ mod settlement;
 #[cfg(feature = "llm-router")]
 mod cl100k_prefix_bound;
 
+/// Initialize local CPU-heavy accounting tables at runtime construction,
+/// before a source starts its fixed admission clock.
+pub(crate) fn initialize_tokenizers() {
+    let _ = crate::agent::context_budget::count_tokens_with_source("");
+    #[cfg(feature = "llm-router")]
+    cl100k_prefix_bound::initialize();
+}
+
 /// Pinned configuration and a real cleanup owner are borrowed through Arc;
 /// builtin/cache-only calls never initialize the token owner or cost storage.
 pub(crate) struct AccountingScope {
@@ -367,7 +375,7 @@ impl AccountingScope {
                             timing.mark("tracker_open");
                         }
                     }
-                    let tracker = CostTracker::new(config.cost.clone(), &config.workspace_dir)?;
+                    let tracker = CostTracker::for_workspace(config.cost.clone(), &config.workspace_dir)?;
                     #[cfg(test)]
                     {
                         diagnostic_stage = "reserve";
@@ -511,7 +519,7 @@ impl Drop for UnclaimedReceipt {
 
 pub(super) struct OwnedReceipt {
     _settlement_guard: tokio::sync::OwnedMutexGuard<()>,
-    tracker: CostTracker,
+    tracker: Arc<CostTracker>,
     receipt: ReservationReceipt,
     config: Arc<Config>,
     provider: String,
