@@ -51,28 +51,23 @@ pub(super) async fn open_store(
         .map(|owner| owner.register(CancellationToken::new()))
         .transpose()
         .map_err(TurnServiceBuildError::PreparationOwner)?;
-    Ok(tokio::task::spawn_blocking(move || {
-        let config = &generation.effective;
-        let result = if durable_key {
-            CausalDecisionStore::open_shared(
-                &config.workspace_dir,
-                Retention::days(
-                    config.causal_tree.store.retention_days,
-                    config.self_system.fitness.retention_days,
-                ),
-                events,
-                StoreMode::ReadWrite,
-            )
-        } else {
-            Ok(CausalDecisionStore::open_unshared_read_only(&config.workspace_dir))
-        };
-        if let Some(ticket) = ticket {
-            ticket.retain_prepared_store(result.as_ref().ok().cloned(), durable_events);
-            ticket.finish(true);
-        }
-        result
-    })
-    .await??)
+    let config = &generation.effective;
+    Ok(crate::causal_tree::store_preparation::open_store(
+        config.workspace_dir.clone(),
+        Retention::days(
+            config.causal_tree.store.retention_days,
+            config.self_system.fitness.retention_days,
+        ),
+        events,
+        durable_key.then_some(StoreMode::ReadWrite),
+        move |result| {
+            if let Some(ticket) = ticket {
+                ticket.retain_prepared_store(result.as_ref().ok().cloned(), durable_events);
+                ticket.finish(true);
+            }
+        },
+    )
+    .await?)
 }
 
 #[cfg(test)]

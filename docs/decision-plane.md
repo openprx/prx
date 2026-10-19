@@ -638,6 +638,7 @@ historical events are not rewritten by this change.
 SQLite memory initialization applies schema creation, legacy upgrades and migration-checksum verification in one write transaction. A failed upgrade rolls back the entire initialization; a successful open commits once, reducing schema-write interference with active decision deadlines. Migration versions, checksums and durability settings are unchanged.
 
 Decision-store preparation runs on blocking workers before source admission.
+Operator-worker publication and admin opens use the same preparation path.
 The process registry only locates per-path slots; SQLite open, WAL setup and
 migration never hold the global registry lock. A concurrent open of the same
 path shares its slot, while unrelated workspaces can prepare independently.
