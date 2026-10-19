@@ -142,31 +142,31 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     // closed pipe (the OOM-kill shape); the other emits output in instalments
     // so the drain can be observed refreshing the run's progress beat while the
     // child is still alive. A managed spawn would hide both.
-    "src/tools/sessions_spawn.rs::a_sigkilled_worker_is_classified_as_exited_without_result::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn/tests/liveness.rs::a_sigkilled_worker_is_classified_as_exited_without_result::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
     // b2: a join must survive a member that is a real OS process emitting
     // nothing at all; only a real child can prove the silence is real.
-    "src/tools/sessions_spawn.rs::a_join_survives_a_real_child_process_that_never_writes_anything::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn/tests/join.rs::a_join_survives_a_real_child_process_that_never_writes_anything::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
     // Test-only (b3): the wording that separates `no_result` from `failed` must
     // be derived from a genuinely SIGKILLed child through the production
     // classifier, not typed into the test — a managed spawn would supply an
     // exit status the classifier never sees in the fault this models.
-    "src/tools/sessions_spawn.rs::silent_death_reason_from_a_real_sigkill::.spawn()",
-    "src/tools/sessions_spawn.rs::worker_output_refreshes_the_run_beat_while_it_is_still_arriving::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
-    "src/tools/sessions_spawn.rs::assert_explicit_cleanup_signals_once::let mut child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::injected_panic_cleanup_try_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::injected_termination_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::injected_wait_error_keeps_child_finalization_and_slot_pending::let child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::owned_child_panic_cleanup_signals_once_and_reaps_before_return::let mut child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::owner_keeps_child_after_requester_timeout_until_reap::let child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::owner_mediated_process_kill_reaps_leader_and_terminates_group::let child = command.spawn().expect(\"test child should spawn\");",
-    "src/tools/sessions_spawn.rs::process_mode_waits_for_natural_completion_without_a_deadline::let mut child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::run_sub_agent_process::let mut child = command.spawn()?;",
+    "src/tools/sessions_spawn/tests/join_verdicts.rs::silent_death_reason_from_a_real_sigkill::.spawn()",
+    "src/tools/sessions_spawn/tests/liveness.rs::worker_output_refreshes_the_run_beat_while_it_is_still_arriving::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn/tests/owned_child.rs::assert_explicit_cleanup_signals_once::let mut child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::injected_panic_cleanup_try_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::injected_termination_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::injected_wait_error_keeps_child_finalization_and_slot_pending::let child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::owned_child_panic_cleanup_signals_once_and_reaps_before_return::let mut child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::owner_keeps_child_after_requester_timeout_until_reap::let child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::owner_mediated_process_kill_reaps_leader_and_terminates_group::let child = command.spawn().expect(\"test child should spawn\");",
+    "src/tools/sessions_spawn/tests/owned_child.rs::process_mode_waits_for_natural_completion_without_a_deadline::let mut child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/process_mode.rs::run_sub_agent_process::let mut child = command.spawn()?;",
     // Test-only: the steer wire is only proved by a real pipe to a real child,
     // so these two stand in for a session-worker (one echoes stdin, one never
     // reads it) rather than mocking the very pipe under test.
-    "src/tools/sessions_spawn.rs::steer_frames_reach_worker_stdin_and_land_in_history::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
-    "src/tools/sessions_spawn.rs::steer_pump_backpressures_when_the_worker_never_reads_stdin::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
-    "src/tools/sessions_spawn.rs::termination_after_leader_exit_does_not_wait_forever_on_inherited_pipe::let mut child = command.spawn().expect(\"test leader should spawn\");",
+    "src/tools/sessions_spawn/tests/actions.rs::steer_frames_reach_worker_stdin_and_land_in_history::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn/tests/actions.rs::steer_pump_backpressures_when_the_worker_never_reads_stdin::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn/tests/owned_child.rs::termination_after_leader_exit_does_not_wait_forever_on_inherited_pipe::let mut child = command.spawn().expect(\"test leader should spawn\");",
     // Test-only: the orphan-reclaim test must create a child that deliberately
     // bypasses the managed path, otherwise there is no orphan to detect.
     "src/runtime/registry.rs::unreaped_child_is_reported_as_an_orphan_then_reclaimed::let mut child = command.spawn().expect(\"test: spawn detached child\");",
@@ -1205,7 +1205,7 @@ const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
     "src/tools/message_send.rs::auto_generate_voice::let mut ffmpeg_cmd = tokio::process::Command::new(\"ffmpeg\");",
     "src/tools/message_send.rs::auto_generate_voice::let mut node_cmd = tokio::process::Command::new(\"node\");",
     "src/tools/message_send.rs::auto_generate_voice::let mut npm_cmd = tokio::process::Command::new(\"npm\");",
-    "src/tools/sessions_spawn.rs::run_sub_agent_process::let mut command = tokio::process::Command::new(executable);",
+    "src/tools/sessions_spawn/process_mode.rs::run_sub_agent_process::let mut command = tokio::process::Command::new(executable);",
     "src/tunnel/cloudflare.rs::start::let mut child = Command::new(\"cloudflared\")",
     "src/tunnel/custom.rs::start::let mut child = Command::new(parts[0])",
     "src/tunnel/ngrok.rs::start::Command::new(\"ngrok\")",
@@ -2768,7 +2768,16 @@ fn runtime_prompt_has_no_parallel_tool_description_catalog() {
         "src/chat/views.rs",
         "src/gateway/api/sessions.rs",
         "src/gateway/mod.rs",
-        "src/session_worker/runner.rs",
+        "src/session_worker/runner/mod.rs",
+        "src/session_worker/runner/capability.rs",
+        "src/session_worker/runner/context.rs",
+        "src/session_worker/runner/paths.rs",
+        "src/session_worker/runner/prompt.rs",
+        "src/session_worker/runner/provider.rs",
+        "src/session_worker/runner/run.rs",
+        "src/session_worker/runner/steering.rs",
+        "src/session_worker/runner/tools.rs",
+        "src/session_worker/runner/validate.rs",
     ];
     let mut scanned = Vec::new();
     for path in rust_source_files() {
@@ -2869,9 +2878,9 @@ fn production_tool_loop_memory_is_wired_to_request_context_events() {
         "src/chat/run.rs",
         "src/gateway/api/sessions.rs",
         "src/gateway/mod.rs",
-        "src/session_worker/runner.rs",
+        "src/session_worker/runner/run.rs",
         "src/tools/delegate.rs",
-        "src/tools/sessions_spawn.rs",
+        "src/tools/sessions_spawn/task_mode.rs",
     ] {
         let source = fs::read_to_string(repository_root().join(relative))
             .unwrap_or_else(|error| panic!("read {relative}: {error}"));
@@ -2931,9 +2940,9 @@ const REVIEWED_DECISION_HANDOFFS: &[(&str, usize, &str)] = &[
         1,
         "crate::agent::turn_request::TurnDecision{service,context:&context,proof:&gateway_proof,}",
     ),
-    ("src/session_worker/runner.rs", 1, "admitted_turn.routing()"),
+    ("src/session_worker/runner/run.rs", 1, "admitted_turn.routing()"),
     ("src/tools/delegate.rs", 1, "child_turn.routing()"),
-    ("src/tools/sessions_spawn.rs", 1, "child_turn.routing()"),
+    ("src/tools/sessions_spawn/task_mode.rs", 1, "child_turn.routing()"),
 ];
 
 fn compact_rust_tokens(expression: &str) -> String {
@@ -3537,9 +3546,9 @@ const FORWARDED_COMPACTION_SITES: &[&str] = &[
     // The reducer action carries its explicitly resolved compaction config.
     "src/chat/dispatcher.rs::drive_start_turn_stream",
     // Workers prefer admitted child context, retaining the signed manifest fallback.
-    "src/session_worker/runner.rs::run_owned_manifest",
+    "src/session_worker/runner/run.rs::run_owned_manifest",
     "src/tools/delegate.rs::execute_tool_loop",
-    "src/tools/sessions_spawn.rs::run_sub_agent_task",
+    "src/tools/sessions_spawn/task_mode.rs::run_sub_agent_task",
 ];
 
 /// The sub-agent tool types and their constructors (INT-2B a46).
@@ -3743,7 +3752,7 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         }
         if matches!(
             relative.as_str(),
-            "src/tools/delegate.rs" | "src/tools/sessions_spawn.rs"
+            "src/tools/delegate.rs" | "src/tools/sessions_spawn/spawn.rs"
         ) {
             for (at, _) in production.match_indices("resolve_effective_compaction_config_with_catalog(") {
                 admitted_resolution_sites.push(site(at));
@@ -3759,7 +3768,7 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
             "src/channels/mod.rs::start_channels_with_config",
             "src/chat/run.rs::run",
             "src/gateway/mod.rs::register_gateway_turn_tools",
-            "src/session_worker/runner.rs::worker_spawn_tool",
+            "src/session_worker/runner/provider.rs::worker_spawn_tool",
             "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions",
         ],
     );
@@ -3768,7 +3777,7 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         admitted_resolution_sites,
         &[
             "src/tools/delegate.rs::resolve_pinned_child_compaction",
-            "src/tools/sessions_spawn.rs::resolve_pinned_child_compaction",
+            "src/tools/sessions_spawn/spawn.rs::resolve_pinned_child_compaction",
         ],
     );
 }
@@ -3787,7 +3796,7 @@ const FORWARDED_COMPACTION_PRODUCERS: &[(&str, &str, &str, Option<&str>)] = &[
     ),
     // `WorkerManifest.compaction_config` (process branch).
     (
-        "src/tools/sessions_spawn.rs",
+        "src/tools/sessions_spawn/spawn.rs",
         "execute_spawn_with_id",
         "&process_compaction_config",
         None,
@@ -3977,11 +3986,13 @@ fn production_turns_budget_on_the_effective_context_window() {
                         "src/agent/entry.rs::run_with_runtime_envelope" => "Some(decision_context.main_compaction())",
                         "src/channels/mod.rs::run_channel_turn" => "Some(decision_turn.compaction())",
                         "src/chat/dispatcher.rs::drive_start_turn_stream" => "compaction_config.as_ref()",
-                        "src/session_worker/runner.rs::run_owned_manifest" => {
+                        "src/session_worker/runner/run.rs::run_owned_manifest" => {
                             "child_turn.as_ref().map(|turn|turn.compaction()).or(compaction_config_ref)"
                         }
                         "src/tools/delegate.rs::execute_tool_loop"
-                        | "src/tools/sessions_spawn.rs::run_sub_agent_task" => "Some(child_turn.compaction())",
+                        | "src/tools/sessions_spawn/task_mode.rs::run_sub_agent_task" => {
+                            "Some(child_turn.compaction())"
+                        }
                         _ => panic!("unreviewed forwarded compaction site: {site}"),
                     };
                     assert_eq!(
@@ -4072,9 +4083,9 @@ fn context_handoff_has_one_production_owner_and_exact_lookup_is_registered() {
 
     for relative in [
         "src/agent/turn_engine.rs",
-        "src/session_worker/runner.rs",
+        "src/session_worker/runner/tests/tool_selection.rs",
         "src/tools/delegate.rs",
-        "src/tools/sessions_spawn.rs",
+        "src/tools/sessions_spawn/tool_proxy.rs",
     ] {
         let source = fs::read_to_string(repository_root().join(relative))
             .unwrap_or_else(|error| panic!("read {relative}: {error}"));
@@ -4429,9 +4440,9 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     "src/tools/image.rs::execute",
     // `run_sub_agent_task`: the operator steering turn, which opens with `[Steering instruction from
     // operator]` and so can never open with a reserved marker.
-    "src/tools/sessions_spawn.rs::run_sub_agent_task",
+    "src/tools/sessions_spawn/task_mode.rs::run_sub_agent_task",
     // The session worker's steering turn, the same wrapper.
-    "src/session_worker/runner.rs::run_segments_with_steering",
+    "src/session_worker/runner/steering.rs::run_segments_with_steering",
 ];
 
 /// The names the loop-note guards scan for cannot be hidden (R-LOOPD5 F-1).
@@ -4878,7 +4889,30 @@ const LABEL_LOG_FILES: &[&str] = &[
     "src/router/context.rs",
     "src/router/mod.rs",
     "src/tools/delegate.rs",
-    "src/tools/sessions_spawn.rs",
+    "src/tools/sessions_spawn/actions.rs",
+    "src/tools/sessions_spawn/announce.rs",
+    "src/tools/sessions_spawn/batch.rs",
+    "src/tools/sessions_spawn/builders.rs",
+    "src/tools/sessions_spawn/chat_assign.rs",
+    "src/tools/sessions_spawn/child_lifecycle.rs",
+    "src/tools/sessions_spawn/events.rs",
+    "src/tools/sessions_spawn/failure.rs",
+    "src/tools/sessions_spawn/memory_scope.rs",
+    "src/tools/sessions_spawn/mod.rs",
+    "src/tools/sessions_spawn/monitor.rs",
+    "src/tools/sessions_spawn/owned_process.rs",
+    "src/tools/sessions_spawn/process_control.rs",
+    "src/tools/sessions_spawn/process_mode.rs",
+    "src/tools/sessions_spawn/provider.rs",
+    "src/tools/sessions_spawn/scope.rs",
+    "src/tools/sessions_spawn/spawn.rs",
+    "src/tools/sessions_spawn/task_mode.rs",
+    "src/tools/sessions_spawn/terminal_commit.rs",
+    "src/tools/sessions_spawn/test_worker.rs",
+    "src/tools/sessions_spawn/tool.rs",
+    "src/tools/sessions_spawn/tool_proxy.rs",
+    "src/tools/sessions_spawn/worker_capability.rs",
+    "src/tools/sessions_spawn/worker_manifest.rs",
 ];
 
 /// Log fields that name a provider or a `<provider>/<model>` target.
@@ -5332,9 +5366,27 @@ fn terminal_provider_label_guard_rejects_bypass_missing_calls_and_literal_decoys
 #[test]
 fn a_session_worker_selects_its_tools_through_its_manifest() {
     let root = repository_root();
-    let source =
-        fs::read_to_string(root.join("src/session_worker/runner.rs")).expect("read src/session_worker/runner.rs");
-    let production = strip_cfg_test_items(&source);
+    let production: String = [
+        "mod",
+        "capability",
+        "context",
+        "paths",
+        "prompt",
+        "provider",
+        "run",
+        "steering",
+        "tools",
+        "validate",
+    ]
+    .iter()
+    .map(|name| {
+        let relative = format!("src/session_worker/runner/{name}.rs");
+        let source =
+            fs::read_to_string(root.join(&relative)).unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        strip_cfg_test_items(&source)
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
 
     let entry = function_body(&production, "run_owned_manifest");
     assert!(
@@ -5682,22 +5734,22 @@ const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
         "decorator: the tiering wrapper forwards to the wrapped tool",
     ),
     (
-        "src/tools/sessions_spawn.rs::execute",
+        "src/tools/sessions_spawn/tool_proxy.rs::execute",
         1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
     (
-        "src/tools/sessions_spawn.rs::execute_named",
+        "src/tools/sessions_spawn/tool_proxy.rs::execute_named",
         1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
     (
-        "src/tools/sessions_spawn.rs::execute_named_with_cancellation",
+        "src/tools/sessions_spawn/tool_proxy.rs::execute_named_with_cancellation",
         1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
     (
-        "src/tools/sessions_spawn.rs::execute_with_cancellation",
+        "src/tools/sessions_spawn/tool_proxy.rs::execute_with_cancellation",
         1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
@@ -8029,7 +8081,7 @@ fn session_worker_credentials_are_decided_in_one_scoped_place() {
     }
     assert_eq!(
         factory_sites,
-        vec!["src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for".to_string()],
+        vec!["src/session_worker/runner/provider.rs:build_worker_provider_selection:create_provider_for".to_string()],
         "a session worker builds its provider only through `worker_provider`"
     );
 }
@@ -8150,7 +8202,7 @@ fn provider_construction_outside_the_provider_module_is_pinned() {
         "src/runtime/child_source.rs:from_selection:create_provider_for",
         "src/runtime/turn_decision/auxiliary.rs:auxiliary_accounting:create_provider_for",
         "src/runtime/turn_decision/auxiliary.rs:smart_group_accounting:create_provider_for",
-        "src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for",
+        "src/session_worker/runner/provider.rs:build_worker_provider_selection:create_provider_for",
     ]
     .iter()
     .map(|site| (*site).to_string())
