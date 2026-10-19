@@ -182,6 +182,12 @@ write concurrently across workspaces; scalar and Applied writes, selected reads
 and accounting are outside this background gate. Observers remain immediate.
 Batches stop at Applied and drain markers, preserving their FIFO boundary;
 a storage failure still reports incomplete persistence for each affected event.
+The decision-store writer also commits up to 32 already queued ordinary chains
+in one transaction. Each chain has its own savepoint, so a conflict or SQL error
+rolls back that entire chain without losing its valid neighbors. Notifications
+follow the real outer commit. Batches stop at acknowledged reads, outcomes,
+import progress, drain/close markers and the original retention boundary;
+selected Router commits and delegation readbacks keep their existing deadlines.
 A failed write closes further accounting and leaves cleanup unconfirmed. Missing, partial
 or estimated usage retains the pending token and money liability; cancellation does not turn
 an unknown charge into zero. Local budget refusal does not damage backend health.
