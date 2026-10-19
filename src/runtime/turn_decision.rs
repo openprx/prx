@@ -647,6 +647,7 @@ pub(crate) struct TurnDecisionContext {
     source_actor: (Arc<str>, Arc<str>),
     service_id: uuid::Uuid,
     record_admitted: AtomicBool,
+    recursive_child_claimed: std::sync::OnceLock<Arc<AtomicBool>>,
     execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
     #[cfg(feature = "llm-router")]
     automix_deadline: std::sync::OnceLock<std::time::Instant>,
@@ -2498,6 +2499,7 @@ impl TurnDecisionService {
                 source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
                 service_id: self.service_id,
                 record_admitted: AtomicBool::new(false),
+                recursive_child_claimed: Default::default(),
                 execution_trace: std::sync::OnceLock::new(),
                 #[cfg(feature = "llm-router")]
                 automix_deadline: std::sync::OnceLock::new(),
@@ -2552,6 +2554,7 @@ impl TurnDecisionService {
                         source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
                         service_id: self.service_id,
                         record_admitted: AtomicBool::new(false),
+                        recursive_child_claimed: Default::default(),
                         execution_trace: std::sync::OnceLock::new(),
                         #[cfg(feature = "llm-router")]
                         automix_deadline: std::sync::OnceLock::new(),
@@ -2812,6 +2815,7 @@ impl TurnDecisionService {
                             source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
+                            recursive_child_claimed: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -2854,6 +2858,7 @@ impl TurnDecisionService {
                             source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
+                            recursive_child_claimed: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -2897,6 +2902,7 @@ impl TurnDecisionService {
                             source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
+                            recursive_child_claimed: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -3431,6 +3437,7 @@ mod tests {
     pub(crate) mod exact_call_approval;
     mod ledger_probe;
     mod performance;
+    mod recursive_budget;
     mod terminal_scope;
 
     use std::collections::BTreeMap;
@@ -5102,6 +5109,7 @@ mod tests {
             source_actor: (Arc::from("cli"), Arc::from("local-user")),
             service_id: uuid::Uuid::nil(),
             record_admitted: AtomicBool::new(false),
+            recursive_child_claimed: Default::default(),
             execution_trace: std::sync::OnceLock::new(),
             #[cfg(feature = "llm-router")]
             automix_deadline: std::sync::OnceLock::new(),
@@ -6391,6 +6399,7 @@ mod tests {
                 source_actor: (Arc::from("cli"), Arc::from("local-user")),
                 service_id: service.service_id,
                 record_admitted: AtomicBool::new(false),
+                recursive_child_claimed: Default::default(),
                 execution_trace: std::sync::OnceLock::new(),
                 #[cfg(feature = "llm-router")]
                 automix_deadline: std::sync::OnceLock::new(),

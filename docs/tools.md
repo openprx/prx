@@ -1248,7 +1248,9 @@ An enabled, admitted parent can explicitly request that a `sessions_spawn` child
 may spawn another child by setting `allow_delegation: true` on the spawn request
 or a batch entry. This requires `allow_recursive_delegation = true` in
 `[sessions_spawn]`; the operator setting defaults to false. `max_recursive_depth` defaults to
-1 additional level and must be positive when permission is enabled. Without the
+1 additional level and must equal 1 when permission is enabled. Depth 2 is
+refused at configuration validation because the strict tool-subset contract
+cannot pass the same singleton delegator set onward. Without the
 request, an exact model-only spawn retains its existing empty capability set.
 An invalid batch opt-in is refused before any member is journaled or started,
 and the caller receives the policy refusal reason.
@@ -1259,6 +1261,18 @@ Every generation consumes depth, retains the owner, channel exclusions and cost
 ceiling, and pins descendants to the child's selected provider/model. Model and
 provider fallback cannot escape these pins. A descendant must opt in again to
 pass delegation onward; it cannot replenish depth or recover discarded tools.
+A recursive grant permits at most one child, including a model-only leaf.
+A recursive batch with more than one member is refused before launch; repeating
+a single spawn or issuing another outgoing grant cannot reset the consumed slot.
+This caps fanout instead of copying the same cost ceiling into multiple leaves.
+A failed publication consumes its slot conservatively.
+
+Enabling the operator permission also retains the root
+`capability_search` reference before a future spawn request is known. This
+changes the root parent-set/depth bookkeeping even for requests without opt-in.
+Such children still receive exactly the empty model-only tool set and no
+recursive delegation permission; they cannot use that retained root reference.
+
 Worker manifests seal the request, pins and depth, and admission verifies them
 again. `task.spawned` and child-input records carry the grant projection.
 Nested workers bind their logical parent task separately from the admitted

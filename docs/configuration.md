@@ -825,8 +825,9 @@ max_recursive_depth = 1
 ```
 
 The permission defaults to false, including when loading an older config.
-When permission is enabled, `max_recursive_depth` must be positive and caps the
-additional levels an opted-in child can receive. Each child remains a proper
+When permission is enabled, `max_recursive_depth` must equal 1. Values above 1 are refused while
+permission is enabled; the current strict tool-subset contract supports one
+additional level. Each child remains a proper
 subset of its authenticated parent, cannot replenish depth or budget, and keeps
 the selected provider/model pins through descendants. A request without the
 opt-in keeps the existing exact model-only scope. See [recursive child grants](tools.md)

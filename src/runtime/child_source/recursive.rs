@@ -4,6 +4,43 @@ use super::{Arc, ChildGrantData, IssuedChildGrant};
 use anyhow::Context as _;
 
 impl IssuedChildGrant {
+    pub(in crate::runtime) fn recursive_child_allowance(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        self.0.recursive_child_claimed.clone()
+    }
+
+    pub(crate) fn has_recursive_ancestry(&self) -> bool {
+        self.scope().gate_inputs().0.authority.delegation.is_some()
+    }
+
+    /// Refuse a spent grant before batch journaling. Publication still claims
+    /// atomically, since concurrent requests can pass this read-only check.
+    pub(crate) fn ensure_recursive_child_available(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self
+                .0
+                .recursive_child_claimed
+                .as_ref()
+                .context("recursive grant has no child allowance owner")?
+                .load(std::sync::atomic::Ordering::Acquire),
+            "recursive grant already allocated its one child allowance"
+        );
+        Ok(())
+    }
+
+    fn claim_recursive_child(&self) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        anyhow::ensure!(
+            self.0
+                .recursive_child_claimed
+                .as_ref()
+                .context("recursive grant has no child allowance owner")?
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "recursive grant already allocated its one child allowance"
+        );
+        Ok(())
+    }
+
     pub(super) fn verify_child_model(&self, provider: &str, model: &str) -> anyhow::Result<()> {
         let (issued, _) = self.scope().gate_inputs();
         if let Some(pins) = &issued.authority.delegation {
@@ -25,6 +62,9 @@ impl IssuedChildGrant {
         let (issued, parent) = self.scope().gate_inputs();
         self.verify_child_model(provider, model)?;
         if !requested {
+            if issued.authority.delegation.is_some() {
+                self.claim_recursive_child()?;
+            }
             return Ok(Arc::clone(self));
         }
         let config = &self.generation().effective.sessions_spawn;
@@ -62,7 +102,11 @@ impl IssuedChildGrant {
         let scope = Arc::new(crate::tools::capability::child::VerifiedChildScope::new(
             manifest, parent,
         )?);
+        self.claim_recursive_child()?;
         Ok(Arc::new(Self(Arc::new(ChildGrantData {
+            // The newly published child owns one further child slot; the
+            // parent slot was consumed above and stays consumed across reissue.
+            recursive_child_claimed: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             parent_model: self.0.parent_model.clone(),
             source_fabric: self.0.source_fabric.clone(),
             security: Arc::clone(&self.0.security),
