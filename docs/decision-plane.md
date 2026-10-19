@@ -150,8 +150,9 @@ The estimate is not a vendor-enforced billing cap. Each retry has its own durabl
 reservation; builtin and cache-only paths do not open the cost ledger.
 For a two-attempt plan, accounting prefers an equal share of the remaining
 tokens. If the complete guarded input cannot fit that share but does fit the
-existing total allowance, the current attempt reserves the smallest larger
-share that satisfies the existing strict input-fit check instead.
+existing total allowance, the current attempt reserves input plus the declared
+wire output cap, clamped to that available allowance. Without a wire output cap,
+it conservatively reserves the whole available allowance instead.
 This does not raise a token, cost or time limit or guarantee a second attempt:
 each later attempt must fit the actual remaining allowance. Unknown usage keeps
 the whole claimed reservation; only fully reported usage releases unused tokens.
@@ -163,8 +164,54 @@ closed on that workspace ledger. Once the transport receives the receipt,
 missing usage still retains the entire liability.
 
 Fully reported input/output usage replaces the estimate using pinned PMM prices.
-Actual usage above the estimate is recorded in full. Missing, partial or estimated
-usage retains the pending token and money liability; cancellation does not turn
+Actual usage above the estimate is recorded in full. Known usage updates the
+local budget while cleanup owns its durable settlement in the background, so
+semantic admission can overlap the ledger sync and reconciliation. The durable
+dispatched hold stays in place until both writes finish. Another physical send
+waits for that persistence; shutdown and next-turn cleanup also wait. The receipt
+retains its serialization gate from reservation through transport and settlement,
+so handing reported usage to persistence cannot suspend behind another request.
+Only one physical attempt can be in flight in one decision-accounting scope.
+A second attempt in that same scope waits even while the first provider call is
+still running; it can exhaust its unchanged admission deadline without being
+sent. Retry attempts proceed after the previous receipt has relinquished the
+gate. Independent scopes do not share this gate.
+
+Deferred settlement has a crash window: the in-memory usage adjustment can
+precede the canonical cost-row sync. The durable dispatched estimate remains,
+but any reported actual cost above that estimate can be absent after a crash
+in this interval. The gate bounds this window to at most one reported,
+not-yet-durable settlement per live scope; there is no fixed wall-clock bound
+on slow storage and no single global monetary bound across concurrent scopes.
+Cleanup waits for persistence and closes further accounting on failure. It
+cannot recover an excess that was never durably written before a process crash.
+Metering and estimated-liability reconciliation share one held ledger lock and
+snapshot. The canonical cost row is synced before journal reconciliation;
+invalid journal state still retains the charge and fails cleanup closed.
+Ordinary phase writes defer only for their own source admission, until its
+deadline or guard release. Each queued event retains that admission's deferral;
+overlapping sessions cannot extend it. Re-admitting the same source releases
+its earlier deferral. Delegation reads its committed chain in one bounded operation
+on the writer connection, retaining owner, lineage and replay-digest checks.
+Already queued ordinary phase events persist in batches of at most 32. SQLite
+commits each batch once, isolating individual invalid events with savepoints;
+other backends retain ordered per-event results. At most two SQLite event batches
+write concurrently across workspaces; scalar and Applied writes, selected reads
+and accounting are outside this background gate. Observers remain immediate.
+Applied events bypass deferred ordinary events. A drain marker flushes every
+earlier queued ordinary event before acknowledging, even while admission guards
+remain alive. Ordinary order is retained within an admission; unrelated sessions
+may persist independently. The ordinary backlog is bounded to 256 events across
+the queue, deferred events and in-flight writes, with overflow still reported.
+A storage failure still reports incomplete persistence for each affected event.
+The decision-store writer also commits up to 32 already queued ordinary chains
+in one transaction. Each chain has its own savepoint, so a conflict or SQL error
+rolls back that entire chain without losing its valid neighbors. Notifications
+follow the real outer commit. Batches stop at acknowledged reads, outcomes,
+import progress, drain/close markers and the original retention boundary;
+selected Router commits and delegation readbacks keep their existing deadlines.
+A failed write closes further accounting and leaves cleanup unconfirmed. Missing, partial
+or estimated usage retains the pending token and money liability; cancellation does not turn
 an unknown charge into zero. Local budget refusal does not damage backend health.
 Post-prediction gates and scoring use remaining budgets without rewriting the
 fingerprinted request state. A priced direct Answer has zero extra execution
@@ -173,6 +220,13 @@ token and monetary estimate still pass G6. Retrieval and tool candidates keep
 their own execution-latency estimates. Administrative probes/tests use a
 separate owned scope under the existing live-test permission checks. An
 unfunded probe is reported as unprobed, not as successful health evidence.
+
+While a decision is admitted, ordinary phase-event persistence waits until that
+admission ends instead of competing with its required I/O. The guard starts
+after the decision deadline is set. Observers receive phases immediately;
+leaving admission, including cancellation, releases the queued writes in order.
+An issued context can retain physical accounting without retaining this guard,
+and cleanup still drains the phase events before confirming completion.
 
 Supported auxiliary transports account for each actual send, including nested
 fallbacks. Unsupported transports refuse the additional call before dispatch.
@@ -580,3 +634,24 @@ closes locally without claiming a persisted failure event. Admission failure and
 decision issuance are serialized for the same input. These candidate paths still
 require the full behavioral, cancellation, privacy and performance gates; existing
 historical events are not rewritten by this change.
+
+SQLite memory initialization applies schema creation, legacy upgrades and migration-checksum verification in one write transaction. A failed upgrade rolls back the entire initialization; a successful open commits once, reducing schema-write interference with active decision deadlines. Migration versions, checksums and durability settings are unchanged.
+
+Decision-store preparation runs on blocking workers before source admission.
+The process registry only locates per-path slots; SQLite open, WAL setup and
+migration never hold the global registry lock. A concurrent open of the same
+path shares its slot, while unrelated workspaces can prepare independently.
+Cancelled publication retains preparation tickets and prepared store/event
+queues under runtime cleanup until the actual work and drains complete.
+Accounting tokenizer tables initialize at runtime construction. Physical
+reservation and cost-ledger appends still sync every file write, but sync the
+directory only when creating its journal entry; existing journals keep their
+validated private-file and no-symlink checks. Physical accounting reuses the
+workspace cost tracker, retaining its locked reservation and settlement checks.
+
+Automix may continue after the original decision deadline, using a single
+configured premium window starting at the cheap reply (default 30 seconds,
+hard maximum 120 seconds). Main settlement, premium reservation and dispatch
+consume this window. The continuation shares the original accounting balance
+and settlement gate; it does not replenish money, tokens, tools or decision
+authority. See [Router configuration](router.md) for the field and range.

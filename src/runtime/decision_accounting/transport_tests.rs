@@ -128,7 +128,7 @@ fn reply(usage: Option<Value>) -> Value {
     }
     value
 }
-fn journal(workspace: &std::path::Path) -> anyhow::Result<Vec<Value>> {
+pub(super) fn journal(workspace: &std::path::Path) -> anyhow::Result<Vec<Value>> {
     std::fs::read_to_string(workspace.join("state/costs.reservations.jsonl"))?
         .lines()
         .map(|line| serde_json::from_str(line).map_err(Into::into))
@@ -305,7 +305,7 @@ async fn a_request_above_the_retry_share_can_use_the_existing_owner_allowance() 
     );
     let input_tokens = u64::try_from(input_tokens)?;
     assert!(input_tokens >= budgets.tokens / 2 && input_tokens < budgets.tokens);
-    assert_eq!(receipt.reserved_tokens, input_tokens + 1);
+    assert_eq!(receipt.reserved_tokens, budgets.tokens);
     let reserved_tokens = receipt.reserved_tokens;
     let reserved_money = receipt.reserved_micro_usd;
     assert_eq!(scope.remaining_budgets().tokens, budgets.tokens - reserved_tokens);
@@ -541,6 +541,13 @@ async fn run_case(case: Case) -> anyhow::Result<()> {
                     .await;
                     assert!(denied.is_err(), "unknown liability cannot fund another send");
                 }
+                if let Some(remaining) = scope.remaining.get() {
+                    let _persisted = remaining.settlement_gate.lock().await;
+                    anyhow::ensure!(
+                        !remaining.settlement_failed.load(Ordering::Acquire),
+                        "usage persistence failed"
+                    );
+                }
                 let rows = journal(workspace.path())?;
                 let reserved: BTreeSet<_> = rows
                     .iter()
@@ -651,4 +658,36 @@ async fn real_nested_responses_fallback_accounts_both_physical_sends() {
     run_case(Case::FullResponsesFallback)
         .await
         .expect("actual nested endpoint fallback");
+}
+
+#[cfg(feature = "llm-router")]
+#[test]
+fn automix_window_shares_spend_balance_and_failed_settlement_after_decision_deadline() {
+    let cleanup = Arc::new(CleanupTracker::default());
+    let original_deadline = Instant::now();
+    let scope = AccountingScope::new(
+        Arc::new(Config::default()),
+        DecisionKey::ephemeral(),
+        cleanup,
+        [31; 32],
+        TurnBudgets {
+            tokens: 1024,
+            micro_usd: 5000,
+            latency_ms: 500,
+        },
+        original_deadline,
+    );
+    let premium_deadline = Instant::now() + Duration::from_secs(30);
+    let premium = scope.automix_window(premium_deadline);
+    let original = scope.remaining.get().expect("original balance initialized");
+    let continued = premium.remaining.get().expect("premium shares balance");
+    assert!(Arc::ptr_eq(original, continued));
+    original.tokens.store(512, Ordering::Release);
+    original.micro_usd.store(2300, Ordering::Release);
+    assert_eq!(premium.remaining_budgets().tokens, 512);
+    assert_eq!(premium.remaining_budgets().micro_usd, 2300);
+    assert_eq!(scope.deadline(), original_deadline);
+    assert_eq!(premium.deadline(), premium_deadline);
+    original.settlement_failed.store(true, Ordering::Release);
+    assert_eq!(premium.remaining_budgets().micro_usd, 0);
 }

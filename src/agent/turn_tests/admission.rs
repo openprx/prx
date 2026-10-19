@@ -423,10 +423,48 @@ impl AdmittedTurn {
                 Some("insufficient_evidence") => "insufficient_evidence",
                 Some("no_legal_path") => "no_legal_path",
                 Some("hop_stopped") => "hop_stopped",
+                Some("deadline_exceeded") => "deadline_exceeded",
+                Some("expired_before_prediction") => "expired_before_prediction",
+                Some("decision_failed") => "decision_failed",
+                Some("all_gated") => "all_gated",
+                Some("choice_outside_legal_set") => "choice_outside_legal_set",
                 Some(_) => "unclassified_code",
                 None => "not_applicable",
             };
-            panic!("mechanics fixture must genuinely reach Execute; directive={kind} reason={reason}");
+            let engine = admitted.context.engine();
+            let blocked: Vec<u8> = engine
+                .pre_commit
+                .outcomes
+                .values()
+                .filter_map(|outcome| match outcome {
+                    crate::causal_tree::gates::GateOutcome::Blocked { gate, .. } => Some(*gate),
+                    _ => None,
+                })
+                .collect();
+            let attempt_ms: Vec<u128> = engine
+                .prediction
+                .as_ref()
+                .map(|prediction| {
+                    prediction
+                        .attempts
+                        .iter()
+                        .map(|attempt| attempt.latency.as_millis())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let clock_ahead_ms = tokio::time::Instant::now()
+                .into_std()
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis();
+            panic!(
+                "mechanics fixture must genuinely reach Execute; directive={kind} reason={reason} fallback={:?} elapsed_ms={} compiled={} scored={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
+                engine.fallback_cause,
+                engine.elapsed_ms,
+                engine.request_compiled,
+                engine.scored_count,
+                admitted.context.hop_ids().len(),
+                engine.state.trusted.parts().budgets,
+            );
         }
         admitted
     }
@@ -487,7 +525,40 @@ impl AdmittedTurn {
                 Some(_) => "unclassified_code",
                 None => "not_applicable",
             };
-            panic!("mechanics fixture must genuinely reach Execute; directive={kind} reason={reason}");
+            let engine = admitted.context.engine();
+            let blocked: Vec<u8> = engine
+                .pre_commit
+                .outcomes
+                .values()
+                .filter_map(|outcome| match outcome {
+                    crate::causal_tree::gates::GateOutcome::Blocked { gate, .. } => Some(*gate),
+                    _ => None,
+                })
+                .collect();
+            let attempt_ms: Vec<u128> = engine
+                .prediction
+                .as_ref()
+                .map(|prediction| {
+                    prediction
+                        .attempts
+                        .iter()
+                        .map(|attempt| attempt.latency.as_millis())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let clock_ahead_ms = tokio::time::Instant::now()
+                .into_std()
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis();
+            panic!(
+                "mechanics fixture must genuinely reach Execute; directive={kind} reason={reason} fallback={:?} elapsed_ms={} compiled={} scored={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
+                engine.fallback_cause,
+                engine.elapsed_ms,
+                engine.request_compiled,
+                engine.scored_count,
+                admitted.context.hop_ids().len(),
+                engine.state.trusted.parts().budgets,
+            );
         }
         admitted
     }
@@ -661,6 +732,7 @@ impl AdmittedTurn {
                 security,
             },
         )
+        .await
         .expect("actual fixture decision service")
         .with_loop_runtime(crate::runtime::turn_decision::TurnLoopRuntime {
             hooks: Arc::new(crate::hooks::HookManager::new(workspace.to_owned())),

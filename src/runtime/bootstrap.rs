@@ -489,6 +489,7 @@ impl RuntimeBootstrap {
                 config.model_routes.clone(),
                 mem.clone(),
                 router_embedder,
+                &config.cost,
             )
             .await?;
             let engine = match local_history {
@@ -900,7 +901,7 @@ mod tests {
     ///
     /// Baseline established 2026-06-01 after D1 collapsed chat/daemon/gateway-core
     /// onto `build_security_policy`. Reasons:
-    ///   - `session_worker/runner.rs`: manifest-driven divergent core
+    ///   - `session_worker/runner/run.rs`: manifest-driven divergent core
     ///     (`manifest.workspace_dir`-bound security); intentionally NOT routed through
     ///     `RuntimeBootstrap` under the D1 behavior-unchanged guardrail (see module note).
     ///   - `cron/scheduler.rs`: cron job path, not yet converged.
@@ -921,7 +922,7 @@ mod tests {
     ///
     /// E2 (2026-09-23): `agent/loop_.rs` was REMOVED from this whitelist with the
     /// library-only `process_message`, its only hand-wired site.
-    const HANDWIRED_AUDIT_WHITELIST: &[&str] = &["session_worker/runner.rs", "cron/scheduler.rs"];
+    const HANDWIRED_AUDIT_WHITELIST: &[&str] = &["session_worker/runner/run.rs", "cron/scheduler.rs"];
 
     /// Recursively collect every `.rs` file under `dir`.
     fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {

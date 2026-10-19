@@ -19,6 +19,18 @@ const PREMIUM: &str = "prx-premium";
 const CHEAP_REPLY: &str = "I'm not sure, maybe the expression adds two integers.";
 const PREMIUM_REPLY: &str = "The Rust expression adds two integers and equals four.";
 
+fn original_turn_error(result: &std::thread::Result<anyhow::Result<()>>) -> String {
+    match result {
+        Ok(Ok(())) => "none".to_owned(),
+        Ok(Err(error)) => format!("{error:#}"),
+        Err(panic) => panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|message| (*message).to_owned()))
+            .unwrap_or_else(|| "non-string fixture panic".to_owned()),
+    }
+}
+
 struct ListenerOwner {
     cancel: CancellationToken,
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
@@ -210,7 +222,7 @@ async fn listener_still_rejects_a_connected_client_that_never_sends_headers() {
 }
 
 #[tokio::test]
-async fn completed_main_after_original_deadline_does_not_reset_the_premium_allowance() -> anyhow::Result<()> {
+async fn completed_main_after_original_deadline_uses_separate_reserved_premium_window() -> anyhow::Result<()> {
     Box::pin(async {
         let workspace = tempfile::tempdir()?;
         let mut listener = ListenerOwner::start_with_main_delay(
@@ -221,33 +233,19 @@ async fn completed_main_after_original_deadline_does_not_reset_the_premium_allow
         .await?;
         let mut agent = build_agent(workspace.path(), &listener, false).await?;
         let result = AssertUnwindSafe(async {
-            // Delay a real main HTTP response, not the decision backend or a
-            // fabricated continuation. The original 500ms allowance remains.
+            // A real 650ms cheap HTTP round trip exceeds the unchanged 500ms
+            // decision allowance, but the premium window starts at its reply.
             let reply = tokio::time::timeout(Duration::from_secs(5), turn(&mut agent)).await??;
-            assert_eq!(reply, CHEAP_REPLY);
+            assert_eq!(reply, PREMIUM_REPLY);
             agent.cleanup_state.confirm().await?;
-            assert_eq!(listener.requests.lock().len(), 1);
-            assert_eq!(*listener.response_statuses.lock(), vec![200]);
-            let reservation_path = workspace.path().join("state/costs.reservations.jsonl");
-            if reservation_path.exists() {
-                assert_eq!(
-                    std::fs::read_to_string(reservation_path)?,
-                    "",
-                    "an expired continuation must never reserve or dispatch premium"
-                );
-            }
-            assert_eq!(
-                std::fs::read_to_string(workspace.path().join("state/costs.jsonl"))?
-                    .lines()
-                    .count(),
-                1,
-                "the served main call must still settle exactly once"
-            );
+            assert_eq!(*listener.response_statuses.lock(), vec![200, 200]);
+            // Retain cost deduplication, learning, physical reservation and
+            // cleanup oracles from the real premium ingress family.
+            verify_result(&agent, workspace.path(), false, &listener).await?;
             let terminal = crate::memory::sqlite::fixture_readback::terminal_rows(workspace.path())?;
             assert_eq!(terminal.len(), 1);
             let payload: Value = serde_json::from_str(&terminal.first().context("actual terminal")?.raw_payload)?;
             assert_eq!(payload.get("status").context("actual terminal status")?, "completed");
-            assert!(payload.get("served_auxiliary").is_none());
             Ok::<_, anyhow::Error>(())
         })
         .catch_unwind()
@@ -259,11 +257,12 @@ async fn completed_main_after_original_deadline_does_not_reset_the_premium_allow
         let listener_cleanup = listener.finish().await;
         if !confirmed || listener_cleanup.is_err() || !matches!(&result, Ok(Ok(()))) {
             let retained = workspace.keep();
-            tracing::error!(path=%retained.display(), "expired Automix continuation fixture retained");
+            tracing::error!(path=%retained.display(), "delayed-main Automix continuation fixture retained");
         }
         anyhow::ensure!(
             confirmed && listener_cleanup.is_ok(),
-            "expired continuation cleanup unconfirmed"
+            "delayed-main continuation cleanup unconfirmed; original turn error={}",
+            original_turn_error(&result)
         );
         match result {
             Ok(result) => result,
@@ -321,7 +320,15 @@ async fn build_agent_work(
         },
         ..Default::default()
     };
-    let router = RouterEngine::new(policy.clone(), label.clone(), Vec::new(), Arc::clone(&memory), None).await?;
+    let router = RouterEngine::new(
+        policy.clone(),
+        label.clone(),
+        Vec::new(),
+        Arc::clone(&memory),
+        None,
+        &crate::config::schema::CostConfig::default(),
+    )
+    .await?;
     let mut config = Config::default();
     config.workspace_dir = workspace.to_path_buf();
     config.config_path = workspace.join("config.toml");
@@ -680,7 +687,8 @@ async fn run_case_work(recording: bool) -> anyhow::Result<()> {
     if !agent_cleanup || listener_cleanup.is_err() {
         let retained = workspace.keep();
         anyhow::bail!(
-            "Automix cleanup unconfirmed; agent_confirmed={agent_cleanup}; listener_cleanup={listener_cleanup:?}; retained {}",
+            "Automix cleanup unconfirmed; agent_confirmed={agent_cleanup}; listener_cleanup={listener_cleanup:?}; original turn error={}; retained {}",
+            original_turn_error(&result),
             retained.display()
         );
     }
@@ -773,7 +781,8 @@ async fn run_dropped_premium_work() -> anyhow::Result<()> {
     if !confirmed || listener_cleanup.is_err() {
         let retained = workspace.keep();
         anyhow::bail!(
-            "Automix drop cleanup unconfirmed; agent_confirmed={confirmed}; listener_cleanup={listener_cleanup:?}; retained {}",
+            "Automix drop cleanup unconfirmed; agent_confirmed={confirmed}; listener_cleanup={listener_cleanup:?}; original turn error={}; retained {}",
+            original_turn_error(&result),
             retained.display()
         );
     }
@@ -1035,7 +1044,8 @@ async fn run_cheap_outcome_case_work(fail_premium: bool, turns: usize) -> anyhow
     if !confirmed || listener_cleanup.is_err() {
         let retained = workspace.keep();
         anyhow::bail!(
-            "Automix fixture cleanup unconfirmed; agent_confirmed={confirmed}; listener_cleanup={listener_cleanup:?}; retained {}",
+            "Automix fixture cleanup unconfirmed; agent_confirmed={confirmed}; listener_cleanup={listener_cleanup:?}; original turn error={}; retained {}",
+            original_turn_error(&result),
             retained.display()
         );
     }

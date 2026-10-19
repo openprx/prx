@@ -987,7 +987,7 @@ mod tests {
     /// a caller has to pass back, or the `session_ref` that ties it to
     /// `prx tasks list` — and this test goes red. That the hint is *reached* at
     /// all is guarded separately, by
-    /// `sessions_spawn::tests::an_unknown_session_id_is_answered_with_the_sessions_this_caller_may_assign_to`.
+    /// `sessions_spawn::tests::chat_assign::an_unknown_session_id_is_answered_with_the_sessions_this_caller_may_assign_to`.
     #[tokio::test]
     async fn an_assignable_principal_is_given_the_ids_it_may_use() {
         let security = policy(&[], &[]);

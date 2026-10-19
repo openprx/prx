@@ -39,7 +39,6 @@ where
                     .with_event_recording(config.memory.event_recording_config());
                 let spawn = SessionsSpawnTool::new_with_registry(
                     Arc::new(NoAnnouncements),
-                    Arc::new(NoTransport),
                     "ollama",
                     "prx-local-model",
                     0.0,
@@ -52,6 +51,7 @@ where
                     config.sessions_spawn.clone(),
                     Arc::clone(&owned_runs),
                 )
+                .with_test_parent_provider(Arc::new(NoTransport))
                 .with_hint_config(&config)
                 .with_model_catalog(crate::providers::selection::catalog_for(&config))
                 .with_shared_memory(Arc::clone(&memory))
@@ -87,7 +87,8 @@ where
                         memory: Arc::clone(&memory),
                         security,
                     },
-                )?;
+                )
+                .await?;
                 let owning = Arc::get_mut(&mut service).expect("unshared parent service");
                 owning.factory = DecisionBackendFactory::from_slots(
                     vec![Box::new(ParentDelegateBackend {

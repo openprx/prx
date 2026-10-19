@@ -269,7 +269,7 @@ wired in 0.8.133 keep their original test names):
 | `xin` | `src/tools/xin.rs` |
 | `cron` | `src/tools/cron.rs` |
 | `message_send` (channel and daemon schemas) | `src/tools/message_send.rs` |
-| `sessions_spawn` | `src/tools/sessions_spawn.rs` |
+| `sessions_spawn` | `src/tools/sessions_spawn/tool.rs` |
 | `wasm_plugins_manage` | `src/plugins/runtime.rs` |
 | `mcp_call` | `src/tools/mcp.rs` |
 | `git_operations` (the `stash` sub-action enum) | `src/tools/git_operations.rs` |

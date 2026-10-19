@@ -359,6 +359,9 @@ impl AgentBuilder {
             "embedded Agent route providers require runtime_config"
         );
         let runtime = self.pin_runtime_config()?;
+        if runtime.is_some() {
+            crate::runtime::decision_accounting::initialize_tokenizers();
+        }
         let mut tools = self.tools.ok_or_else(|| anyhow::anyhow!("tools are required"))?;
         if runtime.is_some() && !tools.iter().any(|tool| tool.name() == "capability_search") {
             tools.push(Box::new(crate::tools::capability::search_tool::CapabilitySearchTool));
@@ -1527,9 +1530,16 @@ mod tests {
             } else {
                 Arc::new(crate::memory::SqliteMemory::new(other_workspace.path()).unwrap())
             };
-            let router = RouterEngine::new(router_config, "openai".to_owned(), Vec::new(), memory, None)
-                .await
-                .unwrap();
+            let router = RouterEngine::new(
+                router_config,
+                "openai".to_owned(),
+                Vec::new(),
+                memory,
+                None,
+                &crate::config::schema::CostConfig::default(),
+            )
+            .await
+            .unwrap();
             let result = builder.router(router).build();
             if matching {
                 let agent = result.expect("matching source-bound Router must be supported");
@@ -2048,10 +2058,16 @@ mod tests {
         };
         config.router = router_config.clone();
         let memory = Arc::clone(builder.memory.as_ref().unwrap());
-        let router =
-            crate::router::RouterEngine::new(router_config, LABEL.into(), Vec::new(), Arc::clone(&memory), None)
-                .await
-                .expect("test: router");
+        let router = crate::router::RouterEngine::new(
+            router_config,
+            LABEL.into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .expect("test: router");
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut agent = builder
             .provider(Box::new(ModelSpy(Arc::clone(&calls), LABEL)))
@@ -3092,6 +3108,7 @@ mod tests {
                 confidence_threshold: 0.7,
                 cheap_model_tiers: vec!["mini".into(), "ollama".into()],
                 premium_model_id: "openai/model-premium".into(),
+                ..Default::default()
             },
             models: vec![
                 crate::config::RouterModelConfig {
