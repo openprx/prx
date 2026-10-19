@@ -1317,7 +1317,6 @@ fn register_gateway_turn_tools(
     config: &Config,
     shared_config: &crate::config::SharedConfig,
     security: &Arc<crate::security::SecurityPolicy>,
-    #[cfg(test)] provider: &Arc<dyn Provider>,
     _model: &str,
     memory: &Arc<dyn Memory>,
     provider_runtime_options: &providers::ProviderRuntimeOptions,
@@ -1367,8 +1366,6 @@ fn register_gateway_turn_tools(
         let provider_name = providers::selection::default_provider(config).to_string();
         let spawn_tool = tools::SessionsSpawnTool::new(
             announce_channel,
-            #[cfg(test)]
-            Arc::clone(provider),
             provider_name,
             providers::selection::default_model(config).to_string(),
             config.default_temperature,
@@ -1481,8 +1478,6 @@ fn build_gateway_turn_runtime(
         config,
         &shared_config,
         &security,
-        #[cfg(test)]
-        &provider,
         &model,
         &memory,
         &provider_runtime_options,
@@ -1749,8 +1744,6 @@ pub async fn run_gateway(
         &config,
         &shared_config_for_reload,
         &security,
-        #[cfg(test)]
-        &provider,
         &model,
         &mem,
         &provider_runtime_options,

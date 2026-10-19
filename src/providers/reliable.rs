@@ -368,7 +368,7 @@ impl FallbackAdmission {
         self.candidates.insert((provider, model.into()), eligibility);
     }
 
-    fn eligibility(&self, provider: &super::ProviderId, model: &str) -> Option<FallbackEligibility> {
+    pub(super) fn eligibility(&self, provider: &super::ProviderId, model: &str) -> Option<FallbackEligibility> {
         if provider == &self.primary_provider && model == self.primary_model {
             return Some(FallbackEligibility {
                 cost_admitted: true,

@@ -818,7 +818,7 @@ impl CausalDecisionEngine {
         if ![&post_rehearsal, &pre_commit].iter().all(|report| {
             matches!(
                 report.outcomes.get(candidate.candidate_id()),
-                Some(GateOutcome::ApprovalDeferred)
+                Some(GateOutcome::ApprovalDeferred | GateOutcome::ApprovalOnly { .. })
             )
         }) {
             return Ok(None);
@@ -1833,6 +1833,7 @@ mod tests {
                 level: AutonomyLevel::Full,
                 max_cost_cents: 100,
                 remaining_depth: 2,
+                delegation: None,
             },
             catalog_generation: generation,
             key: Arc::clone(&key),
@@ -2100,6 +2101,7 @@ mod tests {
                 level: AutonomyLevel::ReadOnly,
                 max_cost_cents: 0,
                 remaining_depth: 1,
+                delegation: None,
             },
             catalog_generation: view.generation(),
             key,

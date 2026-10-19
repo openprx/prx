@@ -93,7 +93,7 @@ impl TurnTerminalGuard {
             return Ok(false);
         }
         let mut state = self.state.lock();
-        if state.finished || state.pending.is_some() || state.automix_claimed || self.auxiliary_call.is_some() {
+        if state.finished || state.pending.is_some() || state.automix_claimed || !self.auxiliary_calls.is_empty() {
             return Ok(false);
         }
         state.automix_claimed = true;

@@ -77,18 +77,15 @@ where
     let directory = tempfile::tempdir().context("private delegate diagnostic")?.keep();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
         .context("private diagnostic permissions")?;
-    // Best-effort locator: a subscriber failure must not prevent the original fixture.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let subscriber = tracing_subscriber::fmt()
-            .with_test_writer()
-            .with_ansi(false)
-            .without_time()
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(diagnostic_directory = %directory.display(), "owned delegate diagnostic directory");
-        });
-    }));
+    // The locator must not register a temporary INFO subscriber: callsite
+    // interest is process-wide and shared with the DEBUG privacy controls.
+    let _ = std::io::Write::write_fmt(
+        &mut std::io::stderr().lock(),
+        format_args!(
+            "owned delegate diagnostic directory diagnostic_directory={}\n",
+            directory.display()
+        ),
+    );
     let capture = Capture {
         directory,
         failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

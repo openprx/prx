@@ -1739,9 +1739,12 @@ impl Tool for McpTool {
         // target so an approval for server-A can never authorize server-B
         // (op naming per design d03).
         let operation_name = op_id::op_id(self.name(), "call", &[&server_name, &tool_name]);
-        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        // The grant names the capability that was approved: the alias public
+        // name for a discovered tool, the root name for a root call. The
+        // operation id stays root-based so one approval never crosses targets.
+        let approval_grant = ApprovalGrant::from_runtime_args(name, &args);
         if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-            self.name(),
+            name,
             &operation_name,
             ResourceRiskLevel::High,
             approval_grant.as_ref(),
@@ -3150,6 +3153,74 @@ for line in sys.stdin:
         assert!(
             !err.contains("requires runtime approval grant") && !err.contains("high-risk operation is disallowed"),
             "gate must have allowed the matching grant, got: {err:?}"
+        );
+    }
+
+    /// A grant names the capability it approved. A grant for alias A never
+    /// authorizes alias B, nor the root `mcp_call` for the same server/tool, and
+    /// a root grant never authorizes the alias.
+    #[tokio::test]
+    async fn alias_grant_is_refused_for_other_aliases_and_the_root() {
+        let mut cfg = McpConfig::default();
+        cfg.servers.insert(
+            "srv".into(),
+            McpServerConfig {
+                tool_name_prefix: "mcp".into(),
+                ..McpServerConfig::default()
+            },
+        );
+        let tool = McpTool::new(mcp_gate_security(), cfg, std::env::temp_dir());
+        let op = op_id::op_id(MCP_ROOT_NAME, "call", &["srv", "act"]);
+        let grant_for = |name: &str| ApprovalGrant::for_resource_operation(name, &op, "test", None);
+        let gate_denied = |result: &ToolResult| {
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant")
+        };
+        let own = tool
+            .execute_named(
+                "mcp__srv__act",
+                json!({ crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG: grant_for("mcp__srv__act") }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !gate_denied(&own),
+            "the alias grant passes for its own alias: {:?}",
+            own.error
+        );
+        let other_alias = tool
+            .execute_named(
+                "mcp__srv__other",
+                json!({ crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG: grant_for("mcp__srv__act") }),
+            )
+            .await
+            .unwrap();
+        assert!(gate_denied(&other_alias), "alias A grant must not authorize alias B");
+        let root = tool
+            .execute(json!({
+                "server": "srv",
+                "tool": "act",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG: grant_for("mcp__srv__act"),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            gate_denied(&root),
+            "alias grant must not authorize the root for the same server/tool"
+        );
+        let alias_with_root_grant = tool
+            .execute_named(
+                "mcp__srv__act",
+                json!({ crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG: grant_for(MCP_ROOT_NAME) }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            gate_denied(&alias_with_root_grant),
+            "a root grant must not authorize the alias"
         );
     }
 

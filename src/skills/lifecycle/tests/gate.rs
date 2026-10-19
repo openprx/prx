@@ -14,7 +14,7 @@ use crate::skills::lifecycle::gate::rewrite_gate_for_test;
 use crate::skills::lifecycle::proposal::proposal_id_of;
 use crate::skills::lifecycle::proposer_model::TallyCounters;
 use crate::skills::lifecycle::{
-    AppliedEdit, AuthorBinding, BoundedDiff, BudgetRecord, CaseExecutor, EditOp, EvalSplit, EvaluationError,
+    AppliedEdit, AuthorBinding, BoundedDiff, BudgetRecord, Bundle, CaseExecutor, EditOp, EvalSplit, EvaluationError,
     EvaluationPin, EvaluationRequest, ExecutionRequest, FrozenSuite, GateDecision, GateError, GateJudge, GatePolicy,
     GateReason, GateRequest, JudgeBrief, JudgeError, JudgeOpinion, JudgeReply, JudgeResult, MAX_GATE_EPOCHS,
     ModelBinding, ModelCallError, ModelJudge, ModelReply, ProposalBasis, ProposalOperation, ProposalStatus,
@@ -48,14 +48,52 @@ fn evaluating_proposal(fx: &Fixture, suite: &FrozenSuite) -> SkillProposal {
 }
 
 pub(super) fn evaluating_proposal_as(fx: &Fixture, suite: &FrozenSuite, request_id: &str) -> SkillProposal {
-    let owner = fx.store.owner_scope().clone();
-    let id = proposal_id_of(&owner, request_id);
     let bundle = fx
         .store
         .read_revision(&skill(), &fx.candidate, None)
         .expect("test: candidate")
         .bundle;
+    let proposal = stage_draft(fx, request_id, &bundle, "ANSWER=report-v2");
+    let id = proposal.proposal_id;
+    fx.store.write_suite(suite).expect("test: write suite");
+    fx.store
+        .review_source(&id, "reviewer test")
+        .expect("test: source review");
+    fx.store
+        .begin_evaluation(&id, suite.digest(), "evaluation test")
+        .expect("test: begin evaluation")
+}
+
+/// Stages `bundle` as the candidate of a `Draft` proposal whose recorded diff
+/// replaces `ANSWER=draft` with `new_text`.
+pub(super) fn stage_draft(fx: &Fixture, request_id: &str, bundle: &Bundle, new_text: &str) -> SkillProposal {
+    let owner = fx.store.owner_scope().clone();
+    let id = proposal_id_of(&owner, request_id);
     let now = Utc::now();
+    // The figures are the ones the proposer would record for this edit.
+    let mut diff = BoundedDiff {
+        edits: vec![AppliedEdit {
+            op: EditOp::Replace,
+            old: Some("ANSWER=draft".to_string()),
+            new: new_text.to_string(),
+        }],
+        description_change: None,
+        changed_tokens: 0,
+        baseline_tokens: 0,
+        allowed_tokens: 0,
+        summary: None,
+    };
+    let baseline = fx
+        .store
+        .read_revision(&skill(), &fx.baseline, None)
+        .expect("test: baseline")
+        .bundle;
+    let baseline_md = String::from_utf8_lossy(baseline.file("SKILL.md").expect("test: SKILL.md").bytes()).into_owned();
+    let figures = crate::skills::lifecycle::propose::reapply_diff(&baseline_md, "Writes release notes", &diff)
+        .expect("test: the edit applies to the baseline");
+    diff.changed_tokens = figures.changed_tokens;
+    diff.baseline_tokens = figures.baseline_tokens;
+    diff.allowed_tokens = figures.allowed_tokens;
     let proposal = SkillProposal {
         schema_version: 1,
         record_id: id.clone(),
@@ -67,7 +105,7 @@ pub(super) fn evaluating_proposal_as(fx: &Fixture, suite: &FrozenSuite, request_
         requested_patterns: Vec::new(),
         expected_generation: 1,
         baseline_revision: fx.baseline.clone(),
-        candidate_revision: Some(fx.candidate.clone()),
+        candidate_revision: Some(bundle.revision_id().clone()),
         pattern_ids: Vec::new(),
         evidence_ids: Vec::new(),
         basis: ProposalBasis {
@@ -93,18 +131,7 @@ pub(super) fn evaluating_proposal_as(fx: &Fixture, suite: &FrozenSuite, request_
         status: ProposalStatus::Draft,
         status_reason: None,
         failure: None,
-        diff: Some(BoundedDiff {
-            edits: vec![AppliedEdit {
-                op: EditOp::Replace,
-                old: Some("ANSWER=draft".to_string()),
-                new: "ANSWER=report-v2".to_string(),
-            }],
-            description_change: None,
-            changed_tokens: 2,
-            baseline_tokens: 20,
-            allowed_tokens: 4,
-            summary: None,
-        }),
+        diff: Some(diff),
         attempts: Vec::new(),
         required_suite: None,
         evaluation_epoch: 0,
@@ -116,16 +143,10 @@ pub(super) fn evaluating_proposal_as(fx: &Fixture, suite: &FrozenSuite, request_
     };
     {
         let lock = fx.store.lock_proposals().expect("test: lock");
-        fx.store.stage_candidate(&id, &bundle).expect("test: stage");
+        fx.store.stage_candidate(&id, bundle).expect("test: stage");
         fx.store.write_proposal(&lock, &proposal).expect("test: write proposal");
     }
-    fx.store.write_suite(suite).expect("test: write suite");
-    fx.store
-        .advance_proposal(&id, ProposalStatus::SourceReviewed, "reviewer test")
-        .expect("test: source review");
-    fx.store
-        .begin_evaluation(&id, suite.digest(), "evaluation test")
-        .expect("test: begin evaluation")
+    proposal
 }
 
 pub(super) fn mark_evaluated(fx: &Fixture, proposal: &SkillProposal) -> SkillProposal {

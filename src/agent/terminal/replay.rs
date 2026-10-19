@@ -51,6 +51,8 @@ struct ReplayParent {
     decision_id: String,
     digest: String,
     source: EventBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_run_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -319,7 +321,13 @@ impl PreparedReplay {
                     && parent_source.owner_id.as_deref() == Some(owner)
                     && parent_source.role == "user"
                     && parent_source.event_type == "message.created"
-                    && source.parent_run_id == parent_source.run_id
+                    && source.parent_run_id.as_deref() == Some(proof.spawn_run_id())
+                    && (proof.spawn_run_id() == proof.run_id()
+                        || crate::runtime::child_source::parent::matches_parent_task_segment(
+                            proof.spawn_run_id(),
+                            &row,
+                            &parent_source,
+                        ))
                     && source.parent_session_key == parent_source.session_key
                     && source.causation_event_id.as_deref() == Some(parent_source.event_id.as_str())
                     && source.run_id != parent_source.run_id
@@ -336,6 +344,7 @@ impl PreparedReplay {
                 decision_id: parent_id.to_string(),
                 digest: row.digest,
                 source: event_binding(&recorded.key, SOURCE_DOMAIN, &parent_source)?,
+                task_run_id: (proof.spawn_run_id() != proof.run_id()).then(|| proof.spawn_run_id().to_owned()),
             })
         } else {
             None
@@ -739,7 +748,17 @@ async fn verify_terminal_replay_inner(
                 && parent_source.event_type == "message.created"
                 && parent_source.workspace_id == workspace_id
                 && parent_source.owner_id.as_deref() == Some(owner_id)
-                && source.parent_run_id == parent_source.run_id
+                && match parent.task_run_id.as_deref() {
+                    Some(task) =>
+                        source.parent_run_id.as_deref() == Some(task)
+                            && source.run_id.as_deref() != Some(task)
+                            && crate::runtime::child_source::parent::matches_parent_task_segment(
+                                task,
+                                &row,
+                                &parent_source
+                            ),
+                    None => source.parent_run_id == parent_source.run_id,
+                }
                 && source.parent_session_key == parent_source.session_key
                 && source.causation_event_id.as_deref() == Some(parent_source.event_id.as_str())
                 && source.run_id != parent_source.run_id

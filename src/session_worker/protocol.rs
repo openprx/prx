@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-pub use crate::tools::capability::child::wire::{WorkerChildCapabilityManifest, WorkerChildCapabilityRef};
+pub use crate::tools::capability::child::wire::{
+    WorkerChildCapabilityManifest, WorkerChildCapabilityRef, WorkerDelegationAuthority,
+};
 
 /// Original PMM selection, covered by the complete worker transport signature.
 #[derive(Clone, Serialize, Deserialize)]

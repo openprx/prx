@@ -1140,3 +1140,6 @@ fn the_unrecoverable_classifier_separates_refusals_from_recoverable_failures() {
         assert!(!shared_unrecoverable_tool_error(recoverable), "{recoverable}");
     }
 }
+
+#[path = "tool_scheduler/tracing_context.rs"]
+mod tracing_context;

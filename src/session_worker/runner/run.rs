@@ -287,7 +287,9 @@ fn verify_worker_parent_authority(
             && record.decision.enabled_snapshot
             && !record.decision.legacy_v1
             && record.decision.admits_issued_child()
-            && record.decision.run_id == manifest.parent_run_id
+            && source
+                .parent_source
+                .matches_worker_parent_run(manifest, &record.decision)
             && manifest.owner_id.as_deref() == Some(parent.authority.owner.as_str()),
         "session-worker parent decision differs from issued authority"
     );
@@ -746,8 +748,6 @@ async fn run_owned_manifest(
         &manifest,
         &config,
         &credentials,
-        #[cfg(test)]
-        Arc::clone(&provider),
         Arc::clone(&security),
         &provider_runtime_options,
         Arc::clone(&active_runs),

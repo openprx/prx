@@ -24,12 +24,14 @@ use crate::memory::traits::{
     SharedContextQuery,
 };
 
+mod event_batch;
 mod message_events;
 mod mirror_and_guards;
 mod owner_isolation;
 mod pool_and_vector_cap;
 mod recall;
 mod schema_and_documents;
+mod schema_atomic;
 mod visibility_events;
 
 fn temp_sqlite() -> (TempDir, SqliteMemory) {

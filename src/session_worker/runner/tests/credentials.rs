@@ -357,7 +357,6 @@ async fn admitted_worker_fallback_spawn() {
         &manifest,
         &config,
         &credentials,
-        Arc::clone(&provider),
         security,
         &options,
         Arc::clone(&active_runs),

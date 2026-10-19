@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 pub mod lifecycle;
+mod lifecycle_cli;
+pub mod lifecycle_runtime;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".openprx-open-skills-sync";
@@ -1879,6 +1881,9 @@ pub async fn handle_command(command: crate::SkillCommands, config: &crate::confi
         crate::SkillCommands::Disable { name } => {
             set_installed_skill_enabled(workspace_dir, &name, false)?;
             println!("  {} Skill '{}' disabled.", console::style("✓").green().bold(), name);
+        }
+        crate::SkillCommands::Lifecycle { command } => {
+            lifecycle_cli::handle(command, config).await?;
         }
     }
     Ok(())
