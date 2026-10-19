@@ -1020,6 +1020,7 @@ pub(crate) use child_outcome::{ChildOutcomeLink, ChildOutcomeView};
 enum WriterMessage {
     ChildOutcome(Box<ChildOutcomeLink>),
     DecisionBatch(Box<[DecisionRecord]>),
+    #[cfg(any(feature = "llm-router", test))]
     VerifiedDecision(Box<acknowledged::VerifiedDecision>),
     ReplayChain(Box<acknowledged::ReplayChain>),
     Outcome(Box<OutcomeRecord>),
@@ -2674,6 +2675,7 @@ fn run_writer(mut thread: WriterThread) {
         let _held = hold.as_ref().map(|hold| hold.lock());
         match command {
             WriterMessage::DecisionBatch(records) => thread.write_ready_decisions(records, &mut pending),
+            #[cfg(any(feature = "llm-router", test))]
             WriterMessage::VerifiedDecision(record) => record.finish(&mut thread),
             WriterMessage::ReplayChain(read) => read.finish(&thread),
             WriterMessage::Outcome(record) => thread.write_outcome(&record),
