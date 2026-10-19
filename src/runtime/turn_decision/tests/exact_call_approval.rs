@@ -39,6 +39,8 @@ impl Tool for CountedFileMutation {
 // Production compilation, gates and exact-call issuance remain authoritative.
 struct FilesystemApprovalBackend {
     identity: BackendIdentity,
+    /// Capability family the deterministic fixture steers the decision to.
+    family: &'static str,
     calls: Arc<AtomicUsize>,
 }
 
@@ -78,14 +80,14 @@ impl DecisionBackend for FilesystemApprovalBackend {
         for (id, answer) in &mut response.answers {
             // Ordinary family candidates have no namespace suffix; scoped
             // candidates retain the hyphen-delimited namespace form.
-            let work = id.as_str().starts_with("candidate.use_tool-filesystem.")
-                || id.as_str().starts_with("candidate.use_tool-filesystem-");
+            let work = id.as_str().starts_with(&format!("candidate.use_tool-{}.", self.family))
+                || id.as_str().starts_with(&format!("candidate.use_tool-{}-", self.family));
             match answer {
                 DecisionAnswer::Choice(choice) => {
                     let code = if id == &QuestionId::global(GlobalQuestion::NextAction) {
                         "use_tool"
                     } else {
-                        "filesystem"
+                        self.family
                     };
                     if let Some(chosen) = choice.probabilities.keys().find(|key| key.as_str() == code).cloned() {
                         for (key, probability) in &mut choice.probabilities {
@@ -241,6 +243,7 @@ async fn exact_file_without_intent(edit: bool) {
                     provider: None,
                     configured_model: Arc::from("prx-local-model"),
                 },
+                family: "filesystem",
                 calls: Arc::clone(&predictions),
             })],
             Arc::clone(&owning.state_key),

@@ -443,6 +443,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "scope".into(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         };
         assert_eq!(project_run(&run, 1).origin, SessionOrigin::User);

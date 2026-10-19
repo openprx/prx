@@ -328,8 +328,6 @@ pub async fn run(
     );
     let spawn_tool = crate::tools::SessionsSpawnTool::new_with_registry(
         Arc::clone(&terminal) as Arc<dyn Channel>,
-        #[cfg(test)]
-        Arc::clone(&provider),
         provider_name,
         model_name,
         temperature,

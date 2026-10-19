@@ -678,11 +678,11 @@ mod tests {
                     let security = Arc::new(crate::security::SecurityPolicy { workspace_dir:workspace.to_path_buf(), ..Default::default() });
                     let memory: Arc<dyn crate::memory::Memory> = Arc::new(SqliteMemory::new(workspace)?);
                     let tool = SessionsSpawnTool::new(
-                        Arc::new(SilentChannel), Arc::clone(&provider), "ollama", "prx-gateway-parent", 0.0,
+                        Arc::new(SilentChannel), "ollama", "prx-gateway-parent", 0.0,
                         Arc::clone(&security), workspace.to_path_buf(), config.multimodal.clone(),
                         std::collections::HashMap::new(), None,
                         crate::providers::provider_runtime_options_from_config(config), config.sessions_spawn.clone(),
-                    ).with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
+                    ).with_test_parent_provider(Arc::clone(&provider)).with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
                         .with_model_catalog(catalog).with_hint_config(config).with_shared_memory(Arc::clone(&memory))
                         .with_event_recording(config.memory.event_recording_config());
                     let empty_child_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
@@ -970,7 +970,6 @@ mod tests {
             ));
             let tool = SessionsSpawnTool::new(
                 Arc::new(SilentChannel) as Arc<dyn Channel>,
-                Arc::clone(&provider),
                 "custom:http://127.0.0.1:1/v1",
                 "test-model",
                 0.0,
@@ -981,7 +980,8 @@ mod tests {
                 None,
                 crate::providers::ProviderRuntimeOptions::default(),
                 crate::config::SessionsSpawnConfig::default(),
-            );
+            )
+            .with_test_parent_provider(Arc::clone(&provider));
             let runs = tool.active_runs_arc();
             let tools_handle = tool.tools_handle();
             let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(tool)]);

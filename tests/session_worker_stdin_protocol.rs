@@ -45,6 +45,8 @@ use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 
+const RECURSIVE_CHILD_TASK: &str = "Use sessions_spawn in process mode for PRX-NESTED-CHILD";
+
 /// Exercise the real worker executable with a sealed route and an isolated
 /// loopback provider. The listener records headers from the OS child, while
 /// HOME, config, state, and every credential remain inside this fixture.
@@ -120,16 +122,31 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         "PRX-AGENT-PARENT",
                         "PRX-ROUTE-CHILD",
                         "PRX-AGENT-CHILD",
+                        "PRX-DENIED-PARENT",
+                        "PRX-DENIED-CHILD",
+                        "PRX-NESTED-PARENT",
+                        "PRX-NESTED-CHILD",
+                        "PRX-NESTED-LEAF",
                     ]
                     .into_iter()
                     .find(|candidate| request_body.contains(candidate))
                     .expect("fixture request marker");
-                    if !matches!(marker, "PRX-ROUTE-PARENT" | "PRX-AGENT-PARENT") {
+                    if !matches!(
+                        marker,
+                        "PRX-ROUTE-PARENT" | "PRX-AGENT-PARENT" | "PRX-DENIED-PARENT" | "PRX-NESTED-PARENT"
+                    ) {
                         let mut manifests = server_captured.lock();
                         if !manifests.contains_key(marker) {
                             manifests.insert(
                                 marker.to_string(),
-                                capture_live_worker_manifest(&server_workspace_root, marker),
+                                capture_live_worker_manifest(
+                                    &server_workspace_root,
+                                    if marker == "PRX-NESTED-CHILD" {
+                                        RECURSIVE_CHILD_TASK
+                                    } else {
+                                        marker
+                                    },
+                                ),
                             );
                         }
                     }
@@ -151,7 +168,21 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                                 {"task": "PRX-AGENT-CHILD", "agent": "prx_agent"}
                             ]
                         })),
-                        ("PRX-ROUTE-PARENT" | "PRX-AGENT-PARENT", 2) => scripted_join_call(&request_body),
+                        ("PRX-DENIED-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+                            "action": "spawn_batch", "mode": "process", "allow_delegation": true,
+                            "tasks": ["PRX-DENIED-CHILD"]
+                        })),
+                        ("PRX-NESTED-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+                            "action": "spawn_batch", "mode": "process", "tasks": [
+                                {"task": RECURSIVE_CHILD_TASK, "allow_delegation": true}
+                            ]
+                        })),
+                        ("PRX-NESTED-CHILD", 1) => scripted_spawn_call(&serde_json::json!({
+                            "action": "spawn_batch", "mode": "process", "tasks": ["PRX-NESTED-LEAF"]
+                        })),
+                        ("PRX-ROUTE-PARENT" | "PRX-AGENT-PARENT" | "PRX-NESTED-PARENT" | "PRX-NESTED-CHILD", 2) => {
+                            scripted_join_call(&request_body)
+                        }
                         _ => serde_json::json!({"role": "assistant", "content": "PRX-WORKER-OK"}),
                     };
                     let body = serde_json::json!({
@@ -201,6 +232,10 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         }
     });
 
+    let server = OwnedProviderServer {
+        stop: Arc::clone(&stop),
+        thread: Some(server),
+    };
     let mut config = openprx::config::Config {
         config_path: config_dir.join("config.toml"),
         workspace_dir,
@@ -321,6 +356,173 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         Some(CredentialRef::Profile { id: profile.id })
     );
     assert_completion_journal(&parent_workspace, &agent_manifest);
+
+    // Default-off refusal uses the same real parent and spawn request. It
+    // cannot be satisfied by a fixture that never reaches the spawn backend.
+    let denied_output = run_model_parent(&config_dir, &home, "PRX-DENIED-PARENT");
+    assert!(denied_output.status.success(), "denied parent exits cleanly");
+    {
+        let requests = seen.lock();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.marker == "PRX-DENIED-PARENT")
+                .count(),
+            2
+        );
+        assert!(requests.iter().any(|request| {
+            request.marker == "PRX-DENIED-PARENT"
+                && request
+                    .body
+                    .contains("recursive child delegation is disabled by operator configuration")
+        }));
+        assert!(requests.iter().all(|request| request.marker != "PRX-DENIED-CHILD"));
+    }
+
+    // Q88's positive phase now requires actual opt-in and real admitted workers.
+    let mut recursive_config = config.clone();
+    recursive_config.agents.clear();
+    recursive_config.sessions_spawn.allow_recursive_delegation = true;
+    assert_eq!(recursive_config.sessions_spawn.max_recursive_depth, 1);
+    write_worker_config(&recursive_config);
+    let nested_output = run_model_parent(&config_dir, &home, "PRX-NESTED-PARENT");
+    assert!(
+        nested_output.status.success(),
+        "nested parent stderr: {}",
+        String::from_utf8_lossy(&nested_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&nested_output.stdout).contains("PRX-WORKER-OK"),
+        "nested parent stdout: {}",
+        String::from_utf8_lossy(&nested_output.stdout)
+    );
+    {
+        let requests = seen.lock();
+        assert_parent_join(&requests, "PRX-NESTED-PARENT", 1);
+        assert_parent_join(&requests, "PRX-NESTED-CHILD", 1);
+    }
+    let nested = captured
+        .lock()
+        .get("PRX-NESTED-CHILD")
+        .cloned()
+        .expect("actual nested worker manifest");
+    let leaf = captured
+        .lock()
+        .get("PRX-NESTED-LEAF")
+        .cloned()
+        .expect("actual grandchild manifest");
+    assert_authenticated_source(&nested);
+    assert_authenticated_source(&leaf);
+    let scope = nested
+        .capability_manifest
+        .as_ref()
+        .expect("sealed recursive child scope");
+    let parent = &nested
+        .child_source
+        .as_ref()
+        .expect("admitted recursive source")
+        .parent_constraints;
+    assert_eq!(scope.allowed.len(), 1);
+    assert!(
+        scope
+            .allowed
+            .iter()
+            .all(|reference| reference.id.ends_with(":sessions_spawn"))
+    );
+    assert!(scope.allowed.len() < parent.allowed.len());
+    assert!(
+        scope
+            .allowed
+            .iter()
+            .all(|reference| parent.allowed.iter().any(|allowed| {
+                allowed.id == reference.id
+                    && allowed.fingerprint == reference.fingerprint
+                    && allowed.generation == reference.generation
+            }))
+    );
+    assert_eq!(scope.remaining_depth, 1);
+    assert!(scope.max_cost_cents <= parent.max_cost_cents);
+    let pins = scope
+        .delegation
+        .as_ref()
+        .expect("explicit delegation recorded under seal");
+    assert!(pins.requested);
+    assert_eq!(
+        openprx::providers::ProviderId::of(&pins.provider),
+        openprx::providers::ProviderId::of(&destination)
+    );
+    assert_eq!(pins.model, "probe-model");
+    assert_eq!(leaf.parent_run_id.as_deref(), Some(nested.run_id.as_str()));
+    assert_eq!(leaf.owner_id, nested.owner_id);
+    let leaf_scope = leaf.capability_manifest.as_ref().expect("sealed leaf scope");
+    assert!(leaf_scope.allowed.is_empty());
+    assert_eq!(leaf_scope.remaining_depth, 0);
+    let leaf_pins = leaf_scope
+        .delegation
+        .as_ref()
+        .expect("leaf retains inherited model pins");
+    assert!(!leaf_pins.requested);
+    assert_eq!(leaf_pins.provider, pins.provider);
+    assert_eq!(leaf_pins.model, pins.model);
+    assert!(leaf_scope.max_cost_cents <= scope.max_cost_cents);
+    {
+        let requests = seen.lock();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.marker == "PRX-NESTED-LEAF")
+                .count(),
+            1
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|request| request.marker == "PRX-NESTED-CHILD")
+                .all(|request| {
+                    request.head.contains("PRX-WORKER-ROUTE-KEY") && request.body.contains("probe-model")
+                })
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|request| request.marker == "PRX-NESTED-LEAF")
+                .all(|request| {
+                    request.head.contains("PRX-WORKER-ROUTE-KEY") && request.body.contains("probe-model")
+                })
+        );
+        assert_sealed_child(&leaf, &requests, "PRX-NESTED-LEAF");
+    }
+    assert_completion_journal(&parent_workspace, &nested);
+    assert_completion_journal(&parent_workspace, &leaf);
+    assert_delegation_input_record(&parent_workspace, &nested);
+    assert_delegation_input_record(&parent_workspace, &leaf);
+    let requests_before_wrong_parent = seen.lock().len();
+    let mut wrong_parent = leaf.clone();
+    wrong_parent.parent_run_id = Some("prx_unrelated_parent".to_owned());
+    wrong_parent.parent_capability = None;
+    let wrong_parent_capability = worker_capability(&wrong_parent, expiry);
+    wrong_parent.parent_capability = Some(wrong_parent_capability.clone());
+    let mut wrong_parent_child = spawn_worker(
+        &wrong_parent.config_dir,
+        &home,
+        Some((&wrong_parent_capability, expiry)),
+    );
+    let mut wrong_parent_stdin = take_stdin(&mut wrong_parent_child);
+    write_production_manifest_line(
+        &mut wrong_parent_stdin,
+        &serde_json::to_string(&wrong_parent).expect("wrong-parent manifest JSON"),
+    );
+    drop(wrong_parent_stdin);
+    let wrong_parent_run = finish(wrong_parent_child, None);
+    let wrong_parent_result = assert_single_json_line(&wrong_parent_run.stdout);
+    assert!(wrong_parent_run.status.success());
+    assert!(!wrong_parent_result.success);
+    assert_eq!(
+        wrong_parent_result.error.as_deref(),
+        Some("session-worker parent decision differs from issued authority")
+    );
+    assert_eq!(seen.lock().len(), requests_before_wrong_parent);
+    write_worker_config(&config);
     let agent_requests = seen.lock().len();
 
     // Keep the physical refusal controls from the original contract. They
@@ -346,7 +548,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     let missing_source_run = finish(missing_source_child, None);
     let missing_source_result = assert_single_json_line(&missing_source_run.stdout);
     stop.store(true, Ordering::Relaxed);
-    server.join().expect("loopback server joins");
+    server.finish();
     let requests = seen.lock();
     assert!(
         bad_run.status.success(),
@@ -406,6 +608,59 @@ struct ProviderRequest {
     marker: String,
     head: String,
     body: String,
+}
+
+struct OwnedProviderServer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OwnedProviderServer {
+    fn finish(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("loopback server joins");
+        }
+    }
+}
+
+impl Drop for OwnedProviderServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            // Preserve an original fixture panic while confirming server exit.
+            let _ = thread.join();
+        }
+    }
+}
+
+fn assert_delegation_input_record(workspace: &Path, manifest: &WorkerManifest) {
+    let source = manifest.child_source.as_ref().expect("admitted child source");
+    let scope = manifest.capability_manifest.as_ref().expect("sealed child scope");
+    let pins = scope.delegation.as_ref().expect("sealed model pins");
+    let memory = openprx::memory::SqliteMemory::new(workspace).expect("parent admission memory");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let event = runtime
+        .block_on(memory.find_owned_message_event(
+            &source.parent_constraints.workspace,
+            manifest.owner_id.as_deref().expect("child owner"),
+            &source.input_event_id,
+        ))
+        .unwrap()
+        .expect("durable child admission record");
+    let payload: serde_json::Value = serde_json::from_str(event.raw_payload_json.as_deref().unwrap()).unwrap();
+    let delegation = &payload["delegation"];
+    assert_eq!(delegation["requested"], pins.requested);
+    assert_eq!(delegation["remaining_depth"], scope.remaining_depth);
+    assert_eq!(delegation["max_cost_cents"], scope.max_cost_cents);
+    assert_eq!(delegation["model"], pins.model);
+    assert_eq!(
+        delegation["allowed_tools"].as_array().map(Vec::len),
+        Some(scope.allowed.len())
+    );
 }
 
 fn capture_live_worker_manifest(worker_workspace_root: &Path, task: &str) -> WorkerManifest {
@@ -624,7 +879,11 @@ fn assert_parent_join(requests: &[ProviderRequest], marker: &str, expected_total
         .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
         .expect("parent join summary");
     assert_eq!(summary["total"], expected_total);
-    assert_eq!(summary["completed"].as_array().map(Vec::len), Some(expected_total));
+    assert_eq!(
+        summary["completed"].as_array().map(Vec::len),
+        Some(expected_total),
+        "{summary}"
+    );
     assert_eq!(summary["failed"], serde_json::json!([]));
     assert_eq!(summary["killed"], serde_json::json!([]));
     assert_eq!(summary["no_result"], serde_json::json!([]));
@@ -646,11 +905,29 @@ fn scripted_spawn_call(arguments: &serde_json::Value) -> serde_json::Value {
 }
 
 fn scripted_join_call(request_body: &str) -> serde_json::Value {
-    let start = request_body.find("batch-").unwrap_or_else(|| {
-        let start = request_body.len().saturating_sub(4_000);
-        panic!("spawn batch id in parent request: {}", &request_body[start..])
-    });
-    let batch_id = &request_body[start..start + 42];
+    let request: serde_json::Value = serde_json::from_str(request_body).expect("provider request JSON");
+    let batch = request["messages"]
+        .as_array()
+        .expect("provider request messages")
+        .iter()
+        .rev()
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["content"].as_str())
+        .filter_map(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+        .find(|result| result["batch_id"].is_string())
+        .unwrap_or_else(|| {
+            let results: Vec<_> = request["messages"]
+                .as_array()
+                .expect("provider messages")
+                .iter()
+                .rev()
+                .filter(|message| message["role"] == "tool")
+                .take(3)
+                .map(|message| message["content"].to_string().chars().take(2000).collect::<String>())
+                .collect();
+            panic!("spawn batch tool result in parent request; actual tool results={results:?}")
+        });
+    let batch_id = batch["batch_id"].as_str().expect("actual production batch id");
     scripted_spawn_call(&serde_json::json!({"action": "join", "batch_id": batch_id}))
 }
 

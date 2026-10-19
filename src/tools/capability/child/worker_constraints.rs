@@ -6,7 +6,7 @@ use super::{
 use wire::{WorkerChildCapabilityRef, WorkerParentConstraints};
 
 fn signing_payload(wire: &WorkerParentConstraints) -> Result<Vec<u8>, ChildManifestError> {
-    serde_json::to_vec(&(
+    let mut payload = serde_json::to_vec(&(
         &wire.decision_id,
         &wire.allowed,
         &wire.owner,
@@ -16,7 +16,12 @@ fn signing_payload(wire: &WorkerParentConstraints) -> Result<Vec<u8>, ChildManif
         wire.remaining_depth,
         wire.catalog_generation,
     ))
-    .map_err(|_| ChildManifestError::InvalidTransport)
+    .map_err(|_| ChildManifestError::InvalidTransport)?;
+    if let Some(delegation) = &wire.delegation {
+        payload.extend_from_slice(b"\nrecursive-delegation-v1\n");
+        payload.extend(serde_json::to_vec(delegation).map_err(|_| ChildManifestError::InvalidTransport)?);
+    }
+    Ok(payload)
 }
 
 impl CapabilityConstraints {
@@ -37,6 +42,7 @@ impl CapabilityConstraints {
             level: self.authority.level,
             max_cost_cents: self.authority.max_cost_cents,
             remaining_depth: self.authority.remaining_depth,
+            delegation: self.authority.delegation.as_deref().cloned(),
             catalog_generation: self.catalog_generation.0,
             seal: [0; 32],
         };
@@ -75,6 +81,7 @@ impl CapabilityConstraints {
                 level: wire.level,
                 max_cost_cents: wire.max_cost_cents,
                 remaining_depth: wire.remaining_depth,
+                delegation: wire.delegation.clone().map(Arc::new),
             },
         })
     }

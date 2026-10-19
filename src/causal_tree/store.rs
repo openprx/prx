@@ -1020,6 +1020,8 @@ pub(crate) use child_outcome::{ChildOutcomeLink, ChildOutcomeView};
 enum WriterMessage {
     ChildOutcome(Box<ChildOutcomeLink>),
     DecisionBatch(Box<[DecisionRecord]>),
+    VerifiedDecision(Box<acknowledged::VerifiedDecision>),
+    ReplayChain(Box<acknowledged::ReplayChain>),
     Outcome(Box<OutcomeRecord>),
     /// A v1 file's progress, saved only when every listed decision is
     /// stored (a record the writer failed to store is never marked done).
@@ -1029,6 +1031,9 @@ enum WriterMessage {
     /// sender is answered once the connection is closed.
     Close(std::sync::mpsc::Sender<()>),
 }
+
+mod acknowledged;
+mod batching;
 
 /// The writer's queue. Cloning shares the one writer thread.
 #[derive(Clone)]
@@ -2656,11 +2661,21 @@ struct WriterThread {
 fn run_writer(mut thread: WriterThread) {
     #[cfg(test)]
     let hold = thread.hold.take();
-    while let Ok(command) = thread.commands.recv() {
+    let mut pending = None;
+    loop {
+        let command = match pending.take() {
+            Some(command) => command,
+            None => match thread.commands.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
         #[cfg(test)]
         let _held = hold.as_ref().map(|hold| hold.lock());
         match command {
-            WriterMessage::DecisionBatch(records) => thread.write_decisions(&records),
+            WriterMessage::DecisionBatch(records) => thread.write_ready_decisions(records, &mut pending),
+            WriterMessage::VerifiedDecision(record) => record.finish(&mut thread),
+            WriterMessage::ReplayChain(read) => read.finish(&thread),
             WriterMessage::Outcome(record) => thread.write_outcome(&record),
             WriterMessage::ChildOutcome(record) => thread.write_child_outcome(&record),
             WriterMessage::Imported(progress, imported) => match all_stored(&thread.conn, &imported) {
@@ -2730,9 +2745,13 @@ impl WriterThread {
                 }
             }
         }
+        self.finish_decision_write(records.len());
+    }
+
+    fn finish_decision_write(&mut self, record_count: usize) {
         self.writes_since_prune = self
             .writes_since_prune
-            .saturating_add(u32::try_from(records.len()).unwrap_or(u32::MAX));
+            .saturating_add(u32::try_from(record_count).unwrap_or(u32::MAX));
         if self.writes_since_prune >= PRUNE_EVERY {
             self.writes_since_prune = 0;
             if let Some(cutoff) = self.retention.cutoff(now_ms()) {

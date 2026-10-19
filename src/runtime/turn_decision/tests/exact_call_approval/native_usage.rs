@@ -116,6 +116,7 @@ async fn native_discovery_approval_retains_reported_usage_in_normal_terminal() {
                     provider: None,
                     configured_model: Arc::from("prx-local-model"),
                 },
+                family: "filesystem",
                 calls: Arc::clone(&predictions),
             })],
             Arc::clone(&owning.state_key),

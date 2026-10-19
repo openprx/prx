@@ -310,7 +310,15 @@ impl SkillLifecycleStore {
     ///
     /// Staging happens in `staging/`; a crash can leave a stale directory
     /// there, which the SL08 recovery pass is responsible for sweeping.
-    pub fn write_revision(&self, new: &NewRevision, bundle: &Bundle) -> Result<WriteOutcome, LifecycleError> {
+    ///
+    /// Raw store write with no lifecycle policy, `pub(in crate::skills)`;
+    /// learned candidates are written solely by `install_candidate`, and test
+    /// fixtures elsewhere use `test_support`.
+    pub(in crate::skills) fn write_revision(
+        &self,
+        new: &NewRevision,
+        bundle: &Bundle,
+    ) -> Result<WriteOutcome, LifecycleError> {
         let info = validate_manifest(bundle)?;
         let revision_id = bundle.revision_id().clone();
         let final_dir = self.revision_dir(&new.skill_id, &revision_id);

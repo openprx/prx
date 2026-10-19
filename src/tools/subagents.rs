@@ -580,6 +580,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         }
     }
@@ -626,7 +627,6 @@ mod tests {
     fn join_capable_spawn_tool() -> SessionsSpawnTool {
         SessionsSpawnTool::new(
             Arc::new(SilentChannel),
-            Arc::new(UnusedProvider),
             "test-provider",
             "test-model",
             0.7,
@@ -638,6 +638,7 @@ mod tests {
             crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
         )
+        .with_test_parent_provider(Arc::new(UnusedProvider))
     }
 
     fn kill_grant(run_id: &str) -> serde_json::Value {
@@ -936,6 +937,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         };
         let tool = SubagentsTool::new(Arc::new(RwLock::new(vec![run])));
@@ -974,6 +976,7 @@ mod tests {
             parent_run_id: Some("parent-b".to_string()),
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         };
         let tool = SubagentsTool::with_security(

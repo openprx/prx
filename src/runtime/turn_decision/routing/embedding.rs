@@ -79,7 +79,7 @@ impl AttemptReceipt for RouterEmbeddingReceipt {
         self.deadline.min(self.receipt.deadline())
     }
     async fn settle(self: Box<Self>, usage: TokenUsage) -> anyhow::Result<()> {
-        self.receipt.settle_provider_usage(usage).await.map_err(Into::into)
+        self.receipt.settle_provider_usage(usage).map_err(Into::into)
     }
 }
 

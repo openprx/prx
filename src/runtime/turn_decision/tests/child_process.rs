@@ -355,7 +355,6 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
             .with_event_recording(config.memory.event_recording_config());
         let spawn = SessionsSpawnTool::new_with_registry(
             Arc::new(NoAnnouncements),
-            Arc::new(NoTransport),
             "ollama",
             if non_root_route {
                 route_binding::MODEL_HINT
@@ -372,6 +371,7 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
             config.sessions_spawn.clone(),
             Arc::clone(&owned_runs),
         )
+        .with_test_parent_provider(Arc::new(NoTransport))
         .with_hint_config(&config)
         .with_model_catalog(crate::providers::selection::catalog_for(&config))
         .with_shared_memory(Arc::clone(&memory))
@@ -786,7 +786,6 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
             }
             let recovery = SessionsSpawnTool::new(
                 Arc::new(NoAnnouncements),
-                Arc::new(NoTransport),
                 "ollama",
                 "prx-local-model",
                 0.0,
@@ -798,6 +797,7 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
                 crate::providers::ProviderRuntimeOptions::default(),
                 config.sessions_spawn.clone(),
             )
+            .with_test_parent_provider(Arc::new(NoTransport))
             .with_source_fabric(MemoryFabric::new(Arc::clone(&copied_memory), proof.workspace_id()));
             // Exact one-row page: errors cannot be hidden by a different launch.
             let page = recovery.recover_process_page_for_test(launch_event.id - 1, 1).await?;
@@ -918,6 +918,26 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
     config.providers.models.push(toml::from_str(
         "provider='ollama'\nmodel='prx-local-model'\noperations=['chat']\nnative_tools=true\n",
     )?);
+    // Finding 79(f): a granted child binding must refuse the same
+    // cross-dialect fallback the ordinary child binding refuses (finding 71).
+    // The parent keeps its own provider; the granted selection below is a
+    // custom endpoint whose fallback speaks another tool-schema dialect.
+    {
+        use crate::providers::entrypoint_consistency_tests::{CROSS_DIALECT_PROVIDER, FALLBACK_MODEL, PRIMARY_MODEL};
+        config
+            .reliability
+            .model_fallbacks
+            .insert(PRIMARY_MODEL.to_owned(), vec![FALLBACK_MODEL.to_owned()]);
+        config
+            .providers
+            .tool_dialects
+            .push(crate::config::schema::ProviderToolDialectConfig {
+                provider: CROSS_DIALECT_PROVIDER.to_owned(),
+                model: Some(PRIMARY_MODEL.to_owned()),
+                tool_schema: Some(crate::config::schema::ToolSchemaDialectSetting::NoRootCombinators),
+                tool_call: None,
+            });
+    }
     let resolved = crate::providers::selection::check(
         &config,
         "ollama",
@@ -937,7 +957,6 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         .with_event_recording(config.memory.event_recording_config());
     let spawn = SessionsSpawnTool::new_with_registry(
         Arc::new(NoAnnouncements),
-        Arc::new(NoTransport),
         "ollama",
         "prx-local-model",
         0.0,
@@ -950,6 +969,7 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         config.sessions_spawn.clone(),
         Arc::clone(&owned_runs),
     )
+    .with_test_parent_provider(Arc::new(NoTransport))
     .with_hint_config(&config)
     .with_model_catalog(crate::providers::selection::catalog_for(&config))
     .with_shared_memory(Arc::clone(&memory))
@@ -1035,6 +1055,20 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         let grant = service.issue_child_grant(&proof, &context)?;
         assert_eq!(grant.parent().source_event_id(), proof.source_event_id());
         assert_eq!(grant.parent().owner_id(), proof.owner_id());
+        let granted = crate::runtime::child_source::ChildProviderBinding::build(
+            Arc::clone(&grant),
+            crate::providers::entrypoint_consistency_tests::CROSS_DIALECT_PROVIDER,
+            crate::providers::entrypoint_consistency_tests::PRIMARY_MODEL,
+            crate::providers::selection::credential_for(
+                &grant.generation().effective,
+                crate::providers::entrypoint_consistency_tests::CROSS_DIALECT_PROVIDER,
+            ),
+        );
+        let refusal = match granted {
+            Ok(_) => anyhow::bail!("granted child binding accepted a cross-dialect fallback"),
+            Err(error) => format!("{error:#}"),
+        };
+        crate::providers::entrypoint_consistency_tests::assert_cross_dialect_refusal("granted gateway child", &refusal);
         let (manifest, parent) = grant.scope().gate_inputs();
         manifest.verify(parent)?;
         assert_eq!(manifest.authority.level, level);

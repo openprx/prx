@@ -129,7 +129,22 @@ fn estimate_cost(model: &ResolvedModel, pricing: &CostConfig, schema_bytes: usiz
 }
 
 fn zero_price_exempt(model: &ResolvedModel) -> bool {
-    model.provider().catalog_name() == Some("ollama") || (cfg!(test) && model.provider().catalog_name() == Some("mock"))
+    provider_is_zero_price_exempt(model.provider(), model.credential().api_url())
+        || (cfg!(test) && model.provider().catalog_name() == Some("mock"))
+}
+
+/// The one provider rule for "no price row means no money": a local Ollama
+/// model is free unless it has an explicit price. "Local" means the effective
+/// base URL is unset (the default `http://localhost:11434`) or a literal
+/// loopback address; a remote Ollama (`https://ollama.com`, a proxy, a LAN
+/// host) can bill, so an unpriced one is never free. G6 estimates, fallback
+/// admission and decision-attempt reservation/settlement all use it.
+pub(crate) fn provider_is_zero_price_exempt(provider: &crate::providers::ProviderId, api_url: Option<&str>) -> bool {
+    provider.catalog_name() == Some("ollama")
+        && api_url
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .is_none_or(crate::decision::loopback::is_literal_loopback)
 }
 
 fn estimate_cost_with_validity(
@@ -360,6 +375,40 @@ mod tests {
         let estimate = estimate_cost(&model, &config.cost, 0).expect("priced candidate");
         assert_eq!(expected, 4);
         assert_eq!(u128::from(estimate.micro_usd), expected);
+    }
+
+    #[test]
+    fn a_remote_ollama_is_not_free_when_unpriced() {
+        let id = crate::providers::ProviderId::of("ollama");
+        assert!(provider_is_zero_price_exempt(&id, None));
+        assert!(provider_is_zero_price_exempt(&id, Some("")));
+        assert!(provider_is_zero_price_exempt(&id, Some("http://localhost:11434")));
+        assert!(provider_is_zero_price_exempt(&id, Some("http://127.0.0.1:11434")));
+        assert!(provider_is_zero_price_exempt(&id, Some("http://[::1]:11434")));
+        assert!(!provider_is_zero_price_exempt(&id, Some("https://ollama.com")));
+        assert!(!provider_is_zero_price_exempt(&id, Some("http://192.168.1.20:11434")));
+        assert!(!provider_is_zero_price_exempt(
+            &crate::providers::ProviderId::of("openai"),
+            None
+        ));
+
+        // Through G6: the resolved model's effective base URL decides.
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("ollama".to_string());
+        config.api_url = Some("https://ollama.com".to_string());
+        let remote = resolve(
+            &Selection {
+                provider: "ollama",
+                model: "prx-local-model",
+                credential: CredentialRef::LegacyInline(crate::providers::credentials::LegacySlot::Root),
+            },
+            &Requirement::chat(),
+            &ProviderCatalogView::from_config(&config),
+            &ConfigCredentialSource::new(&config),
+            UnknownPolicy::Invocation,
+        )
+        .expect("remote ollama resolves");
+        assert!(estimate_cost(&remote, &config.cost, 0).is_none());
     }
 
     #[test]

@@ -81,6 +81,9 @@ impl ApprovalManager {
     /// moved to [`crate::security::SecurityPolicy::decide`]; this only reports the
     /// session-scoped "Always" shortcut so a previously-approved tool is not
     /// re-prompted within the session.
+    /// The shortcut never applies to a decision-bound call: gate G4 ignores it
+    /// and `AgentToolApprovalStrategy::resolve` denies such a call before
+    /// consulting it, since a decision-scoped approval needs durable review.
     #[must_use]
     pub fn is_session_allowlisted(&self, tool_name: &str) -> bool {
         self.session_allowlist.lock().contains(tool_name)

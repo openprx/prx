@@ -82,9 +82,16 @@ async fn build(workspace: &std::path::Path, endpoint: &str) -> (Agent, Arc<Obser
     assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
     let embedder = crate::memory::create_embedder_from_config(&config);
     assert!(embedder.supports_attempt_accounting());
-    let router = RouterEngine::new(policy, "ollama".into(), Vec::new(), Arc::clone(&memory), Some(embedder))
-        .await
-        .unwrap();
+    let router = RouterEngine::new(
+        policy,
+        "ollama".into(),
+        Vec::new(),
+        Arc::clone(&memory),
+        Some(embedder),
+        &crate::config::schema::CostConfig::default(),
+    )
+    .await
+    .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let agent = Agent::builder()
         .runtime_config(config, "ollama")

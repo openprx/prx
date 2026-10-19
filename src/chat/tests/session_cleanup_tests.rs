@@ -95,6 +95,7 @@ async fn exit_shutdown_helper_calls_shutdown_all_and_records_interrupted_summary
             parent_run_id: None,
             session_scope_key: String::new(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         };
         let runs = std::sync::Arc::new(tokio::sync::RwLock::new(vec![run]));

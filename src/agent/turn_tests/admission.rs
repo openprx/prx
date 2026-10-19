@@ -145,6 +145,37 @@ impl AdmittedTurn {
             None,
             None,
             true,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// The enabled builtin plane over a registry whose MCP root has already
+    /// discovered its servers; `mcp_snapshot` is that root's published state.
+    pub(crate) async fn with_enabled_builtin_model_and_mcp(
+        config: crate::config::Config,
+        input: &str,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+        selection: (&str, &str),
+        mcp_snapshot: Vec<crate::tools::mcp::McpCapabilitySpec>,
+    ) -> Self {
+        assert!(
+            config.causal_tree.enabled,
+            "enabled-builtin fixture requires causal tree"
+        );
+        Self::build_mode(
+            config,
+            input,
+            registry,
+            memory,
+            FixtureOrigin::Cli { recorded: true },
+            selection,
+            None,
+            None,
+            None,
+            true,
+            mcp_snapshot,
         )
         .await
     }
@@ -228,6 +259,7 @@ impl AdmittedTurn {
             None,
             None,
             true,
+            Vec::new(),
         )
         .await
     }
@@ -259,6 +291,7 @@ impl AdmittedTurn {
             None,
             Some(generation),
             false,
+            Vec::new(),
         )
         .await
     }
@@ -290,7 +323,17 @@ impl AdmittedTurn {
         selection: (&str, &str),
     ) -> Self {
         Self::build_mode(
-            config, input, registry, memory, origin, selection, None, None, None, false,
+            config,
+            input,
+            registry,
+            memory,
+            origin,
+            selection,
+            None,
+            None,
+            None,
+            false,
+            Vec::new(),
         )
         .await
     }
@@ -324,6 +367,7 @@ impl AdmittedTurn {
             None,
             None,
             false,
+            Vec::new(),
         )
         .await
     }
@@ -354,6 +398,7 @@ impl AdmittedTurn {
             None,
             None,
             false,
+            Vec::new(),
         )
         .await;
         if admitted
@@ -378,10 +423,48 @@ impl AdmittedTurn {
                 Some("insufficient_evidence") => "insufficient_evidence",
                 Some("no_legal_path") => "no_legal_path",
                 Some("hop_stopped") => "hop_stopped",
+                Some("deadline_exceeded") => "deadline_exceeded",
+                Some("expired_before_prediction") => "expired_before_prediction",
+                Some("decision_failed") => "decision_failed",
+                Some("all_gated") => "all_gated",
+                Some("choice_outside_legal_set") => "choice_outside_legal_set",
                 Some(_) => "unclassified_code",
                 None => "not_applicable",
             };
-            panic!("mechanics fixture must genuinely reach Execute; directive={kind} reason={reason}");
+            let engine = admitted.context.engine();
+            let blocked: Vec<u8> = engine
+                .pre_commit
+                .outcomes
+                .values()
+                .filter_map(|outcome| match outcome {
+                    crate::causal_tree::gates::GateOutcome::Blocked { gate, .. } => Some(*gate),
+                    _ => None,
+                })
+                .collect();
+            let attempt_ms: Vec<u128> = engine
+                .prediction
+                .as_ref()
+                .map(|prediction| {
+                    prediction
+                        .attempts
+                        .iter()
+                        .map(|attempt| attempt.latency.as_millis())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let clock_ahead_ms = tokio::time::Instant::now()
+                .into_std()
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis();
+            panic!(
+                "mechanics fixture must genuinely reach Execute; directive={kind} reason={reason} fallback={:?} elapsed_ms={} compiled={} scored={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
+                engine.fallback_cause,
+                engine.elapsed_ms,
+                engine.request_compiled,
+                engine.scored_count,
+                admitted.context.hop_ids().len(),
+                engine.state.trusted.parts().budgets,
+            );
         }
         admitted
     }
@@ -414,6 +497,7 @@ impl AdmittedTurn {
             None,
             None,
             false,
+            Vec::new(),
         )
         .await;
         if admitted
@@ -441,7 +525,40 @@ impl AdmittedTurn {
                 Some(_) => "unclassified_code",
                 None => "not_applicable",
             };
-            panic!("mechanics fixture must genuinely reach Execute; directive={kind} reason={reason}");
+            let engine = admitted.context.engine();
+            let blocked: Vec<u8> = engine
+                .pre_commit
+                .outcomes
+                .values()
+                .filter_map(|outcome| match outcome {
+                    crate::causal_tree::gates::GateOutcome::Blocked { gate, .. } => Some(*gate),
+                    _ => None,
+                })
+                .collect();
+            let attempt_ms: Vec<u128> = engine
+                .prediction
+                .as_ref()
+                .map(|prediction| {
+                    prediction
+                        .attempts
+                        .iter()
+                        .map(|attempt| attempt.latency.as_millis())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let clock_ahead_ms = tokio::time::Instant::now()
+                .into_std()
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis();
+            panic!(
+                "mechanics fixture must genuinely reach Execute; directive={kind} reason={reason} fallback={:?} elapsed_ms={} compiled={} scored={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
+                engine.fallback_cause,
+                engine.elapsed_ms,
+                engine.request_compiled,
+                engine.scored_count,
+                admitted.context.hop_ids().len(),
+                engine.state.trusted.parts().budgets,
+            );
         }
         admitted
     }
@@ -474,6 +591,7 @@ impl AdmittedTurn {
             None,
             None,
             false,
+            Vec::new(),
         )
         .await
     }
@@ -509,6 +627,7 @@ impl AdmittedTurn {
                 audit,
                 None,
                 false,
+                Vec::new(),
             )
             .await
         })
@@ -525,6 +644,7 @@ impl AdmittedTurn {
         audit: Option<Arc<dyn crate::tools::execution::ToolExecutionAuditSink>>,
         generation_override: Option<Arc<crate::config::ConfigGeneration>>,
         keep_builtin_enabled: bool,
+        mcp_snapshot: Vec<crate::tools::mcp::McpCapabilitySpec>,
     ) -> Self {
         let workspace_path = config.workspace_dir.clone();
         let workspace = workspace_path.as_path();
@@ -596,7 +716,7 @@ impl AdmittedTurn {
                 catalog_sources: CatalogSources::from_runtime_inputs(
                     generation.id.0.to_string(),
                     &config,
-                    Vec::new(),
+                    mcp_snapshot,
                     &hooks,
                     0,
                 ),

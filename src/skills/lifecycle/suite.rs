@@ -576,7 +576,7 @@ impl SkillLifecycleStore {
 
     /// Stores a frozen suite under its digest. Idempotent; a different suite
     /// can never take the place of an existing digest.
-    pub fn write_suite(&self, suite: &FrozenSuite) -> Result<(), EvaluationError> {
+    pub(in crate::skills) fn write_suite(&self, suite: &FrozenSuite) -> Result<(), EvaluationError> {
         self.check_owner_scope(&suite.suite.owner_scope)?;
         let dir = self.suites_dir();
         ensure_dir_synced(self.root(), &dir)?;
