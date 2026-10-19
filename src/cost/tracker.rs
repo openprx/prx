@@ -287,13 +287,13 @@ fn open_cost_file(path: &Path, access: CostFileAccess) -> Result<Option<(File, O
             && stat.st_mode & 0o022 == 0,
         "cost file is not a private single-link regular file"
     );
+    let file = File::from(fd);
+    let state = File::from(state);
     if created {
         // CostStorage may have just created state; persist that entry too.
-        File::from(root)
-            .sync_all()
-            .context("failed to sync cost workspace directory")?;
+        super::creation::sync_created_entry(&file, &state, filename, &File::from(root))?;
     }
-    Ok(Some((File::from(fd), created.then(|| File::from(state)))))
+    Ok(Some((file, created.then_some(state))))
 }
 
 // Keep ordinary cost recording available on non-Unix platforms. This path
@@ -346,10 +346,14 @@ fn open_cost_file(path: &Path, access: CostFileAccess) -> Result<Option<(File, O
     Ok(Some((file, None)))
 }
 
-fn sync_cost_directory(state: Option<File>) -> Result<()> {
+fn sync_cost_directory(state: Option<File>, file: &File, path: &Path) -> Result<()> {
+    #[cfg(unix)]
     if let Some(state) = state {
-        state.sync_all().context("failed to sync cost state directory")?;
+        let name = path.file_name().context("cost ledger has no filename")?;
+        super::creation::sync_created_entry(file, &state, name, &state)?;
     }
+    #[cfg(not(unix))]
+    let _ = (state, file, path);
     Ok(())
 }
 
@@ -853,9 +857,7 @@ fn migrate_legacy_cost_file(mut legacy: File, storage_path: &Path) -> Result<()>
     let state = state.context("cost migration directory handle is missing")?;
     rustix::fs::renameat(&state, temporary_name.as_str(), &state, "costs.jsonl")
         .context("failed to publish migrated cost ledger")?;
-    state
-        .sync_all()
-        .context("failed to sync migrated cost state directory")?;
+    super::creation::sync_created_entry(&destination, &state, std::ffi::OsStr::new("costs.jsonl"), &state)?;
     // Preserve the legacy source; no migration cleanup is performed here.
     Ok(())
 }
@@ -1192,7 +1194,7 @@ impl CostStorage {
             .with_context(|| format!("Failed to sync cost storage at {}", self.path.display()))?;
         // A durable file body is insufficient when this append created the
         // ledger. Persist its directory entry before acknowledging settlement.
-        sync_cost_directory(state)?;
+        sync_cost_directory(state, &file, &self.path)?;
 
         self.daily_micro_usd = daily_micro;
         self.monthly_micro_usd = monthly_micro;

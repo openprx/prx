@@ -173,6 +173,10 @@ Workspace cost trackers share storage while each admitted caller retains its
 immutable cost configuration. Looking up an older generation cannot overwrite
 a newer caller's reservation limits.
 
+Creation-only directory sync remains mandatory: a failed sync rolls back the newly created journal entry, so a
+subsequent append must create and sync it again. Existing ledger files and
+replacement inodes are never removed by this rollback.
+
 Fully reported input/output usage replaces the estimate using pinned PMM prices.
 Actual usage above the estimate is recorded in full. Known usage updates the
 local budget while cleanup owns its durable settlement in the background, so
