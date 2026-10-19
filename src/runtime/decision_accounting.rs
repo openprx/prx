@@ -53,12 +53,44 @@ pub(crate) struct AccountingScope {
 
 struct RemainingBudgets {
     tokens: AtomicU64,
-    micro_usd: AtomicU64,
+    micro_usd: Arc<AtomicU64>,
     settlement_gate: Arc<tokio::sync::Mutex<()>>,
     settlement_failed: AtomicBool,
 }
 
 impl AccountingScope {
+    /// Bind a newly constructed scope to the run's remaining monetary owner.
+    pub(crate) fn with_money(mut self, money: Option<Arc<AtomicU64>>) -> Self {
+        if let Some(micro_usd) = money {
+            // A resumed source may have a stricter current allowance. Sharing
+            // ownership must never restore money removed by either source.
+            micro_usd.fetch_min(self.budgets.micro_usd, Ordering::AcqRel);
+            self.remaining = OnceLock::from(Arc::new(RemainingBudgets {
+                tokens: AtomicU64::new(self.budgets.tokens),
+                micro_usd,
+                settlement_gate: Arc::new(tokio::sync::Mutex::new(())),
+                settlement_failed: AtomicBool::new(false),
+            }));
+        }
+        self
+    }
+
+    pub(crate) fn money_owner(&self) -> Arc<AtomicU64> {
+        Arc::clone(
+            &self
+                .remaining
+                .get_or_init(|| {
+                    Arc::new(RemainingBudgets {
+                        tokens: AtomicU64::new(self.budgets.tokens),
+                        micro_usd: Arc::new(AtomicU64::new(self.budgets.micro_usd)),
+                        settlement_gate: Arc::new(tokio::sync::Mutex::new(())),
+                        settlement_failed: AtomicBool::new(false),
+                    })
+                })
+                .micro_usd,
+        )
+    }
+
     pub(crate) fn remaining_budgets(&self) -> TurnBudgets {
         if self
             .remaining
@@ -93,7 +125,7 @@ impl AccountingScope {
         let remaining = self.remaining.get_or_init(|| {
             Arc::new(RemainingBudgets {
                 tokens: AtomicU64::new(self.budgets.tokens),
-                micro_usd: AtomicU64::new(self.budgets.micro_usd),
+                micro_usd: Arc::new(AtomicU64::new(self.budgets.micro_usd)),
                 settlement_gate: Arc::new(tokio::sync::Mutex::new(())),
                 settlement_failed: AtomicBool::new(false),
             })
@@ -237,7 +269,7 @@ impl AccountingScope {
         let remaining = Arc::clone(self.remaining.get_or_init(|| {
             Arc::new(RemainingBudgets {
                 tokens: AtomicU64::new(self.budgets.tokens),
-                micro_usd: AtomicU64::new(self.budgets.micro_usd),
+                micro_usd: Arc::new(AtomicU64::new(self.budgets.micro_usd)),
                 settlement_gate: Arc::new(tokio::sync::Mutex::new(())),
                 settlement_failed: AtomicBool::new(false),
             })

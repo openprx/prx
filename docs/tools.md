@@ -1264,8 +1264,22 @@ pass delegation onward; it cannot replenish depth or recover discarded tools.
 A recursive grant permits at most one child, including a model-only leaf.
 A recursive batch with more than one member is refused before launch; repeating
 a single spawn or issuing another outgoing grant cannot reset the consumed slot.
-This caps fanout instead of copying the same cost ceiling into multiple leaves.
-A failed publication consumes its slot conservatively.
+The first opted-in child receives half the parent's currently unallocated
+monetary balance, rounded down to whole cents and bounded by its sealed ceiling.
+That share is subtracted from the parent's balance before publication. A
+recursive child's model-only leaf receives half of that child's remaining
+balance in the same way. A balance too small to fund a positive whole-cent
+share is refused. Parent, child and leaf reservations therefore divide the
+original allowance; each generation cannot reserve the original amount again.
+The one-child slot and remaining balance follow an authenticated approval
+resume of the original run, even though the resumed turn has a new run ID.
+If the original allowance is unavailable (including after process restart),
+approval resume refuses further recursive child authorization. It does not
+infer an unused slot from missing process state. Ordinary approval execution
+continues under its current admitted limits.
+A failed publication consumes its slot and allocated share conservatively.
+These are reservation bounds, not vendor-enforced billing caps; reported usage
+above an estimate is still charged in full.
 
 Enabling the operator permission also retains the root
 `capability_search` reference before a future spawn request is known. This

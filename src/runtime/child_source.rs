@@ -543,7 +543,7 @@ pub(crate) struct IssuedChildGrant(Arc<ChildGrantData>);
 mod recursive;
 
 pub(crate) struct ChildGrantRuntime {
-    pub(crate) recursive_child_claimed: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) recursive_child_claimed: Option<Arc<super::turn_decision::recursive_allowance::RecursiveAllowance>>,
     pub(crate) decision_store: Arc<crate::causal_tree::store::CausalDecisionStore>,
     pub(crate) source_fabric: MemoryFabric,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
@@ -557,7 +557,7 @@ struct ParentModelSelection {
 }
 
 struct ChildGrantData {
-    recursive_child_claimed: Option<Arc<std::sync::atomic::AtomicBool>>,
+    recursive_child_claimed: Option<Arc<super::turn_decision::recursive_allowance::RecursiveAllowance>>,
     // Only a live parent decision can issue default child-model selection.
     // Restored incoming authority is used to admit that child, not to spawn
     // another child without a fresh decision-issued outgoing grant.
@@ -661,7 +661,11 @@ impl IssuedChildGrant {
             recursive_child_claimed: recursive_child_claimed.or_else(|| {
                 (generation.effective.sessions_spawn.allow_recursive_delegation
                     || manifest.authority.delegation.is_some())
-                .then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .then(|| {
+                    Arc::new(super::turn_decision::recursive_allowance::RecursiveAllowance::new(
+                        u64::from(manifest.authority.max_cost_cents) * 10_000,
+                    ))
+                })
             }),
             parent_model,
             source_fabric,

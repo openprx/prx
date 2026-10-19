@@ -163,6 +163,7 @@ impl OperatorChildPublication {
         )?;
         let service = Arc::new(TurnDecisionService {
             child_recovery: Default::default(),
+            recursive_allowances: Default::default(),
             memory_loader: None,
             loop_runtime: Some(runtime),
             publication_policy: policy,
