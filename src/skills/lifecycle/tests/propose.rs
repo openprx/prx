@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 const OWNER: &str = "owner:ws:cli:alice";
-const DECLARED_TOOL: &str = "deploy_check";
+const DECLARED_TOOL: &str = "shell:builtin:deploy_check";
 
 fn skill() -> SkillId {
     SkillId::parse("deploy-helper").expect("test: skill id")
@@ -2037,7 +2037,7 @@ fn run_through_terminal(f: &Fixture, task: &str, observed: &[&str]) -> String {
         tool_calls: observed
             .iter()
             .map(|name| ObservedToolCall {
-                capability_id: format!("shell:builtin:{name}"),
+                capability_id: (*name).to_string(),
                 status: ObservedCallStatus::Succeeded,
             })
             .collect(),
@@ -2061,18 +2061,18 @@ fn run_through_terminal(f: &Fixture, task: &str, observed: &[&str]) -> String {
 
 #[tokio::test]
 async fn an_imported_skill_with_required_tools_qualifies_through_the_whole_chain() {
-    let f = imported(Some("[deploy_check]"));
+    let f = imported(Some("[shell:builtin:deploy_check]"));
     let baseline = f
         .store
         .read_revision(&f.pin.skill_id, &f.pin.revision_id, None)
         .expect("test: baseline");
     assert_eq!(
         baseline.revision.capability_requirements,
-        vec!["deploy_check".to_string()],
+        vec![DECLARED_TOOL.to_string()],
         "the import filled the requirements from the frontmatter"
     );
-    let a = run_through_terminal(&f, "chain-1", &["deploy_check"]);
-    let b = run_through_terminal(&f, "chain-2", &["deploy_check"]);
+    let a = run_through_terminal(&f, "chain-1", &[DECLARED_TOOL]);
+    let b = run_through_terminal(&f, "chain-2", &[DECLARED_TOOL]);
     let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
     let model = ScriptedModel::replying(&good_patch());
     let ProposeOutcome::Staged(proposal) = run(&f, &model, request("chain", &[&pattern])).await else {
@@ -2085,9 +2085,9 @@ async fn an_imported_skill_with_required_tools_qualifies_through_the_whole_chain
 #[tokio::test]
 async fn failures_that_skipped_the_required_tool_or_come_from_undeclaring_skills_never_qualify() {
     // Declared, but the runs never called the tool: not followed.
-    let f = imported(Some("[deploy_check]"));
-    let a = run_through_terminal(&f, "skip-1", &["other"]);
-    let b = run_through_terminal(&f, "skip-2", &["other"]);
+    let f = imported(Some("[shell:builtin:deploy_check]"));
+    let a = run_through_terminal(&f, "skip-1", &["shell:builtin:other"]);
+    let b = run_through_terminal(&f, "skip-2", &["shell:builtin:other"]);
     let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
     let model = ScriptedModel::replying(&good_patch());
     let err = propose_revision(
@@ -2102,8 +2102,8 @@ async fn failures_that_skipped_the_required_tool_or_come_from_undeclaring_skills
 
     // Nothing declared: adherence stays unknown, whatever was called.
     let f = imported(None);
-    let a = run_through_terminal(&f, "bare-1", &["deploy_check"]);
-    let b = run_through_terminal(&f, "bare-2", &["deploy_check"]);
+    let a = run_through_terminal(&f, "bare-1", &[DECLARED_TOOL]);
+    let b = run_through_terminal(&f, "bare-2", &[DECLARED_TOOL]);
     let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
     let err = propose_revision(
         Arc::clone(&f.store),
@@ -2115,4 +2115,146 @@ async fn failures_that_skipped_the_required_tool_or_come_from_undeclaring_skills
     .expect_err("test: undeclared");
     assert!(err.to_string().contains("2 for unknown or unverified facts"), "{err}");
     assert_eq!(model.calls(), 0);
+}
+
+// ---- the production mapping, from the runtime trace to the proposal ---------------------
+
+mod from_trace {
+    use super::*;
+    use crate::agent::terminal::observations_from;
+    use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, ProviderExecutionOutcome, RouteDecision};
+    use crate::skills::lifecycle::{TaskTerminal, on_task_terminal};
+    use crate::tools::capability::execution_trace::ExecutionTrace;
+    use crate::tools::execution::ToolExecutionStatus;
+
+    fn attempt() -> ProviderAttempt {
+        let now = chrono::Utc::now();
+        ProviderAttempt {
+            seq: 1,
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            started_at: now,
+            finished_at: now,
+            status: AttemptStatus::Success,
+            error_class: None,
+            error_message: None,
+        }
+    }
+
+    /// Runs one failed task: `build` drives the real `ExecutionTrace` (provider
+    /// rounds and tool calls), the seal goes through the terminal's mapping and
+    /// the production call-in.
+    fn task(
+        f: &Fixture,
+        name: &str,
+        build: &dyn Fn(&ExecutionTrace),
+        outcome: Option<&ProviderExecutionOutcome>,
+    ) -> String {
+        f.store
+            .record_hydration(name, &f.pin, "SKILL.md", b"x", &Correlation::default())
+            .expect("test: hydrate");
+        let trace = ExecutionTrace::default();
+        trace
+            .begin("op-1", Some(DECLARED_TOOL), false)
+            .finish_with_error(ToolExecutionStatus::Succeeded, None);
+        build(&trace);
+        let observations = observations_from(&trace.seal(), outcome);
+        on_task_terminal(
+            f.tmp.path(),
+            &owner(OWNER),
+            &TaskTerminal {
+                task_id: name,
+                terminal_receipt_id: "term",
+                outcome: ExperienceOutcome::Failure,
+                observations: Some(&observations),
+            },
+        )
+        .expect("test: terminal");
+        crate::skills::lifecycle::experience_id(f.store.owner_scope(), name)
+    }
+
+    async fn outcome_of(
+        label: &str,
+        build: &dyn Fn(&ExecutionTrace),
+        outcome: Option<&ProviderExecutionOutcome>,
+    ) -> Result<ProposeOutcome, LifecycleError> {
+        let f = imported(Some("[shell:builtin:deploy_check]"));
+        let a = task(&f, &format!("{label}-1"), build, outcome);
+        let b = task(&f, &format!("{label}-2"), build, outcome);
+        let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
+        let model = ScriptedModel::replying(&good_patch());
+        propose_revision(
+            Arc::clone(&f.store),
+            request(label, &[&pattern]),
+            &model,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    fn served(trace: &ExecutionTrace) {
+        let a = attempt();
+        trace
+            .begin_provider()
+            .expect("test: begin")
+            .finish(Some(std::slice::from_ref(&a)));
+    }
+
+    #[tokio::test]
+    async fn a_served_round_with_the_required_tool_called_qualifies_without_a_settled_outcome() {
+        let staged = outcome_of("served", &served, None).await.expect("test: proposal");
+        assert!(matches!(staged, ProposeOutcome::Staged(_)));
+    }
+
+    #[tokio::test]
+    async fn an_outage_after_a_served_round_is_not_read_as_served() {
+        // Round 1 succeeded; round 2 failed without an attempt record.
+        let outage = |trace: &ExecutionTrace| {
+            served(trace);
+            trace.begin_provider().expect("test: begin").finish(None);
+        };
+        let err = outcome_of("outage", &outage, None).await.expect_err("test: outage");
+        assert!(err.to_string().contains("2 for unknown or unverified facts"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_for_decision_outcome_is_infrastructure_only_when_its_class_says_so() {
+        let decision = RouteDecision::single_candidate("ollama", "prx-local-model");
+        let failed = |message: &str| {
+            ProviderExecutionOutcome::failed_for_decision(&decision, chrono::Utc::now(), &anyhow::anyhow!("{message}"))
+        };
+        // A timeout is an unavailable provider.
+        let err = outcome_of("timeout", &served, Some(&failed("request timed out")))
+            .await
+            .expect_err("test: timeout");
+        assert!(err.to_string().contains("2 excluded for infrastructure"), "{err}");
+        // Any other agent error carries the catch-all label: unknown, not infrastructure.
+        let err = outcome_of("generic", &served, Some(&failed("max iterations reached")))
+            .await
+            .expect_err("test: generic");
+        assert!(err.to_string().contains("2 for unknown or unverified facts"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_backend_failure_in_a_tool_call_excludes_the_run_but_a_bad_argument_does_not() {
+        let backend = |trace: &ExecutionTrace| {
+            served(trace);
+            trace
+                .begin("op-2", Some("shell:builtin:other"), false)
+                .finish_with_error(
+                    ToolExecutionStatus::Failed,
+                    Some("error sending request: connection refused"),
+                );
+        };
+        let err = outcome_of("backend", &backend, None).await.expect_err("test: backend");
+        assert!(err.to_string().contains("2 excluded for infrastructure"), "{err}");
+        let bad_args = |trace: &ExecutionTrace| {
+            served(trace);
+            trace
+                .begin("op-2", Some("shell:builtin:other"), false)
+                .finish_with_error(ToolExecutionStatus::InvalidArguments, Some("missing field `path`"));
+        };
+        let staged = outcome_of("args", &bad_args, None).await.expect("test: proposal");
+        assert!(matches!(staged, ProposeOutcome::Staged(_)));
+    }
 }

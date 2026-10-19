@@ -106,7 +106,16 @@ fn provenance_difference(record: &SkillRevision, new: &NewRevision) -> Option<&'
         Some("proposal_id")
     } else if record.pattern_ids != new.pattern_ids {
         Some("pattern_ids")
-    } else if record.capability_requirements != new.capability_requirements {
+    } else if record.capability_requirements != new.capability_requirements
+        && (new.source_kind == SourceKind::Learned
+            || !new
+                .capability_requirements
+                .iter()
+                .all(|name| record.capability_requirements.contains(name)))
+    {
+        // A learned revision must match exactly. For the others the manifests
+        // may have added requirements (the record lists the union), and a
+        // revision stored before the key existed lists none.
         Some("capability_requirements")
     } else if record.review_receipt_ids != new.review_receipt_ids {
         Some("review_receipt_ids")
@@ -326,6 +335,7 @@ impl SkillLifecycleStore {
         // own manifests. A learned one keeps exactly what its baseline had
         // (`install_candidate` copies them): it can neither add nor remove a
         // required tool, which would move the adherence oracle.
+        let original = new;
         let mut declared = new.clone();
         if new.source_kind != SourceKind::Learned {
             declared
@@ -338,7 +348,9 @@ impl SkillLifecycleStore {
         let revision_id = bundle.revision_id().clone();
         let final_dir = self.revision_dir(&new.skill_id, &revision_id);
         if fs::symlink_metadata(&final_dir).is_ok() {
-            return self.existing_outcome(&final_dir, new, &revision_id);
+            // An idempotent rewrite: the caller's own list must fit the stored
+            // record; what the manifests add is not the caller's claim.
+            return self.existing_outcome(&final_dir, original, &revision_id);
         }
 
         let skill_dir = self.root.join(REVISIONS_DIR).join(new.skill_id.as_str());

@@ -582,7 +582,7 @@ fn skill_observations(
     )
 }
 
-fn observations_from(
+pub(crate) fn observations_from(
     trace: &crate::tools::capability::execution_trace::ExecutionTraceSnapshot,
     provider: Option<&ProviderExecutionOutcome>,
 ) -> crate::skills::lifecycle::TerminalObservations {
@@ -591,12 +591,17 @@ fn observations_from(
     let provider = match provider.map(|outcome| &outcome.status) {
         Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess) => ProviderEnd::Served,
         Some(ExecutionStatus::AllFailed { last_error_class }) => ProviderEnd::from_failure_class(last_error_class),
-        // Without a settled outcome the trace still shows a served final attempt.
-        None if trace
-            .provider_attempts
-            .as_ref()
-            .and_then(|attempts| attempts.iter().rev().find(|attempt| attempt.status != "skipped"))
-            .is_some_and(|attempt| attempt.status == "success") =>
+        // Without a settled outcome the trace still shows a served final
+        // attempt, but only when every provider call it started was observed:
+        // a later round that failed without an attempt record (an outage after
+        // a served round) leaves the trace incomplete and proves nothing.
+        None if !trace.provider_attempts_incomplete
+            && trace.provider_pending == 0
+            && trace
+                .provider_attempts
+                .as_ref()
+                .and_then(|attempts| attempts.iter().rev().find(|attempt| attempt.status != "skipped"))
+                .is_some_and(|attempt| attempt.status == "success") =>
         {
             ProviderEnd::Served
         }

@@ -7,7 +7,7 @@
 //!   ([`TerminalFacts::infrastructure_unavailable`]);
 //! * no tool call was refused by policy or approval
 //!   ([`TerminalFacts::permission_refused`]);
-//! * the skill's declared tools were actually called ([`Adherence::Followed`]).
+//! * the skill's required tools were actually called ([`Adherence::Followed`]).
 //!
 //! Every fact has an `Unknown` state, which is also what an old record or a
 //! terminal without observations carries. `Unknown` never satisfies the
@@ -18,13 +18,11 @@
 //! state). All interpretation lives here, so the terminal owner passes values
 //! through and decides nothing.
 
-use super::bundle::Bundle;
 use super::capture::SkillExperience;
 use super::store::SkillLifecycleStore;
 use super::types::{RevisionId, SkillId};
 use serde::{Deserialize, Serialize};
 
-const SKILL_TOML: &str = "SKILL.toml";
 /// Skill revisions whose adherence is judged per terminal.
 pub const MAX_ADHERENCE_SKILLS: usize = 32;
 /// Declared names listed in one verdict.
@@ -178,12 +176,13 @@ pub enum ProviderEnd {
 impl ProviderEnd {
     /// Interprets the final error class of a failed provider run. Availability
     /// problems (timeout, rate limit, credentials, a failing endpoint) are not
-    /// the skill's fault; a context overflow may be (the skill adds text), so
-    /// it stays unknown.
+    /// the skill's fault. The catch-all `provider_error` also labels any agent
+    /// error (a max-iterations stop, for one) and a context overflow may come
+    /// from the skill's own text, so those stay unknown.
     #[must_use]
     pub fn from_failure_class(class: &str) -> Self {
         match class {
-            "timeout" | "rate_limit" | "rate_limited" | "auth" | "provider_error" | "server_error" => Self::Unavailable,
+            "timeout" | "rate_limit" | "rate_limited" | "auth" | "server_error" => Self::Unavailable,
             _ => Self::Unknown,
         }
     }
@@ -260,29 +259,21 @@ enum Called {
     Never,
 }
 
-/// Whether `declared` names the capability `capability_id`: the same id, or
-/// the id's public name (its last `:` part).
+/// Whether `declared` is exactly the canonical capability id of the call.
 fn matches_name(capability_id: &str, declared: &str) -> bool {
-    capability_id == declared || capability_id.rsplit(':').next().is_some_and(|name| name == declared)
+    capability_id == declared
 }
 
-/// Tool names a revision declares: its capability requirements and the
-/// `[[tools]]` names of a `SKILL.toml`. Sorted, unique and bounded.
-fn declared_names(capability_requirements: &[String], bundle: &Bundle) -> Vec<String> {
-    let mut names: Vec<String> = capability_requirements.to_vec();
-    if let Some(file) = bundle.file(SKILL_TOML)
-        && let Ok(text) = std::str::from_utf8(file.bytes())
-        && let Ok(value) = toml::from_str::<toml::Value>(text)
-        && let Some(tools) = value.get("tools").and_then(toml::Value::as_array)
-    {
-        names.extend(
-            tools
-                .iter()
-                .filter_map(|tool| tool.get("name").and_then(toml::Value::as_str))
-                .map(str::to_string),
-        );
-    }
-    names.retain(|name| !name.is_empty() && name.len() <= MAX_NAME_BYTES && !name.chars().any(char::is_control));
+/// Tools a revision requires: exactly its stored `capability_requirements`
+/// (the `required-tools` of its manifests), as canonical capability ids. A
+/// skill's own `[[tools]]` entries are not scanned: they are exposed under
+/// other ids and a learned revision could drop one.
+fn declared_names(capability_requirements: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = capability_requirements
+        .iter()
+        .filter(|name| !name.is_empty() && name.len() <= MAX_NAME_BYTES && !name.chars().any(char::is_control))
+        .cloned()
+        .collect();
     names.sort();
     names.dedup();
     names
@@ -337,11 +328,15 @@ pub(super) fn derive(
         }
     }
     seen.truncate(MAX_ADHERENCE_SKILLS);
+    // With several skills in one run, one failure cannot be attributed to any
+    // of them: their adherence stays unknown.
+    let attributable = seen.len() == 1;
     let mut adherence = Vec::with_capacity(seen.len());
     for (skill, revision) in seen {
         let (verdict, missing) = match store.read_revision(skill, revision, None) {
+            Ok(_) if !attributable => (Adherence::Unknown, Vec::new()),
             Ok(verified) => {
-                let declared = declared_names(&verified.revision.capability_requirements, &verified.bundle);
+                let declared = declared_names(&verified.revision.capability_requirements);
                 judge(observations, &declared)
             }
             Err(error) => {

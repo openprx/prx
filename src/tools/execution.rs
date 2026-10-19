@@ -3022,6 +3022,8 @@ impl ToolExecutionService {
                 )
             }
             (Some(Err(error)), _) => {
+                // The trace classifies the full source chain.
+                let chain = format!("{error:#}");
                 let error = error.to_string();
                 let hint = super::error_hints::recovery_hint(&command.name, &error);
                 let model_content = if hint.is_empty() {
@@ -3038,7 +3040,7 @@ impl ToolExecutionService {
                     ToolExecutionStatus::Failed,
                     model_content,
                     None,
-                    Some(error),
+                    Some(chain),
                     Some(preparation),
                     started,
                 )

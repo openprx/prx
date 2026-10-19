@@ -15,8 +15,8 @@ fn skill() -> SkillId {
     SkillId::parse("deploy-helper").expect("test: skill id")
 }
 
-/// A skill that declares `deploy_check` as a requirement and `lint` as a
-/// `SKILL.toml` tool.
+/// A skill that requires two canonical capability ids and also carries a
+/// `SKILL.toml` tool (`lint`) that is not part of the oracle.
 fn setup() -> (TempDir, SkillLifecycleStore, PinnedSkillRevision) {
     let tmp = TempDir::new().expect("test: tempdir");
     let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
@@ -28,7 +28,10 @@ fn setup() -> (TempDir, SkillLifecycleStore, PinnedSkillRevision) {
     ])
     .expect("test: bundle");
     let mut new = NewRevision::new(skill(), SourceKind::Operator);
-    new.capability_requirements = vec!["deploy_check".to_string()];
+    new.capability_requirements = vec![
+        "shell:builtin:deploy_check".to_string(),
+        "skill:deploy-helper:lint".to_string(),
+    ];
     let written = store.write_revision(&new, &bundle).expect("test: write");
     activate(
         &store,
@@ -116,17 +119,17 @@ fn an_unavailable_provider_is_recorded_and_not_attributable() {
     assert!(!facts.failure_attributable_to(&pin.skill_id, &pin.revision_id));
 
     // The provider class decides: availability problems count, a context overflow does not.
-    for class in ["timeout", "rate_limit", "auth", "provider_error"] {
+    for class in ["timeout", "rate_limit", "auth", "server_error"] {
         assert_eq!(
             ProviderEnd::from_failure_class(class),
             ProviderEnd::Unavailable,
             "{class}"
         );
     }
-    assert_eq!(
-        ProviderEnd::from_failure_class("context_overflow"),
-        ProviderEnd::Unknown
-    );
+    // The catch-all label also covers any agent error (a max-iterations stop).
+    for class in ["context_overflow", "provider_error", "anything-else"] {
+        assert_eq!(ProviderEnd::from_failure_class(class), ProviderEnd::Unknown, "{class}");
+    }
 
     // A tool whose backend was unavailable is infrastructure.
     let (tmp, store, pin) = setup();
@@ -177,7 +180,7 @@ fn adherence_needs_every_declared_tool_called_and_a_complete_trace() {
     assert_eq!(verdict(&facts), Adherence::NotFollowed);
     assert_eq!(
         facts.adherence.first().map(|entry| entry.missing.clone()),
-        Some(vec!["lint".to_string()])
+        Some(vec!["skill:deploy-helper:lint".to_string()])
     );
     assert!(!facts.failure_attributable_to(&pin.skill_id, &pin.revision_id));
 
@@ -265,4 +268,90 @@ fn records_written_before_the_facts_existed_still_parse_as_unknown() {
     assert_eq!(partial.permission_refused, FactState::Present);
     assert_eq!(partial.infrastructure_unavailable, FactState::Unknown);
     assert!(partial.adherence.is_empty(), "no adherence entries were given");
+}
+
+#[test]
+fn only_the_full_capability_id_matches_a_requirement() {
+    let (tmp, store, pin) = setup();
+    // The public name alone, or another namespace, is not the required tool.
+    let lookalikes = clean(vec![
+        call("shell:builtin:lint", ObservedCallStatus::Succeeded),
+        call("other:ns:deploy_check", ObservedCallStatus::Succeeded),
+        call("deploy_check", ObservedCallStatus::Succeeded),
+    ]);
+    let facts = terminal_facts(&tmp, &store, &pin, "lookalike", Some(&lookalikes));
+    assert_eq!(
+        facts.adherence_of(&pin.skill_id, &pin.revision_id),
+        Adherence::NotFollowed
+    );
+}
+
+#[test]
+fn a_skill_toml_tool_is_not_part_of_the_oracle() {
+    // `lint` is a SKILL.toml tool and also required here; an `orphan` tool that
+    // is declared only in SKILL.toml must not be required.
+    let tmp = TempDir::new().expect("test: tempdir");
+    let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
+    let toml = "[skill]\nname = \"Deploy helper\"\ndescription = \"Helps with deploys\"\nversion = \"0.1.0\"\n\n\
+                [[tools]]\nname = \"orphan\"\ndescription = \"x\"\nkind = \"shell\"\ncommand = \"true\"\n";
+    let bundle = Bundle::from_entries(vec![
+        entry("SKILL.md", md_required("[shell:builtin:deploy_check]").as_bytes()),
+        entry("SKILL.toml", toml.as_bytes()),
+    ])
+    .expect("test: bundle");
+    let written = store
+        .write_revision(&NewRevision::new(skill(), SourceKind::Operator), &bundle)
+        .expect("test: write");
+    assert_eq!(
+        written.revision.capability_requirements,
+        vec!["shell:builtin:deploy_check".to_string()]
+    );
+    activate(
+        &store,
+        &skill(),
+        &(written.revision.revision_id, written.record_digest),
+        0,
+        true,
+    );
+    let pin = store.pin_active(&skill()).expect("test: pin").expect("test: bound");
+    let called = clean(vec![call("shell:builtin:deploy_check", ObservedCallStatus::Succeeded)]);
+    let facts = terminal_facts(&tmp, &store, &pin, "toml-tool", Some(&called));
+    assert_eq!(facts.adherence_of(&pin.skill_id, &pin.revision_id), Adherence::Followed);
+}
+
+fn md_required(list: &str) -> String {
+    format!("---\nname: Deploy helper\ndescription: Helps with deploys\nrequired-tools: {list}\n---\n\nBody.\n")
+}
+
+#[test]
+fn a_run_that_read_several_skills_attributes_nothing_to_any_of_them() {
+    let (tmp, store, pin) = setup();
+    // A second managed skill, also required-tools clean, hydrated in the same run.
+    let other = SkillId::parse("other-helper").expect("test: id");
+    let bundle = Bundle::from_entries(vec![entry(
+        "SKILL.md",
+        md_required("[shell:builtin:deploy_check]").as_bytes(),
+    )])
+    .expect("test: bundle");
+    let written = store
+        .write_revision(&NewRevision::new(other.clone(), SourceKind::Operator), &bundle)
+        .expect("test: write");
+    activate(
+        &store,
+        &other,
+        &(written.revision.revision_id, written.record_digest),
+        0,
+        true,
+    );
+    let other_pin = store.pin_active(&other).expect("test: pin").expect("test: bound");
+    store
+        .record_hydration("multi", &other_pin, "SKILL.md", b"x", &Correlation::default())
+        .expect("test: hydrate second skill");
+    let facts = terminal_facts(&tmp, &store, &pin, "multi", Some(&clean(both_called())));
+    assert_eq!(facts.adherence.len(), 2, "both are listed");
+    for entry in &facts.adherence {
+        assert_eq!(entry.verdict, Adherence::Unknown);
+    }
+    assert!(!facts.failure_attributable_to(&pin.skill_id, &pin.revision_id));
+    assert!(!facts.failure_attributable_to(&other, &other_pin.revision_id));
 }

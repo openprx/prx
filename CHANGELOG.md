@@ -15,6 +15,16 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Skill lifecycle evidence: the terminal experience record now stores
+  infrastructure, permission and adherence facts, and the execution trace
+  snapshot gains an optional `unavailable_attempts` counter. Rollback note:
+  `ExecutionTraceSnapshot`, `TerminalJoin` and the new `TerminalFacts` use
+  `deny_unknown_fields`, so a binary from before this change cannot read
+  payloads or experience records written after it; roll back only after
+  removing `experiences/` records and sealed terminal markers written by the
+  new build, or keep the new build. A new optional `required-tools` frontmatter
+  key declares the tools a skill needs (see `docs/skills-catalog-security.md`).
+
 - `causal_tree.policy.extra_token_ratio_limit` must now be finite and greater
   than 0; a zero, negative or non-finite value is rejected at config load
   instead of refusing every Agent turn at admission.

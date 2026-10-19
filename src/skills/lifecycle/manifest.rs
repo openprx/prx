@@ -81,6 +81,14 @@ pub fn validate_manifest(bundle: &Bundle) -> Result<ManifestInfo, ManifestError>
     })
 }
 
+/// A malformed declaration reads as undeclared (and is logged), so a revision
+/// stored before the key was defined stays readable.
+fn lenient(parsed: Result<Vec<String>, ManifestError>, file: &str) -> Option<Vec<String>> {
+    parsed
+        .inspect_err(|error| tracing::warn!(%error, file, "ignoring a malformed `required-tools` declaration"))
+        .ok()
+}
+
 /// Normalises a declared tool list: bounded, plain names, sorted and unique.
 fn checked_tools(items: impl IntoIterator<Item = String>) -> Result<Vec<String>, ManifestError> {
     let invalid = |reason| ManifestError::InvalidField {
@@ -141,17 +149,24 @@ fn strict_frontmatter(markdown: &str) -> Result<(String, String, Option<Vec<Stri
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
     let mut tools: Option<Vec<String>> = None;
+    let mut tools_seen = false;
+    let mut tools_poisoned = false;
     for line in block.lines() {
         let top_level = !line.starts_with(char::is_whitespace);
         // Only a top-level key declares tools; an indented one belongs to some
         // other mapping and is not ours to read.
         if top_level && let Some(value) = line.strip_prefix("required-tools:") {
-            if tools.is_some() {
-                return Err(ManifestError::DuplicateKey {
-                    key: REQUIRED_TOOLS_KEY,
-                });
+            // A line in any other form (a scalar, a repeated key) may already be
+            // in a stored revision, which must stay readable: it declares
+            // nothing, with a warning.
+            if tools_seen {
+                tracing::warn!("SKILL.md repeats `required-tools`; treating it as undeclared");
+                tools = None;
+                tools_poisoned = true;
+            } else if let Some(list) = lenient(markdown_tools(value), "SKILL.md") {
+                tools = Some(list);
             }
-            tools = Some(markdown_tools(value)?);
+            tools_seen = true;
             continue;
         }
         let trimmed = line.trim();
@@ -172,7 +187,7 @@ fn strict_frontmatter(markdown: &str) -> Result<(String, String, Option<Vec<Stri
     }
     match (name, description) {
         (Some(name), Some(description)) if (&name, &description) == (&legacy.0, &legacy.1) => {
-            Ok((name, description, tools))
+            Ok((name, description, if tools_poisoned { None } else { tools }))
         }
         (Some(_), Some(_)) => Err(ManifestError::AmbiguousFrontmatter),
         _ => Err(ManifestError::MissingFrontmatter),
@@ -214,25 +229,19 @@ fn check_toml(bytes: &[u8], name: &str, description: &str) -> Result<(String, Op
     }
     // The same key as in SKILL.md, under `[skill]`, as an array of strings.
     let raw: toml::Value = toml::from_str(text).map_err(|e| ManifestError::InvalidToml(e.to_string()))?;
-    let tools = match raw.get("skill").and_then(|skill| skill.get(REQUIRED_TOOLS_KEY)) {
-        None => None,
-        Some(toml::Value::Array(items)) => Some(checked_tools(
-            items
-                .iter()
-                .map(|item| item.as_str().map(str::to_string).ok_or(()))
-                .collect::<Result<Vec<_>, ()>>()
-                .map_err(|()| ManifestError::InvalidField {
-                    field: REQUIRED_TOOLS_KEY,
-                    reason: "must be an array of strings",
-                })?,
-        )?),
-        Some(_) => {
-            return Err(ManifestError::InvalidField {
+    let tools = raw
+        .get("skill")
+        .and_then(|skill| skill.get(REQUIRED_TOOLS_KEY))
+        .and_then(|value| {
+            let items: Option<Vec<String>> = value
+                .as_array()
+                .and_then(|items| items.iter().map(|item| item.as_str().map(str::to_string)).collect());
+            let parsed = items.ok_or(ManifestError::InvalidField {
                 field: REQUIRED_TOOLS_KEY,
                 reason: "must be an array of strings",
             });
-        }
-    };
+            lenient(parsed.and_then(checked_tools), "SKILL.toml")
+        });
     Ok((version.to_string(), tools))
 }
 

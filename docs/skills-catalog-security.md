@@ -91,21 +91,26 @@ provider-callable ToolSpecs.
 ## Required tools and learning evidence
 
 A skill may declare the tools a run must call to have followed it, with the
-optional top-level `SKILL.md` frontmatter key `required-tools`, a one-line list:
+optional top-level `SKILL.md` frontmatter key `required-tools`, a one-line list
+of canonical capability ids (`family:namespace:name`, the ids the execution
+trace records):
 
 ```yaml
 ---
 name: deploy-helper
 description: Helps with deploys
-required-tools: [deploy_check, lint]
+required-tools: [native:local:deploy_check, skill:deploy-helper:lint]
 ---
 ```
 
-Names are 1-128 characters of letters, digits and `_ - . :`, at most 16. The
-same key may appear under `[skill]` in `SKILL.toml` as an array of strings
-(`required-tools = ["deploy_check"]`). When both files declare it, the lists
-must be equal; a disagreement is rejected when the revision is validated. The
-`[[tools]]` names of `SKILL.toml` count as declared tools too.
+Names are 1-128 characters of letters, digits and `_ - . :`, at most 16; a call
+matches only when its whole capability id is equal. The same key may appear
+under `[skill]` in `SKILL.toml` as an array of strings. When both files declare
+it, the lists must be equal; a disagreement is rejected when the revision is
+validated. A line in any other form (a scalar, a repeated key, a malformed
+list) declares nothing and is logged, so skills stored before the key existed
+stay readable. The `[[tools]]` entries of `SKILL.toml` are not part of the
+requirement.
 
 The skill lifecycle records the declared tools of an imported, operator-written
 or upstream revision as its `capability_requirements`. A learned revision keeps
@@ -113,10 +118,19 @@ exactly its baseline's list: a candidate that adds or removes a required tool,
 in the record or in its manifests, is refused at source review and at
 publication, because that would move the oracle its own evidence is judged by.
 
-At the end of a run the lifecycle compares the declared tools with the tools
+At the end of a run the lifecycle compares the required tools with the tools
 the run called. A failed run counts as evidence against the skill's guidance
-only when the declared tools were called, the provider and the tool backends
-were available (connection errors, timeouts, upstream 5xx and a down MCP server
-are infrastructure; argument and validation errors are not), and no tool call
-was refused by policy or approval. A skill that declares nothing has no
-verifiable adherence, so its failures are never used to propose a revision.
+only when the required tools were called, the provider and the tool backends
+were available, and no tool call was refused by policy or approval. A run that
+read more than one managed skill is not attributed to any of them. A skill that
+declares nothing has no verifiable adherence, so its failures are never used to
+propose a revision.
+
+Tool failures count as an unavailable backend when their text (with its source
+chain) names a connection error, timeout, DNS or routing failure, "error sending
+request", overload, or an HTTP 429, 500, 502, 503, 504 or 529 as a whole token.
+The MCP allow/deny refusal counts as a denial. Known limit: a tool that returns
+an upstream failure as a successful result is invisible; a typed error kind is
+the later fix. Only a provider failure labelled timeout, rate limit,
+credentials or server error counts as an unavailable provider; the generic
+agent error label does not.

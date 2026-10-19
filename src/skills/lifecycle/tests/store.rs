@@ -516,3 +516,27 @@ mod unix {
         assert!(!tmp.path().join("skills").exists());
     }
 }
+
+#[test]
+fn rewriting_a_revision_with_a_legacy_required_tools_line_is_idempotent() {
+    let (_tmp, store) = setup();
+    let skill = SkillId::parse("legacy-skill").expect("test: id");
+    let text = "---\nname: Legacy\ndescription: Old skill\nrequired-tools: lint\n---\n\nBody.\n";
+    let bundle = Bundle::from_entries(vec![entry("SKILL.md", text.as_bytes())]).expect("test: bundle");
+    let first = store
+        .write_revision(&NewRevision::new(skill.clone(), SourceKind::Operator), &bundle)
+        .expect("test: the legacy form is accepted");
+    assert!(
+        first.revision.capability_requirements.is_empty(),
+        "a legacy line declares nothing"
+    );
+    let again = store
+        .write_revision(&NewRevision::new(skill.clone(), SourceKind::Operator), &bundle)
+        .expect("test: an idempotent rewrite");
+    assert!(!again.created);
+    assert_eq!(again.revision.revision_id, first.revision.revision_id);
+    // It still reads back through the verifying reader.
+    store
+        .read_revision(&skill, &first.revision.revision_id, None)
+        .expect("test: readable");
+}

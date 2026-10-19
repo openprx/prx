@@ -132,18 +132,20 @@ fn required_tools_are_read_from_the_frontmatter_list() {
 }
 
 #[test]
-fn malformed_or_repeated_required_tools_are_rejected() {
+fn a_legacy_or_malformed_required_tools_line_reads_as_undeclared() {
+    // A stored revision may already carry such a line in another form: it must
+    // stay readable (and rewritable) and simply declares nothing.
     for line in [
         "required-tools: lint",
         "required-tools: [a b]",
         "required-tools: [a;b]",
         "required-tools: [a, b",
         "required-tools: [a]\nrequired-tools: [b]",
+        "required-tools: {a: 1}",
     ] {
-        assert!(
-            manifest_of(vec![entry("SKILL.md", md_with_tools(line).as_bytes())]).is_err(),
-            "{line}"
-        );
+        let info = manifest_of(vec![entry("SKILL.md", md_with_tools(line).as_bytes())])
+            .unwrap_or_else(|e| panic!("test: {line} must stay readable: {e}"));
+        assert!(info.required_tools.is_empty(), "{line}");
     }
 }
 
@@ -175,6 +177,7 @@ fn skill_md_and_skill_toml_must_agree_on_required_tools() {
         ),
         "{err}"
     );
-    assert!(both("required-tools: [a]", "required-tools = \"a\"\n").is_err());
-    assert!(both("required-tools: [a]", "required-tools = [1]\n").is_err());
+    // A malformed TOML value is undeclared, not a conflict.
+    let lenient = both("required-tools: [a]", "required-tools = [1]\n").expect("test: lenient");
+    assert_eq!(lenient.required_tools, vec!["a".to_string()]);
 }
