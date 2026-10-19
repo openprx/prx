@@ -18,6 +18,8 @@ struct LaunchFields {
     session_key: String,
     parent_decision_id: String,
     parent_decision_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_task_run_id: Option<String>,
     input_event_id: String,
     input_event_mac: [u8; 32],
     config_generation_id: u64,
@@ -61,6 +63,8 @@ pub(super) async fn persist(
         session_key: session.to_owned(),
         parent_decision_id: child.parent_decision_id.to_string(),
         parent_decision_digest: grant.parent_record_binding().1.to_owned(),
+        parent_task_run_id: (grant.parent().spawn_run_id() != grant.parent().run_id())
+            .then(|| grant.parent().spawn_run_id().to_owned()),
         input_event_id: source.event_id.clone(),
         input_event_mac: constraints.key.hmac(
             crate::decision::key::KeyDomain::StateFingerprint,
@@ -284,13 +288,31 @@ pub(super) async fn read(
         .reader()
         .replay_record(&scope, &decision)?
         .context("worker launch parent decision missing")?;
+    let parent_run_matches = if let Some(task) = fields.parent_task_run_id.as_deref() {
+        let source_id = parent
+            .source_event_id
+            .as_deref()
+            .context("worker launch parent source missing")?;
+        let source = memory
+            .find_owned_message_event(fabric.workspace_id(), owner, source_id)
+            .await?
+            .context("worker launch parent source event missing")?;
+        crate::runtime::child_source::parent::matches_parent_task_segment(task, &parent, &source)
+            && input.parent_run_id.as_deref() == Some(task)
+            && source.workspace_id == fields.workspace_id
+            && source.owner_id.as_deref() == Some(owner)
+            && source.config_generation_id == Some(fields.config_generation_id)
+            && source.config_source_revision.as_deref() == Some(fields.config_source_revision.as_str())
+    } else {
+        parent.decision.run_id == input.parent_run_id
+    };
     anyhow::ensure!(
         parent.digest == fields.parent_decision_digest
             && parent.decision.enabled_snapshot
             && !parent.decision.legacy_v1
             && parent.decision.admits_issued_child()
             && parent.decision.run_id.is_some()
-            && parent.decision.run_id == input.parent_run_id
+            && parent_run_matches
             && parent.decision.session_key.is_some()
             && parent.decision.session_key == input.parent_session_key
             && parent.source_event_id.is_some()

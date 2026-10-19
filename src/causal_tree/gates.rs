@@ -292,6 +292,12 @@ impl HardGates {
 
         // G4: mirror the execution policy. A generic tool's exact OpIds are
         // call-argument-dependent; an empty list is never a grant.
+        // The session "Always" allowlist (`ApprovalManager`) is deliberately not
+        // consulted here: `AgentToolApprovalStrategy::resolve` refuses every
+        // decision-bound call before it looks at that allowlist, because a
+        // decision-scoped approval needs durable review and resume. Honoring
+        // "Always" in this gate would admit a candidate that execution then
+        // denies.
         let mut approval_ids = Vec::new();
         let mut policy_asks = false;
         for entry in entries.iter().flatten() {
@@ -1613,6 +1619,7 @@ mod tests {
                 level: AutonomyLevel::Full,
                 max_cost_cents: 100,
                 remaining_depth: 2,
+                delegation: None,
             },
             catalog_generation: *catalog.generation(),
             key: key.clone(),

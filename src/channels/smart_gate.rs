@@ -112,6 +112,20 @@ pub(super) struct AdmittedSmartPreGate {
     pub(super) started_at: chrono::DateTime<chrono::Utc>,
 }
 
+impl AdmittedSmartPreGate {
+    /// The completed classifier outcome that authorizes silence, or `None`
+    /// when the message must enter the loop (fail-open): either the gate
+    /// chose to enter, or it skipped without a settled classifier receipt.
+    pub(super) const fn silence_provider_outcome(
+        &mut self,
+    ) -> Option<crate::llm::route_decision::ProviderExecutionOutcome> {
+        if self.outcome.should_enter_loop() {
+            return None;
+        }
+        self.provider_outcome.take()
+    }
+}
+
 /// Run the smart-group classifier only after the source decision exists. A
 /// heuristic may enter the main loop directly, but neither heuristic nor a
 /// caller-owned provider can authorize silence.

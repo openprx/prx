@@ -384,6 +384,142 @@ async fn cli_agent_configured_scope_denies_wire_file_write() {
     assert!(!config.workspace_dir.join("wire-denied.txt").exists());
 }
 
+/// Finding 76: a plain CLI turn has no owner-review ingress, so a fresh request
+/// naming a supervised, approval-required MCP write tool cannot be prompted
+/// for. It must close (Clarify/Refuse), never answer as if it had written, and
+/// never reach the server. The Chat path that does prompt is
+/// `fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once`.
+/// Real stdio MCP server (python3, no network), real decision plane.
+#[tokio::test]
+async fn cli_turn_exact_named_mcp_write_without_review_ingress_closes_instead_of_answering() {
+    const SERVER: &str = r#"
+import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    method = message.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": message.get("params", {}).get("protocolVersion", "2024-11-05"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "prx-server", "version": "1.0.0"},
+        }
+    elif method == "tools/list":
+        result = {"tools": [{"name": "write", "description": "Write remote data", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}, {"name": "search", "description": "Search remote data", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}}]}
+    elif method == "tools/call":
+        with open("@MARKER@", "w") as marker:
+            marker.write("executed")
+        result = {"content": [{"type": "text", "text": "written"}], "isError": False}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"#;
+    assert!(
+        std::process::Command::new("python3")
+            .arg("--version")
+            .status()
+            .is_ok_and(|status| status.success()),
+        "test: python3 runs the stdio MCP fixture"
+    );
+    let tmp = TempDir::new().unwrap();
+    let marker = tmp.path().join("mcp-executed.marker");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = tmp.path().to_path_buf();
+    config.config_path = tmp.path().join("config.toml");
+    config.causal_tree.enabled = true;
+    config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+    config.cost.prices.insert(
+        "ollama/prx-local-model".to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    config.mcp.servers.insert(
+        "prx_server".to_owned(),
+        crate::config::McpServerConfig {
+            command: Some("python3".into()),
+            args: vec![
+                "-u".into(),
+                "-c".into(),
+                SERVER.replace("@MARKER@", &marker.to_string_lossy()),
+            ],
+            startup_timeout_ms: 10_000,
+            request_timeout_ms: 10_000,
+            ..crate::config::McpServerConfig::default()
+        },
+    );
+    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let mcp = Arc::new(
+        crate::tools::McpTool::new(Arc::clone(&security), config.mcp.clone(), tmp.path().to_path_buf())
+            .with_launch_root(tmp.path().join("mcp")),
+    );
+    let discovered = crate::tools::Tool::execute(mcp.as_ref(), serde_json::json!({"action": "refresh"}))
+        .await
+        .unwrap();
+    assert!(discovered.success, "real MCP discovery: {discovered:?}");
+    let snapshot = mcp.capability_snapshot();
+    assert!(
+        snapshot.iter().any(|spec| spec.spec.name == "mcp__prx_server__write"),
+        "the stdio server published its write tool"
+    );
+    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(vec![mcp.test_boxed_tool()]);
+    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let admit = |input: &'static str| {
+        crate::agent::turn_tests::admission::AdmittedTurn::with_enabled_builtin_model_and_mcp(
+            config.clone(),
+            input,
+            Arc::clone(&tools_registry),
+            Arc::clone(&mem),
+            ("ollama", "prx-local-model"),
+            snapshot.clone(),
+        )
+    };
+    let input = "call mcp__prx_server__write with path remote.txt and content \"approved exact contents\"";
+    let admission = admit(input).await;
+    let directive = admission.decision().context.directive();
+    assert!(
+        matches!(
+            directive,
+            crate::causal_tree::directive::TurnExecutionDirective::Clarify { .. }
+                | crate::causal_tree::directive::TurnExecutionDirective::Refuse { .. }
+        ),
+        "an exact approval-required write must close, not answer or execute: {directive:?}"
+    );
+    assert_eq!(
+        crate::causal_tree::directive::render_terminal_directive(directive).expect("test: terminal text"),
+        "This action needs owner approval, which this surface cannot collect; nothing was run."
+    );
+    // A bare alias match earlier in the family must not hide the full name.
+    let mixed = admit("call mcp__prx_server__write with path remote.txt then search the result").await;
+    assert_eq!(
+        crate::causal_tree::directive::render_terminal_directive(mixed.decision().context.directive())
+            .expect("test: mixed prompt closes with a terminal text"),
+        "This action needs owner approval, which this surface cannot collect; nothing was run."
+    );
+    // Bare server-side tool names are ordinary words: prose still answers.
+    for prose in ["write a poem about spring", "search the docs for the release notes"] {
+        let admission = admit(prose).await;
+        assert!(
+            matches!(
+                admission.decision().context.directive(),
+                crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+            ),
+            "{prose:?} must still answer: {:?}",
+            admission.decision().context.directive()
+        );
+    }
+    assert!(!marker.exists(), "the MCP server saw an unapproved write call");
+}
+
 /// A scheduled turn retains its creator's read-only tool authority even when
 /// the bootstrap CLI policy would otherwise permit the same write.
 #[tokio::test]

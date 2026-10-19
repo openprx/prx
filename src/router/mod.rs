@@ -91,12 +91,13 @@ impl RouterEngine {
         model_routes: Vec<ModelRouteConfig>,
         memory: Arc<dyn Memory>,
         embedder: Option<Arc<dyn EmbeddingProvider>>,
+        cost: &crate::config::schema::CostConfig,
     ) -> Result<Self> {
         let configured_inputs = config.clone();
         let reachable_providers = reachable_provider_names(&default_provider, &model_routes);
         if config.models.is_empty() {
             config.models =
-                filter_models_by_providers(self::models::builtin_model_capabilities(), &reachable_providers);
+                filter_models_by_providers(self::models::builtin_model_capabilities(cost), &reachable_providers);
         } else {
             config.models = filter_models_by_providers(config.models.clone(), &reachable_providers);
         }
@@ -243,7 +244,10 @@ impl RouterEngine {
         let reachable_providers = reachable_provider_names(&default_provider, &model_routes);
         let filtered_config = RouterConfig {
             models: if config.models.is_empty() {
-                filter_models_by_providers(self::models::builtin_model_capabilities(), &reachable_providers)
+                filter_models_by_providers(
+                    self::models::builtin_model_capabilities(&crate::config::schema::CostConfig::default()),
+                    &reachable_providers,
+                )
             } else {
                 filter_models_by_providers(config.models.clone(), &reachable_providers)
             },
@@ -1093,9 +1097,16 @@ mod tests {
     #[tokio::test]
     async fn test_record_outcome_updates_elo() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router = RouterEngine::new(router_config(), "openai".into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let router = RouterEngine::new(
+            router_config(),
+            "openai".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap();
 
         router
             .record_outcome("hello analysis", "model-a", true, 1_600)
@@ -1185,9 +1196,16 @@ mod tests {
     #[tokio::test]
     async fn test_success_rate_window() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router = RouterEngine::new(router_config(), "openai".into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let router = RouterEngine::new(
+            router_config(),
+            "openai".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap();
 
         for _ in 0..100 {
             router
@@ -1209,9 +1227,16 @@ mod tests {
     #[tokio::test]
     async fn test_latency_ema() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router = RouterEngine::new(router_config(), "openai".into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let router = RouterEngine::new(
+            router_config(),
+            "openai".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap();
 
         router
             .record_outcome("hello analysis", "model-a", true, 1_600)
@@ -1366,9 +1391,16 @@ mod tests {
                 },
             ],
         };
-        let router = RouterEngine::new(config, "anthropic".into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let router = RouterEngine::new(
+            config,
+            "anthropic".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let models = router.models.read();
         assert_eq!(models.len(), 1);
@@ -1414,16 +1446,30 @@ mod tests {
         let mut unreachable = router_config();
         unreachable.models = vec![model("openai")];
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let _ = RouterEngine::new(unreachable, LABEL.into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let _ = RouterEngine::new(
+            unreachable,
+            LABEL.into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap();
 
         // A decision among candidates on the credentialed endpoint.
         let mut reachable = router_config();
         reachable.models = vec![model(LABEL)];
-        let router = RouterEngine::new(reachable, LABEL.into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let router = RouterEngine::new(
+            reachable,
+            LABEL.into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap();
         let decision = router.select_model("hello analysis", &TaskIntent::Simple).await;
 
         // An outcome for the credentialed model target.
@@ -1478,9 +1524,16 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let router = RouterEngine::new(config, "anthropic".into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let router = RouterEngine::new(
+            config,
+            "anthropic".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
         assert!(output.contains("no reachable models"));
@@ -1502,14 +1555,21 @@ mod tests {
             elo_rating: 1_000.0,
         }];
 
-        let router = RouterEngine::new(config, "anthropic".into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap()
-            .with_local_hash_history(Arc::new(crate::memory::embeddings::LocalHashEmbedding::new(
-                "prx-local-hash-v1",
-                384,
-            )))
-            .expect("an empty reachable candidate set falls back to the primary model");
+        let router = RouterEngine::new(
+            config,
+            "anthropic".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap()
+        .with_local_hash_history(Arc::new(crate::memory::embeddings::LocalHashEmbedding::new(
+            "prx-local-hash-v1",
+            384,
+        )))
+        .expect("an empty reachable candidate set falls back to the primary model");
 
         assert!(router.has_history());
         assert!(router.models.read().is_empty());
@@ -1599,9 +1659,16 @@ mod tests {
                 },
             ],
         };
-        let router = RouterEngine::new(config, "anthropic".into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let router = RouterEngine::new(
+            config,
+            "anthropic".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap();
 
         let result = router.select_model("hello analysis", &TaskIntent::Simple).await;
         assert_eq!(result.chosen_provider.as_deref(), Some("anthropic"));
@@ -1653,9 +1720,16 @@ mod tests {
                 },
             ],
         };
-        let router = RouterEngine::new(config, "openai".into(), Vec::new(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let router = RouterEngine::new(
+            config,
+            "openai".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await
+        .unwrap();
 
         router.record_outcome("hello", "model-cheap", true, 500).await.unwrap();
 

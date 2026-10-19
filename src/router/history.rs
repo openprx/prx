@@ -127,8 +127,12 @@ impl RouterHistory {
             return Ok(HashMap::new());
         }
         let mut neighbors = Vec::new();
-        for row in &read.rows {
-            tokio::task::yield_now().await;
+        for (index, row) in read.rows.iter().enumerate() {
+            // Bounded batches avoid one scheduler handoff per history row;
+            // the authority deadline and cancellation are still checked per row.
+            if index.is_multiple_of(16) {
+                tokio::task::yield_now().await;
+            }
             anyhow::ensure!(
                 !cancellation.is_cancelled() && std::time::Instant::now() < deadline,
                 "Router history ranking cancelled or expired"

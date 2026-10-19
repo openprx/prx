@@ -1,3 +1,5 @@
+pub(crate) const MESSAGE_EVENT_BATCH_LIMIT: usize = 32;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1773,6 +1775,22 @@ pub trait Memory: Send + Sync {
     async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
         let _ = input;
         Err(crate::memory::fabric::fail_fast(self.name(), "append_message_event"))
+    }
+
+    /// Append at most 32 independent events, returning one result per input in
+    /// the original order. Unsupported backends retain explicit per-event errors.
+    async fn append_message_events(&self, inputs: Vec<MessageEventInput>) -> Vec<anyhow::Result<MessageEvent>> {
+        if inputs.len() > MESSAGE_EVENT_BATCH_LIMIT {
+            return inputs
+                .iter()
+                .map(|_| Err(anyhow::anyhow!("message event batch exceeds capacity")))
+                .collect();
+        }
+        let mut results = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            results.push(self.append_message_event(input).await);
+        }
+        results
     }
 
     /// Create a backend lifetime owner. Unsupported backends fail explicitly.

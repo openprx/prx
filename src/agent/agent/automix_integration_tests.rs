@@ -321,7 +321,15 @@ async fn build_agent_work(
         },
         ..Default::default()
     };
-    let router = RouterEngine::new(policy.clone(), label.clone(), Vec::new(), Arc::clone(&memory), None).await?;
+    let router = RouterEngine::new(
+        policy.clone(),
+        label.clone(),
+        Vec::new(),
+        Arc::clone(&memory),
+        None,
+        &crate::config::schema::CostConfig::default(),
+    )
+    .await?;
     let mut config = Config::default();
     config.workspace_dir = workspace.to_path_buf();
     config.config_path = workspace.join("config.toml");

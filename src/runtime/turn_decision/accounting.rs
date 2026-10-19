@@ -1,7 +1,8 @@
-//! Deferred adapter from a genuine turn proof to physical-send accounting.
-use super::{TurnBudgets, TurnDecisionService, TurnSourceProof, validate_agent_turn_origin};
+//! Bounded admission resources and deferred physical-send accounting.
+use super::{TurnBudgets, TurnDecisionContext, TurnDecisionService, TurnSourceProof, validate_agent_turn_origin};
 use crate::decision::budget::{self, AttemptBinding, DecisionAttemptAccounting, DecisionAttemptReceipt};
 use crate::decision::{DecisionError, KeyDomain};
+use crate::runtime::causal_events::PersistenceGuard;
 use crate::runtime::decision_accounting::AccountingScope;
 use async_trait::async_trait;
 use std::{
@@ -9,12 +10,35 @@ use std::{
     time::Instant,
 };
 
+pub(super) type AdmissionDecision = (Arc<TurnDecisionContext>, Option<PersistenceGuard>);
+
 pub(super) struct TurnAccounting<'a> {
     service: &'a TurnDecisionService,
     proof: &'a dyn TurnSourceProof,
     budgets: TurnBudgets,
     deadline: Instant,
     scope: OnceLock<Option<Arc<AccountingScope>>>,
+}
+
+/// The telemetry guard belongs to admission, independently of the physical
+/// accounting scope that an issued context can retain after admission ends.
+pub(super) fn admission_persistence(service: &TurnDecisionService) -> Option<PersistenceGuard> {
+    service
+        .durable_events
+        .as_ref()
+        .map(|events| events.defer_ordinary_persistence())
+}
+
+pub(super) fn admission_resources<'a>(
+    service: &'a TurnDecisionService,
+    proof: &'a dyn TurnSourceProof,
+    budgets: TurnBudgets,
+    deadline: Instant,
+) -> (TurnAccounting<'a>, Option<PersistenceGuard>) {
+    (
+        TurnAccounting::new(service, proof, budgets, deadline),
+        admission_persistence(service),
+    )
 }
 
 impl<'a> TurnAccounting<'a> {
@@ -99,3 +123,6 @@ impl DecisionAttemptAccounting for TurnAccounting<'_> {
         self.ensure_scope()?.begin(attempt).await
     }
 }
+
+#[cfg(test)]
+mod tests;

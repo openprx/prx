@@ -585,6 +585,10 @@ impl Memory for SqliteMemory {
             .map(|(event, _)| event)
     }
 
+    async fn append_message_events(&self, inputs: Vec<MessageEventInput>) -> Vec<anyhow::Result<MessageEvent>> {
+        self.append_event_batch(inputs).await
+    }
+
     async fn find_message_event_by_idempotency_key(
         &self,
         workspace_id: &str,

@@ -290,7 +290,9 @@ impl TurnDecisionService {
         observation: Option<&'a SegmentObservation>,
         cancellation: &'a CancellationToken,
     ) -> std::pin::Pin<
-        Box<impl std::future::Future<Output = Result<Arc<TurnDecisionContext>, AgentDecisionError>> + Send + 'a>,
+        Box<
+            impl std::future::Future<Output = Result<super::accounting::AdmissionDecision, AgentDecisionError>> + Send + 'a,
+        >,
     > {
         Box::pin(self.decide_agent_initial_inner(
             proof,

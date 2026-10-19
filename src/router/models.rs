@@ -3,15 +3,17 @@ use crate::config::RouterModelConfig;
 /// Router candidates derived entirely from the embedded release catalog.
 /// The operator's explicit `[[router.models]]` entries still replace this
 /// list at the router boundary.
-pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
+pub fn builtin_model_capabilities(cost: &crate::config::schema::CostConfig) -> Vec<RouterModelConfig> {
     let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref() else {
         return Vec::new();
     };
-    model_capabilities_from_catalog(catalog)
+    model_capabilities_from_catalog(catalog, cost)
 }
 
-fn model_capabilities_from_catalog(catalog: &crate::providers::catalog::ReleaseCatalog) -> Vec<RouterModelConfig> {
-    let cost = crate::config::schema::CostConfig::default();
+fn model_capabilities_from_catalog(
+    catalog: &crate::providers::catalog::ReleaseCatalog,
+    cost: &crate::config::schema::CostConfig,
+) -> Vec<RouterModelConfig> {
     catalog
         .models
         .iter()
@@ -22,7 +24,7 @@ fn model_capabilities_from_catalog(catalog: &crate::providers::catalog::ReleaseC
             let router = model.router.as_ref()?;
             let context = model.limits.context_window?;
             if !matches!(
-                crate::llm::route_decision::usage_cost_resolution(&model.provider, &model.api_model, 1, 1, 0, 0, &cost),
+                crate::llm::route_decision::usage_cost_resolution(&model.provider, &model.api_model, 1, 1, 0, 0, cost),
                 crate::llm::route_decision::UsagePrice::Priced(_)
             ) {
                 return None;
@@ -51,13 +53,13 @@ mod tests {
 
     #[test]
     fn builtin_models_not_empty() {
-        let models = builtin_model_capabilities();
+        let models = builtin_model_capabilities(&crate::config::schema::CostConfig::default());
         assert!(!models.is_empty());
     }
 
     #[test]
     fn builtin_models_have_unique_provider_model_pairs() {
-        let models = builtin_model_capabilities();
+        let models = builtin_model_capabilities(&crate::config::schema::CostConfig::default());
         let mut seen = HashSet::new();
         for m in &models {
             let key = format!("{}:{}", m.provider, m.model_id);
@@ -67,7 +69,7 @@ mod tests {
 
     #[test]
     fn builtin_models_all_have_categories() {
-        let models = builtin_model_capabilities();
+        let models = builtin_model_capabilities(&crate::config::schema::CostConfig::default());
         for m in &models {
             assert!(!m.categories.is_empty(), "model {} has no categories", m.model_id);
         }
@@ -75,7 +77,7 @@ mod tests {
 
     #[test]
     fn builtin_models_have_positive_latency() {
-        let models = builtin_model_capabilities();
+        let models = builtin_model_capabilities(&crate::config::schema::CostConfig::default());
         for m in &models {
             assert!(m.latency_ms > 0, "model {} has zero latency", m.model_id);
         }
@@ -83,7 +85,7 @@ mod tests {
 
     #[test]
     fn builtin_models_exclude_retired_and_unpriced_catalog_rows() {
-        let models = builtin_model_capabilities();
+        let models = builtin_model_capabilities(&crate::config::schema::CostConfig::default());
         let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
         for model in &models {
             let release = catalog
@@ -138,7 +140,7 @@ mod tests {
     #[test]
     fn responses_only_codex_is_not_an_automatic_chat_candidate() {
         assert!(
-            !builtin_model_capabilities()
+            !builtin_model_capabilities(&crate::config::schema::CostConfig::default())
                 .iter()
                 .any(|model| model.provider == "openai" && model.model_id == "gpt-5.2-codex"),
             "the direct OpenAI adapter has no Responses wire path"
@@ -169,7 +171,7 @@ mod tests {
             row.router = router.clone();
             row.limits = limits.clone();
         }
-        let models = model_capabilities_from_catalog(&catalog);
+        let models = model_capabilities_from_catalog(&catalog, &crate::config::schema::CostConfig::default());
         assert!(
             models
                 .iter()
@@ -186,7 +188,7 @@ mod tests {
 
     #[test]
     fn builtin_context_windows_match_the_active_priced_router_rows() {
-        let models = builtin_model_capabilities();
+        let models = builtin_model_capabilities(&crate::config::schema::CostConfig::default());
         let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("release catalog");
 
         for (provider, model_id, expected_context) in [
@@ -236,3 +238,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod operator_prices;

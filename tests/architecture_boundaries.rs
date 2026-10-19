@@ -212,7 +212,12 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
 
 /// Older child modules that were never part of the exemption for the
 /// repository root and stay scanned like any other file.
-const SQLITE_SEPARATE_MODULES: &[&str] = &["ingress_recovery.rs", "router_history.rs", "router_learning.rs"];
+const SQLITE_SEPARATE_MODULES: &[&str] = &[
+    "event_batch.rs",
+    "ingress_recovery.rs",
+    "router_history.rs",
+    "router_learning.rs",
+];
 
 const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     // Dedicated Article 73 compliance ledger: it stores immutable event hashes,
