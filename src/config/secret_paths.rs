@@ -755,7 +755,7 @@ pub static ACCESS_CONTROL_PATHS: &[AccessControlPath] = &[
     access(
         "identity_bindings",
         &[Key("identity_bindings")],
-        "channels/mod.rs, daemon/mod.rs (channel account -> user identity)",
+        "channels/inbound_policy.rs, daemon/mod.rs (channel account -> user identity)",
     ),
     // ── Channel sender allow-lists and policies ─────────────────────
     access(
@@ -801,12 +801,12 @@ pub static ACCESS_CONTROL_PATHS: &[AccessControlPath] = &[
     access(
         "channels_config.signal.dm_policy",
         &[Key("channels_config"), Key("signal"), Key("dm_policy")],
-        "channels/mod.rs (direct/group message admission policy)",
+        "channels/inbound_policy.rs (direct/group message admission policy)",
     ),
     access(
         "channels_config.signal.group_policy",
         &[Key("channels_config"), Key("signal"), Key("group_policy")],
-        "channels/mod.rs (direct/group message admission policy)",
+        "channels/inbound_policy.rs (direct/group message admission policy)",
     ),
     access(
         "channels_config.whatsapp.allowed_numbers",
@@ -821,12 +821,12 @@ pub static ACCESS_CONTROL_PATHS: &[AccessControlPath] = &[
     access(
         "channels_config.whatsapp.dm_policy",
         &[Key("channels_config"), Key("whatsapp"), Key("dm_policy")],
-        "channels/mod.rs (direct/group message admission policy)",
+        "channels/inbound_policy.rs (direct/group message admission policy)",
     ),
     access(
         "channels_config.whatsapp.group_policy",
         &[Key("channels_config"), Key("whatsapp"), Key("group_policy")],
-        "channels/mod.rs (direct/group message admission policy)",
+        "channels/inbound_policy.rs (direct/group message admission policy)",
     ),
     access(
         "channels_config.wacli.allowed_from",

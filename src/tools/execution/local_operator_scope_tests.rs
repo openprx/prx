@@ -106,7 +106,7 @@ fn only_the_terminal_ui_and_the_agent_cli_are_local_process_operators() {
 fn remote_ingress_is_never_trusted() {
     // channel, sender, chat_type, chat_id per the real ScopeContext sites.
     let remote = [
-        // src/channels/mod.rs:3692 — IM adapters.
+        // src/channels/turn.rs (ScopeContext construction) — IM adapters.
         ("telegram", "1234567", "private", "1234567"),
         ("whatsapp", "995551518602@s.whatsapp.net", "group", "120363@g.us"),
         // src/gateway/mod.rs:2006 — webhook / fabric turns.
