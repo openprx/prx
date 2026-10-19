@@ -1851,6 +1851,14 @@ endpoint = "https://decider:userinfo-sentinel-decision@127.0.0.1:27/v1"
     /// capturing test's event; serializing these few tests removes the race.
     pub(crate) static LOG_CALLSITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Keep callsite registration on sibling threads aware of this capture.
+    /// tracing-core's single-dispatcher fast path uses that thread's default.
+    pub(crate) fn capture_dispatch(subscriber: impl tracing::Subscriber + Send + Sync + 'static) -> tracing::Dispatch {
+        static INERT: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        INERT.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        tracing::Dispatch::new(subscriber)
+    }
+
     /// Deep-merge `patch` into `base`.
     pub(crate) fn overlay(base: &mut toml::Value, patch: toml::Value) {
         match (base, patch) {

@@ -646,6 +646,10 @@ impl Memory for LucidMemory {
         self.local.append_message_event(input).await
     }
 
+    async fn append_message_events(&self, inputs: Vec<MessageEventInput>) -> Vec<anyhow::Result<MessageEvent>> {
+        self.local.append_message_events(inputs).await
+    }
+
     async fn find_message_event_by_idempotency_key(
         &self,
         workspace_id: &str,

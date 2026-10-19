@@ -489,6 +489,7 @@ impl RuntimeBootstrap {
                 config.model_routes.clone(),
                 mem.clone(),
                 router_embedder,
+                &config.cost,
             )
             .await?;
             let engine = match local_history {

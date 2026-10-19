@@ -1773,6 +1773,7 @@ mod tests {
                 level: crate::security::AutonomyLevel::Supervised,
                 max_cost_cents: 100,
                 remaining_depth: 2,
+                delegation: None,
             },
             catalog_generation: *catalog.generation(),
             key,

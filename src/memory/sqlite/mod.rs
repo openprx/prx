@@ -1,6 +1,7 @@
 mod approval_grants;
 mod documents;
 mod drafts;
+mod event_batch;
 mod events;
 mod evolution;
 mod ingress_recovery;

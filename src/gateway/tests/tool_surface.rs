@@ -178,10 +178,6 @@ fn both_gateway_launch_paths_publish_the_same_tool_surface() {
     // Path 2 — `prx gateway`: the same base registry, then the shared
     // registrar with the arguments that entry point supplies.
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
-    let provider: Arc<dyn Provider> = Arc::from(
-        providers::create_provider_from_test_config(&config, &provider_runtime_options)
-            .expect("test: the provider chain must build"),
-    );
     let model = config
         .default_model
         .clone()
@@ -212,7 +208,6 @@ fn both_gateway_launch_paths_publish_the_same_tool_surface() {
         &config,
         &manager,
         &security,
-        &provider,
         &model,
         &memory,
         &provider_runtime_options,

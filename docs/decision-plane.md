@@ -150,8 +150,9 @@ The estimate is not a vendor-enforced billing cap. Each retry has its own durabl
 reservation; builtin and cache-only paths do not open the cost ledger.
 For a two-attempt plan, accounting prefers an equal share of the remaining
 tokens. If the complete guarded input cannot fit that share but does fit the
-existing total allowance, the current attempt reserves the smallest larger
-share that satisfies the existing strict input-fit check instead.
+existing total allowance, the current attempt reserves input plus the declared
+wire output cap, clamped to that available allowance. Without a wire output cap,
+it conservatively reserves the whole available allowance instead.
 This does not raise a token, cost or time limit or guarantee a second attempt:
 each later attempt must fit the actual remaining allowance. Unknown usage keeps
 the whole claimed reservation; only fully reported usage releases unused tokens.
@@ -163,8 +164,34 @@ closed on that workspace ledger. Once the transport receives the receipt,
 missing usage still retains the entire liability.
 
 Fully reported input/output usage replaces the estimate using pinned PMM prices.
-Actual usage above the estimate is recorded in full. Missing, partial or estimated
-usage retains the pending token and money liability; cancellation does not turn
+Actual usage above the estimate is recorded in full. Known usage updates the
+local budget while cleanup owns its durable settlement in the background, so
+semantic admission can overlap the ledger sync and reconciliation. The durable
+dispatched hold stays in place until both writes finish. Another physical send
+waits for that persistence; shutdown and next-turn cleanup also wait. The receipt
+retains its serialization gate from reservation through transport and settlement,
+so handing reported usage to persistence cannot suspend behind another request.
+Metering and estimated-liability reconciliation share one held ledger lock and
+snapshot. The canonical cost row is synced before journal reconciliation;
+invalid journal state still retains the charge and fails cleanup closed.
+Ordinary phase writes remain deferred through final issuance, including delegation
+storage validation. Delegation reads its committed chain in one bounded operation
+on the writer connection, retaining owner, lineage and replay-digest checks.
+Already queued ordinary phase events persist in batches of at most 32. SQLite
+commits each batch once, isolating individual invalid events with savepoints;
+other backends retain ordered per-event results. At most two SQLite event batches
+write concurrently across workspaces; scalar and Applied writes, selected reads
+and accounting are outside this background gate. Observers remain immediate.
+Batches stop at Applied and drain markers, preserving their FIFO boundary;
+a storage failure still reports incomplete persistence for each affected event.
+The decision-store writer also commits up to 32 already queued ordinary chains
+in one transaction. Each chain has its own savepoint, so a conflict or SQL error
+rolls back that entire chain without losing its valid neighbors. Notifications
+follow the real outer commit. Batches stop at acknowledged reads, outcomes,
+import progress, drain/close markers and the original retention boundary;
+selected Router commits and delegation readbacks keep their existing deadlines.
+A failed write closes further accounting and leaves cleanup unconfirmed. Missing, partial
+or estimated usage retains the pending token and money liability; cancellation does not turn
 an unknown charge into zero. Local budget refusal does not damage backend health.
 Post-prediction gates and scoring use remaining budgets without rewriting the
 fingerprinted request state. A priced direct Answer has zero extra execution
@@ -173,6 +200,13 @@ token and monetary estimate still pass G6. Retrieval and tool candidates keep
 their own execution-latency estimates. Administrative probes/tests use a
 separate owned scope under the existing live-test permission checks. An
 unfunded probe is reported as unprobed, not as successful health evidence.
+
+While a decision is admitted, ordinary phase-event persistence waits until that
+admission ends instead of competing with its required I/O. The guard starts
+after the decision deadline is set. Observers receive phases immediately;
+leaving admission, including cancellation, releases the queued writes in order.
+An issued context can retain physical accounting without retaining this guard,
+and cleanup still drains the phase events before confirming completion.
 
 Supported auxiliary transports account for each actual send, including nested
 fallbacks. Unsupported transports refuse the additional call before dispatch.
@@ -580,3 +614,5 @@ closes locally without claiming a persisted failure event. Admission failure and
 decision issuance are serialized for the same input. These candidate paths still
 require the full behavioral, cancellation, privacy and performance gates; existing
 historical events are not rewritten by this change.
+
+SQLite memory initialization applies schema creation, legacy upgrades and migration-checksum verification in one write transaction. A failed upgrade rolls back the entire initialization; a successful open commits once, reducing schema-write interference with active decision deadlines. Migration versions, checksums and durability settings are unchanged.

@@ -75,6 +75,7 @@ impl RecoveredProcessRun {
     ) -> anyhow::Result<bool> {
         use super::{HistoryEntry, ProcessRunControl, SubAgentRun, SubAgentStatus};
         let source = self.source;
+        let delegation = super::SpawnDelegationStatus::from_stored_payload(source.raw_payload_json.as_deref());
         let run_id = source.run_id.clone().context("recovered worker run missing")?;
         let started_at = chrono::DateTime::parse_from_rfc3339(&source.created_at)?.with_timezone(&chrono::Utc);
         let session = source.session_key.context("recovered worker session missing")?;
@@ -242,6 +243,7 @@ impl RecoveredProcessRun {
             session_scope_key: session,
             // Read-only projections cannot spawn descendants or resume.
             spawn_depth: 0,
+            delegation,
             token_usage_records: usage,
             progress: crate::agent::idle::child_beat(),
             batch_id: self.batch_id,

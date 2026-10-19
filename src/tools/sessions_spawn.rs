@@ -9,6 +9,8 @@
 //! - `steer` action: inject a message into a running sub-agent's context
 
 mod batch_journal;
+mod delegation;
+pub use delegation::SpawnDelegationStatus;
 mod process_terminal;
 mod task_control;
 mod task_terminal;
@@ -132,6 +134,7 @@ pub struct SubAgentRun {
     pub parent_run_id: Option<String>,
     pub session_scope_key: String,
     pub spawn_depth: usize,
+    pub delegation: Option<SpawnDelegationStatus>,
     pub token_usage_records: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
     /// Liveness evidence for this run: the beat every progress event inside it
     /// stamps.
@@ -214,6 +217,7 @@ struct ProcessModeRunSeed<'a> {
     parent_run_id: Option<String>,
     session_scope_key: String,
     spawn_depth: usize,
+    delegation: Option<SpawnDelegationStatus>,
     progress: Arc<crate::agent::idle::ProgressBeat>,
     batch_id: Option<String>,
 }
@@ -243,6 +247,7 @@ fn new_process_mode_run(seed: ProcessModeRunSeed<'_>) -> SubAgentRun {
         parent_run_id: seed.parent_run_id,
         session_scope_key: seed.session_scope_key,
         spawn_depth: seed.spawn_depth,
+        delegation: seed.delegation,
         token_usage_records: Vec::new(),
         progress: seed.progress,
         batch_id: seed.batch_id,
@@ -1297,7 +1302,7 @@ pub struct SessionsSpawnTool {
     /// Test-only parent provider injected at the admitted-source seam. Child
     /// providers always come from the production admitted binding.
     #[cfg(test)]
-    test_parent_provider: Arc<dyn Provider>,
+    test_parent_provider: Option<Arc<dyn Provider>>,
     /// Provider name (for logging/display).
     provider_name: String,
     /// Model to use for sub-agent calls.
@@ -1503,6 +1508,9 @@ fn resolve_pinned_child_compaction(
     )
 }
 
+#[cfg(test)]
+mod test_parent;
+
 impl SessionsSpawnTool {
     fn resolved_process_config_source(
         options: &providers::ProviderRuntimeOptions,
@@ -1538,7 +1546,6 @@ impl SessionsSpawnTool {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         channel: Arc<dyn Channel>,
-        #[cfg(test)] provider: Arc<dyn Provider>,
         provider_name: impl Into<String>,
         model: impl Into<String>,
         temperature: f64,
@@ -1552,8 +1559,6 @@ impl SessionsSpawnTool {
     ) -> Self {
         Self::new_with_registry(
             channel,
-            #[cfg(test)]
-            provider,
             provider_name,
             model,
             temperature,
@@ -1579,7 +1584,6 @@ impl SessionsSpawnTool {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_registry(
         channel: Arc<dyn Channel>,
-        #[cfg(test)] provider: Arc<dyn Provider>,
         provider_name: impl Into<String>,
         model: impl Into<String>,
         _temperature: f64,
@@ -1602,7 +1606,7 @@ impl SessionsSpawnTool {
             test_worker_executable: None,
             channels: Arc::new(HashMap::new()),
             #[cfg(test)]
-            test_parent_provider: provider,
+            test_parent_provider: None,
             fallback_api_key_owner: provider_name.clone(),
             fallback_uses_root_connection: true,
             provider_name,
@@ -1934,60 +1938,35 @@ async fn record_spawn_request_event(
     scope: MessageEventScope,
     task: &str,
     mode: &str,
-    provider_name: &str,
-    model: &str,
+    selection: (&str, &str),
     lineage: &SpawnLineage,
+    grant: Option<&crate::runtime::child_source::IssuedChildGrant>,
 ) -> anyhow::Result<Option<Arc<crate::runtime::child_source::ChildInputReceipt>>> {
     let Some(fabric) = fabric else {
         return Ok(None);
     };
     // Durable records keep the endpoint, never a URL's `user:password@`.
-    let provider_name = crate::providers::redact_endpoint_userinfo(provider_name);
+    let provider_name = crate::providers::redact_endpoint_userinfo(selection.0);
     let task_event_scope = scope.clone();
     let task_id = task_event_scope
         .run_id
         .clone()
         .unwrap_or_else(|| "sessions_spawn:unknown".to_string());
-    let grant = crate::runtime::child_source::outgoing_grant();
-    let receipt = crate::runtime::child_source::record_child_input(
-        fabric,
-        scope,
-        task,
-        None,
-        Some(
-            json!({
-                "mode": mode,
-                "provider": provider_name,
-                "model": model,
-                "owner_id": lineage.owner_id,
-                "topic_id": lineage.topic_id,
-                "parent_task_id": lineage.parent_task_id,
-                "source_message_event_id": lineage.source_message_event_id
-            })
-            .to_string(),
-        ),
-        grant.as_deref(),
-    )
-    .await?;
+    let mut metadata = json!({
+        "mode": mode,
+        "provider": provider_name, "model": selection.1,
+        "owner_id": lineage.owner_id,
+        "topic_id": lineage.topic_id,
+        "parent_task_id": lineage.parent_task_id,
+        "source_message_event_id": lineage.source_message_event_id
+    });
+    delegation::append_metadata(&mut metadata, grant)?;
+    let receipt =
+        crate::runtime::child_source::record_child_input(fabric, scope, task, None, Some(metadata.to_string()), grant)
+            .await?;
+    delegation::append_task(&mut metadata, task)?;
     if let Err(error) = fabric
-        .record_task_event(
-            task_event_scope,
-            task_id,
-            "task.spawned",
-            Some(
-                json!({
-                    "task": task,
-                    "mode": mode,
-                    "provider": provider_name,
-                    "model": model,
-                    "owner_id": lineage.owner_id,
-                    "topic_id": lineage.topic_id,
-                    "parent_task_id": lineage.parent_task_id,
-                    "source_message_event_id": lineage.source_message_event_id
-                })
-                .to_string(),
-            ),
-        )
+        .record_task_event(task_event_scope, task_id, "task.spawned", Some(metadata.to_string()))
         .await
     {
         tracing::warn!("failed to record sessions_spawn task.spawned event: {error}");
@@ -3283,7 +3262,7 @@ impl Tool for SessionsSpawnTool {
                     "tasks": {
                         "type": "array",
                         "minItems": 1,
-                        "description": "For 'spawn_batch': the tasks to launch together, unlimited in number. Each entry is a task string or an object {task, agent?, model?, provider?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
+                        "description": "For 'spawn_batch': the tasks to launch together, unlimited in number. Each entry is a task string or an object {task, agent?, model?, provider?, allow_delegation?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
                         "items": {
                             "anyOf": [
                                 {"type": "string", "minLength": 1},
@@ -3319,6 +3298,7 @@ impl Tool for SessionsSpawnTool {
                         "type": "string",
                         "description": "For 'spawn' and 'spawn_batch': provider override. Must be a provider the operator configured (the gateway provider, a named agent's provider, a fallback provider or a model route); any other provider, including an unconfigured 'custom:<url>', is refused. Defaults to the agent config provider, then the gateway provider."
                     },
+                    "allow_delegation": delegation::request_schema(),
                     "agent": {
                         "type": "string",
                         "description": format!(
@@ -3545,6 +3525,7 @@ impl SessionsSpawnTool {
                 "agent": {"type": "string"},
                 "model": {"type": "string"},
                 "provider": {"type": "string"},
+                "allow_delegation": delegation::request_schema(),
                 "mode": {"type": "string", "enum": ["task", "process"]},
                 "recipient": {"type": "string"},
             },
@@ -3681,6 +3662,7 @@ impl SessionsSpawnTool {
             }
         }
 
+        delegation::validate_batch(&member_args, crate::runtime::child_source::outgoing_grant().as_deref())?;
         let prepared = if let Some(grant) = crate::runtime::child_source::outgoing_grant() {
             let fabric = grant.source_fabric().clone();
             Some(batch_journal::PreparedBatch::prepare(fabric, &grant, &batch_id, &member_args).await?)
@@ -4166,9 +4148,9 @@ impl SessionsSpawnTool {
             .or_else(|| ordinary_publication.map(|publication| publication.security()))
             .or_else(|| operator_source.as_ref().map(|source| source.security()))
             .ok_or_else(|| anyhow::anyhow!("spawn admitted security policy missing"))?;
-        let provider_options = providers::provider_runtime_options_from_config(child_model_config);
-        let provider_options = &provider_options;
+        let provider_options = &providers::provider_runtime_options_from_config(child_model_config);
         let spawn_config = &child_model_config.sessions_spawn;
+        let allow_delegation = delegation::requested(args, spawn_config, child_grant.is_some())?;
         let agents = &child_model_config.agents;
         let task = args
             .get("task")
@@ -4275,8 +4257,8 @@ impl SessionsSpawnTool {
             },
         );
 
-        // This runtime caps neither how many sub-agents run at once, how deeply
-        // they nest, nor how many one session may own: an operator sees every
+        // The registry imposes no global fan-out or nesting limit. A child's
+        // sealed delegation grant independently bounds its depth. An operator sees every
         // live run in the runtime registry and ends it with `prx tasks kill`,
         // which is what makes an uncapped fan-out answerable rather than
         // unstoppable. Counting the live runs on the way in keeps that fan-out
@@ -4682,6 +4664,10 @@ impl SessionsSpawnTool {
                 ))
             })
             .transpose()?;
+        let child_grant = child_grant
+            .as_ref()
+            .map(|grant| grant.for_spawn_request(allow_delegation, &resolved_provider_name, &resolved_model))
+            .transpose()?;
         let process_child_grant = (mode == "process")
             .then(|| {
                 child_grant
@@ -4692,6 +4678,7 @@ impl SessionsSpawnTool {
             })
             .transpose()?
             .flatten();
+        let delegation_status = delegation::status(&process_child_grant, &child_grant);
         let event_workspace = memory_fabric.workspace_id();
         let mut spawn_scope_for_event = spawn_event_scope(
             event_workspace,
@@ -4750,9 +4737,9 @@ impl SessionsSpawnTool {
             spawn_scope_for_event.clone(),
             task,
             &mode,
-            &resolved_provider_name,
-            &resolved_model,
+            (&resolved_provider_name, &resolved_model),
             &run_lineage,
+            process_child_grant.as_deref().or(child_grant.as_deref()),
         )
         .await?;
 
@@ -4830,6 +4817,7 @@ impl SessionsSpawnTool {
                     parent_run_id: parent_run_id.clone(),
                     session_scope_key: session_scope_key.clone(),
                     spawn_depth,
+                    delegation: delegation_status.clone(),
                     progress: Arc::clone(&process_progress),
                     batch_id: batch_id.map(str::to_string),
                 }));
@@ -5664,6 +5652,7 @@ impl SessionsSpawnTool {
                 parent_run_id: parent_run_id.clone(),
                 session_scope_key: session_scope_key.clone(),
                 spawn_depth,
+                delegation: delegation_status.clone(),
                 token_usage_records: Vec::new(),
                 progress: Arc::clone(&task_progress),
                 batch_id: batch_id.map(str::to_string),
@@ -5940,8 +5929,13 @@ impl SessionsSpawnTool {
                 let age = (Utc::now() - r.started_at).num_seconds();
                 let parent = r.parent_run_id.as_deref().unwrap_or("root");
                 let usage = format_run_usage(&r.token_usage_records);
+                let delegation = r.delegation.as_ref().map_or_else(
+                    || "none recorded".to_owned(),
+                    |grant| format!("requested={}, remaining_depth={}, provider={}, model={}, max_cost_cents={}",
+                        grant.requested, grant.remaining_depth, grant.provider, grant.model, grant.max_cost_cents),
+                );
                 format!(
-                    "• `{}` [source=runtime, manageable=true, usage={usage}, {age}s ago] {status}\n  task: {}\n  depth: {} | parent: {}",
+                    "• `{}` [source=runtime, manageable=true, usage={usage}, {age}s ago] {status}\n  task: {}\n  depth: {} | parent: {} | delegation: {delegation}",
                     r.id, r.task, r.spawn_depth, parent
                 )
             })
@@ -9875,7 +9869,7 @@ mod tests {
         let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
         cleanup
             .run(Box::pin(async move {
-                let provider = Arc::clone(&tool.test_parent_provider);
+                let provider = Arc::clone(tool.test_parent_provider());
                 let security = Arc::clone(&tool.security);
                 let workspace = config.workspace_dir.clone();
                 // Q71 hybrid is deliberately invalid for persistence; publish the
@@ -9929,7 +9923,6 @@ mod tests {
     ) -> SessionsSpawnTool {
         SessionsSpawnTool::new(
             channel,
-            provider,
             "ollama",
             "prx-local-model",
             0.7,
@@ -9941,6 +9934,7 @@ mod tests {
             crate::providers::ProviderRuntimeOptions::default(),
             spawn_config,
         )
+        .with_test_parent_provider(provider)
     }
 
     /// D-098: a registry that was bound and is gone (its configuration was
@@ -10240,7 +10234,7 @@ mod tests {
             channel: Arc::clone(&tool.channel),
             test_worker_executable: tool.test_worker_executable.clone(),
             channels: Arc::clone(&tool.channels),
-            test_parent_provider: Arc::clone(&tool.test_parent_provider),
+            test_parent_provider: tool.test_parent_provider.clone(),
             provider_name: tool.provider_name.clone(),
             model: tool.model.clone(),
             security: Arc::clone(&tool.security),
@@ -10425,7 +10419,7 @@ mod tests {
             .entry("ollama/prx-local-model".to_owned())
             .or_insert_with(fixture_price);
         let shared: Arc<dyn Tool> = Arc::new(admission_clone(tool));
-        let provider = Arc::clone(&tool.test_parent_provider);
+        let provider = Arc::clone(tool.test_parent_provider());
         let provider_name = tool.provider_name.clone();
         let model_name = tool.model.clone();
         let registry =
@@ -12296,7 +12290,6 @@ mod tests {
                 let (channel, _) = NamedRecordingChannel::new("terminal");
                 let tool = SessionsSpawnTool::new(
                     channel,
-                    Arc::clone(&provider),
                     "ollama",
                     "prx-parent-spawn-model",
                     0.7,
@@ -12307,7 +12300,7 @@ mod tests {
                     None,
                     crate::providers::provider_runtime_options_from_config(config),
                     config.sessions_spawn.clone(),
-                )
+                ).with_test_parent_provider(Arc::clone(&provider))
                 .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
                 .with_model_catalog(crate::providers::selection::catalog_for(config))
                 .with_hint_config(config)
@@ -12398,7 +12391,6 @@ mod tests {
                 let (channel, _) = NamedRecordingChannel::new("terminal");
                 let tool = SessionsSpawnTool::new(
                     channel,
-                    Arc::clone(&provider),
                     "ollama",
                     "prx-local-model",
                     0.7,
@@ -12410,6 +12402,7 @@ mod tests {
                     crate::providers::provider_runtime_options_from_config(config),
                     config.sessions_spawn.clone(),
                 )
+                .with_test_parent_provider(Arc::clone(&provider))
                 .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
                 .with_model_catalog(crate::providers::selection::catalog_for(config))
                 .with_hint_config(config)
@@ -12507,9 +12500,6 @@ mod tests {
         });
         let tool = SessionsSpawnTool::new(
             Arc::new(ch),
-            Arc::new(EchoProvider {
-                response: "done".into(),
-            }),
             probe.custom_provider(),
             crate::providers::credential_probe::PROBE_MODEL,
             0.7,
@@ -12520,7 +12510,10 @@ mod tests {
             None,
             crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
-        );
+        )
+        .with_test_parent_provider(Arc::new(EchoProvider {
+            response: "done".into(),
+        }));
 
         let error = execute_enabled_admitted_spawn(&tool, task)
             .await
@@ -12595,6 +12588,7 @@ mod tests {
                 parent_run_id: None,
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                delegation: None,
                 token_usage_records: Vec::new(),
             });
         }
@@ -12923,6 +12917,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            delegation: None,
         });
         assert!(
             run.steer_tx.is_some(),
@@ -13115,6 +13110,7 @@ mod tests {
                 parent_run_id: None,
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                delegation: None,
                 token_usage_records: Vec::new(),
             });
         }
@@ -13200,6 +13196,7 @@ mod tests {
                 parent_run_id: None,
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                delegation: None,
                 token_usage_records: Vec::new(),
             });
         }
@@ -13317,6 +13314,7 @@ mod tests {
                 parent_run_id: Some("parent".to_string()),
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                delegation: None,
                 token_usage_records: vec![crate::llm::route_decision::MeteredTokenUsageRecord {
                     settlement_id: None,
                     provider: "test-provider".to_string(),
@@ -13391,7 +13389,6 @@ mod tests {
                 let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
                 let tool = SessionsSpawnTool::new(
                     Arc::new(ch),
-                    Arc::clone(&provider),
                     "ollama",
                     "prx-local-model",
                     0.7,
@@ -13402,7 +13399,8 @@ mod tests {
                     None,
                     crate::providers::ProviderRuntimeOptions::default(),
                     crate::config::SessionsSpawnConfig::default(),
-                );
+                )
+                .with_test_parent_provider(Arc::clone(&provider));
                 let tools_handle = tool.tools_handle();
                 let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(tool)]);
                 assert!(tools_handle.set(&registry));
@@ -13440,7 +13438,6 @@ mod tests {
         agents.insert("alpha".to_string(), cfg);
         let tool = SessionsSpawnTool::new(
             Arc::new(ch),
-            Arc::new(EchoProvider { response: "ok".into() }),
             "ollama",
             "prx-local-model",
             0.7,
@@ -13451,7 +13448,8 @@ mod tests {
             None,
             crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
-        );
+        )
+        .with_test_parent_provider(Arc::new(EchoProvider { response: "ok".into() }));
         let workspace = tempfile::tempdir().expect("test: parent workspace");
         let config = preconstruction_parent_config(&tool, workspace.path());
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("test: parent memory"));
@@ -13483,7 +13481,6 @@ mod tests {
         let (ch, sent) = RecordingChannel::new();
         let tool = SessionsSpawnTool::new(
             Arc::new(ch),
-            Arc::new(EchoSystemProvider),
             "ollama",
             "prx-local-model",
             0.7,
@@ -13494,7 +13491,8 @@ mod tests {
             None,
             crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
-        );
+        )
+        .with_test_parent_provider(Arc::new(EchoSystemProvider));
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
         let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "t", "agent": "alpha"})))
@@ -14365,6 +14363,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "s".to_string(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         }
     }
@@ -15033,7 +15032,6 @@ mod tests {
         agents.insert(agent.to_string(), cfg);
         SessionsSpawnTool::new(
             Arc::new(ch),
-            Arc::new(EchoProvider { response: "ok".into() }),
             "ollama",
             "prx-local-model",
             0.7,
@@ -15045,6 +15043,7 @@ mod tests {
             crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
         )
+        .with_test_parent_provider(Arc::new(EchoProvider { response: "ok".into() }))
     }
 
     /// b2: a spawn that fails while preparing the sub-agent must leave nothing
@@ -17037,6 +17036,7 @@ mod tests {
         ("max_chars_per_entry", &["history"]),
         ("model", &["spawn", "spawn_batch"]),
         ("provider", &["spawn", "spawn_batch"]),
+        ("allow_delegation", &["spawn", "spawn_batch"]),
         ("agent", &["spawn", "spawn_batch"]),
         ("mode", &["spawn", "spawn_batch"]),
         ("recipient", &["spawn", "spawn_batch"]),
@@ -17211,9 +17211,6 @@ mod tests {
         let (channel, _sent) = RecordingChannel::new();
         SessionsSpawnTool::new(
             Arc::new(channel),
-            Arc::new(EchoProvider {
-                response: "gateway".into(),
-            }),
             gateway_provider,
             crate::providers::credential_probe::PROBE_MODEL,
             0.0,
@@ -17233,6 +17230,9 @@ mod tests {
             },
             crate::config::SessionsSpawnConfig::default(),
         )
+        .with_test_parent_provider(Arc::new(EchoProvider {
+            response: "gateway".into(),
+        }))
     }
 
     /// Finding 71: a named-agent override must retain the model fallback
@@ -17664,10 +17664,10 @@ mod tests {
             api_key: Some(SPAWN_ROOT_SENTINEL.to_string()),
             ..crate::config::Config::default()
         };
-        tool.test_parent_provider = Arc::from(
+        tool.test_parent_provider = Some(Arc::from(
             providers::create_provider_from_test_config(&gateway_config, &providers::ProviderRuntimeOptions::default())
                 .expect("test: gateway chain builds"),
-        );
+        ));
         tool = tool.with_hint_config(&gateway_config);
 
         let result = execute_enabled_admitted_spawn(
@@ -17737,7 +17737,7 @@ mod tests {
             .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
             .with_cost_config(config.cost.clone());
         tool.model = "hint:fast".to_string();
-        tool.test_parent_provider = Arc::from(routed_provider);
+        tool.test_parent_provider = Some(Arc::from(routed_provider));
         let inherited = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe"})))
             .await
             .expect("test: inherited spawn result");
@@ -17815,7 +17815,7 @@ mod tests {
             .with_model_catalog(catalog)
             .with_configured_providers(&providers::ConfiguredProviders::from_config(&config));
         tool.model = "hint:fast".to_string();
-        tool.test_parent_provider = Arc::from(routed_provider);
+        tool.test_parent_provider = Some(Arc::from(routed_provider));
         let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "probe", "agent": "prx_agent"})))
             .await
             .expect("test: direct agent child result");
@@ -17886,7 +17886,7 @@ mod tests {
         .expect("test: litellm gateway builds");
         let mut tool = containment_tool(&temp, HashMap::new(), "litellm", Some(F1_SPAWN_ROOT_SENTINEL))
             .with_hint_config(&gateway_config);
-        tool.test_parent_provider = Arc::from(gateway);
+        tool.test_parent_provider = Some(Arc::from(gateway));
 
         for (index, spelling) in ["litellm", "lite-llm", "LiteLLM"].into_iter().enumerate() {
             let result = execute_enabled_admitted_spawn(

@@ -505,6 +505,7 @@ async fn mcp_sessions_reads_admit_nothing_when_the_caller_carries_no_owner_id() 
             parent_run_id: None,
             session_scope_key: "prx_historical_session".to_owned(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
             progress: crate::agent::idle::child_beat(),
             batch_id: None,

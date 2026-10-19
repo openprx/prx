@@ -1690,6 +1690,7 @@ mod session_cleanup_tests {
                 parent_run_id: None,
                 session_scope_key: String::new(),
                 spawn_depth: 0,
+                delegation: None,
                 token_usage_records: Vec::new(),
             };
             let runs = std::sync::Arc::new(tokio::sync::RwLock::new(vec![run]));
@@ -4286,8 +4287,6 @@ pub async fn run(
     );
     let spawn_tool = crate::tools::SessionsSpawnTool::new_with_registry(
         Arc::clone(&terminal) as Arc<dyn Channel>,
-        #[cfg(test)]
-        Arc::clone(&provider),
         provider_name,
         model_name,
         temperature,

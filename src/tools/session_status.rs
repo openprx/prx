@@ -125,6 +125,22 @@ impl Tool for SessionStatusTool {
             .filter(|r| matches!(r.status, SubAgentStatus::Failed(_)))
             .count();
         let runtime_count = runs.len();
+        let delegation = runs
+            .iter()
+            .filter_map(|run| {
+                run.delegation.as_ref().map(|grant| {
+                    format!(
+                        "{}: requested={}, remaining_depth={}, provider={}, model={}, max_cost_cents={}",
+                        run.id,
+                        grant.requested,
+                        grant.remaining_depth,
+                        grant.provider,
+                        grant.model,
+                        grant.max_cost_cents
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
         drop(runs);
         drop(all_runs);
 
@@ -153,7 +169,7 @@ impl Tool for SessionStatusTool {
             self.channels.join(", ")
         };
 
-        let output = format!(
+        let mut output = format!(
             "📊 Session Status\n\
              ─────────────────\n\
              Model:     {}\n\
@@ -172,6 +188,10 @@ impl Tool for SessionStatusTool {
             failed_count + recovered_failed,
             recovered.len(),
         );
+        if !delegation.is_empty() {
+            output.push_str("\nDelegation grants:\n");
+            output.push_str(&delegation.join("\n"));
+        }
 
         Ok(ToolResult {
             success: true,
@@ -294,6 +314,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         }
     }
@@ -330,6 +351,45 @@ mod tests {
             "an in-process caller still counts the whole registry: {}",
             unscoped.output
         );
+    }
+
+    #[tokio::test]
+    async fn delegation_status_is_confined_to_the_requesting_owner() {
+        let mut visible = owned_running_run("prx_visible_run", Some("prx_owner_a"));
+        visible.delegation = Some(crate::tools::sessions_spawn::SpawnDelegationStatus {
+            requested: true,
+            provider: "ollama".to_owned(),
+            model: "prx_visible_model".to_owned(),
+            remaining_depth: 1,
+            max_cost_cents: 7,
+            allowed_tools: vec!["sessions_spawn".to_owned()],
+        });
+        let mut private = owned_running_run("prx_private_run", Some("prx_owner_b"));
+        private.delegation = Some(crate::tools::sessions_spawn::SpawnDelegationStatus {
+            model: "prx_private_model".to_owned(),
+            ..visible.delegation.as_ref().unwrap().clone()
+        });
+        let tool = make_tool_with_runs(vec![visible, private]);
+        let result = tool
+            .execute(json!({
+                "_zc_scope": {"owner_id": "prx_owner_a", "owner_isolated": true},
+                "_zc_scope_trusted": true,
+            }))
+            .await
+            .unwrap();
+        assert!(result.output.contains("prx_visible_model"));
+        assert!(result.output.contains("requested=true, remaining_depth=1"));
+        assert!(!result.output.contains("prx_private_model"));
+        assert!(!result.output.contains("prx_private_run"));
+        let result = tool
+            .execute(json!({
+                "_zc_scope": {"owner_isolated": true},
+                "_zc_scope_trusted": true,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.output.contains("Delegation grants:"));
+        assert!(!result.output.contains("prx_visible_model"));
     }
 
     /// C03 / V02-R4, fail-closed half: an owner-isolated caller with no usable
@@ -388,6 +448,7 @@ mod tests {
                 parent_run_id: None,
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                delegation: None,
                 token_usage_records: Vec::new(),
             },
             SubAgentRun {
@@ -411,6 +472,7 @@ mod tests {
                 parent_run_id: None,
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                delegation: None,
                 token_usage_records: Vec::new(),
             },
             SubAgentRun {
@@ -434,6 +496,7 @@ mod tests {
                 parent_run_id: None,
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                delegation: None,
                 token_usage_records: Vec::new(),
             },
         ];

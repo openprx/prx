@@ -90,8 +90,10 @@ pub trait DecisionAttemptReceipt: sealed::AttemptReceipt + Send {
     /// Record actual usage before semantic prediction validation. Both token
     /// fields must be known to release an estimate; reported vendor cost is a
     /// diagnostic and does not replace PMM pricing. Actual usage above estimate
-    /// is recorded in full, never clamped. The implementation owns settlement
-    /// work before awaiting so cancellation cannot orphan a persistence task.
+    /// is recorded in full, never clamped. The implementation transfers durable
+    /// settlement to its cleanup owner before returning; the dispatched hold
+    /// remains until persistence completes, and further physical sends wait for
+    /// that completion. Cancellation cannot orphan the persistence task.
     async fn settle(self: Box<Self>, usage: DecisionUsage) -> Result<(), DecisionError>;
 }
 

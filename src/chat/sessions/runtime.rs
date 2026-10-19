@@ -1118,6 +1118,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: String::new(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         }
     }
