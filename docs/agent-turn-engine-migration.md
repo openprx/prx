@@ -70,7 +70,7 @@ why its current contents remain cohesive. Future growth still requires review.
 | 6,482 | `src/onboard/wizard.rs` | Owns the interactive onboarding state machine, discovery, configuration writes, fallback/cancellation behavior, and their workflow tests. |
 | 6,239 | `src/providers/reliable.rs` | Owns the resilient provider wrapper, failover, retry, trace/usage attribution, streaming, and the tests for that single policy boundary. |
 | 6,115 | `src/tools/execution.rs` | Owns canonical tool dispatch, approval, idempotency, preparation, reservation, and security-boundary tests. |
-| 5,584 | `src/session_worker/runner.rs` | Owns the worker wire protocol, manifest/source admission, segment runtime, cleanup, and process-boundary tests. |
+| 5,584 | `src/session_worker/runner/` (directory) | Owns the worker wire protocol, manifest/source admission, segment runtime, cleanup, and process-boundary tests. |
 | 5,060 | `src/causal_tree/store.rs` | Owns the decision store schema, migrations, repositories, and persistence tests as one backend boundary. |
 | 5,058 | `src/providers/compatible.rs` | Owns the OpenAI-compatible HTTP/SSE wire family, dialect normalization, stream parser, and protocol fixtures. |
 
