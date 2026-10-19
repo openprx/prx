@@ -163,6 +163,12 @@ as `estimated_unsent_v1`; older builds that do not recognize that event fail
 closed on that workspace ledger. Once the transport receives the receipt,
 missing usage still retains the entire liability.
 
+The bounded causal-event channel keeps 256 entries and admits at most 255
+ordinary phase events at once, reserving a control entry for Applied or Drain.
+Ordinary telemetry alone cannot fill that control entry. A queue already
+saturated by controls can still report StoreDropped; the application remains
+retryable and Drain waits within its caller's existing deadline.
+
 Workspace cost trackers share storage while each admitted caller retains its
 immutable cost configuration. Looking up an older generation cannot overwrite
 a newer caller's reservation limits.

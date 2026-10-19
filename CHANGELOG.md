@@ -15,6 +15,7 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Ordinary causal telemetry reserves channel headroom for Applied/Drain controls.
 - Recursive child grants now subtract a strict half-share from the parent's
   remaining monetary balance, rounded down to whole cents. Authenticated
   approval resume keeps the original run's one-child slot and balance.

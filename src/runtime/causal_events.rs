@@ -19,6 +19,9 @@ use crate::decision::telemetry::{
 use crate::memory::{Memory, MemoryVisibility, MessageEventInput, MessageEventSource};
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
+// Ordinary events retain permits through deferred persistence. Leave one
+// channel entry for Applied/Drain even while every ordinary permit is held.
+const ORDINARY_QUEUE_CAPACITY: usize = EVENT_QUEUE_CAPACITY - 1;
 
 mod deferral;
 mod worker;
@@ -84,7 +87,7 @@ impl DurableCausalEventSink {
             .run(),
         );
         Ok(Self {
-            ordinary_slots: Arc::new(Semaphore::new(EVENT_QUEUE_CAPACITY)),
+            ordinary_slots: Arc::new(Semaphore::new(ORDINARY_QUEUE_CAPACITY)),
             deferral,
             observer,
             queue,
@@ -104,9 +107,11 @@ impl DurableCausalEventSink {
     /// Wait at most until `deadline` for every event queued before this marker.
     /// Ordinary decisions never wait on telemetry.
     pub(crate) async fn drain(&self, deadline: Instant) -> bool {
+        if Instant::now() >= deadline {
+            return false;
+        }
         let (reply, received) = oneshot::channel();
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        tokio::time::timeout(remaining, async {
+        tokio::time::timeout_at(deadline.into(), async {
             self.queue.send(QueueItem::Drain(reply)).await.is_ok() && received.await.is_ok()
         })
         .await
@@ -536,6 +541,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_full_ordinary_quota_keeps_an_applied_control_entry_available() {
+        let workspace = tempfile::tempdir().expect("test workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        let generation = crate::config::new_shared(config).pin();
+        let memory = Arc::new(SqliteMemory::new(workspace.path()).expect("event backend"));
+        let observer = Arc::new(RecordingSink::default());
+        let sink = DurableCausalEventSink::new(&generation, memory.clone(), observer.clone()).expect("sink");
+        let event = applied_fixture(&workspace.path().to_string_lossy(), "prx_terminal");
+        let key = "causal:prx_decision:directive-applied".to_owned();
+        // No await: the single-thread worker cannot consume a queued entry.
+        for _ in 0..ORDINARY_QUEUE_CAPACITY {
+            sink.emit(CausalEvent {
+                kind: CausalEventKind::SnapshotCreated,
+                lineage: event.lineage.clone(),
+                fields: CausalEventFields::default(),
+            });
+        }
+        assert_eq!(sink.ordinary_slots.available_permits(), 0);
+        sink.emit_applied(VerifiedDirectiveApplication::fixture(event, key.clone()));
+        assert!(
+            !observer
+                .events
+                .lock()
+                .iter()
+                .any(|event| event.fields.incomplete == Some(IncompleteReason::StoreDropped))
+        );
+        assert!(sink.drain(Instant::now() + std::time::Duration::from_secs(5)).await);
+        assert!(
+            memory
+                .find_message_event_by_idempotency_key(&workspace.path().to_string_lossy(), &key)
+                .await
+                .expect("persisted control row")
+                .is_some()
+        );
+        assert_eq!(
+            observer
+                .events
+                .lock()
+                .iter()
+                .filter(|event| event.kind == CausalEventKind::DirectiveApplied)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn applied_queue_or_store_failure_leaves_retry_available() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
@@ -546,12 +598,11 @@ mod tests {
         let sink = DurableCausalEventSink::new(&generation, memory.clone(), observer.clone()).expect("sink");
         let event = applied_fixture(&workspace.path().to_string_lossy(), "prx_terminal");
         let key = "causal:prx_decision:directive-applied".to_owned();
+        // Saturate the actual channel with controls: ordinary telemetry now
+        // reserves one entry for Applied. The overflow/retry oracle is intact.
         for _ in 0..EVENT_QUEUE_CAPACITY {
-            sink.emit(CausalEvent {
-                kind: CausalEventKind::SnapshotCreated,
-                lineage: event.lineage.clone(),
-                fields: CausalEventFields::default(),
-            });
+            let (completion, _receiver) = oneshot::channel();
+            assert!(sink.queue.try_send(QueueItem::Drain(completion)).is_ok());
         }
         sink.emit_applied(VerifiedDirectiveApplication::fixture(event.clone(), key.clone()));
         assert!(
