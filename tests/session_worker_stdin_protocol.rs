@@ -1482,7 +1482,7 @@ fn holding_the_stdin_write_end_keeps_an_eof_waiting_child_alive() {
 /// a silent two-second exit tax. No assertion on `Child::wait()` can see that
 /// difference, and the only assertion that could is a wall-clock deadline, which
 /// this repository does not allow anywhere. So the invariant is pinned at the
-/// source instead, in the same style as `tests/architecture_boundaries.rs`: the
+/// source instead, in the same style as `tests/architecture_boundaries/`: the
 /// reader is a detached OS thread that the runtime neither owns nor joins.
 #[test]
 fn the_stdin_control_reader_stays_a_detached_os_thread() {

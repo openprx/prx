@@ -198,7 +198,7 @@ pub(super) fn production_part(source: &str) -> String {
 /// the metaguard without maintaining a second list of architecture files.
 pub(super) fn architecture_guard_source() -> String {
     let root = repository_root().join("tests/architecture_boundaries/main.rs");
-    let raw = fs::read_to_string(root).expect("read tests/architecture_boundaries.rs");
+    let raw = fs::read_to_string(root).expect("read tests/architecture_boundaries/main.rs");
     assert!(!raw.trim().is_empty(), "architecture test root must not be empty");
     let modules = top_level_modules(&raw);
     assert!(

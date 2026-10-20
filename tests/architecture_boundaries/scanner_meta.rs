@@ -239,7 +239,7 @@ fn every_tree_scanner_is_probed_or_declared_test_inclusive() {
 
     let bootstrap = fs::read_to_string(repository_root().join("src/runtime/bootstrap.rs")).expect("read bootstrap");
     for (file, text) in [
-        ("tests/architecture_boundaries.rs", &raw),
+        ("tests/architecture_boundaries/", &raw),
         ("src/runtime/bootstrap.rs", &bootstrap),
     ] {
         let found = hand_stripping_patterns(text);

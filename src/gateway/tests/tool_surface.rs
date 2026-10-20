@@ -542,7 +542,7 @@ async fn a_webhook_turn_hands_the_gateways_own_boundary_to_what_it_spawns() {
 /// `SpawnExecutionContext::seed_turn_context(..)` turns both assertion
 /// groups below red. That `run_gateway_chat_with_multimodal` still routes
 /// through this wrapper is pinned by
-/// `tests/architecture_boundaries.rs::the_gateway_webhook_turn_seeds_its_spawn_boundary`.
+/// `the_gateway_webhook_turn_seeds_its_spawn_boundary` in `tests/architecture_boundaries/`.
 #[tokio::test]
 async fn the_webhook_turns_tool_loop_runs_inside_the_seeded_spawn_context() {
     let fabric_ctx = GatewayFabricContext::generic_webhook(Some("webhook-client"), "public", None);

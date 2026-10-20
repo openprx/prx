@@ -2302,7 +2302,7 @@ fn gateway_turn_spawn_context(
 /// test green while `sessions_spawn` handed a child the tools the operator hid
 /// from the gateway. Binding construction and scoping together here gives that
 /// wiring one place to be tested, and
-/// `tests/architecture_boundaries.rs::the_gateway_webhook_turn_seeds_its_spawn_boundary`
+/// `the_gateway_webhook_turn_seeds_its_spawn_boundary` in `tests/architecture_boundaries/`
 /// pins that `run_gateway_chat_with_multimodal` still goes through it.
 async fn within_gateway_turn_spawn_context<F>(
     run_id: String,
