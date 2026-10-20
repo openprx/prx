@@ -38,6 +38,13 @@ complete 32-byte key. Existing key material is never overwritten by initializati
 a malformed key is refused and must be restored before using it for worker
 capabilities. Existing valid keys remain compatible with older binaries.
 
+Worker transport signing keys are published without replacing a concurrent
+writer's key. On Unix, an existing valid key with group or other permissions is
+tightened to mode `0600` without rotating it. If shared key publication fails
+(for example, on a filesystem without hard links), a warning includes the
+filesystem error and identifies the process-local fallback; the key is never
+logged. Restarting processes cannot share that fallback key.
+
 `prx init` resolves its target directory in this order, highest first:
 
 1. `prx init --dir <DIR>` — the init-specific target;
