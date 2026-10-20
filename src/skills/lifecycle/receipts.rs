@@ -163,6 +163,10 @@ pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
     if !request.enabled || request.skill_names.is_empty() {
         return 0;
     }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("skill selection receipts skipped: no async runtime");
+        return 0;
+    };
     let fresh: Vec<String> = request
         .skill_names
         .iter()
@@ -172,10 +176,6 @@ pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
     if fresh.is_empty() {
         return 0;
     }
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        tracing::warn!("skill selection receipts skipped: no async runtime");
-        return 0;
-    };
     let count = fresh.len();
     let workspace = request.workspace_dir.to_path_buf();
     let owner = request.owner_id.to_string();
