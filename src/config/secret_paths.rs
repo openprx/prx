@@ -3658,6 +3658,7 @@ classifier_provider = "custom:http://grace:userinfo-sentinel-classifier@127.0.0.
             self_system,
             skills,
             skill_rag,
+            plugins,
             skills_lifecycle,
             model_routes,
             embedding_routes,

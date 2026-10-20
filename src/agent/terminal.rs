@@ -1044,6 +1044,9 @@ async fn finalize_turn_impl(
             execution_trace.as_ref(),
             commit.provider_outcome.as_ref(),
         );
+        if !awaiting_approval {
+            commit.decision.context.retire_recursive_allowance();
+        }
         release_skill_lifecycle(
             workspace_dir,
             skill_owner,

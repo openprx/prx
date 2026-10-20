@@ -88,7 +88,12 @@ async fn recursive_publication_cannot_multiply_the_parent_allowance_by_reissue_o
             let (manifest, parent) = recursive.scope().gate_inputs();
             manifest.verify(parent)?;
             assert!(parent.authority.max_cost_cents > 0, "exercise a real nonzero allowance");
-            assert_eq!(manifest.authority.max_cost_cents, parent.authority.max_cost_cents);
+            assert_eq!(manifest.authority.max_cost_cents, parent.authority.max_cost_cents / 2);
+            let root_remaining = root.recursive_child_allowance().context("root budget owner")?.money();
+            assert_eq!(
+                root_remaining.load(Ordering::Acquire) + u64::from(manifest.authority.max_cost_cents) * 10_000,
+                u64::from(parent.authority.max_cost_cents) * 10_000
+            );
             assert_eq!(manifest.authority.remaining_depth, 1);
             assert_eq!(manifest.allowed.len(), 1);
             assert!(
@@ -115,7 +120,17 @@ async fn recursive_publication_cannot_multiply_the_parent_allowance_by_reissue_o
             let leaf = worker.for_spawn_request(false, "ollama", "prx-local-model")?;
             assert_eq!(
                 leaf.scope().gate_inputs().0.authority.max_cost_cents,
-                manifest.authority.max_cost_cents
+                manifest.authority.max_cost_cents / 2
+            );
+            let child_remaining = recursive
+                .recursive_child_allowance()
+                .context("child budget owner")?
+                .money();
+            let leaf_money = u64::from(leaf.scope().gate_inputs().0.authority.max_cost_cents) * 10_000;
+            assert!(leaf_money < u64::from(manifest.authority.max_cost_cents) * 10_000);
+            assert_eq!(
+                root_remaining.load(Ordering::Acquire) + child_remaining.load(Ordering::Acquire) + leaf_money,
+                u64::from(parent.authority.max_cost_cents) * 10_000
             );
             assert!(
                 recursive.for_spawn_request(false, "ollama", "prx-local-model").is_err(),

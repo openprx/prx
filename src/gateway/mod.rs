@@ -1599,7 +1599,7 @@ pub async fn run_gateway(
         || memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config))
             .starts_with("wasm:")
     {
-        crate::plugins::init_plugin_runtime(&config.workspace_dir, None).await
+        crate::plugins::init_plugin_runtime(&config, None).await
     } else {
         None
     };
@@ -1636,7 +1636,7 @@ pub async fn run_gateway(
             .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend in gateway: {error}"))?;
         Some(runtime)
     } else {
-        crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await
+        crate::plugins::init_plugin_runtime(&config, Some(Arc::clone(&mem))).await
     };
 
     let (composio_key, composio_entity_id) = if config.composio.configured() {

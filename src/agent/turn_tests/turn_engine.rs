@@ -2395,7 +2395,9 @@ async fn shared_tool_loop_applies_wasm_middleware_to_delivered_text_and_history(
             std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).unwrap();
             std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
 
-            let runtime = crate::plugins::init_plugin_runtime(temp.path(), None).await.unwrap();
+            let runtime = crate::plugins::init_test_plugin_runtime(temp.path(), None)
+                .await
+                .unwrap();
             let hooks = crate::hooks::HookManager::new(temp.path().to_path_buf());
             hooks.set_plugin_runtime(runtime).await;
             let provider = ScriptedProvider::from_text_responses(vec!["plain response"]);
@@ -2477,7 +2479,7 @@ mod outbound_middleware_lifecycle {
             .expect("test: copy the fixture manifest");
         std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm"))
             .expect("test: copy the fixture component");
-        let runtime = crate::plugins::init_plugin_runtime(workspace, None)
+        let runtime = crate::plugins::init_test_plugin_runtime(workspace, None)
             .await
             .expect("test: initialize the workspace plugin runtime");
         let hooks = crate::hooks::HookManager::new(workspace.to_path_buf());

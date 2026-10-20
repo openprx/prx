@@ -197,22 +197,7 @@ impl TurnDecisionService {
                 security: Arc::clone(&self.security),
             },
             crate::runtime::child_source::ChildGrantRuntime {
-                recursive_child_claimed: self.parent_grant.as_ref().map_or_else(
-                    || {
-                        self.generation
-                            .effective
-                            .sessions_spawn
-                            .allow_recursive_delegation
-                            .then(|| {
-                                Arc::clone(
-                                    context
-                                        .recursive_child_claimed
-                                        .get_or_init(|| Arc::new(std::sync::atomic::AtomicBool::new(false))),
-                                )
-                            })
-                    },
-                    |incoming| incoming.recursive_child_allowance(),
-                ),
+                recursive_child_claimed: self.issue_recursive_allowance(proof, context),
                 decision_store: Arc::clone(&self.store),
                 source_fabric: crate::memory::MemoryFabric::new(Arc::clone(&self.memory), proof.workspace_id())
                     .with_event_recording(self.generation.effective.memory.event_recording_config()),
@@ -399,7 +384,11 @@ impl TurnDecisionService {
                     remaining_depth,
                     delegation: None,
                 },
-                |manifest| manifest.authority.clone(),
+                |manifest| {
+                    let mut authority = manifest.authority.clone();
+                    authority.max_cost_cents = authority.max_cost_cents.min(max_cost_cents);
+                    authority
+                },
             ),
             catalog_generation: trusted.catalog_generation,
             key: Arc::clone(&self.state_key),

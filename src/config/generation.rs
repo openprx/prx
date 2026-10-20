@@ -1072,6 +1072,7 @@ pub(crate) fn is_process_restart_only(field: &str) -> bool {
             | "mcp_server"
             | "a2a"
             | "skills_lifecycle"
+            | "plugins"
     )
 }
 

@@ -343,6 +343,14 @@ always_exclude = []
 [skill_rag]
 top_k = 32
 
+# WASM plugins. Off by default: nothing under <workspace>/plugins is scanned
+# or loaded, and no plugin tool, provider, memory backend, hook, cron job or
+# middleware exists. Read at process start. Which plugins may run, and with
+# which permissions, is decided by the operator trust file `plugin-trust.json`
+# beside this file, never by anything inside the workspace (see "WASM plugins").
+[plugins]
+enabled = false
+
 # Skill lifecycle: learned revisions of skills are proposed, evaluated against an
 # operator-owned frozen suite, gated and only then published. Everything here is
 # operator-owned; no tool or model output can change it. The section is read at
@@ -829,7 +837,11 @@ When permission is enabled, `max_recursive_depth` must equal 1. Values above 1 a
 permission is enabled; the current strict tool-subset contract supports one
 additional level. Each child remains a proper
 subset of its authenticated parent, cannot replenish depth or budget, and keeps
-the selected provider/model pins through descendants. A request without the
+the selected provider/model pins through descendants. Recursive publication
+subtracts a strict half-share of the remaining monetary balance, rounded down
+to whole cents; the parent retains the rest. Approval resume keeps the original
+run's consumed child slot and balance; if that state is unavailable after a
+restart, further recursive grants are refused. A request without the
 opt-in keeps the existing exact model-only scope. See [recursive child grants](tools.md)
 for admission, audit/status and rollback behavior.
 
@@ -1692,9 +1704,11 @@ A command hook that runs:
   name is looked up in `PATH`. Without a configuration directory, command
   hooks are not started.
 
-Writing or editing `hooks.json` or `mcp.json` at the workspace root with the
+Writing or editing `hooks.json` or `mcp.json` at the workspace root, or any
+file under `<workspace>/plugins/` (WASM plugin code and manifests), with the
 file tools is a high-risk operation of its own (`write-launch-definition`,
-`edit-launch-definition`). Every other surface classifies a `hooks.json`
+`edit-launch-definition`); git operations that change those paths are treated
+the same way. Every other surface classifies a `hooks.json`
 change the same way: a change that installs, changes or runs a hook command
 (its program, arguments or event) is high risk (`hooks_manage` `replace` and
 `test`, Gateway `POST /api/hooks` and a `PUT /api/hooks/{id}` that sets
@@ -1720,6 +1734,35 @@ high-risk decision. Hooks that run now start in the cleared environment and
 the dedicated directory above: a hook that relied on an exported variable
 must list it in its `env` in `hooks.json`, and one that relied on starting in
 the workspace must use absolute paths or change directory itself.
+
+### WASM plugins
+
+`[plugins] enabled` (default `false`, read at process start) is the only switch.
+While it is off, `<workspace>/plugins` is not scanned and no plugin code is
+compiled or run. A WASM provider or memory backend named `wasm:<name>` then
+fails to resolve like any unknown backend.
+
+With the switch on, a plugin runs only if the operator trust file
+`plugin-trust.json` holds a record for it. The file lives in the directory of
+`config.toml` (not in the workspace), has mode `0600`, and binds each plugin's
+name, the SHA-256 of its component, the SHA-256 of its `plugin.toml` and the
+exact permissions granted. A plugin without a matching record is listed with an
+error status and never compiled. PRX does not enable plugins when the
+configuration directory lies inside the workspace, and it trusts nothing from a
+trust file that is a symlink, group- or world-accessible, or malformed.
+
+Records are written by `wasm_plugins_manage install|update`, a high-risk
+operation whose approval names the plugin, both hashes and the
+`grant_permissions` list. See `docs/plugin-developer-guide.md` for the manifest
+side and `docs/plugin-runtime-lifecycle.md` for the admission rules. Compiled
+component caches are kept in `plugin-cache/` beside the trust file.
+
+**Upgrading (breaking):** plugins in `<workspace>/plugins` no longer load
+unless `[plugins] enabled = true` is set and each plugin has been installed
+(trusted) through `wasm_plugins_manage`. The old `.prx-managed` marker no longer
+confers trust, an empty `http_allowlist` now denies every URL instead of
+allowing all, and allowlist entries are URL patterns rather than string
+prefixes (`https://api.example.com*` must become `https://api.example.com/*`).
 
 ### Configurations that no longer load
 

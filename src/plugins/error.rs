@@ -41,6 +41,9 @@ pub enum PluginError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("WASM plugins are disabled; set `[plugins] enabled = true` to load them")]
+    Disabled,
+
     #[error("plugin system not available (feature 'wasm-plugins' not enabled)")]
     NotAvailable,
 }

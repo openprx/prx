@@ -4,10 +4,10 @@
 //! Host functions provide plugins with controlled access to logging, config,
 //! KV storage, memory system, and HTTP requests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::memory::traits::Memory;
@@ -47,11 +47,32 @@ struct TungsteniteConnection {
 
 #[async_trait]
 impl WebSocketConnector for TungsteniteConnector {
+    /// Resolve the host through the address guard, then connect to one of the
+    /// vetted addresses only. A websocket upgrade that answers with a redirect
+    /// is an error here, never a hop, so no later target is ever contacted.
     async fn connect(&self, url: &str) -> Result<Box<dyn WebSocketConnection>, String> {
-        let (stream, _) = tokio_tungstenite::connect_async(url)
-            .await
-            .map_err(|e| format!("websocket connect failed: {e}"))?;
-        Ok(Box::new(TungsteniteConnection { stream }))
+        let parsed = reqwest::Url::parse(url).map_err(|error| format!("invalid websocket URL: {error}"))?;
+        crate::plugins::outbound::check_literal_target(&parsed)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "websocket URL has no host".to_string())?;
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| "websocket URL has no port".to_string())?;
+        let addrs = crate::plugins::outbound::resolve_host_guarded(host, port).await?;
+        let mut last_error = String::from("no address to connect to");
+        for addr in addrs {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(tcp) => {
+                    let (stream, _) = tokio_tungstenite::client_async_tls(url, tcp)
+                        .await
+                        .map_err(|e| format!("websocket connect failed: {e}"))?;
+                    return Ok(Box::new(TungsteniteConnection { stream }));
+                }
+                Err(error) => last_error = format!("websocket connect failed: {error}"),
+            }
+        }
+        Err(last_error)
     }
 }
 
@@ -113,8 +134,24 @@ pub struct HostState {
     /// Optional permissions the plugin can request at runtime.
     pub optional_permissions: HashSet<String>,
 
-    /// Outbound URL allowlist patterns (used by HTTP and WebSocket host functions).
+    /// Outbound URL allowlist entries as written in the manifest.
     pub http_allowlist: Vec<String>,
+
+    /// The parsed form of `http_allowlist` (used by HTTP and WebSocket host
+    /// functions). Empty denies every URL.
+    pub outbound: Arc<crate::plugins::outbound::OutboundAllowlist>,
+
+    /// Outbound requests one invocation may make.
+    pub max_http_requests: u32,
+
+    /// Outbound requests made by the current invocation.
+    http_requests_this_call: u32,
+
+    /// Optional rolling one-minute cap on outbound requests.
+    http_requests_per_minute: Option<u32>,
+
+    /// Start times of the outbound requests inside the rolling minute.
+    http_request_times: Arc<parking_lot::Mutex<VecDeque<Instant>>>,
 
     /// Namespaced in-memory KV store (plugin-isolated).
     pub kv_store: Arc<RwLock<HashMap<String, Vec<u8>>>>,
@@ -176,7 +213,14 @@ impl HostState {
             config,
             granted_permissions,
             optional_permissions,
+            outbound: Arc::new(crate::plugins::outbound::OutboundAllowlist::from_entries_lossy(
+                &http_allowlist,
+            )),
             http_allowlist,
+            max_http_requests: 10,
+            http_requests_this_call: 0,
+            http_requests_per_minute: None,
+            http_request_times: Arc::default(),
             kv_store: Arc::new(RwLock::new(HashMap::new())),
             kv_quota_bytes,
             timeout_ms,
@@ -253,24 +297,129 @@ impl HostState {
         }
     }
 
-    /// Check if a URL is allowed by the http_allowlist.
-    pub fn check_url_allowed(&self, url: &str) -> bool {
-        if self.http_allowlist.is_empty() {
-            // No allowlist = all URLs allowed (if http-outbound permission is granted)
-            return true;
+    /// Set the outbound request budget from the manifest `[resources]`.
+    ///
+    /// The rolling-minute window is shared by every adapter and every rebuilt
+    /// store of the plugin (keyed by plugin name), so a trap-and-respawn loop
+    /// cannot reset it.
+    pub fn with_http_limits(mut self, per_call: u32, per_minute: Option<u32>) -> Self {
+        self.max_http_requests = per_call;
+        self.http_requests_per_minute = per_minute;
+        if per_minute.is_some() {
+            self.http_request_times = shared_http_window(&self.plugin_name);
         }
-        for pattern in &self.http_allowlist {
-            if pattern.ends_with('*') {
-                let prefix = &pattern[..pattern.len() - 1];
-                if url.starts_with(prefix) {
-                    return true;
-                }
-            } else if url == pattern {
-                return true;
-            }
-        }
-        false
+        self
     }
+
+    /// Start a new invocation: the per-call outbound request counter resets.
+    pub const fn begin_invocation(&mut self) {
+        self.http_requests_this_call = 0;
+    }
+
+    /// Whether `url` passes the allowlist and the address checks for an
+    /// outbound HTTP or WebSocket request. An empty allowlist denies all.
+    pub fn check_url_allowed(&self, url: &str) -> bool {
+        crate::plugins::outbound::authorize_url(&self.outbound, url, &["http", "https", "ws", "wss"]).is_ok()
+    }
+
+    /// Spend one outbound request from the per-call and per-minute budgets.
+    pub fn consume_http_request(&mut self) -> Result<(), String> {
+        if self.http_requests_this_call >= self.max_http_requests {
+            return Err(format!(
+                "plugin '{}' exceeded max_http_requests_per_call ({})",
+                self.plugin_name, self.max_http_requests
+            ));
+        }
+        if let Some(limit) = self.http_requests_per_minute {
+            let now = Instant::now();
+            let mut times = self.http_request_times.lock();
+            while times
+                .front()
+                .is_some_and(|started| now.duration_since(*started) >= Duration::from_secs(60))
+            {
+                times.pop_front();
+            }
+            let in_window = u32::try_from(times.len()).unwrap_or(u32::MAX);
+            if in_window >= limit {
+                return Err(format!(
+                    "plugin '{}' exceeded max_http_requests_per_minute ({limit})",
+                    self.plugin_name
+                ));
+            }
+            times.push_back(now);
+        }
+        self.http_requests_this_call = self.http_requests_this_call.saturating_add(1);
+        Ok(())
+    }
+
+    /// Authorize one outbound request: allowlist, address literal and budget.
+    /// Returns the parsed URL the request must use.
+    pub fn authorize_outbound(&mut self, url: &str, schemes: &[&str]) -> Result<reqwest::Url, String> {
+        let parsed = crate::plugins::outbound::authorize_url(&self.outbound, url, schemes)?;
+        self.consume_http_request()?;
+        Ok(parsed)
+    }
+}
+
+/// Rolling-minute request windows, one per plugin name for the process.
+static HTTP_WINDOWS: std::sync::LazyLock<
+    parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<VecDeque<Instant>>>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+fn shared_http_window(plugin: &str) -> Arc<parking_lot::Mutex<VecDeque<Instant>>> {
+    Arc::clone(HTTP_WINDOWS.lock().entry(plugin.to_string()).or_default())
+}
+
+/// Largest HTTP response body a plugin receives.
+const MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Run one authorized HTTP request through the guarded client.
+pub(crate) async fn perform_http_request(
+    allowlist: Arc<crate::plugins::outbound::OutboundAllowlist>,
+    timeout_ms: u64,
+    method: String,
+    url: reqwest::Url,
+    headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    let client = crate::plugins::outbound::build_http_client(allowlist, websocket_timeout(timeout_ms))?;
+    let mut request = match method.to_ascii_uppercase().as_str() {
+        "GET" => client.get(url),
+        "POST" => client.post(url),
+        "PUT" => client.put(url),
+        "DELETE" => client.delete(url),
+        "PATCH" => client.patch(url),
+        "HEAD" => client.head(url),
+        _ => return Err(format!("unsupported method: {method}")),
+    };
+    for (name, value) in &headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|error| format!("request failed: {error}"))?;
+    let status = response.status().as_u16();
+    let response_headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or_default().to_string()))
+        .collect();
+    let mut collected = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("body read error: {error}"))?
+    {
+        if collected.len().saturating_add(chunk.len()) > MAX_HTTP_RESPONSE_BYTES {
+            return Err(format!("response body exceeds {MAX_HTTP_RESPONSE_BYTES} bytes"));
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    Ok((status, response_headers, collected))
 }
 
 #[cfg(feature = "wasm-plugins")]
@@ -505,18 +654,16 @@ pub async fn host_kv_list_keys(state: &HostState, prefix: &str) -> Vec<String> {
 }
 
 /// Open a websocket-outbound connection and return an opaque session id.
-pub async fn host_websocket_connect(state: &HostState, url: &str) -> Result<u64, String> {
+pub async fn host_websocket_connect(state: &mut HostState, url: &str) -> Result<u64, String> {
     state.check_permission("websocket-outbound")?;
-    if !state.check_url_allowed(url) {
-        return Err(format!("URL not in allowlist: {url}"));
-    }
+    let url = state.authorize_outbound(url, &["ws", "wss"])?.to_string();
 
     websocket_connect_with(
         Arc::clone(&state.websocket_connector),
         Arc::clone(&state.websocket_sessions),
         Arc::clone(&state.next_websocket_session_id),
         state.timeout_ms,
-        url.to_string(),
+        url,
     )
     .await
 }
@@ -713,8 +860,9 @@ mod tests {
         assert!(!state.check_url_allowed("https://evil.com/hack"));
     }
 
+    /// The old behaviour (an empty allowlist allowed every URL) was the defect.
     #[test]
-    fn url_allowlist_empty_allows_all() {
+    fn url_allowlist_empty_denies_all() {
         let state = HostState::new(
             "test".to_string(),
             HashMap::new(),
@@ -724,7 +872,148 @@ mod tests {
             5000,
             10,
         );
-        assert!(state.check_url_allowed("https://anything.com"));
+        assert!(!state.check_url_allowed("https://anything.com"));
+        assert!(!state.check_url_allowed("http://203.0.113.5/"));
+    }
+
+    #[test]
+    fn url_allowlist_rejects_host_prefix_confusion() {
+        let state = HostState::new(
+            "test".to_string(),
+            HashMap::new(),
+            HashSet::new(),
+            HashSet::new(),
+            vec!["https://api.x.com/*".to_string()],
+            5000,
+            10,
+        );
+        assert!(state.check_url_allowed("https://api.x.com/v1"));
+        assert!(!state.check_url_allowed("https://api.x.com.evil/v1"));
+        assert!(!state.check_url_allowed("https://api.x.com@evil.example/"));
+    }
+
+    fn http_state(limit: u32, per_minute: Option<u32>) -> HostState {
+        HostState::new(
+            "budget".to_string(),
+            HashMap::new(),
+            HashSet::from(["http-outbound".to_string()]),
+            HashSet::new(),
+            vec!["https://api.x.com/*".to_string()],
+            5000,
+            10,
+        )
+        .with_http_limits(limit, per_minute)
+    }
+
+    #[test]
+    fn max_http_requests_is_enforced_per_invocation() {
+        let mut state = http_state(2, None);
+        assert!(state.authorize_outbound("https://api.x.com/a", &["https"]).is_ok());
+        assert!(state.authorize_outbound("https://api.x.com/b", &["https"]).is_ok());
+        let error = state.authorize_outbound("https://api.x.com/c", &["https"]).unwrap_err();
+        assert!(error.contains("max_http_requests_per_call"), "{error}");
+        // A refused URL does not spend budget; a new invocation restores it.
+        state.begin_invocation();
+        assert!(state.authorize_outbound("https://evil.example/", &["https"]).is_err());
+        assert!(state.authorize_outbound("https://api.x.com/d", &["https"]).is_ok());
+    }
+
+    #[test]
+    fn max_http_requests_per_minute_is_enforced_across_invocations() {
+        let mut state = http_state(10, Some(2));
+        assert!(state.authorize_outbound("https://api.x.com/a", &["https"]).is_ok());
+        state.begin_invocation();
+        assert!(state.authorize_outbound("https://api.x.com/b", &["https"]).is_ok());
+        state.begin_invocation();
+        let error = state.authorize_outbound("https://api.x.com/c", &["https"]).unwrap_err();
+        assert!(error.contains("max_http_requests_per_minute"), "{error}");
+    }
+
+    #[test]
+    fn the_per_minute_window_survives_a_store_rebuild() {
+        let name = "window-shared-across-rebuilds";
+        let build = || {
+            HostState::new(
+                name.to_string(),
+                HashMap::new(),
+                HashSet::new(),
+                HashSet::new(),
+                vec!["https://api.x.com/*".to_string()],
+                5000,
+                10,
+            )
+            .with_http_limits(10, Some(2))
+        };
+        let mut first = build();
+        assert!(first.authorize_outbound("https://api.x.com/a", &["https"]).is_ok());
+        assert!(first.authorize_outbound("https://api.x.com/b", &["https"]).is_ok());
+        // A respawned store gets a fresh HostState but the same window.
+        let mut respawned = build();
+        let error = respawned
+            .authorize_outbound("https://api.x.com/c", &["https"])
+            .unwrap_err();
+        assert!(error.contains("max_http_requests_per_minute"), "{error}");
+    }
+
+    #[test]
+    fn a_zero_http_budget_refuses_every_request() {
+        let mut state = http_state(0, None);
+        assert!(state.authorize_outbound("https://api.x.com/a", &["https"]).is_err());
+    }
+
+    #[test]
+    fn websocket_urls_use_the_same_allowlist_and_address_guard() {
+        let mut state = HostState::new(
+            "ws".to_string(),
+            HashMap::new(),
+            HashSet::from(["websocket-outbound".to_string()]),
+            HashSet::new(),
+            vec![
+                "wss://stream.x.com/*".to_string(),
+                "ws://127.0.0.1/*".to_string(),
+                "ws://169.254.169.254/*".to_string(),
+            ],
+            5000,
+            10,
+        );
+        assert!(
+            state
+                .authorize_outbound("wss://stream.x.com/feed", &["ws", "wss"])
+                .is_ok()
+        );
+        assert!(
+            state
+                .authorize_outbound("wss://stream.x.com.evil/feed", &["ws", "wss"])
+                .is_err()
+        );
+        assert!(state.authorize_outbound("ws://127.0.0.1/x", &["ws", "wss"]).is_err());
+        assert!(
+            state
+                .authorize_outbound("ws://169.254.169.254/x", &["ws", "wss"])
+                .is_err()
+        );
+        // An http URL is not a websocket URL even when the host matches.
+        assert!(
+            state
+                .authorize_outbound("https://stream.x.com/feed", &["ws", "wss"])
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_real_connector_refuses_loopback_before_connecting() {
+        let error = TungsteniteConnector
+            .connect("ws://127.0.0.1:9/x")
+            .await
+            .err()
+            .expect("test: loopback must be refused");
+        assert!(error.contains("not reachable"), "{error}");
+        let error = TungsteniteConnector
+            .connect("ws://localhost:9/x")
+            .await
+            .err()
+            .expect("test: localhost must be refused");
+        assert!(error.contains("not reachable"), "{error}");
     }
 
     #[test]
@@ -830,9 +1119,11 @@ mod tests {
                 MockConnectBehavior::Connect(Ok(mock_connection(vec![]))),
             )
             .await;
-        let state = test_state().with_websocket_connector(connector);
+        let mut state = test_state().with_websocket_connector(connector);
 
-        let session_id = host_websocket_connect(&state, "ws://mock.example/echo").await.unwrap();
+        let session_id = host_websocket_connect(&mut state, "ws://mock.example/echo")
+            .await
+            .unwrap();
         host_websocket_send(&state, session_id, "hello".to_string())
             .await
             .unwrap();
@@ -850,9 +1141,9 @@ mod tests {
                 MockConnectBehavior::Connect(Err("invalid websocket url".to_string())),
             )
             .await;
-        let state = test_state().with_websocket_connector(connector);
+        let mut state = test_state().with_websocket_connector(connector);
 
-        let error = host_websocket_connect(&state, "ws://mock.example/bad")
+        let error = host_websocket_connect(&mut state, "ws://mock.example/bad")
             .await
             .unwrap_err();
         assert!(error.contains("invalid websocket url"));
@@ -870,7 +1161,7 @@ mod tests {
                 },
             )
             .await;
-        let state = HostState::new(
+        let mut state = HostState::new(
             "test-plugin".to_string(),
             HashMap::new(),
             HashSet::from(["websocket-outbound".to_string()]),
@@ -881,7 +1172,7 @@ mod tests {
         )
         .with_websocket_connector(connector);
 
-        let error = host_websocket_connect(&state, "ws://mock.example/slow")
+        let error = host_websocket_connect(&mut state, "ws://mock.example/slow")
             .await
             .unwrap_err();
         assert!(error.contains("timed out"));
@@ -902,9 +1193,11 @@ mod tests {
                 MockConnectBehavior::Connect(Ok(mock_connection(vec![]))),
             )
             .await;
-        let state = test_state().with_websocket_connector(connector);
+        let mut state = test_state().with_websocket_connector(connector);
 
-        let first_session = host_websocket_connect(&state, "ws://mock.example/retry").await.unwrap();
+        let first_session = host_websocket_connect(&mut state, "ws://mock.example/retry")
+            .await
+            .unwrap();
         let first_error = host_websocket_receive(&state, first_session).await.unwrap_err();
         assert!(first_error.contains("closed"));
         assert!(
@@ -913,7 +1206,9 @@ mod tests {
                 .is_err()
         );
 
-        let second_session = host_websocket_connect(&state, "ws://mock.example/retry").await.unwrap();
+        let second_session = host_websocket_connect(&mut state, "ws://mock.example/retry")
+            .await
+            .unwrap();
         host_websocket_send(&state, second_session, "retry-ok".to_string())
             .await
             .unwrap();

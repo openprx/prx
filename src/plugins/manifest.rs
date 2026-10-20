@@ -95,13 +95,17 @@ const fn default_priority() -> i32 {
 /// Permission declarations (spec-aligned: interface-based, not boolean).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Permissions {
-    /// Required host interfaces (must be granted for plugin to load).
+    /// Required host interfaces. The operator's trust record must grant every
+    /// one of them or the plugin is refused.
     #[serde(default)]
     pub required: Vec<String>,
-    /// Optional host interfaces (can be requested at runtime).
+    /// Optional host interfaces. They are granted only when the operator's
+    /// trust record lists them; otherwise the plugin runs without them.
     #[serde(default)]
     pub optional: Vec<String>,
-    /// HTTP outbound URL whitelist patterns.
+    /// Outbound URL patterns for `http-outbound` and `websocket-outbound`:
+    /// `scheme://host[:port][/path-prefix][*]`, host optionally `*.parent`.
+    /// Empty denies every URL.
     #[serde(default)]
     pub http_allowlist: Vec<String>,
     /// Filesystem path whitelist patterns.
@@ -124,6 +128,10 @@ pub struct Resources {
     /// Max HTTP requests per single call.
     #[serde(default = "default_max_http_requests")]
     pub max_http_requests_per_call: u32,
+    /// Optional cap on outbound HTTP/WebSocket requests in any rolling
+    /// 60-second window, on top of the per-call cap. Absent means no window.
+    #[serde(default)]
+    pub max_http_requests_per_minute: Option<u32>,
     /// KV storage cap in MB.
     #[serde(default = "default_max_kv_storage_mb")]
     pub max_kv_storage_mb: u64,
@@ -212,6 +220,7 @@ impl Default for Resources {
             max_memory_mb: default_max_memory_mb(),
             max_execution_time_ms: default_timeout_ms(),
             max_http_requests_per_call: default_max_http_requests(),
+            max_http_requests_per_minute: None,
             max_kv_storage_mb: default_max_kv_storage_mb(),
             pool_size: 0,
             max_payload_bytes: None,
@@ -250,6 +259,12 @@ const fn default_max_kv_storage_mb() -> u64 {
 impl PluginManifest {
     /// Parse a `plugin.toml` from a file path.
     pub fn from_file(path: &Path) -> PluginResult<Self> {
+        Self::from_file_with_digest(path).map(|(manifest, _)| manifest)
+    }
+
+    /// Parse a `plugin.toml` and return the SHA-256 (lowercase hex) of the
+    /// exact bytes that were parsed.
+    pub fn from_file_with_digest(path: &Path) -> PluginResult<(Self, String)> {
         let metadata = std::fs::symlink_metadata(path).map_err(PluginError::Io)?;
         if metadata.file_type().is_symlink() {
             return Err(PluginError::Manifest(format!(
@@ -277,7 +292,7 @@ impl PluginManifest {
             source: e,
         })?;
         manifest.validate()?;
-        Ok(manifest)
+        Ok((manifest, super::trust::sha256_hex(&bytes)))
     }
 
     /// Basic validation of required fields, plus the `[resources]`
@@ -333,6 +348,12 @@ impl PluginManifest {
                     capability.name
                 )));
             }
+        }
+        if let Err(error) = super::outbound::OutboundAllowlist::parse_all(&self.permissions.http_allowlist) {
+            return Err(PluginError::Manifest(format!(
+                "plugin '{}' has an invalid permissions.http_allowlist entry: {error}",
+                self.plugin.name
+            )));
         }
         self.resources.normalize_payload_cap(&self.plugin.name)?;
         Ok(())

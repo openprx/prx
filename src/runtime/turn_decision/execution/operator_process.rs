@@ -1,12 +1,12 @@
 //! Bind an authenticated operator worker to its actual execution service.
 use super::{
-    Arc, BTreeSet, CapabilityRef, CatalogScope, CausalDecisionStore, CausalEventSink, DecisionBackendFactory,
-    DecisionKey, FactoryDeps, Retention, StoreMode, TurnDecisionService, TurnLoopRuntime, TurnServiceBuild,
-    TurnServiceBuildError, TurnSurfaceKind, pinned_policy_version,
+    Arc, BTreeSet, CapabilityRef, CatalogScope, CausalEventSink, DecisionBackendFactory, DecisionKey, FactoryDeps,
+    StoreMode, TurnDecisionService, TurnLoopRuntime, TurnServiceBuild, TurnServiceBuildError, TurnSurfaceKind,
+    pinned_policy_version,
 };
 
 impl TurnDecisionService {
-    pub(crate) fn operator_process_service(
+    pub(crate) async fn operator_process_service(
         authority: Arc<crate::runtime::child_source::operator_process::OperatorProcessAuthority>,
         mut build: TurnServiceBuild<'_>,
         runtime: TurnLoopRuntime,
@@ -56,7 +56,7 @@ impl TurnDecisionService {
                     && config.memory.events.record_user_messages),
             "operator worker decision recording is unavailable"
         );
-        let workspace_key = FactoryDeps::load_key(config);
+        let workspace_key = super::super::store_preparation::load_key(Arc::clone(&build.generation)).await?;
         let durable_key = config.causal_tree.enabled && workspace_key.is_some();
         let durable_events = if durable_key {
             Some(Arc::new(crate::runtime::causal_events::DurableCausalEventSink::new(
@@ -71,19 +71,13 @@ impl TurnDecisionService {
             || Arc::clone(&build.events),
             |events| Arc::clone(events) as Arc<dyn CausalEventSink>,
         );
-        let store = if durable_key {
-            CausalDecisionStore::open_shared(
-                &config.workspace_dir,
-                Retention::days(
-                    config.causal_tree.store.retention_days,
-                    config.self_system.fitness.retention_days,
-                ),
-                Arc::clone(&events),
-                StoreMode::ReadWrite,
-            )?
-        } else {
-            CausalDecisionStore::open_unshared_read_only(&config.workspace_dir)
-        };
+        let store = super::super::store_preparation::open_store(
+            Arc::clone(&build.generation),
+            Arc::clone(&events),
+            durable_events.clone(),
+            durable_key,
+        )
+        .await?;
         let state_key = workspace_key.clone().unwrap_or_else(DecisionKey::ephemeral);
         let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
             .map_err(TurnServiceBuildError::PolicyFingerprint)?;
@@ -101,6 +95,7 @@ impl TurnDecisionService {
         let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
         let service = Arc::new(Self {
             child_recovery: Default::default(),
+            recursive_allowances: Default::default(),
             memory_loader: None,
             loop_runtime: Some(runtime),
             publication_policy: build.surface_policy,

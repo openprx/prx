@@ -691,3 +691,106 @@ fn automix_window_shares_spend_balance_and_failed_settlement_after_decision_dead
     original.settlement_failed.store(true, Ordering::Release);
     assert_eq!(premium.remaining_budgets().micro_usd, 0);
 }
+
+#[tokio::test]
+async fn recursive_parent_child_and_leaf_reservations_share_the_original_money() -> anyhow::Result<()> {
+    use crate::runtime::turn_decision::recursive_allowance::RecursiveAllowance;
+    let workspace = tempfile::tempdir()?;
+    let mut config = Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.cost.prices.insert(
+        "openrouter/prx-recursive-money".to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let config = Arc::new(config);
+    let initial_money = crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, workspace.path())?;
+    let root = RecursiveAllowance::new(40_000);
+    let (_, child) = root.carve_child(4)?;
+    let (_, leaf) = child.carve_child(2)?;
+    let cleanup = Arc::new(CleanupTracker::default());
+    let result = cleanup
+        .scope(Box::pin(async {
+            let mut total = 0_u64;
+            for (id, owner) in [(1_u8, root.money()), (2, child.money()), (3, leaf.money())] {
+                let micro_usd = owner.load(Ordering::Acquire);
+                let budgets = TurnBudgets {
+                    tokens: 1000,
+                    micro_usd,
+                    latency_ms: 500,
+                };
+                let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
+                let scope = AccountingScope::new(
+                    Arc::clone(&config),
+                    DecisionKey::ephemeral(),
+                    Arc::clone(&cleanup),
+                    [id; 32],
+                    budgets,
+                    deadline,
+                )
+                .with_money(Some(Arc::clone(&owner)));
+                let binding = [id; 32];
+                let estimate = || PhysicalEstimate {
+                    purpose: "decision",
+                    provider: "openrouter",
+                    model: "prx-recursive-money",
+                    body: b"{}",
+                    transport_binding: &binding,
+                    request_id: "prx-recursive-money",
+                    deadline,
+                    remaining_attempts: 1,
+                };
+                let receipt = scope.begin_physical(estimate()).await?;
+                let reserved = receipt.reserved_micro_usd;
+                assert!(reserved > 0 && reserved <= micro_usd);
+                total += receipt.reserved_micro_usd;
+                drop(receipt); // Unknown dispatch liability must stay held.
+                assert_eq!(owner.load(Ordering::Acquire), micro_usd - reserved);
+                let overdraw = AccountingScope::new(
+                    Arc::clone(&config),
+                    DecisionKey::ephemeral(),
+                    Arc::clone(&cleanup),
+                    [id + 3; 32],
+                    TurnBudgets {
+                        tokens: 1_000_000,
+                        ..budgets
+                    },
+                    deadline,
+                )
+                .with_money(Some(Arc::clone(&owner)));
+                assert!(overdraw.begin_physical(estimate()).await.is_err());
+                assert_eq!(owner.load(Ordering::Acquire), micro_usd - reserved);
+                assert!(scope.begin_physical(estimate()).await.is_err());
+            }
+            assert!(total <= 40_000);
+            assert_eq!(
+                total
+                    + root.money().load(Ordering::Acquire)
+                    + child.money().load(Ordering::Acquire)
+                    + leaf.money().load(Ordering::Acquire),
+                40_000
+            );
+            assert!(root.carve_child(4).is_err());
+            assert!(child.carve_child(2).is_err());
+            Ok::<_, anyhow::Error>(total)
+        }))
+        .await;
+    cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+    let total = result?;
+    let rows = journal(workspace.path())?;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.get("event").and_then(Value::as_str) == Some("dispatched"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, workspace.path())?,
+        initial_money - total
+    );
+    Ok(())
+}

@@ -1202,9 +1202,10 @@ const fn has_other_hard_links(_target: &Path) -> bool {
 }
 
 /// The workspace launch definitions (`hooks.json`, `mcp.json` at the
-/// workspace root) as git pathspecs relative to the workspace, matched in
+/// workspace root, and everything under `plugins/`, which holds WASM plugin
+/// code and manifests) as git pathspecs relative to the workspace, matched in
 /// any letter case.
-pub const LAUNCH_DEFINITION_PATHSPECS: [&str; 2] = [":(icase)hooks.json", ":(icase)mcp.json"];
+pub const LAUNCH_DEFINITION_PATHSPECS: [&str; 3] = [":(icase)hooks.json", ":(icase)mcp.json", ":(icase)plugins"];
 
 /// Test support: every git process of the lib tests reads a scratch global
 /// file and no system file, never the host's configuration (D-103). The

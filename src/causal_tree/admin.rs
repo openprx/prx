@@ -697,15 +697,17 @@ impl DecisionAdmin {
         } else {
             StoreMode::ReadOnly
         };
-        let store = CausalDecisionStore::open_shared(
-            &self.config.workspace_dir,
+        let store = super::store_preparation::open_store(
+            self.config.workspace_dir.clone(),
             Retention::days(
                 section.store.retention_days,
                 self.config.self_system.fitness.retention_days,
             ),
             Arc::clone(&self.events),
-            mode,
-        )?;
+            Some(mode),
+            |_| {},
+        )
+        .await?;
         let import = match (store.mode(), self.key()) {
             (StoreMode::ReadWrite, Some(key)) => {
                 Some(import_v1_feedback(&store, &self.config.workspace_dir, &key).await?)
