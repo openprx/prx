@@ -5691,7 +5691,7 @@ Connection: close\r\n\
 
     #[test]
     fn summarize_provider_availability_marks_degraded_when_only_primary_has_credentials() {
-        let _guard = provider_availability_env_lock().lock().unwrap();
+        let _guard = env_lock();
 
         // Isolate from host credentials: override HOME to an empty temp dir so
         // resolve_claude_code_context cannot find ~/.claude/.credentials.json,
@@ -5732,14 +5732,9 @@ Connection: close\r\n\
         );
     }
 
-    fn provider_availability_env_lock() -> &'static std::sync::Mutex<()> {
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     #[test]
     fn summarize_provider_availability_marks_openai_codex_available_with_auth_profile() {
-        let _guard = provider_availability_env_lock().lock().unwrap();
+        let _guard = env_lock();
 
         let fake_home = std::env::temp_dir().join(format!(
             "openprx-provider-avail-test-{}-{}",
@@ -5794,7 +5789,7 @@ Connection: close\r\n\
 
     #[test]
     fn summarize_provider_availability_marks_openai_codex_unavailable_without_auth_profile() {
-        let _guard = provider_availability_env_lock().lock().unwrap();
+        let _guard = env_lock();
 
         let fake_home = std::env::temp_dir().join(format!(
             "openprx-provider-avail-noauth-test-{}-{}",
