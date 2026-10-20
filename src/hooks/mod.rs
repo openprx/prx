@@ -504,12 +504,18 @@ impl HookCore {
     /// [`Self::deliver`] under the per-event bound; on expiry the event is
     /// abandoned (logged) so the next one is delivered.
     async fn deliver_bounded(&self, event: HookEvent, payload: &serde_json::Value) {
-        if tokio::time::timeout(self.delivery_bound, self.deliver(event, payload))
+        let progress = std::sync::atomic::AtomicUsize::new(0);
+        let total = std::sync::atomic::AtomicUsize::new(0);
+        if tokio::time::timeout(self.delivery_bound, self.deliver(event, payload, &total, &progress))
             .await
             .is_err()
         {
+            let planned = total.load(std::sync::atomic::Ordering::Relaxed);
+            let finished = progress.load(std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 event = event.as_str(),
+                actions_total = planned,
+                actions_unfinished = planned.saturating_sub(finished),
                 bound_ms = u64::try_from(self.delivery_bound.as_millis()).unwrap_or(u64::MAX),
                 "hook delivery exceeded its bound and was abandoned"
             );
@@ -519,7 +525,13 @@ impl HookCore {
     /// Deliver one already-redacted event: command hooks first, then WASM
     /// lifecycle hooks and the plugin event bus. Runs on the dispatcher, never
     /// on a turn.
-    async fn deliver(&self, event: HookEvent, payload: &serde_json::Value) {
+    async fn deliver(
+        &self,
+        event: HookEvent,
+        payload: &serde_json::Value,
+        total: &std::sync::atomic::AtomicUsize,
+        finished: &std::sync::atomic::AtomicUsize,
+    ) {
         if let Err(err) = self.refresh_if_changed() {
             tracing::warn!(error = %err, "hooks refresh failed");
         } else {
@@ -541,6 +553,8 @@ impl HookCore {
                     WORKSPACE_HOOKS_OPT_IN
                 );
             } else if !actions.is_empty() {
+                // Progress lets the event bound say how many actions it cut off.
+                total.store(actions.len(), std::sync::atomic::Ordering::Relaxed);
                 for action in actions {
                     if let Err(err) = self.run_action(event, payload, timeout_ms, &action).await {
                         tracing::warn!(
@@ -550,6 +564,7 @@ impl HookCore {
                             "hook execution failed"
                         );
                     }
+                    finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -2121,6 +2136,45 @@ mod tests {
             "the next event was delivered after the first timed out"
         );
         assert_eq!(manager.dispatch_stats().delivered, 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_abandoned_delivery_kills_and_reaps_the_hook_process() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let pid_file = temp.path().join("hook.pid");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let hooks = json!({
+            "timeout_ms": 60_000,
+            "hooks": {"turn_complete": [{"command": "sh", "args": ["-c", script], "stdin_json": false}]}
+        });
+        std::fs::write(workspace.join("hooks.json"), hooks.to_string()).unwrap();
+        let manager = HookManager::new(workspace)
+            .allowing_workspace_hooks(temp.path().join("hooks"))
+            .with_delivery_bound(Duration::from_secs(3));
+
+        manager.emit(HookEvent::TurnComplete, json!({})).await;
+        assert!(manager.drain(TEST_DRAIN).await);
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("test: hook started")
+            .trim()
+            .to_string();
+        let mut gone = false;
+        for _ in 0..100 {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(gone, "the abandoned hook process {pid} is still running");
     }
 
     #[tokio::test]
