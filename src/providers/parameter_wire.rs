@@ -123,9 +123,10 @@ pub(crate) fn check_selection(
 }
 
 /// Serialization wrapper shared by ordinary, accounted and streaming sends.
-/// Unknown model identities use the base request; known rows send only their
-/// declared canonical values. Empty declarations are unverified and preserve
-/// the adapter base request, like an unknown model identity.
+/// Unknown model identities use the base request. Known rows send declared
+/// canonical values, retaining the Anthropic/Bedrock adapter output boundary
+/// when the catalog supplies none. Empty declarations are unverified and
+/// preserve the adapter base request, like an unknown model identity.
 pub(crate) struct Request<'a, T: ?Sized> {
     provider: ParameterProvider<'a>,
     format: Format,
@@ -341,23 +342,21 @@ fn encode_recorded<T: Serialize + ?Sized>(
             }
             resolved.values.insert(ModelParameter::MaxOutputTokens, limit);
         }
-        let output = resolved
-            .values
-            .get(&ModelParameter::MaxOutputTokens)
-            .and_then(Value::as_u64);
-        anyhow::ensure!(
-            output.is_some_and(|output| output > 0),
-            "adapter requires a positive output limit"
-        );
-        if let Some(thinking) = resolved
-            .values
-            .get(&ModelParameter::ThinkingBudget)
-            .and_then(Value::as_u64)
-        {
-            anyhow::ensure!(
-                output.is_some_and(|output| output > thinking),
-                "max_output_tokens must exceed thinking_budget"
-            );
+        // A generic wrapper input may carry no adapter limit. Preserve that
+        // absence if the catalog supplies none, while validating every
+        // present output limit and retaining the thinking-budget boundary.
+        if let Some(output) = resolved.values.get(&ModelParameter::MaxOutputTokens) {
+            let output = output
+                .as_u64()
+                .filter(|output| *output > 0)
+                .ok_or_else(|| anyhow::anyhow!("adapter requires a positive output limit"))?;
+            if let Some(thinking) = resolved
+                .values
+                .get(&ModelParameter::ThinkingBudget)
+                .and_then(Value::as_u64)
+            {
+                anyhow::ensure!(output > thinking, "max_output_tokens must exceed thinking_budget");
+            }
         }
     }
     // Effort alone must never leave a partial/adaptive thinking object in an
@@ -508,6 +507,31 @@ mod tests {
                 let prepared = encode_recorded(&body, format, &model, "fixture", false, true).unwrap();
                 assert_eq!(prepared.pointer(pointer), Some(&json!(4096)), "{pointer}");
             }
+        }
+    }
+
+    #[test]
+    fn absent_adapter_output_limit_preserves_absence_or_uses_the_catalog_default() {
+        for (format, pointer) in [
+            (Format::Anthropic, "/max_tokens"),
+            (Format::Bedrock, "/inferenceConfig/maxTokens"),
+        ] {
+            let body = json!({"messages":[]});
+            for (default, expected) in [(None, None), (Some(3072), Some(3072))] {
+                let row = model(
+                    json!({"max_output_tokens":{"kind":"range","min":1,"max":8192,"default":default}}),
+                    json!({}),
+                );
+                let prepared = encode_recorded(&body, format, &row, "fixture", false, true).unwrap();
+                assert_eq!(prepared.pointer(pointer).and_then(Value::as_u64), expected, "{pointer}");
+                assert_eq!(prepared.get("messages"), Some(&json!([])));
+            }
+            let invalid = model(
+                json!({"max_output_tokens":{"kind":"range","min":0,"max":8192,"default":0}}),
+                json!({}),
+            );
+            let error = encode_recorded(&body, format, &invalid, "fixture", false, true).unwrap_err();
+            assert!(error.to_string().contains("adapter requires a positive output limit"));
         }
     }
 
