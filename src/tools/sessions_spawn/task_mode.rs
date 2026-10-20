@@ -109,6 +109,9 @@ pub(super) async fn run_sub_agent_task(
     // iteration below, so the run's registry row observes exactly the events
     // `crate::agent::idle` already defines as progress.
     progress: Arc<crate::agent::idle::ProgressBeat>,
+    // The parent registry's live hook manager, shared by a child that has no
+    // Ordinary parent runtime of its own.
+    parent_hooks: Option<Arc<HookManager>>,
 ) -> anyhow::Result<SubAgentTaskResult> {
     let operator_authority = SPAWN_EXECUTION_CONTEXT
         .try_with(|context| context.operator_authority.clone())
@@ -294,6 +297,7 @@ pub(super) async fn run_sub_agent_task(
         let provider_instance = provider.clone();
         let child_source_owned = child_source.clone().context("task segment source missing")?;
         let ordinary_runtime_owned = ordinary_runtime.clone();
+        let parent_hooks_owned = parent_hooks.clone();
         let child_service_owned = child_service.clone().context("task segment service missing")?;
         let child_config_owned = child_config.clone().context("task segment configuration missing")?;
         let child_fabric_owned = child_fabric.clone().context("task segment fabric missing")?;
@@ -349,7 +353,7 @@ pub(super) async fn run_sub_agent_task(
                     Some(runtime) => (runtime.observer, runtime.hooks),
                     None => (
                         Arc::new(NoopObserver),
-                        Arc::new(HookManager::new(workspace_dir_owned.clone())),
+                        crate::tools::child_hooks::child_hooks(parent_hooks_owned, &workspace_dir_owned),
                     ),
                 };
             let context = &child_source.1;

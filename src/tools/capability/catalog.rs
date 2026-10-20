@@ -1323,7 +1323,7 @@ mod tests {
                 runtime,
                 workspace.path().to_path_buf(),
             )),
-            Box::new(crate::tools::file_read::FileReadTool::new(security)),
+            Box::new(crate::tools::file_read::FileReadTool::new(security, false)),
         ];
         let mut sources = CatalogSources::default();
         for server in ["notes", "my__srv"] {

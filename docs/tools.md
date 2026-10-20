@@ -995,7 +995,7 @@ itself is unaffected and remains searchable by its owner.
 
 The `Agent::run_single` shell runs through the same service as of 0.8.128;
 approval there is fail-closed for the same reason.
-`tests/architecture_boundaries.rs` pins the inventory of production call sites
+`tests/architecture_boundaries/main.rs` pins the inventory of production call sites
 that invoke a tool directly, so a new bypass fails a test, and
 `tests/tool_schema_contract.rs` sweeps the whole static tool inventory: every
 published contract must accept a document derived from itself and reject one
@@ -1432,6 +1432,8 @@ Create `hooks.json` in the workspace directory:
 
 - `command` + `args` — executed directly, not via shell (no injection risk)
 - `timeout_ms` — per-hook timeout, default 5000ms; valid range 1–300000ms
+- `cwd` is not supported: a hook always starts in its dedicated `hooks/` directory beside `config.toml`, so a `hooks.json` that sets `cwd` is refused at load with a clear error (remove the field)
+- hooks are observe-only and run off the turn path: an event is queued and a background worker per hook manager delivers it (command hooks in file order, then WASM hooks and the plugin event bus), in emit order. A slow hook never delays a turn; each hook keeps its own timeout. The queue holds 1024 events; when it is full the new event is dropped, counted and logged (first drop, then every 100th). At gateway shutdown queued events are given up to 3 seconds to finish
 - `hooks.json` is capped at 256 KiB and hot-reloaded by content generation; an invalid candidate leaves the active generation unchanged
 - payloads are capped at 4 MiB and passed through a restrictive temporary file plus optional stdin
 - timeout covers stdin and process execution; timed-out children are killed and reaped, and temporary payload files are removed on every exit path

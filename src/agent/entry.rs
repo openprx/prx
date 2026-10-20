@@ -2630,6 +2630,8 @@ pub(crate) async fn run_with_runtime_envelope(
                 .await;
         }
     }
+    // The process may exit right after this run: deliver the queued hook events first.
+    ctx.hooks.drain_for_shutdown().await;
     result
 }
 

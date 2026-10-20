@@ -1384,7 +1384,10 @@ impl DelegateLoopResources {
                     (Arc::clone(&runtime.hooks), Arc::clone(&runtime.observer))
                 }
                 _ => (
-                    Arc::new(HookManager::new(security.workspace_dir.clone())),
+                    super::child_hooks::child_hooks(
+                        super::child_hooks::parent_hook_manager(self.parent_tools.as_slice()),
+                        &security.workspace_dir,
+                    ),
                     Arc::new(NoopObserver),
                 ),
             };
@@ -1634,6 +1637,10 @@ impl ToolArcRef {
 
 #[async_trait]
 impl Tool for ToolArcRef {
+    fn live_hook_manager(&self) -> Option<Arc<HookManager>> {
+        self.inner.live_hook_manager()
+    }
+
     fn name(&self) -> &str {
         self.public_spec
             .as_ref()
@@ -3219,6 +3226,47 @@ mod tests {
             (result, executions.load(Ordering::SeqCst), history)
         })
         .await
+    }
+
+    /// Finding 96b: a delegate child without an Ordinary parent runtime
+    /// emits its hook events through the parent registry's live manager.
+    #[tokio::test]
+    async fn a_delegate_child_shares_the_parents_hook_manager() {
+        let temp = tempfile::tempdir().unwrap();
+        let hook_workspace = temp.path().join("hooks-ws");
+        std::fs::create_dir_all(&hook_workspace).unwrap();
+        let log = temp.path().join("llm-request.log");
+        let hooks = json!({
+            "timeout_ms": 60_000,
+            "hooks": {"llm_request": [{
+                "command": "sh",
+                "args": ["-c", format!("echo hit >> '{}'", log.display())],
+                "stdin_json": false
+            }]}
+        });
+        std::fs::write(hook_workspace.join("hooks.json"), hooks.to_string()).unwrap();
+        let manager = Arc::new(HookManager::new(hook_workspace).allowing_workspace_hooks(temp.path().join("hooks")));
+        let mut parent_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(DynamicAliasTool)];
+        parent_tools.extend(manager.control_tool_arcs(test_security()));
+
+        let (result, _) = run_configured_delegate_fixture(
+            vec!["dynamic_alias".to_owned()],
+            parent_tools,
+            "dynamic_alias",
+            json!({}),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(manager.drain(std::time::Duration::from_secs(30)).await);
+        assert!(
+            manager.dispatch_stats().delivered >= 1,
+            "the child's events reach the parent's queue"
+        );
+        let recorded = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(recorded.contains("hit"), "the parent's hook recorded the child's event");
     }
 
     #[tokio::test]

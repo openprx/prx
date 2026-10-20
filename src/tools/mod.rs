@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 mod catalog_snapshot;
+mod child_hooks;
 pub use catalog_snapshot::{SharedToolCatalogEntry, SharedToolCatalogSnapshot};
 
 pub mod agents_list;
@@ -228,12 +229,12 @@ pub fn tool_name_is_exposed(name: &str, expose_stay_silent: bool) -> bool {
 }
 
 #[derive(Clone)]
-struct ArcDelegatingTool {
+pub(crate) struct ArcDelegatingTool {
     inner: Arc<dyn Tool>,
 }
 
 impl ArcDelegatingTool {
-    fn boxed(inner: Arc<dyn Tool>) -> Box<dyn Tool> {
+    pub(crate) fn boxed(inner: Arc<dyn Tool>) -> Box<dyn Tool> {
         Box::new(Self { inner })
     }
 }
@@ -242,6 +243,10 @@ impl ArcDelegatingTool {
 impl Tool for ArcDelegatingTool {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    fn live_hook_manager(&self) -> Option<Arc<crate::hooks::HookManager>> {
+        self.inner.live_hook_manager()
     }
 
     fn description(&self) -> &str {

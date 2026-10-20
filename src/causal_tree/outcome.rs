@@ -725,6 +725,30 @@ impl TerminalFacts {
         })
     }
 
+    /// What a terminal recovered after a restart can be trusted for:
+    /// `(status, awaiting_approval, verified)`. The facts are verified only
+    /// with a settled execution trace and, for a completed turn, a successful
+    /// provider outcome. `directive_kind` is the recorded decision's directive.
+    pub(crate) fn recovered_signals(&self, directive_kind: &str) -> (TurnTerminalStatus, bool, bool) {
+        let trace = self.execution_trace.as_ref();
+        let settled = trace.is_some_and(|trace| {
+            !trace.incomplete
+                && !trace.provider_attempts_incomplete
+                && trace.provider_pending == 0
+                && trace.pending_attempts == 0
+        });
+        let provider_ok = matches!(
+            self.provider_outcome.as_ref().map(|outcome| &outcome.status),
+            Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess)
+        );
+        let awaiting = directive_kind == "request_approval" || trace.is_some_and(|t| t.awaiting_approval_attempts > 0);
+        (
+            self.status,
+            awaiting,
+            settled && (self.status != TurnTerminalStatus::Completed || provider_ok),
+        )
+    }
+
     pub(crate) fn from_receipt(
         context: &TurnDecisionContext,
         receipt: &TurnTerminalReceipt,
@@ -1525,6 +1549,84 @@ mod tests {
         assert_eq!(
             sampled.candidates.first().expect("one candidate").propensity,
             Some(0.75)
+        );
+    }
+    fn recovered_facts(
+        status: TurnTerminalStatus,
+        trace: Option<crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
+        provider_success: bool,
+    ) -> TerminalFacts {
+        let now = chrono::Utc::now();
+        TerminalFacts {
+            collected_pending: false,
+            resume_claimed: false,
+            terminal_id: "recovered-terminal".to_owned(),
+            status,
+            provider_outcome: provider_success.then(|| ProviderExecutionOutcome {
+                decision_id: String::new(),
+                started_at: now,
+                finished_at: now,
+                attempts: Vec::new(),
+                final_provider: "prx_test".to_owned(),
+                final_model: "prx_test".to_owned(),
+                status: ExecutionStatus::Success,
+                fallback_reason: None,
+                tokens_used: Default::default(),
+                prepared_parameters: Vec::new(),
+            }),
+            usage: None,
+            cost: None,
+            latency_ms: 0,
+            execution_trace: trace,
+        }
+    }
+
+    #[test]
+    fn recovered_terminals_are_verified_only_with_settled_execution_facts() {
+        use crate::tools::capability::execution_trace::ExecutionTraceSnapshot;
+        let settled = || Some(ExecutionTraceSnapshot::default());
+        let signals = |status, trace, provider, directive: &str| {
+            recovered_facts(status, trace, provider).recovered_signals(directive)
+        };
+        // No execution trace: nothing about the run is verifiable.
+        for status in [
+            TurnTerminalStatus::Completed,
+            TurnTerminalStatus::Failed,
+            TurnTerminalStatus::Cancelled,
+        ] {
+            assert_eq!(signals(status, None, true, "answer"), (status, false, false));
+        }
+        // An unsettled trace is not verifiable either.
+        for unsettled in [
+            ExecutionTraceSnapshot {
+                incomplete: true,
+                ..ExecutionTraceSnapshot::default()
+            },
+            ExecutionTraceSnapshot {
+                pending_attempts: 1,
+                ..ExecutionTraceSnapshot::default()
+            },
+            ExecutionTraceSnapshot {
+                provider_pending: 1,
+                ..ExecutionTraceSnapshot::default()
+            },
+        ] {
+            assert!(!signals(TurnTerminalStatus::Failed, Some(unsettled), false, "answer").2);
+        }
+        // A completed turn also needs a successful provider outcome.
+        assert!(!signals(TurnTerminalStatus::Completed, settled(), false, "answer").2);
+        assert_eq!(
+            signals(TurnTerminalStatus::Completed, settled(), true, "answer"),
+            (TurnTerminalStatus::Completed, false, true)
+        );
+        // The same approval signals as the live path.
+        assert_eq!(
+            signals(TurnTerminalStatus::Completed, settled(), true, "request_approval"),
+            (TurnTerminalStatus::Completed, true, true)
+        );
+        assert_eq!(
+            signals(TurnTerminalStatus::Failed, settled(), false, "answer"),
+            (TurnTerminalStatus::Failed, false, true)
         );
     }
 }

@@ -62,6 +62,10 @@ pub enum ExperienceOutcome {
     /// No terminal has been joined (the initial state).
     Incomplete,
     Blocked,
+    /// A terminal was joined but its outcome could not be verified (restart
+    /// recovery without a trustworthy execution trace or provider facts). It
+    /// completes the record and never supports a learning claim.
+    Unknown,
 }
 
 /// Separate correlation identities of one receipt. None is inferred from
@@ -159,11 +163,15 @@ pub struct SkillExperience {
 }
 
 impl SkillExperience {
-    /// Whether the experience may support a learning claim: it has a terminal
-    /// and no evidence was dropped or late.
+    /// Whether the experience may support a learning claim: it has a verified
+    /// terminal and no evidence was dropped or late.
     #[must_use]
     pub const fn learning_eligible(&self) -> bool {
-        self.terminal.is_some() && self.dropped_evidence == 0 && self.late_evidence == 0
+        let verified = match &self.terminal {
+            Some(terminal) => !matches!(terminal.outcome, ExperienceOutcome::Unknown),
+            None => false,
+        };
+        verified && self.dropped_evidence == 0 && self.late_evidence == 0
     }
 
     /// Skills with at least one hydration receipt: the only skills credited as used.
@@ -311,6 +319,29 @@ impl SkillLifecycleStore {
         pin: &PinnedSkillRevision,
         correlation: &Correlation,
     ) -> Result<SkillExperience, LifecycleError> {
+        self.record_selection_inner(task_id, pin, correlation, false)
+    }
+
+    /// Like [`Self::record_selection`], but idempotent: a task that already
+    /// holds a receipt for the same skill revision records nothing new (not
+    /// even late evidence). The runtime assembles a turn's prompt skills more
+    /// than once, so its source of receipts uses this.
+    pub fn record_selection_once(
+        &self,
+        task_id: &str,
+        pin: &PinnedSkillRevision,
+        correlation: &Correlation,
+    ) -> Result<SkillExperience, LifecycleError> {
+        self.record_selection_inner(task_id, pin, correlation, true)
+    }
+
+    fn record_selection_inner(
+        &self,
+        task_id: &str,
+        pin: &PinnedSkillRevision,
+        correlation: &Correlation,
+        once: bool,
+    ) -> Result<SkillExperience, LifecycleError> {
         check_correlation(correlation)?;
         let receipt = SelectionReceipt {
             skill_id: pin.skill_id.clone(),
@@ -321,6 +352,14 @@ impl SkillLifecycleStore {
             selected_at: Utc::now(),
         };
         self.update_experience(task_id, |record| {
+            if once
+                && record
+                    .selection_receipts
+                    .iter()
+                    .any(|seen| seen.skill_id == receipt.skill_id && seen.revision_id == receipt.revision_id)
+            {
+                return Ok(Some(true));
+            }
             record.correlation.fill_missing(correlation);
             if record.terminal.is_some() {
                 record.late_evidence = record.late_evidence.saturating_add(1);

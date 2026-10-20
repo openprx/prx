@@ -251,11 +251,13 @@ fn every_production_spawn_tool_carries_the_model_catalog() {
     let mut missing = Vec::new();
     for file in [
         "chat/run.rs",
+        "chat/run/startup.rs",
         "gateway/mod.rs",
         "channels/startup.rs",
         "session_worker/runner/provider.rs",
     ] {
         let text = std::fs::read_to_string(root.join(file)).expect("test: read source");
+        assert!(!text.trim().is_empty(), "unscanned production source: {file}");
         let mut offset = 0;
         for line in text.split_inclusive('\n') {
             let code = !line.trim_start().starts_with("//");

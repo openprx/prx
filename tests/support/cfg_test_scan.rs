@@ -1,6 +1,6 @@
 // Shared test-code recognition for the source scanners.
 //
-// Included with `include!` by `tests/architecture_boundaries.rs` and by the
+// Included with `include!` by `tests/architecture_boundaries/` and by the
 // audit-wiring gate in `src/runtime/bootstrap.rs`, so both apply exactly one
 // rule for "which text is production code". Not a test target of its own
 // (cargo only builds `tests/*.rs`). Items only: an included file may carry no

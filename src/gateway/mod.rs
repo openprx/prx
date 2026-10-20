@@ -1628,6 +1628,8 @@ pub async fn run_gateway(
     // opt-in (HOOKS-ENV).
     let hooks =
         Arc::new(HookManager::new(config.workspace_dir.clone()).with_config(Arc::clone(&shared_config_for_reload)));
+    // Kept for the shutdown drain of queued hook events.
+    let hooks_for_shutdown = Arc::clone(&hooks);
     #[cfg(feature = "wasm-plugins")]
     let wasm_plugin_runtime = if let Some(runtime) = wasm_early_runtime {
         runtime
@@ -2046,6 +2048,7 @@ pub async fn run_gateway(
         .cleanup
         .drain(tokio::time::Instant::now() + Duration::from_secs(15))
         .await;
+    hooks_for_shutdown.drain_for_shutdown().await;
     health_shutdown.cancel();
     let _ = health_heartbeat.await;
     serve_result?;
@@ -2299,7 +2302,7 @@ fn gateway_turn_spawn_context(
 /// test green while `sessions_spawn` handed a child the tools the operator hid
 /// from the gateway. Binding construction and scoping together here gives that
 /// wiring one place to be tested, and
-/// `tests/architecture_boundaries.rs::the_gateway_webhook_turn_seeds_its_spawn_boundary`
+/// `the_gateway_webhook_turn_seeds_its_spawn_boundary` in `tests/architecture_boundaries/`
 /// pins that `run_gateway_chat_with_multimodal` still goes through it.
 async fn within_gateway_turn_spawn_context<F>(
     run_id: String,

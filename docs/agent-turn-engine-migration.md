@@ -46,7 +46,7 @@ git ls-files -z '*.rs' ':!vendor/**' \
   | sort -nr
 ```
 
-The threshold is strictly more than 5,000 physical lines. The current tree has
+The threshold is strictly more than 5,000 physical lines. The 2026-10-15 snapshot had
 20 qualifying first-party files. Crossing the threshold does not by itself
 justify a behavior-changing split; each exception below records its owner and
 why its current contents remain cohesive. Future growth still requires review.
@@ -80,3 +80,46 @@ upstream copies: `vendor/matrix-sdk-0.19.1/src/room/mod.rs` (5,836 lines),
 `vendor/matrix-sdk-0.19.1/src/test_utils/mocks/mod.rs` (5,308). Their source
 ownership and decomposition remain upstream; PRX does not refactor vendored
 code as part of this migration.
+
+## Finding 103 split status (2026-10-20)
+
+The inventory above is the historical 2026-10-15 baseline. Finding 103 moves
+configuration schema responsibilities into `src/config/schema/`: domain
+structures/defaults, compatibility migration, proxy handling, path resolution,
+credential migration, lifecycle/validation, and atomic persistence. The old
+`config::schema` paths remain available through re-exports. The root is 551
+lines; the largest moved source/test file is below 1,500 lines. The full public
+`prx config schema` JSON is pinned by a CLI golden captured before the moves.
+The original 227 schema tests remain with unchanged assertions. One inherited
+host-specific example path is replaced by a neutral project path in a fixture
+and the corresponding schema description.
+
+The onboarding wizard keeps its public entry points through re-exports while
+models, provider setup, workspace setup, preferences, channels, tunnels,
+summaries, and persistence live in `src/onboard/wizard/`. Its root is 397
+lines; the largest production child is 1,416 lines and the largest test child
+is 943 lines. All 77 original tests remain. Source guards cover the root and
+production children; moved test files retain explicit test-only scope.
+
+The chat entry point keeps its event loop in `src/chat/run.rs` (4,961 lines).
+Eleven contiguous startup and teardown blocks live in `run/startup.rs` (727
+lines), with explicit arguments and one private borrowed UI context. The
+original statements, error propagation, primitive await order, guard lifetimes,
+and 238 clone calls are preserved. All chat tests remain unchanged; source
+guards cover the new production child alongside the root.
+
+
+## Finding 104 split and current inventory (2026-10-21)
+
+The architecture guards remain one integration target, `architecture_boundaries`,
+with a 30-line `tests/architecture_boundaries/main.rs` root and 22 child modules
+by concern. Shared source readers and function helpers live in `helpers.rs`;
+the largest child is 884 lines. All 248 guard and probe function names,
+assertions, allowlists, and failure messages are retained. Rust module prefixes
+change, while the Cargo test target name stays the same. The metaguard reads
+every module declared by the thin root and checks that each source is nonempty.
+
+A fresh scan of 1,279 tracked first-party Rust, JavaScript, TypeScript, and Svelte
+files, excluding `vendor/` and `console/dist/`, finds no file above 5,000 physical
+lines. The largest is `src/providers/compatible.rs` at 4,991 lines. The dated
+2026-10-15 inventory above is retained as the historical baseline.
