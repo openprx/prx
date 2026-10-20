@@ -282,8 +282,7 @@ fn encode_recorded<T: Serialize + ?Sized>(
         }
     }
     let selected = super::model_settings::selected(&model.id);
-    let settings_layers =
-        crate::config::model_settings::parameter_layers(&model.id, &selected.iter().collect::<Vec<_>>())?;
+    let settings_layers = crate::config::model_settings::runtime_layers(model, &selected.iter().collect::<Vec<_>>());
     if default_output_limit {
         caller.overrides.remove(&ModelParameter::MaxOutputTokens);
     }

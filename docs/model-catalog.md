@@ -264,7 +264,12 @@ string such as `reasoning_effort=low`. Repeated names are refused. Settings
 replace the model's saved level and explicit overrides together. Plan-time
 validation refuses unknown levels, unsupported parameters, invalid types,
 out-of-range values and invalid steps; it does not silently clamp a durable
-choice. Runtime caller overrides retain the catalog's clamp/drop rules.
+choice. The loader refuses misspelled route or model-settings keys, so a field
+such as `api_keyy` cannot be absorbed as a parameter. Saved values that become
+invalid after a catalog update do not prevent startup or requests: runtime
+drops unsupported or malformed values and unknown levels, clamps numeric
+values, and warns. Load and doctor diagnostics identify settings to repair.
+Explicit caller overrides retain their existing validation and precedence.
 
 The Console Models page loads the selected model's declarations and generates
 its level selector and numeric/enum controls from them. A settings change uses
@@ -326,3 +331,8 @@ ownership checks still apply; creating a new retired selection remains refused.
 Retired models retain published context-window facts for compaction while their
 release capabilities remain unverified. The signed terminal claim and persisted
 terminal event both carry the admitted catalog revision and digest.
+
+Catalog lifecycle notices distinguish known deprecated or retired rows from
+unlisted names. Custom endpoints and wildcard-covered local model names do
+not produce absence notices. Other absent catalog names are informational
+at load and in doctor; deprecated and retired rows still warn.

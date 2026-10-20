@@ -3,9 +3,19 @@ use crate::config::Config;
 use crate::providers::ProviderId;
 use crate::providers::catalog::{ModelLifecycleStatus, ReleaseCatalog};
 
-/// Warnings for persisted models, including references left by older releases.
-/// Unknown local models are advisory, as they have always been executable.
+/// Lifecycle messages for command output, including informational absences.
 pub fn warnings(config: &Config) -> anyhow::Result<Vec<String>> {
+    Ok(diagnostics(config)?.into_iter().map(|note| note.message).collect())
+}
+
+pub(crate) struct LifecycleDiagnostic {
+    pub message: String,
+    pub warning: bool,
+}
+
+/// Unknown catalog selections are informational; open-ended providers do not
+/// promise a closed release inventory.
+pub(crate) fn diagnostics(config: &Config) -> anyhow::Result<Vec<LifecycleDiagnostic>> {
     let release = ReleaseCatalog::embedded_ref()?;
     let mut selected = super::validate::selected_models(config);
     for id in config.model_settings.keys() {
@@ -18,10 +28,19 @@ pub fn warnings(config: &Config) -> anyhow::Result<Vec<String>> {
     let mut warnings = Vec::new();
     for (provider, model) in selected {
         let identity = ProviderId::of(&provider);
-        if !identity.is_resolvable() || model.starts_with("hint:") {
+        if identity.catalog_name().is_none() || model.starts_with("hint:") {
             continue;
         }
-        let state = match release.model(&identity, &model) {
+        let row = release.model(&identity, &model);
+        if row.is_none()
+            && release
+                .models
+                .iter()
+                .any(|row| Some(row.provider.as_str()) == identity.catalog_name() && row.api_model == "*")
+        {
+            continue;
+        }
+        let state = match row {
             Some(row) if row.lifecycle.status == ModelLifecycleStatus::Active => continue,
             Some(row) => {
                 let status = match row.lifecycle.status {
@@ -36,11 +55,11 @@ pub fn warnings(config: &Config) -> anyhow::Result<Vec<String>> {
             }
             None => "absent from this release (deleted or custom); unverified without local evidence".into(),
         };
-        warnings.push(format!(
+        warnings.push(LifecycleDiagnostic { warning: row.is_some(), message: format!(
             "model '{}' of provider '{}' is {state}; existing configuration is retained; inspect `prx models migrate-retired`",
             crate::security::redaction::redact_provider_text(&model),
             crate::security::redaction::redact_provider_text(&provider),
-        ));
+        ) });
     }
     Ok(warnings)
 }
@@ -211,6 +230,41 @@ fn migrate_fallbacks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_absence_is_informational_and_open_ended_providers_are_skipped() {
+        for (provider, model, absent) in [
+            ("custom:https://example.com/v1", "prx-custom-model", false),
+            ("ollama", "prx-local-tag:latest", false),
+            ("openrouter", "prx/unlisted-model", true),
+            ("openai", "prx-unlisted-model", true),
+        ] {
+            let config = Config {
+                default_provider: Some(provider.into()),
+                default_model: Some(model.into()),
+                ..Default::default()
+            };
+            let notes = diagnostics(&config).unwrap();
+            let selected = notes
+                .iter()
+                .filter(|note| note.message.contains(model))
+                .collect::<Vec<_>>();
+            assert_eq!(!selected.is_empty(), absent, "{provider}");
+            assert!(selected.iter().all(|note| !note.warning));
+        }
+        let config = Config {
+            default_provider: Some("openai".into()),
+            default_model: Some("gpt-4o".into()),
+            ..Default::default()
+        };
+        assert!(
+            diagnostics(&config)
+                .unwrap()
+                .iter()
+                .any(|note| note.warning && note.message.contains("retired"))
+        );
+    }
+
     use crate::providers::catalog::{CatalogView, DescriptorSource, Requirement, UnknownPolicy};
 
     #[test]

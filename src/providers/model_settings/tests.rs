@@ -536,3 +536,101 @@ async fn saved_anthropic_high_level_reaches_the_actual_native_output_limit() {
     assert_eq!(body.pointer("/output_config/effort"), Some(&json!("high")));
     assert!(body.get("thinking").is_none());
 }
+
+#[tokio::test]
+async fn stale_saved_model_and_route_settings_serve_real_requests_with_safe_wire_values() {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let received = Arc::clone(&bodies);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let received = Arc::clone(&received);
+            async move {
+                received.lock().push(body);
+                Json(json!({"choices":[{"message":{"role":"assistant","content":"prx reply"}}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut config = crate::config::Config {
+        config_path: dir.path().join("config.toml"),
+        workspace_dir: dir.path().join("workspace"),
+        default_provider: Some("openai".into()),
+        default_model: Some("gpt-5.6".into()),
+        api_url: Some(base),
+        api_key: Some("prx-model-settings-fixture".into()),
+        ..Default::default()
+    };
+    config.model_settings.insert(
+        "openai/gpt-5.6".into(),
+        serde_json::from_value(json!({"level":"future","reasoning_effort":"invalid","max_output_tokens":0})).unwrap(),
+    );
+    config.model_routes.push(crate::config::ModelRouteConfig {
+        hint: "high".into(),
+        provider: "openai".into(),
+        model: "gpt-5.6".into(),
+        api_key: None,
+        credential_ref: None,
+        settings: serde_json::from_value(json!({"level":"future","reasoning_effort":"high"})).unwrap(),
+    });
+    std::fs::write(&config.config_path, toml::to_string(&config).unwrap()).unwrap();
+    let config = crate::config::Config::load_from_path(&config.config_path, config.workspace_dir.clone()).unwrap();
+    assert_ne!(
+        crate::config::model_settings::warnings(&config).unwrap(),
+        [] as [String; 0]
+    );
+    assert!(
+        config
+            .model_settings
+            .get("openai/gpt-5.6")
+            .unwrap()
+            .validate("openai/gpt-5.6")
+            .is_err()
+    );
+    let options = crate::providers::provider_runtime_options_from_config(&config);
+    let provider = crate::providers::create_provider_from_test_config(&config, &options).unwrap();
+    let capture = Capture::new(true);
+    assert_eq!(
+        capture
+            .scope(provider.chat_with_system(None, "prx request", "gpt-5.6", 0.7))
+            .await
+            .unwrap(),
+        "prx reply"
+    );
+    capture
+        .scope(provider.chat_with_system(None, "prx route", "hint:high", 0.7))
+        .await
+        .unwrap();
+    capture
+        .scope(provider.chat_with_system(None, "prx root again", "gpt-5.6", 0.7))
+        .await
+        .unwrap();
+    server.abort();
+    let bodies = bodies.lock();
+    assert_eq!(bodies.len(), 3);
+    let body = bodies.first().unwrap();
+    assert_eq!(body.get("reasoning_effort"), Some(&json!("medium")));
+    assert_eq!(body.get("max_completion_tokens"), Some(&json!(1)));
+    assert!(body.get("temperature").is_none());
+    let parameters = capture.take();
+    assert_eq!(bodies.get(1).unwrap().get("reasoning_effort"), Some(&json!("high")));
+    assert_eq!(
+        bodies.get(2).unwrap().get("reasoning_effort"),
+        Some(&json!("medium")),
+        "route settings must not change a sibling chain"
+    );
+    assert_eq!(parameters.len(), 3);
+    assert_eq!(
+        parameters
+            .first()
+            .unwrap()
+            .values
+            .get(&crate::providers::catalog::ModelParameter::ReasoningEffort),
+        Some(&json!("medium"))
+    );
+}

@@ -3172,23 +3172,14 @@ pub fn create_provider_for(
             });
         }
     }
-    let route_settings = resolved
-        .route_settings()
-        .map(|settings| -> anyhow::Result<_> {
-            let release = catalog.release_catalog()?;
-            let row = release
-                .model(resolved.provider(), resolved.model())
-                .ok_or_else(|| anyhow::anyhow!("route settings require a release catalog model"))?;
-            let mut selected = Vec::new();
-            if let Some(model) = options.model_settings.as_ref().and_then(|models| models.get(&row.id)) {
-                selected.push(model);
-            }
-            selected.push(settings);
-            let layers = crate::config::model_settings::parameter_layers(&row.id, &selected)?;
-            catalog::parameters::resolve(row, &release.revision, &layers)?;
-            Ok((row.id.clone(), settings.clone()))
-        })
-        .transpose()?;
+    let route_settings = if let Some(settings) = resolved.route_settings() {
+        catalog
+            .release_catalog()?
+            .model(resolved.provider(), resolved.model())
+            .map(|row| (row.id.clone(), settings.clone()))
+    } else {
+        None
+    };
     let credential = resolved.credential();
     create_resilient_provider_from_resolved(
         label,

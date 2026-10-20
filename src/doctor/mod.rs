@@ -1328,8 +1328,18 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
 /// unverified), verified is fine.
 fn check_model_selection(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "models";
-    match crate::config::manage::lifecycle::warnings(config) {
+    match crate::config::model_settings::warnings(config) {
         Ok(warnings) => items.extend(warnings.into_iter().map(|warning| DiagItem::warn(cat, warning))),
+        Err(error) => items.push(DiagItem::error(cat, error.to_string())),
+    }
+    match crate::config::manage::lifecycle::diagnostics(config) {
+        Ok(notes) => items.extend(notes.into_iter().map(|note| {
+            if note.warning {
+                DiagItem::warn(cat, note.message)
+            } else {
+                DiagItem::with_state(Severity::Ok, DiagnosticState::Unknown, cat, note.message)
+            }
+        })),
         Err(error) => items.push(DiagItem::error(cat, error.to_string())),
     }
     match crate::providers::selection::default_status(config) {
@@ -2558,6 +2568,37 @@ mod tests {
     )]
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn doctor_reports_invalid_saved_model_settings_as_repairable_warnings() {
+        let mut config = Config::default();
+        config.default_provider = Some("openai".into());
+        config.default_model = Some("gpt-5.6".into());
+        config.model_settings.insert(
+            "openai/gpt-5.6".into(),
+            serde_json::from_value(serde_json::json!({"level":"future"})).unwrap(),
+        );
+        let mut items = Vec::new();
+        check_model_selection(&config, &mut items);
+        assert!(items.iter().any(|item| item.message.contains("saved level")));
+    }
+
+    #[test]
+    fn absent_catalog_lifecycle_is_informational_without_claiming_model_health() {
+        let config = Config {
+            default_provider: Some("openai".into()),
+            default_model: Some("prx-unlisted-model".into()),
+            ..Default::default()
+        };
+        let mut items = Vec::new();
+        check_model_selection(&config, &mut items);
+        let note = items
+            .iter()
+            .find(|item| item.message.contains("deleted or custom"))
+            .unwrap();
+        assert_eq!(note.severity, Severity::Ok);
+        assert_eq!(note.state, DiagnosticState::Unknown);
+    }
 
     #[cfg(feature = "llm-router")]
     #[test]
