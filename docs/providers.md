@@ -67,8 +67,9 @@ models before local-only ids.
   loops. See [extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking).
   Both streaming and non-streaming requests carry tools.
 - OpenAI (direct) sends native `tools` with `tool_choice: "auto"` and parses
-  streamed `tool_calls` deltas. Both streaming and non-streaming requests carry
-  tools.
+  streamed `tool_calls` deltas. Both the system-prompt and full-history streaming
+  entry points use this transport.
+  Both streaming and non-streaming requests carry tools.
 - Gemini sends native `functionDeclarations`, parses `functionCall`, sends
   `functionResponse` on the next turn, and converts validated image markers to
   Gemini `inlineData`. Gemini 3.x `thoughtSignature` values are retained across

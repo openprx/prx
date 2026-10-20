@@ -945,6 +945,22 @@ impl Provider for OpenAiProvider {
         true
     }
 
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        let mut messages = Vec::with_capacity(if system_prompt.is_some() { 2 } else { 1 });
+        if let Some(system) = system_prompt {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(ChatMessage::user(message));
+        self.stream_chat_with_history(&messages, model, temperature, options)
+    }
+
     /// **5a-7a**: Native streaming with full history + tool_calls.
     ///
     /// Sends `stream: true`, the native tools in `options.tools` and
