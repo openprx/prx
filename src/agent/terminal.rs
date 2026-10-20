@@ -584,10 +584,12 @@ fn skill_observations(
     trace: Option<&crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
     provider: Option<&ProviderExecutionOutcome>,
 ) -> crate::skills::lifecycle::TerminalObservations {
-    trace.map_or_else(
+    let mut observations = trace.map_or_else(
         || observations_from(&decision.context.terminal_execution_trace(), provider),
         |trace| observations_from(trace, provider),
-    )
+    );
+    observations.catalog_ids = Some(decision.context.executable_capability_ids());
+    observations
 }
 
 pub(crate) fn observations_from(
@@ -628,6 +630,7 @@ pub(crate) fn observations_from(
         awaiting_approval_attempts: trace.awaiting_approval_attempts,
         complete: !trace.incomplete && trace.pending_attempts == 0 && trace.unbound_attempts == 0,
         provider,
+        catalog_ids: None,
     }
 }
 

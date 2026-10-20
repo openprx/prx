@@ -18,6 +18,15 @@ fn skill() -> SkillId {
 /// A skill that requires two canonical capability ids and also carries a
 /// `SKILL.toml` tool (`lint`) that is not part of the oracle.
 fn setup() -> (TempDir, SkillLifecycleStore, PinnedSkillRevision) {
+    setup_with(&DECLARED)
+}
+
+const DECLARED: [&str; 2] = [
+    "native_tool:native:deploy_check",
+    "skill:native:skill__deploy-helper__lint",
+];
+
+fn setup_with(requirements: &[&str]) -> (TempDir, SkillLifecycleStore, PinnedSkillRevision) {
     let tmp = TempDir::new().expect("test: tempdir");
     let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
     let toml = "[skill]\nname = \"Deploy helper\"\ndescription = \"Helps with deploys\"\nversion = \"0.1.0\"\n\n\
@@ -28,10 +37,7 @@ fn setup() -> (TempDir, SkillLifecycleStore, PinnedSkillRevision) {
     ])
     .expect("test: bundle");
     let mut new = NewRevision::new(skill(), SourceKind::Operator);
-    new.capability_requirements = vec![
-        "native_tool:native:deploy_check".to_string(),
-        "skill:native:skill__deploy-helper__lint".to_string(),
-    ];
+    new.capability_requirements = requirements.iter().map(ToString::to_string).collect();
     let written = store.write_revision(&new, &bundle).expect("test: write");
     activate(
         &store,
@@ -51,11 +57,19 @@ fn call(id: &str, status: ObservedCallStatus) -> ObservedToolCall {
     }
 }
 
+/// A complete, served run whose turn catalog holds the declared ids and every
+/// id that was called.
 fn clean(calls: Vec<ObservedToolCall>) -> TerminalObservations {
+    let catalog_ids = DECLARED
+        .iter()
+        .map(ToString::to_string)
+        .chain(calls.iter().map(|call| call.capability_id.clone()))
+        .collect();
     TerminalObservations {
         tool_calls: calls,
         complete: true,
         provider: ProviderEnd::Served,
+        catalog_ids: Some(catalog_ids),
         ..TerminalObservations::default()
     }
 }
@@ -363,4 +377,59 @@ fn a_run_that_read_several_skills_attributes_nothing_to_any_of_them() {
     }
     assert!(!facts.failure_attributable_to(&pin.skill_id, &pin.revision_id));
     assert!(!facts.failure_attributable_to(&other, &other_pin.revision_id));
+}
+
+const MCP_DECLARED: &str = "mcp:notes:mcp__notes__search";
+
+#[test]
+fn an_undiscovered_mcp_alias_is_unknown_with_a_diagnostic_never_not_followed() {
+    // The skill declares the discovered form; this turn's catalog only has the
+    // alias that was not discovered (namespace `mcp`).
+    let (tmp, store, pin) = setup_with(&[MCP_DECLARED]);
+    let mut run = clean(Vec::new());
+    run.catalog_ids = Some(std::iter::once("mcp:mcp:mcp__notes__search".to_string()).collect());
+    let facts = terminal_facts(&tmp, &store, &pin, "alias", Some(&run));
+    assert_eq!(facts.adherence_of(&pin.skill_id, &pin.revision_id), Adherence::Unknown);
+    assert_eq!(
+        facts.adherence.first().and_then(|entry| entry.diagnostic.as_deref()),
+        Some("declared id not in catalog: mcp:notes:mcp__notes__search")
+    );
+    assert!(!facts.failure_attributable_to(&pin.skill_id, &pin.revision_id));
+
+    // Once the server is discovered, the same missing call is a real lapse.
+    let (tmp, store, pin) = setup_with(&[MCP_DECLARED]);
+    let mut run = clean(Vec::new());
+    run.catalog_ids = Some(std::iter::once(MCP_DECLARED.to_string()).collect());
+    let facts = terminal_facts(&tmp, &store, &pin, "discovered", Some(&run));
+    assert_eq!(
+        facts.adherence_of(&pin.skill_id, &pin.revision_id),
+        Adherence::NotFollowed
+    );
+}
+
+#[test]
+fn a_declared_id_absent_from_the_turn_catalog_is_unknown_with_a_diagnostic() {
+    let (tmp, store, pin) = setup();
+    let mut run = clean(vec![call(
+        "native_tool:native:deploy_check",
+        ObservedCallStatus::Succeeded,
+    )]);
+    run.catalog_ids = Some(std::iter::once("native_tool:native:deploy_check".to_string()).collect());
+    let facts = terminal_facts(&tmp, &store, &pin, "absent", Some(&run));
+    assert_eq!(facts.adherence_of(&pin.skill_id, &pin.revision_id), Adherence::Unknown);
+    assert_eq!(
+        facts.adherence.first().and_then(|entry| entry.diagnostic.as_deref()),
+        Some("declared id not in catalog: skill:native:skill__deploy-helper__lint")
+    );
+    assert!(facts.adherence.first().is_some_and(|entry| entry.missing.is_empty()));
+
+    // No catalog at all (the runtime could not say): the same.
+    let (tmp, store, pin) = setup();
+    let mut run = clean(vec![call(
+        "native_tool:native:deploy_check",
+        ObservedCallStatus::Succeeded,
+    )]);
+    run.catalog_ids = None;
+    let facts = terminal_facts(&tmp, &store, &pin, "no-catalog", Some(&run));
+    assert_eq!(facts.adherence_of(&pin.skill_id, &pin.revision_id), Adherence::Unknown);
 }

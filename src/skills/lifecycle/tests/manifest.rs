@@ -142,12 +142,17 @@ const B: &str = "mcp:notes:mcp__notes__search";
 
 /// Every form the key does not allow: the real ids of the lifecycle have the
 /// shape `family:namespace:name` with a known family.
-const BAD_LINES: [&str; 12] = [
+const BAD_LINES: [&str; 17] = [
     "required-tools: lint",
     "required-tools: [lint]",
     "required-tools: [deploy_check]",
     "required-tools: [shell:native]",
     "required-tools: [shell:native:]",
+    "required-tools: [shell:native:shell]",
+    "required-tools: [mcp:notes:search]",
+    "required-tools: [mcp:notes:mcp__other__search]",
+    "required-tools: [mcp:mcp:mcp__nosep]",
+    "required-tools: [mcp:notes:mcp__notes__]",
     "required-tools: [shell::shell]",
     "required-tools: [bogus:native:x]",
     "required-tools: [none:native:x]",
@@ -197,9 +202,21 @@ fn a_new_revision_with_a_malformed_required_tools_line_is_refused_with_a_typed_e
             "{line}: {err}"
         );
     }
-    let ok = strict("required-tools: [filesystem:native:shell, filesystem:native:file_read, mcp:notes:mcp__notes__search, skill:native:skill__a__b, native_tool:native:x]")
-        .expect("test: every known shape");
-    assert_eq!(ok.required_tools.len(), 5);
+    // The two ids people guess first are refused, and the error says where the
+    // real ids come from.
+    for wrong in [
+        "required-tools: [shell:native:shell]",
+        "required-tools: [mcp:notes:search]",
+    ] {
+        let err = strict(wrong).expect_err(wrong);
+        assert!(err.to_string().contains("capability_search"), "{wrong}: {err}");
+    }
+    let ok = strict(
+        "required-tools: [filesystem:native:shell, filesystem:native:file_read, mcp:notes:mcp__notes__search, \
+         mcp:mcp:mcp__notes__search, skill:native:skill__a__b, native_tool:native:x]",
+    )
+    .expect("test: every known shape, including the undiscovered MCP alias");
+    assert_eq!(ok.required_tools.len(), 6);
 }
 
 #[test]

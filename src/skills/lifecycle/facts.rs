@@ -65,6 +65,10 @@ pub struct SkillAdherence {
     /// Declared tools that were never called (only for `NotFollowed`).
     #[serde(default)]
     pub missing: Vec<String>,
+    /// Why the verdict is `Unknown` when a declared id is not in the turn's
+    /// capability catalog (`declared id not in catalog: <id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
 }
 
 /// Facts stored with the joined terminal. Every field defaults, so records
@@ -202,6 +206,11 @@ pub struct TerminalObservations {
     /// The trace saw every attempt (nothing pending, unbound or over the bound).
     pub complete: bool,
     pub provider: ProviderEnd,
+    /// Canonical ids of the capabilities the turn could execute (issued or
+    /// admitted for it). `None` when the runtime could not say; a declared id
+    /// that is not in it could not have been called, so a missing call proves
+    /// nothing about the run.
+    pub catalog_ids: Option<std::collections::BTreeSet<String>>,
 }
 
 impl TerminalObservations {
@@ -279,33 +288,76 @@ fn declared_names(capability_requirements: &[String]) -> Vec<String> {
     names
 }
 
+/// Result of judging one revision: the verdict, the declared tools that were
+/// never called (for `NotFollowed`) and a diagnostic for an unverifiable id.
+struct Judgement {
+    verdict: Adherence,
+    missing: Vec<String>,
+    diagnostic: Option<String>,
+}
+
+impl Judgement {
+    const fn unknown() -> Self {
+        Self {
+            verdict: Adherence::Unknown,
+            missing: Vec::new(),
+            diagnostic: None,
+        }
+    }
+}
+
 /// Judges one revision's adherence from what it declares and what was called.
-fn judge(observations: &TerminalObservations, declared: &[String]) -> (Adherence, Vec<String>) {
+fn judge(observations: &TerminalObservations, declared: &[String]) -> Judgement {
     if declared.is_empty() {
-        return (Adherence::Unknown, Vec::new());
+        return Judgement::unknown();
     }
     let mut missing = Vec::new();
+    let mut not_in_catalog = Vec::new();
     let mut blocked = false;
     for name in declared {
         match observations.called(name) {
             Called::Yes => {}
             Called::Blocked => blocked = true,
-            Called::Never => missing.push(name.clone()),
+            Called::Never => {
+                if observations.catalog_ids.as_ref().is_some_and(|ids| ids.contains(name)) {
+                    missing.push(name.clone());
+                } else {
+                    not_in_catalog.push(name.clone());
+                }
+            }
         }
+    }
+    if let Some(first) = not_in_catalog.first() {
+        // A typo, a tool the turn never offered or an undiscovered MCP server
+        // must not turn into a lasting NotFollowed: nothing can be concluded.
+        let diagnostic = format!("declared id not in catalog: {first}");
+        tracing::warn!(declared = %first, "adherence unknown: {diagnostic}");
+        return Judgement {
+            diagnostic: Some(diagnostic),
+            ..Judgement::unknown()
+        };
     }
     if !missing.is_empty() {
         // A call absent from an incomplete trace proves nothing.
         return if observations.complete {
             missing.truncate(MAX_ADHERENCE_NAMES);
-            (Adherence::NotFollowed, missing)
+            Judgement {
+                verdict: Adherence::NotFollowed,
+                missing,
+                diagnostic: None,
+            }
         } else {
-            (Adherence::Unknown, Vec::new())
+            Judgement::unknown()
         };
     }
     if blocked {
-        (Adherence::Unknown, Vec::new())
+        Judgement::unknown()
     } else {
-        (Adherence::Followed, Vec::new())
+        Judgement {
+            verdict: Adherence::Followed,
+            missing: Vec::new(),
+            diagnostic: None,
+        }
     }
 }
 
@@ -333,22 +385,23 @@ pub(super) fn derive(
     let attributable = seen.len() == 1;
     let mut adherence = Vec::with_capacity(seen.len());
     for (skill, revision) in seen {
-        let (verdict, missing) = match store.read_revision(skill, revision, None) {
-            Ok(_) if !attributable => (Adherence::Unknown, Vec::new()),
+        let judgement = match store.read_revision(skill, revision, None) {
+            Ok(_) if !attributable => Judgement::unknown(),
             Ok(verified) => {
                 let declared = declared_names(&verified.revision.capability_requirements);
                 judge(observations, &declared)
             }
             Err(error) => {
                 tracing::warn!(%error, skill = %skill, "adherence unknown: the hydrated revision could not be read");
-                (Adherence::Unknown, Vec::new())
+                Judgement::unknown()
             }
         };
         adherence.push(SkillAdherence {
             skill_id: skill.clone(),
             revision_id: revision.clone(),
-            verdict,
-            missing,
+            verdict: judgement.verdict,
+            missing: judgement.missing,
+            diagnostic: judgement.diagnostic,
         });
     }
     TerminalFacts {

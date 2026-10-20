@@ -111,21 +111,41 @@ fn lenient(
     }
 }
 
-/// Whether `id` is `family:namespace:name`: exactly three non-empty parts and
-/// a capability family PRX knows.
+/// Whether `id` is a canonical capability id the catalog can build:
+/// `family:namespace:name` with a known family, where
+///
+/// * a tool named `shell` is in the `filesystem` family (it is a file-system
+///   tool before it is a shell), and
+/// * an MCP id is `mcp:<server>:mcp__<server>__<tool>`, or
+///   `mcp:mcp:mcp__<server>__<tool>` for an alias not discovered yet.
 fn is_capability_id(id: &str) -> bool {
+    use crate::causal_tree::branch::CapabilityTarget;
     let mut parts = id.split(':');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(family), Some(namespace), Some(name), None) => {
-            !namespace.is_empty()
-                && !name.is_empty()
-                && crate::causal_tree::branch::CapabilityTarget::ALL.iter().any(|known| {
-                    *known != crate::causal_tree::branch::CapabilityTarget::None && known.as_str() == family
-                })
-        }
-        _ => false,
+    let (Some(family), Some(namespace), Some(name), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if namespace.is_empty()
+        || name.is_empty()
+        || !CapabilityTarget::ALL
+            .iter()
+            .any(|known| *known != CapabilityTarget::None && known.as_str() == family)
+    {
+        return false;
     }
+    if family == "mcp" {
+        return name
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split_once("__"))
+            .is_some_and(|(server, tool)| {
+                !server.is_empty() && !tool.is_empty() && (namespace == server || namespace == "mcp")
+            });
+    }
+    name != "shell" || family == "filesystem"
 }
+
+const ID_HELP: &str = "each tool must be a canonical capability id as returned by capability_search (capability.id), \
+                       such as filesystem:native:shell or mcp:notes:mcp__notes__search";
 
 /// Normalises a declared tool list: bounded, plain names, sorted and unique.
 fn checked_tools(items: impl IntoIterator<Item = String>) -> Result<Vec<String>, ManifestError> {
@@ -142,14 +162,10 @@ fn checked_tools(items: impl IntoIterator<Item = String>) -> Result<Vec<String>,
                 .chars()
                 .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
         {
-            return Err(invalid(
-                "each tool must be 1..=128 characters of letters, digits and _ - . :",
-            ));
+            return Err(invalid(ID_HELP));
         }
         if !is_capability_id(&item) {
-            return Err(invalid(
-                "each tool must be a capability id family:namespace:name with a known family",
-            ));
+            return Err(invalid(ID_HELP));
         }
         tools.push(item);
     }

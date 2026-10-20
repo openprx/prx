@@ -1186,6 +1186,26 @@ impl TurnDecisionContext {
         &self.execution_refs
     }
 
+    /// Canonical ids of every capability this turn could execute: the issued
+    /// references and those admitted by discovery. Read-only; the skill
+    /// lifecycle uses it to tell a skipped tool from one that was never there.
+    pub(crate) fn executable_capability_ids(&self) -> BTreeSet<String> {
+        let mut ids: BTreeSet<String> = self
+            .execution_refs
+            .iter()
+            .map(|reference| reference.id.as_str().to_owned())
+            .collect();
+        if let Some(admissions) = self.discovery_admissions.get() {
+            ids.extend(
+                admissions
+                    .lock()
+                    .values()
+                    .map(|admission| admission.reference.id.as_str().to_owned()),
+            );
+        }
+        ids
+    }
+
     /// The selected evidence belongs to the issued turn, not a fresh read.
     /// Decision-stage timeouts do not expire the subsequent provider turn;
     /// closing that turn prevents its evidence from re-entering execution.

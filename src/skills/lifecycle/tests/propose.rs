@@ -107,6 +107,7 @@ fn verified_facts(pin: &PinnedSkillRevision) -> TerminalFacts {
             revision_id: pin.revision_id.clone(),
             verdict: Adherence::Followed,
             missing: Vec::new(),
+            diagnostic: None,
         }],
     }
 }
@@ -1919,6 +1920,7 @@ fn facts_for(pin: &PinnedSkillRevision, infra: FactState, permission: FactState,
             revision_id: pin.revision_id.clone(),
             verdict,
             missing: Vec::new(),
+            diagnostic: None,
         }],
     }
 }
@@ -2043,6 +2045,13 @@ fn run_through_terminal(f: &Fixture, task: &str, observed: &[&str]) -> String {
             .collect(),
         complete: true,
         provider: ProviderEnd::Served,
+        catalog_ids: Some(
+            observed
+                .iter()
+                .map(ToString::to_string)
+                .chain(std::iter::once(DECLARED_TOOL.to_string()))
+                .collect(),
+        ),
         ..TerminalObservations::default()
     };
     on_task_terminal(
@@ -2158,7 +2167,13 @@ mod from_trace {
             .begin("op-1", Some(DECLARED_TOOL), false)
             .finish_with_error(ToolExecutionStatus::Succeeded, None);
         build(&trace);
-        let observations = observations_from(&trace.seal(), outcome);
+        let mut observations = observations_from(&trace.seal(), outcome);
+        observations.catalog_ids = Some(
+            [DECLARED_TOOL, "native_tool:native:other"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        );
         on_task_terminal(
             f.tmp.path(),
             &owner(OWNER),
