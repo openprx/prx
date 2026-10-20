@@ -17,14 +17,13 @@
 //!    ended in a failure terminal and hydrated the *baseline revision* count,
 //!    and at least two distinct root tasks must remain. A pattern's own claim
 //!    (`usable_for_proposal`) is necessary, never sufficient.
-//!    Known gap (hard gate for SL09): the stored experience carries no
-//!    adherence, infrastructure-unavailable or permission-refusal fact, and
-//!    its terminal outcome only distinguishes success, failure, cancelled and
-//!    blocked. Only `Failure` terminals are accepted here; cancelled and
-//!    blocked ones are excluded. Whether a failure was an infrastructure or
-//!    permission problem, or a followed-but-wrong skill, still rests on the
-//!    caller's `FailureFacts`. `propose_revision` must not be wired to a
-//!    service, CLI or scheduler until those facts are captured on the record.
+//!    The stored terminal facts decide the rest (`TerminalFacts`): a failure
+//!    counts as support only when infrastructure and permission refusal are
+//!    positively absent and the skill's declared tools were called
+//!    (`Adherence::Followed`). An unknown fact, an old record, an
+//!    infrastructure or permission failure and an unverified adherence all
+//!    keep the experience out; the refusal names how many were excluded and
+//!    why. Cancelled and blocked terminals are excluded as well.
 //! 3. Rejection suppression is consulted before the call (same patterns, same
 //!    environment, no new evidence) and again on the generated material.
 //! 4. The call goes through [`ProposerModel`] (the managed provider path with
@@ -40,6 +39,7 @@
 
 use super::bundle::Bundle;
 use super::consolidate::{check_text, sorted_unique};
+use super::facts::Exclusion;
 use super::knowledge::{FailureClass, KnowledgePattern, MIN_DISTINCT_TASKS_FOR_PROPOSAL, PatternId};
 use super::manifest::validate_manifest;
 use super::proposal::{
@@ -310,6 +310,26 @@ fn sha256_hex(parts: &[&str]) -> String {
 struct Qualified {
     ids: Vec<String>,
     facts: Vec<super::consolidate::EvidenceFacts>,
+    excluded: Excluded,
+}
+
+/// Failed, eligible experiences of the baseline that were kept out of the
+/// support, by reason.
+#[derive(Default)]
+struct Excluded {
+    infrastructure: usize,
+    permission: usize,
+    unverified: usize,
+}
+
+impl Excluded {
+    fn describe(&self) -> String {
+        format!(
+            "{} excluded for infrastructure being unavailable, {} for a permission refusal, {} for unknown or \
+             unverified facts",
+            self.infrastructure, self.permission, self.unverified
+        )
+    }
 }
 
 impl SkillLifecycleStore {
@@ -324,6 +344,7 @@ impl SkillLifecycleStore {
         let mut qualified = Qualified {
             ids: Vec::new(),
             facts: Vec::new(),
+            excluded: Excluded::default(),
         };
         for id in ids {
             let Some(experience) = self.read_experience_by_id(id)? else {
@@ -340,6 +361,31 @@ impl SkillLifecycleStore {
                     .is_some_and(|terminal| terminal.outcome == ExperienceOutcome::Failure);
             if !experience.learning_eligible() || !hydrated || (must_have_failed && !failed) {
                 continue;
+            }
+            if must_have_failed {
+                // Support must be a failure the guidance can be blamed for:
+                // only positive facts qualify, unknown never does.
+                let exclusion = experience
+                    .terminal
+                    .as_ref()
+                    .map_or(Some(Exclusion::NotVerified), |terminal| {
+                        terminal.facts.exclusion(skill, baseline)
+                    });
+                match exclusion {
+                    None => {}
+                    Some(Exclusion::InfrastructureUnavailable) => {
+                        qualified.excluded.infrastructure += 1;
+                        continue;
+                    }
+                    Some(Exclusion::PermissionRefused) => {
+                        qualified.excluded.permission += 1;
+                        continue;
+                    }
+                    Some(Exclusion::NotVerified) => {
+                        qualified.excluded.unverified += 1;
+                        continue;
+                    }
+                }
             }
             qualified.ids.push(id.clone());
             qualified.facts.push(experience.into());
@@ -393,8 +439,10 @@ impl SkillLifecycleStore {
             let support = self.qualified_evidence(&pattern.evidence_ids, skill, baseline, true)?;
             if support.ids.is_empty() {
                 return Err(refuse(format!(
-                    "pattern {} has no stored failure of {skill} on revision {baseline}",
-                    pattern.pattern_id
+                    "pattern {} has no stored failure of {skill} on revision {baseline} that can be held against its \
+                     guidance ({})",
+                    pattern.pattern_id,
+                    support.excluded.describe()
                 )));
             }
             let refreshed = self.refresh_pattern(&pattern, support.ids.clone())?;
@@ -501,7 +549,9 @@ impl SkillLifecycleStore {
         let basis = ProposalBasis {
             failed_tasks_on_baseline: self.distinct_roots(&support_facts, &pool)?,
             contradicting_tasks: self.distinct_roots(&counter_facts, &pool)?,
-            adherence_verified: false,
+            // Every support fact passed `failure_attributable_to`, which requires
+            // `Adherence::Followed` for this skill and baseline revision.
+            adherence_verified: true,
         };
 
         let skill_md = baseline

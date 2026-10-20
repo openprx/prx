@@ -572,6 +572,64 @@ fn skill_awaiting_approval(
         ) > 0
 }
 
+/// The runtime's terminal observations as the skill lifecycle takes them:
+/// plain values only, no interpretation (the lifecycle derives infrastructure,
+/// permission and adherence facts from them).
+fn skill_observations(
+    decision: &DecisionSettlementRef,
+    trace: Option<&crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
+    provider: Option<&ProviderExecutionOutcome>,
+) -> crate::skills::lifecycle::TerminalObservations {
+    let mut observations = trace.map_or_else(
+        || observations_from(&decision.context.terminal_execution_trace(), provider),
+        |trace| observations_from(trace, provider),
+    );
+    observations.catalog_ids = Some(decision.context.executable_capability_ids());
+    observations
+}
+
+pub(crate) fn observations_from(
+    trace: &crate::tools::capability::execution_trace::ExecutionTraceSnapshot,
+    provider: Option<&ProviderExecutionOutcome>,
+) -> crate::skills::lifecycle::TerminalObservations {
+    use crate::llm::route_decision::ExecutionStatus;
+    use crate::skills::lifecycle::{ObservedCallStatus, ObservedToolCall, ProviderEnd, TerminalObservations};
+    // "Served" needs the execution trace to agree, whatever else reports a
+    // success: every provider call observed and the last attempt a success. A
+    // retained trace of an earlier round (`abort_commit` after a failed later
+    // round) can read as a success while the run ended in an outage.
+    let trace_served = !trace.provider_attempts_incomplete
+        && trace.provider_pending == 0
+        && trace
+            .provider_attempts
+            .as_ref()
+            .and_then(|attempts| attempts.iter().rev().find(|attempt| attempt.status != "skipped"))
+            .is_some_and(|attempt| attempt.status == "success");
+    let provider = match provider.map(|outcome| &outcome.status) {
+        Some(ExecutionStatus::AllFailed { last_error_class }) => ProviderEnd::from_failure_class(last_error_class),
+        Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess) | None if trace_served => ProviderEnd::Served,
+        Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess) | None => ProviderEnd::Unknown,
+    };
+    TerminalObservations {
+        tool_calls: trace
+            .calls
+            .iter()
+            .filter_map(|call| {
+                Some(ObservedToolCall {
+                    capability_id: call.capability_id.clone(),
+                    status: ObservedCallStatus::from_trace_code(&call.status)?,
+                })
+            })
+            .collect(),
+        denied_attempts: trace.denied_attempts,
+        unavailable_attempts: trace.unavailable_attempts.unwrap_or(0),
+        awaiting_approval_attempts: trace.awaiting_approval_attempts,
+        complete: !trace.incomplete && trace.pending_attempts == 0 && trace.unbound_attempts == 0,
+        provider,
+        catalog_ids: None,
+    }
+}
+
 /// Task-terminal call-in of the skill lifecycle (see
 /// `skills::lifecycle::settle_task_terminal`, shared with restart recovery). A
 /// silent turn is not credited and a turn waiting for approval is `Blocked`,
@@ -583,6 +641,7 @@ async fn release_skill_lifecycle(
     terminal_id: &str,
     status: TurnTerminalStatus,
     awaiting_approval: bool,
+    observations: crate::skills::lifecycle::TerminalObservations,
 ) {
     crate::skills::lifecycle::settle_task_terminal(
         workspace_dir,
@@ -590,6 +649,7 @@ async fn release_skill_lifecycle(
         task_key,
         terminal_id,
         status.skill_observation(awaiting_approval, true),
+        Some(observations),
     )
     .await;
 }
@@ -992,6 +1052,11 @@ async fn finalize_turn_impl(
         // (`rejoin_terminal`, `rejoin_ingress_terminal`) reaches the same
         // lifecycle call-in from its own owner with the facts it can verify.
         let awaiting_approval = skill_awaiting_approval(&commit.decision, execution_trace.as_ref());
+        let observations = skill_observations(
+            &commit.decision,
+            execution_trace.as_ref(),
+            commit.provider_outcome.as_ref(),
+        );
         if !awaiting_approval {
             commit.decision.context.retire_recursive_allowance();
         }
@@ -1002,6 +1067,7 @@ async fn finalize_turn_impl(
             &commit.terminal_id,
             commit.status,
             awaiting_approval,
+            observations,
         )
         .await;
         let receipt = TurnTerminalReceipt {
@@ -2653,6 +2719,7 @@ mod tests {
             "silent-term",
             TurnTerminalStatus::Silent,
             false,
+            crate::skills::lifecycle::TerminalObservations::default(),
         )
         .await;
 
@@ -2691,6 +2758,7 @@ mod tests {
             "child-term",
             TurnTerminalStatus::Completed,
             false,
+            crate::skills::lifecycle::TerminalObservations::default(),
         )
         .await;
 
@@ -2703,6 +2771,7 @@ mod tests {
             "parent-term",
             TurnTerminalStatus::Failed,
             false,
+            crate::skills::lifecycle::TerminalObservations::default(),
         )
         .await;
         assert!(!holds_pin(owner, "run-parent", &skill));
@@ -2727,6 +2796,7 @@ mod tests {
             "approval-term",
             TurnTerminalStatus::Completed,
             true,
+            crate::skills::lifecycle::TerminalObservations::default(),
         )
         .await;
 
@@ -2785,5 +2855,123 @@ mod tests {
         task_only.run_id = None;
         assert_eq!(scope_key(&task_only).as_deref(), Some("job-2"));
         assert_eq!(scope_key(&task_only), read_key(&task_only));
+    }
+    /// The runtime trace and provider outcome reach the skill lifecycle as plain
+    /// observations: an unavailable provider, a refused call and the called tools.
+    #[test]
+    fn skill_observations_carry_the_trace_and_provider_facts() {
+        use crate::causal_tree::store::RecordedToolCall;
+        use crate::skills::lifecycle::{ObservedCallStatus, ProviderEnd};
+        use crate::tools::capability::execution_trace::ExecutionTraceSnapshot;
+        let call = |id: &str, status: &str| RecordedToolCall {
+            capability_id: id.to_string(),
+            status: status.to_string(),
+        };
+        let trace = ExecutionTraceSnapshot {
+            calls: vec![
+                call("native_tool:native:deploy_check", "success"),
+                call("filesystem:native:shell", "denied"),
+                call("native_tool:native:odd", "no-such-code"),
+            ],
+            denied_attempts: 1,
+            unavailable_attempts: Some(2),
+            ..ExecutionTraceSnapshot::default()
+        };
+        let down = ProviderExecutionOutcome::failed_for_decision(
+            &RouteDecision::single_candidate("ollama", "prx-local-model"),
+            chrono::Utc::now(),
+            &anyhow::anyhow!("request timed out"),
+        );
+        let seen = observations_from(&trace, Some(&down));
+        assert_eq!(seen.provider, ProviderEnd::Unavailable);
+        assert_eq!(seen.denied_attempts, 1);
+        assert_eq!(seen.unavailable_attempts, 2);
+        assert!(seen.complete);
+        assert_eq!(
+            seen.tool_calls.iter().map(|c| c.status).collect::<Vec<_>>(),
+            vec![ObservedCallStatus::Succeeded, ObservedCallStatus::Denied],
+            "a code the lifecycle does not know is dropped, not guessed"
+        );
+
+        // No outcome and no attempts: unknown, never served. An open trace is incomplete.
+        let open = ExecutionTraceSnapshot {
+            incomplete: true,
+            ..ExecutionTraceSnapshot::default()
+        };
+        let seen = observations_from(&open, None);
+        assert_eq!(seen.provider, ProviderEnd::Unknown);
+        assert!(!seen.complete);
+    }
+    /// `abort_commit` turns the retained trace of an earlier, served round into a
+    /// success outcome even when a later round failed. The execution trace must
+    /// overrule it: the run ended in an outage, not a served answer.
+    #[test]
+    fn a_retained_success_does_not_make_a_later_outage_served() {
+        use crate::agent::turn_contracts::{RetainedProviderTrace, ToolLoopTrace};
+        use crate::llm::route_decision::{AttemptStatus, ProviderAttempt};
+        use crate::skills::lifecycle::ProviderEnd;
+        use crate::tools::capability::execution_trace::ExecutionTrace;
+        let now = chrono::Utc::now();
+        let attempt = ProviderAttempt {
+            seq: 1,
+            provider: "ollama".to_string(),
+            model: "prx-local-model".to_string(),
+            started_at: now,
+            finished_at: now,
+            status: AttemptStatus::Success,
+            error_class: None,
+            error_message: None,
+        };
+        let loop_trace = ToolLoopTrace {
+            final_provider: Some("ollama".to_string()),
+            final_model: Some("prx-local-model".to_string()),
+            attempts: vec![attempt.clone()],
+            ..ToolLoopTrace::default()
+        };
+        let retained = RetainedProviderTrace::default();
+        retained.begin();
+        retained.completed(
+            &loop_trace,
+            crate::llm::route_decision::TokenUsage::default(),
+            false,
+            true,
+        );
+        retained.begin();
+        retained.failed();
+        let (trace, uncertain) = retained.snapshot();
+        assert!(uncertain, "the failed second round is flagged");
+        let outcome = provider_outcome_from_trace(
+            &RouteDecision::single_candidate("ollama", "prx-local-model"),
+            now,
+            trace.expect("test: the first round completed"),
+        );
+        assert!(matches!(
+            outcome.status,
+            crate::llm::route_decision::ExecutionStatus::Success
+                | crate::llm::route_decision::ExecutionStatus::FallbackSuccess
+        ));
+
+        // The execution trace saw round 1 served and round 2 fail without an attempt.
+        let execution = ExecutionTrace::default();
+        execution
+            .begin_provider()
+            .expect("test: begin")
+            .finish(Some(std::slice::from_ref(&attempt)));
+        assert_eq!(
+            observations_from(&execution.seal(), Some(&outcome)).provider,
+            ProviderEnd::Served,
+            "one served round with nothing else is served"
+        );
+        let execution = ExecutionTrace::default();
+        execution
+            .begin_provider()
+            .expect("test: begin")
+            .finish(Some(std::slice::from_ref(&attempt)));
+        execution.begin_provider().expect("test: begin").finish(None);
+        assert_eq!(
+            observations_from(&execution.seal(), Some(&outcome)).provider,
+            ProviderEnd::Unknown,
+            "the outage after the served round is not served"
+        );
     }
 }

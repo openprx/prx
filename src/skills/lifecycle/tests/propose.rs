@@ -6,11 +6,11 @@ use crate::skills::lifecycle::proposal::ProposalStatus as Status;
 use crate::skills::lifecycle::propose::{CallResult, Prepare};
 use crate::skills::lifecycle::proposer_model::TallyCounters;
 use crate::skills::lifecycle::{
-    AttemptOutcome, Bundle, BundleEntry, ConsolidationRequest, Correlation, ExperienceOutcome, FailureClass,
-    KnowledgePattern, LifecycleError, ManagedProviderModel, ModelBinding, ModelCallError, ModelReply, NewRejection,
-    NewRevision, PatternId, PatternScope, PinnedSkillRevision, ProposalFailureKind, ProposalOperation, ProposeOutcome,
-    ProposeRequest, ProposerBudget, ProposerModel, PublishRequest, ReportedUsage, SkillId, SkillLifecycleStore,
-    SourceKind, SuppressionStage, TransactionId, propose_revision,
+    Adherence, AttemptOutcome, Bundle, BundleEntry, ConsolidationRequest, Correlation, ExperienceOutcome, FactState,
+    FailureClass, KnowledgePattern, LifecycleError, ManagedProviderModel, ModelBinding, ModelCallError, ModelReply,
+    NewRejection, NewRevision, PatternId, PatternScope, PinnedSkillRevision, ProposalFailureKind, ProposalOperation,
+    ProposeOutcome, ProposeRequest, ProposerBudget, ProposerModel, PublishRequest, ReportedUsage, SkillAdherence,
+    SkillId, SkillLifecycleStore, SourceKind, SuppressionStage, TerminalFacts, TransactionId, propose_revision,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -24,6 +24,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 const OWNER: &str = "owner:ws:cli:alice";
+const DECLARED_TOOL: &str = "native_tool:native:deploy_check";
 
 fn skill() -> SkillId {
     SkillId::parse("deploy-helper").expect("test: skill id")
@@ -67,9 +68,10 @@ fn fixture_with(skill_md: &str) -> Fixture {
     let tmp = TempDir::new().expect("test: tempdir");
     let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
     let bundle = Bundle::from_entries(baseline_entries(skill_md)).expect("test: bundle");
-    let written = store
-        .write_revision(&NewRevision::new(skill(), SourceKind::Operator), &bundle)
-        .expect("test: write");
+    // The baseline declares one tool, so that following it is checkable.
+    let mut new = NewRevision::new(skill(), SourceKind::Operator);
+    new.capability_requirements = vec![DECLARED_TOOL.to_string()];
+    let written = store.write_revision(&new, &bundle).expect("test: write");
     activate(
         &store,
         &skill(),
@@ -91,10 +93,38 @@ fn fixture() -> Fixture {
 
 /// An experience that hydrated the pinned revision and ended as `outcome`.
 fn experience(f: &Fixture, pin: &PinnedSkillRevision, task: &str, outcome: ExperienceOutcome) -> String {
+    experience_with(f, pin, task, outcome, &verified_facts(pin))
+}
+
+/// Facts that hold a failure against the guidance: no infrastructure or
+/// permission cause, and the pinned revision's declared tool was called.
+fn verified_facts(pin: &PinnedSkillRevision) -> TerminalFacts {
+    TerminalFacts {
+        infrastructure_unavailable: FactState::Absent,
+        permission_refused: FactState::Absent,
+        adherence: vec![SkillAdherence {
+            skill_id: pin.skill_id.clone(),
+            revision_id: pin.revision_id.clone(),
+            verdict: Adherence::Followed,
+            missing: Vec::new(),
+            diagnostic: None,
+        }],
+    }
+}
+
+fn experience_with(
+    f: &Fixture,
+    pin: &PinnedSkillRevision,
+    task: &str,
+    outcome: ExperienceOutcome,
+    facts: &TerminalFacts,
+) -> String {
     f.store
         .record_hydration(task, pin, "SKILL.md", b"x", &Correlation::default())
         .expect("test: hydrate");
-    f.store.join_terminal(task, "term", outcome).expect("test: join");
+    f.store
+        .join_terminal_with(task, "term", outcome, facts)
+        .expect("test: join");
     crate::skills::lifecycle::experience_id(f.store.owner_scope(), task)
 }
 
@@ -107,7 +137,7 @@ fn consolidate(f: &Fixture, statement: &str, class: FailureClass, evidence: &[&S
         .consolidate_pattern(&ConsolidationRequest {
             task_family: "deploy".to_string(),
             failure_class: class,
-            skill_id: Some(skill()),
+            skill_id: Some(f.pin.skill_id.clone()),
             scope: PatternScope {
                 environment: "local".to_string(),
                 capabilities: vec!["shell".to_string()],
@@ -140,7 +170,7 @@ fn budget() -> ProposerBudget {
 fn request(id: &str, patterns: &[&KnowledgePattern]) -> ProposeRequest {
     ProposeRequest {
         request_id: id.to_string(),
-        skill_id: skill(),
+        skill_id: patterns.first().and_then(|p| p.skill_id.clone()).unwrap_or_else(skill),
         pattern_ids: patterns.iter().map(|p| p.pattern_id.clone()).collect(),
         budget: budget(),
     }
@@ -313,7 +343,10 @@ async fn a_bounded_candidate_is_staged_and_nothing_is_activated() {
     assert_eq!(proposal.pattern_ids, vec![pattern.pattern_id.clone()]);
     assert_eq!(proposal.evidence_ids.len(), 2);
     assert_eq!(proposal.basis.failed_tasks_on_baseline, 2);
-    assert!(!proposal.basis.adherence_verified);
+    assert!(
+        proposal.basis.adherence_verified,
+        "every support fact is a verified-adherence failure"
+    );
     assert_eq!(proposal.expected_generation, before.generation);
     assert_eq!(proposal.baseline_revision, before.revision_id);
     let diff = proposal.diff.as_ref().expect("test: diff");
@@ -1876,4 +1909,409 @@ async fn the_source_review_recomputes_the_edit_budget() {
         "{:?}",
         outcome.record.findings
     );
+}
+
+fn facts_for(pin: &PinnedSkillRevision, infra: FactState, permission: FactState, verdict: Adherence) -> TerminalFacts {
+    TerminalFacts {
+        infrastructure_unavailable: infra,
+        permission_refused: permission,
+        adherence: vec![SkillAdherence {
+            skill_id: pin.skill_id.clone(),
+            revision_id: pin.revision_id.clone(),
+            verdict,
+            missing: Vec::new(),
+            diagnostic: None,
+        }],
+    }
+}
+
+/// Two failed tasks with `facts` back a pattern; the proposal must be refused
+/// before any model call.
+async fn refused_for(facts: &TerminalFacts, second: Option<&TerminalFacts>) -> String {
+    let f = fixture();
+    let a = experience_with(&f, &f.pin, "fact-1", ExperienceOutcome::Failure, facts);
+    let b = experience_with(
+        &f,
+        &f.pin,
+        "fact-2",
+        ExperienceOutcome::Failure,
+        second.unwrap_or(facts),
+    );
+    let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
+    let model = ScriptedModel::replying(&good_patch());
+    let err = propose_revision(
+        Arc::clone(&f.store),
+        request("facts", &[&pattern]),
+        &model,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("test: the facts must keep the proposal out");
+    assert!(matches!(err, LifecycleError::ProposalRefused(_)), "{err}");
+    assert_eq!(model.calls(), 0, "refused before any model call");
+    assert!(
+        f.store.list_proposals().expect("test: list").is_empty(),
+        "nothing was recorded"
+    );
+    err.to_string()
+}
+
+#[tokio::test]
+async fn failures_caused_by_infrastructure_or_a_permission_refusal_are_not_evidence() {
+    let ok = |pin: &PinnedSkillRevision| verified_facts(pin);
+    let pin = fixture().pin;
+
+    let infra = facts_for(&pin, FactState::Present, FactState::Absent, Adherence::Followed);
+    let message = refused_for(&infra, None).await;
+    assert!(message.contains("2 excluded for infrastructure"), "{message}");
+
+    let denied = facts_for(&pin, FactState::Absent, FactState::Present, Adherence::Followed);
+    let message = refused_for(&denied, None).await;
+    assert!(message.contains("2 for a permission refusal"), "{message}");
+
+    // One honest failure is not enough once the other is excluded.
+    let message = refused_for(&ok(&pin), Some(&infra)).await;
+    assert!(message.contains("rests on 1 failed task"), "{message}");
+}
+
+#[tokio::test]
+async fn unverified_adherence_or_unknown_facts_keep_a_proposal_out() {
+    let pin = fixture().pin;
+    for facts in [
+        facts_for(&pin, FactState::Absent, FactState::Absent, Adherence::Unknown),
+        facts_for(&pin, FactState::Absent, FactState::Absent, Adherence::NotFollowed),
+        facts_for(&pin, FactState::Unknown, FactState::Absent, Adherence::Followed),
+        facts_for(&pin, FactState::Absent, FactState::Unknown, Adherence::Followed),
+        // The adherence entry is for another revision of the skill.
+        TerminalFacts {
+            adherence: Vec::new(),
+            ..facts_for(&pin, FactState::Absent, FactState::Absent, Adherence::Followed)
+        },
+        // A record written before the facts existed.
+        TerminalFacts::default(),
+    ] {
+        let message = refused_for(&facts, None).await;
+        assert!(message.contains("2 for unknown or unverified facts"), "{message}");
+    }
+}
+
+/// A fixture whose baseline came in through the legacy import, from a real
+/// `SKILL.md` that does (or does not) carry `required-tools`.
+fn imported(required: Option<&str>) -> Fixture {
+    let tmp = TempDir::new().expect("test: tempdir");
+    let dir = tmp.path().join("skills/deploy-helper");
+    fs::create_dir_all(&dir).expect("test: mkdir");
+    let mut text = skill_md_with(20);
+    if let Some(list) = required {
+        text = text.replacen(
+            "description: Helps with deploys\n",
+            &format!("description: Helps with deploys\nrequired-tools: {list}\n"),
+            1,
+        );
+    }
+    fs::write(dir.join("SKILL.md"), text).expect("test: write");
+    let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
+    let plan = crate::skills::lifecycle::plan_migration(tmp.path(), Some(&store)).expect("test: plan");
+    let report = crate::skills::lifecycle::apply_migration(&store, tmp.path(), &plan);
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    let (imported_id, _) = report.imported.first().expect("test: one skill imported");
+    let pin = store
+        .pin_active(imported_id)
+        .expect("test: pin")
+        .expect("test: imported");
+    Fixture {
+        tmp,
+        store: Arc::new(store),
+        pin,
+    }
+}
+
+/// A failed run through the production terminal call-in: the skill is read,
+/// `observed` tools are called, the run ends clean.
+fn run_through_terminal(f: &Fixture, task: &str, observed: &[&str]) -> String {
+    use crate::skills::lifecycle::{
+        ObservedCallStatus, ObservedToolCall, ProviderEnd, TaskTerminal, TerminalObservations, on_task_terminal,
+    };
+    f.store
+        .record_hydration(task, &f.pin, "SKILL.md", b"x", &Correlation::default())
+        .expect("test: hydrate");
+    let observations = TerminalObservations {
+        tool_calls: observed
+            .iter()
+            .map(|name| ObservedToolCall {
+                capability_id: (*name).to_string(),
+                status: ObservedCallStatus::Succeeded,
+            })
+            .collect(),
+        complete: true,
+        provider: ProviderEnd::Served,
+        catalog_ids: Some(
+            observed
+                .iter()
+                .map(ToString::to_string)
+                .chain(std::iter::once(DECLARED_TOOL.to_string()))
+                .collect(),
+        ),
+        ..TerminalObservations::default()
+    };
+    on_task_terminal(
+        f.tmp.path(),
+        &owner(OWNER),
+        &TaskTerminal {
+            task_id: task,
+            terminal_receipt_id: "term",
+            outcome: ExperienceOutcome::Failure,
+            observations: Some(&observations),
+        },
+    )
+    .expect("test: terminal");
+    crate::skills::lifecycle::experience_id(f.store.owner_scope(), task)
+}
+
+#[tokio::test]
+async fn an_imported_skill_with_required_tools_qualifies_through_the_whole_chain() {
+    let f = imported(Some("[native_tool:native:deploy_check]"));
+    let baseline = f
+        .store
+        .read_revision(&f.pin.skill_id, &f.pin.revision_id, None)
+        .expect("test: baseline");
+    assert_eq!(
+        baseline.revision.capability_requirements,
+        vec![DECLARED_TOOL.to_string()],
+        "the import filled the requirements from the frontmatter"
+    );
+    let a = run_through_terminal(&f, "chain-1", &[DECLARED_TOOL]);
+    let b = run_through_terminal(&f, "chain-2", &[DECLARED_TOOL]);
+    let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
+    let model = ScriptedModel::replying(&good_patch());
+    let ProposeOutcome::Staged(proposal) = run(&f, &model, request("chain", &[&pattern])).await else {
+        panic!("test: expected a staged proposal");
+    };
+    assert!(proposal.basis.adherence_verified);
+    assert_eq!(proposal.basis.failed_tasks_on_baseline, 2);
+}
+
+#[tokio::test]
+async fn failures_that_skipped_the_required_tool_or_come_from_undeclaring_skills_never_qualify() {
+    // Declared, but the runs never called the tool: not followed.
+    let f = imported(Some("[native_tool:native:deploy_check]"));
+    let a = run_through_terminal(&f, "skip-1", &["native_tool:native:other"]);
+    let b = run_through_terminal(&f, "skip-2", &["native_tool:native:other"]);
+    let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
+    let model = ScriptedModel::replying(&good_patch());
+    let err = propose_revision(
+        Arc::clone(&f.store),
+        request("skip", &[&pattern]),
+        &model,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("test: not followed");
+    assert!(err.to_string().contains("2 for unknown or unverified facts"), "{err}");
+
+    // Nothing declared: adherence stays unknown, whatever was called.
+    let f = imported(None);
+    let a = run_through_terminal(&f, "bare-1", &[DECLARED_TOOL]);
+    let b = run_through_terminal(&f, "bare-2", &[DECLARED_TOOL]);
+    let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
+    let err = propose_revision(
+        Arc::clone(&f.store),
+        request("bare", &[&pattern]),
+        &model,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("test: undeclared");
+    assert!(err.to_string().contains("2 for unknown or unverified facts"), "{err}");
+    assert_eq!(model.calls(), 0);
+}
+
+// ---- the production mapping, from the runtime trace to the proposal ---------------------
+
+mod from_trace {
+    use super::*;
+    use crate::agent::terminal::observations_from;
+    use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, ProviderExecutionOutcome, RouteDecision};
+    use crate::skills::lifecycle::{TaskTerminal, on_task_terminal};
+    use crate::tools::capability::execution_trace::ExecutionTrace;
+    use crate::tools::execution::ToolExecutionStatus;
+
+    fn attempt() -> ProviderAttempt {
+        let now = chrono::Utc::now();
+        ProviderAttempt {
+            seq: 1,
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            started_at: now,
+            finished_at: now,
+            status: AttemptStatus::Success,
+            error_class: None,
+            error_message: None,
+        }
+    }
+
+    /// Runs one failed task: `build` drives the real `ExecutionTrace` (provider
+    /// rounds and tool calls), the seal goes through the terminal's mapping and
+    /// the production call-in.
+    fn task(
+        f: &Fixture,
+        name: &str,
+        build: &dyn Fn(&ExecutionTrace),
+        outcome: Option<&ProviderExecutionOutcome>,
+    ) -> String {
+        f.store
+            .record_hydration(name, &f.pin, "SKILL.md", b"x", &Correlation::default())
+            .expect("test: hydrate");
+        let trace = ExecutionTrace::default();
+        trace
+            .begin("op-1", Some(DECLARED_TOOL), false)
+            .finish_with_error(ToolExecutionStatus::Succeeded, None);
+        build(&trace);
+        let mut observations = observations_from(&trace.seal(), outcome);
+        observations.catalog_ids = Some(
+            [DECLARED_TOOL, "native_tool:native:other"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        );
+        on_task_terminal(
+            f.tmp.path(),
+            &owner(OWNER),
+            &TaskTerminal {
+                task_id: name,
+                terminal_receipt_id: "term",
+                outcome: ExperienceOutcome::Failure,
+                observations: Some(&observations),
+            },
+        )
+        .expect("test: terminal");
+        crate::skills::lifecycle::experience_id(f.store.owner_scope(), name)
+    }
+
+    async fn outcome_of(
+        label: &str,
+        build: &dyn Fn(&ExecutionTrace),
+        outcome: Option<&ProviderExecutionOutcome>,
+    ) -> Result<ProposeOutcome, LifecycleError> {
+        let f = imported(Some("[native_tool:native:deploy_check]"));
+        let a = task(&f, &format!("{label}-1"), build, outcome);
+        let b = task(&f, &format!("{label}-2"), build, outcome);
+        let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
+        let model = ScriptedModel::replying(&good_patch());
+        propose_revision(
+            Arc::clone(&f.store),
+            request(label, &[&pattern]),
+            &model,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    fn served(trace: &ExecutionTrace) {
+        let a = attempt();
+        trace
+            .begin_provider()
+            .expect("test: begin")
+            .finish(Some(std::slice::from_ref(&a)));
+    }
+
+    #[tokio::test]
+    async fn a_served_round_with_the_required_tool_called_qualifies_without_a_settled_outcome() {
+        let staged = outcome_of("served", &served, None).await.expect("test: proposal");
+        assert!(matches!(staged, ProposeOutcome::Staged(_)));
+    }
+
+    #[tokio::test]
+    async fn an_outage_after_a_served_round_is_not_read_as_served() {
+        // Round 1 succeeded; round 2 failed without an attempt record.
+        let outage = |trace: &ExecutionTrace| {
+            served(trace);
+            trace.begin_provider().expect("test: begin").finish(None);
+        };
+        let err = outcome_of("outage", &outage, None).await.expect_err("test: outage");
+        assert!(err.to_string().contains("2 for unknown or unverified facts"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_for_decision_outcome_is_infrastructure_only_when_its_class_says_so() {
+        let decision = RouteDecision::single_candidate("ollama", "prx-local-model");
+        let failed = |message: &str| {
+            ProviderExecutionOutcome::failed_for_decision(&decision, chrono::Utc::now(), &anyhow::anyhow!("{message}"))
+        };
+        // A timeout is an unavailable provider.
+        let err = outcome_of("timeout", &served, Some(&failed("request timed out")))
+            .await
+            .expect_err("test: timeout");
+        assert!(err.to_string().contains("2 excluded for infrastructure"), "{err}");
+        // Any other agent error carries the catch-all label: unknown, not infrastructure.
+        let err = outcome_of("generic", &served, Some(&failed("max iterations reached")))
+            .await
+            .expect_err("test: generic");
+        assert!(err.to_string().contains("2 for unknown or unverified facts"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_backend_failure_in_a_tool_call_excludes_the_run_but_a_bad_argument_does_not() {
+        let backend = |trace: &ExecutionTrace| {
+            served(trace);
+            trace
+                .begin("op-2", Some("native_tool:native:other"), false)
+                .finish_with_error(
+                    ToolExecutionStatus::Failed,
+                    Some("error sending request: connection refused"),
+                );
+        };
+        let err = outcome_of("backend", &backend, None).await.expect_err("test: backend");
+        assert!(err.to_string().contains("2 excluded for infrastructure"), "{err}");
+        let bad_args = |trace: &ExecutionTrace| {
+            served(trace);
+            trace
+                .begin("op-2", Some("native_tool:native:other"), false)
+                .finish_with_error(ToolExecutionStatus::InvalidArguments, Some("missing field `path`"));
+        };
+        let staged = outcome_of("args", &bad_args, None).await.expect("test: proposal");
+        assert!(matches!(staged, ProposeOutcome::Staged(_)));
+    }
+    #[tokio::test]
+    async fn a_retained_trace_success_on_a_failed_terminal_is_not_read_as_served() {
+        use crate::agent::turn_contracts::{RetainedProviderTrace, ToolLoopTrace};
+        // What `abort_commit` does: round 1 completed, round 2 failed, and the
+        // retained trace of round 1 becomes a success outcome.
+        let loop_trace = ToolLoopTrace {
+            final_provider: Some("p".to_string()),
+            final_model: Some("m".to_string()),
+            attempts: vec![attempt()],
+            ..ToolLoopTrace::default()
+        };
+        let retained = RetainedProviderTrace::default();
+        retained.begin();
+        retained.completed(
+            &loop_trace,
+            crate::llm::route_decision::TokenUsage::default(),
+            false,
+            true,
+        );
+        retained.begin();
+        retained.failed();
+        let (trace, uncertain) = retained.snapshot();
+        assert!(uncertain);
+        let outcome = crate::agent::terminal::provider_outcome_from_trace(
+            &RouteDecision::single_candidate("p", "m"),
+            chrono::Utc::now(),
+            trace.expect("test: round 1 completed"),
+        );
+        let outage = |trace: &ExecutionTrace| {
+            served(trace);
+            trace.begin_provider().expect("test: begin").finish(None);
+        };
+        let err = outcome_of("retained", &outage, Some(&outcome))
+            .await
+            .expect_err("test: an outage after a served round");
+        assert!(err.to_string().contains("2 for unknown or unverified facts"), "{err}");
+        // The same outcome with a trace that agrees is served and qualifies.
+        let staged = outcome_of("retained-ok", &served, Some(&outcome))
+            .await
+            .expect("test: proposal");
+        assert!(matches!(staged, ProposeOutcome::Staged(_)));
+    }
 }

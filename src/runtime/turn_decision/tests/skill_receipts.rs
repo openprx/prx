@@ -506,3 +506,26 @@ async fn rejoin_never_creates_a_store_or_an_experience() {
     );
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
 }
+
+#[test]
+fn an_admission_waiting_for_approval_is_not_an_executable_capability_id() {
+    use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, CatalogGeneration, SchemaFingerprint};
+    let admission = |name: &str, requires_approval: bool| {
+        (
+            name.to_owned(),
+            discovery::DiscoveryAdmission {
+                reference: CapabilityRef {
+                    id: CapabilityId::new(CapabilityTarget::NativeTool, "native", name).expect("test: id"),
+                    fingerprint: SchemaFingerprint([0; 32]),
+                    generation: CatalogGeneration([0; 32]),
+                },
+                requires_approval,
+            },
+        )
+    };
+    let admissions = BTreeMap::from([admission("free_tool", false), admission("gated_tool", true)]);
+    assert_eq!(
+        unprompted_admission_ids(&admissions).collect::<Vec<_>>(),
+        vec!["native_tool:native:free_tool".to_owned()]
+    );
+}

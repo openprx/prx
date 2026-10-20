@@ -42,8 +42,56 @@ pub(crate) struct ExecutionTraceSnapshot {
     pub(crate) denied_attempts: u64,
     #[serde(default)]
     pub(crate) awaiting_approval_attempts: u64,
+    /// Failed attempts whose cause was an unavailable backend (also counted in
+    /// `failed_attempts`); argument and validation failures are not. Absent
+    /// when none, so older sealed payloads serialise unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unavailable_attempts: Option<u64>,
     pub(crate) unbound_attempts: u64,
     pub(crate) incomplete: bool,
+}
+
+/// HTTP statuses that mean the upstream could not serve the call (matched as
+/// whole tokens, never as digits inside other text).
+const UNAVAILABLE_STATUS_TOKENS: [&str; 6] = ["500", "502", "503", "504", "429", "529"];
+const UNAVAILABLE_PHRASES: [&str; 14] = [
+    "connection refused",
+    "connection reset",
+    "connection closed",
+    "connection error",
+    "timed out",
+    "timeout",
+    "unreachable",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "broken pipe",
+    "overloaded",
+    "dns error",
+    "no route to host",
+];
+const OTHER_UNAVAILABLE_PHRASES: [&str; 2] = ["os error 111", "error sending request"];
+
+/// Whether a tool failure says its backend could not be reached or served:
+/// connection, timeout, rate limit, overload or an upstream 5xx. The text is
+/// the error with its source chain (`{:#}`).
+///
+/// Documented limit: a tool that returns an upstream failure as a successful
+/// result is invisible here; a typed error kind is the later fix.
+fn backend_unavailable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    UNAVAILABLE_PHRASES
+        .iter()
+        .chain(&OTHER_UNAVAILABLE_PHRASES)
+        .any(|marker| error.contains(marker))
+        || error
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| UNAVAILABLE_STATUS_TOKENS.contains(&token))
+}
+
+/// The MCP allow/deny refusal is a policy denial, not a failed backend.
+fn mcp_policy_denial(error: &str) -> bool {
+    error.contains("is blocked by allow/deny rules for MCP server")
 }
 
 #[derive(Debug, Default)]
@@ -64,6 +112,10 @@ struct State {
     pending_attempts: u64,
     denied_attempts: u64,
     awaiting_approval_attempts: u64,
+    unavailable_attempts: u64,
+    /// Error text with its source chain, by operation id, for the classifier
+    /// only (never persisted or returned).
+    error_details: BTreeMap<String, String>,
     unbound_attempts: u64,
     incomplete: bool,
     sealed: Option<ExecutionTraceSnapshot>,
@@ -80,6 +132,7 @@ impl Eq for ExecutionTrace {}
 
 pub(crate) struct PendingExecution {
     trace: ExecutionTrace,
+    key: String,
     operation_id: Option<String>,
     active: bool,
     selected: bool,
@@ -155,7 +208,12 @@ impl ExecutionTrace {
         self.0.lock().sealed.is_some()
     }
 
-    pub(crate) fn begin(&self, operation_id: &str, capability_id: Option<&str>, selected: bool) -> PendingExecution {
+    pub(crate) fn begin(
+        &self,
+        raw_operation_id: &str,
+        capability_id: Option<&str>,
+        selected: bool,
+    ) -> PendingExecution {
         let mut state = self.0.lock();
         let active = state.sealed.is_none();
         if active {
@@ -165,18 +223,18 @@ impl ExecutionTrace {
         let operation_id = if !active {
             None
         } else if let Some(id) = capability_id {
-            if state.calls.len() >= MAX_CALLS || state.calls.contains_key(operation_id) {
+            if state.calls.len() >= MAX_CALLS || state.calls.contains_key(raw_operation_id) {
                 state.incomplete = true;
                 None
             } else {
                 state.calls.insert(
-                    operation_id.to_owned(),
+                    raw_operation_id.to_owned(),
                     RecordedToolCall {
                         capability_id: id.to_owned(),
                         status: "pending".to_owned(),
                     },
                 );
-                Some(operation_id.to_owned())
+                Some(raw_operation_id.to_owned())
             }
         } else {
             state.unbound_attempts = state.unbound_attempts.saturating_add(1);
@@ -184,9 +242,20 @@ impl ExecutionTrace {
         };
         PendingExecution {
             trace: self.clone(),
+            key: raw_operation_id.to_owned(),
             operation_id,
             active,
             selected: selected && capability_id.is_some(),
+        }
+    }
+
+    /// Remembers the full error text (source chain included) of the operation
+    /// `operation_id` so that its failure can be classified. Content-free
+    /// output is unchanged: the text is used by the classifier and dropped.
+    pub(crate) fn note_error_detail(&self, operation_id: &str, detail: String) {
+        let mut state = self.0.lock();
+        if state.sealed.is_none() && state.error_details.len() < MAX_CALLS {
+            state.error_details.insert(operation_id.to_owned(), detail);
         }
     }
 
@@ -231,6 +300,7 @@ impl ExecutionTrace {
             pending_attempts: state.pending_attempts,
             denied_attempts: state.denied_attempts,
             awaiting_approval_attempts: state.awaiting_approval_attempts,
+            unavailable_attempts: (state.unavailable_attempts > 0).then_some(state.unavailable_attempts),
             unbound_attempts: state.unbound_attempts,
             incomplete,
         };
@@ -320,16 +390,28 @@ impl Drop for PendingProvider {
 }
 
 impl PendingExecution {
-    pub(crate) fn finish(mut self, status: ToolExecutionStatus) {
-        self.record(status);
+    pub(crate) fn finish(self, status: ToolExecutionStatus) {
+        self.finish_with_error(status, None);
+    }
+    /// Like [`Self::finish`], with the failure text so an unavailable backend
+    /// can be told from an argument or validation failure.
+    pub(crate) fn finish_with_error(mut self, status: ToolExecutionStatus, error: Option<&str>) {
+        self.record(status, error);
         self.active = false;
     }
-    fn record(&self, status: ToolExecutionStatus) {
+    fn record(&self, status: ToolExecutionStatus, error: Option<&str>) {
         let mut state = self.trace.0.lock();
         if state.sealed.is_some() {
             return;
         }
         state.pending_attempts = state.pending_attempts.saturating_sub(1);
+        let detail = state.error_details.remove(&self.key);
+        let texts = || error.into_iter().chain(detail.as_deref());
+        let status = if status == ToolExecutionStatus::Failed && texts().any(mcp_policy_denial) {
+            ToolExecutionStatus::Denied
+        } else {
+            status
+        };
         let code = match status {
             ToolExecutionStatus::Succeeded => {
                 state.successful_attempts = state.successful_attempts.saturating_add(1);
@@ -356,6 +438,9 @@ impl PendingExecution {
             }
             _ => {
                 state.failed_attempts = state.failed_attempts.saturating_add(1);
+                if status == ToolExecutionStatus::Indeterminate || texts().any(backend_unavailable) {
+                    state.unavailable_attempts = state.unavailable_attempts.saturating_add(1);
+                }
                 "failed"
             }
         };
@@ -367,7 +452,7 @@ impl PendingExecution {
 impl Drop for PendingExecution {
     fn drop(&mut self) {
         if self.active {
-            self.record(ToolExecutionStatus::Cancelled);
+            self.record(ToolExecutionStatus::Cancelled, None);
         }
     }
 }
@@ -577,5 +662,124 @@ mod silent_tests {
         drop(trace.begin_provider().expect("begin"));
         assert!(trace.record_authorized_silence().is_err());
         assert!(trace.seal().provider_attempts_incomplete);
+    }
+
+    /// A tool failure caused by an unavailable backend is counted apart from an
+    /// argument or validation failure; both stay `failed` calls.
+    #[test]
+    fn unavailable_backends_are_distinct_from_argument_failures() {
+        let unavailable = [
+            "connection refused (os error 111)",
+            "upstream returned 503 Service Unavailable",
+            "HTTP 500 from upstream",
+            "status: 429",
+            "status 529 overloaded_error",
+            "the model is overloaded",
+            "request timed out after 30s",
+            "dns error: failed to lookup address",
+            "No route to host",
+            "tcp connect error: os error 111",
+            "error sending request for url (http://x)",
+            "bad gateway",
+            "gateway timeout",
+            "connection reset by peer",
+        ];
+        let trace = ExecutionTrace::default();
+        for (index, text) in unavailable.iter().enumerate() {
+            trace
+                .begin(&format!("u{index}"), Some("native:local:probe"), false)
+                .finish_with_error(ToolExecutionStatus::Failed, Some(text));
+        }
+        trace.begin("ind", Some("native:local:probe"), false).finish_with_error(
+            ToolExecutionStatus::Indeterminate,
+            Some("durable ledger is unavailable"),
+        );
+        // The run's own errors are not infrastructure, including digits and
+        // MCP wording that only look alike.
+        let own = [
+            "missing field `path`",
+            "validation failed: path must be relative",
+            "wrote 5003 bytes to file1500.txt",
+            "line 5029: unexpected token",
+            "the MCP server 'notes' has no tool named x",
+            "no such tool",
+        ];
+        for (index, text) in own.iter().enumerate() {
+            trace
+                .begin(&format!("o{index}"), Some("native:local:probe"), false)
+                .finish_with_error(ToolExecutionStatus::Failed, Some(text));
+        }
+        trace
+            .begin("args", Some("native:local:probe"), false)
+            .finish_with_error(ToolExecutionStatus::InvalidArguments, Some("bad"));
+        trace
+            .begin("none", Some("native:local:probe"), false)
+            .finish_with_error(ToolExecutionStatus::Failed, None);
+        let snapshot = trace.seal();
+        assert_eq!(snapshot.unavailable_attempts, Some(unavailable.len() as u64 + 1));
+        assert_eq!(
+            snapshot.failed_attempts,
+            (unavailable.len() + own.len() + 3) as u64,
+            "unavailable failures are failures too"
+        );
+        assert!(snapshot.calls.iter().all(|call| call.status == "failed"));
+        // A snapshot without the counter serialises exactly as before.
+        let clean = ExecutionTrace::default().seal();
+        let value = serde_json::to_value(&clean).expect("test: serialise");
+        assert!(value.get("unavailable_attempts").is_none());
+    }
+
+    /// The MCP allow/deny refusal is a policy denial, so it never counts as an
+    /// unavailable server and shows up as a refused call.
+    #[test]
+    fn an_mcp_allow_deny_refusal_is_a_denial() {
+        let trace = ExecutionTrace::default();
+        trace.begin("mcp", Some("mcp:notes:write"), false).finish_with_error(
+            ToolExecutionStatus::Failed,
+            Some("Tool 'write' is blocked by allow/deny rules for MCP server 'notes'"),
+        );
+        let snapshot = trace.seal();
+        assert_eq!(snapshot.denied_attempts, 1);
+        assert_eq!(snapshot.failed_attempts, 0);
+        assert_eq!(snapshot.unavailable_attempts, None);
+        assert_eq!(snapshot.calls.first().map(|call| call.status.as_str()), Some("denied"));
+    }
+
+    /// A provider failure that records no attempt after a served round leaves
+    /// the trace incomplete: the earlier success must not stand for the run.
+    #[test]
+    fn a_provider_outage_after_a_served_round_leaves_the_trace_incomplete() {
+        let served = outcome();
+        let attempt = served.attempts.last().expect("test: attempt");
+        let trace = ExecutionTrace::default();
+        trace
+            .begin_provider()
+            .expect("test: begin")
+            .finish(Some(std::slice::from_ref(attempt)));
+        trace.begin_provider().expect("test: begin").finish(None);
+        let snapshot = trace.seal();
+        assert!(snapshot.provider_attempts_incomplete);
+        let seen = crate::agent::terminal::observations_from(&snapshot, None);
+        assert_eq!(seen.provider, crate::skills::lifecycle::ProviderEnd::Unknown);
+    }
+    /// The source chain is classified through a side channel and never becomes
+    /// part of the snapshot: only the counters change.
+    #[test]
+    fn the_error_chain_is_classified_without_being_kept() {
+        let trace = ExecutionTrace::default();
+        trace.note_error_detail(
+            "chained",
+            "http_request failed: error sending request: connection refused".to_string(),
+        );
+        trace
+            .begin("chained", Some("native_tool:native:http"), false)
+            .finish_with_error(ToolExecutionStatus::Failed, Some("http_request failed"));
+        trace
+            .begin("plain", Some("native_tool:native:http"), false)
+            .finish_with_error(ToolExecutionStatus::Failed, Some("http_request failed"));
+        let snapshot = trace.seal();
+        assert_eq!(snapshot.unavailable_attempts, Some(1));
+        let text = serde_json::to_string(&snapshot).expect("test: serialise");
+        assert!(!text.contains("connection refused"));
     }
 }

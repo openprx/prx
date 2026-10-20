@@ -8,6 +8,10 @@ const SKILL_MD: &str = "SKILL.md";
 const SKILL_TOML: &str = "SKILL.toml";
 const MAX_NAME_BYTES: usize = 128;
 const MAX_VERSION_BYTES: usize = 64;
+/// Frontmatter key (and `[skill]` key of `SKILL.toml`) listing the tools a run
+/// must call to have followed the skill: the adherence oracle of the lifecycle.
+pub const REQUIRED_TOOLS_KEY: &str = "required-tools";
+const MAX_REQUIRED_TOOLS: usize = 16;
 
 #[derive(Debug, Error)]
 pub enum ManifestError {
@@ -41,30 +45,170 @@ pub struct ManifestInfo {
     pub name: String,
     pub description: String,
     pub semantic_version: Option<String>,
+    /// Sorted, unique `required-tools`; empty when the skill declares none.
+    pub required_tools: Vec<String>,
 }
 
+/// Validates a stored or incoming bundle. A `required-tools` declaration in a
+/// form the key does not allow reads as undeclared (and is logged), so a
+/// revision stored before the key existed stays readable.
 pub fn validate_manifest(bundle: &Bundle) -> Result<ManifestInfo, ManifestError> {
+    validate(bundle, false)
+}
+
+/// Validation for a revision about to be written by an operator or an import:
+/// a malformed, repeated or mis-shaped `required-tools` declaration is refused.
+pub fn validate_manifest_strict(bundle: &Bundle) -> Result<ManifestInfo, ManifestError> {
+    validate(bundle, true)
+}
+
+fn validate(bundle: &Bundle, strict: bool) -> Result<ManifestInfo, ManifestError> {
     let skill_md = bundle.file(SKILL_MD).ok_or(ManifestError::MissingSkillMd)?;
     let markdown = std::str::from_utf8(skill_md.bytes()).map_err(|_| ManifestError::NotUtf8 { file: SKILL_MD })?;
-    let (name, description) = strict_frontmatter(markdown)?;
+    let (name, description, markdown_tools) = strict_frontmatter(markdown, strict)?;
     let name = checked_name(&name)?;
     let description = checked_description(&description)?;
 
-    let semantic_version = match bundle.file(SKILL_TOML) {
-        Some(toml_file) => Some(check_toml(toml_file.bytes(), &name, &description)?),
-        None => None,
+    let (semantic_version, required_tools) = match bundle.file(SKILL_TOML) {
+        Some(toml_file) => {
+            let (version, toml_tools) = check_toml(toml_file.bytes(), &name, &description, strict)?;
+            // Both manifests are parsed the same way; neither wins a disagreement.
+            if let (Some(md), Some(toml)) = (&markdown_tools, &toml_tools)
+                && md != toml
+            {
+                return Err(ManifestError::Conflict {
+                    field: REQUIRED_TOOLS_KEY,
+                    markdown: md.join(","),
+                    toml: toml.join(","),
+                });
+            }
+            (Some(version), markdown_tools.or(toml_tools))
+        }
+        None => (None, markdown_tools),
     };
     Ok(ManifestInfo {
         name,
         description,
         semantic_version,
+        required_tools: required_tools.unwrap_or_default(),
     })
+}
+
+/// A malformed declaration reads as undeclared (and is logged), so a revision
+/// stored before the key was defined stays readable.
+fn lenient(
+    parsed: Result<Vec<String>, ManifestError>,
+    file: &str,
+    strict: bool,
+) -> Result<Option<Vec<String>>, ManifestError> {
+    match parsed {
+        Ok(list) => Ok(Some(list)),
+        Err(error) if strict => Err(error),
+        Err(error) => {
+            tracing::warn!(%error, file, "ignoring a malformed `required-tools` declaration");
+            Ok(None)
+        }
+    }
+}
+
+/// Whether `id` is a canonical capability id the catalog can build:
+/// `family:namespace:name` with a known family, where
+///
+/// * a tool named `shell` is in the `filesystem` family (it is a file-system
+///   tool before it is a shell), and
+/// * an MCP id is `mcp:<server>:mcp__<server>__<tool>`, or
+///   `mcp:mcp:mcp__<server>__<tool>` for an alias not discovered yet.
+fn is_capability_id(id: &str) -> bool {
+    use crate::causal_tree::branch::CapabilityTarget;
+    let mut parts = id.split(':');
+    let (Some(family), Some(namespace), Some(name), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if namespace.is_empty()
+        || name.is_empty()
+        || !CapabilityTarget::ALL
+            .iter()
+            .any(|known| *known != CapabilityTarget::None && known.as_str() == family)
+    {
+        return false;
+    }
+    if family == "mcp" {
+        // The public name is `mcp__<server>__<tool>`. A discovered tool is filed
+        // under its server, which may itself contain `__`, so the name must
+        // start with exactly `mcp__<namespace>__`. An alias that was not
+        // discovered has the namespace `mcp` and any server and tool.
+        let Some(rest) = name.strip_prefix("mcp__") else {
+            return false;
+        };
+        if namespace == "mcp" {
+            return rest
+                .split_once("__")
+                .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty());
+        }
+        return rest
+            .strip_prefix(namespace)
+            .and_then(|after| after.strip_prefix("__"))
+            .is_some_and(|tool| !tool.is_empty());
+    }
+    name != "shell" || family == "filesystem"
+}
+
+const ID_HELP: &str = "each tool must be a canonical capability id as returned by capability_search (capability.id), \
+                       such as filesystem:native:shell or mcp:notes:mcp__notes__search";
+
+/// Normalises a declared tool list: bounded, plain names, sorted and unique.
+fn checked_tools(items: impl IntoIterator<Item = String>) -> Result<Vec<String>, ManifestError> {
+    let invalid = |reason| ManifestError::InvalidField {
+        field: REQUIRED_TOOLS_KEY,
+        reason,
+    };
+    let mut tools: Vec<String> = Vec::new();
+    for item in items {
+        let item = item.trim().to_string();
+        if item.is_empty()
+            || item.len() > MAX_NAME_BYTES
+            || !item
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        {
+            return Err(invalid(ID_HELP));
+        }
+        if !is_capability_id(&item) {
+            return Err(invalid(ID_HELP));
+        }
+        tools.push(item);
+    }
+    tools.sort();
+    tools.dedup();
+    if tools.len() > MAX_REQUIRED_TOOLS {
+        return Err(invalid("at most 16 tools"));
+    }
+    Ok(tools)
+}
+
+/// Parses the one-line flow list `[a, b]` of the frontmatter value.
+fn markdown_tools(value: &str) -> Result<Vec<String>, ManifestError> {
+    let inner = value
+        .trim()
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .ok_or(ManifestError::InvalidField {
+            field: REQUIRED_TOOLS_KEY,
+            reason: "must be a one-line list such as [filesystem:native:shell, mcp:notes:mcp__notes__search]",
+        })?;
+    checked_tools(
+        inner
+            .split(',')
+            .filter(|item| !item.trim().is_empty())
+            .map(super::super::parse_frontmatter_scalar),
+    )
 }
 
 /// Reads name and description from the top-level frontmatter keys only, and
 /// refuses frontmatter the legacy catalog loader would read differently
 /// (repeated keys, or an indented `name:` that overrides the top-level one).
-fn strict_frontmatter(markdown: &str) -> Result<(String, String), ManifestError> {
+fn strict_frontmatter(markdown: &str, strict: bool) -> Result<(String, String, Option<Vec<String>>), ManifestError> {
     let legacy = super::super::parse_skill_frontmatter(markdown).ok_or(ManifestError::MissingFrontmatter)?;
     let rest = markdown.strip_prefix("---").ok_or(ManifestError::MissingFrontmatter)?;
     let block = rest
@@ -73,8 +217,32 @@ fn strict_frontmatter(markdown: &str) -> Result<(String, String), ManifestError>
         .ok_or(ManifestError::MissingFrontmatter)?;
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
+    let mut tools: Option<Vec<String>> = None;
+    let mut tools_seen = false;
+    let mut tools_poisoned = false;
     for line in block.lines() {
         let top_level = !line.starts_with(char::is_whitespace);
+        // Only a top-level key declares tools; an indented one belongs to some
+        // other mapping and is not ours to read.
+        if top_level && let Some(value) = line.strip_prefix("required-tools:") {
+            // A line in any other form (a scalar, a repeated key) may already be
+            // in a stored revision, which must stay readable: it declares
+            // nothing, with a warning.
+            if tools_seen {
+                if strict {
+                    return Err(ManifestError::DuplicateKey {
+                        key: REQUIRED_TOOLS_KEY,
+                    });
+                }
+                tracing::warn!("SKILL.md repeats `required-tools`; treating it as undeclared");
+                tools = None;
+                tools_poisoned = true;
+            } else if let Some(list) = lenient(markdown_tools(value), "SKILL.md", strict)? {
+                tools = Some(list);
+            }
+            tools_seen = true;
+            continue;
+        }
         let trimmed = line.trim();
         let (slot, key, value) = if let Some(value) = trimmed.strip_prefix("name:") {
             (&mut name, "name", value)
@@ -92,7 +260,9 @@ fn strict_frontmatter(markdown: &str) -> Result<(String, String), ManifestError>
         *slot = Some(super::super::parse_frontmatter_scalar(value));
     }
     match (name, description) {
-        (Some(name), Some(description)) if (&name, &description) == (&legacy.0, &legacy.1) => Ok((name, description)),
+        (Some(name), Some(description)) if (&name, &description) == (&legacy.0, &legacy.1) => {
+            Ok((name, description, if tools_poisoned { None } else { tools }))
+        }
         (Some(_), Some(_)) => Err(ManifestError::AmbiguousFrontmatter),
         _ => Err(ManifestError::MissingFrontmatter),
     }
@@ -100,7 +270,12 @@ fn strict_frontmatter(markdown: &str) -> Result<(String, String), ManifestError>
 
 /// Validates SKILL.toml against the already validated SKILL.md identity and
 /// returns its version.
-fn check_toml(bytes: &[u8], name: &str, description: &str) -> Result<String, ManifestError> {
+fn check_toml(
+    bytes: &[u8],
+    name: &str,
+    description: &str,
+    strict: bool,
+) -> Result<(String, Option<Vec<String>>), ManifestError> {
     let limit = usize::try_from(super::super::MAX_MANIFEST_BYTES).unwrap_or(usize::MAX);
     if bytes.len() > limit {
         return Err(ManifestError::TooLarge { file: SKILL_TOML });
@@ -131,7 +306,22 @@ fn check_toml(bytes: &[u8], name: &str, description: &str) -> Result<String, Man
             reason: "must be 1..=64 bytes without control characters",
         });
     }
-    Ok(version.to_string())
+    // The same key as in SKILL.md, under `[skill]`, as an array of strings.
+    let raw: toml::Value = toml::from_str(text).map_err(|e| ManifestError::InvalidToml(e.to_string()))?;
+    let tools = match raw.get("skill").and_then(|skill| skill.get(REQUIRED_TOOLS_KEY)) {
+        None => None,
+        Some(value) => {
+            let items: Option<Vec<String>> = value
+                .as_array()
+                .and_then(|items| items.iter().map(|item| item.as_str().map(str::to_string)).collect());
+            let parsed = items.ok_or(ManifestError::InvalidField {
+                field: REQUIRED_TOOLS_KEY,
+                reason: "must be an array of strings",
+            });
+            lenient(parsed.and_then(checked_tools), "SKILL.toml", strict)?
+        }
+    };
+    Ok((version.to_string(), tools))
 }
 
 fn checked_name(raw: &str) -> Result<String, ManifestError> {

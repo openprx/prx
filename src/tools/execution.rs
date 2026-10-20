@@ -2281,7 +2281,7 @@ impl ToolExecutionService {
         // while it is pending.
         let outcome = Box::pin(self.execute_inner(command, context, cancellation)).await;
         if let Some(pending) = pending {
-            pending.finish(outcome.status);
+            pending.finish_with_error(outcome.status, outcome.error.as_deref());
         }
         outcome
     }
@@ -3022,6 +3022,11 @@ impl ToolExecutionService {
                 )
             }
             (Some(Err(error)), _) => {
+                // The trace alone classifies the full source chain; the outcome and
+                // everything built from it keep the plain message.
+                if let Some(trace) = context.execution_trace.as_ref() {
+                    trace.note_error_detail(&command.operation_id, format!("{error:#}"));
+                }
                 let error = error.to_string();
                 let hint = super::error_hints::recovery_hint(&command.name, &error);
                 let model_content = if hint.is_empty() {
