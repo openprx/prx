@@ -71,6 +71,7 @@ impl SmartGroupClassifierCall {
             chrono::Utc::now(),
             false,
         )
+        .with_prepared_parameters(self.accounting.prepared_parameters())
     }
 }
 
@@ -169,10 +170,10 @@ impl ChannelDecisionTurn {
             false,
             false,
         );
-        let observation = crate::runtime::auxiliary_call::AuxiliaryProviderCall::new_for(
+        let observation = crate::runtime::auxiliary_call::AuxiliaryProviderCall::new_accounted(
             crate::runtime::auxiliary_call::AuxiliaryPurpose::SmartGroupClassifier,
             route.clone(),
-            accounting.scope_id(),
+            accounting.as_ref(),
         );
         self.terminal.register_auxiliary_call(Arc::clone(&observation))?;
         Ok(SmartGroupClassifierCall {
@@ -187,8 +188,11 @@ impl ChannelDecisionTurn {
         &mut self,
         accounting: &crate::runtime::auxiliary_call::AuxiliaryAccounting,
     ) -> anyhow::Result<Arc<crate::runtime::auxiliary_call::AuxiliaryProviderCall>> {
-        let observation =
-            crate::runtime::auxiliary_call::AuxiliaryProviderCall::new(self.route.clone(), accounting.scope_id());
+        let observation = crate::runtime::auxiliary_call::AuxiliaryProviderCall::new_accounted(
+            crate::runtime::auxiliary_call::AuxiliaryPurpose::SignalVision,
+            self.route.clone(),
+            accounting,
+        );
         self.terminal.register_auxiliary_call(Arc::clone(&observation))?;
         Ok(observation)
     }

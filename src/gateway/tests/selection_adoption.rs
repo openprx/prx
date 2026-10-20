@@ -91,6 +91,7 @@ fn a_hint_default_builds_the_turn_runtime() {
     let mut config = decision_only(workspace.path());
     config.default_model = Some("hint:fast".to_string());
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: "openrouter".to_string(),
         model: "vendor/fast-chat".to_string(),
@@ -126,6 +127,7 @@ fn removing_a_live_default_hint_route_keeps_the_previous_generation() {
     let mut good = decision_only(workspace.path());
     good.default_model = Some("hint:fast".to_string());
     good.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: "openrouter".to_string(),
         model: "vendor/fast-chat".to_string(),

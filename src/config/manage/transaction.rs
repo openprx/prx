@@ -367,7 +367,13 @@ async fn lock_settlement(history: &ConfigHistory) -> Result<std::fs::File, Confi
 async fn check_plan_selections(plan: &ConfigPlan, actor: ConfigActor) -> Result<Vec<String>, ConfigTransactionError> {
     let current = plan.current.clone();
     let candidate = Arc::clone(&plan.candidate);
-    let policy = validate::durable_policy(actor);
+    // Only a plan constructed from stored history retains existing selections.
+    // Merely naming the rollback actor never broadens an ordinary write.
+    let policy = if actor == ConfigActor::Rollback && plan.restores.is_some() {
+        crate::providers::catalog::UnknownPolicy::Invocation
+    } else {
+        validate::durable_policy(actor)
+    };
     blocking(move || {
         let selections = validate::check_affected_selections(current.as_deref(), &candidate, policy);
         let references = validate::check_credential_references(current.as_deref(), &candidate);
@@ -2189,6 +2195,27 @@ mod tests {
 
     // ── Rollback (D-4) ────────────────────────────────────────────────────
 
+    #[tokio::test]
+    async fn an_ordinary_plan_cannot_select_a_retired_model_by_naming_the_rollback_actor() {
+        let fixture = fixture().await;
+        let before = fixture.tree();
+        let service = fixture.service();
+        let mut candidate = fixture.desired();
+        candidate.default_provider = Some("openai".into());
+        candidate.default_model = Some("gpt-4o".into());
+        let plan = service
+            .plan(ConfigChange::Structured(Box::new(candidate)))
+            .await
+            .expect("test: ordinary structured plan");
+        assert!(plan.restores.is_none());
+        let error = service
+            .apply(plan, ConfigActor::Rollback, ApplyOptions::default())
+            .await
+            .expect_err("test: actor does not grant a lifecycle exception");
+        assert!(error.to_string().contains("retired"), "{error}");
+        assert_eq!(fixture.tree(), before);
+    }
+
     /// Apply A, apply B, roll back B's record: the stored files are byte
     /// for byte those after A (ciphertext included, so no mask and no
     /// re-encryption), and the rollback has its own record.
@@ -2940,6 +2967,7 @@ mod tests {
 
     fn d5_route(model: &str) -> crate::config::ModelRouteConfig {
         crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "d5".into(),
             provider: D5_ENDPOINT.into(),
             model: model.into(),
@@ -3068,6 +3096,7 @@ mod tests {
         let service = fixture.service();
         let mut config = fixture.desired();
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "d5".into(),
             provider: "openrouter".into(),
             model: "vendor/never-seen-model".into(),
@@ -3105,6 +3134,7 @@ mod tests {
             &fixture,
             |config| {
                 config.model_routes.push(crate::config::ModelRouteConfig {
+                    settings: Default::default(),
                     hint: "d5".into(),
                     provider: "openrouter".into(),
                     model: "vendor/never-seen-model".into(),
@@ -3208,6 +3238,7 @@ mod tests {
             &fixture,
             |config| {
                 config.model_routes.push(crate::config::ModelRouteConfig {
+                    settings: Default::default(),
                     hint: "gone".into(),
                     provider: "openrouter".into(),
                     model: "vendor/image-maker".into(),

@@ -611,6 +611,7 @@ impl SessionsSpawnTool {
             kernel_capped = resolved_compaction.kernel_capped,
             "sessions_spawn resolved child compaction window"
         );
+        let temperature_override = selected_agent.as_ref().and_then(|(_, cfg)| cfg.temperature);
         let resolved_temperature = selected_agent
             .as_ref()
             .and_then(|(_, cfg)| cfg.temperature)
@@ -1011,6 +1012,7 @@ impl SessionsSpawnTool {
                                 route_uses_root_connection,
                                 direct_uses_root_connection,
                                 temperature,
+                                temperature_override,
                                 &workspace_root,
                                 &worker_workspace_root,
                                 identity_dir.as_deref(),
@@ -1690,25 +1692,34 @@ impl SessionsSpawnTool {
                     Some((delta_tx, tool_tx)) => (Some(delta_tx), Some(tool_tx)),
                     None => (None, None),
                 };
-                let run_future = run_sub_agent_task(
-                    &task_owned,
-                    provider,
-                    &provider_name,
-                    &model,
-                    temperature,
-                    filtered_tools,
-                    &system_prompt,
-                    security,
-                    steer_rx,
-                    history_arc,
-                    run_on_delta,
-                    run_on_tool,
-                    run_approval_resolver,
-                    restore_active_runs,
-                    restore_run_id,
-                    Arc::clone(&task_progress),
-                );
-                let result = run_cleanup_scope.run(run_future).await;
+                // Construct the large child loop behind the existing allocation
+                // boundary before adding task-local temperature ownership.
+                let run_future = boxed_spawn_field(|| {
+                    run_sub_agent_task(
+                        &task_owned,
+                        provider,
+                        &provider_name,
+                        &model,
+                        temperature,
+                        filtered_tools,
+                        &system_prompt,
+                        security,
+                        steer_rx,
+                        history_arc,
+                        run_on_delta,
+                        run_on_tool,
+                        run_approval_resolver,
+                        restore_active_runs,
+                        restore_run_id,
+                        Arc::clone(&task_progress),
+                    )
+                });
+                let result = run_cleanup_scope
+                    .run(crate::providers::model_settings::with_temperature(
+                        temperature_override,
+                        run_future,
+                    ))
+                    .await;
                 tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
 
                 let (status, result_text, terminal_status, history_projection, token_usage_records) = match result {

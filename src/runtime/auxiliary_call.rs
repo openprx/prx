@@ -26,6 +26,7 @@ pub(crate) struct AuxiliaryProviderCall {
     purpose: AuxiliaryPurpose,
     accounting_scope_id: String,
     state: parking_lot::Mutex<State>,
+    parameters: crate::providers::parameter_capture::Capture,
 }
 #[derive(Default)]
 struct State {
@@ -36,15 +37,34 @@ struct State {
     served_reply_sha256: Option<[u8; 32]>,
 }
 impl AuxiliaryProviderCall {
-    pub(crate) fn new(route: RouteDecision, accounting_scope_id: String) -> Arc<Self> {
-        Self::new_for(AuxiliaryPurpose::SignalVision, route, accounting_scope_id)
+    pub(crate) fn new_accounted(
+        purpose: AuxiliaryPurpose,
+        route: RouteDecision,
+        accounting: &AuxiliaryAccounting,
+    ) -> Arc<Self> {
+        Self::with_parameters(purpose, route, accounting.scope_id(), accounting.parameters.clone())
     }
+    #[cfg(test)]
     pub(crate) fn new_for(purpose: AuxiliaryPurpose, route: RouteDecision, accounting_scope_id: String) -> Arc<Self> {
+        Self::with_parameters(
+            purpose,
+            route,
+            accounting_scope_id,
+            crate::providers::parameter_capture::Capture::new(false),
+        )
+    }
+    fn with_parameters(
+        purpose: AuxiliaryPurpose,
+        route: RouteDecision,
+        accounting_scope_id: String,
+        parameters: crate::providers::parameter_capture::Capture,
+    ) -> Arc<Self> {
         Arc::new(Self {
             route,
             purpose,
             accounting_scope_id,
             state: parking_lot::Mutex::new(State::default()),
+            parameters,
         })
     }
     pub(crate) fn begin(&self) -> anyhow::Result<()> {
@@ -166,6 +186,7 @@ impl AuxiliaryProviderCall {
             "version": 2, "purpose": purpose, "accounting_scope_id": self.accounting_scope_id,
             "started_at": started_at, "provider_outcome": outcome, "usage_uncertain": uncertain,
             "served_reply_sha256": served_reply_sha256,
+            "prepared_parameters": self.parameters.snapshot(),
         }))?;
         let payload = serde_json::to_string(&payload)?;
         let event = fabric
@@ -243,6 +264,7 @@ pub(crate) struct AuxiliaryAccounting {
     scope: Arc<super::decision_accounting::AccountingScope>,
     purpose: AuxiliaryPurpose,
     execution_trace: crate::tools::capability::execution_trace::ExecutionTrace,
+    parameters: crate::providers::parameter_capture::Capture,
 }
 impl AuxiliaryAccounting {
     pub(super) fn new(
@@ -266,6 +288,7 @@ impl AuxiliaryAccounting {
             scope,
             purpose,
             execution_trace,
+            parameters: crate::providers::parameter_capture::Capture::new(true),
         }))
     }
     pub(crate) const fn selected_model(&self) -> &crate::providers::catalog::ResolvedModel {
@@ -279,6 +302,9 @@ impl AuxiliaryAccounting {
     }
     pub(crate) fn scope_id(&self) -> String {
         self.scope.scope_id()
+    }
+    pub(crate) fn prepared_parameters(&self) -> Vec<crate::providers::catalog::parameters::ResolvedParameters> {
+        self.parameters.snapshot()
     }
     pub(crate) fn deadline(&self) -> std::time::Instant {
         self.scope.deadline()
@@ -301,6 +327,9 @@ impl crate::providers::attempt_accounting::sealed::AccountingOwner for Auxiliary
 impl crate::providers::attempt_accounting::AttemptAccounting for AuxiliaryAccounting {
     fn deadline(&self) -> std::time::Instant {
         self.scope.deadline()
+    }
+    fn parameter_capture(&self) -> Option<crate::providers::parameter_capture::Capture> {
+        Some(self.parameters.clone())
     }
     async fn begin(
         &self,
@@ -354,3 +383,6 @@ impl crate::providers::attempt_accounting::AttemptReceipt for AuxiliaryReceipt {
         Box::new(self.0).settle_provider_usage(usage).map_err(Into::into)
     }
 }
+
+#[cfg(test)]
+mod parameter_tests;

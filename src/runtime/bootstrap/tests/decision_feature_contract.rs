@@ -56,7 +56,10 @@ async fn decision_service_present_in_every_model_turn_build() {
                 .prediction
                 .as_ref()
                 .map(|prediction| prediction.served_by),
-            Some(ServedBy::Builtin)
+            Some(ServedBy::Builtin),
+            "fallback_cause={:?}, elapsed_ms={}",
+            decision.engine().fallback_cause,
+            decision.engine().elapsed_ms
         );
         assert!(!decision.engine().pre_commit.outcomes.is_empty());
         assert!(matches!(

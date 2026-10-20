@@ -1328,6 +1328,20 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
 /// unverified), verified is fine.
 fn check_model_selection(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "models";
+    match crate::config::model_settings::warnings(config) {
+        Ok(warnings) => items.extend(warnings.into_iter().map(|warning| DiagItem::warn(cat, warning))),
+        Err(error) => items.push(DiagItem::error(cat, error.to_string())),
+    }
+    match crate::config::manage::lifecycle::diagnostics(config) {
+        Ok(notes) => items.extend(notes.into_iter().map(|note| {
+            if note.warning {
+                DiagItem::warn(cat, note.message)
+            } else {
+                DiagItem::with_state(Severity::Ok, DiagnosticState::Unknown, cat, note.message)
+            }
+        })),
+        Err(error) => items.push(DiagItem::error(cat, error.to_string())),
+    }
     match crate::providers::selection::default_status(config) {
         Ok((true, line)) => items.push(DiagItem::ok(cat, line)),
         Ok((false, line)) => items.push(DiagItem::warn(cat, line)),
@@ -1336,7 +1350,7 @@ fn check_model_selection(config: &Config, items: &mut Vec<DiagItem>) {
 }
 
 /// Every persisted selection besides the default (routes, agents,
-/// fallbacks, embeddings, ...) resolved as an operator's selection (SP-PMM
+/// fallbacks, embeddings, ...) resolved as an existing invocation (SP-PMM
 /// H-4): one warning per selection the evidence does not verify, and an
 /// error when one no longer resolves. The default is reported by
 /// [`check_model_selection`]. Local only; no credential is read.
@@ -1347,11 +1361,7 @@ fn check_persisted_selections(config: &Config, items: &mut Vec<DiagItem>) {
     for note in crate::config::schema::duplicate_embedding_route_hints(config) {
         items.push(DiagItem::warn(cat, note));
     }
-    match crate::config::manage::validate::check_affected_selections(
-        None,
-        config,
-        crate::providers::catalog::UnknownPolicy::OperatorSelection,
-    ) {
+    match crate::config::manage::validate::check_existing_selections(config) {
         Ok(warnings) => {
             let unverified = warnings
                 .into_iter()
@@ -1399,10 +1409,20 @@ fn check_router_candidates(config: &Config, items: &mut Vec<DiagItem>) {
     } else {
         config.router.models.clone()
     };
-    if crate::router::capability::filter_models_by_providers(candidates, &reachable).is_empty() {
+    let has_reachable_model = crate::router::capability::filter_models_by_providers(candidates, &reachable)
+        .into_iter()
+        .any(|model| {
+            crate::router::capability::is_model_reachable(
+                crate::providers::selection::default_provider(config),
+                &config.model_routes,
+                &model.provider,
+                &model.model_id,
+            )
+        });
+    if !has_reachable_model {
         items.push(DiagItem::warn(
             "router",
-            "Router has no reachable candidates after provider filtering; configure reachable [[router.models]] entries; the selected default is unchanged",
+            "Router has no reachable candidates after provider/model filtering; configure reachable [[router.models]] entries; the selected default is unchanged",
         ));
     }
 }
@@ -2239,7 +2259,7 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// True for a Cargo build output directory (`…/target/debug`,
+/// True for a Cargo build output directory (`…/<output>/debug`,
 /// `…/target/release`, `…/target/<triple>/debug/deps`, …).
 ///
 /// Such a directory must never enter the required set: `cargo run -- doctor`,
@@ -2248,14 +2268,23 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
 /// daemon's `PATH` — an operational step that outlives the build tree.
 #[cfg(any(target_os = "linux", test))]
 fn is_cargo_build_dir(path: &Path) -> bool {
-    let parts: Vec<&std::ffi::OsStr> = path.components().map(std::path::Component::as_os_str).collect();
-    let Some(target_at) = parts.iter().rposition(|part| *part == "target") else {
-        return false;
+    let profile_dir = if path.file_name().is_some_and(|name| name == "deps") {
+        path.parent().unwrap_or(path)
+    } else {
+        path
     };
-    parts
-        .iter()
-        .skip(target_at + 1)
-        .any(|part| *part == "debug" || *part == "release")
+    if !profile_dir
+        .file_name()
+        .is_some_and(|name| name == "debug" || name == "release")
+    {
+        return false;
+    }
+    // `deps` is a Cargo artifact directory even when a copied layout no
+    // longer has its siblings. A profile directory itself needs layout proof.
+    path != profile_dir
+        || ["deps", "build", ".fingerprint"]
+            .iter()
+            .any(|name| profile_dir.join(name).is_dir())
 }
 
 /// The deployed daemon binary as the daemon itself recorded it in
@@ -2549,6 +2578,37 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn doctor_reports_invalid_saved_model_settings_as_repairable_warnings() {
+        let mut config = Config::default();
+        config.default_provider = Some("openai".into());
+        config.default_model = Some("gpt-5.6".into());
+        config.model_settings.insert(
+            "openai/gpt-5.6".into(),
+            serde_json::from_value(serde_json::json!({"level":"future"})).unwrap(),
+        );
+        let mut items = Vec::new();
+        check_model_selection(&config, &mut items);
+        assert!(items.iter().any(|item| item.message.contains("saved level")));
+    }
+
+    #[test]
+    fn absent_catalog_lifecycle_is_informational_without_claiming_model_health() {
+        let config = Config {
+            default_provider: Some("openai".into()),
+            default_model: Some("prx-unlisted-model".into()),
+            ..Default::default()
+        };
+        let mut items = Vec::new();
+        check_model_selection(&config, &mut items);
+        let note = items
+            .iter()
+            .find(|item| item.message.contains("deleted or custom"))
+            .unwrap();
+        assert_eq!(note.severity, Severity::Ok);
+        assert_eq!(note.state, DiagnosticState::Unknown);
+    }
+
     #[cfg(feature = "llm-router")]
     #[test]
     fn doctor_surfaces_an_empty_router_registry_beyond_the_startup_log() {
@@ -2573,6 +2633,36 @@ mod tests {
             items.is_empty(),
             "the published OpenRouter candidate must actually be reachable"
         );
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[test]
+    fn doctor_requires_a_reachable_model_in_a_non_default_provider_route() {
+        let mut config = Config {
+            default_provider: Some("openai".into()),
+            default_model: Some("gpt-5.6".into()),
+            ..Config::default()
+        };
+        config.model_routes.push(crate::config::ModelRouteConfig {
+            hint: "quick".into(),
+            provider: "openrouter".into(),
+            model: "prx-absent-router-model".into(),
+            api_key: None,
+            credential_ref: None,
+            settings: Default::default(),
+        });
+        let mut items = Vec::new();
+        check_router_candidates(&config, &mut items);
+        assert_eq!(items.len(), 1);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("no reachable candidates"))
+        );
+        config.model_routes.first_mut().unwrap().model = "anthropic/claude-sonnet-5".into();
+        items.clear();
+        check_router_candidates(&config, &mut items);
+        assert!(items.is_empty());
     }
 
     #[test]
@@ -2866,6 +2956,7 @@ mod tests {
             ..Config::default()
         };
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "openai".into(),
             model: "pmmh-unlisted-route-model".into(),
@@ -3687,6 +3778,7 @@ mod tests {
     fn config_validation_warns_empty_model_route() {
         let mut config = Config::default();
         config.model_routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "groq".into(),
             model: String::new(),
@@ -4175,12 +4267,19 @@ mod tests {
 
     #[test]
     fn cargo_build_directories_are_recognized_and_ordinary_bin_directories_are_not() {
-        for build in [
-            "/opt/worker/code/prx/target/debug",
-            "/opt/worker/code/prx/target/debug/deps",
-            "/opt/worker/code/prx/target/release",
-            "/opt/worker/code/prx/target/x86_64-unknown-linux-gnu/release",
+        let temp = TempDir::new().unwrap();
+        for layout in [
+            "target/debug",
+            "target/debug/deps",
+            "target/release",
+            "target/x86_64-unknown-linux-gnu/release",
+            "prx-qa-output/debug",
+            "prx-qa-output/debug/deps",
+            "custom-output/aarch64-unknown-linux-gnu/release",
         ] {
+            let build = temp.path().join(layout);
+            std::fs::create_dir_all(build.join(".fingerprint")).unwrap();
+            let build = build.to_str().unwrap();
             assert!(
                 is_cargo_build_dir(Path::new(build)),
                 "must be a build directory: {build}"
@@ -4300,6 +4399,7 @@ mod tests {
         config.reliability.fallback_providers =
             vec![label(2), "custom:http://u:SECRET-fixture-pw@127.0.0.1:99999/v1".into()];
         config.model_routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "custom:http://u:SECRET-fixture-pw@127.0.0.1:99998/v1".into(),
             model: "m".into(),

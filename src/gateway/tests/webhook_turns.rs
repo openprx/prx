@@ -91,6 +91,7 @@ async fn webhook_default_hint_uses_only_selected_route_key_on_wire() {
         },
     );
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: route_provider,
         model: PROBE_MODEL.to_string(),

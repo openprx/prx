@@ -246,23 +246,10 @@ pub(super) fn session_secret_path() -> Option<std::path::PathBuf> {
 /// when no state dir is resolvable or filesystem ops fail.
 fn load_or_create_persisted_session_secret() -> Option<[u8; 32]> {
     let path = session_secret_path()?;
-    if let Ok(existing) = std::fs::read(&path) {
-        if existing.len() == 32 {
-            let mut buf = [0u8; 32];
-            buf.copy_from_slice(&existing);
-            return Some(buf);
-        }
-    }
-    let secret = generate_session_secret();
-    if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return None;
-        }
-    }
-    match std::fs::write(&path, secret) {
-        Ok(()) => Some(secret),
+    match crate::session_worker::transport_key::load_or_create(&path, generate_session_secret) {
+        Ok(secret) => Some(secret),
         Err(error) => {
-            tracing::warn!("failed to persist session-worker secret: {error}");
+            tracing::warn!("failed to load or persist session-worker secret: {error}");
             None
         }
     }

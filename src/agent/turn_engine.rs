@@ -454,6 +454,7 @@ async fn run_turn_unguarded(
         event_fabric,
         request_event_scope,
     } = memory_runtime;
+    let parameter_capture = context.capture_main_parameters(event_fabric.is_some());
     let runtime_adapter = runtime_adapter.unwrap_or_else(|| {
         build_agent_tool_runtime_adapter(AgentToolRuntimeInputs {
             scope: scope_ctx,
@@ -1121,26 +1122,27 @@ async fn run_turn_unguarded(
             retained.begin();
         }
         let chat_result = if runtime_adapter.stream_provider {
-            run_streaming_provider_turn(
-                provider,
-                &prepared_messages.messages,
-                request_tools,
-                provider_name,
-                model,
-                temperature,
-                cancellation_token.as_ref(),
-                &runtime_adapter,
-            )
-            .await
+            parameter_capture
+                .scope(run_streaming_provider_turn(
+                    provider,
+                    &prepared_messages.messages,
+                    request_tools,
+                    provider_name,
+                    model,
+                    temperature,
+                    cancellation_token.as_ref(),
+                    &runtime_adapter,
+                ))
+                .await
         } else {
-            let chat_future = provider.chat_traced(
+            let chat_future = parameter_capture.scope(provider.chat_traced(
                 ChatRequest {
                     messages: &prepared_messages.messages,
                     tools: request_tools,
                 },
                 model,
                 temperature,
-            );
+            ));
             if let Some(token) = cancellation_token.as_ref() {
                 tokio::select! {
                     () = token.cancelled() => {
@@ -1158,6 +1160,8 @@ async fn run_turn_unguarded(
                 chat_future.await
             }
         };
+        let prepared = parameter_capture.snapshot_from(last_turn_trace.prepared_parameters.len());
+        last_turn_trace.prepared_parameters.extend(prepared);
 
         if let Some(observation) = provider_observation {
             observation.finish(chat_result.as_ref().ok().map(|trace| trace.attempts.as_slice()));
@@ -1202,6 +1206,7 @@ async fn run_turn_unguarded(
                     )
                     .unwrap_or_else(|| provider.tool_schema_dialect_for(&trace.final_model));
                 last_turn_trace = ToolLoopTrace {
+                    prepared_parameters: std::mem::take(&mut last_turn_trace.prepared_parameters),
                     final_provider: Some(trace.final_provider),
                     final_model: Some(trace.final_model),
                     attempts: trace.attempts,

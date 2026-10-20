@@ -218,10 +218,32 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "/model",
         aliases: &[],
-        args_hint: "[name]",
+        args_hint: "[name [level]] | save-default",
         description: "Show or switch model",
         arg: CommandArgSpec {
             source: CommandArgSource::CurrentProviderModels,
+        },
+    },
+    CommandSpec {
+        name: "/level",
+        aliases: &[],
+        args_hint: "<low|medium|high>",
+        description: "Choose a model level for this session",
+        arg: CommandArgSpec {
+            source: CommandArgSource::Static(&[
+                CommandArgCandidate {
+                    value: "low",
+                    description: "Use the model's low level",
+                },
+                CommandArgCandidate {
+                    value: "medium",
+                    description: "Use the model's medium level",
+                },
+                CommandArgCandidate {
+                    value: "high",
+                    description: "Use the model's high level",
+                },
+            ]),
         },
     },
     CommandSpec {
@@ -516,6 +538,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
         "/cost" => CommandResult::HandledWithOutput(format_cost_feedback(ctx.chat_session)),
         "/workers" => CommandResult::HandledWithOutput("No main provider workers are active.".to_string()),
         "/model" => CommandResult::HandledWithOutput(format_model_feedback(ctx.model_name)),
+        "/level" => CommandResult::HandledWithOutput("Usage: /level <low|medium|high>".to_owned()),
         "/provider" => CommandResult::HandledWithOutput(format!(
             "Current provider: {}",
             crate::providers::redact_endpoint_userinfo(ctx.provider_name)

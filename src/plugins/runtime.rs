@@ -2269,62 +2269,161 @@ max_payload_bytes = 8388608";
 max_memory_mb = 8
 max_execution_time_ms = 30000";
 
-    /// Tuned once against the committed fixture, under the wasmtime version of
-    /// that time: instantiation was measured at roughly 48 000 fuel units and
-    /// one `process` call at roughly 10 400, so 62 000 funds exactly one call
-    /// while fuel is a store-lifetime budget and comfortably funds every call
-    /// once fuel is metered per invocation. Those measurements are not
-    /// asserted anywhere except through
-    /// `the_per_invocation_fuel_bound_stays_discriminating`, which currently
-    /// fails (see its comment).
-    const ONE_CALL_FUEL: u64 = 62_000;
+    /// Fuel the `middleware_fuel_is_metered_per_invocation` test grants: the
+    /// measured cost of instantiating the fixture and serving one call, plus
+    /// half again. Fuel cost differs per platform and wasmtime version
+    /// (instantiation is tens of thousands of units on one target and nearly
+    /// free on another), so no figure is hard-coded; see
+    /// `measure_one_call_fuel`.
+    fn funded_middleware_fuel(measured_one_call_fuel: u64) -> u64 {
+        measured_one_call_fuel.saturating_add(measured_one_call_fuel / 2)
+    }
 
-    /// Boundary assumed for the committed fixture: instantiation alone is
-    /// expected to cost more than this, which
-    /// `the_per_invocation_fuel_bound_stays_discriminating` asserts. The
-    /// original measurement was under 50 000 fuel units; on the current
-    /// wasmtime that assertion no longer holds (instantiation is cheaper), so
-    /// the boundary has to be re-measured. The upper side is pinned only as
-    /// `ONE_CALL_FUEL`, by `middleware_fuel_is_metered_per_invocation`, whose
-    /// adapter fails to load if instantiation costs more than that.
-    const BELOW_INSTANTIATION_FUEL: u64 = 48_000;
+    /// Outcome of loading the middleware fixture under `max_fuel` and sending
+    /// it one envelope.
+    #[derive(Debug, PartialEq, Eq)]
+    enum FuelProbe {
+        /// The adapter loaded and the call returned the transformed text.
+        Funded,
+        /// The adapter never loaded because the budget ran out.
+        StarvedAtLoad,
+        /// The adapter loaded but the call did not return the transformed text.
+        StarvedAtCall,
+    }
 
-    /// `ONE_CALL_FUEL` carries a lower bound (it must fund a call once fuel is
-    /// per invocation) and an upper bound (it must not fund instantiation plus
-    /// several calls, or `middleware_fuel_is_metered_per_invocation` would pass
-    /// without discriminating). The lower bound is the one that test shows. This
-    /// test is meant to pin the upper bound: with `max_fuel` set to
-    /// `BELOW_INSTANTIATION_FUEL` (48 000), instantiating the fixture must
-    /// run out of fuel, i.e. instantiation must cost more than 48 000 units.
-    /// That figure is a measurement of one fixture build under one wasmtime
-    /// version, not a property of the code: when wasmtime or the fixture makes
-    /// instantiation cheaper, the adapter loads and this assertion fails (it
-    /// does so on the current tree, which is an open question about the
-    /// measurement, not a regression of per-invocation fuel). The number must
-    /// then be re-measured, not worked around.
-    #[tokio::test]
-    async fn the_per_invocation_fuel_bound_stays_discriminating() {
+    async fn probe_middleware_fuel(max_fuel: u64) -> FuelProbe {
         let temp = TempDir::new().unwrap();
         install_middleware_fixture_with_resources(
             temp.path(),
-            &format!("max_fuel = {BELOW_INSTANTIATION_FUEL}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
+            &format!("max_fuel = {max_fuel}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
+        );
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        if !runtime.adapter_errors().is_empty() {
+            assert!(
+                runtime
+                    .adapter_errors()
+                    .iter()
+                    .any(|error| error.contains("all fuel consumed")),
+                "the adapter must be missing because the budget ran out, not for another reason \
+                 (max_fuel {max_fuel}): {:?}",
+                runtime.adapter_errors()
+            );
+            return FuelProbe::StarvedAtLoad;
+        }
+        let output = runtime
+            .middleware()
+            .process(MIDDLEWARE_RECOVERY_STAGE, r#"{"text":"hello"}"#)
+            .await;
+        if transformed_middleware_text(&output).as_deref() == Some("[wasm-middleware] hello") {
+            FuelProbe::Funded
+        } else {
+            FuelProbe::StarvedAtCall
+        }
+    }
+
+    /// Measures, on the current platform and engine, the smallest `max_fuel`
+    /// that instantiates the fixture and serves one `process` call, as the
+    /// boundary between a starved and a funded probe. Returns
+    /// `(largest_starved, smallest_funded)`, at most `PRECISION` apart. Fuel
+    /// cost is deterministic for a given engine and guest, so the probe is
+    /// monotonic and the search needs no retries.
+    async fn measure_one_call_fuel() -> (u64, u64) {
+        const PRECISION: u64 = 64;
+        const CEILING: u64 = 1_000_000_000;
+        let mut starved = 0u64;
+        let mut funded = 1_024u64;
+        while probe_middleware_fuel(funded).await != FuelProbe::Funded {
+            assert!(
+                funded < CEILING,
+                "one middleware call is not funded even by {CEILING} fuel"
+            );
+            starved = funded;
+            funded = funded.saturating_mul(2);
+        }
+        while funded - starved > PRECISION {
+            let middle = starved + (funded - starved) / 2;
+            if probe_middleware_fuel(middle).await == FuelProbe::Funded {
+                funded = middle;
+            } else {
+                starved = middle;
+            }
+        }
+        (starved, funded)
+    }
+
+    /// The per-invocation fuel limit is real and discriminating, on every
+    /// platform. Fuel costs differ per target and wasmtime version, so the
+    /// oracle is measured here rather than hard-coded:
+    ///
+    /// 1. `measure_one_call_fuel` finds the boundary between a budget that
+    ///    cannot instantiate the fixture and serve one call and a budget that
+    ///    can.
+    /// 2. A budget just below the boundary must fail, either because the
+    ///    adapter runs out of fuel while loading (`all fuel consumed`) or, when
+    ///    instantiation is nearly free, because the call itself runs out. In
+    ///    both cases the call must not return the transformed text.
+    /// 3. A budget half again above the boundary must serve several calls in
+    ///    a row; each call that succeeds after the first proves fuel is reset
+    ///    per invocation, since the sum of the calls exceeds that budget.
+    ///
+    /// The old oracle asserted that instantiation alone costs over 48 000
+    /// fuel, which holds on aarch64 but not on x86_64.
+    #[tokio::test]
+    async fn the_per_invocation_fuel_bound_stays_discriminating() {
+        let (starved_fuel, funded_fuel) = measure_one_call_fuel().await;
+        assert!(starved_fuel > 0, "a zero-fuel budget must not fund a call");
+
+        let temp = TempDir::new().unwrap();
+        install_middleware_fixture_with_resources(
+            temp.path(),
+            &format!("max_fuel = {starved_fuel}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
         );
         let starved = init_plugin_runtime(temp.path(), None).await.unwrap();
-        assert!(
-            starved.middleware_diagnostics().is_empty(),
-            "instantiating the fixture must still cost more than {BELOW_INSTANTIATION_FUEL} fuel, \
-             otherwise ONE_CALL_FUEL would fund instantiation plus several calls and the \
-             per-invocation regression would stop discriminating: {:?}",
-            starved.middleware_diagnostics()
+        if starved.adapter_errors().is_empty() {
+            let output = starved
+                .middleware()
+                .process(MIDDLEWARE_RECOVERY_STAGE, r#"{"text":"hello"}"#)
+                .await;
+            assert_ne!(
+                transformed_middleware_text(&output).as_deref(),
+                Some("[wasm-middleware] hello"),
+                "a budget below the measured boundary ({starved_fuel}..{funded_fuel}) must not fund a call: {output}"
+            );
+        } else {
+            assert!(
+                starved.middleware_diagnostics().is_empty(),
+                "a starved load must publish no middleware: {:?}",
+                starved.middleware_diagnostics()
+            );
+            assert!(
+                starved
+                    .adapter_errors()
+                    .iter()
+                    .any(|error| error.contains("all fuel consumed")),
+                "the adapter must be missing because the budget ran out, not for another reason: {:?}",
+                starved.adapter_errors()
+            );
+        }
+
+        let budget = funded_middleware_fuel(funded_fuel);
+        let temp = TempDir::new().unwrap();
+        install_middleware_fixture_with_resources(
+            temp.path(),
+            &format!("max_fuel = {budget}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
         );
-        assert!(
-            starved
-                .adapter_errors()
-                .iter()
-                .any(|error| error.contains("all fuel consumed")),
-            "the adapter must be missing because the budget ran out, not for another reason: {:?}",
-            starved.adapter_errors()
-        );
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        for call in 1..=8 {
+            let output = runtime
+                .middleware()
+                .process(MIDDLEWARE_RECOVERY_STAGE, r#"{"text":"hello"}"#)
+                .await;
+            assert_eq!(
+                transformed_middleware_text(&output).as_deref(),
+                Some("[wasm-middleware] hello"),
+                "call {call} under {budget} fuel (boundary {funded_fuel}) must succeed: {output}"
+            );
+        }
     }
 
     fn install_middleware_fixture_with_resources(workspace: &Path, resources: &str) {
@@ -2596,10 +2695,12 @@ optional = []
 
     #[tokio::test]
     async fn middleware_fuel_is_metered_per_invocation() {
+        let (_, funded_fuel) = measure_one_call_fuel().await;
+        let one_call_fuel = funded_middleware_fuel(funded_fuel);
         let temp = TempDir::new().unwrap();
         install_middleware_fixture_with_resources(
             temp.path(),
-            &format!("max_fuel = {ONE_CALL_FUEL}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
+            &format!("max_fuel = {one_call_fuel}\nmax_memory_mb = 8\nmax_execution_time_ms = 30000"),
         );
         let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
         assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());

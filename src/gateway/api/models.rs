@@ -190,6 +190,8 @@ pub async fn get_defaults(State(state): State<AppState>) -> Response {
 #[derive(Deserialize)]
 pub struct DefaultBody {
     #[serde(default)]
+    settings: Option<crate::config::model_settings::ModelSettings>,
+    #[serde(default)]
     operation: OperationParam,
     provider: String,
     model: String,
@@ -211,6 +213,7 @@ pub async fn put_defaults(
     manage::apply_change(
         &state,
         ManagedChange::SetDefault {
+            settings: body.settings,
             operation: body.operation.into(),
             provider: body.provider,
             model: body.model,
@@ -402,6 +405,43 @@ mod tests {
     use super::super::test_support::{at, json, serve_config};
     use reqwest::Method;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn invalid_saved_model_settings_remain_readable_for_repair() {
+        let served = serve_config(|config| {
+            config.model_settings.insert(
+                "openai/gpt-5.6".into(),
+                serde_json::from_value(json!({"level":"future","max_output_tokens":0})).unwrap(),
+            );
+        })
+        .await;
+        let (status, reply) = served
+            .call(Method::GET, "/api/models/settings?provider=openai&model=gpt-5.6", None)
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        let value = json(&reply);
+        assert_eq!(at(&value, "/settings/level"), "future");
+        assert!(at(&value, "/levels/high").is_object());
+        assert!(at(&value, "/validation_error").is_string());
+        let (status, reply) = served
+            .call(
+                Method::PUT,
+                "/api/models/settings?confirm_high_risk=true",
+                Some(json!({"model":"openai/gpt-5.6","settings":{"level":"high"}})),
+            )
+            .await;
+        assert!(status == 200 || status == 202, "{status}: {reply}");
+        assert_eq!(
+            served
+                .loaded()
+                .model_settings
+                .get("openai/gpt-5.6")
+                .unwrap()
+                .level
+                .as_deref(),
+            Some("high")
+        );
+    }
 
     /// F-2: a model id with `/` round-trips through the body (declaration,
     /// route, default, agent binding), through the query of `GET
@@ -649,6 +689,7 @@ mod tests {
                 config.default_model = Some("local-model".into());
                 config.reliability.fallback_providers = vec![url.clone()];
                 config.model_routes = vec![crate::config::ModelRouteConfig {
+                    settings: Default::default(),
                     hint: "fast".into(),
                     provider: url.clone(),
                     model: "local-model".into(),
@@ -700,4 +741,63 @@ mod tests {
             assert!(!reply.contains(FRAGMENT), "{surface} echoed the fragment: {reply}");
         }
     }
+}
+
+/// One canonical model and its durable parameter settings.
+#[derive(Deserialize)]
+pub struct SettingsBody {
+    model: String,
+    settings: crate::config::model_settings::ModelSettings,
+}
+
+/// Persist settings through the same authorization and revision checks as model selection.
+pub async fn put_model_settings(
+    State(state): State<AppState>,
+    Query(query): Query<WriteQuery>,
+    headers: HeaderMap,
+    Json(body): Json<SettingsBody>,
+) -> Response {
+    let write = write_of!(query, headers);
+    manage::apply_change(
+        &state,
+        ManagedChange::SetModelSettings {
+            model: body.model,
+            settings: body.settings,
+        },
+        write,
+    )
+    .await
+}
+
+/// Catalog declarations and the currently saved choice for a selected model.
+pub async fn get_model_settings(State(state): State<AppState>, Query(query): Query<ModelKey>) -> Response {
+    let Some(model) = query.model else {
+        return manage_error_response(ManageError::Invalid("a model is required".into()), None, &verbatim);
+    };
+    let release = match crate::providers::catalog::ReleaseCatalog::embedded_ref() {
+        Ok(release) => release,
+        Err(error) => return manage_error_response(ManageError::Invalid(error.to_string()), None, &verbatim),
+    };
+    let Some(row) = release.model(&crate::providers::ProviderId::of(&query.provider), &model) else {
+        return manage_error_response(ManageError::NotFound("release catalog model".into()), None, &verbatim);
+    };
+    let config = manage::service(&state).config();
+    let validation_error = config
+        .model_settings
+        .get(&row.id)
+        .and_then(|settings| settings.validate(&row.id).err())
+        .map(|error| error.to_string());
+    let mut settings = json!(config.model_settings.get(&row.id));
+    crate::config::secret_paths::redact_subtree(
+        &mut settings,
+        &[
+            crate::config::secret_paths::PathElem::Key("model_settings".into()),
+            crate::config::secret_paths::PathElem::Key(row.id.clone()),
+        ],
+    );
+    Json(
+        json!({"model":row.id, "levels":row.levels, "default_level":row.default_level,
+        "parameters":row.parameters, "settings":settings, "validation_error":validation_error}),
+    )
+    .into_response()
 }

@@ -1128,6 +1128,7 @@ mod tests {
             ..Config::default()
         };
         cfg.model_routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "openrouter".into(),
             model: "route-model".into(),
@@ -1346,6 +1347,7 @@ mod tests {
             ..Config::default()
         };
         cfg.model_routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "openrouter".into(),
             model: "vendor/route-model".into(),

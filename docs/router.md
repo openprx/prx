@@ -88,6 +88,13 @@ not establish complete attribution of every failed physical attempt.
 The revised actual-outcome learning policy uses a new domain version; earlier
 statistics based on reply text remain historical data and are not imported.
 
+SQLite learning shares the message/history writer pool. Competing writers wait
+within the learning operation's existing absolute deadline; a separate 25 ms
+connection timeout no longer poisons cleanup while that deadline is still
+available. Source, terminal, receipt and cancellation checks are unchanged.
+Reverting the finding-98 SQLite learning fix restores the earlier connection
+behavior without changing stored receipts.
+
 The embedded Agent currently creates a new session identity for a new instance.
 Persisted rows do not imply statistics automatically resume across a new Agent
 or process. Existing legacy global records are not a source-authorized migration.

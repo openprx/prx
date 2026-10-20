@@ -421,3 +421,13 @@ The read-only `GET /api/causal/reports/saved` catalog returns only authenticated
 Decision inspection also projects recorded Noul probabilities for canonical global and candidate questions. Missing, legacy or malformed feature maps remain unavailable; the view neither fills missing probabilities nor renormalizes them. Candidate feature names are restricted to canonical action/target keys and optional eight-digit hexadecimal namespace discriminators.
 
 Ordinary Console session messages use the pinned source-bound built-in decision service even when the causal plane is disabled. Disabled mode may use authenticated in-memory input when no durable event exists, omits causal settlement/rejoin, and keeps normal transcript persistence and cancellation cleanup. Approval/revoke/resume endpoints remain unavailable while disabled. Gateway default-provider construction binds the exact PMM-resolved model and credentials in both modes.
+
+## Model levels and parameter settings
+
+Open **Model settings** on the Models page to load that model's release-catalog
+levels and parameter declarations. Numeric controls use the declared bounds
+and steps; enumerated controls list only declared values. Empty controls keep
+the level's value. Review the settings change before applying it through the
+existing transaction flow; revision checks and history rollback still apply.
+The backend refuses invalid durable values before any write. See
+[model settings and API examples](model-catalog.md#saving-a-model-level).

@@ -64,12 +64,14 @@ struct ResponsesInputContent {
 
 #[derive(Debug, Serialize)]
 struct ResponsesTextOptions {
-    verbosity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verbosity: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct ResponsesReasoningOptions {
-    effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
     summary: String,
 }
 
@@ -195,42 +197,6 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
     };
 
     (instructions, input)
-}
-
-fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
-    let id = normalize_model_id(model);
-    if (id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3")) && effort == "minimal" {
-        return "low".to_string();
-    }
-    if id == "gpt-5.1" && effort == "xhigh" {
-        return "high".to_string();
-    }
-    if id == "gpt-5.1-codex-mini" {
-        return if effort == "high" || effort == "xhigh" {
-            "high".to_string()
-        } else {
-            "medium".to_string()
-        };
-    }
-    effort.to_string()
-}
-
-const VALID_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
-
-fn resolve_reasoning_effort(model_id: &str, config_effort: Option<&str>) -> String {
-    let base = match config_effort {
-        None => "xhigh",
-        Some(effort) if VALID_REASONING_EFFORTS.contains(&effort) => effort,
-        Some(invalid) => {
-            tracing::warn!(
-                value = invalid,
-                valid = ?VALID_REASONING_EFFORTS,
-                "invalid reasoning_effort config value, falling back to default"
-            );
-            "xhigh"
-        }
-    };
-    clamp_reasoning_effort(model_id, base)
 }
 
 fn nonempty_preserve(text: Option<&str>) -> Option<String> {
@@ -748,7 +714,7 @@ fn responses_stream_to_chunks(
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-    tokio::spawn(async move {
+    super::parameter_capture::spawn(async move {
         let normalized_content_type = normalize_content_type(
             response
                 .headers()
@@ -966,6 +932,7 @@ impl OpenAiCodexProvider {
                 )
             })?;
         let normalized_model = normalize_model_id(model);
+        let (text, reasoning) = request_options(normalized_model, self.reasoning_effort_override.clone());
 
         let request = ResponsesRequest {
             model: normalized_model.to_string(),
@@ -973,13 +940,8 @@ impl OpenAiCodexProvider {
             instructions,
             store: false,
             stream: true,
-            text: ResponsesTextOptions {
-                verbosity: "medium".to_string(),
-            },
-            reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(normalized_model, self.reasoning_effort_override.as_deref()),
-                summary: "auto".to_string(),
-            },
+            text,
+            reasoning,
             include: vec!["reasoning.encrypted_content".to_string()],
             tool_choice: "auto".to_string(),
             parallel_tool_calls: true,
@@ -996,7 +958,12 @@ impl OpenAiCodexProvider {
             .header("accept", "text/event-stream")
             .header("accept-encoding", "identity")
             .header("Content-Type", "application/json")
-            .json(&request)
+            .json(&super::parameter_wire::request(
+                "openai-codex",
+                super::parameter_wire::Format::Responses,
+                &request.model,
+                &request,
+            ))
             .send()
             .await?;
 
@@ -1037,7 +1004,7 @@ impl OpenAiCodexProvider {
         let count_tokens = options.count_tokens;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
-        tokio::spawn(async move {
+        super::parameter_capture::spawn(async move {
             let access_token = match auth
                 .get_valid_openai_access_token(auth_profile_override.as_deref())
                 .await
@@ -1080,19 +1047,15 @@ impl OpenAiCodexProvider {
                 }
             };
             let normalized_model = normalize_model_id(&model);
+            let (text, reasoning) = request_options(normalized_model, reasoning_effort_override.clone());
             let request = ResponsesRequest {
                 model: normalized_model.to_string(),
                 input,
                 instructions,
                 store: false,
                 stream: true,
-                text: ResponsesTextOptions {
-                    verbosity: "medium".to_string(),
-                },
-                reasoning: ResponsesReasoningOptions {
-                    effort: resolve_reasoning_effort(normalized_model, reasoning_effort_override.as_deref()),
-                    summary: "auto".to_string(),
-                },
+                text,
+                reasoning,
                 include: vec!["reasoning.encrypted_content".to_string()],
                 tool_choice: "auto".to_string(),
                 parallel_tool_calls: true,
@@ -1108,7 +1071,12 @@ impl OpenAiCodexProvider {
                 .header("accept", "text/event-stream")
                 .header("accept-encoding", "identity")
                 .header("Content-Type", "application/json")
-                .json(&request)
+                .json(&super::parameter_wire::request(
+                    "openai-codex",
+                    super::parameter_wire::Format::Responses,
+                    &request.model,
+                    &request,
+                ))
                 .send()
                 .await
             {
@@ -1269,10 +1237,66 @@ impl Provider for OpenAiCodexProvider {
     }
 }
 
+// Known rows use the adopted catalog default of medium effort.
+fn request_options(model: &str, effort: Option<String>) -> (ResponsesTextOptions, ResponsesReasoningOptions) {
+    let legacy = !super::catalog::ReleaseCatalog::embedded_ref().is_ok_and(|catalog| {
+        catalog
+            .model(&super::ProviderId::of("openai-codex"), normalize_model_id(model))
+            .is_some_and(|row| !row.parameters.is_empty())
+    });
+    (
+        ResponsesTextOptions {
+            verbosity: legacy.then(|| "medium".into()),
+        },
+        ResponsesReasoningOptions {
+            effort: effort.or_else(|| legacy.then(|| "xhigh".into())),
+            summary: "auto".into(),
+        },
+    )
+}
+
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_codex_requests_keep_legacy_options_and_explicit_effort() {
+        let (text, reasoning) = request_options("prx-unknown-model", None);
+        let body = serde_json::json!({"text":text,"reasoning":reasoning});
+        let encoded = serde_json::to_value(super::super::parameter_wire::request(
+            "openai-codex",
+            super::super::parameter_wire::Format::Responses,
+            "prx-unknown-model",
+            &body,
+        ))
+        .unwrap();
+        assert_eq!(encoded["text"]["verbosity"], "medium");
+        assert_eq!(encoded["reasoning"]["effort"], "xhigh");
+        let (_, reasoning) = request_options("prx-unknown-model", Some("minimal".into()));
+        assert_eq!(reasoning.effort.as_deref(), Some("minimal"));
+        let (text, reasoning) = request_options("openai-codex/gpt-5.3-codex", None);
+        assert!(text.verbosity.is_none());
+        assert!(reasoning.effort.is_none());
+    }
+
+    #[test]
+    fn empty_codex_declarations_preserve_the_legacy_request_options() {
+        let catalog = super::super::catalog::ReleaseCatalog::embedded_ref().unwrap();
+        let mut exercised = 0;
+        for row in &catalog.models {
+            if row.provider != "openai-codex" || !row.parameters.is_empty() {
+                continue;
+            }
+            let (text, reasoning) = request_options(&row.api_model, None);
+            assert_eq!(text.verbosity.as_deref(), Some("medium"), "{}", row.id);
+            assert_eq!(reasoning.effort.as_deref(), Some("xhigh"), "{}", row.id);
+            let (_, explicit) = request_options(&row.api_model, Some("low".into()));
+            assert_eq!(explicit.effort.as_deref(), Some("low"));
+            exercised += 1;
+        }
+        assert!(exercised > 0);
+    }
 
     /// **UTF-8 streaming regression** — the byte-level decoder used by this
     /// provider's stream loop must carry a character that the transport split
@@ -1359,6 +1383,20 @@ mod tests {
 
     #[test]
     fn clamp_reasoning_effort_adjusts_known_models() {
+        fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
+            let body = serde_json::json!({"reasoning":{"effort":effort}});
+            let request = super::super::parameter_wire::request(
+                "openai-codex",
+                super::super::parameter_wire::Format::Responses,
+                model,
+                &body,
+            );
+            serde_json::to_value(request).expect("test: resolved request")["reasoning"]["effort"]
+                .as_str()
+                .expect("test: effort")
+                .to_owned()
+        }
+
         assert_eq!(clamp_reasoning_effort("gpt-5.3-codex", "minimal"), "low".to_string());
         assert_eq!(clamp_reasoning_effort("gpt-5.1", "xhigh"), "high".to_string());
         assert_eq!(
@@ -1370,6 +1408,18 @@ mod tests {
             "high".to_string()
         );
         assert_eq!(clamp_reasoning_effort("gpt-5.3-codex", "xhigh"), "xhigh".to_string());
+        assert_eq!(
+            clamp_reasoning_effort("prx-unknown-model", "minimal"),
+            "minimal".to_string()
+        );
+        let body = serde_json::json!({"reasoning":{"effort":"xhigh"}});
+        let request = super::super::parameter_wire::request(
+            "custom:https://example.com",
+            super::super::parameter_wire::Format::Responses,
+            "gpt-5.1",
+            &body,
+        );
+        assert_eq!(serde_json::to_value(request).unwrap()["reasoning"]["effort"], "xhigh");
     }
 
     #[test]

@@ -183,6 +183,7 @@ fn process_mode_task_arg_is_not_json_encoded() {
         route_uses_root_connection: false,
         direct_uses_root_connection: false,
         temperature: 0.7,
+        temperature_override: None,
         config_dir: std::path::PathBuf::from("/tmp/openprx"),
         config_generation: "0".repeat(64),
         runtime_config_generation_id: None,

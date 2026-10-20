@@ -1089,6 +1089,7 @@ mod tests {
                 });
             let config = &mut builder.runtime_config.as_mut().unwrap().0;
             config.model_routes.push(crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "other".to_owned(),
                 provider: endpoint.to_owned(),
                 model: "prx-other-model".to_owned(),

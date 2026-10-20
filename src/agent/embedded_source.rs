@@ -1155,6 +1155,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".to_owned(),
             provider: "ollama".to_owned(),
             model: "prx-fast-model".to_owned(),
@@ -1187,6 +1188,7 @@ mod tests {
         config.config_path = workspace.path().join("config.toml");
         config.causal_tree.enabled = false;
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".to_owned(),
             provider: "ollama".to_owned(),
             model: "prx-fast-model".to_owned(),
@@ -1219,6 +1221,7 @@ mod tests {
         config.config_path = workspace.path().join("config.toml");
         config.causal_tree.enabled = false;
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "private_route".to_owned(),
             provider: endpoint.to_owned(),
             model: "prx-route-model".to_owned(),
@@ -1254,6 +1257,7 @@ mod tests {
         config.config_path = workspace.path().join("config.toml");
         config.causal_tree.enabled = false;
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "other".to_owned(),
             provider: "custom:http://127.0.0.1:19999/v1".to_owned(),
             model: "prx-other-model".to_owned(),
@@ -1335,6 +1339,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "other".to_owned(),
             provider: "custom:http://127.0.0.1:19999/v1".to_owned(),
             model: "prx-other-model".to_owned(),

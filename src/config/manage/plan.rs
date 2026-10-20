@@ -1640,6 +1640,7 @@ mod tests {
         let before = Config::default();
         let mut after = before.clone();
         after.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "openrouter".into(),
             model: "m".into(),
@@ -1814,6 +1815,7 @@ mod tests {
         before.default_provider = Some("openai".into());
         before.api_key = Some("sentinel-root-key".into());
         before.model_routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "openai".into(),
             model: "gpt-4o-mini".into(),
@@ -1871,6 +1873,7 @@ mod tests {
     #[test]
     fn a_key_moved_under_a_renamed_route_or_embedding_route_is_high_risk() {
         let route = |hint: &str, provider: &str| crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: hint.into(),
             provider: provider.into(),
             model: "some-model".into(),
@@ -1952,6 +1955,7 @@ mod tests {
     /// now high risk; turning them off is not.
     fn route(hint: &str, api_key: Option<&str>) -> crate::config::ModelRouteConfig {
         crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: hint.into(),
             provider: "openai".into(),
             model: "gpt-4o-mini".into(),

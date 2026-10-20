@@ -237,7 +237,7 @@ pub async fn run(
         .as_deref()
         .unwrap_or_else(|| providers::selection::default_model(&config));
 
-    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
+    let mut provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
     let (startup_connection, startup_provider) = chat_provider_chain(
         &config,
@@ -1947,19 +1947,29 @@ pub async fn run(
         // subtask actually requests on the next turn), and (c) dispatching ModelChanged so the reducer
         // updates session.model → the status bar reflects it immediately. A bare `/model` (no
         // argument) is still handed to dispatch, which shows the current model.
-        if let Some(raw) = user_input.strip_prefix("/model ") {
-            let new_model = raw.trim();
-            if new_model.is_empty() {
-                emit_chat_output("Usage: /model <name>");
-                continue;
+        if user_input == "/model save-default" {
+            let saved = super::model_commands::save_default(&config, provider_name, &current_model_owned, &provider_runtime_options).await;
+            match saved {
+                Ok(()) => emit_chat_output("Saved the current model and level as the default."),
+                Err(error) => emit_chat_output(&format!("Cannot save model default: {}", providers::sanitize_api_error(&error.to_string()))),
             }
+            continue;
+        }
+        let model_command = user_input.strip_prefix("/model ");
+        let level_command = user_input.strip_prefix("/level ");
+        if model_command.is_some() || level_command.is_some() {
+            let (new_model, candidate_options) = match super::model_commands::selection(&user_input, &current_model_owned, provider_name, &provider_runtime_options) {
+                Ok(selection) => selection,
+                Err(error) => { emit_chat_output(&format!("{error:#}")); continue; }
+            };
+            let new_model = new_model.as_str();
             let rebuilt = chat_model_switch(&config, provider_name, new_model).and_then(|()| {
                 chat_provider_chain(
                     &config,
                     provider_name,
                     configured_provider_name,
                     new_model,
-                    &provider_runtime_options,
+                    &candidate_options,
                 )
             });
             match rebuilt {
@@ -1980,6 +1990,7 @@ pub async fn run(
                             continue;
                         }
                     };
+                    provider_runtime_options = candidate_options;
                     provider_binding = binding;
                     provider = Arc::clone(&new_provider_arc);
                     #[cfg(feature = "terminal-tui")]

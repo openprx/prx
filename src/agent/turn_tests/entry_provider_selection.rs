@@ -209,6 +209,7 @@ async fn a_route_to_a_decision_only_model_is_refused() {
     let routed = probe.custom_provider();
     declare_decision_only(&mut config, &routed);
     config.model_routes = vec![crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "decide".to_string(),
         provider: routed,
         model: "jev-decision-test".to_string(),
@@ -236,6 +237,7 @@ fn a_hint_model_is_resolved_through_its_route() {
     let temp = tempfile::tempdir().expect("test: temp config dir");
     let mut config = isolated_config(&temp);
     config.model_routes = vec![crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: "openai".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -261,6 +263,7 @@ async fn direct_turn_keeps_root_credential_beside_a_keyed_route() {
     config.default_model = Some(PROBE_MODEL.to_string());
     config.causal_tree.enabled = false;
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: selected.clone(),
         model: PROBE_MODEL.to_string(),
@@ -300,6 +303,7 @@ async fn second_same_provider_hint_uses_its_own_wire_key() {
     config.causal_tree.enabled = false;
     for (hint, key) in [("first", "PRX-FIRST-KEY"), ("second", "PRX-SECOND-KEY")] {
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: hint.to_string(),
             provider: selected.clone(),
             model: PROBE_MODEL.to_string(),
@@ -338,6 +342,7 @@ async fn keyed_hint_after_unkeyed_route_uses_its_own_key() {
     config.causal_tree.enabled = false;
     config.model_routes = vec![
         crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "unkeyed".to_string(),
             provider: selected.clone(),
             model: PROBE_MODEL.to_string(),
@@ -345,6 +350,7 @@ async fn keyed_hint_after_unkeyed_route_uses_its_own_key() {
             credential_ref: None,
         },
         crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "keyed".to_string(),
             provider: selected,
             model: PROBE_MODEL.to_string(),
@@ -386,6 +392,7 @@ async fn keyed_primary_hint_retries_without_root_rotation_key() {
     config.causal_tree.enabled = false;
     config.reliability.api_keys = vec![ROTATION_SENTINEL.to_string()];
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: selected,
         model: PROBE_MODEL.to_string(),
@@ -413,6 +420,7 @@ fn keyed_primary_hint_does_not_inherit_root_endpoint() {
     config.api_url = Some("http://127.0.0.1:9/v1".to_string());
     config.causal_tree.enabled = false;
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: "openai".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -440,6 +448,7 @@ fn raw_provider_whitespace_cannot_hide_a_keyed_factory_route() {
     let mut config = isolated_config(&temp);
     config.default_provider = Some("openai ".to_string());
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: "openai ".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -603,6 +612,7 @@ async fn resolved_url_only_roots_restore_provider_profile_lookup_on_owned_wire()
             let selection = agent_provider_selection(&choice);
             let mut changed = config.clone();
             changed.model_routes.push(crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "prx_route".into(),
                 provider: provider_label.clone(),
                 model: "prx-local-model".into(),
