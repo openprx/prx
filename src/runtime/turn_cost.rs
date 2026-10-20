@@ -338,6 +338,33 @@ mod tests {
     }
 
     #[test]
+    fn moonshot_release_default_is_priced_by_the_real_g6_cost_model() {
+        let config = crate::config::Config::default();
+        let release = crate::providers::catalog::ReleaseCatalog::embedded_ref().unwrap();
+        let selected = release.default_model("moonshot").expect("test: Moonshot default");
+        let row = release
+            .model(&crate::providers::ProviderId::of("moonshot"), selected)
+            .unwrap();
+        assert!(row.is_active(), "default model must be active");
+        assert!(row.pricing.is_some(), "default model must have a published tariff");
+        assert!(config.cost.prices.is_empty());
+        let selected = model(&config, "moonshot", selected);
+        let catalog = empty_catalog();
+        let view = catalog.view(&Default::default());
+        let priced = build_cost_model(&view, &selected, &config.cost, &BTreeMap::new());
+        let (cost, _) = priced
+            .estimates
+            .get(&CapabilityTarget::None)
+            .expect("test: cost-admitted answer candidate");
+        assert!(cost.micro_usd > 0);
+        assert!(
+            RuntimeCostModel::new(&selected, &config, &BTreeMap::new())
+                .estimate_terminal()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn an_unknown_price_cannot_become_a_free_candidate() {
         let config = crate::config::Config::default();
         let model = model(&config, "openai", "prx-unlisted-model");

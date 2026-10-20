@@ -436,7 +436,14 @@
     "unset": "未声明",
     "planAdd": "预览添加",
     "planUpdate": "预览更新",
-    "planRemove": "预览移除"
+    "planRemove": "预览移除",
+    "settings": "模型设置",
+    "level": "模型级别",
+    "defaultValue": "默认",
+    "useLevelValue": "使用级别值",
+    "enabled": "启用",
+    "disabled": "禁用",
+    "reviewSettings": "查看设置变更"
   },
   "routing": {
     "title": "默认、路由与代理",

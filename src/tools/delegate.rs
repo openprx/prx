@@ -1090,8 +1090,9 @@ impl DelegateTool {
                         .agents
                         .get(&agent_name)
                         .ok_or_else(|| anyhow::anyhow!("delegate admitted agent configuration missing"))?;
-                    resources
-                        .boxed_delegate_loop(DelegateLoopRequest {
+                    crate::providers::model_settings::with_temperature(
+                        agent_config.temperature,
+                        resources.boxed_delegate_loop(DelegateLoopRequest {
                             agent_name: &agent_name,
                             agent_config,
                             effective_provider: &effective_provider,
@@ -1102,8 +1103,9 @@ impl DelegateTool {
                             scope: None,
                             child_source: Some(child_source),
                             task_context: Some(task_context),
-                        })
-                        .await
+                        }),
+                    )
+                    .await
                 })
                 .await
         }
@@ -3830,6 +3832,7 @@ mod credential_containment_tests {
         config.api_key = Some("PRX-DELEGATE-ROOT-KEY".to_string());
         config.agents = agents.clone();
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".to_string(),
             provider: route.custom_provider(),
             model: PROBE_MODEL.to_string(),

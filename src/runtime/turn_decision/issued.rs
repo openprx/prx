@@ -12,6 +12,9 @@ impl TurnDecisionService {
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
         let (context, _telemetry) = admission;
+        // Admission, including a pause before any child publication, owns the
+        // original run allowance. The context lease cleans up failed issuance.
+        self.issue_recursive_allowance(proof, &context);
         if cancellation.is_cancelled() && !context.router_cleanup_close() {
             return Err(AgentDecisionError::Cancelled);
         }

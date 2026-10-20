@@ -1,8 +1,8 @@
 {
   "$schema": "./models.schema.json",
   "schema_version": "1.0",
-  "revision": "2026-10-17.1",
-  "published_at": "2026-10-17T00:00:00Z",
+  "revision": "2026-10-20.1",
+  "published_at": "2026-10-20T06:07:31Z",
   "providers": {
     "anthropic": {
       "default_model": "anthropic/claude-sonnet-5",
@@ -73,7 +73,7 @@
       "display_name": "Mistral"
     },
     "moonshot": {
-      "default_model": "moonshot/kimi-k2.5",
+      "default_model": "moonshot/kimi-k2.6",
       "display_name": "Moonshot"
     },
     "nvidia": {
@@ -155,11 +155,35 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 1,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium"
     },
@@ -184,11 +208,35 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 1,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium"
     },
@@ -215,11 +263,33 @@
       "limits": {
         "context_window": 1000000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium",
       "router": {
@@ -257,11 +327,35 @@
       "limits": {
         "context_window": 200000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 1,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium",
       "router": {
@@ -298,11 +392,35 @@
       "limits": {
         "context_window": 200000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 1,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium",
       "router": {
@@ -343,11 +461,35 @@
       "limits": {
         "context_window": 200000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 1,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -389,11 +531,35 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 1,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -427,11 +593,35 @@
       "limits": {
         "context_window": 1000000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 1,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium",
       "router": {
@@ -469,11 +659,33 @@
       "limits": {
         "context_window": 1000000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium",
       "router": {
@@ -508,11 +720,33 @@
       "limits": {
         "context_window": 1000000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -555,11 +789,35 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 1,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -593,11 +851,35 @@
       "limits": {
         "context_window": 1000000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 1,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium",
       "router": {
@@ -637,11 +919,47 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048,
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "max_output_tokens": 4096,
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "max_output_tokens": 8192,
+          "reasoning_effort": "high"
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -774,11 +1092,35 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 1,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium"
     },
@@ -800,11 +1142,33 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium"
     },
@@ -826,11 +1190,35 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 1,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium"
     },
@@ -852,11 +1240,33 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 4096,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048
+        },
+        "medium": {
+          "max_output_tokens": 4096
+        },
+        "high": {
+          "max_output_tokens": 4096
+        }
       },
       "default_level": "medium"
     },
@@ -1167,11 +1577,35 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 8192,
+          "default": 8192
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 4096
+        },
+        "medium": {
+          "max_output_tokens": 8192
+        },
+        "high": {
+          "max_output_tokens": 8192
+        }
       },
       "default_level": "medium"
     },
@@ -1198,11 +1632,35 @@
       "limits": {
         "context_window": 1000000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 8192,
+          "default": 8192
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 4096
+        },
+        "medium": {
+          "max_output_tokens": 8192
+        },
+        "high": {
+          "max_output_tokens": 8192
+        }
       },
       "default_level": "medium",
       "router": {
@@ -1239,11 +1697,35 @@
       "limits": {
         "context_window": 1000000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 8192,
+          "default": 8192
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 4096
+        },
+        "medium": {
+          "max_output_tokens": 8192
+        },
+        "high": {
+          "max_output_tokens": 8192
+        }
       },
       "default_level": "medium",
       "router": {
@@ -1304,11 +1786,35 @@
         "latency_ms": 800,
         "quality_rank": 1000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 65536,
+          "default": 8192
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 4096
+        },
+        "medium": {
+          "max_output_tokens": 8192
+        },
+        "high": {
+          "max_output_tokens": 16384
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -1349,11 +1855,35 @@
         "latency_ms": 2000,
         "quality_rank": 1000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 65536,
+          "default": 8192
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 4096
+        },
+        "medium": {
+          "max_output_tokens": 8192
+        },
+        "high": {
+          "max_output_tokens": 16384
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -1391,11 +1921,35 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 8192,
+          "default": 8192
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 4096
+        },
+        "medium": {
+          "max_output_tokens": 8192
+        },
+        "high": {
+          "max_output_tokens": 8192
+        }
       },
       "default_level": "medium"
     },
@@ -1599,7 +2153,14 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 1,
+          "max": 1,
+          "default": 1
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -1625,7 +2186,14 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 1,
+          "max": 1,
+          "default": 1
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -1651,7 +2219,14 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 1,
+          "max": 1,
+          "default": 1
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -1952,7 +2527,10 @@
       "display_name": "Kimi K2 0905 Preview (strong coding)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-05-25T00:00:00Z",
+        "retire_at": "2026-05-25T00:00:00Z",
+        "replacement": "moonshot/kimi-k2.6"
       },
       "operations": [
         "chat"
@@ -1978,7 +2556,10 @@
       "display_name": "Kimi K2 Thinking (deep reasoning + tool use)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-05-25T00:00:00Z",
+        "retire_at": "2026-05-25T00:00:00Z",
+        "replacement": "moonshot/kimi-k2.6"
       },
       "operations": [
         "chat"
@@ -2004,7 +2585,10 @@
       "display_name": "Kimi K2.5 (latest flagship, recommended)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-08-31T00:00:00Z",
+        "retire_at": "2026-08-31T00:00:00Z",
+        "replacement": "moonshot/kimi-k2.6"
       },
       "operations": [
         "chat"
@@ -2030,10 +2614,7 @@
       "display_name": "kimi-k2.6",
       "aliases": [],
       "lifecycle": {
-        "status": "retired",
-        "deprecated_at": "2026-10-16T00:00:00Z",
-        "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "moonshot/kimi-k2.5"
+        "status": "active"
       },
       "operations": [
         "chat"
@@ -2225,7 +2806,24 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -2251,7 +2849,24 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -2277,7 +2892,24 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -2303,7 +2935,24 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -2329,11 +2978,39 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "high"
+        }
       },
       "default_level": "medium"
     },
@@ -2355,11 +3032,40 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
       },
       "default_level": "medium"
     },
@@ -2423,11 +3129,39 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "high"
+        }
       },
       "default_level": "medium"
     },
@@ -2454,7 +3188,24 @@
       "limits": {
         "context_window": 128000
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -2469,7 +3220,7 @@
         "cache_read": 1.25
       },
       "router": {
-        "cost_per_million_tokens": 5.0,
+        "cost_per_million_tokens": 2.5,
         "categories": [
           "conversation",
           "analysis",
@@ -2502,7 +3253,24 @@
       "limits": {
         "context_window": 128000
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -2584,11 +3352,48 @@
         "context_window": 1050000,
         "max_output_tokens": 128000
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -2629,11 +3434,48 @@
         "context_window": 1050000,
         "max_output_tokens": 128000
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -2674,11 +3516,43 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -2719,11 +3593,48 @@
         "context_window": 1050000,
         "max_output_tokens": 128000
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -2801,7 +3712,7 @@
         "max_output_tokens": 128000
       },
       "router": {
-        "cost_per_million_tokens": 3,
+        "cost_per_million_tokens": 2,
         "categories": [
           "code",
           "reasoning",
@@ -2810,11 +3721,47 @@
         "latency_ms": 1500,
         "quality_rank": 1000
       },
-      "parameters": {},
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "max_output_tokens": 2048,
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "max_output_tokens": 4096,
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "max_output_tokens": 8192,
+          "reasoning_effort": "high"
+        }
       },
       "default_level": "medium",
       "pricing": {
@@ -3029,11 +3976,48 @@
         "streaming": true
       },
       "limits": {},
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
       "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
       },
       "default_level": "medium"
     },
@@ -3935,7 +4919,24 @@
         "cache_write": 0.0,
         "cache_read": 0.0
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -3968,7 +4969,24 @@
         "cache_write": 0.0,
         "cache_read": 0.0
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -4001,7 +5019,24 @@
         "cache_write": 0.0,
         "cache_read": 0.0
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -4034,7 +5069,24 @@
         "cache_write": 0.0,
         "cache_read": 0.0
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -4067,7 +5119,24 @@
         "cache_write": 0.0,
         "cache_read": 0.0
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -4100,7 +5169,24 @@
         "cache_write": 0.0,
         "cache_read": 0.0
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -4133,7 +5219,24 @@
         "cache_write": 0.0,
         "cache_read": 0.0
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -4166,7 +5269,24 @@
         "cache_write": 0.0,
         "cache_read": 0.0
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
@@ -4199,11 +5319,185 @@
         "cache_write": 0.0,
         "cache_read": 0.0
       },
-      "parameters": {},
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        },
+        "seed": {
+          "kind": "range",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
       "levels": {
         "low": {},
         "medium": {},
         "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openai-codex/gpt-5.3-codex",
+      "provider": "openai-codex",
+      "api_model": "gpt-5.3-codex",
+      "display_name": "gpt-5.3-codex",
+      "aliases": [],
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_at": "2026-10-19T00:00:00Z",
+        "replacement": "openai-codex/gpt-5.2-codex"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openai-codex/gpt-5.1",
+      "provider": "openai-codex",
+      "api_model": "gpt-5.1",
+      "display_name": "gpt-5.1",
+      "aliases": [],
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_at": "2026-10-19T00:00:00Z",
+        "replacement": "openai-codex/gpt-5.2-codex"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "none"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "high"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openai-codex/gpt-5.1-codex-mini",
+      "provider": "openai-codex",
+      "api_model": "gpt-5.1-codex-mini",
+      "display_name": "gpt-5.1-codex-mini",
+      "aliases": [],
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_at": "2026-10-19T00:00:00Z",
+        "replacement": "openai-codex/gpt-5.2-codex"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {},
+      "limits": {},
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "medium"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "high"
+        }
       },
       "default_level": "medium"
     }

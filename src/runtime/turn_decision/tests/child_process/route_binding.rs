@@ -11,6 +11,7 @@ pub(super) fn configure(config: &mut crate::config::Config) {
     config.default_model = Some(MODEL_HINT.into());
     config.api_key = Some(ROOT_KEY.into());
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: ROUTE.into(),
         provider: "ollama".into(),
         model: "prx-local-model".into(),

@@ -48,6 +48,10 @@ impl TurnDecisionService {
 }
 
 impl ApprovalCollectionLease {
+    pub(crate) fn parameter_capture(&self) -> crate::providers::parameter_capture::Capture {
+        self.context.capture_main_parameters(true)
+    }
+
     pub(crate) fn proposal_spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.descriptor.public_name.clone(),

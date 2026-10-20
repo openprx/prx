@@ -120,6 +120,7 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
 
     print_step(2, 9, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
+    let model_settings = choose_model_level(&provider, &model)?;
 
     print_step(3, 9, "Channels (How You Talk to OpenPRX)");
     let channels_config = setup_channels()?;
@@ -153,6 +154,7 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
         // Stored as the resolver reads it (R-PMMCh C-2).
         default_model: Some(model.trim().to_string()),
         default_temperature: 0.7,
+        model_settings,
         providers: crate::config::ProvidersConfig::default(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
@@ -252,7 +254,7 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
     // Write config.toml (main) + config.d/ fragment files.
     // This replaces the flat config.save() call so that the user's
     // workspace is set up with the split layout from the start.
-    crate::config::files::write_split_config(&config, false).await?;
+    persist_onboarding_config(&config, true).await?;
     persist_workspace_selection(&config.config_path).await?;
 
     // ── Decision plane: the shared setup service, then a local test ──
@@ -486,6 +488,7 @@ async fn run_quick_setup_with_home(
         default_provider: Some(provider_name.clone()),
         default_model: Some(model.clone()),
         default_temperature: 0.7,
+        model_settings: Default::default(),
         providers: crate::config::ProvidersConfig::default(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
@@ -543,16 +546,11 @@ async fn run_quick_setup_with_home(
     // evidence for, or nothing is written.
     check_onboarding_selection(&config, &provider_name, &model)?;
 
-    let config_d_dir = config
+    let split = config
         .config_path
         .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("config.d");
-    if config_d_dir.is_dir() {
-        crate::config::files::write_split_config(&config, false).await?;
-    } else {
-        config.save().await?;
-    }
+        .is_some_and(|parent| parent.join("config.d").is_dir());
+    persist_onboarding_config(&config, split).await?;
     persist_workspace_selection_at(&config.config_path, &default_user_config_dir(home)).await?;
 
     // Scaffold minimal workspace files
@@ -4581,6 +4579,35 @@ mod tests {
     use std::io::{BufRead, Write};
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn onboarding_model_and_level_commit_through_history_in_both_file_layouts() {
+        use crate::config::manage::{ConfigActor, ConfigTransactions, RecordStatus};
+        for split in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let settings = serde_json::from_value(json!({"level":"high","reasoning_effort":"low"})).unwrap();
+            let config = Config {
+                config_path: dir.path().join("config.toml"),
+                workspace_dir: dir.path().join("workspace"),
+                default_provider: Some("openai".into()),
+                default_model: Some("gpt-5.6".into()),
+                model_settings: [("openai/gpt-5.6".into(), settings)].into(),
+                ..Default::default()
+            };
+            std::fs::create_dir_all(&config.workspace_dir).unwrap();
+            persist_onboarding_config(&config, split).await.unwrap();
+            let loaded = Config::load_from_path(&config.config_path, config.workspace_dir.clone()).unwrap();
+            assert_eq!(loaded.default_model, config.default_model);
+            assert_eq!(loaded.model_settings, config.model_settings);
+            let transactions = ConfigTransactions::new(crate::config::new_shared(loaded));
+            let records = transactions.history().unwrap().list().unwrap();
+            assert_eq!(records.len(), 1);
+            let record = records.first().unwrap();
+            assert_eq!(record.actor, ConfigActor::Cli);
+            assert_eq!(record.status, RecordStatus::ActivationDeferred);
+            assert!(record.committed_revision.is_some());
+        }
+    }
+
     // ── ProjectContext defaults ──────────────────────────────────
 
     #[test]
@@ -5136,7 +5163,7 @@ mod tests {
         assert_eq!(default_model_for_provider("bedrock"), "anthropic.claude-sonnet-5");
         assert_eq!(default_model_for_provider("google-gemini"), "gemini-3.5-flash");
         assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
-        assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
+        assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.6");
         assert_eq!(default_model_for_provider("nvidia"), "meta/llama-3.3-70b-instruct");
         assert_eq!(default_model_for_provider("nvidia-nim"), "meta/llama-3.3-70b-instruct");
         assert_eq!(default_model_for_provider("llamacpp"), "ggml-org/gpt-oss-20b-GGUF");
@@ -5233,8 +5260,9 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        assert!(ids.contains(&"kimi-k2.5".to_string()));
-        assert!(ids.contains(&"kimi-k2-thinking".to_string()));
+        assert!(ids.contains(&"kimi-k2.6".to_string()));
+        assert!(!ids.contains(&"kimi-k2.5".to_string()));
+        assert!(!ids.contains(&"kimi-k2-thinking".to_string()));
         assert!(!ids.contains(&"kimi-latest".to_string()));
         assert!(!ids.contains(&"kimi-thinking-preview".to_string()));
     }
@@ -6397,4 +6425,75 @@ mod tests {
             "the file was rewritten"
         );
     }
+}
+
+/// The first files contain only safe shipped defaults. The operator's complete
+/// selection then uses the shared PMM transaction, including revision/history
+/// and compensation, for both quick setup and the interactive wizard.
+async fn persist_onboarding_config(config: &Config, split: bool) -> Result<()> {
+    use crate::config::manage::{ApplyOptions, ConfigActor, ConfigChange, ConfigTransactions};
+    if !config.config_path.exists() {
+        let initial = Config {
+            config_path: config.config_path.clone(),
+            workspace_dir: config.workspace_dir.clone(),
+            ..Config::default()
+        };
+        if split {
+            crate::config::files::write_split_config(&initial, false).await?;
+        } else {
+            initial.save().await?;
+        }
+    }
+    let current = Config::load_from_path(&config.config_path, config.workspace_dir.clone())?;
+    let transactions = ConfigTransactions::new(crate::config::new_shared(current)).deferring_activation();
+    let plan = transactions
+        .plan(ConfigChange::Structured(Box::new(config.clone())))
+        .await?;
+    let revision = plan.planned_revision().map(str::to_string);
+    // These are the inputs the operator just supplied to onboarding. Bind
+    // confirmation to the actual plan revision, never to a wildcard.
+    transactions
+        .apply(
+            plan,
+            ConfigActor::Cli,
+            ApplyOptions {
+                expected_revision: revision.as_deref(),
+                confirm_high_risk: true,
+                confirmed_revision: revision.as_deref(),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+fn choose_model_level(
+    provider: &str,
+    model: &str,
+) -> Result<std::collections::BTreeMap<String, crate::config::model_settings::ModelSettings>> {
+    let release = crate::providers::catalog::ReleaseCatalog::embedded_ref()?;
+    let Some(row) = release.model(&crate::providers::ProviderId::of(provider), model) else {
+        return Ok(Default::default());
+    };
+    if row.levels.is_empty() {
+        return Ok(Default::default());
+    }
+    let levels = ["low", "medium", "high"];
+    let default = levels
+        .iter()
+        .position(|level| row.default_level.as_deref() == Some(*level))
+        .unwrap_or(1);
+    let choice = Select::new()
+        .with_prompt("Model level")
+        .items(levels)
+        .default(default)
+        .interact()?;
+    let level = levels
+        .get(choice)
+        .ok_or_else(|| anyhow::anyhow!("invalid model level selection"))?;
+    let settings = crate::config::model_settings::ModelSettings {
+        level: Some((*level).to_owned()),
+        ..Default::default()
+    };
+    settings.validate(&row.id)?;
+    Ok([(row.id.clone(), settings)].into())
 }

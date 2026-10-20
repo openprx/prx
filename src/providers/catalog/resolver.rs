@@ -267,6 +267,7 @@ impl fmt::Debug for ResolvedCredential {
 /// A model the resolver released for one operation.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedModel {
+    route_settings: Option<crate::config::model_settings::ModelSettings>,
     provider: ProviderId,
     label: Arc<str>,
     model: Arc<str>,
@@ -280,6 +281,13 @@ pub struct ResolvedModel {
 }
 
 impl ResolvedModel {
+    pub(crate) fn set_route_settings(&mut self, settings: crate::config::model_settings::ModelSettings) {
+        self.route_settings = (settings.level.is_some() || !settings.overrides.is_empty()).then_some(settings);
+    }
+
+    pub(crate) const fn route_settings(&self) -> Option<&crate::config::model_settings::ModelSettings> {
+        self.route_settings.as_ref()
+    }
     /// The provider identity.
     #[must_use]
     pub const fn provider(&self) -> &ProviderId {
@@ -402,6 +410,7 @@ pub fn resolve(
     let credential = release_credential(&provider, label, &shown, &selection.credential, credentials)?;
 
     Ok(ResolvedModel {
+        route_settings: None,
         provider,
         label: Arc::from(label),
         model: Arc::from(model),
@@ -471,6 +480,20 @@ pub fn resolve_model(
             detail: crate::security::redaction::redact_provider_text(&error.to_string()),
             provider: shown,
             model: model.to_string(),
+        });
+    }
+    if policy != UnknownPolicy::Invocation
+        && let Ok(release) = catalog.release_catalog()
+        && let Some(row) = release.model(&provider, model)
+        && row.lifecycle.status == super::ModelLifecycleStatus::Retired
+    {
+        return Err(ResolutionError::ModelIncompatible {
+            provider: shown,
+            model: model.to_owned(),
+            detail: row.lifecycle.replacement.as_deref().map_or_else(
+                || "retired model cannot be selected; choose an active model".to_owned(),
+                |replacement| format!("retired model cannot be selected; use {replacement}"),
+            ),
         });
     }
     let descriptor = catalog.describe(&provider, model);

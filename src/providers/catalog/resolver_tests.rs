@@ -596,6 +596,7 @@ fn agent_and_route_keys_are_bound_to_their_entries_provider() {
     );
     for hint in ["fast", "dup", "dup"] {
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: hint.to_string(),
             provider: "groq".to_string(),
             model: "llama-3.3-70b-versatile".to_string(),
@@ -1258,6 +1259,7 @@ fn a_routed_turn_is_enforced_in_its_destinations_dialect() {
     let temp = tempfile::TempDir::new().expect("test: temp dir");
     let mut config = isolated_config(&temp, "openai", "gpt-4o");
     let routes = vec![crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "vision".to_string(),
         provider: "gemini".to_string(),
         model: "gemini-2.5-pro".to_string(),

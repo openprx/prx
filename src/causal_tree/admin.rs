@@ -708,7 +708,8 @@ impl DecisionAdmin {
             |_| {},
         )
         .await?;
-        let import = match (store.mode(), self.key()) {
+        let key = super::store_preparation::load_key(self.config.clone()).await;
+        let import = match (store.mode(), key) {
             (StoreMode::ReadWrite, Some(key)) => {
                 Some(import_v1_feedback(&store, &self.config.workspace_dir, &key).await?)
             }

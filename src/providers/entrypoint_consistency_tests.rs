@@ -89,6 +89,7 @@ fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
         &config,
         provider,
         PRIMARY_MODEL,
+        None,
         crate::providers::selection::credential_for(&config, provider),
         &connection,
         &reliability,
@@ -228,6 +229,7 @@ async fn broken_route_is_retained_as_the_same_refusal_on_every_surface() {
     config.auth.codex_auth_json_path = temp.path().join("no-codex-auth.json");
     config.reliability.provider_retries = 0;
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "broken".to_string(),
         provider: "prx-unknown-provider".to_string(),
         model: "prx-unknown-model".to_string(),

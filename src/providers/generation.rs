@@ -158,7 +158,11 @@ async fn get_or_create_provider_for_generation_with_catalog(
         &super::catalog::Requirement::chat(),
         super::catalog::UnknownPolicy::Invocation,
     )?;
-    let provider = super::create_provider_for(&resolved, catalog, &config.reliability, &config.cost, options)?;
+    let mut scoped_options = options.clone();
+    scoped_options.model_settings =
+        (!config.model_settings.is_empty()).then(|| Arc::new(config.model_settings.clone()));
+    scoped_options.default_temperature = Some(config.default_temperature);
+    let provider = super::create_provider_for(&resolved, catalog, &config.reliability, &config.cost, &scoped_options)?;
     let provider: Arc<dyn Provider> = Arc::from(provider);
 
     if let Err(error) = provider.warmup().await {

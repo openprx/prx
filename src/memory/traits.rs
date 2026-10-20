@@ -3221,6 +3221,7 @@ mod router_served_auxiliary_tests {
     fn outcome(model: &str) -> ProviderExecutionOutcome {
         let now = chrono::Utc::now();
         ProviderExecutionOutcome {
+            prepared_parameters: Vec::new(),
             decision_id: "prx-routing-observation".to_owned(),
             started_at: now,
             finished_at: now,

@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
+use tracing::instrument::WithSubscriber as _;
 
 /// The bearer token the served router accepts. Not a real credential.
 pub(super) const TOKEN: &str = "zc_management_api_test_token";
@@ -163,9 +164,17 @@ pub(super) async fn serve_config(edit: impl FnOnce(&mut Config)) -> Served {
     let loaded =
         Config::load_from_path(&config.config_path, config.workspace_dir.clone()).expect("test: load initial config");
     let state = app_state(loaded);
+    // Axum serves connections on independent tasks. Bind the test dispatcher
+    // on every request poll rather than relying on a thread-local default.
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let app = axum::Router::new()
         .nest("/api", super::router(state.clone()))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                next.run(request).with_subscriber(dispatch.clone())
+            },
+        ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("test: bind ephemeral port");

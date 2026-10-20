@@ -19,6 +19,38 @@
   const SCHEMA_DIALECTS = ['raw', 'no_root_combinators'];
   const CALL_DIALECTS = ['native', 'xml_function_tags'];
 
+  let settingsCatalog = $state(null);
+  let settingsLevel = $state('');
+  let parameterValues = $state({});
+  let settingsError = $state(null);
+  let settingsRequest = 0;
+
+  async function editSettings(entry) {
+    const request = ++settingsRequest;
+    settingsCatalog = null;
+    settingsError = null;
+    try {
+      const catalog = await api.getModelSettings(entry.provider, entry.model);
+      if (!alive || request !== settingsRequest) return;
+      settingsCatalog = catalog;
+      settingsLevel = catalog.settings?.level ?? '';
+      parameterValues = Object.fromEntries(Object.entries(catalog.settings ?? {}).filter(([key]) => key !== 'level'));
+    } catch (error) {
+      if (alive && request === settingsRequest) settingsError = error;
+    }
+  }
+
+  function planSettings() {
+    if (!settingsCatalog) return;
+    const settings = {};
+    if (settingsLevel) settings.level = settingsLevel;
+    for (const [name, value] of Object.entries(parameterValues)) {
+      if (value === '' || value == null) continue;
+      settings[name] = settingsCatalog.parameters[name].kind === 'range' ? Number(value) : value;
+    }
+    flow.preview({kind: 'set_model_settings', model: settingsCatalog.model, settings});
+  }
+
   let models = $state([]);
   let loading = $state(true);
   let loadError = $state(null);
@@ -158,6 +190,44 @@
     </button>
   </div>
 
+  {#if settingsError}<ErrorNotice error={settingsError} />{/if}
+  {#if settingsCatalog}
+    <section class="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800" aria-label={t('models.settings')}>
+      <h3 class="mb-4 text-lg font-semibold">{t('models.settings')} <span class="font-mono text-sm">{settingsCatalog.model}</span></h3>
+      <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <label class="flex flex-col gap-1 text-sm">
+          {t('models.level')}
+          <select bind:value={settingsLevel} class="rounded-lg border border-gray-300 bg-transparent px-3 py-2 dark:border-gray-600">
+            <option value="">{t('models.defaultValue')} ({settingsCatalog.default_level ?? 'none'})</option>
+            {#each Object.keys(settingsCatalog.levels ?? {}) as level}<option value={level}>{level}</option>{/each}
+          </select>
+        </label>
+        {#each Object.entries(settingsCatalog.parameters ?? {}) as [name, declaration]}
+          {#if declaration.kind !== 'unsupported'}
+            <label class="flex flex-col gap-1 text-sm">
+              {name.replaceAll('_', ' ')}
+              {#if declaration.kind === 'range'}
+                <input type="number" min={declaration.min} max={declaration.max} step={declaration.step ?? (['max_output_tokens', 'thinking_budget', 'seed'].includes(name) ? 1 : 'any')}
+                  placeholder={t('models.useLevelValue')} bind:value={parameterValues[name]}
+                  class="rounded-lg border border-gray-300 bg-transparent px-3 py-2 dark:border-gray-600" />
+              {:else}
+                <select bind:value={parameterValues[name]} class="rounded-lg border border-gray-300 bg-transparent px-3 py-2 dark:border-gray-600">
+                  <option value="">{t('models.useLevelValue')}</option>
+                  {#if declaration.kind === 'bool'}
+                    <option value={true}>{t('models.enabled')}</option><option value={false}>{t('models.disabled')}</option>
+                  {:else}
+                    {#each declaration.levels ?? [] as value}<option {value}>{value}</option>{/each}
+                  {/if}
+                </select>
+              {/if}
+            </label>
+          {/if}
+        {/each}
+      </div>
+      <button type="button" onclick={planSettings} class="mt-4 rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white dark:bg-gray-100 dark:text-gray-900">{t('models.reviewSettings')}</button>
+    </section>
+  {/if}
+
   {#if loading}
     <p class="text-sm text-gray-500 dark:text-gray-400">{t('common.loading')}</p>
   {:else if loadError}
@@ -206,6 +276,10 @@
                   class="rounded-lg border border-gray-300 bg-white px-2 py-1 text-xs text-gray-600 hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
                 >
                   {t('models.declare')}
+                </button>
+                <button type="button" onclick={() => editSettings(entry)}
+                  class="ml-2 rounded-lg border border-gray-300 px-2 py-1 text-xs dark:border-gray-600">
+                  {t('models.settings')}
                 </button>
               </td>
             </tr>

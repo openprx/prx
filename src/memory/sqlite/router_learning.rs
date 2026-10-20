@@ -1,5 +1,5 @@
 //! Bounded runtime statistics, separate from retrieval authorization.
-use super::{Arc, Connection, Context, OptionalExtension, SqliteMemory, params};
+use super::{Arc, Context, OptionalExtension, SqliteMemory, params};
 use crate::memory::traits::{RouterLearningEvidence, RouterLearningRead, RouterLearningSnapshot};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -23,7 +23,7 @@ impl SqliteMemory {
         let domain = evidence.domain();
         let encoded = update.as_ref().map(|(_, next)| next.encode()).transpose()?;
         let evidence = evidence.clone();
-        let path = self.db_path.clone();
+        let pool = Arc::clone(&self.pool);
         let cancelled = Arc::new(AtomicBool::new(false));
         let _owner = CancelOnDrop(Arc::clone(&cancelled));
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<_> {
@@ -32,14 +32,14 @@ impl SqliteMemory {
                     "Router learning deadline expired or cancelled"); Ok(())
             };
             check()?;
-            let parent = path.parent().context("Router database parent missing")?.canonicalize()?;
-            let path = parent.join(path.file_name().context("Router database filename missing")?);
-            let mut conn = Connection::open_with_flags(path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
-            conn.busy_timeout(std::time::Duration::from_millis(25))?;
+            // Serialize with message/telemetry writes and use this operation's
+            // existing deadline for external SQLite contention, like history.
+            let connection = pool.write_until(deadline)?;
+            let _deadline = super::ingress_recovery::ConnectionDeadline::new(&connection, deadline)?;
             let stop = Arc::clone(&cancelled);
-            conn.progress_handler(1000, Some(move || Instant::now() >= deadline || stop.load(Ordering::Acquire)))?;
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            connection.progress_handler(1000, Some(move || Instant::now() >= deadline || stop.load(Ordering::Acquire)))?;
+            check()?;
+            let tx = rusqlite::Transaction::new_unchecked(&connection, rusqlite::TransactionBehavior::Immediate)?;
             let event = &evidence.terminal;
             let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM message_events t JOIN message_events s
                 ON s.event_id=?1 WHERE t.event_id=?2 AND t.workspace_id=?3 AND t.owner_id=?4

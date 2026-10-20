@@ -268,6 +268,7 @@ pub(super) fn worker_provider(
         config,
         &manifest.provider_name,
         &manifest.model,
+        manifest.route_hint.as_deref(),
         credential,
         &credentials.provider,
         &credentials.reliability,
@@ -281,13 +282,14 @@ pub(crate) fn build_worker_provider_selection(
     config: &Config,
     provider_name: &str,
     model: &str,
+    route_hint: Option<&str>,
     credential: crate::providers::credentials::CredentialRef,
     sealed_connection: &crate::providers::ProviderConnection<'_>,
     reliability: &crate::config::ReliabilityConfig,
     options: &crate::providers::ProviderRuntimeOptions,
 ) -> Result<Box<dyn Provider>> {
     let catalog = crate::providers::selection::catalog_for(config);
-    let resolved = crate::providers::selection::check_with(
+    let mut resolved = crate::providers::selection::check_with(
         config,
         &catalog,
         provider_name,
@@ -296,6 +298,19 @@ pub(crate) fn build_worker_provider_selection(
         &crate::providers::catalog::Requirement::chat(),
         crate::providers::catalog::UnknownPolicy::Invocation,
     )?;
+    if let Some(hint) = route_hint {
+        let route = config
+            .model_routes
+            .iter()
+            .find(|route| route.hint.trim() == hint)
+            .context("session-worker model route is missing")?;
+        anyhow::ensure!(
+            crate::providers::ProviderId::of(&route.provider) == *resolved.provider()
+                && route.model.trim() == resolved.model(),
+            "session-worker route differs from its sealed selection"
+        );
+        resolved.set_route_settings(route.settings.clone());
+    }
     anyhow::ensure!(
         resolved.credential().api_key() == sealed_connection.api_key
             && resolved.credential().api_url() == sealed_connection.api_url,

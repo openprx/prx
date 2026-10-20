@@ -572,7 +572,12 @@ impl OllamaProvider {
             request.tools.as_ref().map_or(0, |t| t.len()),
         );
 
-        let mut request_builder = self.http_client().post(&url).json(&request);
+        let mut request_builder = self.http_client().post(&url).json(&super::parameter_wire::request(
+            "ollama",
+            super::parameter_wire::Format::Ollama,
+            &request.model,
+            &request,
+        ));
 
         if should_auth {
             if let Some(key) = self.api_key.as_ref() {
@@ -998,8 +1003,13 @@ impl Provider for OllamaProvider {
         let count_tokens = options.count_tokens;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
-        tokio::spawn(async move {
-            let mut req_builder = client.post(&url).json(&request);
+        super::parameter_capture::spawn(async move {
+            let mut req_builder = client.post(&url).json(&super::parameter_wire::request(
+                "ollama",
+                super::parameter_wire::Format::Ollama,
+                &request.model,
+                &request,
+            ));
             if should_auth {
                 if let Some(key) = api_key.as_ref() {
                     req_builder = req_builder.bearer_auth(key);

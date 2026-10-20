@@ -86,6 +86,10 @@ pub fn router(state: AppState) -> Router<AppState> {
                 .patch(models::patch_model)
                 .delete(models::delete_model),
         )
+        .route(
+            "/models/settings",
+            get(models::get_model_settings).put(models::put_model_settings),
+        )
         .route("/defaults", get(models::get_defaults).put(models::put_defaults))
         .route("/routes", get(models::get_routes).post(models::post_route))
         .route(

@@ -15,7 +15,18 @@ for integration, validation and rollback limits.
 
 ### Changed
 
-- Ordinary causal telemetry reserves channel headroom for Applied/Drain controls.
+- The Moonshot release default is now the cited, priced `kimi-k2.6` model.
+  K2.5 and older K2 Preview/Thinking models are retired according to the
+  provider's published discontinuation dates. Stored selections remain intact;
+  `prx models migrate-retired` previews replacements. See the
+  [Moonshot catalog correction](docs/providers.md#moonshot-release-default-and-lifecycle).
+
+- Known Codex models now default to `medium` reasoning effort instead of the
+  pre-C2 `xhigh`. Explicit configured effort still takes precedence. Unknown
+  models retain the pre-C2 base request (`medium` verbosity and `xhigh` effort).
+
+- Ordinary causal telemetry and Applied/Drain controls now use separate bounded
+  channels, so ordinary backlog cannot consume control capacity.
 - Recursive child grants now subtract a strict half-share from the parent's
   remaining monetary balance, rounded down to whole cents. Authenticated
   approval resume keeps the original run's one-child slot and balance.
@@ -66,6 +77,18 @@ for integration, validation and rollback limits.
   that estimate. The window contains at most one reported pending settlement
   per scope and has no fixed storage-latency bound. See
   [the accounting contract](docs/decision-plane.md#admission-and-backend-selection).
+- Provider request serializers now resolve declared catalog parameters through
+  a closed vocabulary, including streaming, Gemini OAuth and signed Bedrock
+  bodies. Release data replaces the Kimi URL temperature heuristic and Codex
+  model-ID effort clamps; unsupported values are dropped, numeric bounds and
+  recognized effort values are clamped, and invalid typed values fail locally.
+  Unverified models use the adapter base request. Known catalog rows omit
+  undeclared canonical fields, including legacy overrides and adapter defaults;
+  an empty parameter declaration preserves the adapter base request. Catalog changes roll back
+  with the binary; operator TOML and credential ownership are unchanged.
+  Prepared values and revision stay in the existing main and auxiliary outcome
+  records, including failed auxiliary calls, without a separate event write.
+  Auxiliary owners keep their own capture rather than borrowing an outer turn.
 
 - Upgrade compatibility: the decision accounting reservation journal now writes
   `estimated_unsent_v1` when a durable dispatch receipt never reached transport.

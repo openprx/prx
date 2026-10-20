@@ -770,6 +770,78 @@ fn declaration(args: ModelDeclarationArgs) -> (config::schema::ProviderModelConf
 
 async fn run_models(command: ModelCommands, config: Config, io: &mut Io<'_>) -> Result<()> {
     match command {
+        ModelCommands::Catalog {
+            catalog_command: crate::CatalogCommands::Status,
+        } => {
+            let release = providers::catalog::ReleaseCatalog::embedded_ref()?;
+            writeln!(
+                io.out,
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "source": "embedded", "revision": release.revision,
+                    "content_sha256": release.content_sha256(), "providers": release.providers.len(),
+                    "models": release.models.len(),
+                    "active": release.models.iter().filter(|row| row.lifecycle.status == providers::catalog::ModelLifecycleStatus::Active).count(),
+                    "deprecated": release.models.iter().filter(|row| row.lifecycle.status == providers::catalog::ModelLifecycleStatus::Deprecated).count(),
+                    "retired": release.models.iter().filter(|row| row.lifecycle.status == providers::catalog::ModelLifecycleStatus::Retired).count(),
+                    "updates": "releases only"
+                }))?
+            )?;
+            Ok(())
+        }
+        ModelCommands::MigrateRetired { apply } => {
+            for warning in openprx::config::manage::lifecycle::warnings(&config)? {
+                writeln!(io.out, "{warning}")?;
+            }
+            change(&service(config), ManagedChange::MigrateRetired, &apply, io).await
+        }
+        ModelCommands::Levels { model } => {
+            let release = providers::catalog::ReleaseCatalog::embedded_ref()?;
+            let row = release
+                .models
+                .iter()
+                .find(|row| row.id == model)
+                .ok_or_else(|| anyhow::anyhow!("use a canonical release catalog model ID"))?;
+            writeln!(
+                io.out,
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "model": row.id, "levels": row.levels, "parameters": row.parameters,
+                    "default_level": row.default_level
+                }))?
+            )?;
+            Ok(())
+        }
+        ModelCommands::Settings {
+            model,
+            level,
+            overrides,
+            apply,
+        } => {
+            if level.is_none() && overrides.is_empty() {
+                let release = providers::catalog::ReleaseCatalog::embedded_ref()?;
+                if release.models.iter().any(|row| row.id == model && row.is_listed())
+                    && let Some(settings) = config.model_settings.get(&model)
+                {
+                    settings.validate(&model)?;
+                }
+                writeln!(
+                    io.out,
+                    "{}",
+                    serde_json::to_string_pretty(&config.model_settings.get(&model))?
+                )?;
+                return Ok(());
+            }
+            let settings = parse_model_settings(level, overrides)?;
+            change(
+                &service(config),
+                ManagedChange::SetModelSettings { model, settings },
+                &apply,
+                io,
+            )
+            .await
+        }
+
         ModelCommands::List {
             provider,
             operation: None,
@@ -842,6 +914,8 @@ async fn run_models(command: ModelCommands, config: Config, io: &mut Io<'_>) -> 
                 Ok(())
             }
             DefaultCommands::Set {
+                level,
+                overrides,
                 provider,
                 model,
                 operation: op,
@@ -849,6 +923,11 @@ async fn run_models(command: ModelCommands, config: Config, io: &mut Io<'_>) -> 
                 clear_root_credential,
                 apply,
             } => {
+                let settings = if level.is_some() || !overrides.is_empty() {
+                    Some(parse_model_settings(level, overrides)?)
+                } else {
+                    None
+                };
                 let root_credential = if keep_root_credential {
                     RootCredential::Keep
                 } else if clear_root_credential {
@@ -859,6 +938,7 @@ async fn run_models(command: ModelCommands, config: Config, io: &mut Io<'_>) -> 
                 change(
                     &service(config),
                     ManagedChange::SetDefault {
+                        settings,
                         operation: operation(op),
                         provider,
                         model,
@@ -1536,6 +1616,7 @@ mod tests {
     async fn providers_migrate_reports_plans_and_applies() {
         let (dir, config) = fixture(|config| {
             config.model_routes.push(openprx::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "fast".into(),
                 provider: "openai".into(),
                 model: "gpt-4o-mini".into(),
@@ -1708,20 +1789,21 @@ mod tests {
         let before = stored(&dir);
         let cases: Vec<(Vec<&str>, ManagedChange)> = vec![
             (
-                vec!["routes", "add", "fast", "openai", "gpt-4o-mini"],
+                vec!["routes", "add", "fast", "openai", "gpt-5.6"],
                 ManagedChange::AddRoute {
                     operation: SelectionOperation::Chat,
                     hint: "fast".into(),
                     provider: "openai".into(),
-                    model: "gpt-4o-mini".into(),
+                    model: "gpt-5.6".into(),
                 },
             ),
             (
-                vec!["models", "default", "set", "openai", "gpt-4o-mini"],
+                vec!["models", "default", "set", "openai", "gpt-5.6"],
                 ManagedChange::SetDefault {
+                    settings: None,
                     operation: SelectionOperation::Chat,
                     provider: "openai".into(),
-                    model: "gpt-4o-mini".into(),
+                    model: "gpt-5.6".into(),
                     root_credential: RootCredential::Refuse,
                 },
             ),
@@ -1732,11 +1814,11 @@ mod tests {
                 },
             ),
             (
-                vec!["config", "agents", "set", "coder", "openai", "gpt-4o-mini"],
+                vec!["config", "agents", "set", "coder", "openai", "gpt-5.6"],
                 ManagedChange::BindAgent {
                     agent: "coder".into(),
                     provider: "openai".into(),
-                    model: "gpt-4o-mini".into(),
+                    model: "gpt-5.6".into(),
                 },
             ),
             (
@@ -1746,7 +1828,7 @@ mod tests {
                     "--provider",
                     "openai",
                     "--model",
-                    "gpt-4o-mini",
+                    "gpt-5.6",
                     "--operations",
                     "chat",
                     "--native-tools",
@@ -1754,7 +1836,7 @@ mod tests {
                 ],
                 ManagedChange::AddModel(config::schema::ProviderModelConfig {
                     provider: "openai".into(),
-                    model: Some("gpt-4o-mini".into()),
+                    model: Some("gpt-5.6".into()),
                     operations: Some(vec![config::schema::ModelOperationSetting::Chat]),
                     native_tools: Some(true),
                     vision_input: None,
@@ -1840,6 +1922,65 @@ mod tests {
         assert_ne!(stored(&dir), before);
     }
 
+    #[tokio::test]
+    async fn stored_deleted_model_settings_can_be_inspected_without_selecting_them() {
+        let (dir, config) = fixture(|config| {
+            config.model_settings.insert(
+                "openai/prx-deleted-model".into(),
+                config::model_settings::ModelSettings {
+                    level: Some("high".into()),
+                    ..Default::default()
+                },
+            );
+        })
+        .await;
+        let before = stored(&dir);
+        let (result, text) = run_cli(&["models", "settings", "openai/prx-deleted-model"], config, "", &[]).await;
+        result.unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(settings.get("level").and_then(serde_json::Value::as_str), Some("high"));
+        assert_eq!(stored(&dir), before);
+    }
+
+    #[tokio::test]
+    async fn catalog_lifecycle_status_and_migration_use_the_cli_transaction() {
+        let (dir, config) = fixture(|config| {
+            config.default_provider = Some("openai".into());
+            config.default_model = Some("gpt-4o".into());
+        })
+        .await;
+        let before = stored(&dir);
+        let (result, text) = run_cli(&["models", "catalog", "status"], config.clone(), "", &[]).await;
+        result.unwrap();
+        let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let release = providers::catalog::ReleaseCatalog::embedded_ref().unwrap();
+        assert_eq!(
+            status.get("revision").and_then(serde_json::Value::as_str),
+            Some(release.revision.as_str())
+        );
+        assert_eq!(
+            status.get("models").and_then(serde_json::Value::as_u64),
+            Some(u64::try_from(release.models.len()).unwrap())
+        );
+        assert_eq!(
+            status.get("content_sha256").and_then(serde_json::Value::as_str),
+            Some(release.content_sha256())
+        );
+        assert_eq!(
+            status.get("updates").and_then(serde_json::Value::as_str),
+            Some("releases only")
+        );
+        let (result, text) = run_cli(&["models", "migrate-retired"], config.clone(), "", &[]).await;
+        result.unwrap();
+        assert!(text.contains("gpt-5.6"), "{text}");
+        assert_eq!(stored(&dir), before);
+        let (result, text) = run_cli(&["models", "migrate-retired", "--yes"], config, "", &[]).await;
+        result.unwrap();
+        assert!(text.contains("history record"), "{text}");
+        assert_ne!(stored(&dir), before);
+        assert!(String::from_utf8(stored(&dir)).unwrap().contains("gpt-5.6"));
+    }
+
     /// D-085 F-6: `prx models list --operation` and `prx models show` print
     /// the service's model read model.
     #[tokio::test]
@@ -1885,6 +2026,7 @@ mod tests {
         const PROVIDER: &str = "custom:https://llm.example/v1?sig=sentinel-listing-sig";
         let (_dir, config) = fixture(|config| {
             config.model_routes = vec![config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "fast".into(),
                 provider: PROVIDER.into(),
                 model: "m".into(),
@@ -1914,7 +2056,7 @@ mod tests {
         let (dir, config) = fixture(|_| {}).await;
         let before = stored(&dir);
         let (result, out) = run_cli(
-            &["routes", "add", "fast", "openai", "gpt-4o-mini", "--yes"],
+            &["routes", "add", "fast", "openai", "gpt-5.6", "--yes"],
             config,
             "",
             &[],
@@ -1955,6 +2097,36 @@ mod tests {
         assert!(
             out.contains("activation deferred to the daemon (not confirmed here)"),
             "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_history_rollback_retains_the_existing_retired_default() {
+        let (dir, config) = fixture(|config| {
+            config.default_provider = Some("openai".into());
+            config.default_model = Some("gpt-4o".into());
+        })
+        .await;
+        let before = stored(&dir);
+        let (result, _) = run_cli(
+            &["models", "default", "set", "openai", "gpt-5.6", "--yes"],
+            config,
+            "",
+            &[],
+        )
+        .await;
+        result.unwrap();
+        assert_ne!(stored(&dir), before);
+        let (result, _) = run_cli(&["config", "rollback", "--last", "--yes"], reload(&dir).await, "", &[]).await;
+        result.unwrap();
+        assert_eq!(stored(&dir), before);
+        let restored = reload(&dir).await;
+        assert_eq!(restored.default_model.as_deref(), Some("gpt-4o"));
+        assert!(
+            openprx::config::manage::lifecycle::warnings(&restored)
+                .unwrap()
+                .iter()
+                .any(|warning| warning.contains("retired"))
         );
     }
 
@@ -2032,4 +2204,91 @@ mod tests {
         assert!(error.starts_with("Invalid TOML content at line 1"), "{error}");
         assert!(!error.contains(SECRET), "{error}");
     }
+    #[tokio::test]
+    async fn cli_model_settings_plan_inspect_and_atomic_default_selection_use_pmm() {
+        let (dir, config) = fixture(|_| {}).await;
+        let before = stored(&dir);
+        let (result, out) = run_cli(&["models", "levels", "openai/gpt-5.6"], config.clone(), "", &[]).await;
+        result.unwrap();
+        assert!(out.contains("xhigh"));
+        assert_eq!(stored(&dir), before);
+        let (result, out) = run_cli(
+            &["models", "settings", "openai/gpt-5.6", "--level", "high"],
+            config.clone(),
+            "",
+            &[],
+        )
+        .await;
+        result.unwrap();
+        assert!(out.contains("model_settings"));
+        assert_eq!(stored(&dir), before);
+        let (result, out) = run_cli(
+            &[
+                "models",
+                "default",
+                "set",
+                "openai",
+                "gpt-5.6",
+                "--level",
+                "high",
+                "--set",
+                "reasoning_effort=low",
+                "--yes",
+            ],
+            config,
+            "",
+            &[],
+        )
+        .await;
+        result.unwrap();
+        assert!(out.contains("history record"));
+        let config = reload(&dir).await;
+        assert_eq!(config.default_model.as_deref(), Some("gpt-5.6"));
+        let settings = config.model_settings.get("openai/gpt-5.6").unwrap();
+        assert_eq!(settings.level.as_deref(), Some("high"));
+        assert_eq!(
+            settings.overrides.get("reasoning_effort"),
+            Some(&serde_json::json!("low"))
+        );
+        let committed = stored(&dir);
+        let (result, _) = run_cli(
+            &[
+                "models",
+                "settings",
+                "openai/gpt-5.6",
+                "--set",
+                "max_output_tokens=0",
+                "--yes",
+            ],
+            config,
+            "",
+            &[],
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(stored(&dir), committed);
+    }
+}
+
+fn parse_model_settings(
+    level: Option<String>,
+    overrides: Vec<String>,
+) -> Result<config::model_settings::ModelSettings> {
+    let mut settings = config::model_settings::ModelSettings {
+        level,
+        ..Default::default()
+    };
+    for entry in overrides {
+        let (name, value) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("use --set name=value"))?;
+        if providers::catalog::ModelParameter::parse(name).is_none() {
+            anyhow::bail!("unknown model parameter");
+        }
+        let value = serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.to_owned()));
+        if settings.overrides.insert(name.to_owned(), value).is_some() {
+            anyhow::bail!("duplicate model parameter");
+        }
+    }
+    Ok(settings)
 }

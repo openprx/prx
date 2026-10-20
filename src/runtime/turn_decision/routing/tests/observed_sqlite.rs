@@ -49,6 +49,8 @@ pub(super) struct Observations {
     pub last_read: Option<Result<ReadSummary, Vec<String>>>,
     pub commit_calls: usize,
     pub last_commit: Option<Result<(), Vec<String>>>,
+    pub learning_commits: usize,
+    pub last_learning_commit: Option<Result<(), Vec<String>>>,
 }
 
 // Never accumulate a call log or copy the 1024-row result. Only the most recent
@@ -56,12 +58,14 @@ pub(super) struct Observations {
 pub(super) struct ObservedSqlite {
     inner: SqliteMemory,
     pub observations: Mutex<Observations>,
+    pub learning_contention: Mutex<Option<std::path::PathBuf>>,
 }
 impl ObservedSqlite {
     pub(super) fn new(inner: SqliteMemory) -> Self {
         Self {
             inner,
             observations: Mutex::new(Observations::default()),
+            learning_contention: Mutex::new(None),
         }
     }
 }
@@ -200,9 +204,37 @@ impl Memory for ObservedSqlite {
         next: &RouterLearningSnapshot,
         deadline: std::time::Instant,
     ) -> anyhow::Result<RouterLearningCommit> {
-        self.inner
+        let contention = self.learning_contention.lock().take();
+        let holder = if let Some(path) = contention {
+            let (ready, acquired) = tokio::sync::oneshot::channel();
+            let job = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
+                let mut connection = rusqlite::Connection::open(path)?;
+                let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                ready
+                    .send(())
+                    .map_err(|_| anyhow::anyhow!("contention fixture receiver closed"))?;
+                // A real competing writer outlives the old connection's 25 ms
+                // busy timeout, within the unchanged learning deadline.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                transaction.rollback()?;
+                Ok(())
+            });
+            acquired.await?;
+            Some(job)
+        } else {
+            None
+        };
+        let result = self
+            .inner
             .commit_router_learning(evidence, expected_version, next, deadline)
-            .await
+            .await;
+        if let Some(holder) = holder {
+            holder.await??;
+        }
+        let mut observations = self.observations.lock();
+        observations.learning_commits += 1;
+        observations.last_learning_commit = Some(result.as_ref().map(|_| ()).map_err(error_chain));
+        result
     }
 
     async fn count_rehearsal_hits(

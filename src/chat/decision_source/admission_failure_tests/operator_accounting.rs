@@ -388,6 +388,7 @@ async fn restore_operator_process(
         route_uses_root_connection: false,
         direct_uses_root_connection: false,
         temperature: 0.0,
+        temperature_override: None,
         config_dir: config_dir.to_path_buf(),
         config_generation,
         runtime_config_generation_id: scope.config_generation_id,

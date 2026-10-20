@@ -23,3 +23,14 @@ pub(crate) async fn open_store(
     .await
     .map_err(|error| StoreError::Io(std::io::Error::other(error)))?
 }
+
+/// Key creation includes filesystem synchronization, just like store opening.
+pub(crate) async fn load_key(config: crate::config::Config) -> Option<Arc<crate::decision::DecisionKey>> {
+    match tokio::task::spawn_blocking(move || crate::decision::factory::FactoryDeps::load_key(&config)).await {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(%error, "decision key preparation failed");
+            None
+        }
+    }
+}

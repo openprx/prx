@@ -22,6 +22,7 @@ mod accounting;
 mod auxiliary;
 mod build_error;
 mod issued;
+mod request_parameters;
 mod store_preparation;
 
 pub(crate) use build_error::TurnServiceBuildError;
@@ -41,6 +42,7 @@ pub(crate) use pending_approval::collection::ApprovalCollectionLease;
 #[path = "turn_decision/routing/replay_facts.rs"]
 mod router_replay_facts;
 pub(crate) use router_replay_facts::{RouterReadFacts, provider_binding as router_provider_binding};
+mod latency_snapshot;
 #[cfg(feature = "llm-router")]
 mod routing;
 #[cfg(feature = "llm-router")]
@@ -643,13 +645,15 @@ pub(crate) enum AgentTurnKind {
 /// The immutable result of one source-bound decision chain. Only the service
 /// constructs it; later record and execution streams consume these facts.
 pub(crate) struct TurnDecisionContext {
+    model_catalog: Option<Arc<crate::providers::catalog::ReleaseCatalog>>,
     owner_filesystem: Option<Arc<crate::tools::owner_filesystem::OwnerFilesystem>>,
     accounting: Option<Arc<crate::runtime::decision_accounting::AccountingScope>>,
     resume: Option<Arc<pending_approval::AdmittedDecisionResume>>,
     source_actor: (Arc<str>, Arc<str>),
     service_id: uuid::Uuid,
     record_admitted: AtomicBool,
-    recursive_allowance: std::sync::OnceLock<Arc<recursive_allowance::RecursiveAllowance>>,
+    recursive_allowance: std::sync::OnceLock<recursive_allowance::ContextAllowance>,
+    main_parameters: std::sync::OnceLock<crate::providers::parameter_capture::Capture>,
     execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
     #[cfg(feature = "llm-router")]
     automix_deadline: std::sync::OnceLock<std::time::Instant>,
@@ -2143,9 +2147,12 @@ impl TurnDecisionService {
             () = cancellation.cancelled() => return Err(AgentDecisionError::Cancelled),
             admitted = self.admit_decision_resume(proof) => admitted.map_err(AgentDecisionError::PendingApproval)?,
         };
-        if self.generation.effective.sessions_spawn.allow_recursive_delegation {
-            self.recursive_allowances.inherit_resume(proof, admitted.original_run());
-        }
+        let _resume_allowance = self
+            .generation
+            .effective
+            .sessions_spawn
+            .allow_recursive_delegation
+            .then(|| self.recursive_allowances.inherit_resume(proof, admitted.original_run()));
         let (mut context, telemetry) = self
             .decide_agent_initial_inner(
                 proof,
@@ -2180,6 +2187,9 @@ impl TurnDecisionService {
             .await
             .map_err(AgentDecisionError::IngressRecovery)?;
         let budget = self.agent_budget_snapshot(proof)?;
+        let observed_latency = self
+            .observed_capability_latency(proof.owner_id(), *self.catalog.generation())
+            .await;
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(budget.budgets.latency_ms))
             .ok_or(AgentDecisionError::Deadline)?;
@@ -2340,7 +2350,6 @@ impl TurnDecisionService {
             (model, model_ref)
         };
         let decision_request_model = self.factory.request_model().or_else(|| Some(model.model()));
-        let observed_latency = self.observed_capability_latency(proof.owner_id(), catalog.generation());
         let cost_model = super::turn_cost::RuntimeCostModel::new(&model, config, &observed_latency);
         let mut discovered_refs = DiscoveredRefs::empty();
         let call_fingerprints = resume_evidence
@@ -2498,6 +2507,7 @@ impl TurnDecisionService {
                 return Err(AgentDecisionError::Cancelled);
             }
             Ok(Arc::new(TurnDecisionContext {
+                model_catalog: self.provider_catalog.release_pin(),
                 resume: None,
                 accounting: accounting.retained_scope(),
                 owner_filesystem: owner_filesystem.clone(),
@@ -2505,6 +2515,7 @@ impl TurnDecisionService {
                 service_id: self.service_id,
                 record_admitted: AtomicBool::new(false),
                 recursive_allowance: self.recursive_allowances.retain(proof),
+                main_parameters: Default::default(),
                 execution_trace: std::sync::OnceLock::new(),
                 #[cfg(feature = "llm-router")]
                 automix_deadline: std::sync::OnceLock::new(),
@@ -2553,6 +2564,7 @@ impl TurnDecisionService {
                 };
                 return Ok((
                     Arc::new(TurnDecisionContext {
+                        model_catalog: self.provider_catalog.release_pin(),
                         resume: None,
                         accounting: accounting.retained_scope(),
                         owner_filesystem: owner_filesystem.clone(),
@@ -2560,6 +2572,7 @@ impl TurnDecisionService {
                         service_id: self.service_id,
                         record_admitted: AtomicBool::new(false),
                         recursive_allowance: self.recursive_allowances.retain(proof),
+                        main_parameters: Default::default(),
                         execution_trace: std::sync::OnceLock::new(),
                         #[cfg(feature = "llm-router")]
                         automix_deadline: std::sync::OnceLock::new(),
@@ -2814,6 +2827,7 @@ impl TurnDecisionService {
                     }
                     return Ok((
                         Arc::new(TurnDecisionContext {
+                            model_catalog: self.provider_catalog.release_pin(),
                             resume: None,
                             accounting: accounting.retained_scope(),
                             owner_filesystem: owner_filesystem.clone(),
@@ -2821,6 +2835,7 @@ impl TurnDecisionService {
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
                             recursive_allowance: self.recursive_allowances.retain(proof),
+                            main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -2857,6 +2872,7 @@ impl TurnDecisionService {
                     }
                     return Ok((
                         Arc::new(TurnDecisionContext {
+                            model_catalog: self.provider_catalog.release_pin(),
                             resume: None,
                             accounting: accounting.retained_scope(),
                             owner_filesystem: owner_filesystem.clone(),
@@ -2864,6 +2880,7 @@ impl TurnDecisionService {
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
                             recursive_allowance: self.recursive_allowances.retain(proof),
+                            main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -2901,6 +2918,7 @@ impl TurnDecisionService {
                     }
                     return Ok((
                         Arc::new(TurnDecisionContext {
+                            model_catalog: self.provider_catalog.release_pin(),
                             resume: None,
                             accounting: accounting.retained_scope(),
                             owner_filesystem: owner_filesystem.clone(),
@@ -2908,6 +2926,7 @@ impl TurnDecisionService {
                             service_id: self.service_id,
                             record_admitted: AtomicBool::new(false),
                             recursive_allowance: self.recursive_allowances.retain(proof),
+                            main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             #[cfg(feature = "llm-router")]
                             automix_deadline: std::sync::OnceLock::new(),
@@ -3062,21 +3081,22 @@ impl TurnDecisionService {
         Err(AgentDecisionError::UnsupportedAction)
     }
 
-    fn observed_capability_latency(&self, owner_id: &str, generation: CatalogGeneration) -> BTreeMap<String, u32> {
+    async fn observed_capability_latency(
+        &self,
+        owner_id: &str,
+        generation: CatalogGeneration,
+    ) -> BTreeMap<String, u32> {
         let Some(workspace_id) = self.store.workspace_id() else {
             return BTreeMap::new();
         };
-        match self
-            .store
-            .reader()
-            .capability_latency_p50(&workspace_id, owner_id, &generation.to_hex())
-        {
-            Ok(samples) => samples,
-            Err(error) => {
-                tracing::warn!(error = %error, "causal outcome latency snapshot unavailable; using pinned defaults");
-                BTreeMap::new()
-            }
-        }
+        let store = Arc::clone(&self.store);
+        let owner_id = owner_id.to_owned();
+        latency_snapshot::read(move || {
+            store
+                .reader()
+                .capability_latency_p50(&workspace_id, &owner_id, &generation.to_hex())
+        })
+        .await
     }
 
     /// Snapshot the initial decision budget after the source proof and PMM
@@ -5112,6 +5132,7 @@ mod tests {
             outgoing_parent_allowed: None,
         };
         let mut context = TurnDecisionContext {
+            model_catalog: None,
             resume: None,
             accounting: None,
             owner_filesystem: None,
@@ -5119,6 +5140,7 @@ mod tests {
             service_id: uuid::Uuid::nil(),
             record_admitted: AtomicBool::new(false),
             recursive_allowance: Default::default(),
+            main_parameters: Default::default(),
             execution_trace: std::sync::OnceLock::new(),
             #[cfg(feature = "llm-router")]
             automix_deadline: std::sync::OnceLock::new(),
@@ -6402,6 +6424,7 @@ mod tests {
             );
 
             let answer_context = TurnDecisionContext {
+                model_catalog: service.provider_catalog.release_pin(),
                 resume: None,
                 accounting: None,
                 owner_filesystem: None,
@@ -6409,6 +6432,7 @@ mod tests {
                 service_id: service.service_id,
                 record_admitted: AtomicBool::new(false),
                 recursive_allowance: Default::default(),
+                main_parameters: Default::default(),
                 execution_trace: std::sync::OnceLock::new(),
                 #[cfg(feature = "llm-router")]
                 automix_deadline: std::sync::OnceLock::new(),
@@ -7150,6 +7174,7 @@ mod tests {
         config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".to_string(),
             provider: "openai".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -8151,6 +8176,7 @@ mod tests {
         assert_eq!(
             service
                 .observed_capability_latency(proof.owner_id(), context.catalog_generation())
+                .await
                 .get("native_tool:prx_project:read"),
             Some(&30),
             "the service must use the store's stable workspace ID"
@@ -8356,6 +8382,7 @@ mod tests {
         );
         let priced_outcome =
             |decision_id: DecisionId, prompt_tokens: u32| crate::llm::route_decision::ProviderExecutionOutcome {
+                prepared_parameters: Vec::new(),
                 decision_id: decision_id.to_string(),
                 started_at: now,
                 finished_at: now,
@@ -8820,6 +8847,7 @@ mod tests {
             Some(crate::causal_tree::branch::CausalActionKind::Answer) => (
                 "success",
                 Some(crate::llm::route_decision::ProviderExecutionOutcome {
+                    prepared_parameters: Vec::new(),
                     decision_id: completed_context.decision_id().to_string(),
                     started_at: now,
                     finished_at: now,

@@ -1362,6 +1362,29 @@ enum AuthCommands {
 
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
+    /// Inspect the embedded release catalog
+    Catalog {
+        #[command(subcommand)]
+        catalog_command: CatalogCommands,
+    },
+    /// Plan published model replacements; --yes applies one PMM transaction
+    MigrateRetired {
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
+    /// Show declared model levels and parameters from the release catalog
+    Levels { model: String },
+    /// Show or update persisted model settings through a configuration transaction
+    Settings {
+        model: String,
+        #[arg(long, value_parser = ["low", "medium", "high"])]
+        level: Option<String>,
+        /// Explicit override, repeated as --set name=JSON-value
+        #[arg(long = "set")]
+        overrides: Vec<String>,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
     /// List model catalogs; with --operation or --executable, every known model with what the
     /// evidence says it can do
     List {
@@ -1414,6 +1437,12 @@ enum ModelCommands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum CatalogCommands {
+    /// Show the embedded revision, content digest and lifecycle counts
+    Status,
+}
+
 /// A `[[providers.models]]` declaration on the command line.
 #[derive(Args, Debug)]
 struct ModelDeclarationArgs {
@@ -1461,6 +1490,11 @@ enum DefaultCommands {
         provider: String,
         /// The model
         model: String,
+        #[arg(long, value_parser = ["low", "medium", "high"])]
+        level: Option<String>,
+        /// Explicit model parameter override, repeated as --set name=JSON-value
+        #[arg(long = "set")]
+        overrides: Vec<String>,
         /// Which default
         #[arg(long, value_enum, default_value_t = OperationArg::Chat)]
         operation: OperationArg,

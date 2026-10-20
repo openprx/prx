@@ -1218,6 +1218,7 @@ mod agent_turn_origin_tests {
 
         config.default_model = Some("prx-local-model".to_string());
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".to_string(),
             provider: "ollama".to_string(),
             model: "prx-route-model ".to_string(),

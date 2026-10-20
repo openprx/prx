@@ -466,6 +466,7 @@ mod tests {
     fn apply_sets_and_clears_and_refuses_missing_or_ambiguous_targets() {
         let mut config = Config::default();
         let route = |hint: &str| crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: hint.into(),
             provider: "openrouter".into(),
             model: "m".into(),

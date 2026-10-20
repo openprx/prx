@@ -190,6 +190,8 @@ pub async fn get_defaults(State(state): State<AppState>) -> Response {
 #[derive(Deserialize)]
 pub struct DefaultBody {
     #[serde(default)]
+    settings: Option<crate::config::model_settings::ModelSettings>,
+    #[serde(default)]
     operation: OperationParam,
     provider: String,
     model: String,
@@ -211,6 +213,7 @@ pub async fn put_defaults(
     manage::apply_change(
         &state,
         ManagedChange::SetDefault {
+            settings: body.settings,
             operation: body.operation.into(),
             provider: body.provider,
             model: body.model,
@@ -649,6 +652,7 @@ mod tests {
                 config.default_model = Some("local-model".into());
                 config.reliability.fallback_providers = vec![url.clone()];
                 config.model_routes = vec![crate::config::ModelRouteConfig {
+                    settings: Default::default(),
                     hint: "fast".into(),
                     provider: url.clone(),
                     model: "local-model".into(),
@@ -700,4 +704,55 @@ mod tests {
             assert!(!reply.contains(FRAGMENT), "{surface} echoed the fragment: {reply}");
         }
     }
+}
+
+/// One canonical model and its durable parameter settings.
+#[derive(Deserialize)]
+pub struct SettingsBody {
+    model: String,
+    settings: crate::config::model_settings::ModelSettings,
+}
+
+/// Persist settings through the same authorization and revision checks as model selection.
+pub async fn put_model_settings(
+    State(state): State<AppState>,
+    Query(query): Query<WriteQuery>,
+    headers: HeaderMap,
+    Json(body): Json<SettingsBody>,
+) -> Response {
+    let write = write_of!(query, headers);
+    manage::apply_change(
+        &state,
+        ManagedChange::SetModelSettings {
+            model: body.model,
+            settings: body.settings,
+        },
+        write,
+    )
+    .await
+}
+
+/// Catalog declarations and the currently saved choice for a selected model.
+pub async fn get_model_settings(State(state): State<AppState>, Query(query): Query<ModelKey>) -> Response {
+    let Some(model) = query.model else {
+        return manage_error_response(ManageError::Invalid("a model is required".into()), None, &verbatim);
+    };
+    let release = match crate::providers::catalog::ReleaseCatalog::embedded_ref() {
+        Ok(release) => release,
+        Err(error) => return manage_error_response(ManageError::Invalid(error.to_string()), None, &verbatim),
+    };
+    let Some(row) = release.model(&crate::providers::ProviderId::of(&query.provider), &model) else {
+        return manage_error_response(ManageError::NotFound("release catalog model".into()), None, &verbatim);
+    };
+    let config = manage::service(&state).config();
+    if let Some(settings) = config.model_settings.get(&row.id)
+        && let Err(error) = settings.validate(&row.id)
+    {
+        return manage_error_response(ManageError::Invalid(error.to_string()), None, &verbatim);
+    }
+    Json(
+        json!({"model":row.id, "levels":row.levels, "default_level":row.default_level,
+        "parameters":row.parameters, "settings":config.model_settings.get(&row.id)}),
+    )
+    .into_response()
 }

@@ -27,10 +27,13 @@ pub mod credentials;
 pub mod gemini;
 pub(crate) mod generation;
 mod identity;
+pub(crate) mod model_settings;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
+pub(crate) mod parameter_capture;
+pub(crate) mod parameter_wire;
 pub mod rate_limit;
 pub mod reliable;
 pub mod router;
@@ -1282,6 +1285,10 @@ pub struct ToolCallDialectDeclaration {
 
 #[derive(Debug, Clone)]
 pub struct ProviderRuntimeOptions {
+    /// The global baseline; invocation-specific temperatures remain higher precedence.
+    pub default_temperature: Option<f64>,
+    pub model_settings:
+        Option<std::sync::Arc<std::collections::BTreeMap<String, crate::config::model_settings::ModelSettings>>>,
     pub auth_profile_override: Option<String>,
     pub openprx_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
@@ -1342,6 +1349,8 @@ impl ProviderRuntimeOptions {
 impl Default for ProviderRuntimeOptions {
     fn default() -> Self {
         Self {
+            default_temperature: None,
+            model_settings: Default::default(),
             auth_profile_override: None,
             openprx_dir: None,
             secrets_encrypt: true,
@@ -1361,6 +1370,8 @@ impl Default for ProviderRuntimeOptions {
 #[must_use]
 pub fn provider_runtime_options_from_config(config: &crate::config::Config) -> ProviderRuntimeOptions {
     ProviderRuntimeOptions {
+        default_temperature: Some(config.default_temperature),
+        model_settings: (!config.model_settings.is_empty()).then(|| std::sync::Arc::new(config.model_settings.clone())),
         auth_profile_override: None,
         openprx_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
@@ -2708,10 +2719,9 @@ fn create_provider_with_url_and_options(
                     // nothing about, so it is the one that needs a declaration.
                     .with_declared_tool_dialects(name, options),
             )),
-            ByoDialect::AnthropicCompatible => Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
-                key,
-                Some(&base_url),
-            ))),
+            ByoDialect::AnthropicCompatible => Ok(Box::new(
+                anthropic::AnthropicProvider::with_base_url(key, Some(&base_url)).with_parameter_provider(name),
+            )),
         };
     }
 
@@ -2761,7 +2771,9 @@ fn create_provider_with_url_and_options(
             }
             Ok(Box::new(anthropic::AnthropicProvider::new(effective_key)))
         }
-        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
+        "openai" => Ok(Box::new(
+            openai::OpenAiProvider::with_base_url(api_url, key).with_parameter_provider(name),
+        )),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_runtime_options(
             api_url,
@@ -2773,78 +2785,66 @@ fn create_provider_with_url_and_options(
         "gemini" | "google" | "google-gemini" => Ok(Box::new(gemini::GeminiProvider::new(key))),
 
         // ── OpenAI-compatible providers ──────────────────────
-        "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Venice",
-            "https://api.venice.ai",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "vercel" | "vercel-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Vercel AI Gateway",
-            "https://api.vercel.ai",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "cloudflare" | "cloudflare-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Cloudflare AI Gateway",
-            "https://gateway.ai.cloudflare.com/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "venice" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("Venice", "https://api.venice.ai", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
+        "vercel" | "vercel-ai" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("Vercel AI Gateway", "https://api.vercel.ai", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
+        "cloudflare" | "cloudflare-ai" => Ok(Box::new(
+            OpenAiCompatibleProvider::new(
+                "Cloudflare AI Gateway",
+                "https://gateway.ai.cloudflare.com/v1",
+                key,
+                AuthStyle::Bearer,
+            )
+            .with_parameter_provider(name),
+        )),
         name if moonshot_base_url(name).is_some() => {
             let url = moonshot_base_url(name).ok_or_else(|| anyhow::anyhow!("moonshot URL resolved to None"))?;
-            Ok(Box::new(OpenAiCompatibleProvider::new(
-                "Moonshot",
-                url,
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new("Moonshot", url, key, AuthStyle::Bearer).with_parameter_provider(name),
+            ))
+        }
+        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
+            OpenAiCompatibleProvider::new_with_user_agent(
+                "Kimi Code",
+                "https://api.kimi.com/coding/v1",
                 key,
                 AuthStyle::Bearer,
-            )))
-        }
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(OpenAiCompatibleProvider::new_with_user_agent(
-            "Kimi Code",
-            "https://api.kimi.com/coding/v1",
-            key,
-            AuthStyle::Bearer,
-            "KimiCLI/0.77",
-        ))),
-        "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Synthetic",
-            "https://api.synthetic.com",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "OpenCode Zen",
-            "https://opencode.ai/zen/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
+                "KimiCLI/0.77",
+            )
+            .with_declared_tool_dialects(name, options),
+        )),
+        "synthetic" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("Synthetic", "https://api.synthetic.com", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
+        "opencode" | "opencode-zen" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
         name if zai_base_url(name).is_some() => {
             let url = zai_base_url(name).ok_or_else(|| anyhow::anyhow!("Z.AI URL resolved to None"))?;
-            Ok(Box::new(OpenAiCompatibleProvider::new(
-                "Z.AI",
-                url,
-                key,
-                AuthStyle::Bearer,
-            )))
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new("Z.AI", url, key, AuthStyle::Bearer).with_parameter_provider(name),
+            ))
         }
         name if glm_base_url(name).is_some() => {
             let url = glm_base_url(name).ok_or_else(|| anyhow::anyhow!("GLM URL resolved to None"))?;
-            Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
-                "GLM",
-                url,
-                key,
-                AuthStyle::Bearer,
-            )))
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new_no_responses_fallback("GLM", url, key, AuthStyle::Bearer)
+                    .with_parameter_provider(name),
+            ))
         }
         name if minimax_base_url(name).is_some() => {
             let url = minimax_base_url(name).ok_or_else(|| anyhow::anyhow!("MiniMax URL resolved to None"))?;
-            Ok(Box::new(OpenAiCompatibleProvider::new_merge_system_into_user(
-                "MiniMax",
-                url,
-                key,
-                AuthStyle::Bearer,
-            )))
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new_merge_system_into_user("MiniMax", url, key, AuthStyle::Bearer)
+                    .with_parameter_provider(name),
+            ))
         }
         "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
         name if is_qwen_oauth_alias(name) => {
@@ -2855,88 +2855,73 @@ fn create_provider_with_url_and_options(
                 .or_else(|| resolved.qwen_base_url.clone())
                 .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
 
-            Ok(Box::new(OpenAiCompatibleProvider::new_with_user_agent(
-                "Qwen Code",
-                &base_url,
-                key,
-                AuthStyle::Bearer,
-                "QwenCode/1.0",
-            )))
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new_with_user_agent(
+                    "Qwen Code",
+                    &base_url,
+                    key,
+                    AuthStyle::Bearer,
+                    "QwenCode/1.0",
+                )
+                .with_parameter_provider(name),
+            ))
         }
-        name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Qianfan",
-            "https://aip.baidubce.com",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        name if is_qianfan_alias(name) => Ok(Box::new(
+            OpenAiCompatibleProvider::new("Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
         name if qwen_coding_base_url(name).is_some() => {
             let url = qwen_coding_base_url(name).ok_or_else(|| anyhow::anyhow!("Qwen Coding URL resolved to None"))?;
-            Ok(Box::new(OpenAiCompatibleProvider::new(
-                "Qwen Coding Plan Pro",
-                url,
-                key,
-                AuthStyle::Bearer,
-            )))
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new("Qwen Coding Plan Pro", url, key, AuthStyle::Bearer)
+                    .with_parameter_provider(name),
+            ))
         }
         name if qwen_base_url(name).is_some() => {
             let url = qwen_base_url(name).ok_or_else(|| anyhow::anyhow!("Qwen URL resolved to None"))?;
-            Ok(Box::new(OpenAiCompatibleProvider::new(
-                "Qwen",
-                url,
-                key,
-                AuthStyle::Bearer,
-            )))
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new("Qwen", url, key, AuthStyle::Bearer).with_parameter_provider(name),
+            ))
         }
 
         // ── Extended ecosystem (community favorites) ─────────
-        "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Groq",
-            "https://api.groq.com/openai",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "mistral" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Mistral",
-            "https://api.mistral.ai/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "xai" | "grok" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "xAI",
-            "https://api.x.ai/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "deepseek" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "DeepSeek",
-            "https://api.deepseek.com",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "together" | "together-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Together AI",
-            "https://api.together.xyz",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "fireworks" | "fireworks-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Fireworks AI",
-            "https://api.fireworks.ai/inference/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "perplexity" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Perplexity",
-            "https://api.perplexity.ai",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "cohere" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Cohere",
-            "https://api.cohere.com/compatibility",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "groq" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("Groq", "https://api.groq.com/openai", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
+        "mistral" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
+        "xai" | "grok" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("xAI", "https://api.x.ai/v1", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
+        "deepseek" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("DeepSeek", "https://api.deepseek.com", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
+        "together" | "together-ai" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("Together AI", "https://api.together.xyz", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
+        "fireworks" | "fireworks-ai" => Ok(Box::new(
+            OpenAiCompatibleProvider::new(
+                "Fireworks AI",
+                "https://api.fireworks.ai/inference/v1",
+                key,
+                AuthStyle::Bearer,
+            )
+            .with_parameter_provider(name),
+        )),
+        "perplexity" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("Perplexity", "https://api.perplexity.ai", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
+        "cohere" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("Cohere", "https://api.cohere.com/compatibility", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
         "lmstudio" | "lm-studio" => {
             let lm_studio_key = key
@@ -2987,32 +2972,36 @@ fn create_provider_with_url_and_options(
                     .with_declared_tool_dialects(name, options),
             ))
         }
-        name if is_huggingface_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Hugging Face",
-            "https://router.huggingface.co/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "NVIDIA NIM",
-            "https://integrate.api.nvidia.com/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        name if is_huggingface_alias(name) => Ok(Box::new(
+            OpenAiCompatibleProvider::new(
+                "Hugging Face",
+                "https://router.huggingface.co/v1",
+                key,
+                AuthStyle::Bearer,
+            )
+            .with_parameter_provider(name),
+        )),
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(
+            OpenAiCompatibleProvider::new(
+                "NVIDIA NIM",
+                "https://integrate.api.nvidia.com/v1",
+                key,
+                AuthStyle::Bearer,
+            )
+            .with_parameter_provider(name),
+        )),
 
         // ── AI inference routers ─────────────────────────────
-        "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Astrai",
-            "https://as-trai.com/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "astrai" => Ok(Box::new(
+            OpenAiCompatibleProvider::new("Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer)
+                .with_parameter_provider(name),
+        )),
 
         // ── Cloud AI endpoints ───────────────────────────────
-        "ovhcloud" | "ovh" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
-            Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
-            key,
-        ))),
+        "ovhcloud" | "ovh" => Ok(Box::new(
+            openai::OpenAiProvider::with_base_url(Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"), key)
+                .with_parameter_provider(name),
+        )),
 
         _ => anyhow::bail!(
             "Unknown provider: {}. Check README for supported providers or run `prx onboard --interactive` to reconfigure.\n\
@@ -3183,6 +3172,23 @@ pub fn create_provider_for(
             });
         }
     }
+    let route_settings = resolved
+        .route_settings()
+        .map(|settings| -> anyhow::Result<_> {
+            let release = catalog.release_catalog()?;
+            let row = release
+                .model(resolved.provider(), resolved.model())
+                .ok_or_else(|| anyhow::anyhow!("route settings require a release catalog model"))?;
+            let mut selected = Vec::new();
+            if let Some(model) = options.model_settings.as_ref().and_then(|models| models.get(&row.id)) {
+                selected.push(model);
+            }
+            selected.push(settings);
+            let layers = crate::config::model_settings::parameter_layers(&row.id, &selected)?;
+            catalog::parameters::resolve(row, &release.revision, &layers)?;
+            Ok((row.id.clone(), settings.clone()))
+        })
+        .transpose()?;
     let credential = resolved.credential();
     create_resilient_provider_from_resolved(
         label,
@@ -3193,6 +3199,14 @@ pub fn create_provider_for(
         ResolvedPrimary::new(resolved),
         fallback_admission,
     )
+    .map(|provider| {
+        model_settings::wrap(
+            provider,
+            options.model_settings.clone(),
+            route_settings,
+            options.default_temperature,
+        )
+    })
 }
 
 /// Build the routed chat provider for one resolver-released default selection.
@@ -4297,6 +4311,7 @@ Connection: close\r\n\
         );
         config.model_routes = vec![
             crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "foreign".to_string(),
                 provider: "anthropic".to_string(),
                 model: "claude-3-5-sonnet-20241022".to_string(),
@@ -4304,6 +4319,7 @@ Connection: close\r\n\
                 credential_ref: None,
             },
             crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "owned".to_string(),
                 provider: "anthropic".to_string(),
                 model: "claude-3-5-sonnet-20241022".to_string(),
@@ -5675,7 +5691,7 @@ Connection: close\r\n\
 
     #[test]
     fn summarize_provider_availability_marks_degraded_when_only_primary_has_credentials() {
-        let _guard = provider_availability_env_lock().lock().unwrap();
+        let _guard = env_lock();
 
         // Isolate from host credentials: override HOME to an empty temp dir so
         // resolve_claude_code_context cannot find ~/.claude/.credentials.json,
@@ -5716,14 +5732,9 @@ Connection: close\r\n\
         );
     }
 
-    fn provider_availability_env_lock() -> &'static std::sync::Mutex<()> {
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     #[test]
     fn summarize_provider_availability_marks_openai_codex_available_with_auth_profile() {
-        let _guard = provider_availability_env_lock().lock().unwrap();
+        let _guard = env_lock();
 
         let fake_home = std::env::temp_dir().join(format!(
             "openprx-provider-avail-test-{}-{}",
@@ -5778,7 +5789,7 @@ Connection: close\r\n\
 
     #[test]
     fn summarize_provider_availability_marks_openai_codex_unavailable_without_auth_profile() {
-        let _guard = provider_availability_env_lock().lock().unwrap();
+        let _guard = env_lock();
 
         let fake_home = std::env::temp_dir().join(format!(
             "openprx-provider-avail-noauth-test-{}-{}",
@@ -6366,6 +6377,8 @@ Connection: close\r\n\
     /// operator's real configuration.
     fn byo_isolated_options(temp: &TempDir) -> ProviderRuntimeOptions {
         ProviderRuntimeOptions {
+            default_temperature: None,
+            model_settings: Default::default(),
             auth_profile_override: None,
             openprx_dir: Some(temp.path().to_path_buf()),
             secrets_encrypt: false,
@@ -7101,6 +7114,7 @@ mod credential_containment_tests {
         let temp = tempfile::tempdir().expect("test: temp config dir");
         let probe = CredentialProbe::start_with_statuses(vec![429]).await;
         let routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "probe".to_string(),
             provider: probe.custom_provider(),
             model: PROBE_MODEL.to_string(),
@@ -7134,6 +7148,7 @@ mod credential_containment_tests {
         let temp = tempfile::tempdir().expect("test: temp config dir");
         let probe = CredentialProbe::start_with_statuses(vec![429]).await;
         let routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "probe".to_string(),
             provider: probe.custom_provider(),
             model: PROBE_MODEL.to_string(),
@@ -7172,6 +7187,7 @@ mod credential_containment_tests {
         let temp = tempfile::tempdir().expect("test: temp config dir");
         let probe = CredentialProbe::start().await;
         let routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "probe".to_string(),
             provider: probe.custom_provider(),
             model: PROBE_MODEL.to_string(),
@@ -7252,6 +7268,7 @@ mod credential_containment_tests {
         config.default_provider = None;
         config.reliability.fallback_providers = vec!["anthropic".to_string()];
         config.model_routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".to_string(),
             provider: "custom:http://127.0.0.1:8080/v1".to_string(),
             model: "m".to_string(),
@@ -7379,6 +7396,7 @@ mod credential_containment_tests {
             Some(ROOT_SENTINEL),
             Some("https://gateway.corp.example/v1"),
             vec![crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "primary".to_string(),
                 provider: "OpenAI".to_string(),
                 model: "gpt-4o".to_string(),
@@ -7403,6 +7421,7 @@ mod credential_containment_tests {
             Some(ROOT_SENTINEL),
             Some("https://gateway.corp.example/v1"),
             vec![crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "owned".to_string(),
                 provider: "OpenAI".to_string(),
                 model: "gpt-4o".to_string(),
@@ -7430,6 +7449,7 @@ mod credential_containment_tests {
             Some(ROOT_SENTINEL),
             Some("https://gw/v1"),
             vec![crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "foreign".to_string(),
                 provider: "groq".to_string(),
                 model: "llama-3.3-70b-versatile".to_string(),
@@ -7468,6 +7488,7 @@ mod credential_containment_tests {
         let primary = probe.custom_provider();
         let respelled = format!("{primary}/");
         let routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "probe".to_string(),
             provider: respelled,
             model: PROBE_MODEL.to_string(),
@@ -7518,3 +7539,6 @@ pub(crate) mod credential_resolution_observation {
         (result, counts)
     }
 }
+
+#[cfg(test)]
+mod parameter_regression_tests;

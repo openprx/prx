@@ -203,6 +203,8 @@ const fn operation_name(change: &ManagedChange) -> &'static str {
         ManagedChange::AddModel(_) | ManagedChange::UpdateModel(_) | ManagedChange::RemoveModel { .. } => {
             "gateway_api:models:update"
         }
+        ManagedChange::MigrateRetired => "gateway_api:models:migrate-retired",
+        ManagedChange::SetModelSettings { .. } => "gateway_api:models:settings",
         ManagedChange::SetDefault { .. } => "gateway_api:defaults:update",
         ManagedChange::AddRoute { .. } | ManagedChange::UpdateRoute { .. } | ManagedChange::RemoveRoute { .. } => {
             "gateway_api:routes:update"
@@ -558,6 +560,10 @@ impl From<OperationParam> for SelectionOperation {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum ChangeRequest {
+    SetModelSettings {
+        model: String,
+        settings: crate::config::model_settings::ModelSettings,
+    },
     AddProvider {
         provider: String,
     },
@@ -577,6 +583,8 @@ pub(super) enum ChangeRequest {
         model: Option<String>,
     },
     SetDefault {
+        #[serde(default)]
+        settings: Option<crate::config::model_settings::ModelSettings>,
         #[serde(default)]
         operation: OperationParam,
         provider: String,
@@ -634,6 +642,7 @@ enum Change {
 impl ChangeRequest {
     fn into_change(self) -> Result<Change, Box<Response>> {
         let managed = match self {
+            Self::SetModelSettings { model, settings } => ManagedChange::SetModelSettings { model, settings },
             Self::AddProvider { provider } => ManagedChange::AddProvider { provider },
             Self::UpdateProvider { provider, api_url } => ManagedChange::SetProviderEndpoint { provider, api_url },
             Self::RemoveProvider { provider } => ManagedChange::RemoveProvider { provider },
@@ -641,11 +650,13 @@ impl ChangeRequest {
             Self::UpdateModel(declaration) => ManagedChange::UpdateModel(declaration),
             Self::RemoveModel { provider, model } => ManagedChange::RemoveModel { provider, model },
             Self::SetDefault {
+                settings,
                 operation,
                 provider,
                 model,
                 root_credential,
             } => ManagedChange::SetDefault {
+                settings,
                 operation: operation.into(),
                 provider,
                 model,
@@ -1345,20 +1356,21 @@ mod tests {
         let before = served.disk();
         let cases: Vec<(serde_json::Value, ManagedChange)> = vec![
             (
-                json!({"kind": "add_route", "hint": "fast", "provider": "openai", "model": "gpt-4o-mini"}),
+                json!({"kind": "add_route", "hint": "fast", "provider": "openai", "model": "gpt-5.6"}),
                 ManagedChange::AddRoute {
                     operation: SelectionOperation::Chat,
                     hint: "fast".into(),
                     provider: "openai".into(),
-                    model: "gpt-4o-mini".into(),
+                    model: "gpt-5.6".into(),
                 },
             ),
             (
-                json!({"kind": "set_default", "provider": "openai", "model": "gpt-4o-mini"}),
+                json!({"kind": "set_default", "provider": "openai", "model": "gpt-5.6"}),
                 ManagedChange::SetDefault {
+                    settings: None,
                     operation: SelectionOperation::Chat,
                     provider: "openai".into(),
-                    model: "gpt-4o-mini".into(),
+                    model: "gpt-5.6".into(),
                     root_credential: RootCredential::Refuse,
                 },
             ),
@@ -1369,18 +1381,18 @@ mod tests {
                 },
             ),
             (
-                json!({"kind": "bind_agent", "agent": "coder", "provider": "openai", "model": "gpt-4o-mini"}),
+                json!({"kind": "bind_agent", "agent": "coder", "provider": "openai", "model": "gpt-5.6"}),
                 ManagedChange::BindAgent {
                     agent: "coder".into(),
                     provider: "openai".into(),
-                    model: "gpt-4o-mini".into(),
+                    model: "gpt-5.6".into(),
                 },
             ),
             (
-                json!({"kind": "add_model", "provider": "openai", "model": "gpt-4o-mini", "operations": ["chat"], "native_tools": true}),
+                json!({"kind": "add_model", "provider": "openai", "model": "gpt-5.6", "operations": ["chat"], "native_tools": true}),
                 ManagedChange::AddModel(crate::config::schema::ProviderModelConfig {
                     provider: "openai".into(),
-                    model: Some("gpt-4o-mini".into()),
+                    model: Some("gpt-5.6".into()),
                     operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
                     native_tools: Some(true),
                     vision_input: None,
@@ -1460,7 +1472,7 @@ mod tests {
                 Method::POST,
                 "/api/routes",
                 &old,
-                Some(json!({"hint": "fast", "provider": "openai", "model": "gpt-4o-mini"})),
+                Some(json!({"hint": "fast", "provider": "openai", "model": "gpt-5.6"})),
             )
             .await;
         assert_eq!(status, 200, "{reply}");
@@ -1470,7 +1482,7 @@ mod tests {
             (
                 Method::POST,
                 "/api/routes",
-                Some(json!({"hint": "slow", "provider": "openai", "model": "gpt-4o"})),
+                Some(json!({"hint": "slow", "provider": "openai", "model": "gpt-5.6"})),
             ),
             (
                 Method::POST,
@@ -1480,7 +1492,7 @@ mod tests {
             (
                 Method::PUT,
                 "/api/agents/coder",
-                Some(json!({"provider": "openai", "model": "gpt-4o-mini"})),
+                Some(json!({"provider": "openai", "model": "gpt-5.6"})),
             ),
         ] {
             let (status, reply) = served.call_if_match(method.clone(), path, &old, body).await;
@@ -1501,7 +1513,9 @@ mod tests {
             .call(
                 Method::POST,
                 "/api/config/apply",
-                Some(json!({"change": {"kind": "add_route", "hint": "fast", "provider": "openai", "model": "gpt-4o-mini"}})),
+                Some(
+                    json!({"change": {"kind": "add_route", "hint": "fast", "provider": "openai", "model": "gpt-5.6"}}),
+                ),
             )
             .await;
         assert_eq!(status, 200, "{reply}");
@@ -1625,7 +1639,7 @@ mod tests {
                 Method::POST,
                 "/api/routes",
                 &desired,
-                Some(json!({"hint": "fast", "provider": "openai", "model": "gpt-4o-mini"})),
+                Some(json!({"hint": "fast", "provider": "openai", "model": "gpt-5.6"})),
             )
             .await;
         assert_eq!(status, 409, "{reply}");
@@ -1715,7 +1729,7 @@ mod tests {
             .call(
                 Method::POST,
                 "/api/routes",
-                Some(json!({"hint": "fast", "provider": "openai", "model": "gpt-4o-mini"})),
+                Some(json!({"hint": "fast", "provider": "openai", "model": "gpt-5.6"})),
             )
             .await;
         assert_eq!(status, 200, "{reply}");
@@ -1732,7 +1746,7 @@ mod tests {
                 .call(
                     Method::POST,
                     "/api/routes",
-                    Some(json!({"hint": hint, "provider": "openai", "model": "gpt-4o-mini"})),
+                    Some(json!({"hint": hint, "provider": "openai", "model": "gpt-5.6"})),
                 )
                 .await;
             assert_eq!(status, 200, "{reply}");
@@ -1777,5 +1791,51 @@ mod tests {
         let reply = response.text().await.expect("test: body");
         assert_eq!(at(&json(&reply), "/required"), "if_match", "{reply}");
         assert_eq!(served.disk(), before);
+    }
+    #[tokio::test]
+    async fn gateway_model_settings_share_plan_validation_and_commit_with_cli() {
+        let served = serve_config(|_| {}).await;
+        let before = served.disk();
+        let settings = json!({"level":"high","max_output_tokens":64000});
+        let change = json!({"kind":"set_model_settings","model":"openai/gpt-5.6","settings":settings});
+        let (status, reply) = served
+            .call(Method::POST, "/api/config/plans", Some(json!({"change":change})))
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(served.disk(), before);
+        let (status, reply) = served
+            .call(
+                Method::PUT,
+                "/api/models/settings",
+                Some(json!({"model":"openai/gpt-5.6","settings":settings})),
+            )
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(
+            served
+                .loaded()
+                .model_settings
+                .get("openai/gpt-5.6")
+                .unwrap()
+                .level
+                .as_deref(),
+            Some("high")
+        );
+        let (status, reply) = served
+            .call(Method::GET, "/api/models/settings?provider=openai&model=gpt-5.6", None)
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(at(&json(&reply), "/settings/level"), "high");
+        assert!(at(&json(&reply), "/levels/low").is_object());
+        let committed = served.disk();
+        let (status, reply) = served
+            .call(
+                Method::PUT,
+                "/api/models/settings",
+                Some(json!({"model":"openai/gpt-5.6","settings":{"temperature":0.5}})),
+            )
+            .await;
+        assert_eq!(status, 400, "{reply}");
+        assert_eq!(served.disk(), committed);
     }
 }

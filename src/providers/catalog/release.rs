@@ -543,6 +543,9 @@ impl ReleaseCatalog {
     #[must_use]
     pub fn descriptor(&self, provider: &ProviderId, selected: &str) -> Option<ModelDescriptor> {
         let model = self.model(provider, selected)?;
+        if model.lifecycle.status == ModelLifecycleStatus::Retired {
+            return None;
+        }
         let mut descriptor = ModelDescriptor::id_only(provider.clone(), selected.trim());
         for operation in ModelOperation::ALL {
             let support = if model.supports(operation) {
@@ -724,7 +727,7 @@ fn validate_model_parameters(model: &ReleaseModel, warnings: &mut Vec<String>) -
             let Some(declaration) = model.parameters.get(parameter.as_str()) else {
                 return Err(ReleaseCatalogError::new("a catalog level uses an undeclared parameter"));
             };
-            if !declaration.accepts(value) {
+            if !declaration.accepts(value) || !valid_integer_parameter(parameter, value) {
                 return Err(ReleaseCatalogError::new(
                     "a catalog level parameter value is outside its declaration",
                 ));
@@ -820,6 +823,16 @@ fn validate_parameter_declaration(
     parameter: ModelParameter,
     declaration: &CatalogParameter,
 ) -> Result<(), ReleaseCatalogError> {
+    if integer_parameter(parameter)
+        && !matches!(
+            declaration,
+            CatalogParameter::Range { .. } | CatalogParameter::Unsupported
+        )
+    {
+        return Err(ReleaseCatalogError::new(
+            "integer catalog parameters require numeric ranges",
+        ));
+    }
     match declaration {
         CatalogParameter::Range {
             min,
@@ -832,7 +845,11 @@ fn validate_parameter_declaration(
                 || !max.is_finite()
                 || min > max
                 || step.is_some_and(|step| !step.is_finite() || step <= 0.0)
-                || default.as_ref().is_some_and(|value| !declaration.accepts(value))
+                || default
+                    .as_ref()
+                    .is_some_and(|value| !declaration.accepts(value) || !valid_integer_parameter(parameter, value))
+                || (integer_parameter(parameter)
+                    && (min.fract() != 0.0 || max.fract() != 0.0 || step.is_some_and(|step| step.fract() != 0.0)))
             {
                 return Err(ReleaseCatalogError::new(format!(
                     "catalog parameter '{}' has an invalid range",
@@ -911,6 +928,17 @@ fn validate_secret_free(value: &Value) -> Result<(), ReleaseCatalogError> {
     Ok(())
 }
 
+const fn integer_parameter(parameter: ModelParameter) -> bool {
+    matches!(
+        parameter,
+        ModelParameter::MaxOutputTokens | ModelParameter::ThinkingBudget | ModelParameter::Seed
+    )
+}
+
+fn valid_integer_parameter(parameter: ModelParameter, value: &Value) -> bool {
+    !integer_parameter(parameter) || value.as_i64().is_some() || value.as_u64().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,7 +971,7 @@ mod tests {
             return;
         };
         assert_eq!(catalog.schema_version, "1.0");
-        assert_eq!(catalog.revision, "2026-10-17.1");
+        assert_eq!(catalog.revision, "2026-10-20.1");
         assert_eq!(catalog.schema.as_deref(), Some("./models.schema.json"));
         assert!(catalog.content_sha256().starts_with("sha256:"));
         assert!(catalog.models.len() >= 100);
@@ -960,6 +988,87 @@ mod tests {
             assert!(model.levels.contains_key("low"), "{} lacks low", model.id);
             assert!(model.levels.contains_key("medium"), "{} lacks medium", model.id);
             assert!(model.levels.contains_key("high"), "{} lacks high", model.id);
+        }
+    }
+
+    #[test]
+    fn active_router_ranking_hints_match_the_published_input_baseline() {
+        let catalog = ReleaseCatalog::embedded().expect("test: catalog");
+        for row in catalog.models.iter().filter(|row| row.is_active()) {
+            if let (Some(router), Some(pricing)) = (&row.router, &row.pricing) {
+                assert!(
+                    (router.cost_per_million_tokens - pricing.input).abs() < f64::EPSILON,
+                    "{} ranking input tariff",
+                    row.id
+                );
+            }
+        }
+        let legacy = catalog.model(&ProviderId::of("openai"), "gpt-4o").unwrap();
+        assert!(
+            (legacy.router.as_ref().unwrap().cost_per_million_tokens - legacy.pricing.as_ref().unwrap().input).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn every_priced_release_row_has_a_tariff_citation_or_the_documented_zero_rule() {
+        let catalog = ReleaseCatalog::embedded().expect("test: release catalog");
+        let docs = include_str!("../../../docs/providers.md");
+        let table = docs
+            .split_once("<!-- catalog-tariff-citations:start -->")
+            .and_then(|(_, rest)| rest.split_once("<!-- catalog-tariff-citations:end -->"))
+            .map(|(table, _)| table)
+            .expect("test: citation table exists");
+        let mut citations = BTreeMap::new();
+        for line in table.lines() {
+            let mut columns = line.split('|').skip(1);
+            let Some(id) = columns
+                .next()
+                .and_then(|column| column.trim().strip_prefix('`'))
+                .and_then(|id| id.strip_suffix('`'))
+            else {
+                continue;
+            };
+            let source = columns.next().expect("test: citation source column").trim();
+            assert!(citations.insert(id, source).is_none(), "duplicate citation: {id}");
+            assert!(
+                catalog.models.iter().any(|row| row.id == id && row.pricing.is_some()),
+                "stale citation: {id}"
+            );
+        }
+        for row in catalog.models.iter().filter(|row| row.pricing.is_some()) {
+            let pricing = row.pricing.as_ref().expect("test: priced row");
+            if row.provider == "ollama" {
+                assert_eq!(
+                    citations.get("ollama/*"),
+                    Some(&"[Documented Ollama zero rule](#ollama-zero-cost-rule)")
+                );
+                assert!(docs.contains("### Ollama zero-cost rule"));
+                for rate in [pricing.input, pricing.output, pricing.cache_write, pricing.cache_read] {
+                    assert_eq!(
+                        rate.to_bits(),
+                        0.0_f64.to_bits(),
+                        "{} is covered by the zero rule",
+                        row.id
+                    );
+                }
+                assert!(
+                    pricing.tiers.is_empty(),
+                    "{} has no priced tier under the zero rule",
+                    row.id
+                );
+            } else {
+                let source = citations.get(row.id.as_str());
+                assert!(source.is_some(), "uncited tariff: {}", row.id);
+                let source = source.expect("test: every priced model has a citation");
+                let url = source
+                    .split_once("](https://")
+                    .and_then(|(_, tail)| tail.split_once(')'))
+                    .map(|(tail, _)| format!("https://{tail}"))
+                    .expect("test: published HTTPS tariff link");
+                let parsed = reqwest::Url::parse(&url).expect("test: public source URL");
+                assert!(parsed.host_str().is_some() && parsed.username().is_empty() && parsed.password().is_none());
+            }
         }
     }
 
@@ -1367,5 +1476,75 @@ mod tests {
                 .is_unsupported(),
             "negative discovery outranks an operator declaration"
         );
+    }
+}
+
+#[cfg(test)]
+mod integer_parameter_tests {
+    use super::*;
+    #[test]
+    fn fractional_integer_ranges_defaults_and_levels_are_rejected() {
+        for pointer in [
+            "/parameters/max_output_tokens/min",
+            "/parameters/max_output_tokens/max",
+            "/parameters/max_output_tokens/step",
+            "/parameters/max_output_tokens/default",
+            "/levels/high/max_output_tokens",
+        ] {
+            let mut raw: Value = serde_json::from_str(EMBEDDED_CATALOG_JSON).unwrap();
+            let row = raw
+                .get_mut("models")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row.get("id").and_then(Value::as_str) == Some("anthropic/claude-sonnet-5"))
+                .unwrap();
+            if pointer.ends_with("/step") {
+                row.pointer_mut("/parameters/max_output_tokens")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("step".into(), Value::from(0.5));
+            } else {
+                let value = if pointer.ends_with("/min") {
+                    0.5
+                } else if pointer.ends_with("/max") {
+                    128_000.5
+                } else {
+                    1024.5
+                };
+                *row.pointer_mut(pointer).unwrap() = Value::from(value);
+            }
+            assert!(ReleaseCatalog::from_json(&raw.to_string()).is_err(), "{pointer}");
+        }
+    }
+    #[test]
+    fn integer_parameter_declarations_cannot_supply_boolean_or_string_defaults() {
+        for declaration in [
+            serde_json::json!({"kind":"bool","default":true}),
+            serde_json::json!({"kind":"levels","levels":["2048"],"default":"2048"}),
+        ] {
+            let mut raw: Value = serde_json::from_str(EMBEDDED_CATALOG_JSON).unwrap();
+            let row = raw
+                .get_mut("models")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row.get("id").and_then(Value::as_str) == Some("anthropic/claude-sonnet-5"))
+                .unwrap();
+            row.get_mut("parameters")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("max_output_tokens".into(), declaration);
+            // Isolate the declaration itself: no selected-level value should
+            // cause this rejection before the invalid default is inspected.
+            for level in row.get_mut("levels").unwrap().as_object_mut().unwrap().values_mut() {
+                level.as_object_mut().unwrap().remove("max_output_tokens");
+            }
+            assert!(ReleaseCatalog::from_json(&raw.to_string()).is_err());
+        }
     }
 }

@@ -67,7 +67,7 @@ async fn overlapping_admissions_release_independently_and_controls_bypass_live_d
     // Exercise the worker's control queue directly; authenticated application
     // creation is covered separately by the admission/rejoin tests.
     let (reply, received) = tokio::sync::oneshot::channel();
-    sink.queue
+    sink.control_queue
         .send(QueueItem::Applied {
             event: Box::new(event(CausalEventKind::DirectiveApplied, second_lineage)),
             idempotency_key: "prx-deferral-applied".into(),

@@ -280,18 +280,27 @@ fn open_cost_file(path: &Path, access: CostFileAccess) -> Result<Option<(File, O
             Err(rustix::io::Errno::NOENT) if matches!(access, CostFileAccess::Read) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-    let stat = rustix::fs::fstat(&fd)?;
-    anyhow::ensure!(
-        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
-            && stat.st_nlink == 1
-            && stat.st_mode & 0o022 == 0,
-        "cost file is not a private single-link regular file"
-    );
     let file = File::from(fd);
     let state = File::from(state);
+    let validate = || -> Result<()> {
+        let stat = rustix::fs::fstat(&file)?;
+        anyhow::ensure!(
+            FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+                && stat.st_nlink == 1
+                && stat.st_mode & 0o022 == 0,
+            "cost file is not a private single-link regular file"
+        );
+        Ok(())
+    };
     if created {
-        // CostStorage may have just created state; persist that entry too.
-        super::creation::sync_created_entry(&file, &state, filename, &File::from(root))?;
+        super::creation::with_created_entry(&file, &state, filename, || {
+            validate()?;
+            // CostStorage may have just created state; persist that entry too.
+            File::from(root).sync_all()?;
+            Ok(())
+        })?;
+    } else {
+        validate()?;
     }
     Ok(Some((file, created.then_some(state))))
 }
@@ -344,17 +353,6 @@ fn open_cost_file(path: &Path, access: CostFileAccess) -> Result<Option<(File, O
     // Portable std has no directory sync facility on Windows. Preserve its
     // prior file-sync contract rather than disabling basic usage settlement.
     Ok(Some((file, None)))
-}
-
-fn sync_cost_directory(state: Option<File>, file: &File, path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    if let Some(state) = state {
-        let name = path.file_name().context("cost ledger has no filename")?;
-        super::creation::sync_created_entry(file, &state, name, &state)?;
-    }
-    #[cfg(not(unix))]
-    let _ = (state, file, path);
-    Ok(())
 }
 
 struct CostLedgerLockGuard {
@@ -1188,13 +1186,33 @@ impl CostStorage {
         let (mut file, state) = open_cost_file(&self.path, CostFileAccess::Append)
             .with_context(|| format!("Failed to open cost storage at {}", self.path.display()))?
             .context("cost ledger was not created")?;
-        file.write_all(&encoded)
-            .with_context(|| format!("Failed to write cost record to {}", self.path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("Failed to sync cost storage at {}", self.path.display()))?;
-        // A durable file body is insufficient when this append created the
-        // ledger. Persist its directory entry before acknowledging settlement.
-        sync_cost_directory(state, &file, &self.path)?;
+        let result = (|| -> Result<()> {
+            file.write_all(&encoded)
+                .with_context(|| format!("Failed to write cost record to {}", self.path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("Failed to sync cost storage at {}", self.path.display()))?;
+            Ok(())
+        })();
+        #[cfg(unix)]
+        if let Some(parent) = state.as_ref() {
+            super::creation::with_created_entry(
+                &file,
+                parent,
+                self.path.file_name().context("cost ledger has no filename")?,
+                || {
+                    result?;
+                    parent.sync_all()?;
+                    Ok(())
+                },
+            )?;
+        } else {
+            result?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = state;
+            result?;
+        }
 
         self.daily_micro_usd = daily_micro;
         self.monthly_micro_usd = monthly_micro;
