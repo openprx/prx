@@ -406,6 +406,43 @@ mod tests {
     use reqwest::Method;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn invalid_saved_model_settings_remain_readable_for_repair() {
+        let served = serve_config(|config| {
+            config.model_settings.insert(
+                "openai/gpt-5.6".into(),
+                serde_json::from_value(json!({"level":"future","max_output_tokens":0})).unwrap(),
+            );
+        })
+        .await;
+        let (status, reply) = served
+            .call(Method::GET, "/api/models/settings?provider=openai&model=gpt-5.6", None)
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        let value = json(&reply);
+        assert_eq!(at(&value, "/settings/level"), "future");
+        assert!(at(&value, "/levels/high").is_object());
+        assert!(at(&value, "/validation_error").is_string());
+        let (status, reply) = served
+            .call(
+                Method::PUT,
+                "/api/models/settings?confirm_high_risk=true",
+                Some(json!({"model":"openai/gpt-5.6","settings":{"level":"high"}})),
+            )
+            .await;
+        assert!(status == 200 || status == 202, "{status}: {reply}");
+        assert_eq!(
+            served
+                .loaded()
+                .model_settings
+                .get("openai/gpt-5.6")
+                .unwrap()
+                .level
+                .as_deref(),
+            Some("high")
+        );
+    }
+
     /// F-2: a model id with `/` round-trips through the body (declaration,
     /// route, default, agent binding), through the query of `GET
     /// /api/models`, and back out of every read.
@@ -745,14 +782,22 @@ pub async fn get_model_settings(State(state): State<AppState>, Query(query): Que
         return manage_error_response(ManageError::NotFound("release catalog model".into()), None, &verbatim);
     };
     let config = manage::service(&state).config();
-    if let Some(settings) = config.model_settings.get(&row.id)
-        && let Err(error) = settings.validate(&row.id)
-    {
-        return manage_error_response(ManageError::Invalid(error.to_string()), None, &verbatim);
-    }
+    let validation_error = config
+        .model_settings
+        .get(&row.id)
+        .and_then(|settings| settings.validate(&row.id).err())
+        .map(|error| error.to_string());
+    let mut settings = json!(config.model_settings.get(&row.id));
+    crate::config::secret_paths::redact_subtree(
+        &mut settings,
+        &[
+            crate::config::secret_paths::PathElem::Key("model_settings".into()),
+            crate::config::secret_paths::PathElem::Key(row.id.clone()),
+        ],
+    );
     Json(
         json!({"model":row.id, "levels":row.levels, "default_level":row.default_level,
-        "parameters":row.parameters, "settings":config.model_settings.get(&row.id)}),
+        "parameters":row.parameters, "settings":settings, "validation_error":validation_error}),
     )
     .into_response()
 }

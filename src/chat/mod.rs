@@ -83,6 +83,7 @@ mod copy_select;
 mod external_editor;
 mod file_mention;
 mod input_queue;
+mod model_commands;
 mod output;
 mod provider_turns;
 mod pty_attach;

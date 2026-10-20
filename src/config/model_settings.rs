@@ -5,13 +5,32 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+mod runtime;
+pub(crate) use runtime::{runtime_layers, warnings};
+
 /// A model level plus explicit parameter overrides in `[model_settings."<id>"]`.
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ModelSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
     #[serde(flatten)]
     pub overrides: BTreeMap<String, Value>,
+}
+
+// Preserve malformed saved levels for diagnosis and repair. Runtime ignores
+// them, while the transaction validator rejects new malformed selections.
+impl<'de> Deserialize<'de> for ModelSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut overrides = BTreeMap::<String, Value>::deserialize(deserializer)?;
+        let level = match overrides.get("level") {
+            Some(Value::String(value)) => Some(value.clone()),
+            _ => None,
+        };
+        if level.is_some() || overrides.get("level").is_some_and(Value::is_null) {
+            overrides.remove("level");
+        }
+        Ok(Self { level, overrides })
+    }
 }
 
 impl std::fmt::Debug for ModelSettings {
@@ -39,6 +58,7 @@ impl ModelSettings {
     }
 
     fn parameter_layer(&self, id: &str) -> anyhow::Result<ParameterLayer> {
+        anyhow::ensure!(!self.overrides.contains_key("level"), "model level requires a string");
         let release = ReleaseCatalog::embedded_ref()?;
         let model = release
             .models
@@ -112,13 +132,39 @@ impl ModelSettings {
     }
 }
 
+/// Flattened settings must not absorb misspelled configuration fields.
+/// Values remain available for runtime compatibility with an older catalog.
+pub(crate) fn validate_keys(config: &crate::config::Config) -> anyhow::Result<()> {
+    for (index, route) in config.model_routes.iter().enumerate() {
+        for name in route.settings.overrides.keys() {
+            anyhow::ensure!(
+                name == "level" || ModelParameter::parse(name).is_some(),
+                "Unknown configuration path: model_routes.{index}.{name}; configuration is never silently ignored"
+            );
+        }
+    }
+    for (id, settings) in &config.model_settings {
+        for name in settings.overrides.keys() {
+            anyhow::ensure!(
+                name == "level" || ModelParameter::parse(name).is_some(),
+                "Unknown configuration path: model_settings.{id}.{name}; configuration is never silently ignored"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Select the route level before applying explicit model and route parameters.
 /// An explicit model value survives a route that only selects a level (design §5).
 pub(crate) fn parameter_layers(id: &str, settings: &[&ModelSettings]) -> anyhow::Result<Vec<ParameterLayer>> {
-    let mut layers = settings
+    let layers = settings
         .iter()
         .map(|settings| settings.parameter_layer(id))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(order_layers(layers))
+}
+
+fn order_layers(mut layers: Vec<ParameterLayer>) -> Vec<ParameterLayer> {
     let level = layers.iter().rev().find_map(|layer| layer.level.clone());
     for layer in &mut layers {
         layer.level = None;
@@ -132,7 +178,7 @@ pub(crate) fn parameter_layers(id: &str, settings: &[&ModelSettings]) -> anyhow:
             },
         );
     }
-    Ok(layers)
+    layers
 }
 
 /// Validate changed settings at the shared transaction boundary.
@@ -140,25 +186,18 @@ pub(crate) fn validate_changes(
     current: Option<&crate::config::Config>,
     candidate: &crate::config::Config,
 ) -> Result<(), String> {
-    validate_settings(current, candidate, false)
+    validate_settings(current, candidate)
 }
 
 /// Existing retired/deleted settings remain stored but cannot justify new choices.
 pub(crate) fn validate_existing(candidate: &crate::config::Config) -> Result<(), String> {
-    validate_settings(None, candidate, true)
+    validate_keys(candidate).map_err(|error| error.to_string())
 }
 
-fn validate_settings(
-    current: Option<&crate::config::Config>,
-    candidate: &crate::config::Config,
-    existing: bool,
-) -> Result<(), String> {
+fn validate_settings(current: Option<&crate::config::Config>, candidate: &crate::config::Config) -> Result<(), String> {
     let release = ReleaseCatalog::embedded_ref().map_err(|error| error.to_string())?;
     for route in &candidate.model_routes {
         let row = release.model(&crate::providers::ProviderId::of(&route.provider), &route.model);
-        if existing && row.is_none_or(|row| !row.is_listed()) {
-            continue;
-        }
         let model_settings = row.and_then(|row| candidate.model_settings.get(&row.id));
         if current.is_some_and(|current| {
             current.model_routes.iter().any(|old| {
@@ -183,15 +222,6 @@ fn validate_settings(
         }
     }
     for (id, settings) in &candidate.model_settings {
-        if existing
-            && release
-                .models
-                .iter()
-                .find(|row| row.id == *id)
-                .is_none_or(|row| !row.is_listed())
-        {
-            continue;
-        }
         if current.and_then(|config| config.model_settings.get(id)) != Some(settings) {
             settings.validate(id).map_err(|error| error.to_string())?;
         }
@@ -203,6 +233,73 @@ fn validate_settings(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn model_settings_loader_refuses_misspelled_route_and_model_keys_without_values() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let secret = ["prx_loader_", "private_value"].concat();
+        for model_settings in [false, true] {
+            let mut config = crate::config::Config::default();
+            let settings = ModelSettings {
+                level: None,
+                overrides: [("api_keyy".into(), json!(secret))].into(),
+            };
+            if model_settings {
+                config.model_settings.insert("openai/gpt-5.6".into(), settings);
+            } else {
+                config.model_routes.push(crate::config::ModelRouteConfig {
+                    hint: "prx_route".into(),
+                    provider: "openai".into(),
+                    model: "gpt-5.6".into(),
+                    settings,
+                    api_key: None,
+                    credential_ref: None,
+                });
+            }
+            std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+            let error = crate::config::Config::load_from_path(&path, dir.path().join("workspace")).unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains("Unknown configuration path"), "{error}");
+            assert!(error.contains("api_keyy"), "{error}");
+            if model_settings {
+                assert!(error.contains("model_settings.openai/gpt-5.6.api_keyy"), "{error}");
+                assert!(!error.contains("<id>"), "{error}");
+            }
+            assert!(!error.contains(&secret), "{error}");
+        }
+    }
+
+    #[test]
+    fn model_settings_loader_keeps_known_flat_route_parameters() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_temperature=0.7\n[[model_routes]]\nhint='prx_route'\nprovider='openai'\nmodel='gpt-5.6'\nlevel='high'\nmax_output_tokens=8192\n").unwrap();
+        let config = crate::config::Config::load_from_path(&path, dir.path().join("workspace")).unwrap();
+        let route = config.model_routes.first().unwrap();
+        assert_eq!(route.settings.level.as_deref(), Some("high"));
+        assert_eq!(route.settings.overrides.get("max_output_tokens"), Some(&json!(8192)));
+    }
+
+    #[test]
+    fn loader_keeps_malformed_saved_levels_available_for_repair() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_temperature=0.7\n[model_settings.\"openai/gpt-5.6\"]\nlevel=42\n[[model_routes]]\nhint='prx_route'\nprovider='openai'\nmodel='gpt-5.6'\nlevel=false\n").unwrap();
+        let config = crate::config::Config::load_from_path(&path, dir.path().join("workspace")).unwrap();
+        let model = config.model_settings.get("openai/gpt-5.6").unwrap();
+        let route = &config.model_routes.first().unwrap().settings;
+        assert_eq!(model.overrides.get("level"), Some(&json!(42)));
+        assert_eq!(route.overrides.get("level"), Some(&json!(false)));
+        assert!(
+            warnings(&config)
+                .unwrap()
+                .iter()
+                .any(|note| note.contains("requires a string"))
+        );
+        assert!(model.validate("openai/gpt-5.6").is_err());
+        assert!(route.validate("openai/gpt-5.6").is_err());
+    }
 
     #[test]
     fn model_settings_roundtrip_as_flat_toml_parameters() {

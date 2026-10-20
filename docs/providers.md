@@ -895,11 +895,18 @@ onboarding use the same configuration transaction boundary. See
 
 Adapter output caps are defaults, so the release catalog and a saved level can
 replace them. For example, Anthropic Sonnet 5 `high` sends `max_tokens: 8192`.
+If neither supplies a limit, Anthropic and Bedrock retain the adapter output
+limit so required request fields remain present.
 Explicit caller limits still take precedence. Unknown models and rows with no
 parameter declarations retain their adapter request, including Codex's legacy
 medium verbosity and xhigh effort. Authentication retries reuse the first
 preparation record. Parameter lookup uses the selected canonical provider
 identity, including endpoints sharing the OpenAI transport.
+
+Stale saved settings are adjusted once for each resolved provider generation,
+with a warning when an invalid value is dropped or clamped. Repeated requests,
+streams and inherited tasks reuse that preparation. Replacing the provider
+generation prepares its settings again and can warn again.
 
 ## Release catalog lifecycle
 
@@ -927,6 +934,10 @@ billed. Kimi K2.6's public model card lists 0.95 input, 4 output and 0.16 cache
 hit. K2 cache misses use the input rate, including the catalog's cache-write
 accounting field. All values are USD per million tokens.
 
+OpenAI documents `gpt-5.6` as an alias routing to GPT-5.6 Sol, so the alias row
+uses the [Sol model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
+This alias relationship was checked on 2026-10-20; the catalog prices are unchanged.
+
 <!-- catalog-tariff-citations:start -->
 | Exact catalog row or zero-rule scope | Published source or documented zero rule |
 | --- | --- |
@@ -944,7 +955,7 @@ accounting field. All values are USD per million tokens.
 | `openai/gpt-4o` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-4o) |
 | `openai/gpt-4o-mini` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-4o-mini) |
 | `openai/gpt-5.2-codex` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.2-codex) |
-| `openai/gpt-5.6` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
+| `openai/gpt-5.6` | [GPT-5.6 alias of GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
 | `openai/gpt-5.6-luna` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-luna) |
 | `openai/gpt-5.6-sol` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
 | `openai/gpt-5.6-terra` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-terra) |

@@ -281,12 +281,12 @@ fn encode_recorded<T: Serialize + ?Sized>(
             caller.overrides.insert(parameter, value.clone());
         }
     }
-    let selected = super::model_settings::selected(&model.id);
-    let settings_layers =
-        crate::config::model_settings::parameter_layers(&model.id, &selected.iter().collect::<Vec<_>>())?;
-    if default_output_limit {
-        caller.overrides.remove(&ModelParameter::MaxOutputTokens);
-    }
+    let settings_layers = super::model_settings::runtime_layers(model);
+    let adapter_output_limit = if default_output_limit {
+        caller.overrides.remove(&ModelParameter::MaxOutputTokens)
+    } else {
+        None
+    };
     let mut layers = Vec::new();
     if let Some(temperature) = super::model_settings::default_temperature() {
         let mut baseline = parameters::ParameterLayer::default();
@@ -313,12 +313,53 @@ fn encode_recorded<T: Serialize + ?Sized>(
             .insert(ModelParameter::Temperature, Value::from(temperature));
     }
     layers.extend(settings_layers);
-    let resolved = if layers.is_empty() {
+    let mut resolved = if layers.is_empty() {
         parameters::resolve(model, revision, std::slice::from_ref(&caller))?
     } else {
         layers.push(caller);
         parameters::resolve(model, revision, &layers)?
     };
+    if default_output_limit && matches!(format, Format::Anthropic | Format::Bedrock) {
+        // A transport-owned output limit is the last fallback, after catalog,
+        // saved settings and explicit callers. Even a partially declared row
+        // cannot remove the adapter's required/conservative output boundary.
+        if !resolved.values.contains_key(&ModelParameter::MaxOutputTokens)
+            && let Some(mut limit) = adapter_output_limit
+        {
+            if let Some(CatalogParameter::Range { min, max, step, .. }) =
+                model.parameters.get(ModelParameter::MaxOutputTokens.as_str())
+            {
+                let number = limit
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("adapter output limit requires a positive integer"))?;
+                let bounded = parameters::bounded_number(number as f64, *min, *max, *step);
+                anyhow::ensure!(
+                    bounded.fract() == 0.0 && (1.0..=9_007_199_254_740_991.0).contains(&bounded),
+                    "adapter output limit requires a positive integer"
+                );
+                limit = Value::from(bounded as u64);
+            }
+            resolved.values.insert(ModelParameter::MaxOutputTokens, limit);
+        }
+        let output = resolved
+            .values
+            .get(&ModelParameter::MaxOutputTokens)
+            .and_then(Value::as_u64);
+        anyhow::ensure!(
+            output.is_some_and(|output| output > 0),
+            "adapter requires a positive output limit"
+        );
+        if let Some(thinking) = resolved
+            .values
+            .get(&ModelParameter::ThinkingBudget)
+            .and_then(Value::as_u64)
+        {
+            anyhow::ensure!(
+                output.is_some_and(|output| output > thinking),
+                "max_output_tokens must exceed thinking_budget"
+            );
+        }
+    }
     // Effort alone must never leave a partial/adaptive thinking object in an
     // Anthropic request. Budget-based thinking is emitted only when resolved.
     if !resolved.values.contains_key(&ModelParameter::ThinkingBudget) {
@@ -447,6 +488,88 @@ mod tests {
         assert_eq!(baseline.get("max_tokens"), Some(&json!(3072)));
         let explicit = encode_recorded(&body, Format::Anthropic, &model, "fixture", false, false).unwrap();
         assert_eq!(explicit.get("max_tokens"), Some(&json!(4096)));
+    }
+
+    #[test]
+    fn required_output_limits_survive_catalog_rows_without_a_default() {
+        for (format, body, pointer) in [
+            (Format::Anthropic, json!({"max_tokens":4096}), "/max_tokens"),
+            (
+                Format::Bedrock,
+                json!({"inferenceConfig":{"maxTokens":4096}}),
+                "/inferenceConfig/maxTokens",
+            ),
+        ] {
+            for declarations in [
+                json!({"max_output_tokens":{"kind":"range","min":1,"max":8192}}),
+                json!({"temperature":{"kind":"range","min":0,"max":1}}),
+            ] {
+                let model = model(declarations, json!({}));
+                let prepared = encode_recorded(&body, format, &model, "fixture", false, true).unwrap();
+                assert_eq!(prepared.pointer(pointer), Some(&json!(4096)), "{pointer}");
+            }
+        }
+    }
+
+    #[test]
+    fn adapter_output_fallback_obeys_catalog_bounds_and_thinking_budget() {
+        let bounded = model(
+            json!({"max_output_tokens":{"kind":"range","min":1,"max":1024}}),
+            json!({}),
+        );
+        let body = json!({"max_tokens":4096});
+        let prepared = encode_recorded(&body, Format::Anthropic, &bounded, "fixture", false, true).unwrap();
+        assert_eq!(prepared.get("max_tokens"), Some(&json!(1024)));
+        let thinking = model(
+            json!({"max_output_tokens":{"kind":"range","min":1,"max":16384},"thinking_budget":{"kind":"range","min":1024,"max":16384,"default":8192}}),
+            json!({}),
+        );
+        let error = encode_recorded(&body, Format::Anthropic, &thinking, "fixture", false, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("max_output_tokens must exceed thinking_budget")
+        );
+    }
+
+    #[test]
+    fn every_required_output_limit_adapter_sends_a_limit_for_every_release_model() {
+        let release = ReleaseCatalog::embedded_ref().unwrap();
+        for (provider, format, body, pointer) in [
+            (
+                "anthropic",
+                Format::Anthropic,
+                json!({"max_tokens":4096}),
+                "/max_tokens",
+            ),
+            (
+                "bedrock",
+                Format::Bedrock,
+                json!({"inferenceConfig":{"maxTokens":4096}}),
+                "/inferenceConfig/maxTokens",
+            ),
+        ] {
+            let rows: Vec<_> = release.models.iter().filter(|row| row.provider == provider).collect();
+            assert!(!rows.is_empty(), "nonempty {provider} control");
+            for row in rows {
+                let prepared =
+                    serde_json::to_value(request(provider, format, &row.api_model, &body).with_default_output_limit())
+                        .unwrap();
+                assert!(
+                    prepared
+                        .pointer(pointer)
+                        .and_then(Value::as_u64)
+                        .is_some_and(|limit| limit > 0),
+                    "{}: {prepared}",
+                    row.id
+                );
+            }
+            let legacy = serde_json::to_value(
+                request(provider, format, "prx-unlisted-model", &body).with_default_output_limit(),
+            )
+            .unwrap();
+            assert_eq!(legacy.pointer(pointer), Some(&json!(4096)));
+        }
     }
 
     #[test]

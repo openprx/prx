@@ -4558,6 +4558,77 @@ fn print_summary(config: &Config) {
     println!();
 }
 
+/// The first files contain only safe shipped defaults. The operator's complete
+/// selection then uses the shared PMM transaction, including revision/history
+/// and compensation, for both quick setup and the interactive wizard.
+async fn persist_onboarding_config(config: &Config, split: bool) -> Result<()> {
+    use crate::config::manage::{ApplyOptions, ConfigActor, ConfigChange, ConfigTransactions};
+    if !config.config_path.exists() {
+        let initial = Config {
+            config_path: config.config_path.clone(),
+            workspace_dir: config.workspace_dir.clone(),
+            ..Config::default()
+        };
+        if split {
+            crate::config::files::write_split_config(&initial, false).await?;
+        } else {
+            initial.save().await?;
+        }
+    }
+    let current = Config::load_from_path(&config.config_path, config.workspace_dir.clone())?;
+    let transactions = ConfigTransactions::new(crate::config::new_shared(current)).deferring_activation();
+    let plan = transactions
+        .plan(ConfigChange::Structured(Box::new(config.clone())))
+        .await?;
+    let revision = plan.planned_revision().map(str::to_string);
+    // These are the inputs the operator just supplied to onboarding. Bind
+    // confirmation to the actual plan revision, never to a wildcard.
+    transactions
+        .apply(
+            plan,
+            ConfigActor::Cli,
+            ApplyOptions {
+                expected_revision: revision.as_deref(),
+                confirm_high_risk: true,
+                confirmed_revision: revision.as_deref(),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+fn choose_model_level(
+    provider: &str,
+    model: &str,
+) -> Result<std::collections::BTreeMap<String, crate::config::model_settings::ModelSettings>> {
+    let release = crate::providers::catalog::ReleaseCatalog::embedded_ref()?;
+    let Some(row) = release.model(&crate::providers::ProviderId::of(provider), model) else {
+        return Ok(Default::default());
+    };
+    if row.levels.is_empty() {
+        return Ok(Default::default());
+    }
+    let levels = ["low", "medium", "high"];
+    let default = levels
+        .iter()
+        .position(|level| row.default_level.as_deref() == Some(*level))
+        .unwrap_or(1);
+    let choice = Select::new()
+        .with_prompt("Model level")
+        .items(levels)
+        .default(default)
+        .interact()?;
+    let level = levels
+        .get(choice)
+        .ok_or_else(|| anyhow::anyhow!("invalid model level selection"))?;
+    let settings = crate::config::model_settings::ModelSettings {
+        level: Some((*level).to_owned()),
+        ..Default::default()
+    };
+    settings.validate(&row.id)?;
+    Ok([(row.id.clone(), settings)].into())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -6425,75 +6496,4 @@ mod tests {
             "the file was rewritten"
         );
     }
-}
-
-/// The first files contain only safe shipped defaults. The operator's complete
-/// selection then uses the shared PMM transaction, including revision/history
-/// and compensation, for both quick setup and the interactive wizard.
-async fn persist_onboarding_config(config: &Config, split: bool) -> Result<()> {
-    use crate::config::manage::{ApplyOptions, ConfigActor, ConfigChange, ConfigTransactions};
-    if !config.config_path.exists() {
-        let initial = Config {
-            config_path: config.config_path.clone(),
-            workspace_dir: config.workspace_dir.clone(),
-            ..Config::default()
-        };
-        if split {
-            crate::config::files::write_split_config(&initial, false).await?;
-        } else {
-            initial.save().await?;
-        }
-    }
-    let current = Config::load_from_path(&config.config_path, config.workspace_dir.clone())?;
-    let transactions = ConfigTransactions::new(crate::config::new_shared(current)).deferring_activation();
-    let plan = transactions
-        .plan(ConfigChange::Structured(Box::new(config.clone())))
-        .await?;
-    let revision = plan.planned_revision().map(str::to_string);
-    // These are the inputs the operator just supplied to onboarding. Bind
-    // confirmation to the actual plan revision, never to a wildcard.
-    transactions
-        .apply(
-            plan,
-            ConfigActor::Cli,
-            ApplyOptions {
-                expected_revision: revision.as_deref(),
-                confirm_high_risk: true,
-                confirmed_revision: revision.as_deref(),
-            },
-        )
-        .await?;
-    Ok(())
-}
-
-fn choose_model_level(
-    provider: &str,
-    model: &str,
-) -> Result<std::collections::BTreeMap<String, crate::config::model_settings::ModelSettings>> {
-    let release = crate::providers::catalog::ReleaseCatalog::embedded_ref()?;
-    let Some(row) = release.model(&crate::providers::ProviderId::of(provider), model) else {
-        return Ok(Default::default());
-    };
-    if row.levels.is_empty() {
-        return Ok(Default::default());
-    }
-    let levels = ["low", "medium", "high"];
-    let default = levels
-        .iter()
-        .position(|level| row.default_level.as_deref() == Some(*level))
-        .unwrap_or(1);
-    let choice = Select::new()
-        .with_prompt("Model level")
-        .items(levels)
-        .default(default)
-        .interact()?;
-    let level = levels
-        .get(choice)
-        .ok_or_else(|| anyhow::anyhow!("invalid model level selection"))?;
-    let settings = crate::config::model_settings::ModelSettings {
-        level: Some((*level).to_owned()),
-        ..Default::default()
-    };
-    settings.validate(&row.id)?;
-    Ok([(row.id.clone(), settings)].into())
 }

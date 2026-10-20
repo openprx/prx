@@ -1,5 +1,6 @@
 //! Generation-owned settings around a resolved provider chain.
 use super::Provider;
+use super::catalog::{ReleaseModel, parameters::ParameterLayer};
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, ChatTrace, ProviderCapabilities, ProviderRequestMode, StreamChunk,
     StreamOptions, StreamResult, ToolsPayload,
@@ -9,6 +10,7 @@ use crate::llm::route_decision::{ProviderExecutionOutcome, RouteDecision};
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
+use parking_lot::Mutex;
 use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Clone, Default)]
@@ -16,6 +18,22 @@ pub(crate) struct Settings {
     models: Option<Arc<BTreeMap<String, ModelSettings>>>,
     route: Option<(String, ModelSettings)>,
     default_temperature: Option<f64>,
+    prepared: Option<Arc<Mutex<BTreeMap<String, Vec<ParameterLayer>>>>>,
+}
+
+impl Settings {
+    fn new(
+        models: Option<Arc<BTreeMap<String, ModelSettings>>>,
+        route: Option<(String, ModelSettings)>,
+        default_temperature: Option<f64>,
+    ) -> Self {
+        Self {
+            models,
+            route,
+            default_temperature,
+            prepared: Some(Arc::new(Mutex::new(BTreeMap::new()))),
+        }
+    }
 }
 
 tokio::task_local! { static CURRENT: Settings; static TEMPERATURE: Option<f64>; }
@@ -37,18 +55,33 @@ pub(crate) fn with_temperature<F: std::future::Future>(
     TEMPERATURE.scope(temperature, work)
 }
 
-pub(crate) fn selected(id: &str) -> Vec<ModelSettings> {
+// The cache belongs to this provider generation and is shared by inherited
+// tasks and streams. Only release model IDs can reach it; there is no global
+// warning registry or state retained after this generation is dropped.
+pub(crate) fn runtime_layers(model: &ReleaseModel) -> Vec<ParameterLayer> {
     CURRENT
         .try_with(|settings| {
-            let mut layers = Vec::new();
-            if let Some(model) = settings.models.as_ref().and_then(|models| models.get(id)) {
-                layers.push(model.clone());
+            let Some(prepared) = &settings.prepared else {
+                return Vec::new();
+            };
+            let mut prepared = prepared.lock();
+            if let Some(layers) = prepared.get(&model.id) {
+                return layers.clone();
             }
-            if let Some((model, route)) = &settings.route
-                && model == id
+            let mut selected = Vec::new();
+            if let Some(saved) = settings.models.as_ref().and_then(|models| models.get(&model.id)) {
+                selected.push(saved);
+            }
+            if let Some((id, route)) = &settings.route
+                && id == &model.id
             {
-                layers.push(route.clone());
+                selected.push(route);
             }
+            if selected.is_empty() {
+                return Vec::new();
+            }
+            let layers = crate::config::model_settings::runtime_layers(model, &selected);
+            prepared.insert(model.id.clone(), layers.clone());
             layers
         })
         .unwrap_or_default()
@@ -73,11 +106,7 @@ pub(crate) fn wrap(
     } else {
         Box::new(SettingsProvider {
             inner,
-            settings: Settings {
-                models,
-                route,
-                default_temperature,
-            },
+            settings: Settings::new(models, route, default_temperature),
         })
     }
 }

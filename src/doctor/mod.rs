@@ -1328,8 +1328,18 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
 /// unverified), verified is fine.
 fn check_model_selection(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "models";
-    match crate::config::manage::lifecycle::warnings(config) {
+    match crate::config::model_settings::warnings(config) {
         Ok(warnings) => items.extend(warnings.into_iter().map(|warning| DiagItem::warn(cat, warning))),
+        Err(error) => items.push(DiagItem::error(cat, error.to_string())),
+    }
+    match crate::config::manage::lifecycle::diagnostics(config) {
+        Ok(notes) => items.extend(notes.into_iter().map(|note| {
+            if note.warning {
+                DiagItem::warn(cat, note.message)
+            } else {
+                DiagItem::with_state(Severity::Ok, DiagnosticState::Unknown, cat, note.message)
+            }
+        })),
         Err(error) => items.push(DiagItem::error(cat, error.to_string())),
     }
     match crate::providers::selection::default_status(config) {
@@ -2249,7 +2259,7 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// True for a Cargo build output directory (`…/target/debug`,
+/// True for a Cargo build output directory (`…/<output>/debug`,
 /// `…/target/release`, `…/target/<triple>/debug/deps`, …).
 ///
 /// Such a directory must never enter the required set: `cargo run -- doctor`,
@@ -2258,14 +2268,23 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
 /// daemon's `PATH` — an operational step that outlives the build tree.
 #[cfg(any(target_os = "linux", test))]
 fn is_cargo_build_dir(path: &Path) -> bool {
-    let parts: Vec<&std::ffi::OsStr> = path.components().map(std::path::Component::as_os_str).collect();
-    let Some(target_at) = parts.iter().rposition(|part| *part == "target") else {
-        return false;
+    let profile_dir = if path.file_name().is_some_and(|name| name == "deps") {
+        path.parent().unwrap_or(path)
+    } else {
+        path
     };
-    parts
-        .iter()
-        .skip(target_at + 1)
-        .any(|part| *part == "debug" || *part == "release")
+    if !profile_dir
+        .file_name()
+        .is_some_and(|name| name == "debug" || name == "release")
+    {
+        return false;
+    }
+    // `deps` is a Cargo artifact directory even when a copied layout no
+    // longer has its siblings. A profile directory itself needs layout proof.
+    path != profile_dir
+        || ["deps", "build", ".fingerprint"]
+            .iter()
+            .any(|name| profile_dir.join(name).is_dir())
 }
 
 /// The deployed daemon binary as the daemon itself recorded it in
@@ -2558,6 +2577,37 @@ mod tests {
     )]
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn doctor_reports_invalid_saved_model_settings_as_repairable_warnings() {
+        let mut config = Config::default();
+        config.default_provider = Some("openai".into());
+        config.default_model = Some("gpt-5.6".into());
+        config.model_settings.insert(
+            "openai/gpt-5.6".into(),
+            serde_json::from_value(serde_json::json!({"level":"future"})).unwrap(),
+        );
+        let mut items = Vec::new();
+        check_model_selection(&config, &mut items);
+        assert!(items.iter().any(|item| item.message.contains("saved level")));
+    }
+
+    #[test]
+    fn absent_catalog_lifecycle_is_informational_without_claiming_model_health() {
+        let config = Config {
+            default_provider: Some("openai".into()),
+            default_model: Some("prx-unlisted-model".into()),
+            ..Default::default()
+        };
+        let mut items = Vec::new();
+        check_model_selection(&config, &mut items);
+        let note = items
+            .iter()
+            .find(|item| item.message.contains("deleted or custom"))
+            .unwrap();
+        assert_eq!(note.severity, Severity::Ok);
+        assert_eq!(note.state, DiagnosticState::Unknown);
+    }
 
     #[cfg(feature = "llm-router")]
     #[test]
@@ -4217,12 +4267,19 @@ mod tests {
 
     #[test]
     fn cargo_build_directories_are_recognized_and_ordinary_bin_directories_are_not() {
-        for build in [
-            "/opt/worker/code/prx/target/debug",
-            "/opt/worker/code/prx/target/debug/deps",
-            "/opt/worker/code/prx/target/release",
-            "/opt/worker/code/prx/target/x86_64-unknown-linux-gnu/release",
+        let temp = TempDir::new().unwrap();
+        for layout in [
+            "target/debug",
+            "target/debug/deps",
+            "target/release",
+            "target/x86_64-unknown-linux-gnu/release",
+            "prx-qa-output/debug",
+            "prx-qa-output/debug/deps",
+            "custom-output/aarch64-unknown-linux-gnu/release",
         ] {
+            let build = temp.path().join(layout);
+            std::fs::create_dir_all(build.join(".fingerprint")).unwrap();
+            let build = build.to_str().unwrap();
             assert!(
                 is_cargo_build_dir(Path::new(build)),
                 "must be a build directory: {build}"

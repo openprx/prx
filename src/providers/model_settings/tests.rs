@@ -409,16 +409,17 @@ async fn selected_levels_replace_adapter_output_defaults_but_preserve_explicit_c
             "/inferenceConfig/maxTokens",
         ),
     ] {
-        let settings = Settings {
-            models: Some(Arc::new(
+        let settings = Settings::new(
+            Some(Arc::new(
                 [(
                     format!("{provider}/{model}"),
                     serde_json::from_value(json!({"level":"low"})).unwrap(),
                 )]
                 .into(),
             )),
-            ..Default::default()
-        };
+            None,
+            None,
+        );
         let original = body.pointer(path).unwrap().clone();
         let unchanged =
             serde_json::to_value(request(provider, format, model, &body).with_default_output_limit()).unwrap();
@@ -535,4 +536,151 @@ async fn saved_anthropic_high_level_reaches_the_actual_native_output_limit() {
     assert_eq!(body.get("max_tokens"), Some(&json!(8192)));
     assert_eq!(body.pointer("/output_config/effort"), Some(&json!("high")));
     assert!(body.get("thinking").is_none());
+}
+
+#[tokio::test]
+async fn stale_saved_model_and_route_settings_serve_real_requests_with_safe_wire_values() {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let received = Arc::clone(&bodies);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let received = Arc::clone(&received);
+            async move {
+                received.lock().push(body);
+                Json(json!({"choices":[{"message":{"role":"assistant","content":"prx reply"}}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut config = crate::config::Config {
+        config_path: dir.path().join("config.toml"),
+        workspace_dir: dir.path().join("workspace"),
+        default_provider: Some("openai".into()),
+        default_model: Some("gpt-5.6".into()),
+        api_url: Some(base),
+        api_key: Some("prx-model-settings-fixture".into()),
+        ..Default::default()
+    };
+    config.model_settings.insert(
+        "openai/gpt-5.6".into(),
+        serde_json::from_value(json!({"level":"future","reasoning_effort":"invalid","max_output_tokens":0})).unwrap(),
+    );
+    config.model_routes.push(crate::config::ModelRouteConfig {
+        hint: "high".into(),
+        provider: "openai".into(),
+        model: "gpt-5.6".into(),
+        api_key: None,
+        credential_ref: None,
+        settings: serde_json::from_value(json!({"level":"future","reasoning_effort":"high"})).unwrap(),
+    });
+    std::fs::write(&config.config_path, toml::to_string(&config).unwrap()).unwrap();
+    let config = crate::config::Config::load_from_path(&config.config_path, config.workspace_dir.clone()).unwrap();
+    assert_ne!(
+        crate::config::model_settings::warnings(&config).unwrap(),
+        [] as [String; 0]
+    );
+    assert!(
+        config
+            .model_settings
+            .get("openai/gpt-5.6")
+            .unwrap()
+            .validate("openai/gpt-5.6")
+            .is_err()
+    );
+    let options = crate::providers::provider_runtime_options_from_config(&config);
+    let provider = crate::providers::create_provider_from_test_config(&config, &options).unwrap();
+    let capture = Capture::new(true);
+    assert_eq!(
+        capture
+            .scope(provider.chat_with_system(None, "prx request", "gpt-5.6", 0.7))
+            .await
+            .unwrap(),
+        "prx reply"
+    );
+    capture
+        .scope(provider.chat_with_system(None, "prx route", "hint:high", 0.7))
+        .await
+        .unwrap();
+    capture
+        .scope(provider.chat_with_system(None, "prx root again", "gpt-5.6", 0.7))
+        .await
+        .unwrap();
+    server.abort();
+    let bodies = bodies.lock();
+    assert_eq!(bodies.len(), 3);
+    let body = bodies.first().unwrap();
+    assert_eq!(body.get("reasoning_effort"), Some(&json!("medium")));
+    assert_eq!(body.get("max_completion_tokens"), Some(&json!(1)));
+    assert!(body.get("temperature").is_none());
+    let parameters = capture.take();
+    assert_eq!(bodies.get(1).unwrap().get("reasoning_effort"), Some(&json!("high")));
+    assert_eq!(
+        bodies.get(2).unwrap().get("reasoning_effort"),
+        Some(&json!("medium")),
+        "route settings must not change a sibling chain"
+    );
+    assert_eq!(parameters.len(), 3);
+    assert_eq!(
+        parameters
+            .first()
+            .unwrap()
+            .values
+            .get(&crate::providers::catalog::ModelParameter::ReasoningEffort),
+        Some(&json!("medium"))
+    );
+}
+
+#[test]
+fn stale_settings_warn_once_for_repeated_and_inherited_requests_per_generation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    struct Warnings(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> Layer<S> for Warnings {
+        fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let warnings = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Warnings(Arc::clone(&warnings)));
+    tracing::subscriber::with_default(subscriber, || {
+        let models: Arc<BTreeMap<String, ModelSettings>> = Arc::new(
+            [(
+                "openai/gpt-5.6".into(),
+                serde_json::from_value(json!({"level":"future","max_output_tokens":0})).unwrap(),
+            )]
+            .into(),
+        );
+        let prepare = || {
+            let body = json!({"temperature":0.7});
+            let prepared = serde_json::to_value(crate::providers::parameter_wire::request(
+                "openai",
+                crate::providers::parameter_wire::Format::OpenAiChat,
+                "gpt-5.6",
+                &body,
+            ))
+            .unwrap();
+            assert_eq!(prepared.get("max_completion_tokens"), Some(&json!(1)));
+        };
+        for generation in 1..=2 {
+            let settings = Settings::new(Some(Arc::clone(&models)), None, None);
+            CURRENT.sync_scope(settings.clone(), || {
+                prepare();
+                assert_eq!(warnings.load(Ordering::Relaxed), generation * 2);
+                prepare();
+                CURRENT.sync_scope(inherited().0, prepare);
+                assert_eq!(warnings.load(Ordering::Relaxed), generation * 2);
+            });
+            CURRENT.sync_scope(settings, prepare);
+            assert_eq!(warnings.load(Ordering::Relaxed), generation * 2);
+        }
+    });
 }

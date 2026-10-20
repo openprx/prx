@@ -6741,8 +6741,16 @@ impl Config {
                 unknown_paths.join(", ")
             );
         }
-        for warning in crate::config::manage::lifecycle::warnings(&config)? {
-            tracing::warn!(%warning, "configured model lifecycle warning");
+        crate::config::model_settings::validate_keys(&config)?;
+        for note in crate::config::manage::lifecycle::diagnostics(&config)? {
+            if note.warning {
+                tracing::warn!(warning = %note.message, "configured model lifecycle warning");
+            } else {
+                tracing::info!(note = %note.message, "configured model is absent from the release catalog");
+            }
+        }
+        for warning in crate::config::model_settings::warnings(&config)? {
+            tracing::warn!(%warning, "saved model settings need repair; using runtime compatibility values");
         }
         if let Some(warning) = config.decision_latency_budget_warning() {
             tracing::warn!(warning = %warning, "decision latency budget is below the catalog recommendation");
@@ -7400,6 +7408,8 @@ impl Config {
             anyhow::bail!("scheduler.claim_lease_secs must be at least 3");
         }
 
+        // Flattened model settings accept canonical parameter names only.
+        crate::config::model_settings::validate_keys(self)?;
         // Model routes
         for (i, route) in self.model_routes.iter().enumerate() {
             if route.hint.trim().is_empty() {

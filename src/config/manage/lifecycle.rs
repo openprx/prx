@@ -3,9 +3,19 @@ use crate::config::Config;
 use crate::providers::ProviderId;
 use crate::providers::catalog::{ModelLifecycleStatus, ReleaseCatalog};
 
-/// Warnings for persisted models, including references left by older releases.
-/// Unknown local models are advisory, as they have always been executable.
+/// Lifecycle messages for command output, including informational absences.
 pub fn warnings(config: &Config) -> anyhow::Result<Vec<String>> {
+    Ok(diagnostics(config)?.into_iter().map(|note| note.message).collect())
+}
+
+pub(crate) struct LifecycleDiagnostic {
+    pub message: String,
+    pub warning: bool,
+}
+
+/// Unknown catalog selections are informational; open-ended providers do not
+/// promise a closed release inventory.
+pub(crate) fn diagnostics(config: &Config) -> anyhow::Result<Vec<LifecycleDiagnostic>> {
     let release = ReleaseCatalog::embedded_ref()?;
     let mut selected = super::validate::selected_models(config);
     for id in config.model_settings.keys() {
@@ -18,10 +28,19 @@ pub fn warnings(config: &Config) -> anyhow::Result<Vec<String>> {
     let mut warnings = Vec::new();
     for (provider, model) in selected {
         let identity = ProviderId::of(&provider);
-        if !identity.is_resolvable() || model.starts_with("hint:") {
+        if identity.catalog_name().is_none() || model.starts_with("hint:") {
             continue;
         }
-        let state = match release.model(&identity, &model) {
+        let row = release.model(&identity, &model);
+        if row.is_none()
+            && release
+                .models
+                .iter()
+                .any(|row| Some(row.provider.as_str()) == identity.catalog_name() && row.api_model == "*")
+        {
+            continue;
+        }
+        let state = match row {
             Some(row) if row.lifecycle.status == ModelLifecycleStatus::Active => continue,
             Some(row) => {
                 let status = match row.lifecycle.status {
@@ -36,11 +55,11 @@ pub fn warnings(config: &Config) -> anyhow::Result<Vec<String>> {
             }
             None => "absent from this release (deleted or custom); unverified without local evidence".into(),
         };
-        warnings.push(format!(
+        warnings.push(LifecycleDiagnostic { warning: row.is_some(), message: format!(
             "model '{}' of provider '{}' is {state}; existing configuration is retained; inspect `prx models migrate-retired`",
             crate::security::redaction::redact_provider_text(&model),
             crate::security::redaction::redact_provider_text(&provider),
-        ));
+        ) });
     }
     Ok(warnings)
 }
@@ -56,6 +75,24 @@ fn replacement(release: &ReleaseCatalog, provider: &str, model: &str) -> anyhow:
     let Some(target) = row.lifecycle.replacement.as_deref() else {
         return Ok(None);
     };
+    // A variant can carry a distinct tariff (for example `:free`). A base
+    // replacement cannot authorize silently losing that suffix.
+    let spellings = || {
+        std::iter::once(row.api_model.as_str())
+            .chain(std::iter::once(row.id.as_str()))
+            .chain(row.aliases.iter().map(String::as_str))
+    };
+    let has_variant = !spellings().any(|name| name.eq_ignore_ascii_case(model))
+        && spellings().any(|name| {
+            model
+                .get(..name.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+                && model.get(name.len()..).is_some_and(|suffix| suffix.starts_with(':'))
+        });
+    anyhow::ensure!(
+        !has_variant,
+        "model variant cannot be migrated to a base replacement; select its variant explicitly"
+    );
     let target = release
         .models
         .iter()
@@ -211,6 +248,73 @@ fn migrate_fallbacks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_absence_is_informational_and_open_ended_providers_are_skipped() {
+        for (provider, model, absent) in [
+            ("custom:https://example.com/v1", "prx-custom-model", false),
+            ("ollama", "prx-local-tag:latest", false),
+            ("openrouter", "prx/unlisted-model", true),
+            ("openai", "prx-unlisted-model", true),
+        ] {
+            let config = Config {
+                default_provider: Some(provider.into()),
+                default_model: Some(model.into()),
+                ..Default::default()
+            };
+            let notes = diagnostics(&config).unwrap();
+            let selected = notes
+                .iter()
+                .filter(|note| note.message.contains(model))
+                .collect::<Vec<_>>();
+            assert_eq!(!selected.is_empty(), absent, "{provider}");
+            assert!(selected.iter().all(|note| !note.warning));
+        }
+        let config = Config {
+            default_provider: Some("openai".into()),
+            default_model: Some("gpt-4o".into()),
+            ..Default::default()
+        };
+        assert!(
+            diagnostics(&config)
+                .unwrap()
+                .iter()
+                .any(|note| note.warning && note.message.contains("retired"))
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_free_variant_refuses_the_real_migration_plan_without_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            workspace_dir: dir.path().join("workspace"),
+            default_provider: Some("openrouter".into()),
+            default_model: Some("moonshotai/kimi-k2.5:free".into()),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let before = std::fs::read(&config.config_path).unwrap();
+        let service = super::super::ManagementService::deferred(crate::config::new_shared(config.clone()));
+        let error = service
+            .plan(
+                &super::super::ManagedChange::MigrateRetired,
+                super::super::ConfigActor::Cli,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("variant"), "{error}");
+        assert_eq!(std::fs::read(&config.config_path).unwrap(), before);
+        assert_eq!(
+            service.config().default_model.as_deref(),
+            Some("moonshotai/kimi-k2.5:free")
+        );
+        config.default_model = Some("moonshotai/kimi-k2.5".into());
+        assert_eq!(
+            candidate(&config).unwrap().default_model.as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+    }
     use crate::providers::catalog::{CatalogView, DescriptorSource, Requirement, UnknownPolicy};
 
     #[test]
