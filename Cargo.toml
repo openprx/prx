@@ -182,19 +182,19 @@ futures = "0.3"
 regex = "1.10"
 unicode-normalization = "0.1"
 hostname = "0.4.2"
-rustls = "0.23"
+rustls = "0.23.46"
 rustls-pki-types = "1.14.0"
 # X.509 SVID parsing for SPIFFE peer verification (PEM/DER decode, SAN URI,
 # validity, chain signature check against a trust bundle CA).
 x509-parser = { version = "0.18", features = ["verify"] }
 tokio-rustls = "0.26.4"
-webpki-roots = "1.0.6"
+webpki-roots = "1.0.10"
 skillratings = { version = "0.27", optional = true }
 tiktoken-rs = { version = "0.5", optional = true }
 
 # WASM Plugin System (optional)
-wasmtime = { version = "48.0.5", optional = true, default-features = false, features = ["async", "component-model", "cranelift", "cache"] }
-wasmtime-wasi = { version = "48.0.5", optional = true }
+wasmtime = { version = "48.0.7", optional = true, default-features = false, features = ["async", "component-model", "cranelift", "cache"] }
+wasmtime-wasi = { version = "48.0.7", optional = true }
 
 # email
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }

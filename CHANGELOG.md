@@ -82,10 +82,11 @@ and the migration warnings below before upgrading.
   a closed vocabulary, including streaming, Gemini OAuth and signed Bedrock
   bodies. Release data replaces the Kimi URL temperature heuristic and Codex
   model-ID effort clamps; unsupported values are dropped, numeric bounds and
-  recognized effort values are clamped, and invalid typed values fail locally.
-  Unverified models use the adapter base request. Known catalog rows omit
-  undeclared canonical fields, including legacy overrides and adapter defaults;
-  an empty parameter declaration preserves the adapter base request. Catalog changes roll back
+  recognized effort values are clamped, and invalid explicit caller types fail
+  locally. Unverified models use the adapter base request. Known catalog rows
+  omit undeclared optional canonical fields, including legacy overrides and
+  adapter defaults; API-required output limits retain a positive default. An
+  empty parameter declaration preserves the adapter base request. Catalog changes roll back
   with the binary; operator TOML and credential ownership are unchanged.
   Prepared values and revision stay in the existing main and auxiliary outcome
   records, including failed auxiliary calls, without a separate event write.
@@ -242,6 +243,9 @@ and the migration warnings below before upgrading.
   nothing and is not an error, as in SQLite.
 
 ### Security
+
+- Raise the minimum Rustls, trusted-root bundle and Wasmtime patch versions
+  to include current upstream security fixes.
 
 - **Breaking: WASM plugins are off and need operator trust.**
   `[plugins] enabled` defaults to `false`; nothing under `<workspace>/plugins`
