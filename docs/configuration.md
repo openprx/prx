@@ -32,6 +32,12 @@ configuration tree the run reads and writes: `config.toml`, `config.d/`,
 `workspace/`, `daemon.lock`, `daemon_state.json`, and the key material under
 `keys/`.
 
+The session-worker transport key at `keys/session_worker.secret` is published
+atomically on first use. Concurrent minting and verification use the same
+complete 32-byte key. Existing key material is never overwritten by initialization;
+a malformed key is refused and must be restored before using it for worker
+capabilities. Existing valid keys remain compatible with older binaries.
+
 `prx init` resolves its target directory in this order, highest first:
 
 1. `prx init --dir <DIR>` — the init-specific target;
