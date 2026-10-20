@@ -46,7 +46,7 @@ git ls-files -z '*.rs' ':!vendor/**' \
   | sort -nr
 ```
 
-The threshold is strictly more than 5,000 physical lines. The current tree has
+The threshold is strictly more than 5,000 physical lines. The 2026-10-15 snapshot had
 20 qualifying first-party files. Crossing the threshold does not by itself
 justify a behavior-changing split; each exception below records its owner and
 why its current contents remain cohesive. Future growth still requires review.
@@ -62,7 +62,7 @@ why its current contents remain cohesive. Future growth still requires review.
 | 11,698 | `src/chat/dispatcher.rs` | Owns the reducer effect executor and admitted Chat driver with behavioral tests that pin action/effect ordering. |
 | 11,033 | `src/chat/state.rs` | Owns the pure Chat reducer, effect vocabulary, state transitions, and exhaustive reducer tests. |
 | 10,755 | `src/memory/postgres.rs` | Owns the PostgreSQL `Memory` adapter, pool, RLS, schema/migrations, SQL projections, and backend-specific tests. |
-| < 1,500 per file | `tests/architecture_boundaries/main.rs` + sibling modules | One integration target with concern-based guard modules and shared helpers; exact allowlists and mutation probes remain together in the target. The metaguard reads every module declared by its thin root. |
+| 10,040 | `tests/architecture_boundaries.rs` | Centralizes declarative source scanners, exact allowlists, and mutation probes so architectural exceptions cannot diverge across test binaries. |
 | 9,819 | `src/gateway/mod.rs` | Owns Axum ingress, production registry assembly, gateway runtime lifecycle, and root integration fixtures; API and compatibility handlers are already separate modules. |
 | 8,881 | `src/runtime/turn_decision.rs` | Owns decision-service integration and its policy matrix; routing and supporting decision concerns are already factored into child modules. |
 | 7,493 | `src/providers/mod.rs` | Owns provider factory, route/credential resolution, dialect selection, and factory tests while concrete provider protocols remain separate. |
@@ -107,3 +107,19 @@ lines), with explicit arguments and one private borrowed UI context. The
 original statements, error propagation, primitive await order, guard lifetimes,
 and 238 clone calls are preserved. All chat tests remain unchanged; source
 guards cover the new production child alongside the root.
+
+
+## Finding 104 split and current inventory (2026-10-21)
+
+The architecture guards remain one integration target, `architecture_boundaries`,
+with a 30-line `tests/architecture_boundaries/main.rs` root and 22 child modules
+by concern. Shared source readers and function helpers live in `helpers.rs`;
+the largest child is 884 lines. All 248 guard and probe function names,
+assertions, allowlists, and failure messages are retained. Rust module prefixes
+change, while the Cargo test target name stays the same. The metaguard reads
+every module declared by the thin root and checks that each source is nonempty.
+
+A fresh scan of 1,279 tracked first-party Rust, JavaScript, TypeScript, and Svelte
+files, excluding `vendor/` and `console/dist/`, finds no file above 5,000 physical
+lines. The largest is `src/providers/compatible.rs` at 4,991 lines. The dated
+2026-10-15 inventory above is retained as the historical baseline.
