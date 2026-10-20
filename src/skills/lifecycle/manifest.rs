@@ -169,7 +169,7 @@ fn markdown_tools(value: &str) -> Result<Vec<String>, ManifestError> {
         .and_then(|rest| rest.strip_suffix(']'))
         .ok_or(ManifestError::InvalidField {
             field: REQUIRED_TOOLS_KEY,
-            reason: "must be a one-line list such as [shell:native:shell, mcp:notes:search]",
+            reason: "must be a one-line list such as [filesystem:native:shell, mcp:notes:mcp__notes__search]",
         })?;
     checked_tools(
         inner

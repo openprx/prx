@@ -157,7 +157,7 @@ fn a_refused_tool_call_is_recorded_as_a_permission_refusal() {
 
     // A denied call in the list counts even when the counter was not carried.
     let (tmp, store, pin) = setup();
-    let listed = clean(vec![call("shell:native:shell", ObservedCallStatus::Denied)]);
+    let listed = clean(vec![call("filesystem:native:shell", ObservedCallStatus::Denied)]);
     let facts = terminal_facts(&tmp, &store, &pin, "listed", Some(&listed));
     assert_eq!(facts.permission_refused, FactState::Present);
 

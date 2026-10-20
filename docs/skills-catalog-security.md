@@ -98,20 +98,37 @@ of canonical capability ids:
 ---
 name: deploy-helper
 description: Helps with deploys
-required-tools: [shell:native:shell, filesystem:native:file_read, mcp:notes:search]
+required-tools: [filesystem:native:shell, filesystem:native:file_read, mcp:notes:mcp__notes__search]
 ---
 ```
 
-An id is exactly three non-empty parts, `family:namespace:public_name`. The
-family is one of `memory`, `skill`, `mcp`, `native_tool`, `wasm`, `hook`,
-`filesystem`, `shell`, `document`, `web`, `im`, `session`. The namespace is
-`native` for built-in tools and the server name for MCP tools. Examples:
-`shell:native:shell`, `filesystem:native:file_read`,
-`native_tool:native:<name>`, `mcp:<server>:<public_name>` and
-`skill:native:skill__<skill>__<tool>`. The public name is the tool name the
-model sees (`capability_search` returns it for each hit); no CLI listing of
-canonical ids exists yet, so build the id from the family, the namespace and
-that name. A call matches a requirement only when the whole id is equal.
+An id is exactly three non-empty parts, `family:namespace:public_name`, as the
+capability catalog builds it:
+
+- The family is the first matching category of the tool, checked in this order:
+  `document_search` is `document`, `sessions_history` is `session`, a tool in
+  the file-system category is `filesystem`, then `memory`, `web`, `im`, and a
+  tool named `shell` is `shell`; every other built-in tool is `native_tool`.
+  The shell tool is in the file-system category, so its id is
+  `filesystem:native:shell`, not `shell:native:shell`. Skill tools are `skill`,
+  MCP tools `mcp`, plugin tools `wasm`.
+- The namespace is `native` for built-in tools. For MCP it is the server name
+  once the tool has been discovered, and the literal `mcp` for a configured
+  alias that has not been discovered yet, so the same tool can have two ids
+  depending on discovery state; declare the id the running catalog shows.
+- The public name is the name the model sees. An MCP tool's is
+  `mcp__<server>__<tool>`, so its id is `mcp:<server>:mcp__<server>__<tool>`.
+  A skill tool's is `skill__<skill>__<tool>`.
+
+Examples: `filesystem:native:shell`, `filesystem:native:file_read`,
+`native_tool:native:<name>`, `mcp:notes:mcp__notes__search`,
+`skill:native:skill__<skill>__<tool>`.
+
+Find an id by calling `capability_search`: each hit carries the canonical id in
+`capability.id`. The id cannot be resolved from a bare tool name when a revision
+is written, because the lifecycle store has no catalog at that point (the
+catalog is built per turn from the live configuration and MCP servers), so
+operators declare the full id.
 
 At most 16 ids per skill. The same key may appear under `[skill]` in
 `SKILL.toml` as an array of strings. When both files declare it, the lists must

@@ -2857,7 +2857,7 @@ mod tests {
         let trace = ExecutionTraceSnapshot {
             calls: vec![
                 call("native_tool:native:deploy_check", "success"),
-                call("shell:native:shell", "denied"),
+                call("filesystem:native:shell", "denied"),
                 call("native_tool:native:odd", "no-such-code"),
             ],
             denied_attempts: 1,

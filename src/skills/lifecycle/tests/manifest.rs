@@ -138,7 +138,7 @@ fn required_tools_are_read_from_the_frontmatter_list() {
 }
 
 const A: &str = "native_tool:native:a";
-const B: &str = "mcp:notes:search";
+const B: &str = "mcp:notes:mcp__notes__search";
 
 /// Every form the key does not allow: the real ids of the lifecycle have the
 /// shape `family:namespace:name` with a known family.
@@ -151,9 +151,9 @@ const BAD_LINES: [&str; 12] = [
     "required-tools: [shell::shell]",
     "required-tools: [bogus:native:x]",
     "required-tools: [none:native:x]",
-    "required-tools: [shell:native:shell:more]",
+    "required-tools: [filesystem:native:shell:more]",
     "required-tools: [a b]",
-    "required-tools: [shell:native:shell, ",
+    "required-tools: [filesystem:native:shell, ",
     "required-tools: {a: 1}",
 ];
 
@@ -164,7 +164,7 @@ fn a_legacy_or_malformed_required_tools_line_reads_as_undeclared() {
     for line in BAD_LINES
         .iter()
         .copied()
-        .chain(["required-tools: [native_tool:native:a]\nrequired-tools: [mcp:notes:search]"])
+        .chain(["required-tools: [native_tool:native:a]\nrequired-tools: [mcp:notes:mcp__notes__search]"])
     {
         let info = manifest_of(vec![entry("SKILL.md", md_with_tools(line).as_bytes())])
             .unwrap_or_else(|e| panic!("test: {line} must stay readable: {e}"));
@@ -183,7 +183,7 @@ fn a_new_revision_with_a_malformed_required_tools_line_is_refused_with_a_typed_e
     for line in BAD_LINES
         .iter()
         .copied()
-        .chain(["required-tools: [native_tool:native:a]\nrequired-tools: [mcp:notes:search]"])
+        .chain(["required-tools: [native_tool:native:a]\nrequired-tools: [mcp:notes:mcp__notes__search]"])
     {
         let err = strict(line).expect_err(line);
         assert!(
@@ -197,7 +197,7 @@ fn a_new_revision_with_a_malformed_required_tools_line_is_refused_with_a_typed_e
             "{line}: {err}"
         );
     }
-    let ok = strict("required-tools: [shell:native:shell, filesystem:native:file_read, mcp:notes:search, skill:native:skill__a__b, native_tool:native:x]")
+    let ok = strict("required-tools: [filesystem:native:shell, filesystem:native:file_read, mcp:notes:mcp__notes__search, skill:native:skill__a__b, native_tool:native:x]")
         .expect("test: every known shape");
     assert_eq!(ok.required_tools.len(), 5);
 }

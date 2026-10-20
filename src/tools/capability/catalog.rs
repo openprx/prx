@@ -1266,6 +1266,50 @@ mod tests {
         }
     }
 
+    /// The canonical ids that `required-tools` takes are the ones the catalog
+    /// builds: the shell tool is a file-system tool first, and a discovered MCP
+    /// tool is filed under its server with its alias as the public name.
+    #[test]
+    fn canonical_ids_of_the_shell_and_a_discovered_mcp_tool_are_the_documented_ones() {
+        use crate::skills::lifecycle::{Bundle, BundleEntry, validate_manifest_strict};
+        let workspace = tempfile::tempdir().unwrap();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::shell::ShellTool::new(
+            Arc::new(crate::runtime::NativeRuntime::new()),
+            workspace.path().to_path_buf(),
+        ))];
+        let mut sources = CatalogSources::default();
+        sources.mcp.push(McpCapabilitySpec {
+            server: "notes".into(),
+            tool: "search".into(),
+            state_digest: [0; 32],
+            spec: ToolSpec {
+                name: "mcp__notes__search".into(),
+                description: "search notes".into(),
+                parameters: json!({"type":"object","properties":{}}),
+            },
+        });
+        let catalog = CapabilityCatalog::build(&tools, &sources, &SurfacePolicy::default()).unwrap();
+        let shell = catalog.entry_for_public_name("shell").unwrap().id.as_str().to_owned();
+        let mcp = catalog
+            .entry_for_public_name("mcp__notes__search")
+            .unwrap()
+            .id
+            .as_str()
+            .to_owned();
+        assert_eq!(shell, "filesystem:native:shell");
+        assert_eq!(mcp, "mcp:notes:mcp__notes__search");
+        // Exactly these strings are accepted by the lifecycle manifest check.
+        let skill = format!("---\nname: ids\ndescription: ids\nrequired-tools: [{shell}, {mcp}]\n---\n\nBody.\n");
+        let bundle = Bundle::from_entries(vec![BundleEntry {
+            path: std::path::PathBuf::from("SKILL.md"),
+            bytes: skill.into_bytes(),
+            executable: false,
+        }])
+        .unwrap();
+        let info = validate_manifest_strict(&bundle).unwrap();
+        assert_eq!(info.required_tools, vec![shell, mcp]);
+    }
+
     #[test]
     fn catalog_rejects_duplicate_public_names_before_execution_deduplicates() {
         let tools: Vec<Box<dyn Tool>> = vec![
