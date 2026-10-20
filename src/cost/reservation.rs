@@ -790,31 +790,40 @@ fn append_inner(workspace: &Path, events: &[Event]) -> Result<()> {
         ),
         Err(error) => return Err(error.into()),
     };
-    let stat = rustix::fs::fstat(&fd)?;
-    ensure!(
-        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
-            && stat.st_nlink == 1
-            && stat.st_mode & 0o022 == 0,
-        "reservation journal is not a private single-link regular file"
-    );
-    ensure!(!events.is_empty(), "reservation append batch is empty");
-    let mut encoded = Vec::new();
-    for event in events {
-        serde_json::to_writer(&mut encoded, event)?;
-        encoded.push(b'\n');
-    }
-    ensure!(
-        stat.st_size >= 0 && (stat.st_size as u64).saturating_add(encoded.len() as u64) <= 8 * 1024 * 1024,
-        "reservation journal exceeds its bound"
-    );
-    let mut file = std::fs::File::from(fd);
-    file.write_all(&encoded)?;
-    file.sync_all()?;
-    // Persist directory creation of the journal before returning authority.
+    let file = std::fs::File::from(fd);
+    let parent = std::fs::File::from(state);
+    let operation = || -> Result<()> {
+        let mut writer = &file;
+        let stat = rustix::fs::fstat(&file)?;
+        ensure!(
+            FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+                && stat.st_nlink == 1
+                && stat.st_mode & 0o022 == 0,
+            "reservation journal is not a private single-link regular file"
+        );
+        ensure!(!events.is_empty(), "reservation append batch is empty");
+        let mut encoded = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut encoded, event)?;
+            encoded.push(b'\n');
+        }
+        ensure!(
+            stat.st_size >= 0 && (stat.st_size as u64).saturating_add(encoded.len() as u64) <= 8 * 1024 * 1024,
+            "reservation journal exceeds its bound"
+        );
+        writer.write_all(&encoded)?;
+        file.sync_all()?;
+        if created {
+            parent.sync_all()?;
+        }
+        Ok(())
+    };
     if created {
-        let state = std::fs::File::from(state);
-        super::creation::sync_created_entry(&file, &state, std::ffi::OsStr::new(JOURNAL), &state)?;
+        super::creation::with_created_entry(&file, &parent, std::ffi::OsStr::new(JOURNAL), operation)?;
+    } else {
+        operation()?;
     }
+
     Ok(())
 }
 
@@ -829,4 +838,17 @@ fn append(workspace: &Path, event: &Event) -> Result<()> {
 
 fn append_batch(workspace: &Path, events: &[Event]) -> Result<()> {
     append_inner(workspace, events).map_err(|error| ReservationWriteUnconfirmed(error).into())
+}
+
+#[cfg(all(test, unix))]
+mod creation_failure_tests {
+    use super::*;
+    #[test]
+    fn invalid_append_after_create_leaves_no_new_reservation_journal() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("state")).unwrap();
+        let error = append_inner(workspace.path(), &[]).unwrap_err();
+        assert!(error.to_string().contains("append batch is empty"));
+        assert!(!workspace.path().join("state").join(JOURNAL).exists());
+    }
 }

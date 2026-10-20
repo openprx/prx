@@ -19,7 +19,8 @@ for integration, validation and rollback limits.
   pre-C2 `xhigh`. Explicit configured effort still takes precedence. Unknown
   models retain the pre-C2 base request (`medium` verbosity and `xhigh` effort).
 
-- Ordinary causal telemetry reserves channel headroom for Applied/Drain controls.
+- Ordinary causal telemetry and Applied/Drain controls now use separate bounded
+  channels, so ordinary backlog cannot consume control capacity.
 - Recursive child grants now subtract a strict half-share from the parent's
   remaining monetary balance, rounded down to whole cents. Authenticated
   approval resume keeps the original run's one-child slot and balance.

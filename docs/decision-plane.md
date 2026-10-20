@@ -163,18 +163,20 @@ as `estimated_unsent_v1`; older builds that do not recognize that event fail
 closed on that workspace ledger. Once the transport receives the receipt,
 missing usage still retains the entire liability.
 
-The bounded causal-event channel keeps 256 entries and admits at most 255
-ordinary phase events at once, reserving a control entry for Applied or Drain.
-Ordinary telemetry alone cannot fill that control entry. A queue already
-saturated by controls can still report StoreDropped; the application remains
-retryable and Drain waits within its caller's existing deadline.
+Causal events use separate bounded channels: 256 ordinary queue entries with
+at most 255 admitted ordinary phase events, and 256 Applied/Drain control
+entries. Ordinary telemetry cannot consume control capacity. A control channel
+already saturated by controls can still report StoreDropped; the application
+remains retryable and Drain waits within its caller's existing deadline.
 
 Workspace cost trackers share storage while each admitted caller retains its
 immutable cost configuration. Looking up an older generation cannot overwrite
 a newer caller's reservation limits.
 
-Creation-only directory sync remains mandatory: a failed sync rolls back the newly created journal entry, so a
-subsequent append must create and sync it again. Existing ledger files and
+Creation-only directory sync remains mandatory. Any failure after creating a
+cost entry, including validation, body write, file sync or directory sync, rolls
+back that entry after verifying its inode identity. A subsequent append must
+create and sync it again. Existing ledger files and
 replacement inodes are never removed by this rollback.
 
 Fully reported input/output usage replaces the estimate using pinned PMM prices.
@@ -670,3 +672,24 @@ hard maximum 120 seconds). Main settlement, premium reservation and dispatch
 consume this window. The continuation shares the original accounting balance
 and settlement gate; it does not replenish money, tokens, tools or decision
 authority. See [Router configuration](router.md) for the field and range.
+
+Recursive delegation allowance lifetime: an enabled supervised root registers
+its allowance at admission, before publishing any child grant. A durable pending
+approval retains that same allowance across a pause and a configuration reload,
+even when no child has been published. Resume consumes that retention without
+reissuing money or the one-child claim. Denial, revocation, expiry, and the last
+nonpending context drop remove the run's registry aliases. A process restart
+that lost the allowance still refuses recursive delegation; approval metadata
+alone cannot recreate it. Ordinary children retain independent per-child
+allowances during closeout; carving from their parent's allowance is deferred
+to the next phase by the operator's finding-98.10 ruling.
+
+Causal persistence has independent bounded ordinary and control channels.
+Applied records and drain barriers cannot lose their capacity to ordinary
+telemetry; a drain includes all earlier queued ordinary events before it
+acknowledges durability. Control overflow and store failure remain explicit
+incomplete outcomes with retry available. Decision-admin key preparation and
+capability-latency SQLite reads run in blocking owners; the initial latency
+snapshot is prepared before the turn deadline starts. The existing turn and
+Router deadlines stay unchanged. Revert the corresponding finding-98 fix
+commits to roll these lifecycle and persistence changes back.

@@ -308,7 +308,12 @@ impl TurnDecisionService {
             sealed_call: None,
             expires_at: approval_scope.expires_at,
         };
-        self.persist_pending_record(record, &source).await
+        let expires_at = record.expires_at;
+        self.persist_pending_record(record, &source).await?;
+        if let Some(owner) = context.recursive_allowance.get() {
+            owner.retain_pending(expires_at);
+        }
+        Ok(())
     }
 
     async fn persist_pending_record(&self, record: PendingRecord, source: &MessageEvent) -> anyhow::Result<()> {
@@ -345,7 +350,11 @@ impl TurnDecisionService {
                 && !record.op_ids.is_empty(),
             "collection pending commitment mismatch"
         );
+        let expires_at = record.expires_at;
         let event = self.persist_pending_record_receipt(record, source).await?;
+        if let Some(owner) = context.recursive_allowance.get() {
+            owner.retain_pending(expires_at);
+        }
         context
             .collected_pending
             .set(Box::new(CollectedPendingCommitment { event }))
@@ -530,6 +539,14 @@ impl TurnDecisionService {
                 "decision approval batch changed during review"
             );
         }
+        if !approved {
+            self.recursive_allowances.retire_pending(
+                &record.subject.workspace_id,
+                &record.subject.owner_id,
+                record.subject.session_key.as_deref().unwrap_or_default(),
+                &record.run_id,
+            );
+        }
         Ok(DecisionApprovalReceipt {
             decision_id: record.binding.decision_id.clone(),
             approved,
@@ -594,6 +611,12 @@ impl TurnDecisionService {
             )
             .await?;
         }
+        self.recursive_allowances.retire_pending(
+            &record.subject.workspace_id,
+            &record.subject.owner_id,
+            record.subject.session_key.as_deref().unwrap_or_default(),
+            &record.run_id,
+        );
         Ok(DecisionRevocationReceipt {
             decision_id: decision_id.to_string(),
             revoked_grants: approval.grants.len(),
@@ -1005,7 +1028,12 @@ impl TurnDecisionService {
             expires_at: Utc::now() + chrono::Duration::minutes(5),
         };
         record.sealed_call = Some(self.seal_pending_call(&record, call.command())?);
-        self.persist_pending_record(record, &source).await
+        let expires_at = record.expires_at;
+        self.persist_pending_record(record, &source).await?;
+        if let Some(owner) = context.recursive_allowance.get() {
+            owner.retain_pending(expires_at);
+        }
+        Ok(())
     }
 }
 

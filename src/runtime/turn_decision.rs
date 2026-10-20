@@ -650,7 +650,7 @@ pub(crate) struct TurnDecisionContext {
     source_actor: (Arc<str>, Arc<str>),
     service_id: uuid::Uuid,
     record_admitted: AtomicBool,
-    recursive_allowance: std::sync::OnceLock<Arc<recursive_allowance::RecursiveAllowance>>,
+    recursive_allowance: std::sync::OnceLock<recursive_allowance::ContextAllowance>,
     main_parameters: std::sync::OnceLock<crate::providers::parameter_capture::Capture>,
     execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
     #[cfg(feature = "llm-router")]
@@ -2145,9 +2145,12 @@ impl TurnDecisionService {
             () = cancellation.cancelled() => return Err(AgentDecisionError::Cancelled),
             admitted = self.admit_decision_resume(proof) => admitted.map_err(AgentDecisionError::PendingApproval)?,
         };
-        if self.generation.effective.sessions_spawn.allow_recursive_delegation {
-            self.recursive_allowances.inherit_resume(proof, admitted.original_run());
-        }
+        let _resume_allowance = self
+            .generation
+            .effective
+            .sessions_spawn
+            .allow_recursive_delegation
+            .then(|| self.recursive_allowances.inherit_resume(proof, admitted.original_run()));
         let (mut context, telemetry) = self
             .decide_agent_initial_inner(
                 proof,
@@ -2182,6 +2185,9 @@ impl TurnDecisionService {
             .await
             .map_err(AgentDecisionError::IngressRecovery)?;
         let budget = self.agent_budget_snapshot(proof)?;
+        let observed_latency = self
+            .observed_capability_latency(proof.owner_id(), *self.catalog.generation())
+            .await;
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(budget.budgets.latency_ms))
             .ok_or(AgentDecisionError::Deadline)?;
@@ -2342,7 +2348,6 @@ impl TurnDecisionService {
             (model, model_ref)
         };
         let decision_request_model = self.factory.request_model().or_else(|| Some(model.model()));
-        let observed_latency = self.observed_capability_latency(proof.owner_id(), catalog.generation());
         let cost_model = super::turn_cost::RuntimeCostModel::new(&model, config, &observed_latency);
         let mut discovered_refs = DiscoveredRefs::empty();
         let call_fingerprints = resume_evidence
@@ -3069,18 +3074,26 @@ impl TurnDecisionService {
         Err(AgentDecisionError::UnsupportedAction)
     }
 
-    fn observed_capability_latency(&self, owner_id: &str, generation: CatalogGeneration) -> BTreeMap<String, u32> {
+    async fn observed_capability_latency(
+        &self,
+        owner_id: &str,
+        generation: CatalogGeneration,
+    ) -> BTreeMap<String, u32> {
         let Some(workspace_id) = self.store.workspace_id() else {
             return BTreeMap::new();
         };
-        match self
-            .store
-            .reader()
-            .capability_latency_p50(&workspace_id, owner_id, &generation.to_hex())
+        let store = Arc::clone(&self.store);
+        let owner_id = owner_id.to_owned();
+        match tokio::task::spawn_blocking(move || {
+            store
+                .reader()
+                .capability_latency_p50(&workspace_id, &owner_id, &generation.to_hex())
+        })
+        .await
         {
-            Ok(samples) => samples,
-            Err(error) => {
-                tracing::warn!(error = %error, "causal outcome latency snapshot unavailable; using pinned defaults");
+            Ok(Ok(samples)) => samples,
+            result => {
+                tracing::warn!(error = ?result, "causal outcome latency snapshot unavailable; using pinned defaults");
                 BTreeMap::new()
             }
         }
@@ -8160,6 +8173,7 @@ mod tests {
         assert_eq!(
             service
                 .observed_capability_latency(proof.owner_id(), context.catalog_generation())
+                .await
                 .get("native_tool:prx_project:read"),
             Some(&30),
             "the service must use the store's stable workspace ID"

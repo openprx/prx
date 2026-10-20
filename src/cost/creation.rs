@@ -16,21 +16,35 @@ fn sync_created_entry_with(
     name: &std::ffi::OsStr,
     sync: impl FnOnce() -> std::io::Result<()>,
 ) -> anyhow::Result<()> {
+    with_created_entry(file, parent, name, || {
+        use anyhow::Context;
+        sync().context("failed to sync new cost entry directory")
+    })
+}
+
+/// Cover every fallible operation after create, including body write and sync.
+#[cfg(unix)]
+pub(super) fn with_created_entry<T>(
+    file: &std::fs::File,
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     use anyhow::Context;
-    if let Err(error) = sync() {
-        // Never unlink a replacement installed at the same name. Callers hold
-        // the workspace ledger lock and pass only files they just created.
-        let opened = rustix::fs::fstat(file)?;
-        let named = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
-        anyhow::ensure!(
-            opened.st_dev == named.st_dev && opened.st_ino == named.st_ino,
-            "new cost entry changed before creation rollback"
-        );
-        rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::empty())
-            .context("failed to roll back unsynced new cost entry")?;
-        return Err(error).context("failed to sync new cost entry directory");
+    match operation() {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let opened = rustix::fs::fstat(file)?;
+            let named = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+            anyhow::ensure!(
+                opened.st_dev == named.st_dev && opened.st_ino == named.st_ino,
+                "new cost entry changed before creation rollback"
+            );
+            rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::empty())
+                .context("failed to roll back unsynced new cost entry")?;
+            Err(error)
+        }
     }
-    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -72,5 +86,20 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
+    #[test]
+    fn failed_operation_after_body_write_rolls_back_created_file_before_retry() {
+        use std::io::Write;
+        let workspace = tempfile::tempdir().unwrap();
+        let parent = File::open(workspace.path()).unwrap();
+        let path = workspace.path().join("costs.jsonl");
+        let file = OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        let result = with_created_entry(&file, &parent, std::ffi::OsStr::new("costs.jsonl"), || {
+            (&file).write_all(b"partial body")?;
+            Err::<(), _>(std::io::Error::other("injected append failure").into())
+        });
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert!(OpenOptions::new().write(true).create_new(true).open(path).is_ok());
     }
 }
