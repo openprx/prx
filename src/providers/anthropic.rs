@@ -802,7 +802,8 @@ impl AnthropicProvider {
                             &native_request.model,
                             &native_request,
                         )
-                        .with_default_output_limit(),
+                        .with_default_output_limit()
+                        .without_recording(),
                     );
                 let retry_response = self.apply_auth(retry_req, &new_credential).send().await?;
                 if !retry_response.status().is_success() {
@@ -1350,7 +1351,8 @@ impl Provider for AnthropicProvider {
                             &body.model,
                             &body,
                         )
-                        .with_default_output_limit(),
+                        .with_default_output_limit()
+                        .without_recording(),
                     );
                 let retry_response = self.apply_auth(retry_req, &new_credential).send().await?;
                 if !retry_response.status().is_success() {

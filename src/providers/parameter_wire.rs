@@ -174,6 +174,13 @@ pub(crate) const fn request<'a, T: Serialize + ?Sized>(
 }
 
 impl<T: ?Sized> Request<'_, T> {
+    /// Reuse preparation on an authentication retry without double recording.
+    #[must_use]
+    pub(crate) const fn without_recording(mut self) -> Self {
+        self.record = false;
+        self
+    }
+
     /// This limit comes from the adapter, not an explicit caller value.
     #[must_use]
     pub(crate) const fn with_default_output_limit(mut self) -> Self {
@@ -277,16 +284,7 @@ fn encode_recorded<T: Serialize + ?Sized>(
     let selected = super::model_settings::selected(&model.id);
     let settings_layers =
         crate::config::model_settings::parameter_layers(&model.id, &selected.iter().collect::<Vec<_>>())?;
-    if default_output_limit
-        && settings_layers.iter().any(|settings| {
-            settings.overrides.contains_key(&ModelParameter::MaxOutputTokens)
-                || settings
-                    .level
-                    .as_ref()
-                    .and_then(|level| model.levels.get(level))
-                    .is_some_and(|values| values.contains_key(ModelParameter::MaxOutputTokens.as_str()))
-        })
-    {
+    if default_output_limit {
         caller.overrides.remove(&ModelParameter::MaxOutputTokens);
     }
     let mut layers = Vec::new();
@@ -436,6 +434,19 @@ mod tests {
         model.levels = serde_json::from_value(json!({"low":level,"medium":level,"high":level})).unwrap();
         model.default_level = Some("medium".into());
         model
+    }
+
+    #[test]
+    fn catalog_output_defaults_replace_adapter_caps_but_explicit_limits_win() {
+        let model = model(
+            json!({"max_output_tokens":{"kind":"range","min":1,"max":8192,"default":3072}}),
+            json!({}),
+        );
+        let body = json!({"max_tokens":4096});
+        let baseline = encode_recorded(&body, Format::Anthropic, &model, "fixture", false, true).unwrap();
+        assert_eq!(baseline.get("max_tokens"), Some(&json!(3072)));
+        let explicit = encode_recorded(&body, Format::Anthropic, &model, "fixture", false, false).unwrap();
+        assert_eq!(explicit.get("max_tokens"), Some(&json!(4096)));
     }
 
     #[test]

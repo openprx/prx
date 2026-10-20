@@ -2771,7 +2771,9 @@ fn create_provider_with_url_and_options(
             }
             Ok(Box::new(anthropic::AnthropicProvider::new(effective_key)))
         }
-        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
+        "openai" => Ok(Box::new(
+            openai::OpenAiProvider::with_base_url(api_url, key).with_parameter_provider(name),
+        )),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_runtime_options(
             api_url,
@@ -2996,10 +2998,10 @@ fn create_provider_with_url_and_options(
         )),
 
         // ── Cloud AI endpoints ───────────────────────────────
-        "ovhcloud" | "ovh" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
-            Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
-            key,
-        ))),
+        "ovhcloud" | "ovh" => Ok(Box::new(
+            openai::OpenAiProvider::with_base_url(Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"), key)
+                .with_parameter_provider(name),
+        )),
 
         _ => anyhow::bail!(
             "Unknown provider: {}. Check README for supported providers or run `prx onboard --interactive` to reconfigure.\n\

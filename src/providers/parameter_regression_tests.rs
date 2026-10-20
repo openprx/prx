@@ -166,3 +166,62 @@ fn typed_anthropic_identity_maps_effort_without_borrowing_it_for_custom_endpoint
         body
     );
 }
+
+#[tokio::test]
+async fn anthropic_authentication_retry_keeps_one_preparation_and_identical_parameters() {
+    let capture = super::parameter_capture::Capture::new(true);
+    let provider = super::ProviderId::of("anthropic");
+    capture
+        .scope(async {
+            let body = json!({"model":"claude-sonnet-5","max_tokens":4096,"temperature":0.7});
+            let original = serde_json::to_value(
+                super::parameter_wire::request_for(&provider, Format::Anthropic, "claude-sonnet-5", &body)
+                    .with_default_output_limit(),
+            )
+            .unwrap();
+            let retry = serde_json::to_value(
+                super::parameter_wire::request_for(&provider, Format::Anthropic, "claude-sonnet-5", &body)
+                    .with_default_output_limit()
+                    .without_recording(),
+            )
+            .unwrap();
+            assert_eq!(retry, original);
+        })
+        .await;
+    assert_eq!(capture.take().len(), 1);
+}
+
+#[tokio::test]
+async fn bound_openai_transport_does_not_borrow_another_providers_parameters() {
+    use axum::{Json, Router, routing::post};
+    let bodies = Arc::new(parking_lot::Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&bodies);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            captured.lock().push(body);
+            async { Json(json!({"choices":[{"message":{"content":"prx reply"}}]})) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for identity in ["ovhcloud", "ovh", "custom:https://example.com/v1", "openai"] {
+        let provider = super::openai::OpenAiProvider::with_base_url(Some(&base), Some("prx-fixture"))
+            .with_parameter_provider(identity);
+        provider
+            .chat_with_system(None, "prx request", "gpt-5.6", 0.3)
+            .await
+            .unwrap();
+    }
+    server.abort();
+    let bodies = bodies.lock();
+    assert_eq!(bodies.len(), 4);
+    for body in bodies.iter().take(3) {
+        assert_eq!(body.get("temperature"), Some(&json!(0.3)));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+    let known = bodies.last().unwrap();
+    assert!(known.get("temperature").is_none());
+    assert!(known.get("reasoning_effort").is_some());
+}

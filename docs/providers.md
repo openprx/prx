@@ -893,6 +893,14 @@ choices with `prx models settings <canonical-id>`. The CLI, Console and
 onboarding use the same configuration transaction boundary. See
 [saving a model level](model-catalog.md#saving-a-model-level).
 
+Adapter output caps are defaults, so the release catalog and a saved level can
+replace them. For example, Anthropic Sonnet 5 `high` sends `max_tokens: 8192`.
+Explicit caller limits still take precedence. Unknown models and rows with no
+parameter declarations retain their adapter request, including Codex's legacy
+medium verbosity and xhigh effort. Authentication retries reuse the first
+preparation record. Parameter lookup uses the selected canonical provider
+identity, including endpoints sharing the OpenAI transport.
+
 ## Release catalog lifecycle
 
 `prx models catalog status` shows the embedded revision, digest and lifecycle

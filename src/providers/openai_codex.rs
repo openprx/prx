@@ -1242,7 +1242,7 @@ fn request_options(model: &str, effort: Option<String>) -> (ResponsesTextOptions
     let legacy = !super::catalog::ReleaseCatalog::embedded_ref().is_ok_and(|catalog| {
         catalog
             .model(&super::ProviderId::of("openai-codex"), normalize_model_id(model))
-            .is_some()
+            .is_some_and(|row| !row.parameters.is_empty())
     });
     (
         ResponsesTextOptions {
@@ -1278,6 +1278,24 @@ mod tests {
         let (text, reasoning) = request_options("openai-codex/gpt-5.3-codex", None);
         assert!(text.verbosity.is_none());
         assert!(reasoning.effort.is_none());
+    }
+
+    #[test]
+    fn empty_codex_declarations_preserve_the_legacy_request_options() {
+        let catalog = super::super::catalog::ReleaseCatalog::embedded_ref().unwrap();
+        let mut exercised = 0;
+        for row in &catalog.models {
+            if row.provider != "openai-codex" || !row.parameters.is_empty() {
+                continue;
+            }
+            let (text, reasoning) = request_options(&row.api_model, None);
+            assert_eq!(text.verbosity.as_deref(), Some("medium"), "{}", row.id);
+            assert_eq!(reasoning.effort.as_deref(), Some("xhigh"), "{}", row.id);
+            let (_, explicit) = request_options(&row.api_model, Some("low".into()));
+            assert_eq!(explicit.effort.as_deref(), Some("low"));
+            exercised += 1;
+        }
+        assert!(exercised > 0);
     }
 
     /// **UTF-8 streaming regression** — the byte-level decoder used by this

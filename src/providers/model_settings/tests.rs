@@ -489,3 +489,50 @@ async fn saved_anthropic_low_level_reaches_the_actual_native_output_limit() {
     assert_eq!(body.pointer("/output_config/effort"), Some(&json!("low")));
     assert!(body.get("thinking").is_none());
 }
+
+#[tokio::test]
+async fn saved_anthropic_high_level_reaches_the_actual_native_output_limit() {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let received = Arc::clone(&bodies);
+    let app = Router::new().route("/v1/messages", post(move |Json(body): Json<Value>| {
+        let received = Arc::clone(&received);
+        async move {
+            received.lock().push(body);
+            Json(json!({"content":[{"type":"text","text":"prx reply"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let provider = wrap(
+        Box::new(crate::providers::anthropic::AnthropicProvider::with_base_url(
+            Some("prx-model-settings-fixture"),
+            Some(&base),
+        )),
+        Some(Arc::new(
+            [(
+                "anthropic/claude-sonnet-5".into(),
+                serde_json::from_value(json!({"level":"high"})).unwrap(),
+            )]
+            .into(),
+        )),
+        None,
+        Some(0.7),
+    );
+    assert_eq!(
+        provider
+            .chat_with_system(None, "prx request", "claude-sonnet-5", 0.7)
+            .await
+            .unwrap(),
+        "prx reply"
+    );
+    server.abort();
+    let bodies = bodies.lock();
+    assert_eq!(bodies.len(), 1);
+    let body = bodies.first().unwrap();
+    assert_eq!(body.get("max_tokens"), Some(&json!(8192)));
+    assert_eq!(body.pointer("/output_config/effort"), Some(&json!("high")));
+    assert!(body.get("thinking").is_none());
+}

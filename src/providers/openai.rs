@@ -20,6 +20,7 @@ const STREAM_DECODER_LABEL: &str = "OpenAI";
 const MAX_STREAMED_TOOL_CALL_INDEX: usize = 128;
 
 pub struct OpenAiProvider {
+    parameter_provider: super::ProviderId,
     base_url: String,
     credential: Option<String>,
 }
@@ -244,7 +245,13 @@ impl OpenAiProvider {
                 .map(|u| u.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             credential: credential.map(ToString::to_string),
+            parameter_provider: super::ProviderId::of("openai"),
         }
+    }
+
+    pub(crate) fn with_parameter_provider(mut self, provider: &str) -> Self {
+        self.parameter_provider = super::ProviderId::of(provider);
+        self
     }
 
     /// Lower every published tool schema to what this endpoint was declared to
@@ -398,8 +405,8 @@ impl OpenAiProvider {
             model,
             &endpoint,
             Some(credential),
-            &super::parameter_wire::request(
-                "openai",
+            &super::parameter_wire::request_for(
+                &self.parameter_provider,
                 super::parameter_wire::Format::OpenAiChat,
                 &native_request.model,
                 &native_request,
@@ -788,8 +795,8 @@ impl Provider for OpenAiProvider {
             .http_client()
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
-            .json(&super::parameter_wire::request(
-                "openai",
+            .json(&super::parameter_wire::request_for(
+                &self.parameter_provider,
                 super::parameter_wire::Format::OpenAiChat,
                 &request.model,
                 &request,
@@ -906,8 +913,8 @@ impl Provider for OpenAiProvider {
             .http_client()
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
-            .json(&super::parameter_wire::request(
-                "openai",
+            .json(&super::parameter_wire::request_for(
+                &self.parameter_provider,
                 super::parameter_wire::Format::OpenAiChat,
                 &native_request.model,
                 &native_request,
@@ -1013,13 +1020,14 @@ impl Provider for OpenAiProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(64);
 
+        let parameter_provider = self.parameter_provider.clone();
         crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
             let response = match client
                 .post(&url)
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("Accept", "text/event-stream")
-                .json(&super::parameter_wire::request(
-                    "openai",
+                .json(&super::parameter_wire::request_for(
+                    &parameter_provider,
                     super::parameter_wire::Format::OpenAiChat,
                     &request_body.model,
                     &request_body,
