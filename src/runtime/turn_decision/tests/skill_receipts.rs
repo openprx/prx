@@ -268,6 +268,7 @@ async fn a_turn_selecting_a_managed_skill_leaves_one_selection_receipt() {
     for _ in 0..3 {
         assert_eq!(selected_names(&turn).expect("test: prompt skills"), [SKILL_NAME]);
     }
+    crate::skills::lifecycle::drain_background_for_test(turn.proof.run_id()).await;
     let experience = store
         .read_experience(turn.proof.run_id())
         .expect("test: read")
@@ -306,6 +307,7 @@ async fn a_failing_selection_record_never_fails_the_turn() {
         selected_names(&turn).expect("the turn survives a capture failure"),
         [SKILL_NAME]
     );
+    crate::skills::lifecycle::drain_background_for_test(turn.proof.run_id()).await;
     crate::skills::lifecycle::release_task_pins(
         &OwnerScope::new(turn.proof.owner_id()).expect("test: owner"),
         turn.proof.run_id(),
@@ -420,6 +422,7 @@ async fn rejoin_without_provider_facts_joins_the_terminal_once_as_unknown() {
         .rejoin_terminal("rejoin-unknown-1", &owner)
         .await
         .expect("test: rejoin");
+    crate::skills::lifecycle::drain_background_for_test("rejoin-unknown-1").await;
     let first = store
         .read_experience(&run_id)
         .expect("test: read")
@@ -440,6 +443,7 @@ async fn rejoin_without_provider_facts_joins_the_terminal_once_as_unknown() {
         .rejoin_terminal("rejoin-unknown-1", &owner)
         .await
         .expect("test: second rejoin");
+    crate::skills::lifecycle::drain_background_for_test("rejoin-unknown-1").await;
     let second = store
         .read_experience(&run_id)
         .expect("test: read")
@@ -466,6 +470,7 @@ async fn rejoin_maps_a_settled_failure_like_the_live_terminal() {
         .rejoin_terminal("rejoin-failed-1", &owner)
         .await
         .expect("test: rejoin");
+    crate::skills::lifecycle::drain_background_for_test("rejoin-failed-1").await;
     let experience = store
         .read_experience(&run_id)
         .expect("test: read")
@@ -492,6 +497,7 @@ async fn rejoin_never_creates_a_store_or_an_experience() {
         .rejoin_terminal("rejoin-bare-1", &owner)
         .await
         .expect("test: rejoin");
+    crate::skills::lifecycle::drain_background_for_test("rejoin-bare-1").await;
     assert!(
         SkillLifecycleStore::open_existing(workspace.path(), OwnerScope::new(&owner).expect("test: owner"))
             .expect("test: open")

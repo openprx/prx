@@ -96,6 +96,132 @@ pub fn record_selected_skills(request: &SelectionRequest<'_>) -> usize {
     recorded
 }
 
+/// Upper bound on remembered (run, skill) selections per process.
+const MAX_REMEMBERED_SELECTIONS: usize = 4096;
+/// How long the background selection write may take before it is abandoned.
+const SELECTION_BUDGET: Duration = Duration::from_millis(3000);
+
+static SCHEDULED_SELECTIONS: std::sync::LazyLock<parking_lot::Mutex<std::collections::VecDeque<String>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::VecDeque::new()));
+
+/// Claims `(workspace, owner, run, skill)` in memory; `false` when already claimed.
+fn claim_selection(request: &SelectionRequest<'_>, name: &str) -> bool {
+    let key = format!(
+        "{}\0{}\0{}\0{}",
+        request.workspace_dir.display(),
+        request.owner_id,
+        request.run_id,
+        name
+    );
+    let mut seen = SCHEDULED_SELECTIONS.lock();
+    if seen.contains(&key) {
+        return false;
+    }
+    if seen.len() >= MAX_REMEMBERED_SELECTIONS {
+        seen.pop_front();
+    }
+    seen.push_back(key);
+    true
+}
+
+#[cfg(test)]
+static BACKGROUND: std::sync::LazyLock<parking_lot::Mutex<Vec<(String, tokio::task::JoinHandle<()>)>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
+
+/// Waits for the background lifecycle writes started for `key` (a run or
+/// terminal id). Test hook: production never awaits them.
+#[cfg(test)]
+pub(crate) async fn drain_background_for_test(key: &str) {
+    let handles: Vec<_> = {
+        let mut pending = BACKGROUND.lock();
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending).into_iter().partition(|(k, _)| k == key);
+        *pending = rest;
+        mine.into_iter().map(|(_, handle)| handle).collect()
+    };
+    for handle in handles {
+        let _ = handle.await;
+    }
+}
+
+fn track_background(_key: &str, handle: tokio::task::JoinHandle<()>) {
+    #[cfg(test)]
+    BACKGROUND.lock().push((_key.to_string(), handle));
+    #[cfg(not(test))]
+    drop(handle);
+}
+
+/// Turn-path entry for selection receipts. Never blocks and never fails the
+/// turn: skills already claimed for this run are skipped from memory without
+/// touching the store, and the store write for the rest runs in a spawned
+/// blocking task with a time budget (errors are logged). Outside a tokio
+/// runtime the receipts are skipped with a warning. Returns how many skills
+/// were handed to the background writer.
+pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
+    if !request.enabled || request.skill_names.is_empty() {
+        return 0;
+    }
+    let fresh: Vec<String> = request
+        .skill_names
+        .iter()
+        .filter(|name| claim_selection(request, name))
+        .map(|name| (*name).to_string())
+        .collect();
+    if fresh.is_empty() {
+        return 0;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("skill selection receipts skipped: no async runtime");
+        return 0;
+    };
+    let count = fresh.len();
+    let workspace = request.workspace_dir.to_path_buf();
+    let owner = request.owner_id.to_string();
+    let run = request.run_id.to_string();
+    let task = request.task_id.map(str::to_string);
+    let key = run.clone();
+    let handle = runtime.spawn(async move {
+        let write = tokio::task::spawn_blocking(move || {
+            let names: Vec<&str> = fresh.iter().map(String::as_str).collect();
+            record_selected_skills(&SelectionRequest {
+                workspace_dir: &workspace,
+                enabled: true,
+                owner_id: &owner,
+                run_id: &run,
+                task_id: task.as_deref(),
+                skill_names: &names,
+            })
+        });
+        match tokio::time::timeout(SELECTION_BUDGET, write).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "skill selection receipt task failed"),
+            Err(_) => tracing::warn!("skill selection receipts exceeded their time budget; continuing"),
+        }
+    });
+    track_background(&key, handle);
+    count
+}
+
+/// Starts [`settle_task_terminal`] without making the caller wait for it:
+/// restart recovery must not extend its own deadline. Outside a tokio runtime
+/// it is skipped with a warning.
+pub fn spawn_settle_task_terminal(
+    workspace_dir: std::path::PathBuf,
+    owner: Option<String>,
+    task_key: Option<String>,
+    terminal_id: String,
+    observation: TerminalObservation,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("skill lifecycle terminal skipped: no async runtime");
+        return;
+    };
+    let key = terminal_id.clone();
+    let handle = runtime.spawn(async move {
+        settle_task_terminal(&workspace_dir, owner, task_key, &terminal_id, observation).await;
+    });
+    track_background(&key, handle);
+}
+
 /// How a turn ended, as the terminal owner observed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalKind {
@@ -122,7 +248,8 @@ pub struct TerminalObservation {
 
 impl TerminalObservation {
     /// The outcome joined to the experience; `None` for a silent turn, which
-    /// is not credited.
+    /// is not credited. Unverified facts (including recovered Failed/Cancelled
+    /// runs) are `Unknown` by ruling: conservative, never learned from.
     #[must_use]
     pub const fn outcome(&self) -> Option<ExperienceOutcome> {
         match self.kind {
@@ -184,6 +311,11 @@ pub async fn settle_task_terminal(
     });
     match tokio::time::timeout(TERMINAL_BUDGET, call_in).await {
         Ok(Ok(Ok(()))) => {}
+        // A join that already exists with another terminal is expected on a
+        // replay racing the live path; the first join is kept.
+        Ok(Ok(Err(error @ LifecycleError::TerminalConflict { .. }))) => {
+            tracing::debug!(%error, "skill lifecycle terminal already joined; keeping the first join");
+        }
         Ok(Ok(Err(error))) => tracing::warn!(%error, "skill lifecycle terminal join failed"),
         Ok(Err(error)) => tracing::warn!(%error, "skill lifecycle terminal task failed"),
         Err(_) => tracing::warn!("skill lifecycle terminal join exceeded its time budget; continuing"),

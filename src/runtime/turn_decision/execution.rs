@@ -732,7 +732,7 @@ impl TurnDecisionService {
             });
         }
         let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
-        crate::skills::lifecycle::record_selected_skills(&crate::skills::lifecycle::SelectionRequest {
+        crate::skills::lifecycle::schedule_selection_receipts(&crate::skills::lifecycle::SelectionRequest {
             workspace_dir: &self.generation.effective.workspace_dir,
             enabled: self.generation.effective.skills_lifecycle.enabled,
             owner_id: proof.owner_id(),

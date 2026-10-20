@@ -3,7 +3,8 @@
 use super::{activate, entry, md, owner};
 use crate::skills::lifecycle::{
     Bundle, ExperienceOutcome, NewRevision, SelectionRequest, SkillId, SkillLifecycleStore, SourceKind, TerminalKind,
-    TerminalObservation, record_selected_skills, release_task_pins, settle_task_terminal, task_pin,
+    TerminalObservation, drain_background_for_test, experience_id, record_selected_skills, release_task_pins,
+    schedule_selection_receipts, settle_task_terminal, task_pin,
 };
 use std::fs;
 use tempfile::TempDir;
@@ -217,4 +218,44 @@ async fn a_recovered_terminal_keeps_the_join_the_live_path_made() {
         .expect("test: record");
     assert_eq!(experience.outcome, ExperienceOutcome::Success);
     assert!(experience.learning_eligible());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scheduled_receipts_do_not_wait_for_a_locked_store_and_dedupe_in_memory() {
+    let (tmp, store) = setup();
+    let exp = SkillId::parse(&experience_id(&owner(OWNER), "run-1")).expect("test: experience id");
+    let held = store
+        .lock_skill(&exp, std::time::Duration::from_secs(1))
+        .expect("test: hold the experience lock");
+    let started = std::time::Instant::now();
+    assert_eq!(schedule_selection_receipts(&request(&tmp, true, &[NAME])), 1);
+    // The repeat assemblies of the same turn never reach the store.
+    assert_eq!(schedule_selection_receipts(&request(&tmp, true, &[NAME])), 0);
+    assert_eq!(schedule_selection_receipts(&request(&tmp, true, &[NAME])), 0);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(250),
+        "scheduling must not wait for the lock: {:?}",
+        started.elapsed()
+    );
+    drop(held);
+    drain_background_for_test("run-1").await;
+    let experience = store
+        .read_experience("run-1")
+        .expect("test: read")
+        .expect("test: record");
+    assert_eq!(experience.selection_receipts.len(), 1);
+    release_task_pins(&owner(OWNER), "run-1");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_disabled_lifecycle_schedules_nothing() {
+    let (tmp, _store) = setup();
+    assert_eq!(schedule_selection_receipts(&request(&tmp, false, &[NAME])), 0);
+}
+
+#[test]
+fn scheduling_outside_a_runtime_is_skipped() {
+    let (tmp, store) = setup();
+    assert_eq!(schedule_selection_receipts(&request(&tmp, true, &[NAME])), 0);
+    assert!(store.read_experience("run-1").expect("test: read").is_none());
 }
