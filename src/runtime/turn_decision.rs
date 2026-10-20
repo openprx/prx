@@ -644,6 +644,7 @@ pub(crate) enum AgentTurnKind {
 /// The immutable result of one source-bound decision chain. Only the service
 /// constructs it; later record and execution streams consume these facts.
 pub(crate) struct TurnDecisionContext {
+    model_catalog: Option<Arc<crate::providers::catalog::ReleaseCatalog>>,
     owner_filesystem: Option<Arc<crate::tools::owner_filesystem::OwnerFilesystem>>,
     accounting: Option<Arc<crate::runtime::decision_accounting::AccountingScope>>,
     resume: Option<Arc<pending_approval::AdmittedDecisionResume>>,
@@ -2505,6 +2506,7 @@ impl TurnDecisionService {
                 return Err(AgentDecisionError::Cancelled);
             }
             Ok(Arc::new(TurnDecisionContext {
+                model_catalog: self.provider_catalog.release_pin(),
                 resume: None,
                 accounting: accounting.retained_scope(),
                 owner_filesystem: owner_filesystem.clone(),
@@ -2561,6 +2563,7 @@ impl TurnDecisionService {
                 };
                 return Ok((
                     Arc::new(TurnDecisionContext {
+                        model_catalog: self.provider_catalog.release_pin(),
                         resume: None,
                         accounting: accounting.retained_scope(),
                         owner_filesystem: owner_filesystem.clone(),
@@ -2823,6 +2826,7 @@ impl TurnDecisionService {
                     }
                     return Ok((
                         Arc::new(TurnDecisionContext {
+                            model_catalog: self.provider_catalog.release_pin(),
                             resume: None,
                             accounting: accounting.retained_scope(),
                             owner_filesystem: owner_filesystem.clone(),
@@ -2867,6 +2871,7 @@ impl TurnDecisionService {
                     }
                     return Ok((
                         Arc::new(TurnDecisionContext {
+                            model_catalog: self.provider_catalog.release_pin(),
                             resume: None,
                             accounting: accounting.retained_scope(),
                             owner_filesystem: owner_filesystem.clone(),
@@ -2912,6 +2917,7 @@ impl TurnDecisionService {
                     }
                     return Ok((
                         Arc::new(TurnDecisionContext {
+                            model_catalog: self.provider_catalog.release_pin(),
                             resume: None,
                             accounting: accounting.retained_scope(),
                             owner_filesystem: owner_filesystem.clone(),
@@ -5132,6 +5138,7 @@ mod tests {
             outgoing_parent_allowed: None,
         };
         let mut context = TurnDecisionContext {
+            model_catalog: None,
             resume: None,
             accounting: None,
             owner_filesystem: None,
@@ -6423,6 +6430,7 @@ mod tests {
             );
 
             let answer_context = TurnDecisionContext {
+                model_catalog: service.provider_catalog.release_pin(),
                 resume: None,
                 accounting: None,
                 owner_filesystem: None,

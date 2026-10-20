@@ -404,6 +404,10 @@ pub fn usage_settlement(
 struct TurnTerminalPayload<'a> {
     terminal_id: &'a str,
     decision_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_catalog_revision: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_catalog_content_sha256: Option<&'a str>,
     status: TurnTerminalStatus,
     history: &'a Option<TurnHistoryProjection>,
     history_scope: Option<serde_json::Value>,
@@ -761,6 +765,8 @@ async fn finalize_turn_impl(
                 "workspace_id": trusted.workspace_id,
                 "source_event_id": trusted.source_event_id,
                 "catalog_generation": trusted.catalog_generation.to_hex(),
+                "model_catalog_revision": decision.context.model_catalog().map(|catalog| catalog.revision.as_str()),
+                "model_catalog_content_sha256": decision.context.model_catalog().map(crate::providers::catalog::ReleaseCatalog::content_sha256),
                 "policy_version": trusted.policy_version,
                 "status": commit.status,
                 "scope": terminal_semantic_scope(&commit.scope),
@@ -935,6 +941,8 @@ async fn finalize_turn_impl(
         let payload = TurnTerminalPayload {
             terminal_id: &commit.terminal_id,
             decision_id: decision_id.as_deref(),
+            model_catalog_revision: commit.decision.context.model_catalog().map(|catalog| catalog.revision.as_str()),
+            model_catalog_content_sha256: commit.decision.context.model_catalog().map(crate::providers::catalog::ReleaseCatalog::content_sha256),
             status: commit.status,
             history: &commit.history,
             history_scope: commit.history_scope.as_ref().map(terminal_semantic_scope),

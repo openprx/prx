@@ -1362,6 +1362,16 @@ enum AuthCommands {
 
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
+    /// Inspect the embedded release catalog
+    Catalog {
+        #[command(subcommand)]
+        catalog_command: CatalogCommands,
+    },
+    /// Plan published model replacements; --yes applies one PMM transaction
+    MigrateRetired {
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
     /// Show declared model levels and parameters from the release catalog
     Levels { model: String },
     /// Show or update persisted model settings through a configuration transaction
@@ -1425,6 +1435,12 @@ enum ModelCommands {
         #[command(subcommand)]
         default_command: DefaultCommands,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum CatalogCommands {
+    /// Show the embedded revision, content digest and lifecycle counts
+    Status,
 }
 
 /// A `[[providers.models]]` declaration on the command line.

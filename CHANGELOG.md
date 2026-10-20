@@ -15,6 +15,12 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- The Moonshot release default is now the cited, priced `kimi-k2.6` model.
+  K2.5 and older K2 Preview/Thinking models are retired according to the
+  provider's published discontinuation dates. Stored selections remain intact;
+  `prx models migrate-retired` previews replacements. See the
+  [Moonshot catalog correction](docs/providers.md#moonshot-release-default-and-lifecycle).
+
 - Known Codex models now default to `medium` reasoning effort instead of the
   pre-C2 `xhigh`. Explicit configured effort still takes precedence. Unknown
   models retain the pre-C2 base request (`medium` verbosity and `xhigh` effort).

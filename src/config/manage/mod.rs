@@ -20,6 +20,7 @@
 pub(crate) mod boundary;
 pub mod credentials;
 pub mod history;
+pub mod lifecycle;
 pub mod migrate;
 pub mod mutation;
 pub mod plan;

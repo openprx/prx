@@ -231,6 +231,11 @@ impl CatalogView {
         }
     }
 
+    /// Retain this view's immutable release evidence for terminal provenance.
+    pub(crate) fn release_pin(&self) -> Option<Arc<ReleaseCatalog>> {
+        self.release.clone()
+    }
+
     /// The release catalog this view pins.
     ///
     /// # Errors

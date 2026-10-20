@@ -501,7 +501,7 @@ mod tests {
             .call(
                 Method::POST,
                 "/api/routes",
-                Some(json!({"hint": "fast", "provider": "openai", "model": "gpt-4o-mini"})),
+                Some(json!({"hint": "fast", "provider": "openai", "model": "gpt-5.6"})),
             )
             .await;
         assert_eq!(status, 200, "{reply}");

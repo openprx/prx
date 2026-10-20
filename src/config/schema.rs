@@ -6689,11 +6689,11 @@ impl Config {
         Some(EMBEDDING_DEFAULT_UPGRADE_NOTICE)
     }
 
-    /// Advisory only: retain the configured ceiling while exposing the
-    /// release catalog recommendation outside the causal policy domain.
+    /// Warn about inherited legacy ceilings below the release recommendation.
+    /// Explicit operator ceilings remain unchanged and do not emit this warning.
     pub(crate) fn decision_latency_budget_warning(&self) -> Option<String> {
         let section = &self.causal_tree;
-        if !section.enabled {
+        if !section.enabled || section.policy.extra_latency_budget_ms_explicit {
             return None;
         }
         let selection = crate::decision::factory::configured_selection(section)?;
@@ -6740,6 +6740,9 @@ impl Config {
                  likely a typo); configuration is never silently ignored.",
                 unknown_paths.join(", ")
             );
+        }
+        for warning in crate::config::manage::lifecycle::warnings(&config)? {
+            tracing::warn!(%warning, "configured model lifecycle warning");
         }
         if let Some(warning) = config.decision_latency_budget_warning() {
             tracing::warn!(warning = %warning, "decision latency budget is below the catalog recommendation");
@@ -8716,6 +8719,27 @@ max_context = 1000000
         config.causal_tree.policy.extra_latency_budget_ms = 500;
         config.causal_tree.enabled = false;
         assert!(config.decision_latency_budget_warning().is_none());
+    }
+
+    #[test]
+    async fn explicit_hosted_latency_ceiling_loads_without_an_upgrade_warning() {
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let version = crate::causal_tree::config::CAUSAL_CONFIG_SCHEMA_VERSION;
+        std::fs::write(&path, format!("default_temperature = 0.7\n[auth]\ncodex_auth_json_auto_import = false\n[causal_tree]\nschema_version = {version}\nenabled = true\n[causal_tree.backend]\nkind = \"openrouter\"\nmodel = \"typesafe/jev-1.13\"\npinned_snapshot = \"typesafe/jev-1.13-20260917\"\n[causal_tree.policy]\nextra_latency_budget_ms = 500\n")).unwrap();
+        let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
+        let config = loaded.unwrap();
+        assert!(config.causal_tree.policy.extra_latency_budget_ms_explicit);
+        assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+        assert!(config.decision_latency_budget_warning().is_none());
+        assert!(!logs.contains("below the catalog recommendation"), "{logs}");
+        assert!(
+            !crate::doctor::diagnose(&config)
+                .items
+                .iter()
+                .any(|item| item.message.contains("below the catalog recommendation"))
+        );
     }
 
     #[test]
@@ -12042,6 +12066,17 @@ classifier_timeout_secs = 8
         let warnings = logs.matches("nothing in this configuration uses").count();
         assert_eq!(warnings, 1, "one warning per entry set: {logs}");
         assert!(logs.contains("command line"), "{logs}");
+    }
+
+    #[test]
+    async fn retired_model_load_keeps_selection_and_logs_published_replacement() {
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_temperature = 0.7\ndefault_provider = \"openai\"\ndefault_model = \"gpt-4o\"\n[auth]\ncodex_auth_json_auto_import = false\n").unwrap();
+        let (config, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
+        assert_eq!(config.unwrap().default_model.as_deref(), Some("gpt-4o"));
+        assert!(logs.contains("retired") && logs.contains("openai/gpt-5.6"), "{logs}");
     }
 
     /// INT-2B AUDIT-SIGN (D-056 DC-2), RED before: `security.audit.sign_events`

@@ -1,8 +1,8 @@
 {
   "$schema": "./models.schema.json",
   "schema_version": "1.0",
-  "revision": "2026-10-19.2",
-  "published_at": "2026-10-19T22:46:12Z",
+  "revision": "2026-10-20.1",
+  "published_at": "2026-10-20T06:07:31Z",
   "providers": {
     "anthropic": {
       "default_model": "anthropic/claude-sonnet-5",
@@ -73,7 +73,7 @@
       "display_name": "Mistral"
     },
     "moonshot": {
-      "default_model": "moonshot/kimi-k2.5",
+      "default_model": "moonshot/kimi-k2.6",
       "display_name": "Moonshot"
     },
     "nvidia": {
@@ -2527,7 +2527,10 @@
       "display_name": "Kimi K2 0905 Preview (strong coding)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-05-25T00:00:00Z",
+        "retire_at": "2026-05-25T00:00:00Z",
+        "replacement": "moonshot/kimi-k2.6"
       },
       "operations": [
         "chat"
@@ -2553,7 +2556,10 @@
       "display_name": "Kimi K2 Thinking (deep reasoning + tool use)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-05-25T00:00:00Z",
+        "retire_at": "2026-05-25T00:00:00Z",
+        "replacement": "moonshot/kimi-k2.6"
       },
       "operations": [
         "chat"
@@ -2579,7 +2585,10 @@
       "display_name": "Kimi K2.5 (latest flagship, recommended)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "deprecated_at": "2026-08-31T00:00:00Z",
+        "retire_at": "2026-08-31T00:00:00Z",
+        "replacement": "moonshot/kimi-k2.6"
       },
       "operations": [
         "chat"
@@ -2605,10 +2614,7 @@
       "display_name": "kimi-k2.6",
       "aliases": [],
       "lifecycle": {
-        "status": "retired",
-        "deprecated_at": "2026-10-16T00:00:00Z",
-        "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "moonshot/kimi-k2.5"
+        "status": "active"
       },
       "operations": [
         "chat"
@@ -3214,7 +3220,7 @@
         "cache_read": 1.25
       },
       "router": {
-        "cost_per_million_tokens": 5.0,
+        "cost_per_million_tokens": 2.5,
         "categories": [
           "conversation",
           "analysis",
@@ -3706,7 +3712,7 @@
         "max_output_tokens": 128000
       },
       "router": {
-        "cost_per_million_tokens": 3,
+        "cost_per_million_tokens": 2,
         "categories": [
           "code",
           "reasoning",

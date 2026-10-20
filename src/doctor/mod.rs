@@ -1328,6 +1328,10 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
 /// unverified), verified is fine.
 fn check_model_selection(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "models";
+    match crate::config::manage::lifecycle::warnings(config) {
+        Ok(warnings) => items.extend(warnings.into_iter().map(|warning| DiagItem::warn(cat, warning))),
+        Err(error) => items.push(DiagItem::error(cat, error.to_string())),
+    }
     match crate::providers::selection::default_status(config) {
         Ok((true, line)) => items.push(DiagItem::ok(cat, line)),
         Ok((false, line)) => items.push(DiagItem::warn(cat, line)),
@@ -1336,7 +1340,7 @@ fn check_model_selection(config: &Config, items: &mut Vec<DiagItem>) {
 }
 
 /// Every persisted selection besides the default (routes, agents,
-/// fallbacks, embeddings, ...) resolved as an operator's selection (SP-PMM
+/// fallbacks, embeddings, ...) resolved as an existing invocation (SP-PMM
 /// H-4): one warning per selection the evidence does not verify, and an
 /// error when one no longer resolves. The default is reported by
 /// [`check_model_selection`]. Local only; no credential is read.
@@ -1347,11 +1351,7 @@ fn check_persisted_selections(config: &Config, items: &mut Vec<DiagItem>) {
     for note in crate::config::schema::duplicate_embedding_route_hints(config) {
         items.push(DiagItem::warn(cat, note));
     }
-    match crate::config::manage::validate::check_affected_selections(
-        None,
-        config,
-        crate::providers::catalog::UnknownPolicy::OperatorSelection,
-    ) {
+    match crate::config::manage::validate::check_existing_selections(config) {
         Ok(warnings) => {
             let unverified = warnings
                 .into_iter()
@@ -1399,10 +1399,20 @@ fn check_router_candidates(config: &Config, items: &mut Vec<DiagItem>) {
     } else {
         config.router.models.clone()
     };
-    if crate::router::capability::filter_models_by_providers(candidates, &reachable).is_empty() {
+    let has_reachable_model = crate::router::capability::filter_models_by_providers(candidates, &reachable)
+        .into_iter()
+        .any(|model| {
+            crate::router::capability::is_model_reachable(
+                crate::providers::selection::default_provider(config),
+                &config.model_routes,
+                &model.provider,
+                &model.model_id,
+            )
+        });
+    if !has_reachable_model {
         items.push(DiagItem::warn(
             "router",
-            "Router has no reachable candidates after provider filtering; configure reachable [[router.models]] entries; the selected default is unchanged",
+            "Router has no reachable candidates after provider/model filtering; configure reachable [[router.models]] entries; the selected default is unchanged",
         ));
     }
 }
@@ -2573,6 +2583,36 @@ mod tests {
             items.is_empty(),
             "the published OpenRouter candidate must actually be reachable"
         );
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[test]
+    fn doctor_requires_a_reachable_model_in_a_non_default_provider_route() {
+        let mut config = Config {
+            default_provider: Some("openai".into()),
+            default_model: Some("gpt-5.6".into()),
+            ..Config::default()
+        };
+        config.model_routes.push(crate::config::ModelRouteConfig {
+            hint: "quick".into(),
+            provider: "openrouter".into(),
+            model: "prx-absent-router-model".into(),
+            api_key: None,
+            credential_ref: None,
+            settings: Default::default(),
+        });
+        let mut items = Vec::new();
+        check_router_candidates(&config, &mut items);
+        assert_eq!(items.len(), 1);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("no reachable candidates"))
+        );
+        config.model_routes.first_mut().unwrap().model = "anthropic/claude-sonnet-5".into();
+        items.clear();
+        check_router_candidates(&config, &mut items);
+        assert!(items.is_empty());
     }
 
     #[test]

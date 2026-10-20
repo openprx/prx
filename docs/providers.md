@@ -892,3 +892,88 @@ express. Inspect them with `prx models levels <canonical-id>` and manage saved
 choices with `prx models settings <canonical-id>`. The CLI, Console and
 onboarding use the same configuration transaction boundary. See
 [saving a model level](model-catalog.md#saving-a-model-level).
+
+## Release catalog lifecycle
+
+`prx models catalog status` shows the embedded revision, digest and lifecycle
+counts. Startup and doctor warn about deprecated, retired and absent model
+references without rewriting stored selections. New retired selections are
+refused. `prx models migrate-retired` previews published replacements;
+`--yes` applies through PMM with normal validation, confirmation and history.
+See [catalog lifecycle and migration](model-catalog.md#release-catalog-lifecycle)
+for replacement conflicts, credential ownership and binary rollback.
+
+## Catalog tariff citation coverage
+
+Each priced release row maps to a published tariff below. The six legacy-row
+citations were checked on 2026-10-20; existing active-row rates retain their
+2026-10-17 snapshot. Retirement preserves historical billing facts while
+excluding those rows from new selections.
+
+The retired Haiku 4.5 alias uses the same 1/5 input/output and 1.25/0.1
+five-minute-cache-write/cache-read tariff as the dated Haiku 4.5 row. Opus 4
+uses 15/75/18.75/1.5; Sonnet 4 and 4.6 use 3/15/3.75/0.3, from the cited
+Anthropic table. Gemini 2.5 Pro uses 1.25/10 input/output and 0.125 cached input
+through 200,000 input tokens, then 2.5/15/0.25; cache storage is separately
+billed. Kimi K2.6's public model card lists 0.95 input, 4 output and 0.16 cache
+hit. K2 cache misses use the input rate, including the catalog's cache-write
+accounting field. All values are USD per million tokens.
+
+<!-- catalog-tariff-citations:start -->
+| Exact catalog row or zero-rule scope | Published source or documented zero rule |
+| --- | --- |
+| `anthropic/claude-haiku-4-5` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `anthropic/claude-haiku-4-5-20251001` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `anthropic/claude-opus-4-20250514` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `anthropic/claude-opus-4-8` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `anthropic/claude-sonnet-4-20250514` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `anthropic/claude-sonnet-4-6` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `anthropic/claude-sonnet-5` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `gemini/gemini-2.5-pro` | [Gemini API paid-tier tariffs](https://ai.google.dev/gemini-api/docs/pricing) |
+| `gemini/gemini-3.1-flash-lite` | [Gemini API paid-tier tariffs](https://ai.google.dev/gemini-api/docs/pricing) |
+| `gemini/gemini-3.1-pro-preview` | [Gemini API paid-tier tariffs](https://ai.google.dev/gemini-api/docs/pricing) |
+| `moonshot/kimi-k2.6` | [Kimi K2.6 model tariff](https://platform.kimi.ai/) and [K2 billing semantics](https://platform.kimi.ai/docs/pricing/chat) |
+| `openai/gpt-4o` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-4o) |
+| `openai/gpt-4o-mini` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-4o-mini) |
+| `openai/gpt-5.2-codex` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.2-codex) |
+| `openai/gpt-5.6` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
+| `openai/gpt-5.6-luna` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-luna) |
+| `openai/gpt-5.6-sol` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
+| `openai/gpt-5.6-terra` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-terra) |
+| `openai/o1-preview` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/o1-preview) |
+| `openrouter/anthropic/claude-sonnet-5` | [OpenRouter model tariff](https://openrouter.ai/anthropic/claude-sonnet-5) |
+| `openrouter/typesafe/jev-1.13` | [OpenRouter model tariff](https://openrouter.ai/typesafe/jev-1.13) |
+| `ollama/*` | [Documented Ollama zero rule](#ollama-zero-cost-rule) |
+<!-- catalog-tariff-citations:end -->
+
+### Ollama zero-cost rule
+
+PRX retains its provider-level zero-cost exemption for all `ollama` selections,
+including local, wildcard and cloud rows. Their catalog token rates are all
+zero; this is the documented admission/accounting rule. Hosted subscription
+or quota charges remain outside this token ledger. The operator retained this
+rule in the 2026-10-20 finding 91 reconciliation. Other providers require a
+published tariff or an explicit operator price override.
+
+### Router ranking and diagnostics
+
+The catalog's default Router ranking inputs track the published base input
+rate when a row supplies both values; operator ranking overrides remain
+independent of billing. The C4 release corrects the retained GPT-4o hint to
+2.50 and the active OpenRouter Sonnet 5 hint to 2.00. Doctor checks candidate
+reachability for the exact provider/model pair, matching the Router's route
+filter. A route to another model on the same provider does not establish that
+candidate's reachability.
+
+### Moonshot release default and lifecycle
+
+Moonshot's release default is now `moonshot/kimi-k2.6`, the existing catalog row
+with a published current K2 tariff. Its stale retirement marker is corrected
+to active using the provider's current [model list](https://platform.kimi.ai/docs/models)
+and [pricing table](https://platform.kimi.ai/docs/pricing/chat). The explicit
+`kimi-k2.5` selection keeps its existing unpriced state. K2.5 is retired on
+2026-08-31 and the older K2 Preview/Thinking rows on 2026-05-25, matching the
+published discontinuation dates. Their published release replacement is the
+existing priced K2.6 row; stored selections load with warnings, and
+`prx models migrate-retired` previews their replacement through PMM. No new
+model is added.

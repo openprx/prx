@@ -123,6 +123,8 @@ impl LogicalTaskTerminalRef {
         let payload = TurnTerminalPayload {
             terminal_id: &draft.terminal_id,
             decision_id: None,
+            model_catalog_revision: None,
+            model_catalog_content_sha256: None,
             status: draft.status,
             history: &draft.history,
             history_scope: draft.history_scope.as_ref().map(terminal_semantic_scope),

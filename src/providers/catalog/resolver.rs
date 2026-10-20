@@ -482,6 +482,20 @@ pub fn resolve_model(
             model: model.to_string(),
         });
     }
+    if policy != UnknownPolicy::Invocation
+        && let Ok(release) = catalog.release_catalog()
+        && let Some(row) = release.model(&provider, model)
+        && row.lifecycle.status == super::ModelLifecycleStatus::Retired
+    {
+        return Err(ResolutionError::ModelIncompatible {
+            provider: shown,
+            model: model.to_owned(),
+            detail: row.lifecycle.replacement.as_deref().map_or_else(
+                || "retired model cannot be selected; choose an active model".to_owned(),
+                |replacement| format!("retired model cannot be selected; use {replacement}"),
+            ),
+        });
+    }
     let descriptor = catalog.describe(&provider, model);
     let unproven = check_descriptor(&descriptor, &shown, model, requirement, policy)?;
     Ok((provider, descriptor, unproven))

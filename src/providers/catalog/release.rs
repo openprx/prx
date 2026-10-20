@@ -543,6 +543,9 @@ impl ReleaseCatalog {
     #[must_use]
     pub fn descriptor(&self, provider: &ProviderId, selected: &str) -> Option<ModelDescriptor> {
         let model = self.model(provider, selected)?;
+        if model.lifecycle.status == ModelLifecycleStatus::Retired {
+            return None;
+        }
         let mut descriptor = ModelDescriptor::id_only(provider.clone(), selected.trim());
         for operation in ModelOperation::ALL {
             let support = if model.supports(operation) {
@@ -968,7 +971,7 @@ mod tests {
             return;
         };
         assert_eq!(catalog.schema_version, "1.0");
-        assert_eq!(catalog.revision, "2026-10-19.2");
+        assert_eq!(catalog.revision, "2026-10-20.1");
         assert_eq!(catalog.schema.as_deref(), Some("./models.schema.json"));
         assert!(catalog.content_sha256().starts_with("sha256:"));
         assert!(catalog.models.len() >= 100);
@@ -985,6 +988,87 @@ mod tests {
             assert!(model.levels.contains_key("low"), "{} lacks low", model.id);
             assert!(model.levels.contains_key("medium"), "{} lacks medium", model.id);
             assert!(model.levels.contains_key("high"), "{} lacks high", model.id);
+        }
+    }
+
+    #[test]
+    fn active_router_ranking_hints_match_the_published_input_baseline() {
+        let catalog = ReleaseCatalog::embedded().expect("test: catalog");
+        for row in catalog.models.iter().filter(|row| row.is_active()) {
+            if let (Some(router), Some(pricing)) = (&row.router, &row.pricing) {
+                assert!(
+                    (router.cost_per_million_tokens - pricing.input).abs() < f64::EPSILON,
+                    "{} ranking input tariff",
+                    row.id
+                );
+            }
+        }
+        let legacy = catalog.model(&ProviderId::of("openai"), "gpt-4o").unwrap();
+        assert!(
+            (legacy.router.as_ref().unwrap().cost_per_million_tokens - legacy.pricing.as_ref().unwrap().input).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn every_priced_release_row_has_a_tariff_citation_or_the_documented_zero_rule() {
+        let catalog = ReleaseCatalog::embedded().expect("test: release catalog");
+        let docs = include_str!("../../../docs/providers.md");
+        let table = docs
+            .split_once("<!-- catalog-tariff-citations:start -->")
+            .and_then(|(_, rest)| rest.split_once("<!-- catalog-tariff-citations:end -->"))
+            .map(|(table, _)| table)
+            .expect("test: citation table exists");
+        let mut citations = BTreeMap::new();
+        for line in table.lines() {
+            let mut columns = line.split('|').skip(1);
+            let Some(id) = columns
+                .next()
+                .and_then(|column| column.trim().strip_prefix('`'))
+                .and_then(|id| id.strip_suffix('`'))
+            else {
+                continue;
+            };
+            let source = columns.next().expect("test: citation source column").trim();
+            assert!(citations.insert(id, source).is_none(), "duplicate citation: {id}");
+            assert!(
+                catalog.models.iter().any(|row| row.id == id && row.pricing.is_some()),
+                "stale citation: {id}"
+            );
+        }
+        for row in catalog.models.iter().filter(|row| row.pricing.is_some()) {
+            let pricing = row.pricing.as_ref().expect("test: priced row");
+            if row.provider == "ollama" {
+                assert_eq!(
+                    citations.get("ollama/*"),
+                    Some(&"[Documented Ollama zero rule](#ollama-zero-cost-rule)")
+                );
+                assert!(docs.contains("### Ollama zero-cost rule"));
+                for rate in [pricing.input, pricing.output, pricing.cache_write, pricing.cache_read] {
+                    assert_eq!(
+                        rate.to_bits(),
+                        0.0_f64.to_bits(),
+                        "{} is covered by the zero rule",
+                        row.id
+                    );
+                }
+                assert!(
+                    pricing.tiers.is_empty(),
+                    "{} has no priced tier under the zero rule",
+                    row.id
+                );
+            } else {
+                let source = citations.get(row.id.as_str());
+                assert!(source.is_some(), "uncited tariff: {}", row.id);
+                let source = source.expect("test: every priced model has a citation");
+                let url = source
+                    .split_once("](https://")
+                    .and_then(|(_, tail)| tail.split_once(')'))
+                    .map(|(tail, _)| format!("https://{tail}"))
+                    .expect("test: published HTTPS tariff link");
+                let parsed = reqwest::Url::parse(&url).expect("test: public source URL");
+                assert!(parsed.host_str().is_some() && parsed.username().is_empty() && parsed.password().is_none());
+            }
         }
     }
 

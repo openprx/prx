@@ -68,6 +68,8 @@ pub enum RootCredential {
 
 /// One management operation.
 pub enum ManagedChange {
+    /// Migrate published model replacements atomically without moving credentials.
+    MigrateRetired,
     /// Persist a validated model level and explicit parameter overrides.
     SetModelSettings {
         model: String,
@@ -1319,6 +1321,9 @@ fn candidate(current: &Config, change: &ManagedChange) -> Result<Config, ManageE
     let mut next = current.clone();
     let default_id = ProviderId::of(crate::providers::selection::default_provider(current));
     match change {
+        ManagedChange::MigrateRetired => {
+            next = super::lifecycle::candidate(current).map_err(|error| ManageError::Invalid(error.to_string()))?;
+        }
         ManagedChange::SetModelSettings { model, settings } => {
             settings
                 .validate(model)

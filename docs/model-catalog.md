@@ -293,3 +293,36 @@ requests retain these settings; actual resolved values continue to enter the
 existing request preparation provenance. Revert a choice through configuration
 history, or apply a new settings transaction. A binary rollback retains the
 TOML file; check that the older binary understands these settings.
+
+## Release catalog lifecycle
+
+`prx models catalog status` reports the embedded revision, content digest,
+provider/model counts and lifecycle counts. Catalog changes ship with PRX
+releases. Reverting the binary restores its embedded catalog; configuration
+rollback uses PMM history.
+
+Persisted deprecated, retired or absent model references produce startup and
+`prx doctor` warnings. Warnings include a published replacement when present.
+Existing selections remain loadable; retired release rows supply no capability
+verification. New retired selections are refused, and agent-written selections
+still require verified capabilities. Custom or deleted IDs have no inferred
+replacement.
+
+`prx models migrate-retired` previews published replacements in defaults,
+routes, agent bindings, fallback maps, router selections and model settings.
+`--yes` applies the plan through PMM; high-risk changes also require the revision
+confirmation printed by the plan. The transaction preserves provider and
+credential ownership, validates settings against the replacement, and refuses
+colliding settings, collapsed fallback models or ambiguous shared fallbacks. Missing replacement metadata
+leaves the reference intact. Inspect the plan before applying it.
+
+Turns retain their admitted catalog evidence and parameter revision. Authenticated
+child snapshots bind both revision and exact content digest; a child binary with
+a different catalog refuses the snapshot before provider construction.
+
+Confirmed, revision-bound PMM history rollback retains retired or deleted
+selections as existing invocations. Negative capability evidence and credential
+ownership checks still apply; creating a new retired selection remains refused.
+Retired models retain published context-window facts for compaction while their
+release capabilities remain unverified. The signed terminal claim and persisted
+terminal event both carry the admitted catalog revision and digest.

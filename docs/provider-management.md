@@ -158,3 +158,13 @@ the same transaction. Both operations validate against the release catalog,
 retain revision/history/rollback checks and refuse invalid durable values.
 The Console generates controls from catalog declarations and submits the
 existing plan/apply protocol. See [commands and API examples](model-catalog.md#saving-a-model-level).
+
+## Release catalog lifecycle
+
+`prx models catalog status` shows the embedded revision, digest and lifecycle
+counts. Startup and doctor warn about deprecated, retired and absent model
+references without rewriting stored selections. New retired selections are
+refused. `prx models migrate-retired` previews published replacements;
+`--yes` applies through PMM with normal validation, confirmation and history.
+See [catalog lifecycle and migration](model-catalog.md#release-catalog-lifecycle)
+for replacement conflicts, credential ownership and binary rollback.

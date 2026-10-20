@@ -30,7 +30,6 @@ use super::service::{ManageError, redact_provider_text};
 use crate::config::schema::{ProviderModelConfig, ProvidersConfig};
 use crate::config::{Config, DelegateAgentConfig, EmbeddingRouteConfig, ModelRouteConfig};
 use crate::providers::ProviderId;
-use crate::providers::catalog::UnknownPolicy;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -345,11 +344,10 @@ pub fn report(config: &Config) -> Result<MigrationReport, ManageError> {
     let (inline_keys, stuck_keys) = inline_keys(config);
     let root_connection =
         held(config.api_key.as_ref()) || config.reliability.api_keys.iter().any(|key| !key.trim().is_empty());
-    let (unverified, refused) =
-        match super::validate::check_affected_selections(None, config, UnknownPolicy::OperatorSelection) {
-            Ok(warnings) => (warnings, None),
-            Err(refusal) => (Vec::new(), Some(refusal)),
-        };
+    let (unverified, refused) = match super::validate::check_existing_selections(config) {
+        Ok(warnings) => (warnings, None),
+        Err(refusal) => (Vec::new(), Some(refusal)),
+    };
     Ok(MigrationReport {
         inline_keys,
         stuck_keys,

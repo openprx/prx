@@ -30,6 +30,10 @@ impl ModelSettings {
             .iter()
             .find(|row| row.id == id)
             .ok_or_else(|| anyhow::anyhow!("model settings require a canonical release catalog ID"))?;
+        anyhow::ensure!(
+            model.is_listed(),
+            "retired model settings cannot be selected; migrate to an active replacement"
+        );
         crate::providers::catalog::parameters::resolve(model, &release.revision, std::slice::from_ref(&layer))?;
         Ok(layer)
     }
@@ -136,9 +140,25 @@ pub(crate) fn validate_changes(
     current: Option<&crate::config::Config>,
     candidate: &crate::config::Config,
 ) -> Result<(), String> {
+    validate_settings(current, candidate, false)
+}
+
+/// Existing retired/deleted settings remain stored but cannot justify new choices.
+pub(crate) fn validate_existing(candidate: &crate::config::Config) -> Result<(), String> {
+    validate_settings(None, candidate, true)
+}
+
+fn validate_settings(
+    current: Option<&crate::config::Config>,
+    candidate: &crate::config::Config,
+    existing: bool,
+) -> Result<(), String> {
     let release = ReleaseCatalog::embedded_ref().map_err(|error| error.to_string())?;
     for route in &candidate.model_routes {
         let row = release.model(&crate::providers::ProviderId::of(&route.provider), &route.model);
+        if existing && row.is_none_or(|row| !row.is_listed()) {
+            continue;
+        }
         let model_settings = row.and_then(|row| candidate.model_settings.get(&row.id));
         if current.is_some_and(|current| {
             current.model_routes.iter().any(|old| {
@@ -163,6 +183,15 @@ pub(crate) fn validate_changes(
         }
     }
     for (id, settings) in &candidate.model_settings {
+        if existing
+            && release
+                .models
+                .iter()
+                .find(|row| row.id == *id)
+                .is_none_or(|row| !row.is_listed())
+        {
+            continue;
+        }
         if current.and_then(|config| config.model_settings.get(id)) != Some(settings) {
             settings.validate(id).map_err(|error| error.to_string())?;
         }

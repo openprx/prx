@@ -5163,7 +5163,7 @@ mod tests {
         assert_eq!(default_model_for_provider("bedrock"), "anthropic.claude-sonnet-5");
         assert_eq!(default_model_for_provider("google-gemini"), "gemini-3.5-flash");
         assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
-        assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
+        assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.6");
         assert_eq!(default_model_for_provider("nvidia"), "meta/llama-3.3-70b-instruct");
         assert_eq!(default_model_for_provider("nvidia-nim"), "meta/llama-3.3-70b-instruct");
         assert_eq!(default_model_for_provider("llamacpp"), "ggml-org/gpt-oss-20b-GGUF");
@@ -5260,8 +5260,9 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        assert!(ids.contains(&"kimi-k2.5".to_string()));
-        assert!(ids.contains(&"kimi-k2-thinking".to_string()));
+        assert!(ids.contains(&"kimi-k2.6".to_string()));
+        assert!(!ids.contains(&"kimi-k2.5".to_string()));
+        assert!(!ids.contains(&"kimi-k2-thinking".to_string()));
         assert!(!ids.contains(&"kimi-latest".to_string()));
         assert!(!ids.contains(&"kimi-thinking-preview".to_string()));
     }

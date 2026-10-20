@@ -199,6 +199,19 @@ async fn prepared_parameters_survive_scope_drop_without_fabricating_a_provider_o
             payload.get("prepared_parameters"),
             Some(&serde_json::to_value(prepared)?)
         );
+        let release = crate::providers::catalog::ReleaseCatalog::embedded_ref()?;
+        assert_eq!(
+            payload
+                .get("model_catalog_revision")
+                .and_then(serde_json::Value::as_str),
+            Some(release.revision.as_str())
+        );
+        assert_eq!(
+            payload
+                .get("model_catalog_content_sha256")
+                .and_then(serde_json::Value::as_str),
+            Some(release.content_sha256())
+        );
         assert_eq!(payload.get("status"), Some(&serde_json::to_value(status)?));
         assert!(payload.get("provider_outcome").unwrap().is_null());
         assert!(receipt.assistant_event.is_none());
