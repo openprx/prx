@@ -2979,19 +2979,51 @@ bot_token = "***"
 
     /// The source files of the structs the `Config` schema is made of. A serde
     /// alias of a credential field in any of them must be registered.
-    const SCHEMA_SOURCES: [(&str, &str); 2] = [
+    const SCHEMA_SOURCES: &[(&str, &str)] = &[
         ("config/schema.rs", include_str!("schema.rs")),
+        ("config/schema/agent.rs", include_str!("schema/agent.rs")),
+        ("config/schema/atomic.rs", include_str!("schema/atomic.rs")),
+        ("config/schema/autonomy.rs", include_str!("schema/autonomy.rs")),
+        ("config/schema/channels.rs", include_str!("schema/channels.rs")),
+        ("config/schema/chat.rs", include_str!("schema/chat.rs")),
+        ("config/schema/codex_effort.rs", include_str!("schema/codex_effort.rs")),
+        ("config/schema/cost.rs", include_str!("schema/cost.rs")),
+        ("config/schema/credentials.rs", include_str!("schema/credentials.rs")),
+        ("config/schema/gateway.rs", include_str!("schema/gateway.rs")),
+        ("config/schema/integrations.rs", include_str!("schema/integrations.rs")),
+        ("config/schema/legacy.rs", include_str!("schema/legacy.rs")),
+        ("config/schema/lifecycle.rs", include_str!("schema/lifecycle.rs")),
+        ("config/schema/media.rs", include_str!("schema/media.rs")),
+        ("config/schema/memory.rs", include_str!("schema/memory.rs")),
+        ("config/schema/messaging.rs", include_str!("schema/messaging.rs")),
+        ("config/schema/nodes.rs", include_str!("schema/nodes.rs")),
+        (
+            "config/schema/observability.rs",
+            include_str!("schema/observability.rs"),
+        ),
+        ("config/schema/paths.rs", include_str!("schema/paths.rs")),
+        ("config/schema/providers.rs", include_str!("schema/providers.rs")),
+        ("config/schema/proxy.rs", include_str!("schema/proxy.rs")),
+        (
+            "config/schema/recursive_spawn.rs",
+            include_str!("schema/recursive_spawn.rs"),
+        ),
+        ("config/schema/routing.rs", include_str!("schema/routing.rs")),
+        ("config/schema/runtime.rs", include_str!("schema/runtime.rs")),
+        ("config/schema/secrets.rs", include_str!("schema/secrets.rs")),
+        ("config/schema/security.rs", include_str!("schema/security.rs")),
+        ("config/schema/tools.rs", include_str!("schema/tools.rs")),
+        ("config/schema/tunnel.rs", include_str!("schema/tunnel.rs")),
         (
             "channels/email_channel.rs",
             include_str!("../channels/email_channel.rs"),
         ),
     ];
-
     /// Every `(alias, field)` pair of a `#[serde(alias = "...")]` attribute in
     /// the schema sources, with the field it decorates.
     fn serde_aliases() -> Vec<(String, String, &'static str)> {
         let mut found = Vec::new();
-        for (file, source) in SCHEMA_SOURCES {
+        for &(file, source) in SCHEMA_SOURCES {
             let lines: Vec<&str> = source.lines().collect();
             for (index, line) in lines.iter().enumerate() {
                 let trimmed = line.trim_start();
@@ -3023,6 +3055,27 @@ bot_token = "***"
     /// `bearer_token` aliases `token` were not registered.
     #[test]
     fn every_serde_alias_of_a_secret_field_is_registered() {
+        assert!(
+            SCHEMA_SOURCES
+                .iter()
+                .any(|(path, source)| path.starts_with("config/schema/") && !source.is_empty()),
+            "the schema scan must include nonempty split sources"
+        );
+        let split_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/schema");
+        for entry in std::fs::read_dir(split_dir).expect("read schema split sources") {
+            let path = entry.expect("schema source entry").path();
+            if path.extension().is_some_and(|ext| ext == "rs")
+                && path
+                    .file_name()
+                    .is_none_or(|name| name != "causal_tree_config_tests.rs")
+            {
+                let relative = format!("config/schema/{}", path.file_name().unwrap().to_string_lossy());
+                assert!(
+                    SCHEMA_SOURCES.iter().any(|(name, _)| *name == relative),
+                    "schema guard misses {relative}"
+                );
+            }
+        }
         let aliases = serde_aliases();
         assert!(
             aliases

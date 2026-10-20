@@ -15,7 +15,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # chat/mod.rs was split into these files; the gate covers all of them.
-FILES=(src/chat/mod.rs src/chat/active_turn.rs src/chat/bootstrap.rs src/chat/chat_events.rs src/chat/compaction.rs src/chat/copy_select.rs src/chat/external_editor.rs src/chat/file_mention.rs src/chat/input_queue.rs src/chat/output.rs src/chat/provider_turns.rs src/chat/pty_attach.rs src/chat/run.rs src/chat/session_glue.rs src/chat/session_store.rs src/chat/session_switch.rs src/chat/terminal.rs src/chat/tui_loop.rs src/chat/views.rs)
+FILES=(src/chat/mod.rs src/chat/active_turn.rs src/chat/bootstrap.rs src/chat/chat_events.rs src/chat/compaction.rs src/chat/copy_select.rs src/chat/external_editor.rs src/chat/file_mention.rs src/chat/input_queue.rs src/chat/output.rs src/chat/provider_turns.rs src/chat/pty_attach.rs src/chat/run.rs src/chat/run/*.rs src/chat/session_glue.rs src/chat/session_store.rs src/chat/session_switch.rs src/chat/terminal.rs src/chat/tui_loop.rs src/chat/views.rs)
+
+for file in "${FILES[@]}"; do
+    if [[ ! -s "$file" ]]; then
+        echo "[FAIL] missing or empty chat source: $file"
+        exit 1
+    fi
+done
 
 echo "[S4-A/B gate] grep chat_mirror.lock() / tui_mirror.lock() push 调用 ..."
 MIRROR_PUSH_COUNT=$(cat "${FILES[@]}" | grep -c "chat_mirror\.lock()\.push_\|tui_mirror\.lock()\.push_" || true)
@@ -32,7 +39,7 @@ GUARDED_COUNT=$(cat "${FILES[@]}" | grep -B 5 "chat_mirror\.lock()\.push_\|tui_m
 echo "  is_pure 守卫数 (启发式, 前 5 行内): $GUARDED_COUNT"
 
 if [ "$GUARDED_COUNT" -lt "$MIRROR_PUSH_COUNT" ]; then
-    echo "[FAIL] 启发式 Pure 守卫数 $GUARDED_COUNT < mirror push 数 $MIRROR_PUSH_COUNT，存在未守卫的旁路写。"
+    echo "[FAIL] 启发式 Pure 守卫数 $GUARDED_COUNT < mirror push 数 ${MIRROR_PUSH_COUNT}，存在未守卫的旁路写。"
     exit 1
 fi
 
@@ -60,4 +67,4 @@ UNGUARDED_OUT=$(awk '
     exit 1
 }
 
-echo "[PASS] S4-A 阶段: mirror push 数 = $MIRROR_PUSH_COUNT，启发式守卫数 = $GUARDED_COUNT，AWK 块级扫描通过."
+echo "[PASS] S4-A 阶段: mirror push 数 = ${MIRROR_PUSH_COUNT}，启发式守卫数 = ${GUARDED_COUNT}，AWK 块级扫描通过."

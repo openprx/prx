@@ -80,3 +80,30 @@ upstream copies: `vendor/matrix-sdk-0.19.1/src/room/mod.rs` (5,836 lines),
 `vendor/matrix-sdk-0.19.1/src/test_utils/mocks/mod.rs` (5,308). Their source
 ownership and decomposition remain upstream; PRX does not refactor vendored
 code as part of this migration.
+
+## Finding 103 split status (2026-10-20)
+
+The inventory above is the historical 2026-10-15 baseline. Finding 103 moves
+configuration schema responsibilities into `src/config/schema/`: domain
+structures/defaults, compatibility migration, proxy handling, path resolution,
+credential migration, lifecycle/validation, and atomic persistence. The old
+`config::schema` paths remain available through re-exports. The root is 551
+lines; the largest moved source/test file is below 1,500 lines. The full public
+`prx config schema` JSON is pinned by a CLI golden captured before the moves.
+The original 227 schema tests remain with unchanged assertions. One inherited
+host-specific example path is replaced by a neutral project path in a fixture
+and the corresponding schema description.
+
+The onboarding wizard keeps its public entry points through re-exports while
+models, provider setup, workspace setup, preferences, channels, tunnels,
+summaries, and persistence live in `src/onboard/wizard/`. Its root is 397
+lines; the largest production child is 1,416 lines and the largest test child
+is 943 lines. All 77 original tests remain. Source guards cover the root and
+production children; moved test files retain explicit test-only scope.
+
+The chat entry point keeps its event loop in `src/chat/run.rs` (4,961 lines).
+Eleven contiguous startup and teardown blocks live in `run/startup.rs` (727
+lines), with explicit arguments and one private borrowed UI context. The
+original statements, error propagation, primitive await order, guard lifetimes,
+and 238 clone calls are preserved. All chat tests remain unchanged; source
+guards cover the new production child alongside the root.

@@ -956,25 +956,35 @@ fn config_writes_route_through_the_transaction_layer() {
             "structured plan primitive",
         ),
         (
-            "src/config/schema.rs",
+            "src/config/schema/lifecycle.rs",
             ".save()",
             1,
             "Config::save (first-run creation)",
         ),
-        ("src/config/schema.rs", "commit_mutation_atomically(", 1, "Config::save"),
         (
-            "src/config/schema.rs",
+            "src/config/schema/lifecycle.rs",
+            "commit_mutation_atomically(",
+            1,
+            "Config::save",
+        ),
+        (
+            "src/config/schema/credentials.rs",
             "commit_mutation_guarded(",
             1,
             "the startup secret migration (revision-guarded, D-101 F-5)",
         ),
         (
-            "src/config/schema.rs",
+            "src/config/schema/atomic.rs",
             "write_toml_string_atomic_without_lock(",
             2,
             "the atomic write primitive",
         ),
-        ("src/config/schema.rs", "plan_structured_save(", 1, "Config::save"),
+        (
+            "src/config/schema/lifecycle.rs",
+            "plan_structured_save(",
+            1,
+            "Config::save",
+        ),
         (
             "src/config/generation.rs",
             "reload_from_disk(",
@@ -1038,14 +1048,26 @@ fn config_writes_route_through_the_transaction_layer() {
         (
             "src/onboard/wizard.rs",
             ".save()",
-            3,
-            "not yet migrated: onboarding (offline)",
+            2,
+            "offline channel repair (one occurrence is in a comment)",
+        ),
+        (
+            "src/onboard/wizard/persistence.rs",
+            ".save()",
+            1,
+            "offline first-run defaults",
         ),
         (
             "src/onboard/wizard.rs",
             "write_split_config(",
-            2,
-            "offline channel repair and safe first-run defaults",
+            1,
+            "offline channel repair",
+        ),
+        (
+            "src/onboard/wizard/persistence.rs",
+            "write_split_config(",
+            1,
+            "safe first-run defaults",
         ),
         (
             "src/runtime/mode.rs",
@@ -2833,6 +2855,7 @@ fn runtime_prompt_has_no_parallel_tool_description_catalog() {
         "src/chat/provider_turns.rs",
         "src/chat/pty_attach.rs",
         "src/chat/run.rs",
+        "src/chat/run/startup.rs",
         "src/chat/session_glue.rs",
         "src/chat/session_store.rs",
         "src/chat/session_switch.rs",
@@ -3839,7 +3862,7 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         constructor_sites,
         &[
             "src/channels/startup.rs::start_channels_with_config",
-            "src/chat/run.rs::run",
+            "src/chat/run/startup.rs::session_tools",
             "src/gateway/mod.rs::register_gateway_turn_tools",
             "src/session_worker/runner/provider.rs::worker_spawn_tool",
             "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions",
@@ -4953,6 +4976,7 @@ const LABEL_LOG_FILES: &[&str] = &[
     "src/chat/provider_turns.rs",
     "src/chat/pty_attach.rs",
     "src/chat/run.rs",
+    "src/chat/run/startup.rs",
     "src/chat/session_glue.rs",
     "src/chat/session_store.rs",
     "src/chat/session_switch.rs",
@@ -8479,8 +8503,8 @@ fn every_provider_source_file_is_in_the_module_tree() {
 /// the resolver, which the lib-test binary points at a scratch home.
 const ALLOWED_HOME_DIRECTORY_LOOKUPS: &[&str] = &[
     // The resolver: the home directory and the platform config directory.
-    "src/config/schema.rs::user_home_dir",
-    "src/config/schema.rs::platform_config_dir",
+    "src/config/schema/paths.rs::user_home_dir",
+    "src/config/schema/paths.rs::platform_config_dir",
     // Reports whether `HOME` is set at all; nothing is read under it.
     "src/doctor/mod.rs::check_environment",
     "src/runtime/shell_process.rs::<module>",
