@@ -275,7 +275,9 @@ The Console Models page loads the selected model's declarations and generates
 its level selector and numeric/enum controls from them. A settings change uses
 the existing review-and-apply flow, revision guard and configuration history.
 `GET /api/models/settings?provider=openai&model=gpt-5.6` returns declarations
-and saved settings. `PUT /api/models/settings` accepts
+and saved settings, with a `validation_error` field when a saved choice needs
+repair; the read remains available even for invalid saved values.
+`PUT /api/models/settings` accepts
 `{"model":"openai/gpt-5.6","settings":{"level":"high"}}`; the same operation
 is `{"kind":"set_model_settings",...}` on the configuration plan/apply
 endpoints. `PUT /api/defaults` accepts optional `settings` atomically with the
