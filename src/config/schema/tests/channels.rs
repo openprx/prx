@@ -857,7 +857,7 @@ async fn wacli_config_parses_official_webhook_toml() {
             webhook_listen = "127.0.0.1:16868"
             webhook_path = "/wacli"
             webhook_secret = "s3cr3t"
-            store_dir = "/home/ck/.wacli"
+            store_dir = "/prx_workspace/.wacli"
             bot_jid = "123@s.whatsapp.net"
             self_chat_mode = true
             group_reply_mode = "smart"

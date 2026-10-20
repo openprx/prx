@@ -543,7 +543,7 @@ impl WhatsAppConfig {
 /// webhook_listen = "127.0.0.1:16868"
 /// webhook_path = "/wacli"
 /// webhook_secret = "<SECRET>"     # must match --webhook-secret
-/// store_dir = "/home/ck/.wacli"
+/// store_dir = "/prx_workspace/.wacli"
 /// bot_jid = "1234567890@s.whatsapp.net"
 /// bot_number = "1234567890"
 /// self_chat_mode = true

@@ -90,4 +90,6 @@ credential migration, lifecycle/validation, and atomic persistence. The old
 `config::schema` paths remain available through re-exports. The root is 551
 lines; the largest moved source/test file is below 1,500 lines. The full public
 `prx config schema` JSON is pinned by a CLI golden captured before the moves.
-The original 227 schema tests remain, with unchanged assertions and fixtures.
+The original 227 schema tests remain with unchanged assertions. One inherited
+host-specific example path is replaced by a neutral project path in a fixture
+and the corresponding schema description.
