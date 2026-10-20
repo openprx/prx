@@ -1310,6 +1310,59 @@ mod tests {
         assert_eq!(info.required_tools, vec![shell, mcp]);
     }
 
+    /// Every id the real catalog builds, for the built-in tools and for both MCP
+    /// forms, passes the strict write-time shape check of `required-tools`.
+    #[test]
+    fn every_id_the_catalog_builds_passes_the_required_tools_shape_check() {
+        use crate::skills::lifecycle::{Bundle, BundleEntry, validate_manifest_strict};
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime: Arc<dyn crate::runtime::RuntimeAdapter> = Arc::new(crate::runtime::NativeRuntime::new());
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(crate::tools::shell::ShellTool::new(
+                runtime,
+                workspace.path().to_path_buf(),
+            )),
+            Box::new(crate::tools::file_read::FileReadTool::new(security)),
+        ];
+        let mut sources = CatalogSources::default();
+        for server in ["notes", "my__srv"] {
+            sources.mcp.push(McpCapabilitySpec {
+                server: server.into(),
+                tool: "search".into(),
+                state_digest: [0; 32],
+                spec: ToolSpec {
+                    name: format!("mcp__{server}__search"),
+                    description: "search".into(),
+                    parameters: json!({"type":"object","properties":{}}),
+                },
+            });
+        }
+        let catalog = CapabilityCatalog::build(&tools, &sources, &SurfacePolicy::default()).unwrap();
+        // An alias that was not discovered is filed under the namespace `mcp`.
+        let alias = CapabilityId::new(CapabilityTarget::Mcp, "mcp", "mcp__late__search").unwrap();
+        let mut ids: Vec<String> = catalog
+            .view(&CatalogScope::default())
+            .iter_entries()
+            .map(|entry| entry.id.as_str().to_owned())
+            .collect();
+        ids.push(alias.as_str().to_owned());
+        assert!(ids.iter().any(|id| id == "filesystem:native:shell"), "{ids:?}");
+        assert!(ids.iter().any(|id| id == "filesystem:native:file_read"), "{ids:?}");
+        assert!(ids.iter().any(|id| id == "mcp:my__srv:mcp__my__srv__search"), "{ids:?}");
+        for id in &ids {
+            let skill = format!("---\nname: ids\ndescription: ids\nrequired-tools: [{id}]\n---\n\nBody.\n");
+            let bundle = Bundle::from_entries(vec![BundleEntry {
+                path: std::path::PathBuf::from("SKILL.md"),
+                bytes: skill.into_bytes(),
+                executable: false,
+            }])
+            .unwrap();
+            let info = validate_manifest_strict(&bundle).unwrap_or_else(|e| panic!("{id} must pass: {e}"));
+            assert_eq!(info.required_tools, vec![id.clone()]);
+        }
+    }
+
     #[test]
     fn catalog_rejects_duplicate_public_names_before_execution_deduplicates() {
         let tools: Vec<Box<dyn Tool>> = vec![

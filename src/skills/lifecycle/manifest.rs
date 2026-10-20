@@ -134,12 +134,22 @@ fn is_capability_id(id: &str) -> bool {
         return false;
     }
     if family == "mcp" {
-        return name
-            .strip_prefix("mcp__")
-            .and_then(|rest| rest.split_once("__"))
-            .is_some_and(|(server, tool)| {
-                !server.is_empty() && !tool.is_empty() && (namespace == server || namespace == "mcp")
-            });
+        // The public name is `mcp__<server>__<tool>`. A discovered tool is filed
+        // under its server, which may itself contain `__`, so the name must
+        // start with exactly `mcp__<namespace>__`. An alias that was not
+        // discovered has the namespace `mcp` and any server and tool.
+        let Some(rest) = name.strip_prefix("mcp__") else {
+            return false;
+        };
+        if namespace == "mcp" {
+            return rest
+                .split_once("__")
+                .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty());
+        }
+        return rest
+            .strip_prefix(namespace)
+            .and_then(|after| after.strip_prefix("__"))
+            .is_some_and(|tool| !tool.is_empty());
     }
     name != "shell" || family == "filesystem"
 }

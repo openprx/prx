@@ -217,6 +217,11 @@ fn a_new_revision_with_a_malformed_required_tools_line_is_refused_with_a_typed_e
     )
     .expect("test: every known shape, including the undiscovered MCP alias");
     assert_eq!(ok.required_tools.len(), 6);
+    // A server whose own name contains `__` is accepted in the discovered form.
+    let odd = strict("required-tools: [mcp:my__srv:mcp__my__srv__search]").expect("test: server with __");
+    assert_eq!(odd.required_tools, vec!["mcp:my__srv:mcp__my__srv__search".to_string()]);
+    // but the namespace must be the server the name carries.
+    assert!(strict("required-tools: [mcp:other:mcp__my__srv__search]").is_err());
 }
 
 #[test]
