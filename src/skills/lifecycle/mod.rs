@@ -38,6 +38,7 @@ mod proposal;
 mod propose;
 mod proposer_model;
 mod publish;
+mod receipts;
 mod rejection;
 mod review;
 mod service;
@@ -105,6 +106,7 @@ pub use proposer_model::{
     ManagedProviderModel, ModelBinding, ModelCallError, ModelReply, ProposerModel, ReportedUsage,
 };
 pub use publish::{PUBLICATION_LOCK_TIMEOUT, PublishRequest, RecoveryReport, RollbackRequest, TransactionOutcome};
+pub use receipts::{SelectionRequest, TerminalKind, TerminalObservation, record_selected_skills, settle_task_terminal};
 pub use rejection::{NewRejection, ProposalOperation, RejectionRecord, material_digest};
 pub use review::{ReviewCheck, ReviewFinding, SOURCE_REVIEW_IDENTITY, SourceReviewOutcome, SourceReviewRecord};
 pub use service::{

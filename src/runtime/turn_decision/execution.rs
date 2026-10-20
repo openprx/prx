@@ -706,7 +706,7 @@ impl TurnDecisionService {
         let _ = self.agent_execution_specs(proof, context)?;
         let refs: Vec<_> = context.execution_refs().iter().cloned().collect();
         let entries = self.catalog.resolve(&refs)?;
-        let mut skills = Vec::new();
+        let mut skills: Vec<crate::skills::Skill> = Vec::new();
         for entry in entries {
             if entry.family != CapabilityTarget::Skill {
                 continue;
@@ -731,6 +731,15 @@ impl TurnDecisionService {
                 embedding: None,
             });
         }
+        let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+        crate::skills::lifecycle::record_selected_skills(&crate::skills::lifecycle::SelectionRequest {
+            workspace_dir: &self.generation.effective.workspace_dir,
+            enabled: self.generation.effective.skills_lifecycle.enabled,
+            owner_id: proof.owner_id(),
+            run_id: proof.run_id(),
+            task_id: proof.task_id(),
+            skill_names: &names,
+        });
         Ok(skills)
     }
 

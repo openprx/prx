@@ -12,6 +12,7 @@ mod manifest;
 mod migrate;
 mod propose;
 mod publish;
+mod receipts;
 mod service;
 mod store;
 
