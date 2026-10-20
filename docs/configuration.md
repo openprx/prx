@@ -1653,7 +1653,8 @@ workspace_hooks = "off"   # default: command hooks in hooks.json do not run
 ```
 
 Turning it on is a high-risk configuration change. The setting is read at
-every event, so turning it off stops hooks at once. Hooks owned by a
+every event, so turning it off stops hooks at once. Hooks run in the background, off the turn path (queued, delivered in order,
+dropped and counted when 1024 events are waiting). Hooks owned by a
 sub-agent (`delegate`, `sessions_spawn`) never run workspace command hooks.
 
 A command hook that runs:
@@ -1668,8 +1669,9 @@ A command hook that runs:
   warning naming them.
 - starts in a dedicated empty directory, `hooks/workspace-hooks-<hash>`
   beside `config.toml` (owner-only; a symlink or a file at that place is
-  refused), never in the workspace. The `cwd` field of `hooks.json` is
-  ignored with a warning. A relative `command` that contains a path
+  refused), never in the workspace. A `cwd` field in `hooks.json`
+  is refused when the file is loaded (the whole file is then invalid until it
+  is removed). A relative `command` that contains a path
   separator (`./scripts/notify.sh`) is resolved against the workspace; a bare
   name is looked up in `PATH`. Without a configuration directory, command
   hooks are not started.

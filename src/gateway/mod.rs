@@ -1633,6 +1633,8 @@ pub async fn run_gateway(
     // opt-in (HOOKS-ENV).
     let hooks =
         Arc::new(HookManager::new(config.workspace_dir.clone()).with_config(Arc::clone(&shared_config_for_reload)));
+    // Kept for the shutdown drain of queued hook events.
+    let hooks_for_shutdown = Arc::clone(&hooks);
     #[cfg(feature = "wasm-plugins")]
     let wasm_plugin_runtime = if let Some(runtime) = wasm_early_runtime {
         runtime
@@ -2053,6 +2055,12 @@ pub async fn run_gateway(
         .cleanup
         .drain(tokio::time::Instant::now() + Duration::from_secs(15))
         .await;
+    if !hooks_for_shutdown.drain(crate::hooks::HOOK_DRAIN_BOUND).await {
+        tracing::warn!(
+            bound_secs = crate::hooks::HOOK_DRAIN_BOUND.as_secs(),
+            "hook events were still queued at shutdown; the rest are abandoned"
+        );
+    }
     health_shutdown.cancel();
     let _ = health_heartbeat.await;
     serve_result?;
