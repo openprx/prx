@@ -12,6 +12,7 @@ mod recorded_chain;
 mod recursive_budget;
 mod selected_memory;
 mod selection_probes;
+mod skill_receipts;
 mod terminal_scope;
 
 use std::collections::BTreeMap;

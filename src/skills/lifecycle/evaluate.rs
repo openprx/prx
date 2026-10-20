@@ -711,6 +711,12 @@ pub(super) fn derive_verdict(input: &DeriveInput<'_>) -> CaseVerdict {
                 ExperienceOutcome::Incomplete => {
                     return invalid(InvalidReason::MissingTerminal, "the task terminal is incomplete");
                 }
+                ExperienceOutcome::Unknown => {
+                    return invalid(
+                        InvalidReason::MissingTerminal,
+                        "the task terminal outcome is unverified",
+                    );
+                }
             },
         }
     }

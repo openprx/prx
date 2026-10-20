@@ -1760,6 +1760,21 @@ impl TurnDecisionService {
             },
             "rejoined outcome is absent or conflicts with the authenticated terminal"
         );
+        let (terminal_status, awaiting_approval, verified) = facts.recovered_signals(&decision.directive_kind);
+        crate::skills::lifecycle::spawn_settle_task_terminal(
+            self.generation.effective.workspace_dir.clone(),
+            Some(owner_id.to_owned()),
+            crate::skills::lifecycle::task_key(
+                super::turn_source::subject_task_id(event.subject.as_ref()),
+                event.run_id.as_deref(),
+                event.parent_run_id.as_deref(),
+            ),
+            terminal_id.to_owned(),
+            crate::skills::lifecycle::TerminalObservation {
+                recovered: true,
+                ..terminal_status.skill_observation(awaiting_approval, verified)
+            },
+        );
         if replay.parent_decision_id().is_some() {
             let link = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &expected)
                 .context("child outcome lineage is inconsistent")?;

@@ -554,10 +554,6 @@ impl Drop for SkillPinGuard {
     }
 }
 
-/// How long finalization waits for the skill lifecycle call-in (the capture
-/// locks are bounded to about a second on their own).
-const SKILL_TERMINAL_BUDGET: Duration = Duration::from_millis(1500);
-
 /// Whether the turn ended waiting for an approval rather than with an answer.
 /// Those turns are reported as `Completed` by their entrypoints, so the signal
 /// comes from the decision: an approval directive, an approval collection, or a
@@ -576,11 +572,10 @@ fn skill_awaiting_approval(
         ) > 0
 }
 
-/// Task-terminal call-in of the skill lifecycle: joins the terminal to the
-/// task's skill experience and releases the task's revision pins. A silent turn
-/// is not credited (pins are released, nothing is joined) and a turn waiting
-/// for approval is `Blocked`, never `Success`. Failures and a missed time
-/// budget are logged and never fail finalization.
+/// Task-terminal call-in of the skill lifecycle (see
+/// `skills::lifecycle::settle_task_terminal`, shared with restart recovery). A
+/// silent turn is not credited and a turn waiting for approval is `Blocked`,
+/// never `Success`. Failures are logged and never fail finalization.
 async fn release_skill_lifecycle(
     workspace_dir: &Path,
     owner: Option<String>,
@@ -589,47 +584,36 @@ async fn release_skill_lifecycle(
     status: TurnTerminalStatus,
     awaiting_approval: bool,
 ) {
-    use crate::skills::lifecycle::{ExperienceOutcome, OwnerScope};
-    let (Some(owner), Some(task)) = (owner, task_key) else {
-        return;
-    };
-    let owner = match OwnerScope::new(&owner) {
-        Ok(owner) => owner,
-        Err(error) => {
-            tracing::warn!(%error, "skill lifecycle terminal skipped: invalid owner scope");
-            return;
-        }
-    };
-    let outcome = match status {
-        TurnTerminalStatus::Completed if awaiting_approval => Some(ExperienceOutcome::Blocked),
-        TurnTerminalStatus::Completed => Some(ExperienceOutcome::Success),
-        TurnTerminalStatus::Failed => Some(ExperienceOutcome::Failure),
-        TurnTerminalStatus::Cancelled => Some(ExperienceOutcome::Cancelled),
-        TurnTerminalStatus::Silent => None,
-    };
-    let workspace = workspace_dir.to_path_buf();
-    let terminal_id = terminal_id.to_string();
-    let call_in = tokio::task::spawn_blocking(move || {
-        let Some(outcome) = outcome else {
-            crate::skills::lifecycle::release_task_pins(&owner, &task);
-            return Ok(());
-        };
-        crate::skills::lifecycle::on_task_terminal(
-            &workspace,
-            &owner,
-            &crate::skills::lifecycle::TaskTerminal {
-                task_id: &task,
-                terminal_receipt_id: &terminal_id,
-                outcome,
+    crate::skills::lifecycle::settle_task_terminal(
+        workspace_dir,
+        owner,
+        task_key,
+        terminal_id,
+        status.skill_observation(awaiting_approval, true),
+    )
+    .await;
+}
+
+impl TurnTerminalStatus {
+    /// The skill lifecycle's view of this status; `verified` is `false` when
+    /// the facts behind it were not observed first hand (restart recovery).
+    pub(crate) const fn skill_observation(
+        self,
+        awaiting_approval: bool,
+        verified: bool,
+    ) -> crate::skills::lifecycle::TerminalObservation {
+        use crate::skills::lifecycle::{TerminalKind, TerminalObservation};
+        TerminalObservation {
+            kind: match self {
+                Self::Completed => TerminalKind::Completed,
+                Self::Silent => TerminalKind::Silent,
+                Self::Failed => TerminalKind::Failed,
+                Self::Cancelled => TerminalKind::Cancelled,
             },
-        )
-        .map(|_| ())
-    });
-    match tokio::time::timeout(SKILL_TERMINAL_BUDGET, call_in).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(error))) => tracing::warn!(%error, "skill lifecycle terminal join failed"),
-        Ok(Err(error)) => tracing::warn!(%error, "skill lifecycle terminal task failed"),
-        Err(_) => tracing::warn!("skill lifecycle terminal join exceeded its time budget; continuing"),
+            awaiting_approval,
+            verified,
+            recovered: false,
+        }
     }
 }
 
@@ -1005,10 +989,8 @@ async fn finalize_turn_impl(
         }
         // After the durable marker and before the early return, so a retried
         // finalization joins and releases as well. Restart recovery
-        // (`rejoin_terminal`, `rejoin_ingress_terminal`) does not reach this
-        // call-in and the lifecycle has no hook there: a run whose process died
-        // keeps its experience `incomplete` (its pins died with the process).
-        // Recorded as a known gap.
+        // (`rejoin_terminal`, `rejoin_ingress_terminal`) reaches the same
+        // lifecycle call-in from its own owner with the facts it can verify.
         let awaiting_approval = skill_awaiting_approval(&commit.decision, execution_trace.as_ref());
         if !awaiting_approval {
             commit.decision.context.retire_recursive_allowance();
