@@ -337,4 +337,6 @@ terminal event both carry the admitted catalog revision and digest.
 Catalog lifecycle notices distinguish known deprecated or retired rows from
 unlisted names. Custom endpoints and wildcard-covered local model names do
 not produce absence notices. Other absent catalog names are informational
-at load and in doctor; deprecated and retired rows still warn.
+at load and in doctor; deprecated and retired rows still warn. Replacement
+migration refuses suffixed variants such as `:free` when only a base-model
+replacement is published, so a free variant cannot silently become paid.

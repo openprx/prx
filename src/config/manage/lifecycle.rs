@@ -75,6 +75,24 @@ fn replacement(release: &ReleaseCatalog, provider: &str, model: &str) -> anyhow:
     let Some(target) = row.lifecycle.replacement.as_deref() else {
         return Ok(None);
     };
+    // A variant can carry a distinct tariff (for example `:free`). A base
+    // replacement cannot authorize silently losing that suffix.
+    let spellings = || {
+        std::iter::once(row.api_model.as_str())
+            .chain(std::iter::once(row.id.as_str()))
+            .chain(row.aliases.iter().map(String::as_str))
+    };
+    let has_variant = !spellings().any(|name| name.eq_ignore_ascii_case(model))
+        && spellings().any(|name| {
+            model
+                .get(..name.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+                && model.get(name.len()..).is_some_and(|suffix| suffix.starts_with(':'))
+        });
+    anyhow::ensure!(
+        !has_variant,
+        "model variant cannot be migrated to a base replacement; select its variant explicitly"
+    );
     let target = release
         .models
         .iter()
@@ -265,6 +283,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retired_free_variant_refuses_the_real_migration_plan_without_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            workspace_dir: dir.path().join("workspace"),
+            default_provider: Some("openrouter".into()),
+            default_model: Some("moonshotai/kimi-k2.5:free".into()),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let before = std::fs::read(&config.config_path).unwrap();
+        let service = super::super::ManagementService::deferred(crate::config::new_shared(config.clone()));
+        let error = service
+            .plan(
+                &super::super::ManagedChange::MigrateRetired,
+                super::super::ConfigActor::Cli,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("variant"), "{error}");
+        assert_eq!(std::fs::read(&config.config_path).unwrap(), before);
+        assert_eq!(
+            service.config().default_model.as_deref(),
+            Some("moonshotai/kimi-k2.5:free")
+        );
+        config.default_model = Some("moonshotai/kimi-k2.5".into());
+        assert_eq!(
+            candidate(&config).unwrap().default_model.as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+    }
     use crate::providers::catalog::{CatalogView, DescriptorSource, Requirement, UnknownPolicy};
 
     #[test]
