@@ -170,6 +170,7 @@ async fn a_recovered_unverified_terminal_joins_unknown_once_and_never_qualifies(
             Some("run-1".to_string()),
             "term-1",
             recovered,
+            None,
         )
         .await;
     }
@@ -199,6 +200,7 @@ async fn a_recovered_terminal_keeps_the_join_the_live_path_made() {
         Some("run-1".to_string()),
         "term-1",
         observation(TerminalKind::Completed, true),
+        None,
     )
     .await;
     settle_task_terminal(
@@ -210,6 +212,7 @@ async fn a_recovered_terminal_keeps_the_join_the_live_path_made() {
             recovered: true,
             ..observation(TerminalKind::Completed, false)
         },
+        None,
     )
     .await;
     let experience = store

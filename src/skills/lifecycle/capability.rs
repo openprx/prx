@@ -11,6 +11,7 @@
 //! path) cannot widen what the skill may do. Files are compared by SHA-256.
 
 use super::bundle::{Bundle, BundleFile};
+use super::manifest::validate_manifest;
 use super::proposal::{SkillProposal, bounded};
 use super::store::SkillLifecycleStore;
 use super::types::LifecycleError;
@@ -100,6 +101,22 @@ impl SkillLifecycleStore {
             if !allowed.contains(required) {
                 problems.push(format!("it newly requires the capability {:?}", bounded(required)));
             }
+        }
+        // The required tools are the adherence oracle: a learned revision
+        // keeps exactly its baseline's, in the record and in its manifests.
+        if candidate.revision.capability_requirements != baseline.revision.capability_requirements {
+            problems.push("it changes the required tools its baseline recorded".to_string());
+        }
+        match (
+            validate_manifest(&baseline.bundle),
+            validate_manifest(&candidate.bundle),
+        ) {
+            (Ok(before), Ok(after)) => {
+                if before.required_tools != after.required_tools {
+                    problems.push("its manifests change the required tools".to_string());
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => problems.push(format!("a manifest is invalid: {e}")),
         }
         let before = executables(&baseline.bundle);
         for path in executables(&candidate.bundle) {

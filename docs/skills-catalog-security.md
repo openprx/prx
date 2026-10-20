@@ -87,3 +87,80 @@ and script output uses the shared bounded, cancellation-aware process adapter;
 HTTP declarations reuse `http_request` network restrictions. Unsupported kinds
 remain visible in `skills_list` as unsupported and are never exported as
 provider-callable ToolSpecs.
+
+## Required tools and learning evidence
+
+A skill may declare the tools a run must call to have followed it, with the
+optional top-level `SKILL.md` frontmatter key `required-tools`, a one-line list
+of canonical capability ids:
+
+```yaml
+---
+name: deploy-helper
+description: Helps with deploys
+required-tools: [filesystem:native:shell, filesystem:native:file_read, mcp:notes:mcp__notes__search]
+---
+```
+
+An id is exactly three non-empty parts, `family:namespace:public_name`, as the
+capability catalog builds it:
+
+- The family is the first matching category of the tool, checked in this order:
+  `document_search` is `document`, `sessions_history` is `session`, a tool in
+  the file-system category is `filesystem`, then `memory`, `web`, `im`, and a
+  tool named `shell` is `shell`; every other built-in tool is `native_tool`.
+  The shell tool is in the file-system category, so its id is
+  `filesystem:native:shell`, not `shell:native:shell`. Skill tools are `skill`,
+  MCP tools `mcp`, plugin tools `wasm`.
+- The namespace is `native` for built-in tools. For MCP it is the server name
+  once the tool has been discovered, and the literal `mcp` for a configured
+  alias that has not been discovered yet, so the same tool can have two ids
+  depending on discovery state; declare the id the running catalog shows.
+- The public name is the name the model sees. An MCP tool's is
+  `mcp__<server>__<tool>`, so its id is `mcp:<server>:mcp__<server>__<tool>`.
+  A skill tool's is `skill__<skill>__<tool>`.
+
+Examples: `filesystem:native:shell`, `filesystem:native:file_read`,
+`native_tool:native:<name>`, `mcp:notes:mcp__notes__search`,
+`skill:native:skill__<skill>__<tool>`.
+
+Find an id by calling `capability_search`: each hit carries the canonical id in
+`capability.id`. The id cannot be resolved from a bare tool name when a revision
+is written, because the lifecycle store has no catalog at that point (the
+catalog is built per turn from the live configuration and MCP servers), so
+operators declare the full id.
+
+At most 16 ids per skill. The same key may appear under `[skill]` in
+`SKILL.toml` as an array of strings. When both files declare it, the lists must
+be equal; a disagreement is rejected when the revision is validated. Writing a
+new revision (an operator write or an import) refuses any other form of the
+key, a repeated key or a mis-shaped id with a typed manifest error. Reading
+a stored revision stays lenient: a line in an older form declares nothing and
+is logged, so skills stored before the key existed stay readable. The
+`[[tools]]` entries of `SKILL.toml` are not part of the requirement.
+
+The skill lifecycle records the declared tools of an imported, operator-written
+or upstream revision as its `capability_requirements`. A learned revision keeps
+exactly its baseline's list: a candidate that adds or removes a required tool,
+in the record or in its manifests, is refused at source review and at
+publication, because that would move the oracle its own evidence is judged by.
+
+At the end of a run the lifecycle compares the required tools with the tools
+the run called. A failed run counts as evidence against the skill's guidance
+only when the required tools were called, the provider and the tool backends
+were available, and no tool call was refused by policy or approval. A run that
+read more than one managed skill is not attributed to any of them. A skill that
+declares nothing has no verifiable adherence, so its failures are never used to
+propose a revision.
+
+Tool failures count as an unavailable backend when their text (with its source
+chain) names a connection error, timeout, DNS or routing failure, "error sending
+request", overload, or an HTTP 429, 500, 502, 503, 504 or 529 as a whole token.
+The MCP allow/deny refusal counts as a denial. Known limit: a tool that returns
+an upstream failure as a successful result is invisible; a typed error kind is
+the later fix. The matching is deliberately broad: a phrase such as "timeout"
+inside unrelated text, or a bare `500` token in a message, counts as an
+unavailable backend; this fails safe, because it only keeps a failure out of
+the evidence. Only a provider failure labelled timeout, rate limit,
+credentials or server error counts as an unavailable provider; the generic
+agent error label does not.

@@ -35,6 +35,18 @@ and the migration warnings below before upgrading.
 
 ### Changed
 
+- Skill lifecycle evidence: the terminal experience record now stores
+  infrastructure, permission and adherence facts, and the execution trace
+  snapshot gains an optional `unavailable_attempts` counter. Rollback note:
+  `ExecutionTraceSnapshot`, `TerminalJoin` and the new `TerminalFacts` use
+  `deny_unknown_fields`, so a binary from before this change cannot read
+  payloads or experience records written after it; roll back only after
+  removing `experiences/` records and sealed terminal markers written by the
+  new build, or keep the new build. A new optional `required-tools` frontmatter
+  key declares the tools a skill needs (see `docs/skills-catalog-security.md`).
+
+- Ordinary causal telemetry reserves channel headroom for Applied/Drain controls.
+
 - The Moonshot release default is now the cited, priced `kimi-k2.6` model.
   K2.5 and older K2 Preview/Thinking models are retired according to the
   provider's published discontinuation dates. Stored selections remain intact;

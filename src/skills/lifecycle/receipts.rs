@@ -7,6 +7,7 @@
 
 use super::binding::{release_task_pins, task_pin};
 use super::capture::{Correlation, ExperienceOutcome, TaskTerminal, on_task_terminal, task_key};
+use super::facts::TerminalObservations;
 use super::store::SkillLifecycleStore;
 use super::types::{LifecycleError, OwnerScope};
 use std::path::Path;
@@ -220,7 +221,8 @@ pub fn spawn_settle_task_terminal(
     };
     let key = terminal_id.clone();
     let handle = runtime.spawn(async move {
-        settle_task_terminal(&workspace_dir, owner, task_key, &terminal_id, observation).await;
+        // Recovery has no first-hand trace, so no observations: adherence is Unknown.
+        settle_task_terminal(&workspace_dir, owner, task_key, &terminal_id, observation, None).await;
     });
     track_background(&key, handle);
 }
@@ -277,6 +279,7 @@ pub async fn settle_task_terminal(
     task_key: Option<String>,
     terminal_id: &str,
     observation: TerminalObservation,
+    observations: Option<TerminalObservations>,
 ) {
     let (Some(owner), Some(task)) = (owner, task_key) else {
         return;
@@ -308,6 +311,7 @@ pub async fn settle_task_terminal(
                 task_id: &task,
                 terminal_receipt_id: &terminal_id,
                 outcome,
+                observations: observations.as_ref(),
             },
         )
         .map(|_| ())

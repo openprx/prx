@@ -679,6 +679,18 @@ pub(crate) struct TurnDecisionContext {
     router_transition: Option<Arc<routing::RouterTransition>>,
 }
 
+/// Ids of the discovery admissions that can run without an approval. One that
+/// still waits for approval may never have been attempted, so it says nothing
+/// about whether a run could have called it.
+fn unprompted_admission_ids(
+    admissions: &BTreeMap<String, discovery::DiscoveryAdmission>,
+) -> impl Iterator<Item = String> {
+    admissions
+        .values()
+        .filter(|admission| !admission.requires_approval)
+        .map(|admission| admission.reference.id.as_str().to_owned())
+}
+
 pub(crate) enum TurnDisposition {
     CollectApprovalArguments,
     Close { reply: std::borrow::Cow<'static, str> },
@@ -1184,6 +1196,22 @@ impl TurnDecisionContext {
 
     pub(crate) const fn execution_refs(&self) -> &BTreeSet<CapabilityRef> {
         &self.execution_refs
+    }
+
+    /// Canonical ids of every capability this turn could execute: the issued
+    /// references and those admitted by discovery without an approval.
+    /// Read-only; the skill lifecycle uses it to tell a skipped tool from one
+    /// that was never there.
+    pub(crate) fn executable_capability_ids(&self) -> BTreeSet<String> {
+        let mut ids: BTreeSet<String> = self
+            .execution_refs
+            .iter()
+            .map(|reference| reference.id.as_str().to_owned())
+            .collect();
+        if let Some(admissions) = self.discovery_admissions.get() {
+            ids.extend(unprompted_admission_ids(&admissions.lock()));
+        }
+        ids
     }
 
     /// The selected evidence belongs to the issued turn, not a fresh read.

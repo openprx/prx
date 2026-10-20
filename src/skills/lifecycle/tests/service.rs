@@ -868,6 +868,76 @@ fn a_candidate_with_a_new_executable_or_tool_widens_capabilities() {
     ));
 }
 
+/// A learned candidate can neither add nor remove a required tool: the
+/// required tools are the adherence oracle of the proposals made from the skill.
+#[test]
+fn a_learned_candidate_cannot_change_the_required_tools() {
+    let (fx, _) = fixture_candidate_unwritten();
+    let md = |line: &str, body: &str| {
+        Bundle::from_entries(vec![BundleEntry {
+            path: PathBuf::from("SKILL.md"),
+            bytes: format!("---\nname: release-notes\ndescription: Writes release notes\n{line}---\n\n{body}\n")
+                .into_bytes(),
+            executable: false,
+        }])
+        .expect("test: bundle")
+    };
+    // An operator revision takes its requirements from its own frontmatter.
+    let base = fx
+        .store
+        .write_revision(
+            &NewRevision::new(skill(), SourceKind::Operator),
+            &md("required-tools: [native_tool:native:deploy_check]\n", "ANSWER=draft"),
+        )
+        .expect("test: baseline");
+    assert_eq!(
+        base.revision.capability_requirements,
+        vec!["native_tool:native:deploy_check".to_string()]
+    );
+    let learned = |line: &str, body: &str, requirements: &[&str]| {
+        let mut new = NewRevision::new(skill(), SourceKind::Learned);
+        new.capability_requirements = requirements.iter().map(ToString::to_string).collect();
+        fx.store
+            .write_revision(&new, &md(line, body))
+            .expect("test: candidate")
+            .revision
+            .revision_id
+    };
+    let mut draft = stage_draft(
+        &fx,
+        "req-required",
+        &candidate_bundle("ANSWER=report-v2"),
+        "ANSWER=report-v2",
+    );
+    draft.baseline_revision = base.revision.revision_id;
+    let check = |draft: &SkillProposal| fx.store.check_capabilities(draft, None);
+
+    // Same list, same record: fine.
+    draft.candidate_revision = Some(learned(
+        "required-tools: [native_tool:native:deploy_check]\n",
+        "ANSWER=v2",
+        &["native_tool:native:deploy_check"],
+    ));
+    assert!(check(&draft).is_ok());
+    // The record dropped the requirement.
+    draft.candidate_revision = Some(learned(
+        "required-tools: [native_tool:native:deploy_check]\n",
+        "ANSWER=v3",
+        &[],
+    ));
+    assert!(matches!(check(&draft), Err(LifecycleError::CapabilityExpansion { .. })));
+    // The frontmatter dropped it, the record still copies the baseline.
+    draft.candidate_revision = Some(learned("", "ANSWER=v4", &["native_tool:native:deploy_check"]));
+    assert!(matches!(check(&draft), Err(LifecycleError::CapabilityExpansion { .. })));
+    // The frontmatter added one.
+    draft.candidate_revision = Some(learned(
+        "required-tools: [native_tool:native:deploy_check, native_tool:native:extra]\n",
+        "ANSWER=v5",
+        &["native_tool:native:deploy_check"],
+    ));
+    assert!(matches!(check(&draft), Err(LifecycleError::CapabilityExpansion { .. })));
+}
+
 // ---- reserved transaction ids and the journal pin ---------------------------------------
 
 fn journal_path(fx: &Fixture, proposal_id: &str, attempt: u32) -> PathBuf {

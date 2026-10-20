@@ -27,6 +27,7 @@ mod capture;
 mod consolidate;
 mod evaluate;
 mod evaluator;
+mod facts;
 mod gate;
 mod gate_judge;
 mod generation;
@@ -76,6 +77,10 @@ pub use evaluate::{
     RunReceipt, RunTerminal, ValidatorOutcome, VerifiedEvaluation,
 };
 pub use evaluator::{EvaluationRequest, RecordedEvaluation};
+pub use facts::{
+    Adherence, Exclusion, FactState, MAX_ADHERENCE_NAMES, MAX_ADHERENCE_SKILLS, ObservedCallStatus, ObservedToolCall,
+    ProviderEnd, SkillAdherence, TerminalFacts, TerminalObservations,
+};
 pub use gate::{
     EvaluationPin, GATE_IDENTITY, GateDecision, GateError, GateEvaluationEntry, GateOutcome, GatePolicy, GateReason,
     GateRequest, JudgeRecord, JudgeResult, MAX_GATE_EPOCHS, RecordedGate, SkillGateDecision, VerifiedGate,
@@ -91,7 +96,7 @@ pub use knowledge::{
     MIN_DISTINCT_TASKS_FOR_PROPOSAL, PatternId, PatternIndex, PatternIndexEntry, PatternKind, PatternScope,
     classify_failure,
 };
-pub use manifest::{ManifestError, ManifestInfo, validate_manifest};
+pub use manifest::{ManifestError, ManifestInfo, validate_manifest, validate_manifest_strict};
 pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationReport, apply_migration, plan_migration};
 pub use proposal::{
     AppliedEdit, AttemptOutcome, AttemptRecord, AuthorBinding, BoundedDiff, BudgetRecord, DescriptionChange, EditOp,
