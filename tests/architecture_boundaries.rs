@@ -1144,8 +1144,13 @@ fn workspace_hooks_launch_through_the_shared_builder_behind_the_opt_in() {
         1,
         "src/hooks/mod.rs builds a process command outside run_action"
     );
-    let emit = function_body(&production, "emit");
-    assert!(emit.contains("self.workspace_policy()"), "emit must check the opt-in");
+    // `emit` only queues; the background `deliver` runs the hooks and checks
+    // the opt-in at delivery time.
+    let deliver = function_body(&production, "deliver");
+    assert!(
+        deliver.contains("self.workspace_policy()"),
+        "deliver must check the opt-in"
+    );
 }
 
 /// GIT-ENV F-6 (D-103): the production places that name the `git`
@@ -5205,7 +5210,7 @@ fn provider_label_sinks_redact_url_userinfo() {
         ),
         // The fan-out point: command hooks, WASM lifecycle hooks and the
         // plugin event bus all receive the payload `emit` redacted.
-        ("src/hooks/mod.rs", "pub async fn emit(", "redacted_hook_payload("),
+        ("src/hooks/mod.rs", "pub fn emit(", "redacted_hook_payload("),
         (
             "src/hooks/mod.rs",
             "fn redacted_hook_payload(",
