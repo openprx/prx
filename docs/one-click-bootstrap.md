@@ -156,7 +156,9 @@ the interactive shell has a different `PATH`.
 `prx doctor` reports this directly. It reads the live daemon's own environment
 (`/proc/<pid>/environ` on Linux, using the pid from `~/.openprx/daemon_state.json`)
 and compares it against the directory the running `prx` binary lives in plus
-`~/.cargo/bin`:
+`~/.cargo/bin`. Cargo build output directories are excluded from required
+PATH entries, including custom `CARGO_TARGET_DIR` roots: doctor recognizes the
+profile/artifact layout rather than requiring a directory named `target`.
 
 ```text
 [daemon]

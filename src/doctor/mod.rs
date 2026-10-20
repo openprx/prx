@@ -2259,7 +2259,7 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// True for a Cargo build output directory (`…/target/debug`,
+/// True for a Cargo build output directory (`…/<output>/debug`,
 /// `…/target/release`, `…/target/<triple>/debug/deps`, …).
 ///
 /// Such a directory must never enter the required set: `cargo run -- doctor`,
@@ -2268,14 +2268,23 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
 /// daemon's `PATH` — an operational step that outlives the build tree.
 #[cfg(any(target_os = "linux", test))]
 fn is_cargo_build_dir(path: &Path) -> bool {
-    let parts: Vec<&std::ffi::OsStr> = path.components().map(std::path::Component::as_os_str).collect();
-    let Some(target_at) = parts.iter().rposition(|part| *part == "target") else {
-        return false;
+    let profile_dir = if path.file_name().is_some_and(|name| name == "deps") {
+        path.parent().unwrap_or(path)
+    } else {
+        path
     };
-    parts
-        .iter()
-        .skip(target_at + 1)
-        .any(|part| *part == "debug" || *part == "release")
+    if !profile_dir
+        .file_name()
+        .is_some_and(|name| name == "debug" || name == "release")
+    {
+        return false;
+    }
+    // `deps` is a Cargo artifact directory even when a copied layout no
+    // longer has its siblings. A profile directory itself needs layout proof.
+    path != profile_dir
+        || ["deps", "build", ".fingerprint"]
+            .iter()
+            .any(|name| profile_dir.join(name).is_dir())
 }
 
 /// The deployed daemon binary as the daemon itself recorded it in
@@ -4258,12 +4267,19 @@ mod tests {
 
     #[test]
     fn cargo_build_directories_are_recognized_and_ordinary_bin_directories_are_not() {
-        for build in [
-            "/opt/worker/code/prx/target/debug",
-            "/opt/worker/code/prx/target/debug/deps",
-            "/opt/worker/code/prx/target/release",
-            "/opt/worker/code/prx/target/x86_64-unknown-linux-gnu/release",
+        let temp = TempDir::new().unwrap();
+        for layout in [
+            "target/debug",
+            "target/debug/deps",
+            "target/release",
+            "target/x86_64-unknown-linux-gnu/release",
+            "prx-qa-output/debug",
+            "prx-qa-output/debug/deps",
+            "custom-output/aarch64-unknown-linux-gnu/release",
         ] {
+            let build = temp.path().join(layout);
+            std::fs::create_dir_all(build.join(".fingerprint")).unwrap();
+            let build = build.to_str().unwrap();
             assert!(
                 is_cargo_build_dir(Path::new(build)),
                 "must be a build directory: {build}"
