@@ -690,6 +690,8 @@ telemetry; a drain includes all earlier queued ordinary events before it
 acknowledges durability. Control overflow and store failure remain explicit
 incomplete outcomes with retry available. Decision-admin key preparation and
 capability-latency SQLite reads run in blocking owners; the initial latency
-snapshot is prepared before the turn deadline starts. The existing turn and
+snapshot is prepared before the turn deadline starts, with a separate 10 ms
+lookup timeout. Pool contention, a slow read or a read failure uses the pinned
+family defaults; a late read cannot alter the turn. The existing turn and
 Router deadlines stay unchanged. Revert the corresponding finding-98 fix
 commits to roll these lifecycle and persistence changes back.

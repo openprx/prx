@@ -42,6 +42,7 @@ pub(crate) use pending_approval::collection::ApprovalCollectionLease;
 #[path = "turn_decision/routing/replay_facts.rs"]
 mod router_replay_facts;
 pub(crate) use router_replay_facts::{RouterReadFacts, provider_binding as router_provider_binding};
+mod latency_snapshot;
 #[cfg(feature = "llm-router")]
 mod routing;
 #[cfg(feature = "llm-router")]
@@ -3090,19 +3091,12 @@ impl TurnDecisionService {
         };
         let store = Arc::clone(&self.store);
         let owner_id = owner_id.to_owned();
-        match tokio::task::spawn_blocking(move || {
+        latency_snapshot::read(move || {
             store
                 .reader()
                 .capability_latency_p50(&workspace_id, &owner_id, &generation.to_hex())
         })
         .await
-        {
-            Ok(Ok(samples)) => samples,
-            result => {
-                tracing::warn!(error = ?result, "causal outcome latency snapshot unavailable; using pinned defaults");
-                BTreeMap::new()
-            }
-        }
     }
 
     /// Snapshot the initial decision budget after the source proof and PMM
