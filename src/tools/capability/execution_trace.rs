@@ -208,7 +208,12 @@ impl ExecutionTrace {
         self.0.lock().sealed.is_some()
     }
 
-    pub(crate) fn begin(&self, operation_id: &str, capability_id: Option<&str>, selected: bool) -> PendingExecution {
+    pub(crate) fn begin(
+        &self,
+        raw_operation_id: &str,
+        capability_id: Option<&str>,
+        selected: bool,
+    ) -> PendingExecution {
         let mut state = self.0.lock();
         let active = state.sealed.is_none();
         if active {
@@ -218,18 +223,18 @@ impl ExecutionTrace {
         let operation_id = if !active {
             None
         } else if let Some(id) = capability_id {
-            if state.calls.len() >= MAX_CALLS || state.calls.contains_key(operation_id) {
+            if state.calls.len() >= MAX_CALLS || state.calls.contains_key(raw_operation_id) {
                 state.incomplete = true;
                 None
             } else {
                 state.calls.insert(
-                    operation_id.to_owned(),
+                    raw_operation_id.to_owned(),
                     RecordedToolCall {
                         capability_id: id.to_owned(),
                         status: "pending".to_owned(),
                     },
                 );
-                Some(operation_id.to_owned())
+                Some(raw_operation_id.to_owned())
             }
         } else {
             state.unbound_attempts = state.unbound_attempts.saturating_add(1);
@@ -237,7 +242,7 @@ impl ExecutionTrace {
         };
         PendingExecution {
             trace: self.clone(),
-            key: operation_id.to_owned(),
+            key: raw_operation_id.to_owned(),
             operation_id,
             active,
             selected: selected && capability_id.is_some(),
