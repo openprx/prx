@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 const OWNER: &str = "owner:ws:cli:alice";
-const DECLARED_TOOL: &str = "shell:builtin:deploy_check";
+const DECLARED_TOOL: &str = "native_tool:native:deploy_check";
 
 fn skill() -> SkillId {
     SkillId::parse("deploy-helper").expect("test: skill id")
@@ -2061,7 +2061,7 @@ fn run_through_terminal(f: &Fixture, task: &str, observed: &[&str]) -> String {
 
 #[tokio::test]
 async fn an_imported_skill_with_required_tools_qualifies_through_the_whole_chain() {
-    let f = imported(Some("[shell:builtin:deploy_check]"));
+    let f = imported(Some("[native_tool:native:deploy_check]"));
     let baseline = f
         .store
         .read_revision(&f.pin.skill_id, &f.pin.revision_id, None)
@@ -2085,9 +2085,9 @@ async fn an_imported_skill_with_required_tools_qualifies_through_the_whole_chain
 #[tokio::test]
 async fn failures_that_skipped_the_required_tool_or_come_from_undeclaring_skills_never_qualify() {
     // Declared, but the runs never called the tool: not followed.
-    let f = imported(Some("[shell:builtin:deploy_check]"));
-    let a = run_through_terminal(&f, "skip-1", &["shell:builtin:other"]);
-    let b = run_through_terminal(&f, "skip-2", &["shell:builtin:other"]);
+    let f = imported(Some("[native_tool:native:deploy_check]"));
+    let a = run_through_terminal(&f, "skip-1", &["native_tool:native:other"]);
+    let b = run_through_terminal(&f, "skip-2", &["native_tool:native:other"]);
     let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
     let model = ScriptedModel::replying(&good_patch());
     let err = propose_revision(
@@ -2178,7 +2178,7 @@ mod from_trace {
         build: &dyn Fn(&ExecutionTrace),
         outcome: Option<&ProviderExecutionOutcome>,
     ) -> Result<ProposeOutcome, LifecycleError> {
-        let f = imported(Some("[shell:builtin:deploy_check]"));
+        let f = imported(Some("[native_tool:native:deploy_check]"));
         let a = task(&f, &format!("{label}-1"), build, outcome);
         let b = task(&f, &format!("{label}-2"), build, outcome);
         let pattern = consolidate(&f, STATEMENT, FailureClass::MissingGuidance, &[&a, &b]);
@@ -2240,7 +2240,7 @@ mod from_trace {
         let backend = |trace: &ExecutionTrace| {
             served(trace);
             trace
-                .begin("op-2", Some("shell:builtin:other"), false)
+                .begin("op-2", Some("native_tool:native:other"), false)
                 .finish_with_error(
                     ToolExecutionStatus::Failed,
                     Some("error sending request: connection refused"),
@@ -2251,10 +2251,52 @@ mod from_trace {
         let bad_args = |trace: &ExecutionTrace| {
             served(trace);
             trace
-                .begin("op-2", Some("shell:builtin:other"), false)
+                .begin("op-2", Some("native_tool:native:other"), false)
                 .finish_with_error(ToolExecutionStatus::InvalidArguments, Some("missing field `path`"));
         };
         let staged = outcome_of("args", &bad_args, None).await.expect("test: proposal");
+        assert!(matches!(staged, ProposeOutcome::Staged(_)));
+    }
+    #[tokio::test]
+    async fn a_retained_trace_success_on_a_failed_terminal_is_not_read_as_served() {
+        use crate::agent::turn_contracts::{RetainedProviderTrace, ToolLoopTrace};
+        // What `abort_commit` does: round 1 completed, round 2 failed, and the
+        // retained trace of round 1 becomes a success outcome.
+        let loop_trace = ToolLoopTrace {
+            final_provider: Some("p".to_string()),
+            final_model: Some("m".to_string()),
+            attempts: vec![attempt()],
+            ..ToolLoopTrace::default()
+        };
+        let retained = RetainedProviderTrace::default();
+        retained.begin();
+        retained.completed(
+            &loop_trace,
+            crate::llm::route_decision::TokenUsage::default(),
+            false,
+            true,
+        );
+        retained.begin();
+        retained.failed();
+        let (trace, uncertain) = retained.snapshot();
+        assert!(uncertain);
+        let outcome = crate::agent::terminal::provider_outcome_from_trace(
+            &RouteDecision::single_candidate("p", "m"),
+            chrono::Utc::now(),
+            trace.expect("test: round 1 completed"),
+        );
+        let outage = |trace: &ExecutionTrace| {
+            served(trace);
+            trace.begin_provider().expect("test: begin").finish(None);
+        };
+        let err = outcome_of("retained", &outage, Some(&outcome))
+            .await
+            .expect_err("test: an outage after a served round");
+        assert!(err.to_string().contains("2 for unknown or unverified facts"), "{err}");
+        // The same outcome with a trace that agrees is served and qualifies.
+        let staged = outcome_of("retained-ok", &served, Some(&outcome))
+            .await
+            .expect("test: proposal");
         assert!(matches!(staged, ProposeOutcome::Staged(_)));
     }
 }

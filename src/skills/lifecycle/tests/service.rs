@@ -887,10 +887,13 @@ fn a_learned_candidate_cannot_change_the_required_tools() {
         .store
         .write_revision(
             &NewRevision::new(skill(), SourceKind::Operator),
-            &md("required-tools: [deploy_check]\n", "ANSWER=draft"),
+            &md("required-tools: [native_tool:native:deploy_check]\n", "ANSWER=draft"),
         )
         .expect("test: baseline");
-    assert_eq!(base.revision.capability_requirements, vec!["deploy_check".to_string()]);
+    assert_eq!(
+        base.revision.capability_requirements,
+        vec!["native_tool:native:deploy_check".to_string()]
+    );
     let learned = |line: &str, body: &str, requirements: &[&str]| {
         let mut new = NewRevision::new(skill(), SourceKind::Learned);
         new.capability_requirements = requirements.iter().map(ToString::to_string).collect();
@@ -911,22 +914,26 @@ fn a_learned_candidate_cannot_change_the_required_tools() {
 
     // Same list, same record: fine.
     draft.candidate_revision = Some(learned(
-        "required-tools: [deploy_check]\n",
+        "required-tools: [native_tool:native:deploy_check]\n",
         "ANSWER=v2",
-        &["deploy_check"],
+        &["native_tool:native:deploy_check"],
     ));
     assert!(check(&draft).is_ok());
     // The record dropped the requirement.
-    draft.candidate_revision = Some(learned("required-tools: [deploy_check]\n", "ANSWER=v3", &[]));
+    draft.candidate_revision = Some(learned(
+        "required-tools: [native_tool:native:deploy_check]\n",
+        "ANSWER=v3",
+        &[],
+    ));
     assert!(matches!(check(&draft), Err(LifecycleError::CapabilityExpansion { .. })));
     // The frontmatter dropped it, the record still copies the baseline.
-    draft.candidate_revision = Some(learned("", "ANSWER=v4", &["deploy_check"]));
+    draft.candidate_revision = Some(learned("", "ANSWER=v4", &["native_tool:native:deploy_check"]));
     assert!(matches!(check(&draft), Err(LifecycleError::CapabilityExpansion { .. })));
     // The frontmatter added one.
     draft.candidate_revision = Some(learned(
-        "required-tools: [deploy_check, extra]\n",
+        "required-tools: [native_tool:native:deploy_check, native_tool:native:extra]\n",
         "ANSWER=v5",
-        &["deploy_check"],
+        &["native_tool:native:deploy_check"],
     ));
     assert!(matches!(check(&draft), Err(LifecycleError::CapabilityExpansion { .. })));
 }

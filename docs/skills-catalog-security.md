@@ -92,25 +92,35 @@ provider-callable ToolSpecs.
 
 A skill may declare the tools a run must call to have followed it, with the
 optional top-level `SKILL.md` frontmatter key `required-tools`, a one-line list
-of canonical capability ids (`family:namespace:name`, the ids the execution
-trace records):
+of canonical capability ids:
 
 ```yaml
 ---
 name: deploy-helper
 description: Helps with deploys
-required-tools: [native:local:deploy_check, skill:deploy-helper:lint]
+required-tools: [shell:native:shell, filesystem:native:file_read, mcp:notes:search]
 ---
 ```
 
-Names are 1-128 characters of letters, digits and `_ - . :`, at most 16; a call
-matches only when its whole capability id is equal. The same key may appear
-under `[skill]` in `SKILL.toml` as an array of strings. When both files declare
-it, the lists must be equal; a disagreement is rejected when the revision is
-validated. A line in any other form (a scalar, a repeated key, a malformed
-list) declares nothing and is logged, so skills stored before the key existed
-stay readable. The `[[tools]]` entries of `SKILL.toml` are not part of the
-requirement.
+An id is exactly three non-empty parts, `family:namespace:public_name`. The
+family is one of `memory`, `skill`, `mcp`, `native_tool`, `wasm`, `hook`,
+`filesystem`, `shell`, `document`, `web`, `im`, `session`. The namespace is
+`native` for built-in tools and the server name for MCP tools. Examples:
+`shell:native:shell`, `filesystem:native:file_read`,
+`native_tool:native:<name>`, `mcp:<server>:<public_name>` and
+`skill:native:skill__<skill>__<tool>`. The public name is the tool name the
+model sees (`capability_search` returns it for each hit); no CLI listing of
+canonical ids exists yet, so build the id from the family, the namespace and
+that name. A call matches a requirement only when the whole id is equal.
+
+At most 16 ids per skill. The same key may appear under `[skill]` in
+`SKILL.toml` as an array of strings. When both files declare it, the lists must
+be equal; a disagreement is rejected when the revision is validated. Writing a
+new revision (an operator write or an import) refuses any other form of the
+key, a repeated key or a mis-shaped id with a typed manifest error. Reading
+a stored revision stays lenient: a line in an older form declares nothing and
+is logged, so skills stored before the key existed stay readable. The
+`[[tools]]` entries of `SKILL.toml` are not part of the requirement.
 
 The skill lifecycle records the declared tools of an imported, operator-written
 or upstream revision as its `capability_requirements`. A learned revision keeps
@@ -131,6 +141,9 @@ chain) names a connection error, timeout, DNS or routing failure, "error sending
 request", overload, or an HTTP 429, 500, 502, 503, 504 or 529 as a whole token.
 The MCP allow/deny refusal counts as a denial. Known limit: a tool that returns
 an upstream failure as a successful result is invisible; a typed error kind is
-the later fix. Only a provider failure labelled timeout, rate limit,
+the later fix. The matching is deliberately broad: a phrase such as "timeout"
+inside unrelated text, or a bare `500` token in a message, counts as an
+unavailable backend; this fails safe, because it only keeps a failure out of
+the evidence. Only a provider failure labelled timeout, rate limit,
 credentials or server error counts as an unavailable provider; the generic
 agent error label does not.

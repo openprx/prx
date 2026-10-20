@@ -29,8 +29,8 @@ fn setup() -> (TempDir, SkillLifecycleStore, PinnedSkillRevision) {
     .expect("test: bundle");
     let mut new = NewRevision::new(skill(), SourceKind::Operator);
     new.capability_requirements = vec![
-        "shell:builtin:deploy_check".to_string(),
-        "skill:deploy-helper:lint".to_string(),
+        "native_tool:native:deploy_check".to_string(),
+        "skill:native:skill__deploy-helper__lint".to_string(),
     ];
     let written = store.write_revision(&new, &bundle).expect("test: write");
     activate(
@@ -91,8 +91,8 @@ fn terminal_facts(
 }
 
 const BOTH_CALLED: [(&str, ObservedCallStatus); 2] = [
-    ("shell:builtin:deploy_check", ObservedCallStatus::Succeeded),
-    ("skill:deploy-helper:lint", ObservedCallStatus::Failed),
+    ("native_tool:native:deploy_check", ObservedCallStatus::Succeeded),
+    ("skill:native:skill__deploy-helper__lint", ObservedCallStatus::Failed),
 ];
 
 fn both_called() -> Vec<ObservedToolCall> {
@@ -157,7 +157,7 @@ fn a_refused_tool_call_is_recorded_as_a_permission_refusal() {
 
     // A denied call in the list counts even when the counter was not carried.
     let (tmp, store, pin) = setup();
-    let listed = clean(vec![call("shell:builtin:rm", ObservedCallStatus::Denied)]);
+    let listed = clean(vec![call("shell:native:shell", ObservedCallStatus::Denied)]);
     let facts = terminal_facts(&tmp, &store, &pin, "listed", Some(&listed));
     assert_eq!(facts.permission_refused, FactState::Present);
 
@@ -175,18 +175,24 @@ fn adherence_needs_every_declared_tool_called_and_a_complete_trace() {
     let verdict = |facts: &TerminalFacts| facts.adherence_of(&pin.skill_id, &pin.revision_id);
 
     // A declared tool that was never called, in a complete trace: not followed.
-    let only_one = clean(vec![call("shell:builtin:deploy_check", ObservedCallStatus::Succeeded)]);
+    let only_one = clean(vec![call(
+        "native_tool:native:deploy_check",
+        ObservedCallStatus::Succeeded,
+    )]);
     let facts = terminal_facts(&tmp, &store, &pin, "missing", Some(&only_one));
     assert_eq!(verdict(&facts), Adherence::NotFollowed);
     assert_eq!(
         facts.adherence.first().map(|entry| entry.missing.clone()),
-        Some(vec!["skill:deploy-helper:lint".to_string()])
+        Some(vec!["skill:native:skill__deploy-helper__lint".to_string()])
     );
     assert!(!facts.failure_attributable_to(&pin.skill_id, &pin.revision_id));
 
     // The same gap in an incomplete trace proves nothing.
     let (tmp, store, pin) = setup();
-    let mut open = clean(vec![call("shell:builtin:deploy_check", ObservedCallStatus::Succeeded)]);
+    let mut open = clean(vec![call(
+        "native_tool:native:deploy_check",
+        ObservedCallStatus::Succeeded,
+    )]);
     open.complete = false;
     let facts = terminal_facts(&tmp, &store, &pin, "open", Some(&open));
     assert_eq!(facts.adherence_of(&pin.skill_id, &pin.revision_id), Adherence::Unknown);
@@ -194,8 +200,8 @@ fn adherence_needs_every_declared_tool_called_and_a_complete_trace() {
     // A declared tool that was refused is neither followed nor ignored.
     let (tmp, store, pin) = setup();
     let refused = vec![
-        call("shell:builtin:deploy_check", ObservedCallStatus::Denied),
-        call("skill:deploy-helper:lint", ObservedCallStatus::Failed),
+        call("native_tool:native:deploy_check", ObservedCallStatus::Denied),
+        call("skill:native:skill__deploy-helper__lint", ObservedCallStatus::Failed),
     ];
     let facts = terminal_facts(&tmp, &store, &pin, "refused", Some(&clean(refused)));
     assert_eq!(facts.adherence_of(&pin.skill_id, &pin.revision_id), Adherence::Unknown);
@@ -275,7 +281,7 @@ fn only_the_full_capability_id_matches_a_requirement() {
     let (tmp, store, pin) = setup();
     // The public name alone, or another namespace, is not the required tool.
     let lookalikes = clean(vec![
-        call("shell:builtin:lint", ObservedCallStatus::Succeeded),
+        call("native_tool:native:lint", ObservedCallStatus::Succeeded),
         call("other:ns:deploy_check", ObservedCallStatus::Succeeded),
         call("deploy_check", ObservedCallStatus::Succeeded),
     ]);
@@ -295,7 +301,7 @@ fn a_skill_toml_tool_is_not_part_of_the_oracle() {
     let toml = "[skill]\nname = \"Deploy helper\"\ndescription = \"Helps with deploys\"\nversion = \"0.1.0\"\n\n\
                 [[tools]]\nname = \"orphan\"\ndescription = \"x\"\nkind = \"shell\"\ncommand = \"true\"\n";
     let bundle = Bundle::from_entries(vec![
-        entry("SKILL.md", md_required("[shell:builtin:deploy_check]").as_bytes()),
+        entry("SKILL.md", md_required("[native_tool:native:deploy_check]").as_bytes()),
         entry("SKILL.toml", toml.as_bytes()),
     ])
     .expect("test: bundle");
@@ -304,7 +310,7 @@ fn a_skill_toml_tool_is_not_part_of_the_oracle() {
         .expect("test: write");
     assert_eq!(
         written.revision.capability_requirements,
-        vec!["shell:builtin:deploy_check".to_string()]
+        vec!["native_tool:native:deploy_check".to_string()]
     );
     activate(
         &store,
@@ -314,7 +320,10 @@ fn a_skill_toml_tool_is_not_part_of_the_oracle() {
         true,
     );
     let pin = store.pin_active(&skill()).expect("test: pin").expect("test: bound");
-    let called = clean(vec![call("shell:builtin:deploy_check", ObservedCallStatus::Succeeded)]);
+    let called = clean(vec![call(
+        "native_tool:native:deploy_check",
+        ObservedCallStatus::Succeeded,
+    )]);
     let facts = terminal_facts(&tmp, &store, &pin, "toml-tool", Some(&called));
     assert_eq!(facts.adherence_of(&pin.skill_id, &pin.revision_id), Adherence::Followed);
 }
@@ -330,7 +339,7 @@ fn a_run_that_read_several_skills_attributes_nothing_to_any_of_them() {
     let other = SkillId::parse("other-helper").expect("test: id");
     let bundle = Bundle::from_entries(vec![entry(
         "SKILL.md",
-        md_required("[shell:builtin:deploy_check]").as_bytes(),
+        md_required("[native_tool:native:deploy_check]").as_bytes(),
     )])
     .expect("test: bundle");
     let written = store

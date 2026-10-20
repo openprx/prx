@@ -588,24 +588,21 @@ pub(crate) fn observations_from(
 ) -> crate::skills::lifecycle::TerminalObservations {
     use crate::llm::route_decision::ExecutionStatus;
     use crate::skills::lifecycle::{ObservedCallStatus, ObservedToolCall, ProviderEnd, TerminalObservations};
+    // "Served" needs the execution trace to agree, whatever else reports a
+    // success: every provider call observed and the last attempt a success. A
+    // retained trace of an earlier round (`abort_commit` after a failed later
+    // round) can read as a success while the run ended in an outage.
+    let trace_served = !trace.provider_attempts_incomplete
+        && trace.provider_pending == 0
+        && trace
+            .provider_attempts
+            .as_ref()
+            .and_then(|attempts| attempts.iter().rev().find(|attempt| attempt.status != "skipped"))
+            .is_some_and(|attempt| attempt.status == "success");
     let provider = match provider.map(|outcome| &outcome.status) {
-        Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess) => ProviderEnd::Served,
         Some(ExecutionStatus::AllFailed { last_error_class }) => ProviderEnd::from_failure_class(last_error_class),
-        // Without a settled outcome the trace still shows a served final
-        // attempt, but only when every provider call it started was observed:
-        // a later round that failed without an attempt record (an outage after
-        // a served round) leaves the trace incomplete and proves nothing.
-        None if !trace.provider_attempts_incomplete
-            && trace.provider_pending == 0
-            && trace
-                .provider_attempts
-                .as_ref()
-                .and_then(|attempts| attempts.iter().rev().find(|attempt| attempt.status != "skipped"))
-                .is_some_and(|attempt| attempt.status == "success") =>
-        {
-            ProviderEnd::Served
-        }
-        None => ProviderEnd::Unknown,
+        Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess) | None if trace_served => ProviderEnd::Served,
+        Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess) | None => ProviderEnd::Unknown,
     };
     TerminalObservations {
         tool_calls: trace
@@ -2856,9 +2853,9 @@ mod tests {
         };
         let trace = ExecutionTraceSnapshot {
             calls: vec![
-                call("shell:builtin:deploy_check", "success"),
-                call("shell:builtin:rm", "denied"),
-                call("shell:builtin:odd", "no-such-code"),
+                call("native_tool:native:deploy_check", "success"),
+                call("shell:native:shell", "denied"),
+                call("native_tool:native:odd", "no-such-code"),
             ],
             denied_attempts: 1,
             unavailable_attempts: Some(2),
@@ -2888,5 +2885,77 @@ mod tests {
         let seen = observations_from(&open, None);
         assert_eq!(seen.provider, ProviderEnd::Unknown);
         assert!(!seen.complete);
+    }
+    /// `abort_commit` turns the retained trace of an earlier, served round into a
+    /// success outcome even when a later round failed. The execution trace must
+    /// overrule it: the run ended in an outage, not a served answer.
+    #[test]
+    fn a_retained_success_does_not_make_a_later_outage_served() {
+        use crate::agent::turn_contracts::{RetainedProviderTrace, ToolLoopTrace};
+        use crate::llm::route_decision::{AttemptStatus, ProviderAttempt};
+        use crate::skills::lifecycle::ProviderEnd;
+        use crate::tools::capability::execution_trace::ExecutionTrace;
+        let now = chrono::Utc::now();
+        let attempt = ProviderAttempt {
+            seq: 1,
+            provider: "ollama".to_string(),
+            model: "prx-local-model".to_string(),
+            started_at: now,
+            finished_at: now,
+            status: AttemptStatus::Success,
+            error_class: None,
+            error_message: None,
+        };
+        let loop_trace = ToolLoopTrace {
+            final_provider: Some("ollama".to_string()),
+            final_model: Some("prx-local-model".to_string()),
+            attempts: vec![attempt.clone()],
+            ..ToolLoopTrace::default()
+        };
+        let retained = RetainedProviderTrace::default();
+        retained.begin();
+        retained.completed(
+            &loop_trace,
+            crate::llm::route_decision::TokenUsage::default(),
+            false,
+            true,
+        );
+        retained.begin();
+        retained.failed();
+        let (trace, uncertain) = retained.snapshot();
+        assert!(uncertain, "the failed second round is flagged");
+        let outcome = provider_outcome_from_trace(
+            &RouteDecision::single_candidate("ollama", "prx-local-model"),
+            now,
+            trace.expect("test: the first round completed"),
+        );
+        assert!(matches!(
+            outcome.status,
+            crate::llm::route_decision::ExecutionStatus::Success
+                | crate::llm::route_decision::ExecutionStatus::FallbackSuccess
+        ));
+
+        // The execution trace saw round 1 served and round 2 fail without an attempt.
+        let execution = ExecutionTrace::default();
+        execution
+            .begin_provider()
+            .expect("test: begin")
+            .finish(Some(std::slice::from_ref(&attempt)));
+        assert_eq!(
+            observations_from(&execution.seal(), Some(&outcome)).provider,
+            ProviderEnd::Served,
+            "one served round with nothing else is served"
+        );
+        let execution = ExecutionTrace::default();
+        execution
+            .begin_provider()
+            .expect("test: begin")
+            .finish(Some(std::slice::from_ref(&attempt)));
+        execution.begin_provider().expect("test: begin").finish(None);
+        assert_eq!(
+            observations_from(&execution.seal(), Some(&outcome)).provider,
+            ProviderEnd::Unknown,
+            "the outage after the served round is not served"
+        );
     }
 }

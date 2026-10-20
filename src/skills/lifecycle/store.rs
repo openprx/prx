@@ -13,7 +13,7 @@
 //! The store never opens `brain.db` and never writes outside its root.
 
 use super::bundle::{BUNDLE_FORMAT_VERSION, Bundle};
-use super::manifest::{ManifestInfo, validate_manifest};
+use super::manifest::{ManifestInfo, validate_manifest, validate_manifest_strict};
 use super::types::{
     LifecycleError, NewRevision, OwnerScope, RevisionId, SCHEMA_VERSION, SkillId, SkillRevision, SourceKind,
 };
@@ -351,6 +351,12 @@ impl SkillLifecycleStore {
             // An idempotent rewrite: the caller's own list must fit the stored
             // record; what the manifests add is not the caller's claim.
             return self.existing_outcome(&final_dir, original, &revision_id);
+        }
+
+        if original.source_kind != SourceKind::Learned {
+            // A new operator, import or upstream revision may not declare a
+            // malformed or mis-shaped `required-tools`; only reading is lenient.
+            validate_manifest_strict(bundle)?;
         }
 
         let skill_dir = self.root.join(REVISIONS_DIR).join(new.skill_id.as_str());

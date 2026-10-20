@@ -110,12 +110,18 @@ fn md_with_tools(line: &str) -> String {
 fn required_tools_are_read_from_the_frontmatter_list() {
     let info = manifest_of(vec![entry(
         "SKILL.md",
-        md_with_tools("required-tools: [lint, \"deploy_check\", lint]").as_bytes(),
+        md_with_tools(
+            "required-tools: [native_tool:native:lint, \"native_tool:native:deploy_check\", native_tool:native:lint]",
+        )
+        .as_bytes(),
     )])
     .expect("test: valid");
     assert_eq!(
         info.required_tools,
-        vec!["deploy_check".to_string(), "lint".to_string()]
+        vec![
+            "native_tool:native:deploy_check".to_string(),
+            "native_tool:native:lint".to_string()
+        ]
     );
     let none = manifest_of(vec![entry("SKILL.md", md("Deploy", "Does deploys").as_bytes())]).expect("test: valid");
     assert!(none.required_tools.is_empty(), "nothing declared is nothing required");
@@ -131,22 +137,69 @@ fn required_tools_are_read_from_the_frontmatter_list() {
     assert!(nested.required_tools.is_empty(), "an indented key is not ours");
 }
 
+const A: &str = "native_tool:native:a";
+const B: &str = "mcp:notes:search";
+
+/// Every form the key does not allow: the real ids of the lifecycle have the
+/// shape `family:namespace:name` with a known family.
+const BAD_LINES: [&str; 12] = [
+    "required-tools: lint",
+    "required-tools: [lint]",
+    "required-tools: [deploy_check]",
+    "required-tools: [shell:native]",
+    "required-tools: [shell:native:]",
+    "required-tools: [shell::shell]",
+    "required-tools: [bogus:native:x]",
+    "required-tools: [none:native:x]",
+    "required-tools: [shell:native:shell:more]",
+    "required-tools: [a b]",
+    "required-tools: [shell:native:shell, ",
+    "required-tools: {a: 1}",
+];
+
 #[test]
 fn a_legacy_or_malformed_required_tools_line_reads_as_undeclared() {
     // A stored revision may already carry such a line in another form: it must
     // stay readable (and rewritable) and simply declares nothing.
-    for line in [
-        "required-tools: lint",
-        "required-tools: [a b]",
-        "required-tools: [a;b]",
-        "required-tools: [a, b",
-        "required-tools: [a]\nrequired-tools: [b]",
-        "required-tools: {a: 1}",
-    ] {
+    for line in BAD_LINES
+        .iter()
+        .copied()
+        .chain(["required-tools: [native_tool:native:a]\nrequired-tools: [mcp:notes:search]"])
+    {
         let info = manifest_of(vec![entry("SKILL.md", md_with_tools(line).as_bytes())])
             .unwrap_or_else(|e| panic!("test: {line} must stay readable: {e}"));
         assert!(info.required_tools.is_empty(), "{line}");
     }
+}
+
+#[test]
+fn a_new_revision_with_a_malformed_required_tools_line_is_refused_with_a_typed_error() {
+    use crate::skills::lifecycle::validate_manifest_strict;
+    let strict = |line: &str| {
+        validate_manifest_strict(
+            &Bundle::from_entries(vec![entry("SKILL.md", md_with_tools(line).as_bytes())]).expect("test: bundle"),
+        )
+    };
+    for line in BAD_LINES
+        .iter()
+        .copied()
+        .chain(["required-tools: [native_tool:native:a]\nrequired-tools: [mcp:notes:search]"])
+    {
+        let err = strict(line).expect_err(line);
+        assert!(
+            matches!(
+                err,
+                ManifestError::InvalidField {
+                    field: "required-tools",
+                    ..
+                } | ManifestError::DuplicateKey { key: "required-tools" }
+            ),
+            "{line}: {err}"
+        );
+    }
+    let ok = strict("required-tools: [shell:native:shell, filesystem:native:file_read, mcp:notes:search, skill:native:skill__a__b, native_tool:native:x]")
+        .expect("test: every known shape");
+    assert_eq!(ok.required_tools.len(), 5);
 }
 
 #[test]
@@ -158,15 +211,20 @@ fn skill_md_and_skill_toml_must_agree_on_required_tools() {
             entry("SKILL.toml", toml(toml_tools).as_bytes()),
         ])
     };
+    let md_list = format!("required-tools: [{B}, {A}]");
     // Equal lists, whatever their order, agree; one side alone is enough.
-    let agreed = both("required-tools: [b, a]", "required-tools = [\"a\", \"b\"]\n").expect("test: agree");
-    assert_eq!(agreed.required_tools, vec!["a".to_string(), "b".to_string()]);
-    let toml_only = both("", "required-tools = [\"a\"]\n").expect("test: toml only");
-    assert_eq!(toml_only.required_tools, vec!["a".to_string()]);
-    let markdown_only = both("required-tools: [a]", "").expect("test: markdown only");
-    assert_eq!(markdown_only.required_tools, vec!["a".to_string()]);
+    let agreed = both(&md_list, &format!("required-tools = [\"{A}\", \"{B}\"]\n")).expect("test: agree");
+    assert_eq!(agreed.required_tools, vec![B.to_string(), A.to_string()], "sorted");
+    let toml_only = both("", &format!("required-tools = [\"{A}\"]\n")).expect("test: toml only");
+    assert_eq!(toml_only.required_tools, vec![A.to_string()]);
+    let markdown_only = both(&format!("required-tools: [{A}]"), "").expect("test: markdown only");
+    assert_eq!(markdown_only.required_tools, vec![A.to_string()]);
     // A disagreement is refused; neither parser wins.
-    let err = both("required-tools: [a]", "required-tools = [\"b\"]\n").expect_err("test: conflict");
+    let err = both(
+        &format!("required-tools: [{A}]"),
+        &format!("required-tools = [\"{B}\"]\n"),
+    )
+    .expect_err("test: conflict");
     assert!(
         matches!(
             err,
@@ -178,6 +236,6 @@ fn skill_md_and_skill_toml_must_agree_on_required_tools() {
         "{err}"
     );
     // A malformed TOML value is undeclared, not a conflict.
-    let lenient = both("required-tools: [a]", "required-tools = [1]\n").expect("test: lenient");
-    assert_eq!(lenient.required_tools, vec!["a".to_string()]);
+    let lenient = both(&format!("required-tools: [{A}]"), "required-tools = [1]\n").expect("test: lenient");
+    assert_eq!(lenient.required_tools, vec![A.to_string()]);
 }

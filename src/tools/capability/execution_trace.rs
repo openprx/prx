@@ -113,6 +113,9 @@ struct State {
     denied_attempts: u64,
     awaiting_approval_attempts: u64,
     unavailable_attempts: u64,
+    /// Error text with its source chain, by operation id, for the classifier
+    /// only (never persisted or returned).
+    error_details: BTreeMap<String, String>,
     unbound_attempts: u64,
     incomplete: bool,
     sealed: Option<ExecutionTraceSnapshot>,
@@ -129,6 +132,7 @@ impl Eq for ExecutionTrace {}
 
 pub(crate) struct PendingExecution {
     trace: ExecutionTrace,
+    key: String,
     operation_id: Option<String>,
     active: bool,
     selected: bool,
@@ -233,9 +237,20 @@ impl ExecutionTrace {
         };
         PendingExecution {
             trace: self.clone(),
+            key: operation_id.to_owned(),
             operation_id,
             active,
             selected: selected && capability_id.is_some(),
+        }
+    }
+
+    /// Remembers the full error text (source chain included) of the operation
+    /// `operation_id` so that its failure can be classified. Content-free
+    /// output is unchanged: the text is used by the classifier and dropped.
+    pub(crate) fn note_error_detail(&self, operation_id: &str, detail: String) {
+        let mut state = self.0.lock();
+        if state.sealed.is_none() && state.error_details.len() < MAX_CALLS {
+            state.error_details.insert(operation_id.to_owned(), detail);
         }
     }
 
@@ -385,7 +400,9 @@ impl PendingExecution {
             return;
         }
         state.pending_attempts = state.pending_attempts.saturating_sub(1);
-        let status = if status == ToolExecutionStatus::Failed && error.is_some_and(mcp_policy_denial) {
+        let detail = state.error_details.remove(&self.key);
+        let texts = || error.into_iter().chain(detail.as_deref());
+        let status = if status == ToolExecutionStatus::Failed && texts().any(mcp_policy_denial) {
             ToolExecutionStatus::Denied
         } else {
             status
@@ -416,7 +433,7 @@ impl PendingExecution {
             }
             _ => {
                 state.failed_attempts = state.failed_attempts.saturating_add(1);
-                if status == ToolExecutionStatus::Indeterminate || error.is_some_and(backend_unavailable) {
+                if status == ToolExecutionStatus::Indeterminate || texts().any(backend_unavailable) {
                     state.unavailable_attempts = state.unavailable_attempts.saturating_add(1);
                 }
                 "failed"
@@ -738,5 +755,25 @@ mod silent_tests {
         assert!(snapshot.provider_attempts_incomplete);
         let seen = crate::agent::terminal::observations_from(&snapshot, None);
         assert_eq!(seen.provider, crate::skills::lifecycle::ProviderEnd::Unknown);
+    }
+    /// The source chain is classified through a side channel and never becomes
+    /// part of the snapshot: only the counters change.
+    #[test]
+    fn the_error_chain_is_classified_without_being_kept() {
+        let trace = ExecutionTrace::default();
+        trace.note_error_detail(
+            "chained",
+            "http_request failed: error sending request: connection refused".to_string(),
+        );
+        trace
+            .begin("chained", Some("native_tool:native:http"), false)
+            .finish_with_error(ToolExecutionStatus::Failed, Some("http_request failed"));
+        trace
+            .begin("plain", Some("native_tool:native:http"), false)
+            .finish_with_error(ToolExecutionStatus::Failed, Some("http_request failed"));
+        let snapshot = trace.seal();
+        assert_eq!(snapshot.unavailable_attempts, Some(1));
+        let text = serde_json::to_string(&snapshot).expect("test: serialise");
+        assert!(!text.contains("connection refused"));
     }
 }

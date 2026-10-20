@@ -95,7 +95,7 @@ pub use knowledge::{
     MIN_DISTINCT_TASKS_FOR_PROPOSAL, PatternId, PatternIndex, PatternIndexEntry, PatternKind, PatternScope,
     classify_failure,
 };
-pub use manifest::{ManifestError, ManifestInfo, validate_manifest};
+pub use manifest::{ManifestError, ManifestInfo, validate_manifest, validate_manifest_strict};
 pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationReport, apply_migration, plan_migration};
 pub use proposal::{
     AppliedEdit, AttemptOutcome, AttemptRecord, AuthorBinding, BoundedDiff, BudgetRecord, DescriptionChange, EditOp,
