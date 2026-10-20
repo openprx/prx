@@ -324,57 +324,33 @@ pub fn register_http_host_functions(linker: &mut wasmtime::component::Linker<Hos
         http_inst
             .func_wrap_async(
                 "request",
-                |store: wasmtime::StoreContextMut<'_, HostState>,
+                |mut store: wasmtime::StoreContextMut<'_, HostState>,
                  (method, url, headers, body): (
                     String,
                     String,
                     Vec<(String, String)>,
                     Option<Vec<u8>>,
                 )| {
+                    // Permission, allowlist, address literal and request budget
+                    // are all decided before the guest is suspended on I/O.
+                    let authorized = store
+                        .data()
+                        .check_permission("http-outbound")
+                        .and_then(|()| store.data_mut().authorize_outbound(&url, &["http", "https"]));
+                    let allowlist = Arc::clone(&store.data().outbound);
+                    let timeout_ms = store.data().timeout_ms;
                     Box::new(async move {
-                        if let Err(e) = store.data().check_permission("http-outbound") {
-                            return Ok((Err::<(u16, Vec<(String, String)>, Vec<u8>), String>(e),));
-                        }
-                        if !store.data().check_url_allowed(&url) {
-                            return Ok((Err(format!("URL not in allowlist: {url}")),));
-                        }
-
-                        let client = reqwest::Client::new();
-                        let mut req = match method.to_uppercase().as_str() {
-                            "GET" => client.get(&url),
-                            "POST" => client.post(&url),
-                            "PUT" => client.put(&url),
-                            "DELETE" => client.delete(&url),
-                            "PATCH" => client.patch(&url),
-                            "HEAD" => client.head(&url),
-                            _ => return Ok((Err(format!("unsupported method: {method}")),)),
-                        };
-
-                        for (k, v) in &headers {
-                            req = req.header(k.as_str(), v.as_str());
-                        }
-
-                        if let Some(b) = body {
-                            req = req.body(b);
-                        }
-
-                        match req.send().await {
-                            Ok(resp) => {
-                                let status = resp.status().as_u16();
-                                let resp_headers: Vec<(String, String)> = resp
-                                    .headers()
-                                    .iter()
-                                    .map(|(k, v)| {
-                                        (k.to_string(), v.to_str().unwrap_or("").to_string())
-                                    })
-                                    .collect();
-                                match resp.bytes().await {
-                                    Ok(bytes) => Ok((Ok((status, resp_headers, bytes.to_vec())),)),
-                                    Err(e) => Ok((Err(format!("body read error: {e}")),)),
-                                }
+                        let target = match authorized {
+                            Ok(target) => target,
+                            Err(error) => {
+                                return Ok((Err::<(u16, Vec<(String, String)>, Vec<u8>), String>(error),));
                             }
-                            Err(e) => Ok((Err(format!("request failed: {e}")),)),
-                        }
+                        };
+                        let result = crate::plugins::host::perform_http_request(
+                            allowlist, timeout_ms, method, target, headers, body,
+                        )
+                        .await;
+                        Ok((result,))
                     })
                 },
             )
@@ -461,26 +437,26 @@ pub fn register_websocket_host_functions(linker: &mut wasmtime::component::Linke
         ws_inst
             .func_wrap_async(
                 "connect",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (url,): (String,)| {
-                    let permission = store.data().check_permission("websocket-outbound");
-                    let is_allowed = store.data().check_url_allowed(&url);
+                |mut store: wasmtime::StoreContextMut<'_, HostState>, (url,): (String,)| {
+                    let authorized = store
+                        .data()
+                        .check_permission("websocket-outbound")
+                        .and_then(|()| store.data_mut().authorize_outbound(&url, &["ws", "wss"]));
                     let timeout_ms = store.data().timeout_ms;
                     let connector = Arc::clone(&store.data().websocket_connector);
                     let sessions = Arc::clone(&store.data().websocket_sessions);
                     let next_session_id = Arc::clone(&store.data().next_websocket_session_id);
                     Box::new(async move {
-                        if let Err(error) = permission {
-                            return Ok((Err::<u64, String>(error),));
-                        }
-                        if !is_allowed {
-                            return Ok((Err(format!("URL not in allowlist: {url}")),));
-                        }
+                        let target = match authorized {
+                            Ok(target) => target.to_string(),
+                            Err(error) => return Ok((Err::<u64, String>(error),)),
+                        };
                         let result = crate::plugins::host::websocket_connect_with(
                             connector,
                             sessions,
                             next_session_id,
                             timeout_ms,
-                            url,
+                            target,
                         )
                         .await;
                         Ok((result,))

@@ -229,6 +229,7 @@ async fn exact_file_without_intent(edit: bool) {
             security,
         },
     )
+    .await
     .unwrap();
     use futures_util::FutureExt as _;
     let result = std::panic::AssertUnwindSafe(Box::pin(async {

@@ -238,6 +238,7 @@ impl TurnDecisionService {
         let store = CausalDecisionStore::open_unshared_read_only(&config.workspace_dir);
         let service = Arc::new(Self {
             child_recovery: Default::default(),
+            recursive_allowances: Default::default(),
             memory_loader: None,
             loop_runtime: Some(runtime),
             publication_policy: build.surface_policy,

@@ -42,8 +42,8 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/runtime/turn_decision/routing/tests.rs::latest_router_receipt::let store = Connection::open(self.workspace.path().join(\"self/causal_tree/decisions.db\")).unwrap();",
     "src/agent/turn_tests/context_recall.rs::build_agent_context_includes_document_evidence_with_source_ids::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/agent/turn_tests/compaction.rs::configurable_compaction_records_run_and_summary_memory::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
-    "src/chat/mod.rs::legacy_chat_compaction_downgrades_fidelity_when_event_provenance_is_unavailable::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
-    "src/chat/mod.rs::legacy_chat_compaction_persists_run_and_summary_memory::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
+    "src/chat/tests/legacy_chat_compaction_audit_tests.rs::legacy_chat_compaction_downgrades_fidelity_when_event_provenance_is_unavailable::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
+    "src/chat/tests/legacy_chat_compaction_audit_tests.rs::legacy_chat_compaction_persists_run_and_summary_memory::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/cron/store.rs::add_job_persists_owner_topic_lineage_and_event::let memory_conn = Connection::open(config.workspace_dir.join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/cron/store.rs::cron_event_outbox_retries_memory_mirror_idempotently::let cron_conn = Connection::open(&cron_db).unwrap();",
     "src/cron/store.rs::cron_event_outbox_retries_memory_mirror_idempotently::let cron_conn = Connection::open(&cron_db).unwrap();",
@@ -133,7 +133,7 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     "src/runtime/ingress_recovery/tests.rs::start::.spawn()",
     "src/channels/signal_native.rs::health_check::let Ok(_child) = cmd.spawn() else {",
     "src/channels/signal_native.rs::listen::.spawn()",
-    "src/chat/mod.rs::run_git_diff_bounded::.spawn()",
+    "src/chat/views.rs::run_git_diff_bounded::.spawn()",
     "src/chat/sessions/shell.rs::spawn_shell_with_origin::.spawn()",
     "src/chat/terminal_proto.rs::copy_to_tmux_buffer::.spawn()?;",
     "src/media/mod.rs::run_command_bounded::.spawn()",
@@ -142,31 +142,31 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     // closed pipe (the OOM-kill shape); the other emits output in instalments
     // so the drain can be observed refreshing the run's progress beat while the
     // child is still alive. A managed spawn would hide both.
-    "src/tools/sessions_spawn.rs::a_sigkilled_worker_is_classified_as_exited_without_result::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn/tests/liveness.rs::a_sigkilled_worker_is_classified_as_exited_without_result::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
     // b2: a join must survive a member that is a real OS process emitting
     // nothing at all; only a real child can prove the silence is real.
-    "src/tools/sessions_spawn.rs::a_join_survives_a_real_child_process_that_never_writes_anything::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn/tests/join.rs::a_join_survives_a_real_child_process_that_never_writes_anything::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
     // Test-only (b3): the wording that separates `no_result` from `failed` must
     // be derived from a genuinely SIGKILLed child through the production
     // classifier, not typed into the test — a managed spawn would supply an
     // exit status the classifier never sees in the fault this models.
-    "src/tools/sessions_spawn.rs::silent_death_reason_from_a_real_sigkill::.spawn()",
-    "src/tools/sessions_spawn.rs::worker_output_refreshes_the_run_beat_while_it_is_still_arriving::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
-    "src/tools/sessions_spawn.rs::assert_explicit_cleanup_signals_once::let mut child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::injected_panic_cleanup_try_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::injected_termination_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::injected_wait_error_keeps_child_finalization_and_slot_pending::let child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::owned_child_panic_cleanup_signals_once_and_reaps_before_return::let mut child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::owner_keeps_child_after_requester_timeout_until_reap::let child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::owner_mediated_process_kill_reaps_leader_and_terminates_group::let child = command.spawn().expect(\"test child should spawn\");",
-    "src/tools/sessions_spawn.rs::process_mode_waits_for_natural_completion_without_a_deadline::let mut child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn.rs::run_sub_agent_process::let mut child = command.spawn()?;",
+    "src/tools/sessions_spawn/tests/join_verdicts.rs::silent_death_reason_from_a_real_sigkill::.spawn()",
+    "src/tools/sessions_spawn/tests/liveness.rs::worker_output_refreshes_the_run_beat_while_it_is_still_arriving::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn/tests/owned_child.rs::assert_explicit_cleanup_signals_once::let mut child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::injected_panic_cleanup_try_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::injected_termination_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::injected_wait_error_keeps_child_finalization_and_slot_pending::let child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::owned_child_panic_cleanup_signals_once_and_reaps_before_return::let mut child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::owner_keeps_child_after_requester_timeout_until_reap::let child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/tests/owned_child.rs::owner_mediated_process_kill_reaps_leader_and_terminates_group::let child = command.spawn().expect(\"test child should spawn\");",
+    "src/tools/sessions_spawn/tests/owned_child.rs::process_mode_waits_for_natural_completion_without_a_deadline::let mut child = command.spawn().unwrap();",
+    "src/tools/sessions_spawn/process_mode.rs::run_sub_agent_process::let mut child = command.spawn()?;",
     // Test-only: the steer wire is only proved by a real pipe to a real child,
     // so these two stand in for a session-worker (one echoes stdin, one never
     // reads it) rather than mocking the very pipe under test.
-    "src/tools/sessions_spawn.rs::steer_frames_reach_worker_stdin_and_land_in_history::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
-    "src/tools/sessions_spawn.rs::steer_pump_backpressures_when_the_worker_never_reads_stdin::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
-    "src/tools/sessions_spawn.rs::termination_after_leader_exit_does_not_wait_forever_on_inherited_pipe::let mut child = command.spawn().expect(\"test leader should spawn\");",
+    "src/tools/sessions_spawn/tests/actions.rs::steer_frames_reach_worker_stdin_and_land_in_history::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn/tests/actions.rs::steer_pump_backpressures_when_the_worker_never_reads_stdin::let mut child = command.spawn().expect(\"stand-in worker spawns\");",
+    "src/tools/sessions_spawn/tests/owned_child.rs::termination_after_leader_exit_does_not_wait_forever_on_inherited_pipe::let mut child = command.spawn().expect(\"test leader should spawn\");",
     // Test-only: the orphan-reclaim test must create a child that deliberately
     // bypasses the managed path, otherwise there is no orphan to detect.
     "src/runtime/registry.rs::unreaped_child_is_reported_as_an_orphan_then_reclaimed::let mut child = command.spawn().expect(\"test: spawn detached child\");",
@@ -212,7 +212,12 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
 
 /// Older child modules that were never part of the exemption for the
 /// repository root and stay scanned like any other file.
-const SQLITE_SEPARATE_MODULES: &[&str] = &["ingress_recovery.rs", "router_history.rs", "router_learning.rs"];
+const SQLITE_SEPARATE_MODULES: &[&str] = &[
+    "event_batch.rs",
+    "ingress_recovery.rs",
+    "router_history.rs",
+    "router_learning.rs",
+];
 
 const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     // Dedicated Article 73 compliance ledger: it stores immutable event hashes,
@@ -624,6 +629,20 @@ fn daemon_owned_components_do_not_reload_process_config_from_disk() {
 
     for relative in [
         "src/channels/mod.rs",
+        "src/channels/inbound_policy.rs",
+        "src/channels/prompt_context.rs",
+        "src/channels/history.rs",
+        "src/channels/runtime_commands.rs",
+        "src/channels/turn_failure.rs",
+        "src/channels/response_sanitize.rs",
+        "src/channels/signal_vision.rs",
+        "src/channels/supervisor.rs",
+        "src/channels/turn.rs",
+        "src/channels/smart_gate.rs",
+        "src/channels/dispatch.rs",
+        "src/channels/service.rs",
+        "src/channels/doctor.rs",
+        "src/channels/startup.rs",
         "src/cron/scheduler.rs",
         "src/xin/runner.rs",
         "src/heartbeat/engine.rs",
@@ -664,11 +683,30 @@ fn gateway_and_channels_have_one_shared_config_owner() {
         "AppState must not restore the former config/shared_config split"
     );
 
-    let channels = fs::read_to_string(repository_root().join("src/channels/mod.rs")).expect("read src/channels/mod.rs");
-    assert!(
-        !channels.contains("HotReloadManager") && !channels.contains("ArcSwap<Config>"),
-        "Channels must not own an independent config watcher or config publisher"
-    );
+    for relative in [
+        "src/channels/mod.rs",
+        "src/channels/inbound_policy.rs",
+        "src/channels/prompt_context.rs",
+        "src/channels/history.rs",
+        "src/channels/runtime_commands.rs",
+        "src/channels/turn_failure.rs",
+        "src/channels/response_sanitize.rs",
+        "src/channels/signal_vision.rs",
+        "src/channels/supervisor.rs",
+        "src/channels/turn.rs",
+        "src/channels/smart_gate.rs",
+        "src/channels/dispatch.rs",
+        "src/channels/service.rs",
+        "src/channels/doctor.rs",
+        "src/channels/startup.rs",
+    ] {
+        let channels = fs::read_to_string(repository_root().join(relative))
+            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        assert!(
+            !channels.contains("HotReloadManager") && !channels.contains("ArcSwap<Config>"),
+            "{relative}: Channels must not own an independent config watcher or config publisher"
+        );
+    }
 }
 
 #[test]
@@ -986,7 +1024,7 @@ fn config_writes_route_through_the_transaction_layer() {
             "not yet migrated: pairing-token persistence",
         ),
         (
-            "src/channels/mod.rs",
+            "src/channels/service.rs",
             ".save()",
             1,
             "not yet migrated: prx channel bind-telegram",
@@ -1132,23 +1170,21 @@ const ALLOWED_GIT_PROGRAM_LITERALS: &[&str] = &[
 /// git must go through `security::git_launch::git_command`.
 const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
     "src/channels/imessage.rs::send::let output = tokio::process::Command::new(\"osascript\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::if let Ok(status_output) = Command::new(\"rc-service\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let _ = Command::new(\"launchctl\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let active_output = Command::new(\"systemctl\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let list_output = Command::new(\"launchctl\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let restart_output = Command::new(\"rc-service\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let restart_output = Command::new(\"systemctl\")",
-    "src/channels/mod.rs::maybe_restart_managed_daemon_service::let start_output = Command::new(\"launchctl\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::if let Ok(status_output) = Command::new(\"rc-service\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let _ = Command::new(\"launchctl\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let active_output = Command::new(\"systemctl\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let list_output = Command::new(\"launchctl\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let restart_output = Command::new(\"rc-service\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let restart_output = Command::new(\"systemctl\")",
+    "src/channels/service.rs::maybe_restart_managed_daemon_service::let start_output = Command::new(\"launchctl\")",
     "src/channels/signal.rs::run_command::let output = tokio::process::Command::new(cmd)",
     "src/channels/signal_native.rs::build_command::let mut cmd = Command::new(&self.cli_path);",
     "src/channels/wacli.rs::health_check::let mut cmd = tokio::process::Command::new(self.cli_binary());",
     "src/channels/wacli.rs::send_prepared_media::let mut cmd = tokio::process::Command::new(self.cli_binary());",
     "src/channels/wacli.rs::send_text::let mut cmd = tokio::process::Command::new(self.cli_binary());",
     "src/channels/wacli.rs::set_presence::let mut cmd = tokio::process::Command::new(self.cli_binary());",
-    // A `#[cfg(test)]` function outside a test module (the scan keeps it).
-    "src/chat/mod.rs::plain_apply_ignores_openprx_approval_override_and_leaves_file_unchanged::let status = std::process::Command::new(exe)",
-    "src/chat/mod.rs::run_external_editor_command::std::process::Command::new(\"cmd\")",
-    "src/chat/mod.rs::run_external_editor_command::std::process::Command::new(\"sh\")",
+    "src/chat/external_editor.rs::run_external_editor_command::std::process::Command::new(\"cmd\")",
+    "src/chat/external_editor.rs::run_external_editor_command::std::process::Command::new(\"sh\")",
     "src/chat/sessions/shell.rs::spawn_shell_with_origin::let mut cmd = tokio::process::Command::new(\"sh\");",
     "src/chat/terminal_proto.rs::copy_to_tmux_buffer::let mut child = Command::new(\"tmux\")",
     "src/doctor/mod.rs::check_command_available::match std::process::Command::new(cmd)",
@@ -1202,7 +1238,7 @@ const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
     "src/tools/message_send.rs::auto_generate_voice::let mut ffmpeg_cmd = tokio::process::Command::new(\"ffmpeg\");",
     "src/tools/message_send.rs::auto_generate_voice::let mut node_cmd = tokio::process::Command::new(\"node\");",
     "src/tools/message_send.rs::auto_generate_voice::let mut npm_cmd = tokio::process::Command::new(\"npm\");",
-    "src/tools/sessions_spawn.rs::run_sub_agent_process::let mut command = tokio::process::Command::new(executable);",
+    "src/tools/sessions_spawn/process_mode.rs::run_sub_agent_process::let mut command = tokio::process::Command::new(executable);",
     "src/tunnel/cloudflare.rs::start::let mut child = Command::new(\"cloudflared\")",
     "src/tunnel/custom.rs::start::let mut child = Command::new(parts[0])",
     "src/tunnel/ngrok.rs::start::Command::new(\"ngrok\")",
@@ -2097,7 +2133,7 @@ planted_violation_probes! {
         "src/gateway/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub async fn d0_planted_call(tool: &dyn Tool) {\n    let _ = tool.execute(args).await;\n}\n";
     probe_direct_invocation_counts: direct_tool_invocation_allowlist_counts_match_the_tree,
-        "src/chat/mod.rs", Planted::AppendedTo, Reads::ProductionText,
+        "src/chat/file_mention.rs", Planted::AppendedTo, Reads::ProductionText,
         "pub async fn enrich_file_mentions_for_prompt(tool: &dyn Tool) {\n    let _ = tool.execute(args).await;\n}\n";
     probe_non_tool_occurrences: non_tool_execute_call_sites_match_their_declared_occurrences,
         "src/agent/embedded_turn.rs", Planted::AppendedTo, Reads::ProductionText,
@@ -2717,7 +2753,8 @@ fn prompt_guided_tool_protocol_has_one_production_owner() {
 
 #[test]
 fn channel_system_prompt_delegates_to_the_canonical_agent_builder() {
-    let channels = fs::read_to_string(repository_root().join("src/channels/mod.rs")).expect("read src/channels/mod.rs");
+    let channels = fs::read_to_string(repository_root().join("src/channels/prompt_context.rs"))
+        .expect("read src/channels/prompt_context.rs");
     let body = function_body(&channels, "build_system_prompt_with_mode");
 
     assert!(body.contains("crate::agent::prompt::SystemPromptBuilder::with_defaults()"));
@@ -2744,10 +2781,51 @@ fn channel_system_prompt_delegates_to_the_canonical_agent_builder() {
 fn runtime_prompt_has_no_parallel_tool_description_catalog() {
     const BUILDERS_OUTSIDE_AGENT: &[&str] = &[
         "src/channels/mod.rs",
+        "src/channels/inbound_policy.rs",
+        "src/channels/prompt_context.rs",
+        "src/channels/history.rs",
+        "src/channels/runtime_commands.rs",
+        "src/channels/turn_failure.rs",
+        "src/channels/response_sanitize.rs",
+        "src/channels/signal_vision.rs",
+        "src/channels/supervisor.rs",
+        "src/channels/turn.rs",
+        "src/channels/smart_gate.rs",
+        "src/channels/dispatch.rs",
+        "src/channels/service.rs",
+        "src/channels/doctor.rs",
+        "src/channels/startup.rs",
         "src/chat/mod.rs",
+        "src/chat/active_turn.rs",
+        "src/chat/bootstrap.rs",
+        "src/chat/chat_events.rs",
+        "src/chat/compaction.rs",
+        "src/chat/copy_select.rs",
+        "src/chat/external_editor.rs",
+        "src/chat/file_mention.rs",
+        "src/chat/input_queue.rs",
+        "src/chat/output.rs",
+        "src/chat/provider_turns.rs",
+        "src/chat/pty_attach.rs",
+        "src/chat/run.rs",
+        "src/chat/session_glue.rs",
+        "src/chat/session_store.rs",
+        "src/chat/session_switch.rs",
+        "src/chat/terminal.rs",
+        "src/chat/tui_loop.rs",
+        "src/chat/views.rs",
         "src/gateway/api/sessions.rs",
         "src/gateway/mod.rs",
-        "src/session_worker/runner.rs",
+        "src/session_worker/runner/mod.rs",
+        "src/session_worker/runner/capability.rs",
+        "src/session_worker/runner/context.rs",
+        "src/session_worker/runner/paths.rs",
+        "src/session_worker/runner/prompt.rs",
+        "src/session_worker/runner/provider.rs",
+        "src/session_worker/runner/run.rs",
+        "src/session_worker/runner/steering.rs",
+        "src/session_worker/runner/tools.rs",
+        "src/session_worker/runner/validate.rs",
     ];
     let mut scanned = Vec::new();
     for path in rust_source_files() {
@@ -2844,13 +2922,13 @@ fn outbound_middleware_has_one_production_owner() {
 fn production_tool_loop_memory_is_wired_to_request_context_events() {
     for relative in [
         "src/agent/entry.rs",
-        "src/channels/mod.rs",
-        "src/chat/mod.rs",
+        "src/channels/turn.rs",
+        "src/chat/run.rs",
         "src/gateway/api/sessions.rs",
         "src/gateway/mod.rs",
-        "src/session_worker/runner.rs",
+        "src/session_worker/runner/run.rs",
         "src/tools/delegate.rs",
-        "src/tools/sessions_spawn.rs",
+        "src/tools/sessions_spawn/task_mode.rs",
     ] {
         let source = fs::read_to_string(repository_root().join(relative))
             .unwrap_or_else(|error| panic!("read {relative}: {error}"));
@@ -2893,10 +2971,10 @@ const REVIEWED_DECISION_HANDOFFS: &[(&str, usize, &str)] = &[
         2,
         "crate::agent::turn_request::TurnDecision{service:decision_service,context:decision_context,proof:decision_proof,}",
     ),
-    ("src/channels/mod.rs", 1, "decision_turn.routing()"),
+    ("src/channels/turn.rs", 1, "decision_turn.routing()"),
     ("src/chat/dispatcher.rs", 1, "routing"),
     (
-        "src/chat/mod.rs",
+        "src/chat/run.rs",
         1,
         "admitted_binding.decision_routing().ok_or_else(||anyhow::anyhow!())?",
     ),
@@ -2910,9 +2988,9 @@ const REVIEWED_DECISION_HANDOFFS: &[(&str, usize, &str)] = &[
         1,
         "crate::agent::turn_request::TurnDecision{service,context:&context,proof:&gateway_proof,}",
     ),
-    ("src/session_worker/runner.rs", 1, "admitted_turn.routing()"),
+    ("src/session_worker/runner/run.rs", 1, "admitted_turn.routing()"),
     ("src/tools/delegate.rs", 1, "child_turn.routing()"),
-    ("src/tools/sessions_spawn.rs", 1, "child_turn.routing()"),
+    ("src/tools/sessions_spawn/task_mode.rs", 1, "child_turn.routing()"),
 ];
 
 fn compact_rust_tokens(expression: &str) -> String {
@@ -3512,13 +3590,13 @@ const FORWARDED_COMPACTION_SITES: &[&str] = &[
     "src/agent/embedded_turn.rs::run_work",
     "src/agent/entry.rs::run_with_runtime_envelope",
     "src/agent/entry.rs::run_with_runtime_envelope",
-    "src/channels/mod.rs::run_channel_turn",
+    "src/channels/turn.rs::run_channel_turn",
     // The reducer action carries its explicitly resolved compaction config.
     "src/chat/dispatcher.rs::drive_start_turn_stream",
     // Workers prefer admitted child context, retaining the signed manifest fallback.
-    "src/session_worker/runner.rs::run_owned_manifest",
+    "src/session_worker/runner/run.rs::run_owned_manifest",
     "src/tools/delegate.rs::execute_tool_loop",
-    "src/tools/sessions_spawn.rs::run_sub_agent_task",
+    "src/tools/sessions_spawn/task_mode.rs::run_sub_agent_task",
 ];
 
 /// The sub-agent tool types and their constructors (INT-2B a46).
@@ -3722,7 +3800,7 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         }
         if matches!(
             relative.as_str(),
-            "src/tools/delegate.rs" | "src/tools/sessions_spawn.rs"
+            "src/tools/delegate.rs" | "src/tools/sessions_spawn/spawn.rs"
         ) {
             for (at, _) in production.match_indices("resolve_effective_compaction_config_with_catalog(") {
                 admitted_resolution_sites.push(site(at));
@@ -3735,10 +3813,10 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         "reviewed production sub-agent tool constructions",
         constructor_sites,
         &[
-            "src/channels/mod.rs::start_channels_with_config",
-            "src/chat/mod.rs::run",
+            "src/channels/startup.rs::start_channels_with_config",
+            "src/chat/run.rs::run",
             "src/gateway/mod.rs::register_gateway_turn_tools",
-            "src/session_worker/runner.rs::worker_spawn_tool",
+            "src/session_worker/runner/provider.rs::worker_spawn_tool",
             "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions",
         ],
     );
@@ -3747,7 +3825,7 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
         admitted_resolution_sites,
         &[
             "src/tools/delegate.rs::resolve_pinned_child_compaction",
-            "src/tools/sessions_spawn.rs::resolve_pinned_child_compaction",
+            "src/tools/sessions_spawn/spawn.rs::resolve_pinned_child_compaction",
         ],
     );
 }
@@ -3759,14 +3837,14 @@ fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() {
 const FORWARDED_COMPACTION_PRODUCERS: &[(&str, &str, &str, Option<&str>)] = &[
     // `Effect::StartTurn.compaction_config`, carried from this action.
     (
-        "src/chat/mod.rs",
+        "src/chat/run.rs",
         "run",
         "Action::StartLLMTurn {",
         Some("compaction_config"),
     ),
     // `WorkerManifest.compaction_config` (process branch).
     (
-        "src/tools/sessions_spawn.rs",
+        "src/tools/sessions_spawn/spawn.rs",
         "execute_spawn_with_id",
         "&process_compaction_config",
         None,
@@ -3954,13 +4032,15 @@ fn production_turns_budget_on_the_effective_context_window() {
                     let expected = match site.as_str() {
                         "src/agent/embedded_turn.rs::run_work" => "Some(decision.main_compaction())",
                         "src/agent/entry.rs::run_with_runtime_envelope" => "Some(decision_context.main_compaction())",
-                        "src/channels/mod.rs::run_channel_turn" => "Some(decision_turn.compaction())",
+                        "src/channels/turn.rs::run_channel_turn" => "Some(decision_turn.compaction())",
                         "src/chat/dispatcher.rs::drive_start_turn_stream" => "compaction_config.as_ref()",
-                        "src/session_worker/runner.rs::run_owned_manifest" => {
+                        "src/session_worker/runner/run.rs::run_owned_manifest" => {
                             "child_turn.as_ref().map(|turn|turn.compaction()).or(compaction_config_ref)"
                         }
                         "src/tools/delegate.rs::execute_tool_loop"
-                        | "src/tools/sessions_spawn.rs::run_sub_agent_task" => "Some(child_turn.compaction())",
+                        | "src/tools/sessions_spawn/task_mode.rs::run_sub_agent_task" => {
+                            "Some(child_turn.compaction())"
+                        }
                         _ => panic!("unreviewed forwarded compaction site: {site}"),
                     };
                     assert_eq!(
@@ -3984,7 +4064,7 @@ fn production_turns_budget_on_the_effective_context_window() {
         "production loop engine calls budgeted on the effective window",
         effective,
         &[
-            "src/chat/mod.rs::run",
+            "src/chat/run.rs::run",
             "src/gateway/api/sessions.rs::run_console_runtime_turn",
             "src/gateway/mod.rs::run_gateway_chat_with_multimodal",
         ],
@@ -4051,9 +4131,9 @@ fn context_handoff_has_one_production_owner_and_exact_lookup_is_registered() {
 
     for relative in [
         "src/agent/turn_engine.rs",
-        "src/session_worker/runner.rs",
+        "src/session_worker/runner/tests/tool_selection.rs",
         "src/tools/delegate.rs",
-        "src/tools/sessions_spawn.rs",
+        "src/tools/sessions_spawn/tool_proxy.rs",
     ] {
         let source = fs::read_to_string(repository_root().join(relative))
             .unwrap_or_else(|error| panic!("read {relative}: {error}"));
@@ -4400,7 +4480,7 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     // Copies of messages already in a history (content truncated or normalised,
     // role kept): compaction and audit projections, multimodal normalisation.
     "src/agent/compaction.rs::bounded_compaction_projection",
-    "src/chat/mod.rs::bounded_legacy_chat_compaction_audit_source",
+    "src/chat/compaction.rs::bounded_legacy_chat_compaction_audit_source",
     "src/multimodal.rs::prepare_messages_for_provider",
     // One-shot provider calls that build no loop history.
     "src/plugins/capabilities/provider.rs::chat_with_system",
@@ -4408,9 +4488,9 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     "src/tools/image.rs::execute",
     // `run_sub_agent_task`: the operator steering turn, which opens with `[Steering instruction from
     // operator]` and so can never open with a reserved marker.
-    "src/tools/sessions_spawn.rs::run_sub_agent_task",
+    "src/tools/sessions_spawn/task_mode.rs::run_sub_agent_task",
     // The session worker's steering turn, the same wrapper.
-    "src/session_worker/runner.rs::run_segments_with_steering",
+    "src/session_worker/runner/steering.rs::run_segments_with_steering",
 ];
 
 /// The names the loop-note guards scan for cannot be hidden (R-LOOPD5 F-1).
@@ -4836,10 +4916,51 @@ const LABEL_LOG_FILES: &[&str] = &[
     "src/agent/agent.rs",
     "src/agent/turn_engine.rs",
     "src/chat/mod.rs",
+    "src/chat/active_turn.rs",
+    "src/chat/bootstrap.rs",
+    "src/chat/chat_events.rs",
+    "src/chat/compaction.rs",
+    "src/chat/copy_select.rs",
+    "src/chat/external_editor.rs",
+    "src/chat/file_mention.rs",
+    "src/chat/input_queue.rs",
+    "src/chat/output.rs",
+    "src/chat/provider_turns.rs",
+    "src/chat/pty_attach.rs",
+    "src/chat/run.rs",
+    "src/chat/session_glue.rs",
+    "src/chat/session_store.rs",
+    "src/chat/session_switch.rs",
+    "src/chat/terminal.rs",
+    "src/chat/tui_loop.rs",
+    "src/chat/views.rs",
     "src/router/context.rs",
     "src/router/mod.rs",
     "src/tools/delegate.rs",
-    "src/tools/sessions_spawn.rs",
+    "src/tools/sessions_spawn/actions.rs",
+    "src/tools/sessions_spawn/announce.rs",
+    "src/tools/sessions_spawn/batch.rs",
+    "src/tools/sessions_spawn/builders.rs",
+    "src/tools/sessions_spawn/chat_assign.rs",
+    "src/tools/sessions_spawn/child_lifecycle.rs",
+    "src/tools/sessions_spawn/events.rs",
+    "src/tools/sessions_spawn/failure.rs",
+    "src/tools/sessions_spawn/memory_scope.rs",
+    "src/tools/sessions_spawn/mod.rs",
+    "src/tools/sessions_spawn/monitor.rs",
+    "src/tools/sessions_spawn/owned_process.rs",
+    "src/tools/sessions_spawn/process_control.rs",
+    "src/tools/sessions_spawn/process_mode.rs",
+    "src/tools/sessions_spawn/provider.rs",
+    "src/tools/sessions_spawn/scope.rs",
+    "src/tools/sessions_spawn/spawn.rs",
+    "src/tools/sessions_spawn/task_mode.rs",
+    "src/tools/sessions_spawn/terminal_commit.rs",
+    "src/tools/sessions_spawn/test_worker.rs",
+    "src/tools/sessions_spawn/tool.rs",
+    "src/tools/sessions_spawn/tool_proxy.rs",
+    "src/tools/sessions_spawn/worker_capability.rs",
+    "src/tools/sessions_spawn/worker_manifest.rs",
 ];
 
 /// Log fields that name a provider or a `<provider>/<model>` target.
@@ -5293,9 +5414,27 @@ fn terminal_provider_label_guard_rejects_bypass_missing_calls_and_literal_decoys
 #[test]
 fn a_session_worker_selects_its_tools_through_its_manifest() {
     let root = repository_root();
-    let source =
-        fs::read_to_string(root.join("src/session_worker/runner.rs")).expect("read src/session_worker/runner.rs");
-    let production = strip_cfg_test_items(&source);
+    let production: String = [
+        "mod",
+        "capability",
+        "context",
+        "paths",
+        "prompt",
+        "provider",
+        "run",
+        "steering",
+        "tools",
+        "validate",
+    ]
+    .iter()
+    .map(|name| {
+        let relative = format!("src/session_worker/runner/{name}.rs");
+        let source =
+            fs::read_to_string(root.join(&relative)).unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        strip_cfg_test_items(&source)
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
 
     let entry = function_body(&production, "run_owned_manifest");
     assert!(
@@ -5553,18 +5692,18 @@ const NON_TOOL_CLOSURE_PROVIDERS: &[(&str, &str, &str)] = &[
 /// receiver by its name.
 const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
     (
-        "src/chat/mod.rs::enrich_file_mentions_for_prompt",
+        "src/chat/file_mention.rs::enrich_file_mentions_for_prompt",
         1,
         "operator-typed `@file` mention expansion; the argument document is built by this code, \
          not by a model",
     ),
     (
-        "src/chat/mod.rs::kill_local_session",
+        "src/chat/session_glue.rs::kill_local_session",
         1,
         "operator-typed `/kill`; the human at the keyboard is the authority",
     ),
     (
-        "src/chat/mod.rs::run",
+        "src/chat/run.rs::run",
         4,
         "operator-typed `/spawn`, `/steer` and `!command`; the human at the keyboard is the \
          authority",
@@ -5643,22 +5782,22 @@ const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
         "decorator: the tiering wrapper forwards to the wrapped tool",
     ),
     (
-        "src/tools/sessions_spawn.rs::execute",
+        "src/tools/sessions_spawn/tool_proxy.rs::execute",
         1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
     (
-        "src/tools/sessions_spawn.rs::execute_named",
+        "src/tools/sessions_spawn/tool_proxy.rs::execute_named",
         1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
     (
-        "src/tools/sessions_spawn.rs::execute_named_with_cancellation",
+        "src/tools/sessions_spawn/tool_proxy.rs::execute_named_with_cancellation",
         1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
     (
-        "src/tools/sessions_spawn.rs::execute_with_cancellation",
+        "src/tools/sessions_spawn/tool_proxy.rs::execute_with_cancellation",
         1,
         "decorator: session-scoped aliases rewrite arguments then forward",
     ),
@@ -7990,7 +8129,7 @@ fn session_worker_credentials_are_decided_in_one_scoped_place() {
     }
     assert_eq!(
         factory_sites,
-        vec!["src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for".to_string()],
+        vec!["src/session_worker/runner/provider.rs:build_worker_provider_selection:create_provider_for".to_string()],
         "a session worker builds its provider only through `worker_provider`"
     );
 }
@@ -8102,16 +8241,16 @@ fn provider_construction_outside_the_provider_module_is_pinned() {
     let expected: BTreeSet<String> = [
         "src/agent/entry.rs:build_provider:create_routed_provider_for",
         "src/channels/decision_turn.rs:build_provider:create_provider_for",
-        "src/channels/mod.rs:build_channel_hint_provider:create_provider_for",
-        "src/channels/mod.rs:build_channel_startup_provider:create_routed_provider_for",
-        "src/chat/mod.rs:chat_provider_chain:create_routed_provider_for",
+        "src/channels/runtime_commands.rs:build_channel_hint_provider:create_provider_for",
+        "src/channels/runtime_commands.rs:build_channel_startup_provider:create_routed_provider_for",
+        "src/chat/bootstrap.rs:chat_provider_chain:create_routed_provider_for",
         "src/daemon/mod.rs:build_evolution_judge_model:create_provider_for",
         "src/doctor/mod.rs:provider_validation_error:create_provider_for",
         "src/gateway/mod.rs:build_gateway_provider_selection:create_routed_provider_for",
         "src/runtime/child_source.rs:from_selection:create_provider_for",
         "src/runtime/turn_decision/auxiliary.rs:auxiliary_accounting:create_provider_for",
         "src/runtime/turn_decision/auxiliary.rs:smart_group_accounting:create_provider_for",
-        "src/session_worker/runner.rs:build_worker_provider_selection:create_provider_for",
+        "src/session_worker/runner/provider.rs:build_worker_provider_selection:create_provider_for",
     ]
     .iter()
     .map(|site| (*site).to_string())

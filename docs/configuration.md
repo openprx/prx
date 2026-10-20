@@ -343,6 +343,14 @@ always_exclude = []
 [skill_rag]
 top_k = 32
 
+# WASM plugins. Off by default: nothing under <workspace>/plugins is scanned
+# or loaded, and no plugin tool, provider, memory backend, hook, cron job or
+# middleware exists. Read at process start. Which plugins may run, and with
+# which permissions, is decided by the operator trust file `plugin-trust.json`
+# beside this file, never by anything inside the workspace (see "WASM plugins").
+[plugins]
+enabled = false
+
 # Skill lifecycle: learned revisions of skills are proposed, evaluated against an
 # operator-owned frozen suite, gated and only then published. Everything here is
 # operator-owned; no tool or model output can change it. The section is read at
@@ -815,6 +823,28 @@ PRX treats `chat`, `agent`, `gateway`, `channel`, `delegate`, and `sessions_spaw
 
 For `sessions_spawn`, `task` runs an in-process sub-agent and `process` launches a worker process. Process mode uses a manifest with `memory_strategy`, `shared_memory_db_path`, and `worker_memory_db_path`; the default `shared_fabric` strategy writes worker events into the parent workspace fabric while still keeping the execution boundary explicit. Set `[sessions_spawn].process_memory_strategy = "isolated_private"` for a private worker DB. `hybrid` is fail-closed because no production merge consumer or merge/reject/ack/cleanup protocol exists; use `shared_fabric` or `isolated_private` instead.
 
+Recursive child delegation requires both an operator setting and an explicit
+`allow_delegation: true` spawn request:
+
+```toml
+[sessions_spawn]
+allow_recursive_delegation = false
+max_recursive_depth = 1
+```
+
+The permission defaults to false, including when loading an older config.
+When permission is enabled, `max_recursive_depth` must equal 1. Values above 1 are refused while
+permission is enabled; the current strict tool-subset contract supports one
+additional level. Each child remains a proper
+subset of its authenticated parent, cannot replenish depth or budget, and keeps
+the selected provider/model pins through descendants. Recursive publication
+subtracts a strict half-share of the remaining monetary balance, rounded down
+to whole cents; the parent retains the rest. Approval resume keeps the original
+run's consumed child slot and balance; if that state is unavailable after a
+restart, further recursive grants are refused. A request without the
+opt-in keeps the existing exact model-only scope. See [recursive child grants](tools.md)
+for admission, audit/status and rollback behavior.
+
 The two modes also differ in the credential a named agent's child uses when the agent's `provider` is the gateway's own provider (any spelling of the same identity). Task mode reuses the gateway's provider chain, with the root `api_key` at the root `api_url`, and ignores the agent's own `api_key`. Process mode passes the agent's `api_key` to the worker, which presents it to that provider's default catalog host, because an `[agents.<name>]` entry has no URL field. In both modes a key only goes to its own provider identity.
 
 ## Standalone Webhook Ingestion
@@ -860,7 +890,7 @@ effect) and its response carries the same `warning`.
 | `agent.concurrency_rollback_cancel_rate_threshold` | staged rollout retired |
 | `agent.concurrency_rollback_error_rate_threshold` | staged rollout retired |
 | `sessions_spawn.max_concurrent` | sub-agent fan-out is uncapped; use `prx tasks` to see and end runs |
-| `sessions_spawn.max_spawn_depth` | nesting is uncapped; depth is still reported |
+| `sessions_spawn.max_spawn_depth` | legacy global limit is ignored; explicit recursive grants use `max_recursive_depth` |
 | `sessions_spawn.max_children_per_agent` | per-session fan-out is uncapped |
 | `scheduler.max_concurrent` | due cron jobs all start at once; use `prx tasks` to see and end them |
 | `xin.max_concurrent` | due Xin work is no longer capped by an arbitrary configuration ceiling |
@@ -1676,9 +1706,11 @@ A command hook that runs:
   name is looked up in `PATH`. Without a configuration directory, command
   hooks are not started.
 
-Writing or editing `hooks.json` or `mcp.json` at the workspace root with the
+Writing or editing `hooks.json` or `mcp.json` at the workspace root, or any
+file under `<workspace>/plugins/` (WASM plugin code and manifests), with the
 file tools is a high-risk operation of its own (`write-launch-definition`,
-`edit-launch-definition`). Every other surface classifies a `hooks.json`
+`edit-launch-definition`); git operations that change those paths are treated
+the same way. Every other surface classifies a `hooks.json`
 change the same way: a change that installs, changes or runs a hook command
 (its program, arguments or event) is high risk (`hooks_manage` `replace` and
 `test`, Gateway `POST /api/hooks` and a `PUT /api/hooks/{id}` that sets
@@ -1704,6 +1736,35 @@ high-risk decision. Hooks that run now start in the cleared environment and
 the dedicated directory above: a hook that relied on an exported variable
 must list it in its `env` in `hooks.json`, and one that relied on starting in
 the workspace must use absolute paths or change directory itself.
+
+### WASM plugins
+
+`[plugins] enabled` (default `false`, read at process start) is the only switch.
+While it is off, `<workspace>/plugins` is not scanned and no plugin code is
+compiled or run. A WASM provider or memory backend named `wasm:<name>` then
+fails to resolve like any unknown backend.
+
+With the switch on, a plugin runs only if the operator trust file
+`plugin-trust.json` holds a record for it. The file lives in the directory of
+`config.toml` (not in the workspace), has mode `0600`, and binds each plugin's
+name, the SHA-256 of its component, the SHA-256 of its `plugin.toml` and the
+exact permissions granted. A plugin without a matching record is listed with an
+error status and never compiled. PRX does not enable plugins when the
+configuration directory lies inside the workspace, and it trusts nothing from a
+trust file that is a symlink, group- or world-accessible, or malformed.
+
+Records are written by `wasm_plugins_manage install|update`, a high-risk
+operation whose approval names the plugin, both hashes and the
+`grant_permissions` list. See `docs/plugin-developer-guide.md` for the manifest
+side and `docs/plugin-runtime-lifecycle.md` for the admission rules. Compiled
+component caches are kept in `plugin-cache/` beside the trust file.
+
+**Upgrading (breaking):** plugins in `<workspace>/plugins` no longer load
+unless `[plugins] enabled = true` is set and each plugin has been installed
+(trusted) through `wasm_plugins_manage`. The old `.prx-managed` marker no longer
+confers trust, an empty `http_allowlist` now denies every URL instead of
+allowing all, and allowlist entries are URL patterns rather than string
+prefixes (`https://api.example.com*` must become `https://api.example.com/*`).
 
 ### Configurations that no longer load
 
@@ -2060,6 +2121,8 @@ snapshot and recommended timeout. It also writes the catalog's recommended
 extra-latency budget when the policy still has its default value. Explicit
 command and policy values remain operator choices. Built-in decision-model
 pricing comes from the catalog; `[cost.prices]` is only an override.
+Automatic Router candidates and doctor use those configured price overrides
+when filtering active release rows with Router metadata.
 During migration, only schema-1's serialized 500 ms default becomes implicit.
 An unversioned pre-1.7 file used 300 ms as its default, so its stored 500 ms
 remains an explicit operator choice, as does 500 ms in schema 2. Loading an
@@ -2452,7 +2515,11 @@ read, an authenticated embedding domain and enough records in the same source
 domain. The 2026-10-05 source addendum wires supported configured paid embeddings
 and AutoMix premium calls through per-physical-attempt accounting. Merely
 configuring a model is insufficient: source/model admission, a supported actual
-transport, pinned prices and remaining original budgets are required. See the
+transport, pinned prices and remaining original token/money budgets are required.
+Automix uses its own window starting at the cheap reply:
+`router.automix.escalation_window_ms = 30000` by default, with an allowed range
+of `1..=120000` ms. Main settlement and premium reservation consume that window;
+the 500 ms decision and 100 ms Router budgets are unchanged. See the
 [current candidate addendum](router.md#source-addendum-2026-10-05) for scope,
 unsupported cases and verification status.
 
@@ -2698,6 +2765,10 @@ files. A crash between those writes retains both the actual charge and the
 hold until reconciliation; matching replay does not
 append another transition. Settled actual cost still consumes the turn allowance.
 Recovery reconstructs accounting receipts without permitting another dispatch.
+Request token sizing can overlap a prior physical attempt's background ledger
+settlement. Preparation reuses only that request's sizing result and grants no
+allowance; the next physical send still requires the prior durable settlement
+and its own durable reservation within the original decision deadline.
 Missing or conflicting cost projections block admission. Estimated reservations
 record fully reported actual token counts and charges even when they exceed the
 estimate; they do not classify ordinary underestimation as legacy bound

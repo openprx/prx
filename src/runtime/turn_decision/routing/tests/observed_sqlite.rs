@@ -347,6 +347,10 @@ impl Memory for ObservedSqlite {
         self.inner.append_message_event(input).await
     }
 
+    async fn append_message_events(&self, inputs: Vec<MessageEventInput>) -> Vec<anyhow::Result<MessageEvent>> {
+        self.inner.append_message_events(inputs).await
+    }
+
     async fn acquire_ingress_lifetime(
         &self,
         workspace_id: &str,

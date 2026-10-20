@@ -271,9 +271,11 @@ Any parse, compile, or target-presence failure leaves the previous generation ac
 
 EventBus queues are bounded. Publishing never waits for a consumer; when a subscriber queue is full, that event is dropped with a warning. Host `subscribe` is accepted only for hook-capable instances that own an `on-event` export. A real pump continuously consumes the subscription receiver and delivers `(topic, payload)` to that guest export. Other plugin capabilities receive an explicit unsupported error.
 
-Native lifecycle names are bridged into the documented `prx.lifecycle.*`
-namespace before WASM dispatch (`agent_end` maps to
-`prx.lifecycle.agent_stop`). Hook manifest events accept string arrays and the
+Native lifecycle names are bridged into the `prx.lifecycle.*` namespace before
+WASM dispatch: `agent_start`, `agent_stop` (the native `agent_end`),
+`llm_request`, `llm_response`, `tool_call_start`, `tool_call`, `turn_complete`
+and `error`. No other lifecycle topics (such as `tool.call` or `llm.request`)
+are published. Hook manifest events accept string arrays and the
 documented `[[capabilities.events]]` table form, with exact, prefix-wildcard,
 global-wildcard, and legacy short-name matching. Status reports per-adapter
 invocation counters and the last event/error for end-to-end verification.
@@ -285,10 +287,15 @@ when one is configured.
 
 ## Admission and trust
 
-- `plugin.toml` is limited to 256 KiB and cannot be a symlink.
+- The runtime exists only when `[plugins] enabled = true` (default `false`, process-restart-only). With the switch off, `<workspace>/plugins` is never scanned and no plugin tool, provider, memory backend, hook, cron job or middleware exists; a `wasm:<name>` provider or memory backend then fails to resolve.
+- `plugin.toml` is limited to 256 KiB and cannot be a symlink. Every `permissions.http_allowlist` entry must parse as a URL pattern or the manifest is rejected.
 - A WASM component is limited to 128 MiB, cannot be a symlink, and its manifest path cannot escape the plugin directory.
 - Directory discovery is deterministic and capped at 256 entries.
-- A plugin missing any required sensitive permission is registered with an error status and does not receive a live adapter.
+- Trust comes only from the operator trust file `plugin-trust.json`, kept beside `config.toml` outside the workspace with mode `0600`. A record binds the plugin name, the SHA-256 of the component, the SHA-256 of `plugin.toml` and the granted permissions. A plugin with no record, a different component or manifest hash, or a record that omits a required permission is registered with an error status carrying the reason; it is not compiled and gets no adapter. A missing trust file trusts nothing; an unreadable, malformed or group/other-accessible one trusts nothing and is logged.
+- A trusted plugin holds exactly the permissions in its record that its manifest declares. `optional` permissions are granted only when the record lists them. Nothing inside `<workspace>/plugins` (a `.prx-managed` marker included) confers trust, and writes there by the file tools are high-risk operations that need their own approval.
+- `wasm_plugins_manage install|update` is the recording path: it is a high-risk operation whose approval names the plugin, both hashes and the granted permission list (`grant_permissions`). The staged copy is re-hashed and compiled before the record is written, and the record is rolled back if the new generation does not load. `remove` deletes the record.
+- Compiled-component caches live in `plugin-cache/` beside the trust file, because a native artifact is loaded without re-validation.
+- Outbound `http-outbound` and `websocket-outbound` requests deny by default (empty `http_allowlist`), match scheme, host, port and path prefix exactly, refuse private, loopback, link-local, CGNAT and metadata addresses (also after DNS resolution and on every redirect hop), and are budgeted by `max_http_requests_per_call` and the optional `max_http_requests_per_minute`.
 
 ## Native hooks
 

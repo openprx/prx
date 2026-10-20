@@ -1509,7 +1509,7 @@ fn shapes_the_fixture_cannot_build() -> Vec<(&'static str, Value)> {
                 }],
             ),
         ),
-        // src/tools/sessions_spawn.rs — per-action fields.
+        // src/tools/sessions_spawn/tool.rs — per-action fields.
         (
             "sessions_spawn",
             with_action_requirements(

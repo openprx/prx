@@ -32,6 +32,7 @@ pub(crate) mod questions;
 pub(crate) mod report_catalog;
 pub mod state;
 pub mod store;
+pub(crate) mod store_preparation;
 pub mod store_schema;
 pub mod v1_compat;
 

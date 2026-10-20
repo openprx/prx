@@ -304,7 +304,6 @@ async fn run_protocol_case(case: TestWorkerProtocolCase) -> anyhow::Result<Worke
             .context("actual operator provider binding missing")?;
         let spawn = SessionsSpawnTool::new_with_registry(
             Arc::new(NoAnnouncements),
-            Arc::clone(&provider),
             "ollama",
             "prx-local-model",
             0.0,
@@ -317,6 +316,7 @@ async fn run_protocol_case(case: TestWorkerProtocolCase) -> anyhow::Result<Worke
             config.sessions_spawn.clone(),
             Arc::clone(&runs),
         )
+        .with_test_parent_provider(Arc::clone(&provider))
         .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(&config))
         .with_hint_config(&config)
         .with_model_catalog(crate::providers::selection::catalog_for(&config))

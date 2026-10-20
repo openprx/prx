@@ -15,6 +15,65 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Ordinary causal telemetry reserves channel headroom for Applied/Drain controls.
+- Recursive child grants now subtract a strict half-share from the parent's
+  remaining monetary balance, rounded down to whole cents. Authenticated
+  approval resume keeps the original run's one-child slot and balance.
+- Operator-worker and admin store preparation runs off Tokio workers.
+- Workspace cost configuration views remain pinned across reloads.
+- Failed creation directory sync rolls back the new entry so retries cannot
+  skip that sync.
+
+- **Breaking: WASM plugins are off and need operator trust (finding 95).**
+  `[plugins] enabled` defaults to `false`; nothing under `<workspace>/plugins`
+  is scanned or loaded until it is set to `true` (restart required). Existing
+  installs must set `[plugins] enabled = true` **and reinstall each plugin**
+  with `wasm_plugins_manage install` (passing `grant_permissions`; the approval
+  is high risk and bound to the plugin name, component hash, manifest hash and
+  permissions). The `.prx-managed` marker no longer confers trust, a plugin
+  without a record in `plugin-trust.json` (beside `config.toml`) is refused, and
+  an optional permission is granted only through that record. Outbound
+  `http-outbound` / `websocket-outbound`: an empty `http_allowlist` now denies
+  every URL, entries are URL patterns (`https://host/*`, `*.` subdomains; the
+  old string-prefix form `https://host*` is a manifest error), private,
+  loopback, link-local, CGNAT and metadata addresses are refused (also after DNS
+  and on redirects), and `max_http_requests_per_call` is enforced. Writing under
+  `plugins/` or to the trust file or cache with the file tools is a high-risk
+  operation. The precompile cache moved out of the workspace to `plugin-cache/`
+  beside the trust file and is keyed by SHA-256; old `plugins/.cwasm-cache` is
+  ignored. See `docs/configuration.md` (WASM plugins).
+
+- Automix premium escalation now has a separate window starting at the cheap
+  reply: `router.automix.escalation_window_ms`, default 30,000 ms, range
+  1–120,000 ms. It includes main settlement and premium reservation, sharing
+  the original token/money balance. Decision 500 ms and Router 100 ms are
+  unchanged. Existing configurations use the default.
+- Decision-store preparation runs off Tokio workers behind per-path gates;
+  SQLite migration and WAL fsync no longer hold the global store registry.
+  Cancelled publication retains preparation and queue cleanup ownership.
+  Runtime startup warms accounting tokenizers. Reservation and cost appends
+  reuse the workspace tracker and sync directories on journal creation,
+  retaining per-write file sync and existing security checks.
+
+- Causal telemetry deferral is now admission-local and expires at that
+  admission's deadline. Applied events bypass deferred phases; drain flushes
+  earlier events without waiting for unrelated admissions. No admission budget
+  is raised.
+- Decision accounting permits one in-flight physical attempt per scope, so a
+  concurrent same-scope attempt can expire while waiting for the first call.
+  Deferred reported-usage settlement retains the dispatched estimate during
+  I/O, but a crash before canonical cost-row sync can lose actual cost above
+  that estimate. The window contains at most one reported pending settlement
+  per scope and has no fixed storage-latency bound. See
+  [the accounting contract](docs/decision-plane.md#admission-and-backend-selection).
+
+- Upgrade compatibility: the decision accounting reservation journal now writes
+  `estimated_unsent_v1` when a durable dispatch receipt never reached transport.
+  Older binaries reject this event and refuse the entire cost ledger. Once it
+  has been written, a binary downgrade cannot safely reuse that workspace's
+  ledger; retain the upgraded binary and journal for recovery. Do not delete
+  ledger rows or reset spending limits to make an older binary start.
+
 - `causal_tree.policy.extra_token_ratio_limit` must now be finite and greater
   than 0; a zero, negative or non-finite value is rejected at config load
   instead of refusing every Agent turn at admission.

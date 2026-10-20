@@ -1317,7 +1317,6 @@ fn register_gateway_turn_tools(
     config: &Config,
     shared_config: &crate::config::SharedConfig,
     security: &Arc<crate::security::SecurityPolicy>,
-    #[cfg(test)] provider: &Arc<dyn Provider>,
     _model: &str,
     memory: &Arc<dyn Memory>,
     provider_runtime_options: &providers::ProviderRuntimeOptions,
@@ -1367,8 +1366,6 @@ fn register_gateway_turn_tools(
         let provider_name = providers::selection::default_provider(config).to_string();
         let spawn_tool = tools::SessionsSpawnTool::new(
             announce_channel,
-            #[cfg(test)]
-            Arc::clone(provider),
             provider_name,
             providers::selection::default_model(config).to_string(),
             config.default_temperature,
@@ -1481,8 +1478,6 @@ fn build_gateway_turn_runtime(
         config,
         &shared_config,
         &security,
-        #[cfg(test)]
-        &provider,
         &model,
         &memory,
         &provider_runtime_options,
@@ -1604,7 +1599,7 @@ pub async fn run_gateway(
         || memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config))
             .starts_with("wasm:")
     {
-        crate::plugins::init_plugin_runtime(&config.workspace_dir, None).await
+        crate::plugins::init_plugin_runtime(&config, None).await
     } else {
         None
     };
@@ -1643,7 +1638,7 @@ pub async fn run_gateway(
             .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend in gateway: {error}"))?;
         Some(runtime)
     } else {
-        crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await
+        crate::plugins::init_plugin_runtime(&config, Some(Arc::clone(&mem))).await
     };
 
     let (composio_key, composio_entity_id) = if config.composio.configured() {
@@ -1751,8 +1746,6 @@ pub async fn run_gateway(
         &config,
         &shared_config_for_reload,
         &security,
-        #[cfg(test)]
-        &provider,
         &model,
         &mem,
         &provider_runtime_options,

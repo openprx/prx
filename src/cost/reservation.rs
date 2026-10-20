@@ -776,12 +776,20 @@ fn append_inner(workspace: &Path, events: &[Event]) -> Result<()> {
         rustix::fs::fstat(&state)?.st_mode & 0o022 == 0,
         "reservation directory is writable by another account"
     );
-    let fd = rustix::fs::openat(
+    let flags = OFlags::WRONLY | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let (fd, created) = match rustix::fs::openat(
         &state,
         JOURNAL,
-        OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        flags | OFlags::CREATE | OFlags::EXCL,
         Mode::RUSR | Mode::WUSR,
-    )?;
+    ) {
+        Ok(fd) => (fd, true),
+        Err(rustix::io::Errno::EXIST) => (
+            rustix::fs::openat(&state, JOURNAL, flags, Mode::RUSR | Mode::WUSR)?,
+            false,
+        ),
+        Err(error) => return Err(error.into()),
+    };
     let stat = rustix::fs::fstat(&fd)?;
     ensure!(
         FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
@@ -803,7 +811,10 @@ fn append_inner(workspace: &Path, events: &[Event]) -> Result<()> {
     file.write_all(&encoded)?;
     file.sync_all()?;
     // Persist directory creation of the journal before returning authority.
-    std::fs::File::from(state).sync_all()?;
+    if created {
+        let state = std::fs::File::from(state);
+        super::creation::sync_created_entry(&file, &state, std::ffi::OsStr::new(JOURNAL), &state)?;
+    }
     Ok(())
 }
 

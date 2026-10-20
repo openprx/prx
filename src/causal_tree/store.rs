@@ -42,10 +42,10 @@
 //!
 //! AG-10: the database file is named and opened only here.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, LazyLock, Weak};
 use std::time::Instant;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -1020,6 +1020,9 @@ pub(crate) use child_outcome::{ChildOutcomeLink, ChildOutcomeView};
 enum WriterMessage {
     ChildOutcome(Box<ChildOutcomeLink>),
     DecisionBatch(Box<[DecisionRecord]>),
+    #[cfg(any(feature = "llm-router", test))]
+    VerifiedDecision(Box<acknowledged::VerifiedDecision>),
+    ReplayChain(Box<acknowledged::ReplayChain>),
     Outcome(Box<OutcomeRecord>),
     /// A v1 file's progress, saved only when every listed decision is
     /// stored (a record the writer failed to store is never marked done).
@@ -1029,6 +1032,10 @@ enum WriterMessage {
     /// sender is answered once the connection is closed.
     Close(std::sync::mpsc::Sender<()>),
 }
+
+mod acknowledged;
+mod batching;
+mod shared;
 
 /// The writer's queue. Cloning shares the one writer thread.
 #[derive(Clone)]
@@ -1950,13 +1957,9 @@ fn uri_path(path: &Path) -> Result<String, StoreError> {
     Ok(text.replace('%', "%25").replace('?', "%3f").replace('#', "%23"))
 }
 
-/// The per-process registry: one store, and so one writer thread, per
-/// database.
-static STORES: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Weak<CausalDecisionStore>>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
-
 /// The causal decision store of one workspace.
 pub(crate) struct CausalDecisionStore {
+    shared_slot: Option<Arc<shared::StoreSlot>>,
     path: PathBuf,
     mode: StoreMode,
     /// The store's stable id; `None` only when no database exists yet.
@@ -2000,6 +2003,7 @@ impl CausalDecisionStore {
             // this fallback never opens or changes a file.
             tracing::warn!(%error, "decision store read-only view unavailable; using empty view");
             Self {
+                shared_slot: None,
                 path: db_path(workspace_dir),
                 mode: StoreMode::ReadOnly,
                 workspace_id: None,
@@ -2018,11 +2022,7 @@ impl CausalDecisionStore {
     pub(crate) fn existing_shared_writer(workspace_dir: &Path) -> Option<Arc<Self>> {
         // Recovery may borrow an already owned writer, but must not create,
         // migrate, repair or upgrade storage merely to replay a terminal.
-        STORES
-            .lock()
-            .get(&db_path(workspace_dir))
-            .and_then(Weak::upgrade)
-            .filter(|store| store.mode == StoreMode::ReadWrite && store.writer.is_some())
+        shared::existing_writer(workspace_dir)
     }
 
     /// The store of `workspace_dir`, shared by the process: a second open of
@@ -2045,23 +2045,7 @@ impl CausalDecisionStore {
         events: Arc<dyn CausalEventSink>,
         mode: StoreMode,
     ) -> Result<Arc<Self>, StoreError> {
-        let path = db_path(workspace_dir);
-        let mut stores = STORES.lock();
-        if let Some(existing) = stores.get(&path).and_then(Weak::upgrade) {
-            if existing.mode == StoreMode::ReadWrite || mode == StoreMode::ReadOnly {
-                return Ok(existing);
-            }
-        }
-        let store = Arc::new(Self::open(
-            workspace_dir,
-            retention,
-            events,
-            mode,
-            WriterSetup::default(),
-        )?);
-        stores.retain(|_, store| store.strong_count() > 0);
-        stores.insert(path, Arc::downgrade(&store));
-        Ok(store)
+        shared::open(workspace_dir, retention, events, mode)
     }
 
     fn open(
@@ -2143,6 +2127,7 @@ impl CausalDecisionStore {
                 });
             })?;
         Ok(Self {
+            shared_slot: None,
             path,
             mode,
             workspace_id: Some(Arc::clone(&workspace_id)),
@@ -2190,6 +2175,7 @@ impl CausalDecisionStore {
             None
         };
         Ok(Self {
+            shared_slot: None,
             path,
             mode: StoreMode::ReadOnly,
             workspace_id,
@@ -2204,7 +2190,7 @@ impl CausalDecisionStore {
     /// `-wal` or `-shm` file is left (R-I1-phase2 R-1). Waits until
     /// `deadline` at most.
     ///
-    /// The other holders are counted under the registry lock, and the last
+    /// The other holders are counted under the per-path state lock, and the last
     /// holder removes the store from the registry in the same critical
     /// section, so no concurrent [`Self::open_shared`] can pick up a store
     /// that is closing: it opens a fresh one (R-I1-confirm Note 1). A holder
@@ -2215,12 +2201,8 @@ impl CausalDecisionStore {
             return;
         };
         writer.drain(deadline).await;
-        {
-            let mut stores = STORES.lock();
-            if Arc::strong_count(&store) > 1 {
-                return;
-            }
-            stores.retain(|_, held| !std::ptr::eq(held.as_ptr(), Arc::as_ptr(&store)));
+        if !shared::detach_last(&store) {
+            return;
         }
         store.reader.idle.lock().clear();
         writer.close(deadline).await;
@@ -2656,11 +2638,22 @@ struct WriterThread {
 fn run_writer(mut thread: WriterThread) {
     #[cfg(test)]
     let hold = thread.hold.take();
-    while let Ok(command) = thread.commands.recv() {
+    let mut pending = None;
+    loop {
+        let command = match pending.take() {
+            Some(command) => command,
+            None => match thread.commands.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
         #[cfg(test)]
         let _held = hold.as_ref().map(|hold| hold.lock());
         match command {
-            WriterMessage::DecisionBatch(records) => thread.write_decisions(&records),
+            WriterMessage::DecisionBatch(records) => thread.write_ready_decisions(records, &mut pending),
+            #[cfg(any(feature = "llm-router", test))]
+            WriterMessage::VerifiedDecision(record) => record.finish(&mut thread),
+            WriterMessage::ReplayChain(read) => read.finish(&thread),
             WriterMessage::Outcome(record) => thread.write_outcome(&record),
             WriterMessage::ChildOutcome(record) => thread.write_child_outcome(&record),
             WriterMessage::Imported(progress, imported) => match all_stored(&thread.conn, &imported) {
@@ -2730,9 +2723,13 @@ impl WriterThread {
                 }
             }
         }
+        self.finish_decision_write(records.len());
+    }
+
+    fn finish_decision_write(&mut self, record_count: usize) {
         self.writes_since_prune = self
             .writes_since_prune
-            .saturating_add(u32::try_from(records.len()).unwrap_or(u32::MAX));
+            .saturating_add(u32::try_from(record_count).unwrap_or(u32::MAX));
         if self.writes_since_prune >= PRUNE_EVERY {
             self.writes_since_prune = 0;
             if let Some(cutoff) = self.retention.cutoff(now_ms()) {

@@ -383,7 +383,6 @@ async fn sessions_spawn_uses_the_provider_owned_by_the_reloaded_generation() {
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("spawn reload memory"));
     let spawn = crate::tools::SessionsSpawnTool::new(
         Arc::new(SilentChannel),
-        startup_provider,
         provider_name,
         model,
         0.0,
@@ -395,6 +394,7 @@ async fn sessions_spawn_uses_the_provider_owned_by_the_reloaded_generation() {
         providers::provider_runtime_options_from_config(&generation.effective),
         generation.effective.sessions_spawn.clone(),
     )
+    .with_test_parent_provider(startup_provider)
     .with_configured_providers(&providers::ConfiguredProviders::from_config(&generation.effective))
     .with_model_catalog(providers::selection::catalog_for(&generation.effective))
     .with_hint_config(&generation.effective)

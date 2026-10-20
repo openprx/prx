@@ -3,13 +3,13 @@
 //! The observer receives ordinary phase events synchronously. Applied events
 //! notify it only after winning durable insertion; crash recovery can retain
 //! the durable event without a notification. A single task writes a
-//! metadata-only copy to `message_events` in order; no prompt, state,
+//! metadata-only copy to `message_events` with admission-local ordering; no prompt, state,
 //! request/response, endpoint, or configured model enters this copy.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use super::turn_decision::VerifiedDirectiveApplication;
 use crate::config::ConfigGeneration;
@@ -19,9 +19,22 @@ use crate::decision::telemetry::{
 use crate::memory::{Memory, MemoryVisibility, MessageEventInput, MessageEventSource};
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
+// Ordinary events retain permits through deferred persistence. Leave one
+// channel entry for Applied/Drain even while every ordinary permit is held.
+const ORDINARY_QUEUE_CAPACITY: usize = EVENT_QUEUE_CAPACITY - 1;
+
+mod deferral;
+mod worker;
+pub(super) use deferral::PersistenceGuard;
+
+struct QueuedEvent {
+    event: Box<CausalEvent>,
+    deferral: Option<Arc<deferral::AdmissionDeferral>>,
+    _permit: OwnedSemaphorePermit,
+}
 
 enum QueueItem {
-    Event(Box<CausalEvent>),
+    Event(QueuedEvent),
     Applied {
         event: Box<CausalEvent>,
         idempotency_key: String,
@@ -40,6 +53,8 @@ pub(crate) struct DurableCausalEventSink {
     revision: String,
     observer: Arc<dyn CausalEventSink>,
     queue: mpsc::Sender<QueueItem>,
+    deferral: Arc<deferral::PersistenceDeferral>,
+    ordinary_slots: Arc<Semaphore>,
 }
 
 impl DurableCausalEventSink {
@@ -49,7 +64,7 @@ impl DurableCausalEventSink {
         observer: Arc<dyn CausalEventSink>,
     ) -> Result<Self, tokio::runtime::TryCurrentError> {
         let handle = tokio::runtime::Handle::try_current()?;
-        let (queue, mut receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        let (queue, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let workspace_id = generation.effective.workspace_dir.to_string_lossy().to_string();
         let config_generation_id = generation.id.0;
         let config_source_revision = generation.source_revision.fingerprint_sha256.clone();
@@ -57,65 +72,23 @@ impl DurableCausalEventSink {
         let replay_workspace = workspace_id.clone();
         let replay_revision = config_source_revision.clone();
         let worker_observer = Arc::clone(&observer);
-        handle.spawn(async move {
-            while let Some(item) = receiver.recv().await {
-                match item {
-                    QueueItem::Event(event) => {
-                        let input =
-                            to_message_input(&event, &workspace_id, config_generation_id, &config_source_revision);
-                        if memory.append_message_event(input).await.is_err() {
-                            report_incomplete(
-                                worker_observer.as_ref(),
-                                event.lineage.clone(),
-                                IncompleteReason::StoreFailed,
-                            );
-                        }
-                    }
-                    QueueItem::Drain(reply) => {
-                        let _ = reply.send(());
-                    }
-                    QueueItem::Applied {
-                        event,
-                        idempotency_key,
-                        original_generation,
-                        acknowledgement,
-                    } => {
-                        let (generation_id, revision) = original_generation.as_ref().map_or(
-                            (config_generation_id, config_source_revision.as_str()),
-                            |(id, revision)| (*id, revision.as_ref()),
-                        );
-                        let mut input = to_message_input(&event, &workspace_id, generation_id, revision);
-                        let event_id = uuid::Uuid::new_v4().to_string();
-                        input.event_id = Some(event_id.clone());
-                        input.idempotency_key = Some(idempotency_key);
-                        let persisted = match memory.append_message_event(input.clone()).await {
-                            Ok(stored) if applied_input_matches(&stored, &input) => {
-                                if stored.event_id == event_id {
-                                    worker_observer.emit(*event);
-                                }
-                                true
-                            }
-                            Ok(_) => {
-                                report_incomplete(worker_observer.as_ref(), event.lineage, IncompleteReason::Conflict);
-                                false
-                            }
-                            Err(_) => {
-                                report_incomplete(
-                                    worker_observer.as_ref(),
-                                    event.lineage,
-                                    IncompleteReason::StoreFailed,
-                                );
-                                false
-                            }
-                        };
-                        if let Some(reply) = acknowledgement {
-                            let _ = reply.send(persisted);
-                        }
-                    }
-                }
+        let deferral = Arc::new(deferral::PersistenceDeferral::default());
+        let worker_deferral = Arc::clone(&deferral);
+        handle.spawn(
+            worker::Worker {
+                receiver,
+                memory,
+                observer: worker_observer,
+                workspace: workspace_id,
+                generation: config_generation_id,
+                revision: config_source_revision,
+                deferral: worker_deferral,
             }
-        });
+            .run(),
+        );
         Ok(Self {
+            ordinary_slots: Arc::new(Semaphore::new(ORDINARY_QUEUE_CAPACITY)),
+            deferral,
             observer,
             queue,
             memory: replay_memory,
@@ -125,12 +98,20 @@ impl DurableCausalEventSink {
         })
     }
 
+    /// A source-bound admission may defer only its own ordinary events. Drain
+    /// overrides that preference; deferral expires at the admission deadline.
+    pub(super) fn defer_ordinary_persistence(&self, lineage: &CausalLineage, deadline: Instant) -> PersistenceGuard {
+        self.deferral.begin(lineage, deadline)
+    }
+
     /// Wait at most until `deadline` for every event queued before this marker.
     /// Ordinary decisions never wait on telemetry.
     pub(crate) async fn drain(&self, deadline: Instant) -> bool {
+        if Instant::now() >= deadline {
+            return false;
+        }
         let (reply, received) = oneshot::channel();
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        tokio::time::timeout(remaining, async {
+        tokio::time::timeout_at(deadline.into(), async {
             self.queue.send(QueueItem::Drain(reply)).await.is_ok() && received.await.is_ok()
         })
         .await
@@ -253,8 +234,24 @@ impl CausalEventSink for DurableCausalEventSink {
             return;
         }
         self.observer.emit(event.clone());
-        if self.queue.try_send(QueueItem::Event(Box::new(event.clone()))).is_err() {
+        let Ok(permit) = Arc::clone(&self.ordinary_slots).try_acquire_owned() else {
             report_incomplete(self.observer.as_ref(), event.lineage, IncompleteReason::StoreDropped);
+            return;
+        };
+        let deferred = self.deferral.for_event(&event.lineage);
+        let queued = QueuedEvent {
+            event: Box::new(event),
+            deferral: deferred,
+            _permit: permit,
+        };
+        if let Err(failed) = self.queue.try_send(QueueItem::Event(queued)) {
+            if let QueueItem::Event(queued) = failed.into_inner() {
+                report_incomplete(
+                    self.observer.as_ref(),
+                    queued.event.lineage,
+                    IncompleteReason::StoreDropped,
+                );
+            }
         }
     }
 }
@@ -544,6 +541,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_full_ordinary_quota_keeps_an_applied_control_entry_available() {
+        let workspace = tempfile::tempdir().expect("test workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        let generation = crate::config::new_shared(config).pin();
+        let memory = Arc::new(SqliteMemory::new(workspace.path()).expect("event backend"));
+        let observer = Arc::new(RecordingSink::default());
+        let sink = DurableCausalEventSink::new(&generation, memory.clone(), observer.clone()).expect("sink");
+        let event = applied_fixture(&workspace.path().to_string_lossy(), "prx_terminal");
+        let key = "causal:prx_decision:directive-applied".to_owned();
+        // No await: the single-thread worker cannot consume a queued entry.
+        for _ in 0..ORDINARY_QUEUE_CAPACITY {
+            sink.emit(CausalEvent {
+                kind: CausalEventKind::SnapshotCreated,
+                lineage: event.lineage.clone(),
+                fields: CausalEventFields::default(),
+            });
+        }
+        assert_eq!(sink.ordinary_slots.available_permits(), 0);
+        sink.emit_applied(VerifiedDirectiveApplication::fixture(event, key.clone()));
+        assert!(
+            !observer
+                .events
+                .lock()
+                .iter()
+                .any(|event| event.fields.incomplete == Some(IncompleteReason::StoreDropped))
+        );
+        assert!(sink.drain(Instant::now() + std::time::Duration::from_secs(5)).await);
+        assert!(
+            memory
+                .find_message_event_by_idempotency_key(&workspace.path().to_string_lossy(), &key)
+                .await
+                .expect("persisted control row")
+                .is_some()
+        );
+        assert_eq!(
+            observer
+                .events
+                .lock()
+                .iter()
+                .filter(|event| event.kind == CausalEventKind::DirectiveApplied)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn applied_queue_or_store_failure_leaves_retry_available() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
@@ -554,12 +598,11 @@ mod tests {
         let sink = DurableCausalEventSink::new(&generation, memory.clone(), observer.clone()).expect("sink");
         let event = applied_fixture(&workspace.path().to_string_lossy(), "prx_terminal");
         let key = "causal:prx_decision:directive-applied".to_owned();
+        // Saturate the actual channel with controls: ordinary telemetry now
+        // reserves one entry for Applied. The overflow/retry oracle is intact.
         for _ in 0..EVENT_QUEUE_CAPACITY {
-            sink.emit(CausalEvent {
-                kind: CausalEventKind::SnapshotCreated,
-                lineage: event.lineage.clone(),
-                fields: CausalEventFields::default(),
-            });
+            let (completion, _receiver) = oneshot::channel();
+            assert!(sink.queue.try_send(QueueItem::Drain(completion)).is_ok());
         }
         sink.emit_applied(VerifiedDirectiveApplication::fixture(event.clone(), key.clone()));
         assert!(

@@ -258,7 +258,11 @@ impl Respawn {
             timeout_ms,
             self.manifest.resources.max_kv_storage_mb,
         )
-        .with_kv_store(Arc::clone(&self.kv_store));
+        .with_kv_store(Arc::clone(&self.kv_store))
+        .with_http_limits(
+            self.manifest.resources.max_http_requests_per_call,
+            self.manifest.resources.max_http_requests_per_minute,
+        );
         if let Some(memory) = &self.memory {
             host_state = host_state.with_memory(Arc::clone(memory));
         }
@@ -677,6 +681,8 @@ impl<'a> GuestCall<'a> {
             AdapterState::Live(live) => {
                 let LiveInstance { store, instance } = live.as_mut();
                 apply_store_epoch_deadline(store, supervisor.timeout_ms);
+                // `max_http_requests_per_call` means per invocation.
+                store.data_mut().begin_invocation();
                 // Fuel is a store-level budget. Arming it only at construction
                 // made `max_fuel` a process-lifetime allowance that every call
                 // drained, so a long-lived adapter was guaranteed to trap

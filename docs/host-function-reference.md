@@ -283,7 +283,7 @@ List all keys matching a prefix.
 ### Notes
 
 - **Namespace isolation:** Keys are automatically namespaced per plugin. Two plugins can both have a key named `"state"` without conflict.
-- **Storage limit:** Controlled by `resources.max_kv_storage_kb` in `plugin.toml` (default: 1024 KB). Writing data that exceeds the limit returns an error.
+- **Storage limit:** Controlled by `resources.max_kv_storage_mb` in `plugin.toml` (default: 10 MB). Writing data that exceeds the limit returns an error.
 - **Value type:** Raw bytes (`list<u8>`). Use PDK helpers for string and JSON serialization.
 - **Atomicity:** Individual `get`/`set`/`delete` operations are atomic. Multi-key transactions are not supported.
 
@@ -398,7 +398,7 @@ pub fn execute_impl(args_json: &str) -> PluginResult {
 **WIT file:** `wit/host/http.wit`  
 **Permission required:** `"http-outbound"` + `http_allowlist` in `plugin.toml`
 
-Make controlled outbound HTTP requests. All URLs are validated against the plugin's `http_allowlist` before any network connection is made.
+Make controlled outbound HTTP requests. All URLs are validated against the plugin's `http_allowlist` (an empty list denies every URL), against the private-network guard and against the request budget before any network connection is made. `websocket-outbound` `connect` follows the same rules.
 
 ### WIT Definition
 
@@ -446,9 +446,13 @@ Make an HTTP request.
 
 **Failure reasons:**
 
-- URL not in `http_allowlist`
+- URL not in `http_allowlist`, or the allowlist is empty
+- URL with user info, or a scheme other than `http`/`https`
+- Target is a loopback, link-local, private (RFC 1918 / ULA), CGNAT, multicast, reserved or cloud-metadata address, as an IP literal, as any address the host name resolves to, or as a redirect target
+- A redirect hop outside the allowlist, or more than 5 redirects
 - Network error (DNS failure, connection refused, timeout)
-- Request count limit reached (`max_http_requests`)
+- Request count limit reached (`max_http_requests_per_call` per invocation, or `max_http_requests_per_minute` over a rolling minute)
+- Response body larger than 16 MiB
 
 ### Declaring the Permission
 
@@ -456,11 +460,13 @@ Make an HTTP request.
 [permissions]
 required = ["http-outbound"]
 
-# Required when using http-outbound: list of allowed origins
+# Required when using http-outbound: URL patterns, scheme://host[:port][/path-prefix][*].
+# Scheme and host (or a leading "*." for subdomains) match exactly; the path is a
+# prefix on a segment boundary. Empty denies everything.
 http_allowlist = [
-    "https://api.openweathermap.org",
-    "https://api.github.com",
-    "https://httpbin.org",
+    "https://api.openweathermap.org/*",
+    "https://api.github.com/*",
+    "https://httpbin.org/*",
 ]
 ```
 
@@ -787,7 +793,7 @@ Subscribe to a topic pattern.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `topic-pattern` | `string` | Topic pattern: exact (`"tool.call"`) or wildcard (`"tool.*"`) |
+| `topic-pattern` | `string` | Topic pattern: exact (`"prx.lifecycle.tool_call"`) or wildcard (`"prx.lifecycle.*"`) |
 
 **Returns:** `result<u64, string>` — subscription ID on success (use with `unsubscribe`), error message on failure
 
@@ -818,13 +824,16 @@ Cancel one of your own subscriptions. A plugin can cancel only subscriptions it 
 
 | Topic | Description | Payload fields |
 |-------|-------------|---------------|
-| `prx.lifecycle.agent_start` | Agent loop started | `agent_id: string` |
-| `prx.lifecycle.agent_stop` | Agent loop stopped | `agent_id: string, reason: string` |
-| `tool.call` | Tool invoked by LLM | `tool_name: string, args: object, session_id: string` |
-| `tool.result` | Tool completed | `tool_name: string, success: bool, duration_ms: number` |
-| `llm.request` | Request sent to LLM | `model: string, message_count: number` |
-| `llm.response` | Response from LLM | `model: string, tokens_used: number` |
-| `error` | Error occurred | `message: string, context: string` |
+| `prx.lifecycle.agent_start` | Agent loop started | `provider: string, model: string` |
+| `prx.lifecycle.agent_stop` | Agent loop stopped | emitter-specific |
+| `prx.lifecycle.llm_request` | Request sent to LLM | emitter-specific |
+| `prx.lifecycle.llm_response` | Response from LLM | emitter-specific |
+| `prx.lifecycle.tool_call_start` | Tool invocation starting | emitter-specific |
+| `prx.lifecycle.tool_call` | Tool invoked by LLM | emitter-specific |
+| `prx.lifecycle.turn_complete` | A turn finished | emitter-specific |
+| `prx.lifecycle.error` | Error occurred | `component: string, message: string` |
+
+These eight are the bridged native hook events (`agent_end` is published as `agent_stop`); the payload is the same JSON the `hooks.json` commands receive. Dot-style topics such as `tool.call` or `llm.request` are not published.
 
 ### PDK Usage
 

@@ -13,10 +13,10 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::Instrument as _;
-
-// Keep the measured owned suspension fields off the caller's poll frame.
-// Construct inside this synchronous boundary and erase the concrete poll type.
+use tracing::{Instrument as _, instrument::WithSubscriber as _};
+#[cfg(test)]
+mod task_size_tests;
+// Box and erase owned suspension fields before caller polls or task spawning.
 #[inline(never)]
 fn boxed_delegate_field<'a, F>(
     make: impl FnOnce() -> F,
@@ -1127,7 +1127,7 @@ impl DelegateTool {
         };
         #[cfg(all(test, unix))]
         let work = delegate_diagnostic::inherit(work);
-        let mut task = DelegateTask(tokio::spawn(work));
+        let mut task = DelegateTask(tokio::spawn(boxed_delegate_field(|| work.with_current_subscriber())));
         match (&mut task.0).await {
             Ok(result) => result,
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
@@ -3278,8 +3278,7 @@ mod tests {
                 move || sink.clone()
             })
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
+        use tracing::instrument::WithSubscriber as _;
 
         let (result, requests) = run_configured_delegate_fixture(
             vec!["dynamic_alias".to_owned()],
@@ -3290,6 +3289,7 @@ mod tests {
             true,
             None,
         )
+        .with_subscriber(crate::config::secret_paths::fixture::capture_dispatch(subscriber))
         .await;
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.ends_with("\ndone"));

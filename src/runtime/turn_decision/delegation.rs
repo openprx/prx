@@ -11,6 +11,30 @@ pub(super) struct OutgoingDelegation {
     pub requested: Vec<CapabilityRef>,
 }
 
+/// A child publication must retain the estimate that passed candidate
+/// admission. Missing estimates remain unknown and G1 continues to refuse
+/// them; constructing an unpriced publication must not erase an admitted one.
+pub(super) fn publication_cost(
+    decision: &crate::causal_tree::decision_engine::EngineDecision,
+    reference: &CapabilityRef,
+    delegator: bool,
+) -> Option<crate::causal_tree::branch::CostEstimate> {
+    use crate::causal_tree::branch::CausalActionKind;
+    let super::CandidateSet::Legal { candidates, .. } = &decision.candidates else {
+        return None;
+    };
+    let action = if delegator {
+        CausalActionKind::Delegate
+    } else {
+        CausalActionKind::UseTool
+    };
+    candidates.iter().find_map(|candidate| {
+        (candidate.action() == action && candidate.required_capabilities() == std::slice::from_ref(reference))
+            .then(|| candidate.estimated_cost())
+            .flatten()
+    })
+}
+
 impl TurnDecisionService {
     pub(super) fn configured_delegation_target(&self, proof: &dyn TurnSourceProof) -> Option<&'static str> {
         let task = &self.generation.effective.task_routing;
@@ -37,13 +61,8 @@ impl TurnDecisionService {
             Instant::now() < deadline,
             "delegation persistence exceeded the decision deadline"
         );
-        let settlement = self.settlement_ref(Arc::clone(&context))?;
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            settlement.validate_durable_chain(),
-        )
-        .await
-        .context("delegation persistence exceeded the decision deadline")??;
+        // Preserve the issued-context authority checks before reading storage.
+        let _settlement = self.settlement_ref(Arc::clone(&context))?;
         let workspace = self.store.workspace_id().context("parent decision store missing")?;
         let trusted = context.engine.state.trusted.parts();
         let scope = crate::causal_tree::store::DecisionScope::Owner {
@@ -56,17 +75,23 @@ impl TurnDecisionService {
             true,
             self.generation.effective.causal_tree.store.record_redacted_projection,
         )?;
-        let reader = self.store.reader();
-        for record in records {
+        let writer = self.store.writer().context("parent decision writer missing")?;
+        let rows = writer.replay_chain(scope, context.hop_ids().to_vec(), deadline).await?;
+        anyhow::ensure!(rows.len() == records.len(), "delegation chain readback count conflicts");
+        for (position, (record, stored)) in records.iter().zip(rows).enumerate() {
+            let stored = stored.context("delegation parent hop was not durably stored")?;
+            let view = &stored.decision;
             anyhow::ensure!(
-                Instant::now() < deadline,
-                "delegation readback exceeded the decision deadline"
-            );
-            let stored = reader
-                .replay_record(&scope, &record.decision_id)?
-                .context("delegation parent hop was not durably stored")?;
-            anyhow::ensure!(
-                stored.digest == record.replay_digest(&workspace)?,
+                view.enabled_snapshot
+                    && !view.legacy_v1
+                    && view.prior_decision_id
+                        == position.checked_sub(1).and_then(|n| context.hop_ids().get(n)).copied()
+                    && view.session_key.as_deref() == trusted.session_key.as_deref()
+                    && view.run_id.as_deref() == trusted.run_id.as_deref()
+                    && view.channel.is_none()
+                    && view.policy_version == trusted.policy_version.as_ref()
+                    && view.decision_id == record.decision_id
+                    && stored.digest == record.replay_digest(&workspace)?,
                 "stored delegation parent differs from the issued decision chain"
             );
         }
@@ -172,6 +197,7 @@ impl TurnDecisionService {
                 security: Arc::clone(&self.security),
             },
             crate::runtime::child_source::ChildGrantRuntime {
+                recursive_child_claimed: self.issue_recursive_allowance(proof, context),
                 decision_store: Arc::clone(&self.store),
                 source_fabric: crate::memory::MemoryFabric::new(Arc::clone(&self.memory), proof.workspace_id())
                     .with_event_recording(self.generation.effective.memory.event_recording_config()),
@@ -273,6 +299,22 @@ impl TurnDecisionService {
                     });
                 }
             }
+            // A root also owns its actual discovery control. Capture that
+            // reference when recursive spawning is permitted, so the child
+            // can drop it while retaining an explicitly requested delegator.
+            // An inherited child can never recover this root-only reference.
+            if self.generation.effective.sessions_spawn.allow_recursive_delegation
+                && let Some(entry) = self
+                    .catalog
+                    .entry_for_public_name("capability_search")
+                    .filter(|entry| permitted(entry))
+            {
+                allowed.insert(CapabilityRef {
+                    id: entry.id.clone(),
+                    fingerprint: entry.fingerprint,
+                    generation: entry.generation,
+                });
+            }
         }
         if !allowed.iter().any(|reference| {
             catalog
@@ -340,8 +382,13 @@ impl TurnDecisionService {
                     level,
                     max_cost_cents,
                     remaining_depth,
+                    delegation: None,
                 },
-                |manifest| manifest.authority.clone(),
+                |manifest| {
+                    let mut authority = manifest.authority.clone();
+                    authority.max_cost_cents = authority.max_cost_cents.min(max_cost_cents);
+                    authority
+                },
             ),
             catalog_generation: trusted.catalog_generation,
             key: Arc::clone(&self.state_key),

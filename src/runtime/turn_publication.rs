@@ -151,7 +151,8 @@ impl TurnDecisionPublication {
                 memory: Arc::clone(memory),
                 security: Arc::clone(&security),
             },
-        )?;
+        )
+        .await?;
         let service = service.with_loop_runtime(super::turn_decision::TurnLoopRuntime {
             hooks: Arc::clone(hooks),
             observer: Arc::clone(observer),
@@ -233,7 +234,8 @@ impl ChildDecisionPublication {
                 memory,
                 security,
             },
-        )?;
+        )
+        .await?;
         if let Err(error) = owner.retain_child_service(Arc::clone(&service)) {
             service
                 .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
@@ -354,7 +356,8 @@ impl OperatorProcessDecisionPublication {
                 security: self.security,
             },
             self.runtime,
-        )?;
+        )
+        .await?;
         if let Err(error) = owner.retain_child_service(Arc::clone(&service)) {
             service
                 .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))

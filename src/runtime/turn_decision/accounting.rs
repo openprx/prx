@@ -1,7 +1,8 @@
-//! Deferred adapter from a genuine turn proof to physical-send accounting.
-use super::{TurnBudgets, TurnDecisionService, TurnSourceProof, validate_agent_turn_origin};
+//! Bounded admission resources and deferred physical-send accounting.
+use super::{TurnBudgets, TurnDecisionContext, TurnDecisionService, TurnSourceProof, validate_agent_turn_origin};
 use crate::decision::budget::{self, AttemptBinding, DecisionAttemptAccounting, DecisionAttemptReceipt};
 use crate::decision::{DecisionError, KeyDomain};
+use crate::runtime::causal_events::PersistenceGuard;
 use crate::runtime::decision_accounting::AccountingScope;
 use async_trait::async_trait;
 use std::{
@@ -9,12 +10,49 @@ use std::{
     time::Instant,
 };
 
+pub(super) type AdmissionDecision = (Arc<TurnDecisionContext>, Option<PersistenceGuard>);
+
 pub(super) struct TurnAccounting<'a> {
     service: &'a TurnDecisionService,
     proof: &'a dyn TurnSourceProof,
     budgets: TurnBudgets,
     deadline: Instant,
     scope: OnceLock<Option<Arc<AccountingScope>>>,
+}
+
+/// The telemetry guard belongs to admission, independently of the physical
+/// accounting scope that an issued context can retain after admission ends.
+pub(super) fn admission_persistence(
+    service: &TurnDecisionService,
+    proof: &dyn TurnSourceProof,
+    deadline: Instant,
+) -> Option<PersistenceGuard> {
+    service.durable_events.as_ref().map(|events| {
+        events.defer_ordinary_persistence(
+            &crate::decision::telemetry::CausalLineage {
+                workspace_id: Arc::from(proof.workspace_id()),
+                owner_id: Some(Arc::from(proof.owner_id())),
+                session_key: Some(Arc::from(proof.session_key())),
+                run_id: Some(Arc::from(proof.run_id())),
+                source_event_id: proof.source_event_id().map(Arc::from),
+                task_id: proof.task_id().map(Arc::from),
+                ..Default::default()
+            },
+            deadline,
+        )
+    })
+}
+
+pub(super) fn admission_resources<'a>(
+    service: &'a TurnDecisionService,
+    proof: &'a dyn TurnSourceProof,
+    budgets: TurnBudgets,
+    deadline: Instant,
+) -> (TurnAccounting<'a>, Option<PersistenceGuard>) {
+    (
+        TurnAccounting::new(service, proof, budgets, deadline),
+        admission_persistence(service, proof, deadline),
+    )
 }
 
 impl<'a> TurnAccounting<'a> {
@@ -41,14 +79,17 @@ impl<'a> TurnAccounting<'a> {
                     self.proof.config_source_revision().as_bytes(),
                 ],
             );
-            Some(Arc::new(AccountingScope::new(
-                self.service.generation.effective.clone(),
-                key.clone(),
-                cleanup,
-                scope_id,
-                self.budgets,
-                self.deadline,
-            )))
+            Some(Arc::new(
+                AccountingScope::new(
+                    self.service.generation.effective.clone(),
+                    key.clone(),
+                    cleanup,
+                    scope_id,
+                    self.budgets,
+                    self.deadline,
+                )
+                .with_money(self.service.recursive_money(self.proof)),
+            ))
         });
         scope.as_ref().map(Arc::clone).ok_or(DecisionError::BudgetExceeded)
     }
@@ -99,3 +140,6 @@ impl DecisionAttemptAccounting for TurnAccounting<'_> {
         self.ensure_scope()?.begin(attempt).await
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -270,6 +270,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         };
         (run, rx)
@@ -502,6 +503,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            delegation: None,
             token_usage_records: Vec::new(),
         };
         let runs = Arc::new(RwLock::new(vec![run]));

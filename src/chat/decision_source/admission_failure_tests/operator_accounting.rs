@@ -133,7 +133,6 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
         let config = &generation.effective;
         let spawn = crate::tools::SessionsSpawnTool::new(
             Arc::new(NoOperatorAnnouncements),
-            Arc::clone(&provider),
             "ollama",
             "prx-local-model",
             0.0,
@@ -145,6 +144,7 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
             crate::providers::provider_runtime_options_from_config(config),
             config.sessions_spawn.clone(),
         )
+        .with_test_parent_provider(Arc::clone(&provider))
         .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
         .with_model_catalog(crate::providers::selection::catalog_for(config))
         .with_hint_config(config)
@@ -270,50 +270,6 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
                 );
                 assert!(turn.close(&cancellation).await?.is_some());
                 drop(turn);
-                let journal = std::fs::read_to_string(workspace.path().join("state/costs.reservations.jsonl"))?;
-                let rows: Vec<Value> = journal.lines().map(serde_json::from_str).collect::<Result<_, _>>()?;
-                let matching = |event: &str| {
-                    rows.iter()
-                        .filter(|row| row.get("event").and_then(Value::as_str) == Some(event))
-                        .collect::<Vec<_>>()
-                };
-                let reserved = matching("estimated_reserved_v1");
-                let dispatched = matching("dispatched");
-                let settled = matching("estimated_settled_v1");
-                assert_eq!((reserved.len(), dispatched.len(), settled.len()), (1, 1, 1));
-                let attempt = reserved
-                    .first()
-                    .and_then(|row| row.pointer("/request/reservation/attempt_id"))
-                    .and_then(Value::as_str)
-                    .context("actual reservation identity missing")?;
-                assert!(attempt.starts_with("decision:"));
-                assert_eq!(
-                    dispatched
-                        .first()
-                        .and_then(|row| row.get("attempt_id"))
-                        .and_then(Value::as_str),
-                    Some(attempt)
-                );
-                assert_eq!(
-                    settled
-                        .first()
-                        .and_then(|row| row.get("attempt_id"))
-                        .and_then(Value::as_str),
-                    Some(attempt)
-                );
-                assert_eq!(
-                    settled
-                        .first()
-                        .and_then(|row| row.get("actual_tokens"))
-                        .and_then(Value::as_str),
-                    Some("30")
-                );
-                assert_eq!(
-                    std::fs::read_to_string(workspace.path().join("state/costs.jsonl"))?
-                        .lines()
-                        .count(),
-                    1
-                );
                 Ok::<_, anyhow::Error>(())
             })
             .await
@@ -334,6 +290,7 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
             false
         }
     };
+    let costs_workspace = workspace.path().to_path_buf();
     let confirmed = matches!(cleanup, Ok(Ok(()))) && server_cleanup;
     if !confirmed {
         let retained = workspace.keep();
@@ -342,7 +299,52 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
     match result {
         Ok(Ok(result)) => {
             anyhow::ensure!(confirmed, "operator accounting cleanup unconfirmed");
-            result
+            result?;
+            let journal = std::fs::read_to_string(costs_workspace.as_path().join("state/costs.reservations.jsonl"))?;
+            let rows: Vec<Value> = journal.lines().map(serde_json::from_str).collect::<Result<_, _>>()?;
+            let matching = |event: &str| {
+                rows.iter()
+                    .filter(|row| row.get("event").and_then(Value::as_str) == Some(event))
+                    .collect::<Vec<_>>()
+            };
+            let reserved = matching("estimated_reserved_v1");
+            let dispatched = matching("dispatched");
+            let settled = matching("estimated_settled_v1");
+            assert_eq!((reserved.len(), dispatched.len(), settled.len()), (1, 1, 1));
+            let attempt = reserved
+                .first()
+                .and_then(|row| row.pointer("/request/reservation/attempt_id"))
+                .and_then(Value::as_str)
+                .context("actual reservation identity missing")?;
+            assert!(attempt.starts_with("decision:"));
+            assert_eq!(
+                dispatched
+                    .first()
+                    .and_then(|row| row.get("attempt_id"))
+                    .and_then(Value::as_str),
+                Some(attempt)
+            );
+            assert_eq!(
+                settled
+                    .first()
+                    .and_then(|row| row.get("attempt_id"))
+                    .and_then(Value::as_str),
+                Some(attempt)
+            );
+            assert_eq!(
+                settled
+                    .first()
+                    .and_then(|row| row.get("actual_tokens"))
+                    .and_then(Value::as_str),
+                Some("30")
+            );
+            assert_eq!(
+                std::fs::read_to_string(costs_workspace.as_path().join("state/costs.jsonl"))?
+                    .lines()
+                    .count(),
+                1
+            );
+            Ok(())
         }
         Ok(Err(panic)) => std::panic::resume_unwind(panic),
         Err(error) => Err(error.into()),

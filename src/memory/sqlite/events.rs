@@ -113,134 +113,155 @@ impl SqliteMemory {
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<(MessageEvent, bool)> {
             // The mutation owns the genuine lease inside this blocking closure,
             // including when its async waiter is cancelled.
-            let conn = match deadline { Some(deadline) => pool.write_until(deadline)?, None => pool.write() };
-            let _budget = deadline.map(|deadline| ingress_recovery::ConnectionDeadline::new(&conn, deadline)).transpose()?;
+            let conn = match deadline {
+                Some(deadline) => pool.write_until(deadline)?,
+                None => pool.write(),
+            };
+            let _budget = deadline
+                .map(|deadline| ingress_recovery::ConnectionDeadline::new(&conn, deadline))
+                .transpose()?;
             let tx = conn.unchecked_transaction()?;
             if let (Some(owner), Some(deadline)) = (&repair_owner, repair_deadline) {
                 ingress_recovery::validate_owner(&tx, owner, &input.workspace_id, deadline)?;
             }
-            if let Some(operation) = &mutation { ingress_recovery::before_append(&tx, operation, &input)?; }
-            let now = Utc::now().to_rfc3339();
-            let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-            let content_hash = Self::content_hash(&input.content);
-            let visibility = input.visibility.as_str().to_string();
-            let source = input.source.as_str().to_string();
-            let source_ref_json = serde_json::to_string(&input.source)?;
-            let subject_ref_json = input.subject.as_ref().map(serde_json::to_string).transpose()?;
-            let config_generation_id = input.config_generation_id.map(i64::try_from).transpose()?;
-
-            let inserted = tx.execute(
-                "INSERT OR IGNORE INTO message_events (
-                    event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
-                    parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                    sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                    goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
-                    content, content_hash, raw_payload_json, visibility, created_at, updated_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                         ?30, ?31)",
-                params![
-                    event_id,
-                    input.idempotency_key,
-                    input.workspace_id,
-                    input.owner_id,
-                    source,
-                    input.channel,
-                    input.session_key,
-                    input.parent_session_key,
-                    input.run_id,
-                    input.parent_run_id,
-                    input.agent_id,
-                    input.persona_id,
-                    input.sender,
-                    input.recipient,
-                    input.role,
-                    input.event_type,
-                    source_ref_json,
-                    subject_ref_json,
-                    input.goal_id,
-                    input.causation_event_id,
-                    input.correlation_id,
-                    input.attempt_id,
-                    input.lease_epoch,
-                    config_generation_id,
-                    input.config_source_revision,
-                    input.content,
-                    content_hash,
-                    input.raw_payload_json,
-                    visibility,
-                    now,
-                    now
-                ],
-            )?;
-
-            if deadline.is_some() {
-                ingress_recovery::check_receipt_size(&tx, &event_id, input.idempotency_key.as_deref(), &input.workspace_id)?;
+            if let Some(operation) = &mutation {
+                ingress_recovery::before_append(&tx, operation, &input)?;
             }
-
-            let event = if let Some(ref idempotency_key) = input.idempotency_key {
-                tx.query_row(
-                    "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
-                            parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                            sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                            goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
-                            content, content_hash, raw_payload_json, visibility, created_at, updated_at
-                     FROM message_events
-                     WHERE event_id = ?1
-                        OR (workspace_id = ?3 AND idempotency_key = ?2)
-                     ORDER BY CASE WHEN event_id = ?1 THEN 0 ELSE 1 END
-                     LIMIT 1",
-                    params![event_id, idempotency_key, input.workspace_id],
-                    Self::message_event_from_row,
-                )?
-            } else {
-                tx.query_row(
-                    "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
-                            parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                            sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                            goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
-                            content, content_hash, raw_payload_json, visibility, created_at, updated_at
-                     FROM message_events
-                     WHERE event_id = ?1
-                     LIMIT 1",
-                    params![event_id],
-                    Self::message_event_from_row,
-                )?
-            };
-
-            if inserted > 0 {
-                tx.execute(
-                    "INSERT INTO memory_events (
-                        event_id, workspace_id, owner_id, event_type, subject_table, subject_id, session_key,
-                        agent_id, persona_id, visibility, payload_json, created_at
-                     )
-                     VALUES (?1, ?2, ?3, ?4, 'message_events', ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
-                    params![
-                        Uuid::new_v4().to_string(),
-                        event.workspace_id,
-                        event.owner_id,
-                        event.event_type,
-                        event.event_id,
-                        event.session_key,
-                        event.agent_id,
-                        event.persona_id,
-                        event.visibility.as_str(),
-                        Utc::now().to_rfc3339()
-                    ],
-                )?;
+            let (event, inserted) = Self::append_event_row(&tx, input, deadline.is_some())?;
+            if let Some(operation) = &mutation {
+                ingress_recovery::after_append(&tx, operation, &event, inserted)?;
             }
-
-            if let Some(operation) = &mutation { ingress_recovery::after_append(&tx, operation, &event, inserted > 0)?; }
             if let (Some(owner), Some(deadline)) = (&repair_owner, repair_deadline) {
                 ingress_recovery::validate_owner(&tx, owner, &event.workspace_id, deadline)?;
             }
-            if let Some(deadline) = deadline { crate::memory::ingress_recovery::remaining(deadline)?; }
+            if let Some(deadline) = deadline {
+                crate::memory::ingress_recovery::remaining(deadline)?;
+            }
             tx.commit()?;
-            if let Some(deadline) = deadline { crate::memory::ingress_recovery::remaining(deadline)?; }
-            Ok((event, inserted > 0))
+            if let Some(deadline) = deadline {
+                crate::memory::ingress_recovery::remaining(deadline)?;
+            }
+            Ok((event, inserted))
         })
         .await?
+    }
+
+    pub(super) fn append_event_row(
+        tx: &rusqlite::Transaction<'_>,
+        input: MessageEventInput,
+        bounded_receipt: bool,
+    ) -> anyhow::Result<(MessageEvent, bool)> {
+        let now = Utc::now().to_rfc3339();
+        let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let content_hash = Self::content_hash(&input.content);
+        let visibility = input.visibility.as_str().to_string();
+        let source = input.source.as_str().to_string();
+        let source_ref_json = serde_json::to_string(&input.source)?;
+        let subject_ref_json = input.subject.as_ref().map(serde_json::to_string).transpose()?;
+        let config_generation_id = input.config_generation_id.map(i64::try_from).transpose()?;
+
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO message_events (
+                event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                content, content_hash, raw_payload_json, visibility, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
+                     ?30, ?31)",
+            params![
+                event_id,
+                input.idempotency_key,
+                input.workspace_id,
+                input.owner_id,
+                source,
+                input.channel,
+                input.session_key,
+                input.parent_session_key,
+                input.run_id,
+                input.parent_run_id,
+                input.agent_id,
+                input.persona_id,
+                input.sender,
+                input.recipient,
+                input.role,
+                input.event_type,
+                source_ref_json,
+                subject_ref_json,
+                input.goal_id,
+                input.causation_event_id,
+                input.correlation_id,
+                input.attempt_id,
+                input.lease_epoch,
+                config_generation_id,
+                input.config_source_revision,
+                input.content,
+                content_hash,
+                input.raw_payload_json,
+                visibility,
+                now,
+                now
+            ],
+        )?;
+
+        if bounded_receipt {
+            ingress_recovery::check_receipt_size(tx, &event_id, input.idempotency_key.as_deref(), &input.workspace_id)?;
+        }
+
+        let event = if let Some(ref idempotency_key) = input.idempotency_key {
+            tx.query_row(
+                "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                 FROM message_events
+                 WHERE event_id = ?1
+                    OR (workspace_id = ?3 AND idempotency_key = ?2)
+                 ORDER BY CASE WHEN event_id = ?1 THEN 0 ELSE 1 END
+                 LIMIT 1",
+                params![event_id, idempotency_key, input.workspace_id],
+                Self::message_event_from_row,
+            )?
+        } else {
+            tx.query_row(
+                "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                 FROM message_events
+                 WHERE event_id = ?1
+                 LIMIT 1",
+                params![event_id],
+                Self::message_event_from_row,
+            )?
+        };
+
+        if inserted > 0 {
+            tx.execute(
+                "INSERT INTO memory_events (
+                    event_id, workspace_id, owner_id, event_type, subject_table, subject_id, session_key,
+                    agent_id, persona_id, visibility, payload_json, created_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, 'message_events', ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    event.workspace_id,
+                    event.owner_id,
+                    event.event_type,
+                    event.event_id,
+                    event.session_key,
+                    event.agent_id,
+                    event.persona_id,
+                    event.visibility.as_str(),
+                    Utc::now().to_rfc3339()
+                ],
+            )?;
+        }
+        Ok((event, inserted > 0))
     }
 
     fn repair_owner(

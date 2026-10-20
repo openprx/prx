@@ -11,6 +11,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+mod settlement;
+
 const COST_LEDGER_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const COST_LEDGER_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 const MAX_READ_ONLY_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
@@ -257,20 +259,27 @@ fn open_cost_file(path: &Path, access: CostFileAccess) -> Result<Option<(File, O
     );
     let flags = match access {
         CostFileAccess::Read => OFlags::RDONLY,
-        CostFileAccess::Append => OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE,
+        CostFileAccess::Append => OFlags::WRONLY | OFlags::APPEND,
         CostFileAccess::Migration => OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
         CostFileAccess::Lock => OFlags::RDWR | OFlags::CREATE,
     };
-    let fd = match rustix::fs::openat(
-        &state,
-        filename,
-        flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    ) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) if matches!(access, CostFileAccess::Read) => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let creates = matches!(access, CostFileAccess::Append | CostFileAccess::Migration);
+    let creation_flags = if creates {
+        OFlags::CREATE | OFlags::EXCL
+    } else {
+        OFlags::empty()
     };
+    let secure_flags = flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let (fd, created) =
+        match rustix::fs::openat(&state, filename, secure_flags | creation_flags, Mode::RUSR | Mode::WUSR) {
+            Ok(fd) => (fd, creates),
+            Err(rustix::io::Errno::EXIST) if matches!(access, CostFileAccess::Append) => (
+                rustix::fs::openat(&state, filename, secure_flags, Mode::RUSR | Mode::WUSR)?,
+                false,
+            ),
+            Err(rustix::io::Errno::NOENT) if matches!(access, CostFileAccess::Read) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
     let stat = rustix::fs::fstat(&fd)?;
     anyhow::ensure!(
         FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
@@ -278,13 +287,13 @@ fn open_cost_file(path: &Path, access: CostFileAccess) -> Result<Option<(File, O
             && stat.st_mode & 0o022 == 0,
         "cost file is not a private single-link regular file"
     );
-    if matches!(access, CostFileAccess::Append | CostFileAccess::Migration) {
+    let file = File::from(fd);
+    let state = File::from(state);
+    if created {
         // CostStorage may have just created state; persist that entry too.
-        File::from(root)
-            .sync_all()
-            .context("failed to sync cost workspace directory")?;
+        super::creation::sync_created_entry(&file, &state, filename, &File::from(root))?;
     }
-    Ok(Some((File::from(fd), Some(File::from(state)))))
+    Ok(Some((file, created.then_some(state))))
 }
 
 // Keep ordinary cost recording available on non-Unix platforms. This path
@@ -337,10 +346,14 @@ fn open_cost_file(path: &Path, access: CostFileAccess) -> Result<Option<(File, O
     Ok(Some((file, None)))
 }
 
-fn sync_cost_directory(state: Option<File>) -> Result<()> {
+fn sync_cost_directory(state: Option<File>, file: &File, path: &Path) -> Result<()> {
+    #[cfg(unix)]
     if let Some(state) = state {
-        state.sync_all().context("failed to sync cost state directory")?;
+        let name = path.file_name().context("cost ledger has no filename")?;
+        super::creation::sync_created_entry(file, &state, name, &state)?;
     }
+    #[cfg(not(unix))]
+    let _ = (state, file, path);
     Ok(())
 }
 
@@ -373,14 +386,14 @@ fn acquire_cost_ledger_lock(path: &Path) -> Result<CostLedgerLockGuard> {
 
 /// Cost tracker for API usage monitoring and budget enforcement.
 pub struct CostTracker {
-    config: Arc<Mutex<CostConfig>>,
+    config: CostConfig,
     storage: Arc<Mutex<CostStorage>>,
     session_id: String,
     session_costs: Arc<Mutex<Vec<CostRecord>>>,
 }
 
 impl CostTracker {
-    /// Return the sole process-level cost authority for a canonical workspace.
+    /// Reuse canonical storage with an immutable configuration view for each caller.
     pub fn for_workspace(config: CostConfig, workspace_dir: &Path) -> Result<Arc<Self>> {
         static TRACKERS: OnceLock<Mutex<HashMap<PathBuf, Arc<CostTracker>>>> = OnceLock::new();
         let workspace_dir = workspace_dir
@@ -389,8 +402,17 @@ impl CostTracker {
         let trackers = TRACKERS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut trackers = trackers.lock();
         if let Some(tracker) = trackers.get(&workspace_dir) {
-            *tracker.config.lock() = config;
-            return Ok(Arc::clone(tracker));
+            if tracker.config == config {
+                return Ok(Arc::clone(tracker));
+            }
+            let view = Arc::new(Self {
+                config,
+                storage: Arc::clone(&tracker.storage),
+                session_id: tracker.session_id.clone(),
+                session_costs: Arc::clone(&tracker.session_costs),
+            });
+            trackers.insert(workspace_dir, Arc::clone(&view));
+            return Ok(view);
         }
         let tracker = Arc::new(Self::new(config, &workspace_dir)?);
         trackers.insert(workspace_dir, Arc::clone(&tracker));
@@ -405,7 +427,7 @@ impl CostTracker {
             .with_context(|| format!("Failed to open cost storage at {}", storage_path.display()))?;
 
         Ok(Self {
-            config: Arc::new(Mutex::new(config)),
+            config,
             storage: Arc::new(Mutex::new(storage)),
             session_id: uuid::Uuid::new_v4().to_string(),
             session_costs: Arc::new(Mutex::new(Vec::new())),
@@ -427,7 +449,7 @@ impl CostTracker {
 
     /// Check if a request is within budget.
     pub fn check_budget(&self, estimated_cost_usd: f64) -> Result<BudgetCheck> {
-        let config = self.config.lock().clone();
+        let config = self.config.clone();
         if !estimated_cost_usd.is_finite() || estimated_cost_usd < 0.0 {
             return Err(anyhow!("Estimated cost must be a finite, non-negative value"));
         }
@@ -461,7 +483,7 @@ impl CostTracker {
         &self,
         request: super::reservation::ReservationRequest,
     ) -> Result<super::reservation::ReservationReceipt> {
-        let config = self.config.lock().clone();
+        let config = self.config.clone();
         let mut storage = self.lock_storage();
         let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
         storage.refresh_from_disk()?;
@@ -489,7 +511,7 @@ impl CostTracker {
         &self,
         request: super::reservation::EstimatedReservationRequest,
     ) -> Result<super::reservation::ReservationReceipt> {
-        let config = self.config.lock().clone();
+        let config = self.config.clone();
         let mut storage = self.lock_storage();
         let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
         storage.refresh_from_disk()?;
@@ -518,7 +540,7 @@ impl CostTracker {
         request: super::reservation::EstimatedReservationRequest,
         may_dispatch: impl FnOnce() -> bool,
     ) -> Result<super::reservation::ReservationReceipt> {
-        let config = self.config.lock().clone();
+        let config = self.config.clone();
         let mut storage = self.lock_storage();
         let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
         storage.refresh_from_disk()?;
@@ -571,7 +593,7 @@ impl CostTracker {
 
     #[cfg(test)]
     fn transition_reservation(&self, receipt: &super::reservation::ReservationReceipt, dispatch: bool) -> Result<()> {
-        let config = self.config.lock().clone();
+        let config = self.config.clone();
         let mut storage = self.lock_storage();
         let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
         storage.refresh_from_disk()?;
@@ -659,6 +681,7 @@ impl CostTracker {
 
     /// Reconcile only a known, already durably metered estimated attempt.
     /// Partial/missing usage must retain the dispatched reservation instead.
+    #[cfg(test)]
     pub(crate) fn reconcile_estimated_attempt(
         &self,
         receipt: &super::reservation::ReservationReceipt,
@@ -674,27 +697,7 @@ impl CostTracker {
         let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
         storage.refresh_from_disk()?;
         storage.verify_replayed_settlement(record, cost)?;
-        let digest = settlement_fingerprint(record, cost)?;
-        let mut projection = None;
-        storage.for_each_record(|stored| {
-            if stored.settlement_id == record.settlement_id {
-                projection = Some(stored);
-            }
-        })?;
-        let projection = projection.context("reservation settlement cost projection is missing")?;
-        anyhow::ensure!(
-            projection.settlement_sha256.as_deref() == Some(digest.as_str()),
-            "reservation settlement requires a canonical cost projection"
-        );
-        let row_digest = super::reservation::cost_row_sha256(&projection)?;
-        let workspace = storage.workspace()?;
-        let mut reservations = super::reservation::Reservations::load(workspace)?;
-        let actual_tokens = u128::from(record.prompt_tokens) + u128::from(record.completion_tokens);
-        anyhow::ensure!(
-            actual_tokens == u128::from(record.total_tokens),
-            "estimated settlement token total conflicts"
-        );
-        reservations.settle_estimated(workspace, receipt, actual, actual_tokens, digest, row_digest)
+        settlement::reconcile_durable_projection(&storage, receipt, record, actual, None)
     }
 
     /// Record a usage event.
@@ -726,55 +729,7 @@ impl CostTracker {
         &self,
         record: &crate::llm::route_decision::MeteredTokenUsageRecord,
     ) -> Result<CostSettlement> {
-        let config = self.config.lock().clone();
-        let settlement_id = record
-            .settlement_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("Metered usage settlement is missing settlement_id"))?;
-        anyhow::ensure!(!settlement_id.trim().is_empty(), "Metered usage settlement_id is empty");
-        let Some(cost_usd) = record.cost_usd else {
-            return Ok(CostSettlement::UnknownPricing);
-        };
-        if !cost_usd.is_finite() || cost_usd < 0.0 {
-            return Err(anyhow!("Metered usage cost must be a finite, non-negative value"));
-        }
-
-        let mut storage = self.lock_storage();
-        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
-        storage.refresh_from_disk()?;
-        if storage.has_settlement(settlement_id) {
-            storage.verify_replayed_settlement(record, cost_usd)?;
-            return Ok(CostSettlement::Replayed);
-        }
-        let (daily_cost, monthly_cost) = storage.get_aggregated_costs()?;
-        let budget = budget_check(
-            &config,
-            daily_cost,
-            monthly_cost,
-            storage.daily_micro_usd,
-            storage.monthly_micro_usd,
-            cost_usd,
-        );
-        let usage = TokenUsage {
-            model: format!("{}/{}", record.provider, record.model),
-            input_tokens: record.prompt_tokens,
-            output_tokens: record.completion_tokens,
-            total_tokens: record.total_tokens,
-            cost_usd,
-            timestamp: Utc::now(),
-        };
-        let mut cost_record = CostRecord::from_settlement(&self.session_id, settlement_id, usage);
-        cost_record.settlement_sha256 = Some(settlement_fingerprint(record, cost_usd)?);
-        cost_record.settlement_provider = Some(record.provider.clone());
-        cost_record.settlement_source = Some(record.source);
-        cost_record.cache_creation_input_tokens = Some(record.cache_creation_input_tokens);
-        cost_record.cache_read_input_tokens = Some(record.cache_read_input_tokens);
-        storage.add_record(cost_record.clone())?;
-        drop(storage);
-        self.lock_session_costs().push(cost_record);
-        // A configuration error must not erase usage already incurred.
-        // Persist the charge before returning the failed budget assessment.
-        Ok(CostSettlement::Recorded { budget: budget? })
+        self.settle_metered_inner(record, None)
     }
 
     /// Get the current cost summary.
@@ -902,9 +857,7 @@ fn migrate_legacy_cost_file(mut legacy: File, storage_path: &Path) -> Result<()>
     let state = state.context("cost migration directory handle is missing")?;
     rustix::fs::renameat(&state, temporary_name.as_str(), &state, "costs.jsonl")
         .context("failed to publish migrated cost ledger")?;
-    state
-        .sync_all()
-        .context("failed to sync migrated cost state directory")?;
+    super::creation::sync_created_entry(&destination, &state, std::ffi::OsStr::new("costs.jsonl"), &state)?;
     // Preserve the legacy source; no migration cleanup is performed here.
     Ok(())
 }
@@ -1241,7 +1194,7 @@ impl CostStorage {
             .with_context(|| format!("Failed to sync cost storage at {}", self.path.display()))?;
         // A durable file body is insufficient when this append created the
         // ledger. Persist its directory entry before acknowledging settlement.
-        sync_cost_directory(state)?;
+        sync_cost_directory(state, &file, &self.path)?;
 
         self.daily_micro_usd = daily_micro;
         self.monthly_micro_usd = monthly_micro;
@@ -2177,6 +2130,47 @@ mod tests {
             source: crate::llm::route_decision::TokenUsageSource::Reported,
             cost_usd,
         }
+    }
+
+    #[test]
+    fn older_configuration_lookup_cannot_restore_a_new_views_limits() {
+        let tmp = TempDir::new().unwrap();
+        let older_config = CostConfig {
+            daily_limit_usd: 10.0,
+            monthly_limit_usd: 20.0,
+            ..enabled_config()
+        };
+        let newer_config = CostConfig {
+            daily_limit_usd: 0.001,
+            ..older_config.clone()
+        };
+        let older = CostTracker::for_workspace(older_config.clone(), tmp.path()).unwrap();
+        let newer = CostTracker::for_workspace(newer_config.clone(), tmp.path()).unwrap();
+        let old_turn = CostTracker::for_workspace(older_config, tmp.path()).unwrap();
+        assert!(Arc::ptr_eq(&older.storage, &newer.storage));
+        assert!(Arc::ptr_eq(&newer.storage, &old_turn.storage));
+        assert!(
+            newer.config == newer_config,
+            "new caller retains its exact configuration"
+        );
+        assert!(
+            newer
+                .reserve_attempt(reservation("prx-new-limits", 2000, 10_000))
+                .is_err()
+        );
+        assert!(matches!(
+            newer.check_budget(0.002).unwrap(),
+            BudgetCheck::Exceeded { .. }
+        ));
+        assert!(!matches!(
+            old_turn.check_budget(0.002).unwrap(),
+            BudgetCheck::Exceeded { .. }
+        ));
+        older
+            .settle_metered(&metered_record("prx-shared-configuration", Some(0.002)))
+            .unwrap();
+        assert_eq!(newer.get_summary().unwrap().request_count, 1);
+        assert_eq!(old_turn.get_summary().unwrap().request_count, 1);
     }
 
     #[test]
