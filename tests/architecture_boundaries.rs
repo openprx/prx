@@ -1048,14 +1048,26 @@ fn config_writes_route_through_the_transaction_layer() {
         (
             "src/onboard/wizard.rs",
             ".save()",
-            3,
-            "not yet migrated: onboarding (offline)",
+            2,
+            "offline channel repair (one occurrence is in a comment)",
+        ),
+        (
+            "src/onboard/wizard/persistence.rs",
+            ".save()",
+            1,
+            "offline first-run defaults",
         ),
         (
             "src/onboard/wizard.rs",
             "write_split_config(",
-            2,
-            "offline channel repair and safe first-run defaults",
+            1,
+            "offline channel repair",
+        ),
+        (
+            "src/onboard/wizard/persistence.rs",
+            "write_split_config(",
+            1,
+            "safe first-run defaults",
         ),
         (
             "src/runtime/mode.rs",

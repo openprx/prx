@@ -93,3 +93,10 @@ lines; the largest moved source/test file is below 1,500 lines. The full public
 The original 227 schema tests remain with unchanged assertions. One inherited
 host-specific example path is replaced by a neutral project path in a fixture
 and the corresponding schema description.
+
+The onboarding wizard keeps its public entry points through re-exports while
+models, provider setup, workspace setup, preferences, channels, tunnels,
+summaries, and persistence live in `src/onboard/wizard/`. Its root is 397
+lines; the largest production child is 1,416 lines and the largest test child
+is 943 lines. All 77 original tests remain. Source guards cover the root and
+production children; moved test files retain explicit test-only scope.
