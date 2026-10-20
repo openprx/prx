@@ -96,6 +96,18 @@ fn excludes(declaration: &CatalogParameter, name: &str) -> bool {
     }
 }
 
+pub(crate) fn bounded_number(number: f64, min: f64, max: f64, step: Option<f64>) -> f64 {
+    let mut bounded = number.clamp(min, max);
+    if let Some(step) = step {
+        let stepped = ((bounded - min) / step).round().mul_add(step, min).clamp(min, max);
+        // Preserve an aligned value instead of manufacturing float noise.
+        if (stepped - bounded).abs() > f64::EPSILON * bounded.abs().max(1.0) * 8.0 {
+            bounded = stepped;
+        }
+    }
+    bounded
+}
+
 fn insert(
     model: &ReleaseModel,
     values: &mut BTreeMap<ModelParameter, Value>,
@@ -117,15 +129,7 @@ fn insert(
                 .as_f64()
                 .filter(|number| number.is_finite())
                 .ok_or_else(|| anyhow::anyhow!("model parameter {name} requires a finite number"))?;
-            let mut bounded = number.clamp(*min, *max);
-            if let Some(step) = step {
-                let stepped = (min + ((bounded - min) / step).round() * step).clamp(*min, *max);
-                // Preserve an already aligned value instead of manufacturing
-                // float noise and reporting it as a real clamp.
-                if (stepped - bounded).abs() > f64::EPSILON * bounded.abs().max(1.0) * 8.0 {
-                    bounded = stepped;
-                }
-            }
+            let bounded = bounded_number(number, *min, *max, *step);
             if matches!(
                 parameter,
                 ModelParameter::MaxOutputTokens | ModelParameter::ThinkingBudget | ModelParameter::Seed

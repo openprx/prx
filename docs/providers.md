@@ -895,11 +895,18 @@ onboarding use the same configuration transaction boundary. See
 
 Adapter output caps are defaults, so the release catalog and a saved level can
 replace them. For example, Anthropic Sonnet 5 `high` sends `max_tokens: 8192`.
+If neither supplies a limit, Anthropic and Bedrock retain the adapter output
+limit so required request fields remain present.
 Explicit caller limits still take precedence. Unknown models and rows with no
 parameter declarations retain their adapter request, including Codex's legacy
 medium verbosity and xhigh effort. Authentication retries reuse the first
 preparation record. Parameter lookup uses the selected canonical provider
 identity, including endpoints sharing the OpenAI transport.
+
+Stale saved settings are adjusted once for each resolved provider generation,
+with a warning when an invalid value is dropped or clamped. Repeated requests,
+streams and inherited tasks reuse that preparation. Replacing the provider
+generation prepares its settings again and can warn again.
 
 ## Release catalog lifecycle
 
