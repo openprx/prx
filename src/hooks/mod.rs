@@ -230,6 +230,8 @@ pub struct HookCore {
     policy: RwLock<HookPolicy>,
     media_artifacts: std::sync::Arc<crate::media::MediaArtifactOwner>,
     state: RwLock<RuntimeState>,
+    /// Longest one event may occupy the dispatcher.
+    delivery_bound: Duration,
     /// Process-level WASM plugin runtime; it is the sole generation owner.
     #[cfg(feature = "wasm-plugins")]
     plugin_runtime: tokio::sync::RwLock<Option<std::sync::Arc<crate::plugins::PluginRuntime>>>,
@@ -240,6 +242,11 @@ pub const HOOK_QUEUE_CAPACITY: usize = 1024;
 
 /// Upper bound on the wait for queued events at shutdown.
 pub const HOOK_DRAIN_BOUND: Duration = Duration::from_secs(3);
+
+/// Longest one event may occupy the dispatcher: the largest single hook
+/// timeout. Every hook, WASM hook and event-bus subscriber of the event shares
+/// it, so one that never completes costs the queue this much, not forever.
+const HOOK_EVENT_DELIVERY_BOUND: Duration = Duration::from_millis(MAX_TIMEOUT_MS);
 
 enum DispatchMessage {
     Event {
@@ -306,6 +313,7 @@ impl HookManager {
                 }),
                 media_artifacts,
                 state: RwLock::new(RuntimeState::default()),
+                delivery_bound: HOOK_EVENT_DELIVERY_BOUND,
                 #[cfg(feature = "wasm-plugins")]
                 plugin_runtime: tokio::sync::RwLock::new(None),
             }),
@@ -322,6 +330,16 @@ impl HookManager {
     #[must_use]
     pub fn with_config(self, shared: crate::config::SharedConfig) -> Self {
         *self.core.policy.write() = HookPolicy::Live(shared);
+        self
+    }
+
+    /// Shorten the per-event delivery bound (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_delivery_bound(mut self, bound: Duration) -> Self {
+        if let Some(core) = std::sync::Arc::get_mut(&mut self.core) {
+            core.delivery_bound = bound;
+        }
         self
     }
 
@@ -483,6 +501,21 @@ impl HookCore {
         Ok(Some(backup))
     }
 
+    /// [`Self::deliver`] under the per-event bound; on expiry the event is
+    /// abandoned (logged) so the next one is delivered.
+    async fn deliver_bounded(&self, event: HookEvent, payload: &serde_json::Value) {
+        if tokio::time::timeout(self.delivery_bound, self.deliver(event, payload))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                event = event.as_str(),
+                bound_ms = u64::try_from(self.delivery_bound.as_millis()).unwrap_or(u64::MAX),
+                "hook delivery exceeded its bound and was abandoned"
+            );
+        }
+    }
+
     /// Deliver one already-redacted event: command hooks first, then WASM
     /// lifecycle hooks and the plugin event bus. Runs on the dispatcher, never
     /// on a turn.
@@ -596,12 +629,6 @@ impl HookCore {
         let working_dir = crate::config::mcp_launch::launch_directory(&launch_root, "workspace-hooks", None)
             .map_err(|error| anyhow::anyhow!(error))?;
         crate::config::mcp_launch::prepare_launch_directory(&launch_root, &working_dir).await?;
-        if action.cwd.is_some() {
-            tracing::warn!(
-                event = event.as_str(),
-                "hooks.json `cwd` is ignored: workspace hooks start in their dedicated directory"
-            );
-        }
         // A command with a path separator is workspace content (a script in
         // the workspace): resolve it against the workspace, since the hook
         // no longer starts there. A bare name is looked up in `PATH`.
@@ -786,15 +813,20 @@ impl HookManager {
             std::borrow::Cow::Borrowed(_) => None,
         };
         let payload = owned.unwrap_or(payload);
-        match self.sender().try_send(DispatchMessage::Event { event, payload }) {
+        let sent = match self.sender() {
+            Some(sender) => sender
+                .try_send(DispatchMessage::Event { event, payload })
+                .map_err(|error| match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => "queue full",
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "dispatcher stopped",
+                }),
+            None => Err("no async runtime"),
+        };
+        match sent {
             Ok(()) => {
                 self.stats.queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            Err(error) => {
-                let reason = match error {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => "queue full",
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "dispatcher stopped",
-                };
+            Err(reason) => {
                 let dropped = self.stats.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 // Logged on the first drop and then every 100th, so a stalled
                 // hook cannot also flood the log.
@@ -832,12 +864,27 @@ impl HookManager {
         }
         let (done, delivered) = tokio::sync::oneshot::channel();
         let wait = async {
-            if self.sender().send(DispatchMessage::Flush(done)).await.is_err() {
+            let Some(sender) = self.sender() else {
+                return false;
+            };
+            if sender.send(DispatchMessage::Flush(done)).await.is_err() {
                 return false;
             }
             delivered.await.is_ok()
         };
         tokio::time::timeout(bound, wait).await.unwrap_or(false)
+    }
+
+    /// Drain at process or component shutdown: wait at most
+    /// [`HOOK_DRAIN_BOUND`] and log what is abandoned. Every owner of a live
+    /// manager calls this on its exit path.
+    pub async fn drain_for_shutdown(&self) {
+        if !self.drain(HOOK_DRAIN_BOUND).await {
+            tracing::warn!(
+                bound_secs = HOOK_DRAIN_BOUND.as_secs(),
+                "hook events were still queued at shutdown; the rest are abandoned"
+            );
+        }
     }
 
     /// Wait until `count` events were delivered in total (tests whose
@@ -856,16 +903,22 @@ impl HookManager {
     }
 
     /// The queue's sender; the single worker starts with the first event.
-    fn sender(&self) -> &tokio::sync::mpsc::Sender<DispatchMessage> {
-        self.queue.get_or_init(|| {
+    /// `None` outside a tokio runtime, where no worker can start (the event is
+    /// dropped and counted rather than panicking the caller).
+    fn sender(&self) -> Option<&tokio::sync::mpsc::Sender<DispatchMessage>> {
+        if let Some(sender) = self.queue.get() {
+            return Some(sender);
+        }
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        Some(self.queue.get_or_init(|| {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<DispatchMessage>(self.capacity);
             let core = std::sync::Arc::clone(&self.core);
             let stats = std::sync::Arc::clone(&self.stats);
-            tokio::spawn(async move {
+            runtime.spawn(async move {
                 while let Some(message) = rx.recv().await {
                     match message {
                         DispatchMessage::Event { event, payload } => {
-                            core.deliver(event, &payload).await;
+                            core.deliver_bounded(event, &payload).await;
                             stats.delivered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             #[cfg(test)]
                             stats.delivery_signal.notify_waiters();
@@ -878,7 +931,7 @@ impl HookManager {
                 }
             });
             tx
-        })
+        }))
     }
 }
 
@@ -2022,6 +2075,53 @@ mod tests {
         std::fs::write(&gate, b"open").unwrap();
         assert!(manager.drain(TEST_DRAIN).await);
         assert_eq!(logged_seqs(&log), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_delivers_an_event_emitted_just_before_exit() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let (gate, log) = (temp.path().join("gate"), temp.path().join("log"));
+        std::fs::write(&gate, b"open").unwrap();
+        write_gated_logging_hook(&workspace, &gate, &log);
+        let manager = HookManager::new(workspace).allowing_workspace_hooks(temp.path().join("hooks"));
+
+        // The helper every owner (worker, CLI, chat, channels, gateway) calls
+        // on its exit path: nothing emitted before it may be lost.
+        manager.emit(HookEvent::TurnComplete, json!({"seq": 1})).await;
+        manager.drain_for_shutdown().await;
+        assert_eq!(logged_seqs(&log), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn a_delivery_that_never_completes_does_not_stall_the_next_event() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let marker = temp.path().join("second-ran");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let hooks = json!({
+            "timeout_ms": 60_000,
+            "hooks": {
+                "turn_complete": [{"command": "sh", "args": ["-c", "sleep 30"], "stdin_json": false}],
+                "error": [{"command": "sh", "args": ["-c", format!("touch '{}'", marker.display())], "stdin_json": false}]
+            }
+        });
+        std::fs::write(workspace.join("hooks.json"), hooks.to_string()).unwrap();
+        let manager = HookManager::new(workspace)
+            .allowing_workspace_hooks(temp.path().join("hooks"))
+            .with_delivery_bound(Duration::from_millis(300));
+
+        manager.emit(HookEvent::TurnComplete, json!({})).await;
+        manager.emit(HookEvent::Error, json!({})).await;
+        assert!(
+            manager.drain(TEST_DRAIN).await,
+            "the stuck event must not hold the queue"
+        );
+        assert!(
+            marker.exists(),
+            "the next event was delivered after the first timed out"
+        );
+        assert_eq!(manager.dispatch_stats().delivered, 2);
     }
 
     #[tokio::test]

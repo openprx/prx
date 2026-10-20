@@ -2048,12 +2048,7 @@ pub async fn run_gateway(
         .cleanup
         .drain(tokio::time::Instant::now() + Duration::from_secs(15))
         .await;
-    if !hooks_for_shutdown.drain(crate::hooks::HOOK_DRAIN_BOUND).await {
-        tracing::warn!(
-            bound_secs = crate::hooks::HOOK_DRAIN_BOUND.as_secs(),
-            "hook events were still queued at shutdown; the rest are abandoned"
-        );
-    }
+    hooks_for_shutdown.drain_for_shutdown().await;
     health_shutdown.cancel();
     let _ = health_heartbeat.await;
     serve_result?;

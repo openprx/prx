@@ -1153,6 +1153,26 @@ fn workspace_hooks_launch_through_the_shared_builder_behind_the_opt_in() {
     );
 }
 
+/// Finding 96: hook events are queued, so every owner of a live
+/// `HookManager` drains it on its exit path or loses the last events.
+#[test]
+fn every_live_hook_manager_owner_drains_at_shutdown() {
+    for path in [
+        "src/gateway/mod.rs",
+        "src/channels/startup.rs",
+        "src/chat/run.rs",
+        "src/agent/entry.rs",
+        "src/session_worker/runner/run.rs",
+    ] {
+        let source =
+            fs::read_to_string(repository_root().join(path)).unwrap_or_else(|error| panic!("read {path}: {error}"));
+        assert!(
+            production_part(&source).contains("drain_for_shutdown()"),
+            "{path} owns a live HookManager and must call drain_for_shutdown() on its exit path"
+        );
+    }
+}
+
 /// GIT-ENV F-6 (D-103): the production places that name the `git`
 /// program (`"git"`, `"git.exe"`, or a path ending in one), as
 /// `file::function::literal`. Only the hardened launch starts git; the rest
