@@ -7,11 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Decision-plane candidate under local development, **not accepted or released**.
-The source default-on cutover is prepared for adoption with its init template;
-this does not change an installed service or real configuration. See the
-[candidate notes](docs/release-notes-decision-plane-candidate-2026-10-04.md)
-for integration, validation and rollback limits.
+Unreleased changes merged during local closeout. Deployment, real messaging,
+paid-provider validation and external PostgreSQL/platform acceptance remain
+pending. See the [candidate notes](docs/release-notes-decision-plane-candidate-2026-10-04.md)
+and the migration warnings below before upgrading.
+
+### Added
+
+- Opt-in, owner-scoped skill lifecycle support: immutable revisions and per-task
+  skill pins, selection and terminal receipts, knowledge consolidation, managed
+  provider proposal staging, frozen-suite evaluation and deterministic gates,
+  and generation-checked publication, rollback and recovery. The lifecycle
+  service exposes approval-bound management actions and
+  `prx skills lifecycle status|list|inspect|publish|cancel|rollback|force-close`.
+  It defaults to disabled and `draft_only`; executable proposals are refused,
+  and automatic proposal scheduling is not wired. See
+  [skill lifecycle configuration](docs/configuration.md).
+- Release catalog inspection and retired-model migration commands, plus
+  persistent `low`/`medium`/`high` levels and typed model parameter selections
+  through transactional configuration management. CLI, chat, onboarding and
+  Console share the same saved settings and catalog generation. Catalog
+  revision and digest are carried in authenticated child provenance. See
+  [the model catalog contract](docs/model-catalog.md).
+- Explicit recursive child delegation, disabled by default, with a maximum
+  depth of one, one child slot and a signed share of the parent's remaining
+  allowance. See [recursive child grants](docs/tools.md).
 
 ### Changed
 
@@ -34,25 +54,6 @@ for integration, validation and rollback limits.
 - Workspace cost configuration views remain pinned across reloads.
 - Failed creation directory sync rolls back the new entry so retries cannot
   skip that sync.
-
-- **Breaking: WASM plugins are off and need operator trust (finding 95).**
-  `[plugins] enabled` defaults to `false`; nothing under `<workspace>/plugins`
-  is scanned or loaded until it is set to `true` (restart required). Existing
-  installs must set `[plugins] enabled = true` **and reinstall each plugin**
-  with `wasm_plugins_manage install` (passing `grant_permissions`; the approval
-  is high risk and bound to the plugin name, component hash, manifest hash and
-  permissions). The `.prx-managed` marker no longer confers trust, a plugin
-  without a record in `plugin-trust.json` (beside `config.toml`) is refused, and
-  an optional permission is granted only through that record. Outbound
-  `http-outbound` / `websocket-outbound`: an empty `http_allowlist` now denies
-  every URL, entries are URL patterns (`https://host/*`, `*.` subdomains; the
-  old string-prefix form `https://host*` is a manifest error), private,
-  loopback, link-local, CGNAT and metadata addresses are refused (also after DNS
-  and on redirects), and `max_http_requests_per_call` is enforced. Writing under
-  `plugins/` or to the trust file or cache with the file tools is a high-risk
-  operation. The precompile cache moved out of the workspace to `plugin-cache/`
-  beside the trust file and is keyed by SHA-256; old `plugins/.cwasm-cache` is
-  ignored. See `docs/configuration.md` (WASM plugins).
 
 - Automix premium escalation now has a separate window starting at the cheap
   reply: `router.automix.escalation_window_ms`, default 30,000 ms, range
@@ -81,10 +82,11 @@ for integration, validation and rollback limits.
   a closed vocabulary, including streaming, Gemini OAuth and signed Bedrock
   bodies. Release data replaces the Kimi URL temperature heuristic and Codex
   model-ID effort clamps; unsupported values are dropped, numeric bounds and
-  recognized effort values are clamped, and invalid typed values fail locally.
-  Unverified models use the adapter base request. Known catalog rows omit
-  undeclared canonical fields, including legacy overrides and adapter defaults;
-  an empty parameter declaration preserves the adapter base request. Catalog changes roll back
+  recognized effort values are clamped, and invalid explicit caller types fail
+  locally. Unverified models use the adapter base request. Known catalog rows
+  omit undeclared optional canonical fields, including legacy overrides and
+  adapter defaults; API-required output limits retain a positive default. An
+  empty parameter declaration preserves the adapter base request. Catalog changes roll back
   with the binary; operator TOML and credential ownership are unchanged.
   Prepared values and revision stay in the existing main and auxiliary outcome
   records, including failed auxiliary calls, without a separate event write.
@@ -183,11 +185,11 @@ for integration, validation and rollback limits.
   uses actual serving and terminal evidence; newly constructed embedded Agents
   do not inherit an earlier session's statistics. New authenticated Router
   projections require readers that understand them.
-- Separately billed embedding, premium AutoMix escalation and auxiliary Channel
-  vision summaries remain blocked by `BudgetUnproven`. Vision summaries are
-  unavailable in this candidate; ordinary chat authority does not permit that
-  additional send. Full behavior, restart, performance and independent acceptance
-  remain pending.
+- Supported premium AutoMix escalation now reserves and settles its own
+  physical attempt within the parent allowance; failure retains the cheap
+  reply and any incurred liability. Separately billed embedding and auxiliary
+  Channel vision summaries remain blocked by `BudgetUnproven`; ordinary chat
+  authority does not permit those additional sends.
 
 - `[agent] tool_dispatcher` is removed because it was never read: the tool-call
   wire form follows the provider's capabilities. A file that still carries it
@@ -198,15 +200,25 @@ for integration, validation and rollback limits.
   follow the configured `[observability]` backend. See the
   [upgrade actions](docs/migration-unreleased.md).
 
-- Skill lifecycle groundwork: immutable owner-scoped skill revisions, a
-  publication journal with generation compare-and-swap and rollback, and a
-  replay-safe import of existing skill directories. `skill_read` serves a
-  managed revision only for a caller that has a managed
-  binding; otherwise it reads the existing skill files exactly as before. No
-  command creates managed revisions in this candidate and nothing rewrites an
-  existing skill directory.
+- Native and plugin hooks deliver through a bounded background queue, with
+  bounded per-event delivery and shutdown draining. Delegate and spawned
+  children share the parent's hook manager. Selection receipts and recovered
+  terminal skill settlement run outside the turn path; uncertain outcomes do
+  not train successful skill use.
 
 ### Fixed
+
+- Invalid saved model settings are dropped or clamped with diagnostics at
+  runtime and remain readable in the Console for repair. Misspelled route keys
+  are refused at load. Retired-model migration refuses changes that would
+  silently discard a model variant.
+- Catalog parameter preparation preserves caller precedence, required provider
+  output limits and adapter defaults for undeclared models. Streaming system
+  prompts use OpenAI's native chat transport. Doctor recognizes custom Cargo
+  build directories from their layout.
+- Router learning is serialized within its existing deadline. Decision-store
+  preparation, cleanup and accounting persistence retain ownership through
+  cancellation without blocking Tokio workers or widening admission budgets.
 
 - Existing configurations no longer mistake the previously serialized 500 ms
   decision latency default for an operator override when selecting a hosted
@@ -229,6 +241,37 @@ for integration, validation and rollback limits.
 - The PostgreSQL memory backend now counts useful recalls
   (`increment_useful_count` incremented nothing before). An unknown id updates
   nothing and is not an error, as in SQLite.
+
+### Security
+
+- Raise the minimum Rustls, trusted-root bundle and Wasmtime patch versions
+  to include current upstream security fixes.
+
+- **Breaking: WASM plugins are off and need operator trust.**
+  `[plugins] enabled` defaults to `false`; nothing under `<workspace>/plugins`
+  is scanned or loaded until it is set to `true` (restart required). Existing
+  installs must set `[plugins] enabled = true` **and reinstall each plugin**
+  with `wasm_plugins_manage install` (passing `grant_permissions`; the approval
+  is high risk and bound to the plugin name, component hash, manifest hash and
+  permissions). The `.prx-managed` marker no longer confers trust, a plugin
+  without a record in `plugin-trust.json` (beside `config.toml`) is refused, and
+  an optional permission is granted only through that record. Outbound
+  `http-outbound` / `websocket-outbound`: an empty `http_allowlist` now denies
+  every URL, entries are URL patterns (`https://host/*`, `*.` subdomains; the
+  old string-prefix form `https://host*` is a manifest error), private,
+  loopback, link-local, CGNAT and metadata addresses are refused (also after DNS
+  and on redirects), and `max_http_requests_per_call` is enforced. Writing under
+  `plugins/` or to the trust file or cache with the file tools is a high-risk
+  operation. The precompile cache moved out of the workspace to `plugin-cache/`
+  beside the trust file and is keyed by SHA-256; old `plugins/.cwasm-cache` is
+  ignored. See `docs/configuration.md` (WASM plugins).
+
+- Worker transport signing keys are published without clobbering an existing
+  key, existing key permissions are tightened, and a per-process fallback logs
+  its cause. Recursive approvals retain the original run's child slot and
+  balance across authenticated resume.
+- `hooks.json` rejects working-directory overrides, so hook actions retain the
+  admitted workspace boundary.
 
 ## [0.8.162] - 19 September 2026
 
