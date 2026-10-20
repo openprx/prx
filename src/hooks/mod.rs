@@ -813,15 +813,14 @@ impl HookManager {
             std::borrow::Cow::Borrowed(_) => None,
         };
         let payload = owned.unwrap_or(payload);
-        let sent = match self.sender() {
-            Some(sender) => sender
+        let sent = self.sender().map_or(Err("no async runtime"), |sender| {
+            sender
                 .try_send(DispatchMessage::Event { event, payload })
                 .map_err(|error| match error {
                     tokio::sync::mpsc::error::TrySendError::Full(_) => "queue full",
                     tokio::sync::mpsc::error::TrySendError::Closed(_) => "dispatcher stopped",
-                }),
-            None => Err("no async runtime"),
-        };
+                })
+        });
         match sent {
             Ok(()) => {
                 self.stats.queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
