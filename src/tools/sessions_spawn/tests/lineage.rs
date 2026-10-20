@@ -63,6 +63,26 @@ async fn spawn_fan_out_is_uncapped_by_concurrency_or_children() {
     /// Comfortably past both removed ceilings (64 global, 32 per session).
     const FAN_OUT: usize = 100;
 
+    // Linux QA inherits a low soft FD limit shared by all parallel tests.
+    // Use this test process's existing hard limit before parking 100 children;
+    // keep it raised until process exit so other live tests retain headroom.
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+        let limits = getrlimit(Resource::Nofile);
+        if limits.current != limits.maximum {
+            setrlimit(
+                Resource::Nofile,
+                Rlimit {
+                    current: limits.maximum,
+                    maximum: limits.maximum,
+                },
+            )
+            .expect("raise the test process soft FD limit to its existing hard limit");
+        }
+    }
+
     let (ch, _) = RecordingChannel::new();
     // Every run parks inside the provider, so all FAN_OUT of them are
     // simultaneously Running when the assertions below look at the registry.
