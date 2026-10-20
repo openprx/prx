@@ -397,7 +397,7 @@ async fn mcp_memory_search_hides_rows_with_no_owner_from_an_isolated_caller() {
 /// The row is forced public with SQL because no memory API writes that
 /// visibility: `classify_memory` produces `owner`, `group` or `private`
 /// only, and `MemoryStoreMetadata` carries no visibility field. The open is
-/// declared in `tests/architecture_boundaries.rs`.
+/// declared in `tests/architecture_boundaries/`.
 #[tokio::test]
 async fn mcp_memory_search_still_returns_public_rows() {
     let workspace = TempDir::new().expect("test: temp workspace");

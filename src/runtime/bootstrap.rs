@@ -985,7 +985,7 @@ mod tests {
     /// nested block comments honoured) and `strip_cfg_test_items` (every
     /// `#[cfg(test)]` construct blanked, extents computed on comment- and
     /// literal-blanked text).
-    // Scanner code shared with `tests/architecture_boundaries.rs`: every index
+    // Scanner code shared with `tests/architecture_boundaries/`: every index
     // is bounded by its loop condition.
     #[allow(clippy::indexing_slicing)]
     mod cfg_test_scan {
