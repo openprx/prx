@@ -15,6 +15,10 @@ for integration, validation and rollback limits.
 
 ### Changed
 
+- Known Codex models now default to `medium` reasoning effort instead of the
+  pre-C2 `xhigh`. Explicit configured effort still takes precedence. Unknown
+  models retain the pre-C2 base request (`medium` verbosity and `xhigh` effort).
+
 - Ordinary causal telemetry reserves channel headroom for Applied/Drain controls.
 - Recursive child grants now subtract a strict half-share from the parent's
   remaining monetary balance, rounded down to whole cents. Authenticated
@@ -73,7 +77,7 @@ for integration, validation and rollback limits.
   recognized effort values are clamped, and invalid typed values fail locally.
   Unverified models use the adapter base request. Known catalog rows omit
   undeclared canonical fields, including legacy overrides and adapter defaults;
-  an empty parameter declaration uses provider defaults. Catalog changes roll back
+  an empty parameter declaration preserves the adapter base request. Catalog changes roll back
   with the binary; operator TOML and credential ownership are unchanged.
   Prepared values and revision stay in the existing main and auxiliary outcome
   records, including failed auxiliary calls, without a separate event write.

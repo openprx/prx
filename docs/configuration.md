@@ -8,6 +8,10 @@ For decision admission, backend gates, inspection and rollback, see the
 The embedded [model catalog](model-catalog.md) owns declared request parameter
 defaults and model levels. The existing Codex reasoning override remains an
 explicit caller value; the resolver applies the selected model's constraints.
+`runtime.codex_reasoning_effort` accepts `none`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, or `max`; invalid values fail typed validation when configuration
+loads. With no override, known Codex models now use `medium` effort instead of
+`xhigh`. Unknown Codex models retain `medium` verbosity and `xhigh` effort.
 Kimi Code's temperature constraint follows its selected model, without inferring
 model support from the endpoint URL. These changes do not write configuration.
 

@@ -57,6 +57,20 @@ pub fn resolve(model: &ReleaseModel, revision: &str, layers: &[ParameterLayer]) 
             insert(model, &mut result.values, *parameter, value.clone())?;
         }
     }
+    if matches!(model.provider.as_str(), "anthropic" | "bedrock")
+        && let (Some(output), Some(thinking)) = (
+            result
+                .values
+                .get(&ModelParameter::MaxOutputTokens)
+                .and_then(Value::as_u64),
+            result
+                .values
+                .get(&ModelParameter::ThinkingBudget)
+                .and_then(Value::as_u64),
+        )
+    {
+        anyhow::ensure!(output > thinking, "max_output_tokens must exceed thinking_budget");
+    }
     Ok(result)
 }
 
@@ -105,7 +119,12 @@ fn insert(
                 .ok_or_else(|| anyhow::anyhow!("model parameter {name} requires a finite number"))?;
             let mut bounded = number.clamp(*min, *max);
             if let Some(step) = step {
-                bounded = (min + ((bounded - min) / step).round() * step).clamp(*min, *max);
+                let stepped = (min + ((bounded - min) / step).round() * step).clamp(*min, *max);
+                // Preserve an already aligned value instead of manufacturing
+                // float noise and reporting it as a real clamp.
+                if (stepped - bounded).abs() > f64::EPSILON * bounded.abs().max(1.0) * 8.0 {
+                    bounded = stepped;
+                }
             }
             if matches!(
                 parameter,
@@ -124,7 +143,11 @@ fn insert(
                 Value::from(bounded as i64)
             } else {
                 if bounded != number {
-                    tracing::warn!(parameter = name, "clamped model parameter to its catalog range");
+                    if min == max {
+                        tracing::debug!(parameter = name, "applied fixed catalog parameter");
+                    } else {
+                        tracing::warn!(parameter = name, "clamped model parameter to its catalog range");
+                    }
                 }
                 Value::from(bounded)
             }
@@ -176,10 +199,10 @@ fn clamp_effort<'a>(requested: &str, allowed: &'a [String]) -> Option<&'a str> {
             ORDER
                 .iter()
                 .position(|candidate| *candidate == value)
-                .map(|index| (index.abs_diff(requested), value.as_str()))
+                .map(|index| (index.abs_diff(requested), std::cmp::Reverse(index), value.as_str()))
         })
-        .min_by_key(|(distance, _)| *distance)
-        .map(|(_, value)| value)
+        .min_by_key(|(distance, index, _)| (*distance, *index))
+        .map(|(_, _, value)| value)
 }
 
 #[cfg(test)]
@@ -326,6 +349,54 @@ mod tests {
         assert_eq!(
             result.values.get(&ModelParameter::MaxOutputTokens).unwrap().clone(),
             8192
+        );
+    }
+    #[test]
+    fn aligned_decimal_step_does_not_change_or_warn_about_the_value() {
+        let result = resolve(&model(), "test", &[layer(None, json!({"temperature":0.3}))]).unwrap();
+        assert_eq!(*result.values.get(&ModelParameter::Temperature).unwrap(), json!(0.3));
+    }
+
+    #[test]
+    fn minimal_effort_tie_keeps_reasoning_enabled() {
+        assert_eq!(clamp_effort("minimal", &["none".into(), "low".into()]), Some("low"));
+    }
+
+    #[test]
+    fn anthropic_thinking_budget_must_fit_inside_the_output_cap() {
+        for provider in ["anthropic", "bedrock"] {
+            let mut row = model();
+            row.provider = provider.into();
+            assert!(
+                resolve(
+                    &row,
+                    "test",
+                    &[layer(None, json!({"max_output_tokens":2048,"thinking_budget":2048}))]
+                )
+                .is_err()
+            );
+            assert!(
+                resolve(
+                    &row,
+                    "test",
+                    &[layer(None, json!({"max_output_tokens":2049,"thinking_budget":2048}))]
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_output_cutoff_does_not_require_a_smaller_thinking_budget() {
+        let mut row = model();
+        row.provider = "gemini".into();
+        assert!(
+            resolve(
+                &row,
+                "test",
+                &[layer(None, json!({"max_output_tokens":2048,"thinking_budget":2048}))]
+            )
+            .is_ok()
         );
     }
 }

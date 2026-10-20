@@ -776,8 +776,8 @@ impl AnthropicProvider {
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&super::parameter_wire::request(
-                self.parameter_provider.as_str(),
+            .json(&super::parameter_wire::request_for(
+                &self.parameter_provider,
                 super::parameter_wire::Format::Anthropic,
                 &native_request.model,
                 &native_request,
@@ -792,8 +792,8 @@ impl AnthropicProvider {
                     .post(format!("{}/v1/messages", self.base_url))
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
-                    .json(&super::parameter_wire::request(
-                        self.parameter_provider.as_str(),
+                    .json(&super::parameter_wire::request_for(
+                        &self.parameter_provider,
                         super::parameter_wire::Format::Anthropic,
                         &native_request.model,
                         &native_request,
@@ -1317,8 +1317,8 @@ impl Provider for AnthropicProvider {
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&super::parameter_wire::request(
-                self.parameter_provider.as_str(),
+            .json(&super::parameter_wire::request_for(
+                &self.parameter_provider,
                 super::parameter_wire::Format::Anthropic,
                 &body.model,
                 &body,
@@ -1334,8 +1334,8 @@ impl Provider for AnthropicProvider {
                     .post(format!("{}/v1/messages", self.base_url))
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
-                    .json(&super::parameter_wire::request(
-                        self.parameter_provider.as_str(),
+                    .json(&super::parameter_wire::request_for(
+                        &self.parameter_provider,
                         super::parameter_wire::Format::Anthropic,
                         &body.model,
                         &body,
@@ -1533,8 +1533,8 @@ impl Provider for AnthropicProvider {
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
-                .json(&super::parameter_wire::request(
-                    parameter_provider.as_str(),
+                .json(&super::parameter_wire::request_for(
+                    &parameter_provider,
                     super::parameter_wire::Format::Anthropic,
                     &request_body.model,
                     &request_body,

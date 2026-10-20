@@ -1,3 +1,5 @@
+mod codex_effort;
+pub use codex_effort::InvalidCodexReasoningEffort;
 mod recursive_spawn;
 
 use crate::auth::codex_auth::default_codex_auth_json_path;
@@ -7156,6 +7158,7 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        codex_effort::validate(self.runtime.codex_reasoning_effort.as_deref())?;
         self.causal_tree.validate()?;
         // The JWKS URI is published in the public, signed Agent Card: a
         // `user:password@` there would be handed to every peer.

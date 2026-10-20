@@ -34,15 +34,23 @@ it is distinct from a provider's `reasoning_effort` value.
 Request parameter declarations use the closed vocabulary `temperature`,
 `top_p`, `max_output_tokens`, `reasoning_effort`, `thinking_budget`, `verbosity`,
 `service_tier`, and `seed`. Resolution starts with parameter defaults and the
-model's default level, then applies increasingly specific model, route and
-caller layers. A layer's explicit values follow its level. A later value removes
+model's default level. The resolver accepts increasingly specific model, route
+and caller layers; persisted model/route level selection is a C3 dependency
+and is not wired into the C2 runtime. Until C3, production applies only the
+base request's explicit caller fields after defaults. A layer's explicit values follow its level. A later value removes
 mutually exclusive earlier values, including exclusions declared in the reverse
 direction. Unsupported or undeclared overrides are dropped; numeric values are
 clamped to the declared range and step. Invalid types, fractional token counts,
 unknown levels and unrecognized enum values fail before transport. Recognized
 reasoning-effort values outside a model's supported subset clamp to the nearest
-declared effort, preserving the former Codex clamp behavior without model-ID
-branches in adapter code.
+declared effort, preferring the higher effort on a tie so `minimal` cannot
+disable reasoning. The adapter contains no model-ID branches for clamping.
+`runtime.codex_reasoning_effort` accepts only `none`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, or `max`; invalid values fail typed configuration validation.
+Unknown Codex models retain the legacy `medium` verbosity and `xhigh` effort
+base request unless effort is explicitly set. Known Codex models now default to
+`medium` effort instead of the pre-C2 `xhigh`; this is an adopted behavior change.
+An explicit configured effort still takes precedence.
 
 Adapter code maps canonical values to API fields; JSON metadata cannot add
 arbitrary request fields. The request serializer applies the same resolution to
@@ -55,9 +63,18 @@ protocol does not borrow original-provider model facts. Unverified model IDs use
 the adapter's base request without catalog rewriting. For a catalog model, every
 canonical wire field is removed before the declared, resolved values are written;
 undeclared fields cannot survive from an adapter default or caller override. An
-empty declaration set therefore uses provider defaults for these parameters.
-This also applies to legacy temperature and reasoning overrides; a release row
-must declare support before a known model receives the value. The resolved values and catalog revision
+empty declaration set is unverified and preserves the whole adapter base
+request, including the classifier's explicit temperature. For nonempty
+declarations, all explicit caller fields (including output limit, top-p and
+seed) participate in resolution before unsupported fields are removed.
+Ollama's boolean `think` is adapter-owned and survives catalog rewriting.
+Anthropic effort maps only to `output_config.effort`; it does not activate
+adaptive thinking, because signed thinking-block replay is not implemented.
+Anthropic and Bedrock thinking budgets must be strictly less than the output
+limit. Other adapters retain their own output-cutoff semantics.
+Compatible providers bind lookup to their configured canonical identity, not
+their display name. A streaming usage-option retry retains one preparation
+record for the logical request. The resolved values and catalog revision
 are retained in engine traces and the existing owner-bound
 `provider.final_outcome` event when that entrypoint records provider outcomes.
 The issued per-run decision context owns main preparation records, so an
@@ -79,7 +96,7 @@ turns and nested streaming tasks keep separate captures, and disabled recording
 does not borrow an outer turn's recorder. Selection surfaces and TOML settings
 remain the next catalog phase.
 
-Release `2026-10-19.1` carries Kimi Code's fixed temperature, Codex
+Release `2026-10-19.2` carries Kimi Code's fixed temperature, Codex
 effort/verbosity declarations, and explicit declarations for the shipped OpenAI,
 Anthropic, Gemini, Ollama, Bedrock and selected OpenRouter rows. Output defaults
 and conservative bounds preserve PRX's existing release policy; they do not
@@ -89,9 +106,8 @@ The wire fields follow the provider APIs, including Ollama's
 Bedrock's [`inferenceConfig` and `additionalModelRequestFields`](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html). Declared Codex rows now use the catalog's
 `medium` default effort and verbosity; the legacy configured effort remains a
 caller override, validated against the selected row. Kimi's rule follows the
-selected provider and model; a URL containing `kimi.com` supplies no parameter evidence. The hidden
-`kimi-code/kimi-k2` row preserves historical serialization compatibility and
-does not add that spelling to the three model IDs accepted by the factory.
+selected provider and model; a URL containing `kimi.com` supplies no parameter evidence. The former test-only hidden `kimi-code/kimi-k2` row has been removed; that
+legacy spelling has no declared parameter support and gains no factory support.
 Newly recorded deprecated Codex rows use this release's annotation date; it is
 not a claim about the vendor's original announcement date. Their parameter
 subsets preserve the former adapter assertions. See the official
@@ -211,3 +227,8 @@ The first command validates the embedded document, common levels, aliases,
 secrets, evidence precedence, and child revision pinning. The second drives the
 real CLI model listing through the management service and proves release rows
 carry catalog provenance.
+
+Finding 98 rollback: reverting the fix commits restores the C2 adapter
+serialization and pending-allowance lifecycle. C3 model/route selection remains
+a separate phase. Ordinary-child allowance carving is deferred to the next phase;
+ordinary children retain independent per-child allowances during closeout.

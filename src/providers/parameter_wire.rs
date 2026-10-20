@@ -124,12 +124,35 @@ pub(crate) fn check_selection(
 
 /// Serialization wrapper shared by ordinary, accounted and streaming sends.
 /// Unknown model identities use the base request; known rows send only their
-/// declared canonical values, even when the declaration set is empty.
+/// declared canonical values. Empty declarations are unverified and preserve
+/// the adapter base request, like an unknown model identity.
 pub(crate) struct Request<'a, T: ?Sized> {
-    provider: &'a str,
+    provider: ParameterProvider<'a>,
     format: Format,
     model: &'a str,
     body: &'a T,
+    record: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ParameterProvider<'a> {
+    Label(&'a str),
+    Canonical(&'a ProviderId),
+}
+
+pub(crate) const fn request_for<'a, T: Serialize + ?Sized>(
+    provider: &'a ProviderId,
+    format: Format,
+    model: &'a str,
+    body: &'a T,
+) -> Request<'a, T> {
+    Request {
+        provider: ParameterProvider::Canonical(provider),
+        format,
+        model,
+        body,
+        record: true,
+    }
 }
 
 pub(crate) const fn request<'a, T: Serialize + ?Sized>(
@@ -139,10 +162,11 @@ pub(crate) const fn request<'a, T: Serialize + ?Sized>(
     body: &'a T,
 ) -> Request<'a, T> {
     Request {
-        provider,
+        provider: ParameterProvider::Label(provider),
         format,
         model,
         body,
+        record: true,
     }
 }
 
@@ -150,20 +174,54 @@ impl<T: Serialize + ?Sized> Serialize for Request<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::Error as _;
         let catalog = ReleaseCatalog::embedded_ref().map_err(S::Error::custom)?;
-        let Some(model) = catalog.model(&ProviderId::of(self.provider), self.model) else {
+        let provider = match self.provider {
+            ParameterProvider::Label(label) => std::borrow::Cow::Owned(ProviderId::of(label)),
+            ParameterProvider::Canonical(provider) => std::borrow::Cow::Borrowed(provider),
+        };
+        let Some(model) = catalog.model(&provider, self.model) else {
             return self.body.serialize(serializer);
         };
-        encode(self.body, self.format, model, &catalog.revision)
+        if model.parameters.is_empty() {
+            return self.body.serialize(serializer);
+        }
+        encode_recorded(self.body, self.format, model, &catalog.revision, self.record)
             .map_err(S::Error::custom)?
             .serialize(serializer)
     }
 }
 
+/// A transport retry keeps the first preparation's provenance exactly once.
+pub(crate) const fn retry_request<'a, T: Serialize + ?Sized>(
+    provider: &'a str,
+    format: Format,
+    model: &'a str,
+    body: &'a T,
+) -> Request<'a, T> {
+    Request {
+        provider: ParameterProvider::Label(provider),
+        format,
+        model,
+        body,
+        record: false,
+    }
+}
+
+#[cfg(test)]
 fn encode<T: Serialize + ?Sized>(
     original: &T,
     format: Format,
     model: &super::catalog::ReleaseModel,
     revision: &str,
+) -> anyhow::Result<Value> {
+    encode_recorded(original, format, model, revision, true)
+}
+
+fn encode_recorded<T: Serialize + ?Sized>(
+    original: &T,
+    format: Format,
+    model: &super::catalog::ReleaseModel,
+    revision: &str,
+    record: bool,
 ) -> anyhow::Result<Value> {
     let mut body = serde_json::to_value(original)?;
     // OAuth Gemini transports wrap generationConfig inside `request`.
@@ -174,14 +232,37 @@ fn encode<T: Serialize + ?Sized>(
         &mut body
     };
     let mut caller = parameters::ParameterLayer::default();
-    for parameter in [ModelParameter::Temperature, ModelParameter::ReasoningEffort] {
+    for parameter in [
+        ModelParameter::Temperature,
+        ModelParameter::TopP,
+        ModelParameter::MaxOutputTokens,
+        ModelParameter::ReasoningEffort,
+        ModelParameter::ThinkingBudget,
+        ModelParameter::Verbosity,
+        ModelParameter::ServiceTier,
+        ModelParameter::Seed,
+    ] {
         if let Some(path) = format.path(parameter)
             && let Some(value) = get(target, path)
         {
+            // Ollama's adapter owns its explicit boolean switch. It is not
+            // a canonical string effort and needs no catalog declaration.
+            if matches!(format, Format::Ollama) && parameter == ModelParameter::ReasoningEffort && value.is_boolean() {
+                continue;
+            }
             caller.overrides.insert(parameter, value.clone());
         }
     }
     let resolved = parameters::resolve(model, revision, &[caller])?;
+    // Effort alone must never leave a partial/adaptive thinking object in an
+    // Anthropic request. Budget-based thinking is emitted only when resolved.
+    if !resolved.values.contains_key(&ModelParameter::ThinkingBudget) {
+        match format {
+            Format::Anthropic => remove(target, &["thinking"]),
+            Format::Bedrock => remove(target, &["additionalModelRequestFields", "thinking"]),
+            _ => {}
+        }
+    }
     for parameter in [
         ModelParameter::Temperature,
         ModelParameter::TopP,
@@ -193,6 +274,12 @@ fn encode<T: Serialize + ?Sized>(
         ModelParameter::Seed,
     ] {
         if let Some(path) = format.path(parameter) {
+            if matches!(format, Format::Ollama)
+                && parameter == ModelParameter::ReasoningEffort
+                && get(target, path).is_some_and(Value::is_boolean)
+            {
+                continue;
+            }
             remove(target, path);
         } else if model
             .parameters
@@ -217,17 +304,12 @@ fn encode<T: Serialize + ?Sized>(
                 _ => continue,
             };
             put(target, type_path, Value::from("enabled"))?;
-        } else if *parameter == ModelParameter::ReasoningEffort {
-            let type_path: &[&str] = match format {
-                Format::Anthropic => &["thinking", "type"],
-                Format::Bedrock => &["additionalModelRequestFields", "thinking", "type"],
-                _ => continue,
-            };
-            put(target, type_path, Value::from("adaptive"))?;
         }
     }
     tracing::debug!(model = %resolved.model, catalog_revision = %resolved.catalog_revision, parameters = ?resolved.values, "resolved model request parameters");
-    super::parameter_capture::record(resolved);
+    if record {
+        super::parameter_capture::record(resolved);
+    }
     Ok(body)
 }
 
@@ -478,7 +560,7 @@ mod tests {
             json!({"max_output_tokens":2048}),
         );
         let result = encode(
-            &json!({"model":"prx-model","request":{"contents":[],"generationConfig":{"maxOutputTokens":8192}}}),
+            &json!({"model":"prx-model","request":{"contents":[],"generationConfig":{"maxOutputTokens":2048}}}),
             Format::Gemini,
             &model,
             "test",
@@ -623,18 +705,43 @@ mod tests {
     }
 
     #[test]
-    fn known_models_drop_undeclared_wire_fields_including_an_empty_declaration_set() {
+    fn known_models_drop_undeclared_wire_fields_from_verified_declarations() {
         let row = model(
             json!({"max_output_tokens":{"kind":"range","min":1,"max":8192,"default":2048}}),
             json!({}),
         );
-        let body = json!({"model":"prx-model","temperature":0.7,"top_p":0.9,"seed":7,"max_tokens":4096,"messages":[],"stream":true});
+        let body = json!({"model":"prx-model","temperature":0.7,"top_p":0.9,"seed":7,"max_tokens":2048,"messages":[],"stream":true});
         let result = encode(&body, Format::Compatible, &row, "test").unwrap();
         assert_eq!(
             result,
             json!({"model":"prx-model","max_tokens":2048,"messages":[],"stream":true})
         );
-        let result = serde_json::to_value(request("deepseek", Format::Compatible, "deepseek-chat", &body)).unwrap();
+        let unsupported = model(
+            json!({"temperature":{"kind":"unsupported"},"top_p":{"kind":"unsupported"},"seed":{"kind":"unsupported"},"max_output_tokens":{"kind":"unsupported"}}),
+            json!({}),
+        );
+        let result = encode(&body, Format::Compatible, &unsupported, "test").unwrap();
         assert_eq!(result, json!({"model":"prx-model","messages":[],"stream":true}));
+    }
+    #[test]
+    fn explicit_caller_output_top_p_and_seed_override_release_defaults() {
+        let row = model(
+            json!({"max_output_tokens":{"kind":"range","min":1,"max":8192,"default":2048},"top_p":{"kind":"range","min":0,"max":1,"default":1.0},"seed":{"kind":"range","min":0,"max":1000,"default":1}}),
+            json!({"max_output_tokens":2048}),
+        );
+        let body = json!({"max_tokens":4096,"top_p":0.25,"seed":7,"messages":[]});
+        assert_eq!(encode(&body, Format::Compatible, &row, "test").unwrap(), body);
+    }
+
+    #[test]
+    fn explicit_oauth_gemini_output_override_stays_in_the_request_envelope() {
+        let row = model(
+            json!({"max_output_tokens":{"kind":"range","min":1,"max":8192,"default":2048}}),
+            json!({"max_output_tokens":2048}),
+        );
+        let body = json!({"model":"prx-model","request":{"contents":[],"generationConfig":{"maxOutputTokens":8192}}});
+        let encoded = encode(&body, Format::Gemini, &row, "test").unwrap();
+        assert_eq!(encoded, body);
+        assert!(encoded.get("generationConfig").is_none());
     }
 }

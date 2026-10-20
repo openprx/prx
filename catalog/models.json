@@ -1,8 +1,8 @@
 {
   "$schema": "./models.schema.json",
   "schema_version": "1.0",
-  "revision": "2026-10-19.1",
-  "published_at": "2026-10-19T00:00:00Z",
+  "revision": "2026-10-19.2",
+  "published_at": "2026-10-19T22:46:12Z",
   "providers": {
     "anthropic": {
       "default_model": "anthropic/claude-sonnet-5",
@@ -5492,37 +5492,6 @@
         "high": {
           "reasoning_effort": "high"
         }
-      },
-      "default_level": "medium"
-    },
-    {
-      "id": "kimi-code/kimi-k2",
-      "provider": "kimi-code",
-      "api_model": "kimi-k2",
-      "display_name": "Historical Kimi Code spelling",
-      "aliases": [],
-      "lifecycle": {
-        "status": "retired",
-        "retire_at": "2026-10-19T00:00:00Z",
-        "replacement": "kimi-code/k3"
-      },
-      "operations": [
-        "chat"
-      ],
-      "features": {},
-      "limits": {},
-      "parameters": {
-        "temperature": {
-          "kind": "range",
-          "min": 1,
-          "max": 1,
-          "default": 1
-        }
-      },
-      "levels": {
-        "low": {},
-        "medium": {},
-        "high": {}
       },
       "default_level": "medium"
     }

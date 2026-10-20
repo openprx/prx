@@ -724,7 +724,7 @@ fn validate_model_parameters(model: &ReleaseModel, warnings: &mut Vec<String>) -
             let Some(declaration) = model.parameters.get(parameter.as_str()) else {
                 return Err(ReleaseCatalogError::new("a catalog level uses an undeclared parameter"));
             };
-            if !declaration.accepts(value) {
+            if !declaration.accepts(value) || !valid_integer_parameter(parameter, value) {
                 return Err(ReleaseCatalogError::new(
                     "a catalog level parameter value is outside its declaration",
                 ));
@@ -820,6 +820,16 @@ fn validate_parameter_declaration(
     parameter: ModelParameter,
     declaration: &CatalogParameter,
 ) -> Result<(), ReleaseCatalogError> {
+    if integer_parameter(parameter)
+        && !matches!(
+            declaration,
+            CatalogParameter::Range { .. } | CatalogParameter::Unsupported
+        )
+    {
+        return Err(ReleaseCatalogError::new(
+            "integer catalog parameters require numeric ranges",
+        ));
+    }
     match declaration {
         CatalogParameter::Range {
             min,
@@ -832,7 +842,11 @@ fn validate_parameter_declaration(
                 || !max.is_finite()
                 || min > max
                 || step.is_some_and(|step| !step.is_finite() || step <= 0.0)
-                || default.as_ref().is_some_and(|value| !declaration.accepts(value))
+                || default
+                    .as_ref()
+                    .is_some_and(|value| !declaration.accepts(value) || !valid_integer_parameter(parameter, value))
+                || (integer_parameter(parameter)
+                    && (min.fract() != 0.0 || max.fract() != 0.0 || step.is_some_and(|step| step.fract() != 0.0)))
             {
                 return Err(ReleaseCatalogError::new(format!(
                     "catalog parameter '{}' has an invalid range",
@@ -911,6 +925,17 @@ fn validate_secret_free(value: &Value) -> Result<(), ReleaseCatalogError> {
     Ok(())
 }
 
+const fn integer_parameter(parameter: ModelParameter) -> bool {
+    matches!(
+        parameter,
+        ModelParameter::MaxOutputTokens | ModelParameter::ThinkingBudget | ModelParameter::Seed
+    )
+}
+
+fn valid_integer_parameter(parameter: ModelParameter, value: &Value) -> bool {
+    !integer_parameter(parameter) || value.as_i64().is_some() || value.as_u64().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,7 +968,7 @@ mod tests {
             return;
         };
         assert_eq!(catalog.schema_version, "1.0");
-        assert_eq!(catalog.revision, "2026-10-19.1");
+        assert_eq!(catalog.revision, "2026-10-19.2");
         assert_eq!(catalog.schema.as_deref(), Some("./models.schema.json"));
         assert!(catalog.content_sha256().starts_with("sha256:"));
         assert!(catalog.models.len() >= 100);
@@ -1367,5 +1392,75 @@ mod tests {
                 .is_unsupported(),
             "negative discovery outranks an operator declaration"
         );
+    }
+}
+
+#[cfg(test)]
+mod integer_parameter_tests {
+    use super::*;
+    #[test]
+    fn fractional_integer_ranges_defaults_and_levels_are_rejected() {
+        for pointer in [
+            "/parameters/max_output_tokens/min",
+            "/parameters/max_output_tokens/max",
+            "/parameters/max_output_tokens/step",
+            "/parameters/max_output_tokens/default",
+            "/levels/high/max_output_tokens",
+        ] {
+            let mut raw: Value = serde_json::from_str(EMBEDDED_CATALOG_JSON).unwrap();
+            let row = raw
+                .get_mut("models")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row.get("id").and_then(Value::as_str) == Some("anthropic/claude-sonnet-5"))
+                .unwrap();
+            if pointer.ends_with("/step") {
+                row.pointer_mut("/parameters/max_output_tokens")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("step".into(), Value::from(0.5));
+            } else {
+                let value = if pointer.ends_with("/min") {
+                    0.5
+                } else if pointer.ends_with("/max") {
+                    128_000.5
+                } else {
+                    1024.5
+                };
+                *row.pointer_mut(pointer).unwrap() = Value::from(value);
+            }
+            assert!(ReleaseCatalog::from_json(&raw.to_string()).is_err(), "{pointer}");
+        }
+    }
+    #[test]
+    fn integer_parameter_declarations_cannot_supply_boolean_or_string_defaults() {
+        for declaration in [
+            serde_json::json!({"kind":"bool","default":true}),
+            serde_json::json!({"kind":"levels","levels":["2048"],"default":"2048"}),
+        ] {
+            let mut raw: Value = serde_json::from_str(EMBEDDED_CATALOG_JSON).unwrap();
+            let row = raw
+                .get_mut("models")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row.get("id").and_then(Value::as_str) == Some("anthropic/claude-sonnet-5"))
+                .unwrap();
+            row.get_mut("parameters")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("max_output_tokens".into(), declaration);
+            // Isolate the declaration itself: no selected-level value should
+            // cause this rejection before the invalid default is inspected.
+            for level in row.get_mut("levels").unwrap().as_object_mut().unwrap().values_mut() {
+                level.as_object_mut().unwrap().remove("max_output_tokens");
+            }
+            assert!(ReleaseCatalog::from_json(&raw.to_string()).is_err());
+        }
     }
 }

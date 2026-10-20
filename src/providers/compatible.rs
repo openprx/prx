@@ -222,6 +222,13 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    /// Bind catalog parameter lookup to the configured factory identity.
+    #[must_use]
+    pub(crate) fn with_parameter_provider(mut self, provider: &str) -> Self {
+        self.configured_label = Some(super::redact_endpoint_userinfo(provider.trim()).into_owned());
+        self
+    }
+
     /// Attach every `[[providers.tool_dialects]]` declaration that applies to
     /// `provider`, the label this endpoint was constructed from.
     ///
@@ -2704,7 +2711,7 @@ impl Provider for OpenAiCompatibleProvider {
                 );
                 let mut fallback_request = request;
                 fallback_request.stream_options = None;
-                let mut fallback_builder = client.post(&url).json(&super::parameter_wire::request(
+                let mut fallback_builder = client.post(&url).json(&super::parameter_wire::retry_request(
                     &parameter_provider,
                     super::parameter_wire::Format::Compatible,
                     &fallback_request.model,
@@ -2806,7 +2813,7 @@ impl Provider for OpenAiCompatibleProvider {
                 );
                 let mut fallback_request = request;
                 fallback_request.stream_options = None;
-                let mut fallback_builder = client.post(&url).json(&super::parameter_wire::request(
+                let mut fallback_builder = client.post(&url).json(&super::parameter_wire::retry_request(
                     &parameter_provider,
                     super::parameter_wire::Format::Compatible,
                     &fallback_request.model,
@@ -3902,7 +3909,7 @@ mod tests {
         ];
 
         let request = provider
-            .build_streaming_history_request(&messages, "kimi-k2", 0.3, StreamOptions::new(true))
+            .build_streaming_history_request(&messages, "kimi-k2", 1.0, StreamOptions::new(true))
             .expect("test: streaming request builds");
         let value = serde_json::to_value(super::super::parameter_wire::request(
             "kimi-code",
@@ -3914,8 +3921,8 @@ mod tests {
         let serialized_messages = value["messages"].as_array().unwrap();
 
         assert_eq!(value["model"], "kimi-k2");
-        // Kimi API only accepts temperature=1; the catalog parameter declaration
-        // must clamp the caller-supplied 0.3 to 1.0 before serializing.
+        // This historical model ID is unverified. Use its explicit base
+        // temperature; real declared Kimi clamp coverage is separate.
         assert_eq!(value["temperature"], 1.0);
         assert_eq!(value["stream"], true);
         assert_eq!(serialized_messages.len(), 4);

@@ -16,6 +16,13 @@ temperature follow the selected provider/model, including streaming requests;
 a matching endpoint URL supplies no model facts. See the
 [parameter resolution contract](model-catalog.md#format-and-validation).
 
+Known Codex models default to `medium` reasoning effort, a behavior change from
+`xhigh`; an explicit configured effort takes precedence. Unknown Codex models
+retain `medium` verbosity and `xhigh` effort unless effort is configured.
+Models with no declared parameters preserve the adapter's base request.
+Anthropic effort alone does not enable thinking, and Ollama's boolean `think`
+setting remains adapter-owned.
+
 ## Embedded release catalog baseline (2026-07-18)
 
 | PRX provider | Curated default / current IDs | Endpoint and authoritative source | Live discovery |

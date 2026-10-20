@@ -341,7 +341,7 @@ mod tests {
         );
         assert_eq!(
             decoded.prepared_parameters.first().unwrap().catalog_revision,
-            "2026-10-19.1"
+            "2026-10-19.2"
         );
         assert!(!payload.contains("prx private request"));
         assert!(!payload.contains("messages"));
