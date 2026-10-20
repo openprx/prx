@@ -200,3 +200,30 @@ fn nested_workspace_dir_creation() {
     fs::create_dir_all(&nested_dir).expect("nested dir creation should succeed");
     assert!(nested_dir.exists(), "nested workspace dir should exist");
 }
+
+/// Full CLI JSON captured before the finding-103 schema moves.
+#[test]
+fn config_schema_matches_the_pre_split_golden_snapshot() -> anyhow::Result<()> {
+    let temp = tempfile::TempDir::new()?;
+    let config_dir = temp.path().join("config");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::create_dir_all(&home)?;
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_prx"))
+        .arg("--config-dir")
+        .arg(&config_dir)
+        .args(["config", "schema"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("OPENPRX_CONFIG_DIR", &config_dir)
+        .env("OPENPRX_WORKSPACE", temp.path().join("workspace"))
+        .output()?;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let actual: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let expected: serde_json::Value = serde_json::from_str(include_str!("fixtures/config-schema.json"))?;
+    assert_eq!(
+        actual, expected,
+        "the full public CLI schema must survive the split unchanged"
+    );
+    Ok(())
+}

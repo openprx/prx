@@ -956,25 +956,35 @@ fn config_writes_route_through_the_transaction_layer() {
             "structured plan primitive",
         ),
         (
-            "src/config/schema.rs",
+            "src/config/schema/lifecycle.rs",
             ".save()",
             1,
             "Config::save (first-run creation)",
         ),
-        ("src/config/schema.rs", "commit_mutation_atomically(", 1, "Config::save"),
         (
-            "src/config/schema.rs",
+            "src/config/schema/lifecycle.rs",
+            "commit_mutation_atomically(",
+            1,
+            "Config::save",
+        ),
+        (
+            "src/config/schema/credentials.rs",
             "commit_mutation_guarded(",
             1,
             "the startup secret migration (revision-guarded, D-101 F-5)",
         ),
         (
-            "src/config/schema.rs",
+            "src/config/schema/atomic.rs",
             "write_toml_string_atomic_without_lock(",
             2,
             "the atomic write primitive",
         ),
-        ("src/config/schema.rs", "plan_structured_save(", 1, "Config::save"),
+        (
+            "src/config/schema/lifecycle.rs",
+            "plan_structured_save(",
+            1,
+            "Config::save",
+        ),
         (
             "src/config/generation.rs",
             "reload_from_disk(",
@@ -8454,8 +8464,8 @@ fn every_provider_source_file_is_in_the_module_tree() {
 /// the resolver, which the lib-test binary points at a scratch home.
 const ALLOWED_HOME_DIRECTORY_LOOKUPS: &[&str] = &[
     // The resolver: the home directory and the platform config directory.
-    "src/config/schema.rs::user_home_dir",
-    "src/config/schema.rs::platform_config_dir",
+    "src/config/schema/paths.rs::user_home_dir",
+    "src/config/schema/paths.rs::platform_config_dir",
     // Reports whether `HOME` is set at all; nothing is read under it.
     "src/doctor/mod.rs::check_environment",
     "src/runtime/shell_process.rs::<module>",

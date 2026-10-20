@@ -80,3 +80,14 @@ upstream copies: `vendor/matrix-sdk-0.19.1/src/room/mod.rs` (5,836 lines),
 `vendor/matrix-sdk-0.19.1/src/test_utils/mocks/mod.rs` (5,308). Their source
 ownership and decomposition remain upstream; PRX does not refactor vendored
 code as part of this migration.
+
+## Finding 103 split status (2026-10-20)
+
+The inventory above is the historical 2026-10-15 baseline. Finding 103 moves
+configuration schema responsibilities into `src/config/schema/`: domain
+structures/defaults, compatibility migration, proxy handling, path resolution,
+credential migration, lifecycle/validation, and atomic persistence. The old
+`config::schema` paths remain available through re-exports. The root is 551
+lines; the largest moved source/test file is below 1,500 lines. The full public
+`prx config schema` JSON is pinned by a CLI golden captured before the moves.
+The original 227 schema tests remain, with unchanged assertions and fixtures.
