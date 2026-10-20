@@ -1572,6 +1572,7 @@ mod tests {
                 status: ExecutionStatus::Success,
                 fallback_reason: None,
                 tokens_used: Default::default(),
+                prepared_parameters: Vec::new(),
             }),
             usage: None,
             cost: None,

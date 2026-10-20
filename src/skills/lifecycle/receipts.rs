@@ -143,10 +143,13 @@ pub(crate) async fn drain_background_for_test(key: &str) {
     }
 }
 
+#[cfg(test)]
+fn track_background(key: &str, handle: tokio::task::JoinHandle<()>) {
+    BACKGROUND.lock().push((key.to_string(), handle));
+}
+
+#[cfg(not(test))]
 fn track_background(_key: &str, handle: tokio::task::JoinHandle<()>) {
-    #[cfg(test)]
-    BACKGROUND.lock().push((_key.to_string(), handle));
-    #[cfg(not(test))]
     drop(handle);
 }
 

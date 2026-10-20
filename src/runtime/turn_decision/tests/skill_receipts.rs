@@ -354,6 +354,7 @@ async fn crashed_after_marker(
         status: crate::llm::route_decision::ExecutionStatus::Success,
         fallback_reason: None,
         tokens_used: Default::default(),
+        prepared_parameters: Vec::new(),
     });
     let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.path().to_string_lossy());
     crate::agent::terminal::finalize_turn_stop_after_marker(
