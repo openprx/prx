@@ -102,8 +102,11 @@ async fn s2_5_t2_5_3_notify_hook_repeat_no_double_fire() {
         })
         .await;
 
-    // the hook command is spawned; give it enough time.
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Both hook events are delivered by the background dispatcher; wait for
+    // the delivery signal instead of a fixed delay.
+    tokio::time::timeout(Duration::from_secs(30), hooks.wait_delivered(2))
+        .await
+        .expect("both hook deliveries finish");
 
     let bytes = std::fs::read(&counter).unwrap_or_default();
     assert_eq!(

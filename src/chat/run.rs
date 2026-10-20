@@ -5462,5 +5462,6 @@ Retry with a compatible model: /provider {shown} <model>",
     turn_decisions
         .shutdown(std::time::Instant::now() + Duration::from_secs(2))
         .await;
+    hooks.drain_for_shutdown().await;
     chat_result
 }

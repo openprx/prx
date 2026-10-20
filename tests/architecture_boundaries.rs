@@ -1166,8 +1166,33 @@ fn workspace_hooks_launch_through_the_shared_builder_behind_the_opt_in() {
         1,
         "src/hooks/mod.rs builds a process command outside run_action"
     );
-    let emit = function_body(&production, "emit");
-    assert!(emit.contains("self.workspace_policy()"), "emit must check the opt-in");
+    // `emit` only queues; the background `deliver` runs the hooks and checks
+    // the opt-in at delivery time.
+    let deliver = function_body(&production, "deliver");
+    assert!(
+        deliver.contains("self.workspace_policy()"),
+        "deliver must check the opt-in"
+    );
+}
+
+/// Finding 96: hook events are queued, so every owner of a live
+/// `HookManager` drains it on its exit path or loses the last events.
+#[test]
+fn every_live_hook_manager_owner_drains_at_shutdown() {
+    for path in [
+        "src/gateway/mod.rs",
+        "src/channels/startup.rs",
+        "src/chat/run.rs",
+        "src/agent/entry.rs",
+        "src/session_worker/runner/run.rs",
+    ] {
+        let source =
+            fs::read_to_string(repository_root().join(path)).unwrap_or_else(|error| panic!("read {path}: {error}"));
+        assert!(
+            production_part(&source).contains("drain_for_shutdown()"),
+            "{path} owns a live HookManager and must call drain_for_shutdown() on its exit path"
+        );
+    }
 }
 
 /// GIT-ENV F-6 (D-103): the production places that name the `git`
@@ -5227,7 +5252,7 @@ fn provider_label_sinks_redact_url_userinfo() {
         ),
         // The fan-out point: command hooks, WASM lifecycle hooks and the
         // plugin event bus all receive the payload `emit` redacted.
-        ("src/hooks/mod.rs", "pub async fn emit(", "redacted_hook_payload("),
+        ("src/hooks/mod.rs", "pub fn emit(", "redacted_hook_payload("),
         (
             "src/hooks/mod.rs",
             "fn redacted_hook_payload(",
