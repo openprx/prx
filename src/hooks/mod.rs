@@ -1626,7 +1626,7 @@ mod tests {
     async fn the_plugin_event_bus_receives_the_provider_without_url_userinfo() {
         let temp = TempDir::new().unwrap();
         let manager = HookManager::new(temp.path().to_path_buf());
-        let runtime = crate::plugins::init_plugin_runtime(temp.path(), None)
+        let runtime = crate::plugins::init_test_plugin_runtime(temp.path(), None)
             .await
             .expect("test: plugin runtime");
         let (_id, mut events) = runtime
@@ -1678,7 +1678,7 @@ mod tests {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/pipeline-middleware");
         std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).expect("test: fixture manifest");
         std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).expect("test: fixture component");
-        let runtime = crate::plugins::init_plugin_runtime(temp.path(), None)
+        let runtime = crate::plugins::init_test_plugin_runtime(temp.path(), None)
             .await
             .expect("test: plugin runtime");
         let manager = HookManager::new(temp.path().to_path_buf());

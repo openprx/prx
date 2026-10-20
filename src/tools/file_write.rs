@@ -100,8 +100,8 @@ impl FileWriteTool {
         ) {
             let error = if launch_file {
                 format!(
-                    "{error} (a workspace launch definition: hooks.json and mcp.json decide which programs run as \
-                     PRX's user, so writing one is a high-risk operation of its own)"
+                    "{error} (a workspace launch definition: {}; writing one is a high-risk operation of its own)",
+                    crate::config::mcp_launch::describe_launch_target(&self.security.workspace_dir, &resolved_target)
                 )
             } else if git_control {
                 format!(
@@ -355,6 +355,47 @@ mod tests {
             .await
             .expect("test: executes");
         assert!(result.success, "{:?}", result.error);
+    }
+
+    /// Finding 95: a `file_write` under `<workspace>/plugins` (plugin code,
+    /// manifests) was an ordinary medium-risk write, which let an agent plant
+    /// a plugin. It is now a high-risk operation of its own, at any depth and
+    /// in any letter case.
+    #[tokio::test]
+    async fn writing_under_the_plugins_directory_needs_its_own_approval() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let workspace = dir.path().to_path_buf();
+        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        for file in [
+            "plugins/evil/plugin.toml",
+            "plugins/evil/plugin.wasm",
+            "plugins/.prx-managed",
+            "Plugins/evil/plugin.toml",
+        ] {
+            let result = tool
+                .execute(approved_args(&workspace, file, "x"))
+                .await
+                .expect("test: executes");
+            assert!(
+                !result.success,
+                "{file}: an ordinary write approval covered a plugin file"
+            );
+            let error = result.error.unwrap_or_default();
+            assert!(error.contains("workspace launch definition"), "{file}: {error}");
+            assert!(
+                error.contains("under plugins/"),
+                "the refusal must name the target: {file}: {error}"
+            );
+            assert!(!workspace.join(file).exists(), "{file} was written");
+        }
+        // Names that merely contain "plugins" keep their ordinary approval.
+        for file in ["plugins-notes.txt", "docs/plugins/readme.md"] {
+            let result = tool
+                .execute(approved_args(&workspace, file, "x"))
+                .await
+                .expect("test: executes");
+            assert!(result.success, "{file}: {:?}", result.error);
+        }
     }
 
     /// RED before GIT-ENV: `.git/config`, `.git/hooks/*` and `.git/info/*`

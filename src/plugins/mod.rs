@@ -20,21 +20,35 @@
 //! `PrecompileCache` persists the native artifact so Cranelift is skipped
 //! entirely.
 //!
-//! # Feature Gate
+//! # Feature Gate and Switch
 //!
-//! This entire module is behind `#[cfg(feature = "wasm-plugins")]`.
-//! Default builds do not include wasmtime.
+//! This entire module is behind `#[cfg(feature = "wasm-plugins")]`, which is in
+//! the default feature set; build with `--no-default-features` to leave
+//! wasmtime out entirely. Even when compiled in, nothing is scanned or loaded
+//! unless the operator sets `[plugins] enabled = true` (default `false`).
+//!
+//! # Trust
+//!
+//! A plugin runs only when the operator's trust file (see [`trust`]) holds a
+//! record for its name, component hash and manifest hash; it holds exactly the
+//! permissions that record grants. Files inside `<workspace>/plugins` cannot
+//! confer trust.
 
 pub mod capabilities;
 pub mod error;
 pub mod event_bus;
 pub mod host;
 pub mod manifest;
+pub mod outbound;
 pub mod precompile;
 pub mod registry;
 pub mod runtime;
+pub mod trust;
 
-pub use runtime::{PluginRuntime, init_plugin_runtime};
+pub use runtime::{PluginRuntime, init_plugin_runtime, init_plugin_runtime_with_policy};
+#[cfg(test)]
+pub(crate) use runtime::{init_test_plugin_runtime, trust_workspace_plugins};
+pub use trust::PluginPolicy;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,9 +56,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use error::{PluginError, PluginResult};
-use manifest::PluginManifest;
 use precompile::PrecompileCache;
 use registry::{LoadedPlugin, PluginInfo, PluginRegistry};
+use trust::{PluginMaterial, TrustOutcome, evaluate};
 
 use crate::tools::Tool;
 
@@ -162,6 +176,8 @@ pub struct PluginManager {
     registry: PluginRegistry,
     /// Base directory where plugin subdirectories live.
     plugins_dir: PathBuf,
+    /// Whether plugins run, and where the operator's trust file lives.
+    policy: PluginPolicy,
     /// Disk-based precompile cache for native WASM artifacts.
     precompile_cache: PrecompileCache,
     /// Runtime performance metrics.
@@ -175,13 +191,17 @@ impl PluginManager {
     /// - `async_support(true)` for tokio integration
     /// - `wasm_component_model(true)` for Component Model
     ///
-    /// A `PrecompileCache` is created at `<plugins_dir>/.cwasm-cache/` to
-    /// avoid recompiling unchanged plugins on every restart.
-    pub fn new(plugins_dir: PathBuf) -> PluginResult<Self> {
+    /// A `PrecompileCache` is created in the policy's cache directory, beside
+    /// the operator's trust file and outside the workspace: native artifacts
+    /// are loaded without re-validation, so an agent must not be able to
+    /// write them.
+    pub fn new(plugins_dir: PathBuf, policy: PluginPolicy) -> PluginResult<Self> {
+        if !policy.enabled() {
+            return Err(PluginError::Disabled);
+        }
         let engine = shared_wasm_engine()?;
 
-        let cache_dir = plugins_dir.join(".cwasm-cache");
-        let precompile_cache = PrecompileCache::new(cache_dir).map_err(PluginError::Io)?;
+        let precompile_cache = PrecompileCache::new(policy.cache_dir()).map_err(PluginError::Io)?;
 
         tracing::info!(
             plugins_dir = %plugins_dir.display(),
@@ -192,6 +212,7 @@ impl PluginManager {
             engine,
             registry: PluginRegistry::new(),
             plugins_dir,
+            policy,
             precompile_cache,
             metrics: Arc::new(PluginMetrics::default()),
         })
@@ -203,6 +224,9 @@ impl PluginManager {
     /// is treated as a plugin. Errors in individual plugins are logged
     /// but do not prevent other plugins from loading.
     pub async fn load_all(&self) -> PluginResult<usize> {
+        if !self.policy.enabled() {
+            return Ok(0);
+        }
         if !self.plugins_dir.exists() {
             tracing::debug!(
                 path = %self.plugins_dir.display(),
@@ -299,59 +323,50 @@ impl PluginManager {
         Ok(())
     }
 
+    /// Read a plugin directory, decide trust, and compile the component only
+    /// when the operator's trust record covers exactly these bytes. A refused
+    /// plugin comes back as an `Error` entry that is never compiled.
     pub(crate) fn prepare_plugin(&self, plugin_dir: &Path) -> PluginResult<LoadedPlugin> {
-        let manifest_path = plugin_dir.join("plugin.toml");
-        let manifest = PluginManifest::from_file(&manifest_path)?;
-        let plugin_name = manifest.plugin.name.clone();
-        let wasm_relative = Path::new(&manifest.plugin.wasm);
-        if wasm_relative.is_absolute()
-            || wasm_relative
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            return Err(PluginError::Manifest(format!(
-                "plugin '{plugin_name}' wasm path must stay within its plugin directory"
-            )));
+        if !self.policy.enabled() {
+            return Err(PluginError::Disabled);
         }
-
-        let wasm_path = plugin_dir.join(wasm_relative);
-        let component = if wasm_path.exists() {
-            let metadata = std::fs::symlink_metadata(&wasm_path).map_err(PluginError::Io)?;
-            if metadata.file_type().is_symlink() {
-                return Err(PluginError::Manifest(format!(
-                    "plugin '{plugin_name}' wasm file must not be a symlink"
-                )));
-            }
-            if metadata.len() > MAX_PLUGIN_WASM_BYTES {
-                return Err(PluginError::ResourceLimit(format!(
-                    "plugin '{plugin_name}' WASM exceeds {MAX_PLUGIN_WASM_BYTES} bytes"
-                )));
-            }
-            let wasm_bytes = std::fs::read(&wasm_path).map_err(PluginError::Io)?;
-            if wasm_bytes.len() as u64 > MAX_PLUGIN_WASM_BYTES {
-                return Err(PluginError::ResourceLimit(format!(
-                    "plugin '{plugin_name}' WASM exceeds {MAX_PLUGIN_WASM_BYTES} bytes"
-                )));
-            }
-            let compiled = self
-                .precompile_cache
-                .get_or_compile(&self.engine, &wasm_bytes)
-                .map_err(|error| {
-                    PluginError::Compilation(format!("failed to compile '{}': {error}", wasm_path.display()))
-                })?;
-            self.update_cache_metrics();
-            tracing::info!(plugin = %plugin_name, wasm = %wasm_path.display(), "WASM component ready");
-            Some(compiled)
+        let material = PluginMaterial::read(plugin_dir)?;
+        let outcome = match self.policy.records() {
+            Ok(records) => evaluate(&records, &material),
+            Err(error) => TrustOutcome::Refused(format!("plugin trust file is unusable, nothing is trusted: {error}")),
+        };
+        let component = if matches!(outcome, TrustOutcome::Trusted { .. }) {
+            self.compile(&material)?
         } else {
-            tracing::debug!(plugin = %plugin_name, wasm = %wasm_path.display(), "WASM file not found — manifest-only load");
             None
         };
+        Ok(LoadedPlugin::new(
+            material.manifest,
+            plugin_dir.to_path_buf(),
+            component,
+            outcome,
+        ))
+    }
 
-        if plugin_dir.join(".prx-managed").is_file() {
-            Ok(LoadedPlugin::new_trusted(manifest, plugin_dir.to_path_buf(), component))
-        } else {
-            Ok(LoadedPlugin::new(manifest, plugin_dir.to_path_buf(), component))
-        }
+    /// Compile the component of `material` without registering it, to prove a
+    /// candidate loads before the operator's trust is recorded for it.
+    pub(crate) fn compile_candidate(&self, material: &PluginMaterial) -> PluginResult<()> {
+        self.compile(material).map(|_| ())
+    }
+
+    fn compile(&self, material: &PluginMaterial) -> PluginResult<Option<wasmtime::component::Component>> {
+        let plugin_name = &material.manifest.plugin.name;
+        let Some(wasm_bytes) = &material.wasm_bytes else {
+            tracing::debug!(plugin = %plugin_name, "WASM file not found — manifest-only load");
+            return Ok(None);
+        };
+        let compiled = self
+            .precompile_cache
+            .get_or_compile(&self.engine, wasm_bytes)
+            .map_err(|error| PluginError::Compilation(format!("failed to compile '{plugin_name}': {error}")))?;
+        self.update_cache_metrics();
+        tracing::info!(plugin = %plugin_name, "WASM component ready");
+        Ok(Some(compiled))
     }
 
     fn update_cache_metrics(&self) {
@@ -937,11 +952,11 @@ fn spawn_epoch_ticker(engine: &wasmtime::Engine) {
 #[cfg(not(target_has_atomic = "64"))]
 fn spawn_epoch_ticker(_engine: &wasmtime::Engine) {}
 
-/// Initialize the plugin manager if configured.
+/// Initialize the plugin manager under `policy`.
 ///
 /// Called during gateway startup. Returns `None` if the plugins directory
 /// doesn't exist or no plugins are found (non-fatal).
-pub async fn init_plugin_manager(workspace_dir: &Path) -> Option<Arc<PluginManager>> {
+pub async fn init_plugin_manager(workspace_dir: &Path, policy: PluginPolicy) -> Option<Arc<PluginManager>> {
     let plugins_dir = workspace_dir.join("plugins");
 
     // Create the plugins directory if it doesn't exist
@@ -952,7 +967,7 @@ pub async fn init_plugin_manager(workspace_dir: &Path) -> Option<Arc<PluginManag
         }
     }
 
-    match PluginManager::new(plugins_dir) {
+    match PluginManager::new(plugins_dir, policy) {
         Ok(manager) => {
             let manager = Arc::new(manager);
             match manager.load_all().await {
@@ -981,6 +996,11 @@ pub async fn init_plugin_manager(workspace_dir: &Path) -> Option<Arc<PluginManag
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// An enabled policy whose trust file sits in `dir/.state`.
+    fn policy_in(dir: &Path) -> PluginPolicy {
+        PluginPolicy::new(true, dir.join(".state").join(trust::TRUST_FILE_NAME))
+    }
 
     // ── PluginMetrics ───────────────────────────────────────────
 
@@ -1055,7 +1075,7 @@ mod tests {
     #[test]
     fn manager_new_creates_engine() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf());
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path()));
         assert!(manager.is_ok());
     }
 
@@ -1063,8 +1083,10 @@ mod tests {
     fn managers_share_the_process_wasm_engine() {
         let first_dir = tempfile::tempdir().expect("test: first tempdir");
         let second_dir = tempfile::tempdir().expect("test: second tempdir");
-        let first = PluginManager::new(first_dir.path().to_path_buf()).expect("test: first manager");
-        let second = PluginManager::new(second_dir.path().to_path_buf()).expect("test: second manager");
+        let first = PluginManager::new(first_dir.path().to_path_buf(), policy_in(first_dir.path()))
+            .expect("test: first manager");
+        let second = PluginManager::new(second_dir.path().to_path_buf(), policy_in(second_dir.path()))
+            .expect("test: second manager");
 
         assert!(wasmtime::Engine::same(&first.engine, &second.engine));
     }
@@ -1073,14 +1095,14 @@ mod tests {
     fn manager_plugins_dir_matches() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let path = tmp.path().to_path_buf();
-        let manager = PluginManager::new(path.clone()).expect("test: new");
+        let manager = PluginManager::new(path.clone(), policy_in(&path)).expect("test: new");
         assert_eq!(manager.plugins_dir(), path);
     }
 
     #[test]
     fn manager_initial_metrics_are_zero() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         let snap = manager.metrics_snapshot();
         assert_eq!(snap.compilations, 0);
         assert_eq!(snap.cache_hits, 0);
@@ -1092,7 +1114,7 @@ mod tests {
     #[tokio::test]
     async fn load_all_empty_dir_returns_zero() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         let count = manager.load_all().await.expect("test: load_all");
         assert_eq!(count, 0);
     }
@@ -1101,7 +1123,7 @@ mod tests {
     async fn load_all_missing_dir_returns_zero() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let nonexistent = tmp.path().join("does_not_exist");
-        let manager = PluginManager::new(nonexistent).expect("test: new");
+        let manager = PluginManager::new(nonexistent, policy_in(tmp.path())).expect("test: new");
         let count = manager.load_all().await.expect("test: load_all");
         assert_eq!(count, 0);
     }
@@ -1111,7 +1133,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         // Create a plain file (not a plugin dir)
         std::fs::write(tmp.path().join("not_a_plugin.txt"), "hello").expect("test: write");
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         let count = manager.load_all().await.expect("test: load_all");
         assert_eq!(count, 0);
     }
@@ -1121,7 +1143,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         std::fs::create_dir(tmp.path().join("my_plugin")).expect("test: mkdir");
         // No plugin.toml → skipped
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         let count = manager.load_all().await.expect("test: load_all");
         assert_eq!(count, 0);
     }
@@ -1129,7 +1151,7 @@ mod tests {
     #[tokio::test]
     async fn list_plugins_initially_empty() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         let plugins = manager.list_plugins().await;
         assert!(plugins.is_empty());
     }
@@ -1137,14 +1159,14 @@ mod tests {
     #[tokio::test]
     async fn get_plugin_nonexistent_returns_none() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         assert!(manager.get_plugin("nonexistent").await.is_none());
     }
 
     #[tokio::test]
     async fn unload_nonexistent_returns_error() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         let result = manager.unload_plugin("nonexistent").await;
         assert!(result.is_err());
     }
@@ -1152,7 +1174,7 @@ mod tests {
     #[tokio::test]
     async fn reload_nonexistent_returns_error() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         let result = manager.reload_plugin("nonexistent").await;
         assert!(result.is_err());
     }
@@ -1165,7 +1187,7 @@ mod tests {
         let manifest =
             |version: &str| format!("[plugin]\nname = \"atomic\"\nversion = \"{version}\"\nwasm = \"missing.wasm\"\n");
         std::fs::write(plugin_dir.join("plugin.toml"), manifest("1.0.0")).unwrap();
-        let manager = PluginManager::new(tmp.path().to_path_buf()).unwrap();
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).unwrap();
         manager.load_plugin(&plugin_dir).await.unwrap();
 
         std::fs::write(plugin_dir.join("plugin.toml"), manifest("2.0.0")).unwrap();
@@ -1187,7 +1209,7 @@ mod tests {
             "[plugin]\nname = \"escape\"\nversion = \"1.0.0\"\nwasm = \"../outside.wasm\"\n",
         )
         .unwrap();
-        let manager = PluginManager::new(tmp.path().to_path_buf()).unwrap();
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).unwrap();
         let error = manager.load_plugin(&plugin_dir).await.unwrap_err();
         assert!(error.to_string().contains("stay within"));
     }
@@ -1201,7 +1223,7 @@ mod tests {
         let plugins_dir = workspace.join("plugins");
         assert!(!plugins_dir.exists());
 
-        let manager = init_plugin_manager(workspace).await;
+        let manager = init_plugin_manager(workspace, policy_in(workspace)).await;
         assert!(manager.is_some());
         assert!(plugins_dir.exists());
     }
@@ -1209,7 +1231,7 @@ mod tests {
     #[tokio::test]
     async fn init_plugin_manager_empty_workspace_succeeds() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = init_plugin_manager(tmp.path()).await;
+        let manager = init_plugin_manager(tmp.path(), policy_in(tmp.path())).await;
         assert!(manager.is_some());
         let plugins = manager.as_ref().expect("test: manager").list_plugins().await;
         assert!(plugins.is_empty());
@@ -1220,7 +1242,7 @@ mod tests {
     #[tokio::test]
     async fn create_tool_adapters_empty_returns_empty() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         let tools = manager.create_tool_adapters().await;
         assert!(tools.is_empty());
     }
@@ -1228,7 +1250,7 @@ mod tests {
     #[tokio::test]
     async fn create_middleware_chain_empty_returns_empty_chain() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         let chain = manager.create_middleware_chain(None).await;
         assert!(chain.value.is_empty());
     }
@@ -1236,7 +1258,7 @@ mod tests {
     #[tokio::test]
     async fn create_provider_adapters_empty() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         let providers = manager.create_provider_adapters(None).await;
         assert!(providers.value.is_empty());
         assert!(providers.errors.is_empty(), "expected an empty value");
@@ -1245,7 +1267,7 @@ mod tests {
     #[tokio::test]
     async fn create_storage_adapters_empty() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
         let storages = manager.create_storage_adapters(None).await;
         assert!(storages.value.is_empty());
         assert!(storages.errors.is_empty(), "expected an empty value");

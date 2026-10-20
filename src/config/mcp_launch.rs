@@ -308,13 +308,67 @@ pub fn launch_environment<S: std::hash::BuildHasher>(
 /// `hooks.json` and the MCP servers of `mcp.json`.
 const WORKSPACE_LAUNCH_FILES: &[&str] = &["hooks.json", "mcp.json"];
 
-/// Whether `target` (a resolved path) is a workspace launch definition
-/// (`hooks.json` or `mcp.json` at the root of `workspace_dir`), compared
-/// case-insensitively so a case-folding filesystem cannot hide it. A file
-/// tool's write there is classified high risk and named as such
+/// Workspace directory of WASM plugins. Everything under it is plugin code or
+/// plugin configuration that PRX loads and runs.
+const WORKSPACE_PLUGINS_DIR: &str = "plugins";
+
+/// Whether `target` (a resolved path) is a workspace launch definition: the
+/// `hooks.json` or `mcp.json` at the root of `workspace_dir`, or anything
+/// under its `plugins/` directory (WASM plugin code and manifests). Names are
+/// compared case-insensitively so a case-folding filesystem cannot hide them.
+/// A file tool's write there is classified high risk and named as such
 /// (HOOKS-ENV): it changes which programs run as PRX's user.
 #[must_use]
 pub fn is_workspace_launch_file(workspace_dir: &std::path::Path, target: &std::path::Path) -> bool {
+    let workspace = std::fs::canonicalize(workspace_dir).unwrap_or_else(|_| workspace_dir.to_path_buf());
+    is_root_launch_file(&workspace, target) || is_under_plugins_dir(&workspace, target) || is_plugin_trust_state(target)
+}
+
+/// The operator's plugin trust file (and its lock and temporary files) and the
+/// compiled-component cache, wherever they are: they decide which WASM runs
+/// and with which permissions, so a file tool's write is high risk even when
+/// the path policy lets it leave the workspace.
+fn is_plugin_trust_state(target: &std::path::Path) -> bool {
+    let named = target.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+        let name = name.trim_start_matches('.').to_ascii_lowercase();
+        name.starts_with("plugin-trust.json")
+    });
+    named
+        || target.components().any(|component| match component {
+            std::path::Component::Normal(name) => name
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case("plugin-cache")),
+            _ => false,
+        })
+}
+
+/// Name what makes `target` a launch definition, for a refusal message:
+/// the plugin trust file, the compiled-component cache, a plugin file, or the
+/// `hooks.json` / `mcp.json` at the workspace root.
+#[must_use]
+pub fn describe_launch_target(workspace_dir: &std::path::Path, target: &std::path::Path) -> String {
+    let shown = target.display();
+    if is_plugin_trust_state(target) {
+        let cache = target.components().any(|component| {
+            matches!(component, std::path::Component::Normal(name)
+                if name.to_str().is_some_and(|name| name.eq_ignore_ascii_case("plugin-cache")))
+        });
+        return if cache {
+            format!("{shown} is in the plugin compiled-component cache, which is loaded as native code")
+        } else {
+            format!(
+                "{shown} is the operator's plugin trust file, which decides which WASM plugins run and with which permissions"
+            )
+        };
+    }
+    let workspace = std::fs::canonicalize(workspace_dir).unwrap_or_else(|_| workspace_dir.to_path_buf());
+    if is_under_plugins_dir(&workspace, target) {
+        return format!("{shown} is under plugins/, where WASM plugin code and manifests live");
+    }
+    format!("{shown} is a hooks.json or mcp.json that decides which programs run as PRX's user")
+}
+
+fn is_root_launch_file(workspace: &std::path::Path, target: &std::path::Path) -> bool {
     let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -324,10 +378,43 @@ pub fn is_workspace_launch_file(workspace_dir: &std::path::Path, target: &std::p
     {
         return false;
     }
-    let workspace = std::fs::canonicalize(workspace_dir).unwrap_or_else(|_| workspace_dir.to_path_buf());
     target
         .parent()
         .is_some_and(|parent| std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()) == workspace)
+}
+
+/// Whether `target` lies at or under `<workspace>/plugins`. The deepest
+/// existing ancestor is canonicalised first, so a symlink cannot hide the
+/// directory, and the not-yet-existing tail is appended unchanged.
+fn is_under_plugins_dir(workspace: &std::path::Path, target: &std::path::Path) -> bool {
+    let mut existing = target;
+    let mut tail = Vec::new();
+    let resolved_base = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(path) => break path,
+            Err(_) => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    break existing.to_path_buf();
+                };
+                tail.push(name.to_os_string());
+                existing = parent;
+            }
+        }
+    };
+    let resolved = tail.iter().rev().fold(resolved_base, |mut path, part| {
+        path.push(part);
+        path
+    });
+    resolved
+        .strip_prefix(workspace)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|first| match first {
+            std::path::Component::Normal(name) => name
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(WORKSPACE_PLUGINS_DIR)),
+            _ => false,
+        })
 }
 
 /// Whether `path` is an existing real directory (`Ok(true)`), absent
@@ -695,5 +782,39 @@ mod tests {
             launch_server(&path(&["mcp", "servers", "a", "startup_timeout_ms"], None)),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod plugin_launch_tests {
+    use super::is_workspace_launch_file;
+    use std::path::Path;
+
+    #[test]
+    fn plugin_trust_state_is_high_risk_wherever_it_lives() {
+        let workspace = Path::new("/nonexistent-prx-test/ws");
+        for target in [
+            "/nonexistent-prx-test/state/plugin-trust.json",
+            "/nonexistent-prx-test/state/plugin-trust.json.lock",
+            "/nonexistent-prx-test/state/.plugin-trust.json.1234.tmp",
+            "/nonexistent-prx-test/state/Plugin-Trust.JSON",
+            "/nonexistent-prx-test/state/plugin-cache/abc.cwasm",
+            "/nonexistent-prx-test/ws/plugins/p/plugin.wasm",
+        ] {
+            assert!(is_workspace_launch_file(workspace, Path::new(target)), "{target}");
+        }
+        let describe = |target: &str| super::describe_launch_target(workspace, Path::new(target));
+        assert!(describe("/nonexistent-prx-test/state/plugin-trust.json").contains("plugin trust file"));
+        assert!(describe("/nonexistent-prx-test/state/plugin-cache/a.cwasm").contains("compiled-component cache"));
+        assert!(describe("/nonexistent-prx-test/ws/plugins/p/plugin.toml").contains("under plugins/"));
+        assert!(describe("/nonexistent-prx-test/ws/hooks.json").contains("hooks.json or mcp.json"));
+        for target in [
+            "/nonexistent-prx-test/ws/notes.txt",
+            "/nonexistent-prx-test/ws/plugin-trust-notes.txt.bak/x",
+            "/nonexistent-prx-test/ws/docs/plugins/readme.md",
+        ] {
+            // `plugin-trust-notes` does not start with the trust file name.
+            assert!(!is_workspace_launch_file(workspace, Path::new(target)), "{target}");
+        }
     }
 }

@@ -417,7 +417,7 @@ impl RuntimeBootstrap {
             )
             .starts_with("wasm:")
         {
-            crate::plugins::init_plugin_runtime(&config.workspace_dir, None).await
+            crate::plugins::init_plugin_runtime(&config, None).await
         } else {
             None
         };
@@ -460,7 +460,7 @@ impl RuntimeBootstrap {
                 }
                 Some(runtime)
             } else {
-                crate::plugins::init_plugin_runtime(&config.workspace_dir, memory.clone()).await
+                crate::plugins::init_plugin_runtime(&config, memory.clone()).await
             }
         } else {
             None
@@ -613,16 +613,19 @@ mod tests {
                 "missing model-managed capability tool {expected}"
             );
         }
+        // `[plugins] enabled` defaults to false (finding 95), and these fixtures
+        // keep the default: the WASM control tools exist only with a plugin
+        // runtime, so none of them may be offered.
         #[cfg(feature = "wasm-plugins")]
-        for expected in [
+        for absent in [
             "wasm_plugin_call",
             "wasm_plugins_status",
             "wasm_plugin_reload",
             "wasm_plugins_manage",
         ] {
             assert!(
-                names.contains(&expected),
-                "missing model-managed capability tool {expected}"
+                !names.contains(&absent),
+                "WASM control tool {absent} offered while plugins are disabled"
             );
         }
     }
@@ -761,12 +764,11 @@ mod tests {
         assert!(ctx.tools.is_some(), "Channel must build tools");
     }
 
+    /// Copy the committed WASM examples into `<workspace>/plugins`.
     #[cfg(feature = "wasm-plugins")]
-    #[tokio::test]
-    async fn wasm_storage_bootstraps_before_memory_and_provider_factory_resolution() {
-        let tmp = tempfile::tempdir().expect("test: create temp dir");
-        for example in ["map-storage", "echo-provider"] {
-            let destination = tmp.path().join("plugins").join(example);
+    fn plant_wasm_examples(workspace: &Path, examples: &[&str]) {
+        for example in examples {
+            let destination = workspace.join("plugins").join(example);
             std::fs::create_dir_all(&destination).unwrap();
             let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("pdk/rust/examples")
@@ -774,9 +776,31 @@ mod tests {
             std::fs::copy(fixture.join("plugin.toml"), destination.join("plugin.toml")).unwrap();
             std::fs::copy(fixture.join("plugin.wasm"), destination.join("plugin.wasm")).unwrap();
         }
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn wasm_storage_bootstraps_before_memory_and_provider_factory_resolution() {
+        let tmp = tempfile::tempdir().expect("test: create temp dir");
+        // The operator's state directory sits outside the workspace.
+        let state = tempfile::tempdir().expect("test: create state dir");
+        let examples = ["map-storage", "echo-provider"];
+        plant_wasm_examples(tmp.path(), &examples);
         let mut config = test_config(tmp.path());
+        config.config_path = state.path().join("config.toml");
+        config.plugins.enabled = true;
         config.memory.backend = "wasm:wasm-map".to_string();
         config.default_provider = Some("wasm:wasm-echo".to_string());
+        // Trust is the operator's: record it in the trust file the runtime reads.
+        let policy = crate::plugins::PluginPolicy::from_config(&config).expect("test: plugin policy");
+        for example in examples {
+            let material = crate::plugins::trust::PluginMaterial::read(&tmp.path().join("plugins").join(example))
+                .expect("test: read example plugin");
+            let granted = material.manifest.permissions.required.clone();
+            policy
+                .record(material.record_for(&granted).expect("test: trust record"))
+                .expect("test: write trust file");
+        }
 
         let ctx = RuntimeBootstrap::build(config, BootstrapProfile::Interactive)
             .await
@@ -786,6 +810,24 @@ mod tests {
         assert_eq!(runtime.storage_names(), vec!["wasm-map"]);
         assert_eq!(runtime.provider_names(), vec!["wasm-echo"]);
         assert!(crate::providers::create_provider("wasm:wasm-echo", None).is_ok());
+    }
+
+    /// Finding 95: the switch defaults to off, and with it off the workspace
+    /// plugins are neither scanned nor loaded, even ones the operator trusted.
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn plugins_stay_absent_while_the_switch_is_off() {
+        let tmp = tempfile::tempdir().expect("test: create temp dir");
+        plant_wasm_examples(tmp.path(), &["pipeline-middleware", "echo-provider"]);
+        crate::plugins::trust_workspace_plugins(tmp.path());
+        let config = test_config(tmp.path());
+        assert!(!config.plugins.enabled);
+
+        let ctx = RuntimeBootstrap::build(config, BootstrapProfile::Worker)
+            .await
+            .expect("test: worker build");
+        assert!(ctx.plugin_runtime.is_none(), "no plugin runtime while disabled");
+        assert!(ctx.tools.is_some());
     }
 
     #[tokio::test]

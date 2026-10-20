@@ -1,14 +1,19 @@
 //! Precompile cache for WASM components.
 //!
 //! Stores native-compiled WASM components on disk to avoid recompilation on
-//! every startup. Cache keys are derived from a fast hash of the WASM bytes,
-//! so updated plugins automatically invalidate their cache entry.
+//! every startup. Cache keys are the SHA-256 of the WASM bytes (the hash the
+//! operator's trust record binds) plus the engine's compatibility hash, and
+//! every file carries an integrity seal checked before deserialization.
 //!
 //! # Safety
 //!
-//! `Component::deserialize_file` is `unsafe` because it trusts that the
+//! `Component::deserialize` is `unsafe` because it trusts that the
 //! serialized bytes were produced by the same wasmtime build on the same
-//! platform. We generate all cache files ourselves, so this is acceptable.
+//! platform. We generate all cache files ourselves, in a directory outside the
+//! agent workspace (see `PluginPolicy::cache_dir`), so this is acceptable. A
+//! directory an agent could write would be a code-execution path around
+//! plugin trust. Only components that already passed the trust check are ever
+//! compiled into the cache.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,55 +75,65 @@ impl PrecompileCache {
 
     /// Return a compiled component, loading from disk cache when possible.
     ///
-    /// On a cache miss, the component is compiled from `wasm_bytes` and the
-    /// native artifact is written to disk for future use.
+    /// The cache key is the SHA-256 of `wasm_bytes` (the hash the operator's
+    /// trust record binds) plus a hash of the engine's compatibility data, so
+    /// two different components never share an entry and an entry built by
+    /// another wasmtime configuration is never reused. Each file starts with a
+    /// seal, `sha256(component hash || native artifact)`, checked before the
+    /// artifact is deserialized: a truncated, altered or swapped file fails the
+    /// seal and the component is recompiled instead. The seal is an integrity
+    /// check only, not authentication; the cache directory being out of the
+    /// agent's reach is what keeps planted native code out. Files are written to a
+    /// temporary name and renamed into place.
     #[allow(unsafe_code)]
     pub fn get_or_compile(
         &self,
         engine: &wasmtime::Engine,
         wasm_bytes: &[u8],
     ) -> Result<wasmtime::component::Component, anyhow::Error> {
-        let hash = Self::hash_bytes(wasm_bytes);
+        let wasm_sha256 = super::trust::sha256_hex(wasm_bytes);
+        let hash = Self::cache_key(engine, &wasm_sha256);
         let cache_path = self.cache_dir.join(format!("{hash}.cwasm"));
 
-        // Try loading from disk cache first.
-        if cache_path.exists() {
-            // SAFETY: We only write cache files from `engine.precompile_component`,
-            // which produces platform-native artifacts for this exact engine
-            // configuration.
-            match unsafe { wasmtime::component::Component::deserialize_file(engine, &cache_path) } {
-                Ok(component) => {
-                    tracing::debug!(hash = %hash, "precompile cache hit");
-                    self.metrics.record_hit();
-                    return Ok(component);
+        if let Ok(stored) = std::fs::read(&cache_path) {
+            match Self::unseal(&wasm_sha256, &stored) {
+                Some(payload) => {
+                    // SAFETY: the payload passed the seal bound to this
+                    // component's SHA-256, and files are written only by this
+                    // function from `engine.precompile_component` into a
+                    // directory outside the agent workspace, for an engine
+                    // with the same compatibility hash.
+                    match unsafe { wasmtime::component::Component::deserialize(engine, payload) } {
+                        Ok(component) => {
+                            tracing::debug!(hash = %hash, "precompile cache hit");
+                            self.metrics.record_hit();
+                            return Ok(component);
+                        }
+                        Err(e) => {
+                            tracing::warn!(hash = %hash, error = %e, "cached component invalid, recompiling");
+                        }
+                    }
                 }
-                Err(e) => {
-                    // Cache file is stale or corrupt — remove and recompile.
-                    tracing::warn!(
-                        hash = %hash,
-                        error = %e,
-                        "cached component invalid, recompiling"
-                    );
-                    let _ = std::fs::remove_file(&cache_path);
+                None => {
+                    tracing::warn!(hash = %hash, "cached component failed its integrity seal, recompiling");
                 }
             }
+            let _ = std::fs::remove_file(&cache_path);
         }
 
-        // Compile from source and measure wall-clock time.
         tracing::debug!(hash = %hash, "precompile cache miss, compiling");
         let t0 = std::time::Instant::now();
 
         let component = wasmtime::component::Component::new(engine, wasm_bytes)
             .map_err(|e| anyhow::anyhow!("WASM compilation failed: {e}"))?;
 
-        let compile_ms = t0.elapsed().as_millis() as u64;
+        let compile_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.metrics.record_miss(compile_ms);
         tracing::debug!(hash = %hash, compile_ms, "WASM component compiled");
 
-        // Persist the native artifact to disk for next startup.
         match engine.precompile_component(wasm_bytes) {
             Ok(serialized) => {
-                if let Err(e) = std::fs::write(&cache_path, &serialized) {
+                if let Err(e) = self.write_sealed(&cache_path, &wasm_sha256, &serialized) {
                     tracing::warn!(hash = %hash, error = %e, "failed to write precompile cache");
                 } else {
                     tracing::debug!(hash = %hash, "precompile cache written");
@@ -130,6 +145,42 @@ impl PrecompileCache {
         }
 
         Ok(component)
+    }
+
+    fn write_sealed(&self, path: &std::path::Path, wasm_sha256: &str, payload: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let temp = self.cache_dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut file = std::fs::File::create(&temp)?;
+            file.write_all(Self::seal(wasm_sha256, payload).as_bytes())?;
+            file.write_all(b"\n")?;
+            file.write_all(payload)?;
+            file.sync_all()?;
+            std::fs::rename(&temp, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
+    }
+
+    /// Integrity check, not authentication: the seal is an unkeyed SHA-256, so
+    /// it catches truncation, bit rot and a file swapped in under another
+    /// component's name, but anyone who can write the cache directory can
+    /// recompute it. The protection boundary is the cache location, which is
+    /// operator-owned and outside the workspace (see `PluginPolicy::cache_dir`).
+    fn seal(wasm_sha256: &str, payload: &[u8]) -> String {
+        let mut material = Vec::with_capacity(wasm_sha256.len() + payload.len());
+        material.extend_from_slice(wasm_sha256.as_bytes());
+        material.extend_from_slice(payload);
+        super::trust::sha256_hex(&material)
+    }
+
+    /// The artifact bytes of a stored file, or `None` when the seal is wrong.
+    fn unseal<'a>(wasm_sha256: &str, stored: &'a [u8]) -> Option<&'a [u8]> {
+        let (seal, payload) = stored.split_at_checked(64)?;
+        let payload = payload.strip_prefix(b"\n")?;
+        (seal == Self::seal(wasm_sha256, payload).as_bytes()).then_some(payload)
     }
 
     /// Delete all `.cwasm` files from the cache directory.
@@ -154,43 +205,30 @@ impl PrecompileCache {
             .unwrap_or(0)
     }
 
-    /// Fast, stable hash for cache keying.
-    ///
-    /// Uses FNV-1a 64-bit — deterministic across Rust versions and platforms,
-    /// unlike `DefaultHasher` whose output is explicitly documented as unstable.
-    /// File size is appended as a suffix to further reduce cache collision
-    /// probability for small WASM changes.
-    fn hash_bytes(data: &[u8]) -> String {
-        // FNV-1a 64-bit constants (http://www.isthe.com/chongo/tech/comp/fnv/)
-        const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut hash = FNV_OFFSET_BASIS;
-        for &byte in data {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
+    /// `<component sha256>-<first 16 hex of sha256(engine compatibility data)>`.
+    fn cache_key(engine: &wasmtime::Engine, wasm_sha256: &str) -> String {
+        use std::hash::Hash as _;
+        /// Collects everything the engine feeds a `Hasher`, so the digest is a
+        /// SHA-256 of the compatibility data rather than a 64-bit std hash.
+        struct ByteSink(Vec<u8>);
+        impl std::hash::Hasher for ByteSink {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.extend_from_slice(bytes);
+            }
         }
-        format!("{:016x}-{:08x}", hash, data.len() as u32)
+        let mut sink = ByteSink(Vec::new());
+        engine.precompile_compatibility_hash().hash(&mut sink);
+        let digest = super::trust::sha256_hex(&sink.0);
+        format!("{wasm_sha256}-{}", digest.get(..16).unwrap_or(&digest))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hash_is_stable() {
-        let data = b"hello wasm";
-        let h1 = PrecompileCache::hash_bytes(data);
-        let h2 = PrecompileCache::hash_bytes(data);
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn different_data_different_hash() {
-        let h1 = PrecompileCache::hash_bytes(b"foo");
-        let h2 = PrecompileCache::hash_bytes(b"bar");
-        assert_ne!(h1, h2);
-    }
 
     #[test]
     fn new_creates_dir() {
@@ -214,6 +252,97 @@ mod tests {
         assert_eq!(cache.cached_count(), 0);
         assert!(tmp.join("keep.txt").exists());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // --- Keying and integrity (finding 95) ---
+
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("pdk/rust/examples")
+                .join(name)
+                .join("plugin.wasm"),
+        )
+        .unwrap()
+    }
+
+    fn cwasm_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "cwasm"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn the_cache_key_is_the_component_sha256_and_distinct_per_component() {
+        let engine = crate::plugins::shared_wasm_engine().unwrap();
+        let a = fixture("echo-provider");
+        let b = fixture("map-storage");
+        let key_a = PrecompileCache::cache_key(&engine, &crate::plugins::trust::sha256_hex(&a));
+        let key_b = PrecompileCache::cache_key(&engine, &crate::plugins::trust::sha256_hex(&b));
+        assert_ne!(key_a, key_b);
+        assert!(key_a.starts_with(&crate::plugins::trust::sha256_hex(&a)));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = PrecompileCache::new(tmp.path().to_path_buf()).unwrap();
+        cache.get_or_compile(&engine, &a).unwrap();
+        cache.get_or_compile(&engine, &b).unwrap();
+        assert_eq!(cwasm_files(tmp.path()).len(), 2, "two components shared a cache entry");
+        cache.get_or_compile(&engine, &a).unwrap();
+        assert_eq!(cache.metrics.hits(), 1);
+        assert_eq!(cache.metrics.misses(), 2);
+    }
+
+    #[test]
+    fn a_tampered_cache_file_is_detected_and_recompiled() {
+        let engine = crate::plugins::shared_wasm_engine().unwrap();
+        let bytes = fixture("echo-provider");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = PrecompileCache::new(tmp.path().to_path_buf()).unwrap();
+        cache.get_or_compile(&engine, &bytes).unwrap();
+        let path = cwasm_files(tmp.path()).remove(0);
+
+        let mut stored = std::fs::read(&path).unwrap();
+        if let Some(byte) = stored.last_mut() {
+            *byte ^= 0xff;
+        }
+        std::fs::write(&path, &stored).unwrap();
+        cache.get_or_compile(&engine, &bytes).unwrap();
+        assert_eq!(cache.metrics.hits(), 0, "a tampered artifact was loaded");
+        assert_eq!(cache.metrics.misses(), 2);
+
+        // The rewritten entry is good again.
+        cache.get_or_compile(&engine, &bytes).unwrap();
+        assert_eq!(cache.metrics.hits(), 1);
+
+        // Truncation and garbage are detected too.
+        std::fs::write(&path, b"short").unwrap();
+        cache.get_or_compile(&engine, &bytes).unwrap();
+        assert_eq!(cache.metrics.misses(), 3);
+    }
+
+    #[test]
+    fn another_components_cache_file_is_not_accepted_under_this_key() {
+        let engine = crate::plugins::shared_wasm_engine().unwrap();
+        let a = fixture("echo-provider");
+        let b = fixture("map-storage");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = PrecompileCache::new(tmp.path().to_path_buf()).unwrap();
+        cache.get_or_compile(&engine, &a).unwrap();
+        let a_path = cwasm_files(tmp.path()).remove(0);
+        let b_path = tmp.path().join(format!(
+            "{}.cwasm",
+            PrecompileCache::cache_key(&engine, &crate::plugins::trust::sha256_hex(&b))
+        ));
+        // Plant A's valid, sealed native code under B's name.
+        std::fs::copy(&a_path, &b_path).unwrap();
+        cache.get_or_compile(&engine, &b).unwrap();
+        assert_eq!(cache.metrics.hits(), 0, "B loaded A's native code");
+        assert_eq!(cache.metrics.misses(), 2);
     }
 
     // --- Metrics tests ---
@@ -259,27 +388,6 @@ mod tests {
     }
 
     // --- Hash-based invalidation ---
-
-    #[test]
-    fn hash_changes_with_single_byte_difference() {
-        let data1 = b"hello wasm world";
-        let data2 = b"hello WASM world"; // uppercase 'W'
-        let h1 = PrecompileCache::hash_bytes(data1);
-        let h2 = PrecompileCache::hash_bytes(data2);
-        assert_ne!(h1, h2, "single-byte change must produce different cache key");
-    }
-
-    #[test]
-    fn hash_includes_length_in_key() {
-        // Even if hashes collide (unlikely), length suffix distinguishes files.
-        let h1 = PrecompileCache::hash_bytes(b"a");
-        let h2 = PrecompileCache::hash_bytes(b"aa");
-        assert_ne!(h1, h2);
-        // The hash format encodes length: "XXXXXXXXXXXXXXXX-YYYYYYYY"
-        let len_suffix_1 = h1.split('-').nth(1).unwrap();
-        let len_suffix_2 = h2.split('-').nth(1).unwrap();
-        assert_ne!(len_suffix_1, len_suffix_2, "length component should differ");
-    }
 
     #[test]
     fn cached_count_after_multiple_writes() {

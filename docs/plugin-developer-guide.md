@@ -218,17 +218,40 @@ max_memory_mb = 8
 max_execution_time_ms = 1000
 ```
 
-### Step 5: Build and deploy
+### Step 5: Build, install and trust
 
 ```bash
 # Build the WASM component
 cargo component build --release
 
-# Deploy to PRX plugins directory
-mkdir -p /path/to/prx/plugins/echo-tool
-cp target/wasm32-wasip2/release/echo_tool.wasm /path/to/prx/plugins/echo-tool/plugin.wasm
-cp plugin.toml /path/to/prx/plugins/echo-tool/
+# Stage the plugin inside the PRX workspace (any directory except plugins/)
+mkdir -p /path/to/workspace/plugin-sources/echo-tool
+cp target/wasm32-wasip2/release/echo_tool.wasm /path/to/workspace/plugin-sources/echo-tool/plugin.wasm
+cp plugin.toml /path/to/workspace/plugin-sources/echo-tool/
 ```
+
+Plugins are off until the operator turns them on, and a plugin runs only after
+the operator has trusted that exact build:
+
+1. Set `[plugins] enabled = true` in `config.toml` (default `false`; restart PRX).
+2. Install with `wasm_plugins_manage`, naming the permissions you grant:
+
+   ```json
+   {"action": "install", "source": "plugin-sources/echo-tool", "grant_permissions": ["log", "kv"]}
+   ```
+
+   `install` and `update` are high-risk operations. The approval request names
+   the plugin, the SHA-256 of `plugin.wasm`, the SHA-256 of `plugin.toml` and the
+   granted permission list, so an approval cannot be reused for different bytes
+   or a wider grant. `grant_permissions` must include every `required`
+   permission and may list only permissions the manifest declares.
+3. PRX copies the plugin into `<workspace>/plugins/echo-tool/`, compiles it,
+   and only then records the grant in the operator trust file (see
+   [Trust](#trust)).
+
+Copying files into `<workspace>/plugins/` by hand does not make a plugin run:
+the directory is scanned, but a plugin without a matching trust record is shown
+with an error status and is never compiled or instantiated.
 
 ### Step 6: Run tests locally (no WASM runtime needed)
 
@@ -256,6 +279,34 @@ mod tests {
 ```bash
 cargo test   # compiles as rlib, runs on host
 ```
+
+### Trust
+
+The trust file `plugin-trust.json` lives in the PRX state directory, next to
+`config.toml` (for example `~/.openprx/plugin-trust.json`), outside the agent
+workspace, mode `0600`. PRX refuses to read it if it is a symlink, is readable
+by group or others, or is malformed (nothing is trusted then), and it refuses to
+enable plugins at all when the state directory lies inside the workspace.
+
+Each record binds:
+
+| Field | Meaning |
+|-------|---------|
+| `name` | `plugin.name` from the manifest |
+| `sha256` | SHA-256 of the `.wasm` component (of empty input for a manifest-only plugin) |
+| `manifest_sha256` | SHA-256 of `plugin.toml`, which carries the `http_allowlist` and the resource limits |
+| `permissions` | The exact host permissions granted |
+
+A plugin is loaded only when a record matches its name, both hashes, and covers
+every `required` permission. It then holds exactly the listed permissions that
+its manifest declares (`required` or `optional`); an `optional` permission that
+is not in the record is simply not granted. Changing the component or the
+manifest after trusting it (including a version bump) means the plugin is
+refused until it is installed or updated again. `remove` deletes the record.
+
+There is no marker file, manifest field or `trusted_plugins` setting that
+confers trust. Compiled-component caches are kept beside the trust file
+(`plugin-cache/`), never under the workspace.
 
 ---
 
@@ -307,8 +358,8 @@ description = "Optional description"
 # [[capabilities.events]]
 # pattern = "prx.lifecycle.*"
 
-# For middleware: processing priority (lower = runs first, 0–100)
-# priority = 50
+# For middleware: processing priority (lower = runs first). Default: 100
+# priority = 100
 
 # For cron: cron expression (standard 5-field cron)
 # schedule = "0 * * * *"   # every hour
@@ -316,17 +367,21 @@ description = "Optional description"
 # ── Permissions ───────────────────────────────────────────────────────────────
 
 [permissions]
-# Permissions the plugin MUST have to function. PRX will refuse to load the
-# plugin if any required permission is denied.
+# Permissions the plugin MUST have to function. PRX refuses the plugin unless
+# the operator's trust record grants every one of them.
 required = ["log", "kv"]
 
-# Permissions the plugin uses if available but can work without.
+# Permissions the plugin uses if available but can work without. They are
+# granted only when the operator's trust record lists them.
 optional = ["http-outbound", "memory", "events"]
 
-# For http-outbound permission: explicit URL allowlist (required)
+# Outbound URL patterns for http-outbound and websocket-outbound. Empty (the
+# default) denies every URL. Pattern: scheme://host[:port][/path-prefix][*]
 # http_allowlist = [
-#     "https://api.example.com",
-#     "https://api.other.com/v1/",
+#     "https://api.example.com/*",
+#     "https://*.cdn.example.com/*",
+#     "https://api.other.com/v1/*",
+#     "wss://stream.example.com/*",
 # ]
 
 # For filesystem permission (future): allowed paths
@@ -335,26 +390,30 @@ optional = ["http-outbound", "memory", "events"]
 # ── Resource Limits ───────────────────────────────────────────────────────────
 
 [resources]
-# Compute budget in wasmtime "fuel" units.
+# Compute budget in wasmtime "fuel" units, per invocation.
 # 1M fuel ≈ 1–5ms of CPU depending on workload.
-# Default: 100_000_000 (100M)
-max_fuel = 100_000_000
+# Default: 1_000_000_000 (1B)
+max_fuel = 1_000_000_000
 
 # Linear memory limit in megabytes.
-# Default: 16
-max_memory_mb = 16
+# Default: 64
+max_memory_mb = 64
 
 # Wall-clock timeout in milliseconds.
-# Default: 5000
-max_execution_time_ms = 5000
+# Default: 30000
+max_execution_time_ms = 30000
 
-# Maximum number of outbound HTTP requests per invocation.
+# Maximum number of outbound HTTP/WebSocket-connect requests per invocation.
 # Default: 10
-max_http_requests = 10
+max_http_requests_per_call = 10
 
-# Maximum total KV storage in kilobytes (across all keys for this plugin).
-# Default: 1024
-max_kv_storage_kb = 1024
+# Optional extra cap on such requests in any rolling 60 seconds (across
+# invocations). Default: none
+# max_http_requests_per_minute = 60
+
+# Maximum total KV storage in megabytes (keys plus values, for this plugin).
+# Default: 10
+max_kv_storage_mb = 10
 
 # ── Static Configuration ──────────────────────────────────────────────────────
 
@@ -372,23 +431,24 @@ max_kv_storage_kb = 1024
 |-------|----------|------|-------------|
 | `plugin.name` | ✅ | string | Unique identifier (kebab-case) |
 | `plugin.version` | ✅ | string | SemVer version |
-| `plugin.description` | ✅ | string | Short description |
-| `plugin.wasm` | ✅ | string | Path to `.wasm` file |
+| `plugin.description` | ❌ | string | Short description (default empty) |
+| `plugin.wasm` | ❌ | string | Path to the `.wasm` file inside the plugin directory (default `plugin.wasm`) |
 | `plugin.author` | ❌ | string | Author name |
 | `capabilities[].type` | ✅ | enum | `tool\|hook\|middleware\|cron\|provider\|storage` |
 | `capabilities[].name` | ✅* | string | Capability name (*required for tool/provider/storage) |
 | `capabilities[].description` | ❌ | string | Capability description |
 | `capabilities[].events[].pattern` | ✅* | string | Event pattern (*required for hook) |
-| `capabilities[].priority` | ❌ | integer | Middleware priority (0–100, default 50) |
+| `capabilities[].priority` | ❌ | integer | Middleware priority (lower runs first, default 100) |
 | `capabilities[].schedule` | ✅* | string | Cron expression (*required for cron) |
-| `permissions.required` | ❌ | list | Required permissions |
-| `permissions.optional` | ❌ | list | Optional permissions |
-| `permissions.http_allowlist` | ✅* | list | Allowed HTTP origins (*required with `http-outbound`) |
-| `resources.max_fuel` | ❌ | integer | Compute budget (default 100M) |
-| `resources.max_memory_mb` | ❌ | integer | Memory limit MB (default 16) |
-| `resources.max_execution_time_ms` | ❌ | integer | Timeout ms (default 5000) |
-| `resources.max_http_requests` | ❌ | integer | HTTP request limit (default 10) |
-| `resources.max_kv_storage_kb` | ❌ | integer | KV storage limit KB (default 1024) |
+| `permissions.required` | ❌ | list | Required permissions; all must be granted by the operator's trust record |
+| `permissions.optional` | ❌ | list | Optional permissions; granted only if the trust record lists them |
+| `permissions.http_allowlist` | ✅* | list | Outbound URL patterns (*without entries, `http-outbound` and `websocket-outbound` deny every URL). An invalid pattern is a manifest load error |
+| `resources.max_fuel` | ❌ | integer | Compute budget per invocation (default 1,000,000,000) |
+| `resources.max_memory_mb` | ❌ | integer | Memory limit MB (default 64) |
+| `resources.max_execution_time_ms` | ❌ | integer | Timeout ms (default 30000) |
+| `resources.max_http_requests_per_call` | ❌ | integer | Outbound requests per invocation (default 10) |
+| `resources.max_http_requests_per_minute` | ❌ | integer | Optional rolling 60-second cap across invocations (default none) |
+| `resources.max_kv_storage_mb` | ❌ | integer | KV storage limit MB (default 10) |
 | `resources.max_payload_bytes` | ❌ | integer | Payload cap in bytes for every WASM capability call that carries input (default: an eighth of `max_memory_mb`, floor 64 KiB). `0` is rejected; a value above `max_memory_mb` is clamped to it |
 | `config.*` | ❌ | string | Static configuration key-value pairs |
 
@@ -507,7 +567,7 @@ pattern = "prx.lifecycle.*"
 description = "All lifecycle events"
 
 [[capabilities.events]]
-pattern = "tool.call"
+pattern = "prx.lifecycle.tool_call"
 description = "Tool invocations only"
 ```
 
@@ -515,7 +575,7 @@ description = "Tool invocations only"
 
 **Event patterns:**
 
-- Exact: `"tool.call"` — matches only that event
+- Exact: `"prx.lifecycle.tool_call"` — matches only that event (the short name `"tool_call"` also matches)
 - Wildcard: `"prx.lifecycle.*"` — matches all events under `prx.lifecycle.`
 - All: `"*"` — matches every event (use sparingly)
 
@@ -523,8 +583,14 @@ description = "Tool invocations only"
 
 | Event | Description | Payload fields |
 |-------|-------------|---------------|
-| `prx.lifecycle.agent_start` | Agent started | `agent_id` |
-| `prx.lifecycle.agent_stop` | Agent stopped | `agent_id`, `reason` |
+| `prx.lifecycle.agent_start` | Agent started | `provider`, `model` |
+| `prx.lifecycle.agent_stop` | Agent stopped | emitter-specific |
+| `prx.lifecycle.llm_request` | LLM request sent | emitter-specific |
+| `prx.lifecycle.llm_response` | LLM response received | emitter-specific |
+| `prx.lifecycle.tool_call_start` | Tool invocation starting | emitter-specific |
+| `prx.lifecycle.tool_call` | Tool invoked | emitter-specific |
+| `prx.lifecycle.turn_complete` | A turn finished | emitter-specific |
+| `prx.lifecycle.error` | Error occurred | `component`, `message` |
 | `prx.plugin.middleware_quarantined` | A middleware adapter spent its restart budget and is no longer called | `plugin`, `capability`, `reason` |
 | `prx.plugin.tool_quarantined` | A tool adapter spent its restart budget; its calls return a tool error | `plugin`, `capability`, `reason` |
 | `prx.plugin.hook_quarantined` | A hook adapter spent its restart budget and no longer observes events | `plugin`, `capability`, `reason` |
@@ -532,11 +598,8 @@ description = "Tool invocations only"
 | `prx.plugin.provider_quarantined` | A provider adapter spent its restart budget; its requests return an error | `plugin`, `capability`, `reason` |
 | `prx.plugin.storage_quarantined` | A storage adapter spent its restart budget; its operations return an error | `plugin`, `capability`, `reason` |
 | `prx.plugin.storage_restarted` | A storage adapter was rebuilt on a fresh store; entries kept in guest memory are gone | `plugin`, `capability`, `reason`, `restart_count` |
-| `tool.call` | Tool invoked | `tool_name`, `args`, `session_id` |
-| `tool.result` | Tool completed | `tool_name`, `success`, `duration_ms` |
-| `llm.request` | LLM request sent | `model`, `message_count` |
-| `llm.response` | LLM response received | `model`, `tokens_used` |
-| `error` | Error occurred | `message`, `context` |
+
+The eight `prx.lifecycle.*` topics are the only built-in lifecycle events: PRX bridges its native hook events (`agent_start`, `agent_end` published as `agent_stop`, `llm_request`, `llm_response`, `tool_call_start`, `tool_call`, `turn_complete`, `error`) to `prx.lifecycle.<name>`, with the same JSON payload that `hooks.json` commands receive; field names beyond those shown depend on the emitting code path. Topics such as `tool.call`, `tool.result`, `llm.request` and `error` without the prefix are not published.
 
 **Example (Rust):**
 
@@ -995,7 +1058,7 @@ count = host.kv.increment("counter", delta=1)
 - Use namespaced keys: `"user:{id}:prefs"`, `"count:tool_calls"`, etc.
 - `list-keys("")` returns all keys for the plugin.
 - Values are raw bytes; use PDK helpers for strings and JSON.
-- Storage is limited by `resources.max_kv_storage_kb`.
+- Storage is limited by `resources.max_kv_storage_mb`.
 
 ---
 
@@ -1004,7 +1067,7 @@ count = host.kv.increment("counter", delta=1)
 **Permission:** `"http-outbound"` + `http_allowlist`  
 **WIT:** `prx:host/http-outbound`
 
-Make outbound HTTP requests. URLs are validated against the `http_allowlist` declared in `plugin.toml` before the request is sent.
+Make outbound HTTP requests. Every request must pass three checks before any connection is made, and the same checks apply to `websocket-outbound`: the `http_allowlist` declared in `plugin.toml`, the private-network guard, and the request budget (see below).
 
 ```rust
 // Rust
@@ -1038,18 +1101,22 @@ resp = host.http.post_json("https://api.example.com/post", {"key": "val"})
 resp = host.http.request("PUT", url, headers=[("X-Token", "abc")], body=b"...")
 ```
 
-**`plugin.toml` — declare allowed origins:**
+**`plugin.toml` — declare allowed URLs:**
 
 ```toml
 [permissions]
 required = ["http-outbound"]
 http_allowlist = [
-    "https://api.openweathermap.org",
-    "https://api.ipify.org",
+    "https://api.openweathermap.org/*",
+    "https://api.ipify.org/*",
 ]
 ```
 
-A request to a URL not matching the allowlist returns an error immediately (no network connection is made).
+A request to a URL not matching the allowlist returns an error immediately (no network connection is made). An empty or missing `http_allowlist` denies every URL.
+
+**Private-network guard.** Requests to loopback (`127.0.0.0/8`, `::1`, `localhost`), link-local (`169.254.0.0/16`, `fe80::/10`), private (RFC 1918, `fc00::/7`), CGNAT (`100.64.0.0/10`), multicast, reserved and cloud-metadata addresses (`169.254.169.254`, `fd00:ec2::254`) are refused even when the allowlist names them. The check applies to IP literals in the URL, to every address a host name resolves to (the resolver filters at connect time, so a rebinding answer cannot slip past; one forbidden answer rejects the host), and to every redirect hop. Redirects are followed at most 5 times and each hop must itself be in the allowlist; HTTP proxies from the environment are ignored. WebSocket connections do not follow redirects.
+
+**Request budget.** `max_http_requests_per_call` (default 10) bounds outbound requests per invocation, and `max_http_requests_per_minute`, when set, bounds them over a rolling 60 seconds. A WebSocket `connect` counts as one request; the budget error is returned to the guest. Response bodies are capped at 16 MiB.
 
 ---
 
@@ -1120,29 +1187,34 @@ host.events.unsubscribe(sub_id)
 
 ## 6. Permissions
 
-Permissions are declared in `plugin.toml` and enforced by the PRX host. Attempting to call a host function without the corresponding permission results in a trap.
+Permissions are declared in `plugin.toml` and **granted by the operator** through the trust record (see [Trust](#trust)); a manifest can only ask. The PRX host enforces the grants: calling a host function without the corresponding permission returns an error to the guest.
 
 ### Permission Reference
 
-| Permission | Host interface | Granted by default | Notes |
+| Permission | Host interface | Available without a grant | Notes |
 |------------|---------------|--------------------|-------|
-| `log` | `prx:host/log` | ✅ Yes | Always available |
+| `log` | `prx:host/log` | ✅ Yes | Always available to a trusted plugin |
 | `config` | `prx:host/config` | ✅ Yes | Read-only plugin config |
-| `kv` | `prx:host/kv` | ❌ No | Must declare |
-| `events` | `prx:host/events` | ❌ No | Must declare |
-| `http-outbound` | `prx:host/http-outbound` | ❌ No | Requires `http_allowlist` |
-| `memory` | `prx:host/memory` | ❌ No | Must declare |
+| `kv` | `prx:host/kv` | ❌ No | Declare it, and the operator must grant it |
+| `events` | `prx:host/events` | ❌ No | Declare it, and the operator must grant it |
+| `http-outbound` | `prx:host/http-outbound` | ❌ No | Also needs `http_allowlist` entries |
+| `websocket-outbound` | `prx:host/websocket-outbound` | ❌ No | Same allowlist and guard as HTTP |
+| `memory` | `prx:host/memory` | ❌ No | Declare it, and the operator must grant it |
+
+Only plugins the operator trusted run at all; the table describes what a trusted plugin may call.
 
 ### `required` vs `optional`
 
 ```toml
 [permissions]
-# Plugin refuses to load if these are denied
+# The plugin is refused unless the operator's trust record grants all of these
 required = ["log", "kv"]
 
-# Plugin loads and degrades gracefully if these are unavailable
+# The plugin loads without these unless the trust record also lists them
 optional = ["http-outbound", "memory"]
 ```
+
+An `optional` permission is granted only through the trust record (`grant_permissions` at install time). Without the grant, calling the host function returns a "not yet granted" error and the plugin should degrade gracefully.
 
 Check optional permissions at runtime:
 
@@ -1159,18 +1231,27 @@ let weather = match http::get("https://wttr.in/London?format=3", &[]) {
 
 ### HTTP Allowlist
 
-The `http_allowlist` is required when declaring `http-outbound` permission. URLs are matched by origin (scheme + host + optional path prefix):
+The `http_allowlist` is required for `http-outbound` and `websocket-outbound`; with no entries every URL is denied. Each entry is a URL pattern, `scheme://host[:port][/path-prefix][*]`, parsed and checked as follows:
+
+- the scheme is compared exactly (`https` does not match `http`, `wss` does not match `ws`);
+- the host is compared exactly, case-insensitively; a leading `*.` matches subdomains on label boundaries (`*.example.com` matches `a.example.com` and `a.b.example.com`, not `example.com` or `evilexample.com`);
+- the port must equal the pattern's port, or the scheme default (80 or 443) when the pattern names none;
+- the path is a prefix on a segment boundary (`/v2/*` or `/v2` matches `/v2` and `/v2/x`, not `/v20`); a trailing `*` is optional and no other `*` is allowed;
+- URLs with user info never match, so `https://api.example.com@evil.example/` is refused.
+
+String-prefix patterns such as `https://api.example.com*` are no longer valid and fail the manifest load with an error naming the entry.
 
 ```toml
 [permissions]
 required = ["http-outbound"]
 http_allowlist = [
-    "https://api.openweathermap.org",     # all paths under this origin
-    "https://api.example.com/v2/",        # only paths under /v2/
+    "https://api.openweathermap.org/*",   # all paths on this host
+    "https://api.example.com/v2/*",       # only paths under /v2
+    "https://*.cdn.example.com/*",        # any subdomain
 ]
 ```
 
-Requests to origins not in the allowlist are rejected before any network connection is made.
+Requests to URLs not in the allowlist, and requests to private or metadata addresses even when listed, are rejected before any network connection is made.
 
 ---
 
@@ -1180,11 +1261,12 @@ Resource limits protect the PRX host from misbehaving plugins.
 
 | Limit | `plugin.toml` key | Default | Description |
 |-------|-------------------|---------|-------------|
-| Compute | `max_fuel` | 100,000,000 | wasmtime fuel units; ~100M ≈ 100–500ms of CPU |
-| Memory | `max_memory_mb` | 16 | WASM linear memory in MB |
-| Wall time | `max_execution_time_ms` | 5000 | Per-invocation timeout |
-| HTTP calls | `max_http_requests` | 10 | Outbound requests per invocation |
-| KV storage | `max_kv_storage_kb` | 1024 | Total KV data for this plugin |
+| Compute | `max_fuel` | 1,000,000,000 | wasmtime fuel units per invocation; ~100M ≈ 100–500ms of CPU |
+| Memory | `max_memory_mb` | 64 | WASM linear memory in MB |
+| Wall time | `max_execution_time_ms` | 30000 | Per-invocation timeout |
+| HTTP calls | `max_http_requests_per_call` | 10 | Outbound HTTP/WebSocket-connect requests per invocation; enforced |
+| HTTP window | `max_http_requests_per_minute` | none | Optional cap over any rolling 60 seconds |
+| KV storage | `max_kv_storage_mb` | 10 | Total KV data (keys plus values) for this plugin |
 | Payload | `max_payload_bytes` | an eighth of `max_memory_mb`, floor 64 KiB | Largest payload handed to a guest in one call (middleware, tool, hook, provider, storage); `0` is rejected and a value above `max_memory_mb` is clamped to it |
 
 ### Fuel Budget Guide
@@ -1195,7 +1277,7 @@ Resource limits protect the PRX host from misbehaving plugins.
 | JSON parse/serialize | ~500K–2M |
 | Crypto (SHA-256 hash) | ~5M |
 | Large loop (1M iterations) | ~50M |
-| Default limit | 100M |
+| Default limit | 1B |
 
 When fuel is exhausted, the plugin call returns an error: `"plugin ran out of fuel"`. Increase `max_fuel` if you hit this limit in production.
 
@@ -1403,12 +1485,13 @@ Topics are dot-separated strings. Use a hierarchy that reflects your domain:
 ```
 prx.lifecycle.agent_start
 prx.lifecycle.agent_stop
+prx.lifecycle.llm_request
+prx.lifecycle.llm_response
+prx.lifecycle.tool_call_start
+prx.lifecycle.tool_call
+prx.lifecycle.turn_complete
+prx.lifecycle.error
 prx.plugin.middleware_quarantined
-tool.call
-tool.result
-llm.request
-llm.response
-error
 my-plugin.custom.event
 ```
 
@@ -1417,7 +1500,7 @@ my-plugin.custom.event
 | Pattern | Matches |
 |---------|---------|
 | `"prx.lifecycle.*"` | `prx.lifecycle.agent_start`, `prx.lifecycle.agent_stop`, etc. |
-| `"tool.*"` | `tool.call`, `tool.result` |
+| `"prx.plugin.*"` | the adapter quarantine and restart events |
 | `"*"` | Everything (use carefully) |
 | `"my-plugin.status"` | Exact match only |
 
@@ -1496,7 +1579,7 @@ The plugin exceeded `max_fuel`. Increase it in `plugin.toml`:
 
 ```toml
 [resources]
-max_fuel = 500_000_000   # try 5x the previous value
+max_fuel = 5_000_000_000   # try 5x the previous value
 ```
 
 If fuel consumption seems unreasonably high, check for infinite loops or excessive JSON serialization.
