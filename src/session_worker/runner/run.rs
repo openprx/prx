@@ -1264,6 +1264,9 @@ async fn run_owned_manifest(
     );
 
     let result = run_future.await;
+    // The worker process exits once its result is reported: deliver the queued
+    // TurnComplete/Error hook events first.
+    hooks.drain_for_shutdown().await;
 
     let (loop_result, history_commit_len) = result;
     let (mut worker_result, terminal_status) = match loop_result {

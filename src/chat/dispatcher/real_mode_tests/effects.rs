@@ -827,8 +827,11 @@ async fn real_mode_notify_hook_triggers_emit() {
         })
         .await;
 
-    // the hook runs through tokio::process::Command (async); give it enough time to finish
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The hook is delivered by the background dispatcher; wait for the
+    // delivery signal instead of a fixed delay.
+    tokio::time::timeout(Duration::from_secs(30), hooks.wait_delivered(1))
+        .await
+        .expect("the hook delivery finishes");
 
     assert!(
         sentinel.exists(),

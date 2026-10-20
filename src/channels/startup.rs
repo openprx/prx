@@ -753,6 +753,7 @@ pub async fn start_channels_with_config(
     #[cfg(not(test))]
     drop(provider);
 
+    let hooks_for_shutdown = Arc::clone(&runtime_ctx.hooks);
     let dispatch_result = run_message_dispatch_loop_with_cleanup(rx, runtime_ctx, shutdown.clone()).await;
     if dispatch_result.is_err() {
         // A failed cleanup closes this component's admission and listeners;
@@ -767,5 +768,6 @@ pub async fn start_channels_with_config(
         let _ = h.await;
     }
 
+    hooks_for_shutdown.drain_for_shutdown().await;
     dispatch_result
 }
