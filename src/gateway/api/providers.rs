@@ -519,78 +519,81 @@ mod tests {
             .with_max_level(tracing::Level::TRACE)
             .with_ansi(false)
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
+        use tracing::instrument::WithSubscriber as _;
+        let dispatch = fixture::capture_dispatch(subscriber);
+        async {
+            let served = serve_config(|_| {}).await;
+            let (status, reply) = served
+                .call(
+                    Method::PUT,
+                    "/api/providers/openai/credential",
+                    Some(json!({"value": SENTINEL})),
+                )
+                .await;
+            assert_eq!(status, 204, "{reply}");
+            assert!(reply.is_empty(), "a 204 has no body: {reply}");
 
-        let served = serve_config(|_| {}).await;
-        let (status, reply) = served
-            .call(
-                Method::PUT,
-                "/api/providers/openai/credential",
-                Some(json!({"value": SENTINEL})),
-            )
-            .await;
-        assert_eq!(status, 204, "{reply}");
-        assert!(reply.is_empty(), "a 204 has no body: {reply}");
+            let (status, reply) = served
+                .call(
+                    Method::PUT,
+                    "/api/providers/openai/credential",
+                    Some(json!({"value": SENTINEL, "name": "spare"})),
+                )
+                .await;
+            assert_eq!(status, 204, "{reply}");
 
-        let (status, reply) = served
-            .call(
-                Method::PUT,
-                "/api/providers/openai/credential",
-                Some(json!({"value": SENTINEL, "name": "spare"})),
-            )
-            .await;
-        assert_eq!(status, 204, "{reply}");
+            let store = std::fs::read_to_string(served.dir.path().join("auth-profiles.json")).expect("test: store");
+            assert!(!store.contains(SENTINEL), "stored in plaintext");
 
-        let store = std::fs::read_to_string(served.dir.path().join("auth-profiles.json")).expect("test: store");
-        assert!(!store.contains(SENTINEL), "stored in plaintext");
+            let (status, reply) = served.call(Method::GET, "/api/providers/openai", None).await;
+            assert_eq!(status, 200, "{reply}");
+            let ids = at(&json(&reply), "/credentials/references")
+                .as_array()
+                .expect("test: references")
+                .iter()
+                .filter_map(|reference| at(&reference, "/id").as_str().map(str::to_string))
+                .collect::<Vec<_>>();
+            assert!(ids.contains(&"cred-openai".to_string()), "{reply}");
+            assert!(ids.contains(&"cred-spare".to_string()), "{reply}");
+            for path in [
+                "/api/providers",
+                "/api/providers/openai",
+                "/api/config",
+                "/api/config/files",
+                "/api/config/history",
+                "/api/defaults",
+            ] {
+                let (status, reply) = served.call(Method::GET, path, None).await;
+                assert_eq!(status, 200, "{path}: {reply}");
+                assert!(!reply.contains(SENTINEL), "{path} leaked the credential: {reply}");
+            }
 
-        let (status, reply) = served.call(Method::GET, "/api/providers/openai", None).await;
-        assert_eq!(status, 200, "{reply}");
-        let ids = at(&json(&reply), "/credentials/references")
-            .as_array()
-            .expect("test: references")
-            .iter()
-            .filter_map(|reference| at(&reference, "/id").as_str().map(str::to_string))
-            .collect::<Vec<_>>();
-        assert!(ids.contains(&"cred-openai".to_string()), "{reply}");
-        assert!(ids.contains(&"cred-spare".to_string()), "{reply}");
-        for path in [
-            "/api/providers",
-            "/api/providers/openai",
-            "/api/config",
-            "/api/config/files",
-            "/api/config/history",
-            "/api/defaults",
-        ] {
-            let (status, reply) = served.call(Method::GET, path, None).await;
-            assert_eq!(status, 200, "{path}: {reply}");
-            assert!(!reply.contains(SENTINEL), "{path} leaked the credential: {reply}");
+            // A refused value is not echoed either.
+            let (status, reply) = served
+                .call(
+                    Method::PUT,
+                    "/api/providers/openai/credential",
+                    Some(json!({"value": format!("{SENTINEL}\nX-Injected: 1")})),
+                )
+                .await;
+            assert_eq!(status, 400, "{reply}");
+            assert!(!reply.contains(SENTINEL), "{reply}");
+
+            let (status, reply) = served
+                .call(Method::DELETE, "/api/providers/openai/credential?name=spare", None)
+                .await;
+            assert_eq!(status, 204, "{reply}");
+            let (status, reply) = served
+                .call(Method::DELETE, "/api/providers/openai/credential?name=spare", None)
+                .await;
+            assert_eq!(status, 404, "{reply}");
+
+            let logs = sink.text();
+            assert!(logs.contains("cred-openai"), "the write is logged by reference: {logs}");
+            assert!(!logs.contains(SENTINEL), "the logs carry the credential: {logs}");
         }
-
-        // A refused value is not echoed either.
-        let (status, reply) = served
-            .call(
-                Method::PUT,
-                "/api/providers/openai/credential",
-                Some(json!({"value": format!("{SENTINEL}\nX-Injected: 1")})),
-            )
-            .await;
-        assert_eq!(status, 400, "{reply}");
-        assert!(!reply.contains(SENTINEL), "{reply}");
-
-        let (status, reply) = served
-            .call(Method::DELETE, "/api/providers/openai/credential?name=spare", None)
-            .await;
-        assert_eq!(status, 204, "{reply}");
-        let (status, reply) = served
-            .call(Method::DELETE, "/api/providers/openai/credential?name=spare", None)
-            .await;
-        assert_eq!(status, 404, "{reply}");
-
-        let logs = sink.text();
-        assert!(logs.contains("cred-openai"), "the write is logged by reference: {logs}");
-        assert!(!logs.contains(SENTINEL), "the logs carry the credential: {logs}");
+        .with_subscriber(dispatch)
+        .await;
     }
 
     /// F-1: a secret in the URL or the query is refused with 400, nothing is
@@ -865,28 +868,31 @@ mod tests {
             .with_max_level(tracing::Level::TRACE)
             .with_ansi(false)
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
-
-        let served = serve_config(|_| {}).await;
-        let dir = served.dir.path().to_path_buf();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("test: read-only dir");
-        let (status, reply) = served
-            .call(
-                Method::PUT,
-                "/api/providers/openai/credential",
-                Some(json!({"value": SENTINEL})),
-            )
-            .await;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("test: restore dir");
-        assert_eq!(status, 500, "{reply}");
-        assert!(reply.contains("credential store"), "{reply}");
-        assert!(!reply.contains(SENTINEL), "{reply}");
-        let logs = sink.text();
-        assert!(
-            logs.contains("Credential reference operation failed"),
-            "the failure is logged: {logs}"
-        );
-        assert!(!logs.contains(SENTINEL), "the logs carry the credential: {logs}");
+        use tracing::instrument::WithSubscriber as _;
+        let dispatch = fixture::capture_dispatch(subscriber);
+        async {
+            let served = serve_config(|_| {}).await;
+            let dir = served.dir.path().to_path_buf();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("test: read-only dir");
+            let (status, reply) = served
+                .call(
+                    Method::PUT,
+                    "/api/providers/openai/credential",
+                    Some(json!({"value": SENTINEL})),
+                )
+                .await;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("test: restore dir");
+            assert_eq!(status, 500, "{reply}");
+            assert!(reply.contains("credential store"), "{reply}");
+            assert!(!reply.contains(SENTINEL), "{reply}");
+            let logs = sink.text();
+            assert!(
+                logs.contains("Credential reference operation failed"),
+                "the failure is logged: {logs}"
+            );
+            assert!(!logs.contains(SENTINEL), "the logs carry the credential: {logs}");
+        }
+        .with_subscriber(dispatch)
+        .await;
     }
 }
