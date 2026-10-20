@@ -332,7 +332,9 @@ impl TurnDecisionService {
         let config = &self.generation.effective;
         let model = self.resolve_agent_model(proof)?;
         let model_ref = &routing_state.trusted.parts().resolved_model;
-        let observed = self.observed_capability_latency(proof.owner_id(), catalog.generation());
+        let observed = self
+            .observed_capability_latency(proof.owner_id(), catalog.generation())
+            .await;
         let cost = super::super::turn_cost::RuntimeCostModel::new(&model, config, &observed);
         let no_refs = DiscoveredRefs::empty();
         let calls = BTreeMap::new();

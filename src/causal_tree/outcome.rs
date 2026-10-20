@@ -1173,6 +1173,7 @@ mod tests {
             terminal_id: "prx_collection_terminal".into(),
             status: TurnTerminalStatus::Completed,
             provider_outcome: Some(ProviderExecutionOutcome {
+                prepared_parameters: Vec::new(),
                 decision_id: "prx_collection_provider".into(),
                 started_at: now,
                 finished_at: now,

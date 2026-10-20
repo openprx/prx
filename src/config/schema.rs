@@ -1,3 +1,5 @@
+mod codex_effort;
+pub use codex_effort::InvalidCodexReasoningEffort;
 mod recursive_spawn;
 
 use crate::auth::codex_auth::default_codex_auth_json_path;
@@ -297,6 +299,10 @@ pub struct Config {
     pub default_model: Option<String>,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     pub default_temperature: f64,
+
+    /// Catalog model levels and explicit parameters, keyed by canonical release ID.
+    #[serde(default)]
+    pub model_settings: std::collections::BTreeMap<String, crate::config::model_settings::ModelSettings>,
 
     /// Provider-specific runtime options (`[providers.<name>]`).
     #[serde(default)]
@@ -4198,6 +4204,9 @@ impl Default for SchedulerConfig {
 /// Usage: pass `hint:reasoning` as the model parameter to route the request.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelRouteConfig {
+    /// Route-selected level; explicit route parameters override explicit model parameters.
+    #[serde(default, flatten)]
+    pub settings: crate::config::model_settings::ModelSettings,
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
     /// Provider to route to (must match a known provider name)
@@ -5914,6 +5923,7 @@ impl Default for Config {
                 .and_then(crate::providers::catalog::ReleaseCatalog::global_default_model)
                 .map(str::to_string),
             default_temperature: 0.7,
+            model_settings: Default::default(),
             providers: ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -6679,11 +6689,11 @@ impl Config {
         Some(EMBEDDING_DEFAULT_UPGRADE_NOTICE)
     }
 
-    /// Advisory only: retain the configured ceiling while exposing the
-    /// release catalog recommendation outside the causal policy domain.
+    /// Warn about inherited legacy ceilings below the release recommendation.
+    /// Explicit operator ceilings remain unchanged and do not emit this warning.
     pub(crate) fn decision_latency_budget_warning(&self) -> Option<String> {
         let section = &self.causal_tree;
-        if !section.enabled {
+        if !section.enabled || section.policy.extra_latency_budget_ms_explicit {
             return None;
         }
         let selection = crate::decision::factory::configured_selection(section)?;
@@ -6730,6 +6740,17 @@ impl Config {
                  likely a typo); configuration is never silently ignored.",
                 unknown_paths.join(", ")
             );
+        }
+        crate::config::model_settings::validate_keys(&config)?;
+        for note in crate::config::manage::lifecycle::diagnostics(&config)? {
+            if note.warning {
+                tracing::warn!(warning = %note.message, "configured model lifecycle warning");
+            } else {
+                tracing::info!(note = %note.message, "configured model is absent from the release catalog");
+            }
+        }
+        for warning in crate::config::model_settings::warnings(&config)? {
+            tracing::warn!(%warning, "saved model settings need repair; using runtime compatibility values");
         }
         if let Some(warning) = config.decision_latency_budget_warning() {
             tracing::warn!(warning = %warning, "decision latency budget is below the catalog recommendation");
@@ -7156,6 +7177,7 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        codex_effort::validate(self.runtime.codex_reasoning_effort.as_deref())?;
         self.causal_tree.validate()?;
         // The JWKS URI is published in the public, signed Agent Card: a
         // `user:password@` there would be handed to every peer.
@@ -7386,6 +7408,8 @@ impl Config {
             anyhow::bail!("scheduler.claim_lease_secs must be at least 3");
         }
 
+        // Flattened model settings accept canonical parameter names only.
+        crate::config::model_settings::validate_keys(self)?;
         // Model routes
         for (i, route) in self.model_routes.iter().enumerate() {
             if route.hint.trim().is_empty() {
@@ -7875,6 +7899,7 @@ mod tests {
     async fn a_selection_names_an_inline_key_or_a_credential_reference() {
         let mut config = Config::default();
         config.model_routes.push(ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "openai".into(),
             model: "gpt-4o-mini".into(),
@@ -8333,6 +8358,7 @@ min_chars = 12
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             default_temperature: 0.5,
+            model_settings: Default::default(),
             providers: ProvidersConfig::default(),
             observability: ObservabilityConfig {
                 backend: "log".into(),
@@ -8706,6 +8732,27 @@ max_context = 1000000
     }
 
     #[test]
+    async fn explicit_hosted_latency_ceiling_loads_without_an_upgrade_warning() {
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let version = crate::causal_tree::config::CAUSAL_CONFIG_SCHEMA_VERSION;
+        std::fs::write(&path, format!("default_temperature = 0.7\n[auth]\ncodex_auth_json_auto_import = false\n[causal_tree]\nschema_version = {version}\nenabled = true\n[causal_tree.backend]\nkind = \"openrouter\"\nmodel = \"typesafe/jev-1.13\"\npinned_snapshot = \"typesafe/jev-1.13-20260917\"\n[causal_tree.policy]\nextra_latency_budget_ms = 500\n")).unwrap();
+        let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
+        let config = loaded.unwrap();
+        assert!(config.causal_tree.policy.extra_latency_budget_ms_explicit);
+        assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+        assert!(config.decision_latency_budget_warning().is_none());
+        assert!(!logs.contains("below the catalog recommendation"), "{logs}");
+        assert!(
+            !crate::doctor::diagnose(&config)
+                .items
+                .iter()
+                .any(|item| item.message.contains("below the catalog recommendation"))
+        );
+    }
+
+    #[test]
     async fn schema_one_hosted_backend_warns_on_load_without_raising_the_latency_budget() {
         let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
         let dir = tempfile::TempDir::new().expect("test: private config directory");
@@ -8913,6 +8960,7 @@ low_priority_tools = ["sessions_spawn", "delegate"]
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             default_temperature: 0.9,
+            model_settings: Default::default(),
             providers: ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -12028,6 +12076,17 @@ classifier_timeout_secs = 8
         let warnings = logs.matches("nothing in this configuration uses").count();
         assert_eq!(warnings, 1, "one warning per entry set: {logs}");
         assert!(logs.contains("command line"), "{logs}");
+    }
+
+    #[test]
+    async fn retired_model_load_keeps_selection_and_logs_published_replacement() {
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_temperature = 0.7\ndefault_provider = \"openai\"\ndefault_model = \"gpt-4o\"\n[auth]\ncodex_auth_json_auto_import = false\n").unwrap();
+        let (config, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
+        assert_eq!(config.unwrap().default_model.as_deref(), Some("gpt-4o"));
+        assert!(logs.contains("retired") && logs.contains("openai/gpt-5.6"), "{logs}");
     }
 
     /// INT-2B AUDIT-SIGN (D-056 DC-2), RED before: `security.audit.sign_events`

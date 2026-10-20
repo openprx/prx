@@ -86,7 +86,16 @@ pub fn resolve_effective_compaction_config_with_catalog(
     }
 
     let descriptor = catalog.describe(&crate::providers::ProviderId::of(&selected_provider), &selected_model);
-    if let Some(context_window) = descriptor.context_window {
+    // Retired models retain their published limits for existing selections.
+    // Views without release evidence keep the existing conservative fallback.
+    let context_window = descriptor.context_window.or_else(|| {
+        catalog
+            .release_catalog()
+            .ok()
+            .and_then(|release| release.model(&crate::providers::ProviderId::of(&selected_provider), &selected_model))
+            .and_then(|model| model.limits.context_window)
+    });
+    if let Some(context_window) = context_window {
         return with_model_context(
             base,
             usize::try_from(context_window).unwrap_or(usize::MAX),
@@ -459,6 +468,7 @@ mod tests {
     fn resolves_hint_route_before_model_lookup() {
         let router = router_with_model("openrouter", "wide", 1_000_000);
         let routes = vec![ModelRouteConfig {
+            settings: Default::default(),
             hint: "reasoning".to_string(),
             provider: "openrouter".to_string(),
             model: "wide".to_string(),

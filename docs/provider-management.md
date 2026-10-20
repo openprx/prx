@@ -59,6 +59,12 @@ facts come from the embedded release catalog. TOML retains operator choices:
 documented boundaries. A configuration rollback therefore restores choices;
 the binary rollback restores the embedded catalog revision.
 
+Model selection also checks whether the adapter can express the release row's
+declared parameters. An unsupported adapter mapping is refused locally. Existing
+Codex reasoning-effort overrides still reach request resolution; recognized
+effort values clamp to the model's declared subset, while unrecognized values
+fail locally. No parameter setting can change a provider's credential owner.
+
 Provider add/update/remove, model declarations, defaults and routes use the
 management change flow. For example, `prx providers add <PROVIDER> --fallback`
 previews adding that provider to the fallback chain; `--yes` applies the plan.
@@ -143,3 +149,22 @@ older binary, verify its parser, credential references and storage readers
 against the actual configuration and retained data. Never delete unknown schema
 metadata to force compatibility. Final release-specific downgrade instructions
 and complete PMM acceptance are still pending.
+
+## Model settings transactions
+
+`ManagedChange::SetModelSettings` replaces a model's persisted level and
+explicit parameter overrides. Default selection accepts optional settings in
+the same transaction. Both operations validate against the release catalog,
+retain revision/history/rollback checks and refuse invalid durable values.
+The Console generates controls from catalog declarations and submits the
+existing plan/apply protocol. See [commands and API examples](model-catalog.md#saving-a-model-level).
+
+## Release catalog lifecycle
+
+`prx models catalog status` shows the embedded revision, digest and lifecycle
+counts. Startup and doctor warn about deprecated, retired and absent model
+references without rewriting stored selections. New retired selections are
+refused. `prx models migrate-retired` previews published replacements;
+`--yes` applies through PMM with normal validation, confirmation and history.
+See [catalog lifecycle and migration](model-catalog.md#release-catalog-lifecycle)
+for replacement conflicts, credential ownership and binary rollback.

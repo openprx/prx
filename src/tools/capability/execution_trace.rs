@@ -531,6 +531,7 @@ mod silent_tests {
     fn outcome() -> ProviderExecutionOutcome {
         let now = chrono::Utc::now();
         ProviderExecutionOutcome {
+            prepared_parameters: Vec::new(),
             decision_id: "prx_silent_fixture".into(),
             started_at: now,
             finished_at: now,

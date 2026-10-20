@@ -3,7 +3,7 @@ use super::{TurnDecisionContext, TurnDecisionService, TurnSourceProof};
 use std::collections::BTreeMap;
 use std::sync::{
     Arc, OnceLock, Weak,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 type Registry = parking_lot::Mutex<BTreeMap<[u8; 32], Arc<RecursiveAllowance>>>;
@@ -20,6 +20,8 @@ pub(crate) struct RecursiveAllowance {
     claimed: AtomicBool,
     funded: bool,
     retention: Option<Weak<Registry>>,
+    contexts: AtomicUsize,
+    pending_until: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 impl RecursiveAllowance {
@@ -29,6 +31,8 @@ impl RecursiveAllowance {
             claimed: AtomicBool::new(false),
             funded: true,
             retention: None,
+            contexts: AtomicUsize::new(0),
+            pending_until: parking_lot::Mutex::new(None),
         }
     }
 
@@ -78,11 +82,17 @@ impl RecursiveAllowance {
     }
 
     fn retire(self: &Arc<Self>) {
+        self.retire_if(|| true);
+    }
+
+    fn retire_if(self: &Arc<Self>, predicate: impl FnOnce() -> bool) {
         if let Some(registry) = &self.retention
             && let Some(registry) = registry.upgrade()
         {
             let mut registry = registry.lock();
-            registry.retain(|_, entry| !Arc::ptr_eq(entry, self));
+            if predicate() {
+                registry.retain(|_, entry| !Arc::ptr_eq(entry, self));
+            }
         }
     }
 }
@@ -106,11 +116,19 @@ impl RunAllowances {
         hash.finalize().into()
     }
 
-    pub(super) fn retain(&self, proof: &dyn TurnSourceProof) -> OnceLock<Arc<RecursiveAllowance>> {
-        self.lookup(proof).map_or_else(OnceLock::new, OnceLock::from)
+    pub(super) fn retain(&self, proof: &dyn TurnSourceProof) -> OnceLock<ContextAllowance> {
+        let Some(registry) = self.existing() else {
+            return OnceLock::new();
+        };
+        let entries = registry.lock();
+        entries
+            .get(&Self::key(proof))
+            .cloned()
+            .map(ContextAllowance::new)
+            .map_or_else(OnceLock::new, OnceLock::from)
     }
 
-    pub(super) fn inherit_resume(&self, proof: &dyn TurnSourceProof, original_run: &str) {
+    pub(super) fn inherit_resume(&self, proof: &dyn TurnSourceProof, original_run: &str) -> ContextAllowance {
         let registry = self
             .0
             .get_or_init(|| Arc::clone(RUN_ALLOWANCES.get_or_init(|| Arc::new(Registry::default()))));
@@ -119,35 +137,42 @@ impl RunAllowances {
             .get(&Self::key_for_run(proof, original_run))
             .cloned()
             .unwrap_or_else(|| {
-                // The process may have restarted, or the original run never
-                // published a grant. Neither case proves an unused child slot.
+                // A process restart has lost the admitted allowance. Fail
+                // closed rather than reconstructing an unused child slot.
                 Arc::new(RecursiveAllowance {
                     money: Arc::new(AtomicU64::new(0)),
                     claimed: AtomicBool::new(true),
                     funded: false,
                     retention: Some(Arc::downgrade(registry)),
+                    contexts: AtomicUsize::new(0),
+                    pending_until: parking_lot::Mutex::new(None),
                 })
             });
-        entries.insert(Self::key(proof), original);
+        *original.pending_until.lock() = None;
+        entries.insert(Self::key(proof), Arc::clone(&original));
+        ContextAllowance::new(original)
     }
 
     fn lookup(&self, proof: &dyn TurnSourceProof) -> Option<Arc<RecursiveAllowance>> {
         self.existing()?.lock().get(&Self::key(proof)).cloned()
     }
 
-    fn issue(&self, proof: &dyn TurnSourceProof, money: Arc<AtomicU64>) -> Arc<RecursiveAllowance> {
+    fn issue(&self, proof: &dyn TurnSourceProof, money: Arc<AtomicU64>) -> ContextAllowance {
         let registry = self
             .0
             .get_or_init(|| Arc::clone(RUN_ALLOWANCES.get_or_init(|| Arc::new(Registry::default()))));
         let key = Self::key(proof);
-        Arc::clone(registry.lock().entry(key).or_insert_with(|| {
+        let mut entries = registry.lock();
+        ContextAllowance::new(Arc::clone(entries.entry(key).or_insert_with(|| {
             Arc::new(RecursiveAllowance {
                 money,
                 claimed: AtomicBool::new(false),
                 funded: true,
                 retention: Some(Arc::downgrade(registry)),
+                contexts: AtomicUsize::new(0),
+                pending_until: parking_lot::Mutex::new(None),
             })
-        }))
+        })))
     }
 }
 
@@ -192,15 +217,81 @@ impl TurnDecisionService {
 impl TurnDecisionContext {
     pub(crate) fn retire_recursive_allowance(&self) {
         if let Some(owner) = self.recursive_allowance.get() {
-            if owner.funded
-                && self
-                    .resume
-                    .as_ref()
-                    .is_some_and(|resume| resume.claimed_event().is_none())
-            {
-                return;
-            }
             owner.retire();
         }
     }
 }
+
+/// A registry entry is active only while a context or a durable pending
+/// approval owns it. Dropping admission on any error releases its lease.
+pub(super) struct ContextAllowance(Arc<RecursiveAllowance>);
+impl ContextAllowance {
+    fn new(owner: Arc<RecursiveAllowance>) -> Self {
+        owner.contexts.fetch_add(1, Ordering::AcqRel);
+        Self(owner)
+    }
+}
+impl std::ops::Deref for ContextAllowance {
+    type Target = Arc<RecursiveAllowance>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for ContextAllowance {
+    fn drop(&mut self) {
+        let last = self.0.contexts.fetch_sub(1, Ordering::AcqRel) == 1;
+        if last {
+            // Lease acquisition holds the same registry lock. Recheck after
+            // taking it so a concurrent resume cannot lose its registry entry.
+            self.0
+                .retire_if(|| self.0.contexts.load(Ordering::Acquire) == 0 && self.0.pending_until.lock().is_none());
+        }
+    }
+}
+
+impl RecursiveAllowance {
+    pub(super) fn retain_pending(self: &Arc<Self>, expires_at: chrono::DateTime<chrono::Utc>) {
+        let remaining = (expires_at - chrono::Utc::now()).to_std().unwrap_or_default();
+        let Some(deadline) = std::time::Instant::now().checked_add(remaining) else {
+            self.retire();
+            return;
+        };
+        *self.pending_until.lock() = Some(deadline);
+        let owner = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline.into()).await;
+            if let Some(owner) = owner.upgrade() {
+                // Serialize expiry with resume's alias/lease publication.
+                owner.retire_if(|| {
+                    let mut pending = owner.pending_until.lock();
+                    if *pending == Some(deadline) {
+                        *pending = None;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+        });
+    }
+}
+
+impl RunAllowances {
+    pub(super) fn retire_pending(&self, workspace: &str, owner: &str, session: &str, run: &str) {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        for part in [workspace, owner, session, run] {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part.as_bytes());
+        }
+        let key: [u8; 32] = hash.finalize().into();
+        let entry = self.existing().and_then(|registry| registry.lock().get(&key).cloned());
+        if let Some(entry) = entry {
+            *entry.pending_until.lock() = None;
+            entry.retire();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

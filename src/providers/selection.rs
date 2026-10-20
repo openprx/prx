@@ -161,7 +161,8 @@ pub fn check_with(
 ) -> Result<ResolvedModel, ResolutionError> {
     // A `hint:<route>` model is the route's destination, with the route's
     // own key when it has one.
-    let (provider, model, credential) = if let Some(route) = route_target(catalog, provider, model)? {
+    let selected_route = route_target(catalog, provider, model)?;
+    let (provider, model, credential) = if let Some(route) = selected_route {
         let route_credential = if route.has_own_key {
             CredentialRef::LegacyInline(LegacySlot::ModelRoute(route.hint.clone()))
         } else if let Some(id) = &route.credential_ref {
@@ -178,7 +179,7 @@ pub fn check_with(
     } else {
         (provider, model, credential)
     };
-    let resolved = catalog::resolve(
+    let mut resolved = catalog::resolve(
         &catalog::Selection {
             provider,
             model,
@@ -189,6 +190,14 @@ pub fn check_with(
         &ConfigCredentialSource::new(config),
         policy,
     )?;
+    if let Some(route) = selected_route
+        && let Some(configured) = config.model_routes.iter().find(|entry| entry.hint.trim() == route.hint)
+    {
+        resolved.set_route_settings(configured.settings.clone());
+    }
+    if requirement.operation == ModelOperation::Chat {
+        super::parameter_wire::check_selection(catalog, resolved.provider(), resolved.model())?;
+    }
     if let Some(warning) = resolved.warning() {
         tracing::warn!(target: "providers::selection", "{warning}");
     }
@@ -486,6 +495,9 @@ pub fn check_model_unproven(
         (route.provider.as_str(), route.model.as_str())
     });
     let (_, descriptor, unproven) = catalog::resolver::resolve_model(provider, model, requirement, catalog, policy)?;
+    if requirement.operation == ModelOperation::Chat {
+        super::parameter_wire::check_selection(catalog, &ProviderId::of(provider), model)?;
+    }
     Ok((!unproven.is_empty()).then(|| UnverifiedModel {
         provider: provider.to_string(),
         model: model.trim().to_string(),
@@ -600,6 +612,10 @@ pub(crate) fn resolve_route(
         &Requirement::chat(),
         policy,
     )
+    .map(|mut resolved| {
+        resolved.set_route_settings(route.settings.clone());
+        resolved
+    })
     .map_err(|refusal| anyhow::anyhow!("model route `hint:{}` is refused: {refusal}", route.hint))
 }
 
@@ -736,6 +752,7 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("test: temp dir");
         let mut config = config_in(&temp, "openai", "gpt-4o");
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "judge".to_string(),
             provider: "openrouter".to_string(),
             model: "vendor/decision".to_string(),
@@ -979,6 +996,7 @@ mod tests {
     fn hinted(temp: &tempfile::TempDir) -> Config {
         let mut config = config_in(temp, "openai", "hint:fast");
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".to_string(),
             provider: "openrouter".to_string(),
             model: "vendor/fast-chat".to_string(),
@@ -1043,6 +1061,7 @@ mod tests {
 
     fn route(hint: &str, provider: &str, model: &str) -> crate::config::ModelRouteConfig {
         crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: hint.to_string(),
             provider: provider.to_string(),
             model: model.to_string(),

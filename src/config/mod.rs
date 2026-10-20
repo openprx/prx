@@ -6,6 +6,7 @@ pub mod hotreload;
 pub mod init;
 pub mod manage;
 pub mod mcp_launch;
+pub mod model_settings;
 pub mod plugins;
 pub mod schema;
 pub mod secret_paths;

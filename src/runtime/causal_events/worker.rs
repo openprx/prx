@@ -6,7 +6,8 @@ use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::mpsc;
 
 pub(super) struct Worker {
-    pub(super) receiver: mpsc::Receiver<QueueItem>,
+    pub(super) receiver: mpsc::Receiver<QueuedEvent>,
+    pub(super) control_receiver: mpsc::Receiver<QueueItem>,
     pub(super) memory: Arc<dyn Memory>,
     pub(super) observer: Arc<dyn CausalEventSink>,
     pub(super) workspace: String,
@@ -19,28 +20,30 @@ impl Worker {
     pub(super) async fn run(mut self) {
         let registry = Arc::clone(&self.deferral);
         let mut deferred = VecDeque::new();
-        let mut closed = false;
-        'work: loop {
+        let mut ordinary_closed = false;
+        let mut control_closed = false;
+        loop {
             let changed = registry.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            // Ordinary permits bound the deferred backlog as well as queued
-            // and in-flight events. Never wait on a guard while reading control.
+            // Read control first; ordinary telemetry cannot consume its slots.
+            for _ in 0..super::EVENT_QUEUE_CAPACITY {
+                match self.control_receiver.try_recv() {
+                    Ok(control) => self.control(control, &mut deferred).await,
+                    Err(_) => break,
+                }
+            }
             for _ in 0..super::EVENT_QUEUE_CAPACITY {
                 match self.receiver.try_recv() {
-                    Ok(QueueItem::Event(event)) => deferred.push_back(event),
-                    Ok(control) => {
-                        self.control(control, &mut deferred).await;
-                        continue 'work;
-                    }
+                    Ok(event) => deferred.push_back(event),
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
-                        closed = true;
+                        ordinary_closed = true;
                         break;
                     }
                 }
             }
-            if closed {
+            if ordinary_closed && control_closed {
                 self.flush_all(&mut deferred).await;
                 return;
             }
@@ -54,20 +57,20 @@ impl Worker {
                 .filter_map(|event| event.deferral.as_ref().map(|state| state.deadline))
                 .min();
             tokio::select! {
-                item = self.receiver.recv() => match item {
-                    Some(QueueItem::Event(event)) => deferred.push_back(event),
-                    Some(control) => self.control(control,&mut deferred).await,
-                    None => closed = true,
+                biased;
+                item = self.control_receiver.recv(), if !control_closed => match item {
+                    Some(control) => self.control(control, &mut deferred).await,
+                    None => control_closed = true,
+                },
+                item = self.receiver.recv(), if !ordinary_closed => match item {
+                    Some(event) => deferred.push_back(event),
+                    None => ordinary_closed = true,
                 },
                 () = changed => {},
                 () = async {
                     if let Some(deadline) = next_deadline { tokio::time::sleep_until(deadline).await; }
                     else { std::future::pending::<()>().await; }
                 } => {},
-            }
-            if closed {
-                self.flush_all(&mut deferred).await;
-                return;
             }
         }
     }
@@ -105,11 +108,19 @@ impl Worker {
         }
     }
 
-    async fn control(&self, control: QueueItem, deferred: &mut VecDeque<QueuedEvent>) {
+    async fn control(&mut self, control: QueueItem, deferred: &mut VecDeque<QueuedEvent>) {
         match control {
             QueueItem::Drain(reply) => {
                 // The barrier makes earlier events durable now; it never waits
                 // for a live admission to release its optional I/O preference.
+                // Separate channels have no common FIFO. Drain snapshots every
+                // earlier ordinary send into the backlog before its barrier.
+                for _ in 0..super::EVENT_QUEUE_CAPACITY {
+                    match self.receiver.try_recv() {
+                        Ok(event) => deferred.push_back(event),
+                        Err(_) => break,
+                    }
+                }
                 self.flush_all(deferred).await;
                 let _ = reply.send(());
             }
@@ -148,8 +159,6 @@ impl Worker {
                     let _ = reply.send(persisted);
                 }
             }
-            // Callers route ordinary events into the same bounded backlog.
-            QueueItem::Event(event) => deferred.push_back(event),
         }
     }
 }

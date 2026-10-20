@@ -45,10 +45,21 @@ async fn authenticated_resume_without_original_allowance_cannot_mint_a_child_slo
     .await;
 }
 
+#[tokio::test]
+async fn authenticated_approval_resume_can_delegate_when_no_grant_was_published_before_pause() {
+    Box::pin(exact_file_collection_with_recursive_budget(
+        false,
+        true,
+        RecursiveBudgetCase::Unused,
+    ))
+    .await;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RecursiveBudgetCase {
     Disabled,
     Allocated,
+    Unused,
     Missing,
 }
 
@@ -464,6 +475,11 @@ async fn exact_file_collection_with_recursive_budget(
         if let crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. } = &ordinary.engine.candidates {
             assert!(candidates.iter().all(|candidate| !candidate.required_capabilities().contains(&reference)));
         }
+        if recursive_budget == RecursiveBudgetCase::Missing {
+            // A real restart loses the process registry; unused admission is
+            // covered separately and must remain funded across a pause.
+            context.retire_recursive_allowance();
+        }
         let resumed = service
             .decide_agent_resume(resume.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
@@ -477,6 +493,15 @@ async fn exact_file_collection_with_recursive_budget(
                 reloaded_service_registry.retain(resume.as_ref()).get().expect("reloaded service retains run")));
             assert!(retained.carve_child(u32::MAX).is_err(), "a fresh resume cannot allocate a second child");
             assert_eq!(original.money().load(Ordering::Acquire), retained.money().load(Ordering::Acquire));
+        }
+        if recursive_budget == RecursiveBudgetCase::Unused {
+            let retained = service.issue_recursive_allowance(resume.as_ref(), &resumed).unwrap();
+            retained.ensure_available().expect("unused admitted allowance survives pause");
+            let available = retained.money().load(Ordering::Acquire);
+            let ceiling = u32::try_from(available / 10_000).unwrap();
+            let (share, child) = retained.carve_child(ceiling).unwrap();
+            assert!(share > 0 && share < ceiling);
+            assert_eq!(retained.money().load(Ordering::Acquire) + child.money().load(Ordering::Acquire), available);
         }
         if recursive_budget == RecursiveBudgetCase::Missing {
             let unavailable = service.issue_recursive_allowance(resume.as_ref(), &resumed).unwrap();

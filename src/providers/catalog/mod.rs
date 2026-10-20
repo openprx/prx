@@ -18,6 +18,7 @@
 pub mod adapters;
 pub mod descriptor;
 pub mod discovery;
+pub mod parameters;
 pub(crate) mod process_snapshot;
 pub mod release;
 pub mod resolver;
@@ -228,6 +229,11 @@ impl CatalogView {
             release,
             release_error,
         }
+    }
+
+    /// Retain this view's immutable release evidence for terminal provenance.
+    pub(crate) fn release_pin(&self) -> Option<Arc<ReleaseCatalog>> {
+        self.release.clone()
     }
 
     /// The release catalog this view pins.

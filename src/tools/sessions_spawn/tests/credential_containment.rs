@@ -526,6 +526,7 @@ async fn child_provider_root_branch_uses_resolved_root_credential_on_wire() {
     config.default_model = Some("hint:fast".to_string());
     config.api_key = Some("PRX-HINT-ROOT-WIRE".to_string());
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: route_provider.clone(),
         model: PROBE_MODEL.to_string(),
@@ -595,6 +596,7 @@ async fn child_provider_build_branch_uses_named_agent_credential_on_wire() {
     config.api_key = Some("PRX-HINT-ROOT-WIRE".to_string());
     config.secrets.encrypt = false;
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: route.custom_provider(),
         model: PROBE_MODEL.to_string(),

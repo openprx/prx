@@ -226,6 +226,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ model: model || undefined, live })
     }),
+  getModelSettings: (provider, model) => request(`/api/models/settings${managementQuery([["provider", provider], ["model", model]])}`),
   getModels: ({ provider, operation, executable } = {}) =>
     request(
       `/api/models${managementQuery([

@@ -449,6 +449,11 @@ pub(crate) fn check_affected_selections(
     candidate: &Config,
     policy: UnknownPolicy,
 ) -> Result<Vec<String>, String> {
+    if policy == UnknownPolicy::Invocation {
+        crate::config::model_settings::validate_existing(candidate)?;
+    } else {
+        crate::config::model_settings::validate_changes(current, candidate)?;
+    }
     let current_sites = current.map(selections).unwrap_or_default();
     let declarations_changed =
         current.is_none_or(|current| rendering_changed(&current.providers, &candidate.providers));
@@ -489,6 +494,27 @@ pub(crate) fn check_affected_selections(
         Ok(warnings)
     } else {
         Err(refusals.join("; "))
+    }
+}
+
+/// Inspect persisted selections as invocations, so lifecycle changes never
+/// turn a diagnostic into a request to make a new durable selection.
+pub(crate) fn check_existing_selections(config: &Config) -> Result<Vec<String>, String> {
+    crate::config::model_settings::validate_existing(config)?;
+    let catalog = selection::catalog_for(config);
+    let mut warnings = Vec::new();
+    let mut refused = Vec::new();
+    for site in selections(config) {
+        match check_site(&catalog, &site, UnknownPolicy::Invocation) {
+            Ok(Some(warning)) => warnings.push(warning),
+            Ok(None) => {}
+            Err(error) => refused.push(error),
+        }
+    }
+    if refused.is_empty() {
+        Ok(warnings)
+    } else {
+        Err(refused.join("; "))
     }
 }
 
@@ -589,6 +615,7 @@ mod tests {
     fn an_unchanged_configuration_checks_nothing() {
         let (_dir, mut config) = isolated();
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "x".into(),
             provider: "openrouter".into(),
             model: "vendor/never-seen".into(),
@@ -606,6 +633,7 @@ mod tests {
         let (_dir, current) = isolated();
         let mut candidate = current.clone();
         candidate.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "x".into(),
             provider: "openrouter".into(),
             model: "vendor/never-seen".into(),
@@ -689,6 +717,7 @@ mod tests {
 
     fn route(hint: &str, provider: &str, model: &str) -> crate::config::ModelRouteConfig {
         crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: hint.into(),
             provider: provider.into(),
             model: model.into(),

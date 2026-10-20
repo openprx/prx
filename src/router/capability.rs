@@ -258,6 +258,7 @@ mod tests {
 
     fn route(provider: &str, model_name: &str) -> ModelRouteConfig {
         ModelRouteConfig {
+            settings: Default::default(),
             hint: "default".to_string(),
             provider: provider.to_string(),
             model: model_name.to_string(),

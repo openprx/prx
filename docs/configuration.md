@@ -5,6 +5,16 @@ OpenPRX uses `~/.openprx/config.toml` as the main configuration file.
 For decision admission, backend gates, inspection and rollback, see the
 [decision plane reference](decision-plane.md).
 
+The embedded [model catalog](model-catalog.md) owns declared request parameter
+defaults and model levels. The existing Codex reasoning override remains an
+explicit caller value; the resolver applies the selected model's constraints.
+`runtime.codex_reasoning_effort` accepts `none`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, or `max`; invalid values fail typed validation when configuration
+loads. With no override, known Codex models now use `medium` effort instead of
+`xhigh`. Unknown Codex models retain `medium` verbosity and `xhigh` effort.
+Kimi Code's temperature constraint follows its selected model, without inferring
+model support from the endpoint URL. These changes do not write configuration.
+
 ## Quick Setup
 
 ```bash
@@ -21,6 +31,19 @@ Every command accepts the global `--config-dir <DIR>`. It selects the whole
 configuration tree the run reads and writes: `config.toml`, `config.d/`,
 `workspace/`, `daemon.lock`, `daemon_state.json`, and the key material under
 `keys/`.
+
+The session-worker transport key at `keys/session_worker.secret` is published
+atomically on first use. Concurrent minting and verification use the same
+complete 32-byte key. Existing key material is never overwritten by initialization;
+a malformed key is refused and must be restored before using it for worker
+capabilities. Existing valid keys remain compatible with older binaries.
+
+Worker transport signing keys are published without replacing a concurrent
+writer's key. On Unix, an existing valid key with group or other permissions is
+tightened to mode `0600` without rotating it. If shared key publication fails
+(for example, on a filesystem without hard links), a warning includes the
+filesystem error and identifies the process-local fallback; the key is never
+logged. Restarting processes cannot share that fallback key.
 
 `prx init` resolves its target directory in this order, highest first:
 
@@ -2816,3 +2839,28 @@ is separate from durable decision review, claim and one-use execution authority;
 it does not extend approvals to another entry point.
 
 Admitted Cron/Xin model turns now obtain a source-bound decision after recording their raw input. Enabled mode requires an exact durable owner-scoped event; disabled mode may use in-memory input without inventing an event ID. The proof pins task/run/configuration, actual provider/model selection and creator execution actor. Selected decisions drive recall, constrained execution and terminal settlement. Operator-created tasks retain the existing CLI execution tuple and semantic mirror eligibility; other tasks retain their creator-derived context and effective policy. Admission does not enable interactive clarification or an approval delivery channel.
+
+## Per-model levels and parameters
+
+`[model_settings."<canonical catalog ID>"]` stores an optional `level`
+(`low`, `medium`, `high`) and explicit declared parameters. Route entries can
+set their own level and parameters, above the model settings. Durable changes
+are validated and written through PMM transactions; invalid values are refused
+before writing. See [model levels and selection commands](model-catalog.md#saving-a-model-level)
+for examples, precedence, session-only chat choices and rollback.
+
+## Release catalog lifecycle
+
+`prx models catalog status` shows the embedded revision, digest and lifecycle
+counts. Startup and doctor warn about deprecated, retired and absent model
+references without rewriting stored selections. New retired selections are
+refused. `prx models migrate-retired` previews published replacements;
+`--yes` applies through PMM with normal validation, confirmation and history.
+See [catalog lifecycle and migration](model-catalog.md#release-catalog-lifecycle)
+for replacement conflicts, credential ownership and binary rollback.
+
+The hosted decision latency upgrade warning applies to an inherited legacy
+ceiling below the catalog recommendation. An explicit current-schema
+`causal_tree.policy.extra_latency_budget_ms` is operator-owned and does not
+emit that upgrade warning at load, status or doctor. Both paths preserve the
+configured ceiling.

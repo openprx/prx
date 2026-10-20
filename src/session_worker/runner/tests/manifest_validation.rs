@@ -26,6 +26,7 @@ fn parse_tools_override_rejects_invalid_json_shape() {
 
 #[test]
 fn worker_manifest_rejects_hybrid_memory_without_merge_consumer() {
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
     let _g = CAP_ENV_GUARD.lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let mut manifest = base_manifest(tmp.path(), "capability-a");
@@ -128,6 +129,7 @@ fn clear_expiry_env() {
 
 #[test]
 fn worker_manifest_validation_rejects_path_escape() {
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
     let _g = CAP_ENV_GUARD.lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let mut manifest = base_manifest(tmp.path(), "");
@@ -143,6 +145,7 @@ fn worker_manifest_validation_rejects_path_escape() {
 
 #[test]
 fn valid_sealed_capability_accepted() {
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
     let _g = CAP_ENV_GUARD.lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let expiry = cap_now() + 300;
@@ -155,6 +158,7 @@ fn valid_sealed_capability_accepted() {
 
 #[test]
 fn legacy_uuid_capability_rejected() {
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
     let _g = CAP_ENV_GUARD.lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let expiry = cap_now() + 300;
@@ -170,6 +174,7 @@ fn legacy_uuid_capability_rejected() {
 
 #[test]
 fn tampered_manifest_capability_rejected() {
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
     let _g = CAP_ENV_GUARD.lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let expiry = cap_now() + 300;
@@ -184,6 +189,7 @@ fn tampered_manifest_capability_rejected() {
 
 #[test]
 fn tampered_route_provenance_breaks_worker_capability() {
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
     let _guard = CAP_ENV_GUARD.lock();
     let temp = tempfile::TempDir::new().expect("test: temp dir");
     let mut original = base_manifest(temp.path(), "");
@@ -218,6 +224,7 @@ fn tampered_route_provenance_breaks_worker_capability() {
 
 #[test]
 fn tampered_config_generation_capability_rejected() {
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
     let _g = CAP_ENV_GUARD.lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let expiry = cap_now() + 300;
@@ -231,6 +238,7 @@ fn tampered_config_generation_capability_rejected() {
 
 #[test]
 fn wrong_run_id_capability_rejected() {
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
     let _g = CAP_ENV_GUARD.lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let expiry = cap_now() + 300;
@@ -245,6 +253,7 @@ fn wrong_run_id_capability_rejected() {
 
 #[test]
 fn expired_capability_rejected() {
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
     let _g = CAP_ENV_GUARD.lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let stale = cap_now().saturating_sub(10);
@@ -257,6 +266,7 @@ fn expired_capability_rejected() {
 
 #[test]
 fn env_manifest_capability_desync_rejected() {
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
     let _g = CAP_ENV_GUARD.lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let expiry = cap_now() + 300;
@@ -316,6 +326,7 @@ async fn malicious_manifest_rejected_before_config_memory_or_worker_dir_creation
     let memory_db = workspace.join("memory").join("brain.db");
     let config_dir_arg = config_dir.to_string_lossy().to_string();
 
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
     let _g = CAP_ENV_GUARD.lock();
     let mut manifest = base_manifest(&workspace, "");
     manifest.run_id = "../escape".to_string();
@@ -389,4 +400,33 @@ async fn worker_rejects_changed_config_generation_before_workspace_side_effects(
         !workspace.exists(),
         "generation mismatch must fail before worker side effects"
     );
+}
+
+#[test]
+fn temperature_override_is_signed_and_absent_from_legacy_payloads() {
+    let _config_dir = crate::config::schema::process_config_dir_test_lock();
+    let _guard = CAP_ENV_GUARD.lock();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut manifest = base_manifest(tmp.path(), "");
+    let value = serde_json::to_value(&manifest).unwrap();
+    assert!(value.get("temperature_override").is_none());
+    manifest.temperature_override = Some(manifest.temperature);
+    let (mut manifest, capability, expiry) = seal(manifest, cap_now() + 300);
+    set_expiry_env(expiry);
+    let valid = validate_worker_capability_with_env(&manifest, Some(&capability));
+    manifest.temperature_override = Some(0.2);
+    let tampered = validate_worker_capability_with_env(&manifest, Some(&capability));
+    clear_expiry_env();
+    valid.expect("test: signed caller temperature");
+    assert!(tampered.unwrap_err().to_string().contains("signature mismatch"));
+}
+
+#[tokio::test]
+async fn signed_temperature_override_must_match_the_sealed_request_before_resources_open() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut manifest = base_manifest(tmp.path(), "");
+    manifest.temperature_override = Some(0.2);
+    let error = run_validated_manifest(manifest, None, None).await.unwrap_err();
+    assert!(format!("{error:#}").contains("worker caller temperature differs from its sealed temperature"));
+    assert!(!tmp.path().join("config.toml").exists());
 }

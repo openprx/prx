@@ -160,6 +160,10 @@ pub struct WorkerManifest {
     #[serde(default)]
     pub direct_uses_root_connection: bool,
     pub temperature: f64,
+    /// Explicit caller temperature, distinct from the global default; covered
+    /// by the existing manifest HMAC and required to match `temperature`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_override: Option<f64>,
     /// Canonical configuration directory selected by the parent process.
     #[serde(default)]
     pub config_dir: PathBuf,
@@ -399,6 +403,7 @@ mod tests {
             route_uses_root_connection: false,
             direct_uses_root_connection: false,
             temperature: 0.7,
+            temperature_override: None,
             config_dir: PathBuf::from("/tmp/openprx"),
             config_generation: "a".repeat(64),
             runtime_config_generation_id: Some(42),

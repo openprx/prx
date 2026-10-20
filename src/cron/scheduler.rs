@@ -2031,6 +2031,7 @@ mod tests {
         config.default_provider = Some(probe.custom_provider());
         config.default_model = Some("vendor/chat-model".into());
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: probe.custom_provider(),
             model: crate::providers::credential_probe::PROBE_MODEL.into(),

@@ -19,8 +19,8 @@ use crate::decision::telemetry::{
 use crate::memory::{Memory, MemoryVisibility, MessageEventInput, MessageEventSource};
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
-// Ordinary events retain permits through deferred persistence. Leave one
-// channel entry for Applied/Drain even while every ordinary permit is held.
+// Ordinary events retain permits through deferred persistence. Control has
+// its own bounded channel, independent of the full ordinary backlog.
 const ORDINARY_QUEUE_CAPACITY: usize = EVENT_QUEUE_CAPACITY - 1;
 
 mod deferral;
@@ -34,7 +34,6 @@ struct QueuedEvent {
 }
 
 enum QueueItem {
-    Event(QueuedEvent),
     Applied {
         event: Box<CausalEvent>,
         idempotency_key: String,
@@ -52,7 +51,8 @@ pub(crate) struct DurableCausalEventSink {
     generation_id: u64,
     revision: String,
     observer: Arc<dyn CausalEventSink>,
-    queue: mpsc::Sender<QueueItem>,
+    queue: mpsc::Sender<QueuedEvent>,
+    control_queue: mpsc::Sender<QueueItem>,
     deferral: Arc<deferral::PersistenceDeferral>,
     ordinary_slots: Arc<Semaphore>,
 }
@@ -65,6 +65,7 @@ impl DurableCausalEventSink {
     ) -> Result<Self, tokio::runtime::TryCurrentError> {
         let handle = tokio::runtime::Handle::try_current()?;
         let (queue, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        let (control_queue, control_receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let workspace_id = generation.effective.workspace_dir.to_string_lossy().to_string();
         let config_generation_id = generation.id.0;
         let config_source_revision = generation.source_revision.fingerprint_sha256.clone();
@@ -77,6 +78,7 @@ impl DurableCausalEventSink {
         handle.spawn(
             worker::Worker {
                 receiver,
+                control_receiver,
                 memory,
                 observer: worker_observer,
                 workspace: workspace_id,
@@ -91,6 +93,7 @@ impl DurableCausalEventSink {
             deferral,
             observer,
             queue,
+            control_queue,
             memory: replay_memory,
             workspace_id: replay_workspace,
             generation_id: config_generation_id,
@@ -112,7 +115,7 @@ impl DurableCausalEventSink {
         }
         let (reply, received) = oneshot::channel();
         tokio::time::timeout_at(deadline.into(), async {
-            self.queue.send(QueueItem::Drain(reply)).await.is_ok() && received.await.is_ok()
+            self.control_queue.send(QueueItem::Drain(reply)).await.is_ok() && received.await.is_ok()
         })
         .await
         .unwrap_or(false)
@@ -125,7 +128,7 @@ impl DurableCausalEventSink {
         let (event, idempotency_key, original_generation) = application.into_parts();
         let lineage = event.lineage.clone();
         if self
-            .queue
+            .control_queue
             .try_send(QueueItem::Applied {
                 event: Box::new(event),
                 idempotency_key,
@@ -192,7 +195,7 @@ impl DurableCausalEventSink {
         let remaining = deadline.saturating_duration_since(Instant::now());
         tokio::time::timeout(remaining, async {
             if self
-                .queue
+                .control_queue
                 .send(QueueItem::Applied {
                     event: Box::new(event),
                     idempotency_key,
@@ -244,14 +247,12 @@ impl CausalEventSink for DurableCausalEventSink {
             deferral: deferred,
             _permit: permit,
         };
-        if let Err(failed) = self.queue.try_send(QueueItem::Event(queued)) {
-            if let QueueItem::Event(queued) = failed.into_inner() {
-                report_incomplete(
-                    self.observer.as_ref(),
-                    queued.event.lineage,
-                    IncompleteReason::StoreDropped,
-                );
-            }
+        if let Err(failed) = self.queue.try_send(queued) {
+            report_incomplete(
+                self.observer.as_ref(),
+                failed.into_inner().event.lineage,
+                IncompleteReason::StoreDropped,
+            );
         }
     }
 }
@@ -602,7 +603,7 @@ mod tests {
         // reserves one entry for Applied. The overflow/retry oracle is intact.
         for _ in 0..EVENT_QUEUE_CAPACITY {
             let (completion, _receiver) = oneshot::channel();
-            assert!(sink.queue.try_send(QueueItem::Drain(completion)).is_ok());
+            assert!(sink.control_queue.try_send(QueueItem::Drain(completion)).is_ok());
         }
         sink.emit_applied(VerifiedDirectiveApplication::fixture(event.clone(), key.clone()));
         assert!(
@@ -656,6 +657,56 @@ mod tests {
                 .filter(|event| event.kind == CausalEventKind::DirectiveApplied)
                 .count(),
             1
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_ordinary_queue_and_waiting_drain_leave_room_for_multiple_applications() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        let generation = crate::config::new_shared(config).pin();
+        let memory = Arc::new(SqliteMemory::new(workspace.path()).unwrap());
+        let observer = Arc::new(RecordingSink::default());
+        let sink = DurableCausalEventSink::new(&generation, memory.clone(), observer.clone()).unwrap();
+        let event = applied_fixture(&workspace.path().to_string_lossy(), "prx_terminal");
+        for _ in 0..ORDINARY_QUEUE_CAPACITY {
+            sink.emit(CausalEvent {
+                kind: CausalEventKind::SnapshotCreated,
+                lineage: event.lineage.clone(),
+                fields: CausalEventFields::default(),
+            });
+        }
+        let (completion, received) = oneshot::channel();
+        assert!(sink.control_queue.try_send(QueueItem::Drain(completion)).is_ok());
+        for key in ["prx_first_application", "prx_second_application"] {
+            sink.emit_applied(VerifiedDirectiveApplication::fixture(event.clone(), key.into()));
+        }
+        assert!(
+            !observer
+                .events
+                .lock()
+                .iter()
+                .any(|event| event.fields.incomplete == Some(IncompleteReason::StoreDropped))
+        );
+        assert!(sink.drain(Instant::now() + std::time::Duration::from_secs(5)).await);
+        received.await.unwrap();
+        for key in ["prx_first_application", "prx_second_application"] {
+            assert!(
+                memory
+                    .find_message_event_by_idempotency_key(&workspace.path().to_string_lossy(), key)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            observer
+                .events
+                .lock()
+                .iter()
+                .filter(|event| event.kind == CausalEventKind::DirectiveApplied)
+                .count(),
+            2
         );
     }
 }

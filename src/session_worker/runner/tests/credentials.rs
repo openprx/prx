@@ -78,6 +78,7 @@ fn selected_route_key_equal_to_root_key_still_gets_no_root_url_or_rotation_keys(
     let temp = tempfile::tempdir().expect("test: temp dir");
     let mut config = root_config(temp.path());
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: "openai".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -112,6 +113,7 @@ fn sealed_foreign_route_refuses_root_key_and_config_drift() {
     let mut config = root_config(temp.path());
     let destination = "custom:http://127.0.0.1:18081/v1";
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: destination.to_string(),
         model: "probe-model".to_string(),
@@ -176,6 +178,7 @@ fn agent_profile_route_keeps_credential_source_without_execution_identity() {
         )
         .expect("test: agent profile");
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "agent".to_string(),
         provider: destination.to_string(),
         model: "probe-model".to_string(),

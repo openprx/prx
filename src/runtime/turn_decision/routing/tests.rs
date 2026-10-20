@@ -375,6 +375,36 @@ async fn sqlite_router_actual_two_hops_train_and_read_in_same_agent_session() {
 }
 
 #[tokio::test]
+async fn sqlite_router_learning_survives_a_competing_writer_within_its_deadline() {
+    let mut fixture = Fixture::new().await;
+    *fixture.observed.learning_contention.lock() = Some(fixture.workspace.path().join("memory/brain.db"));
+    let reply = fixture.turn().await;
+    {
+        let observed = fixture.observed.observations.lock();
+        assert_eq!(
+            observed.learning_commits, 1,
+            "actual terminal must reach learning commit"
+        );
+        assert_eq!(observed.last_learning_commit.as_ref(), Some(&Ok(())));
+        assert_eq!(
+            observed.commit_calls, 1,
+            "history training must follow durable learning"
+        );
+    }
+    assert_eq!(reply.unwrap(), "The expression adds two integers.");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    let rows: i64 = fixture
+        .database()
+        .query_row("SELECT count(*) FROM router_learning_receipts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+    assert!(
+        fixture.observed.learning_contention.lock().is_none(),
+        "the competing writer must execute"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_router_nonfinite_vector_closes_actual_read_without_provider_send() {
     let mut fixture = Fixture::new().await;
     fixture.seed().await;
