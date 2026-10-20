@@ -143,11 +143,11 @@ pub(crate) fn validate_keys(config: &crate::config::Config) -> anyhow::Result<()
             );
         }
     }
-    for settings in config.model_settings.values() {
+    for (id, settings) in &config.model_settings {
         for name in settings.overrides.keys() {
             anyhow::ensure!(
                 name == "level" || ModelParameter::parse(name).is_some(),
-                "Unknown configuration path: model_settings.<id>.{name}; configuration is never silently ignored"
+                "Unknown configuration path: model_settings.{id}.{name}; configuration is never silently ignored"
             );
         }
     }
@@ -262,6 +262,10 @@ mod tests {
             let error = format!("{error:#}");
             assert!(error.contains("Unknown configuration path"), "{error}");
             assert!(error.contains("api_keyy"), "{error}");
+            if model_settings {
+                assert!(error.contains("model_settings.openai/gpt-5.6.api_keyy"), "{error}");
+                assert!(!error.contains("<id>"), "{error}");
+            }
             assert!(!error.contains(&secret), "{error}");
         }
     }

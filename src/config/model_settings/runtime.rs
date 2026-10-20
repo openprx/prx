@@ -39,6 +39,7 @@ fn prepare(model: &ReleaseModel, settings: &[&ModelSettings]) -> (Vec<ParameterL
                 parameter,
                 ModelParameter::MaxOutputTokens | ModelParameter::ThinkingBudget | ModelParameter::Seed
             );
+            let mut normalized = value.clone();
             let valid = match model.parameters.get(name) {
                 Some(CatalogParameter::Range { min, max, step, .. }) => {
                     value.as_f64().filter(|n| n.is_finite()).is_some_and(|number| {
@@ -57,6 +58,17 @@ fn prepare(model: &ReleaseModel, settings: &[&ModelSettings]) -> (Vec<ParameterL
                                     model.id
                                 ));
                             }
+                            let bounded = parameters::bounded_number(number, *min, *max, *step);
+                            // Normalize saved ranges once before caching. The request
+                            // resolver must not warn again for the same stale value.
+                            if integer
+                                && bounded.fract() == 0.0
+                                && (-9_007_199_254_740_991.0..=9_007_199_254_740_991.0).contains(&bounded)
+                            {
+                                normalized = serde_json::Value::from(bounded as i64);
+                            } else if !integer {
+                                normalized = serde_json::Value::from(bounded);
+                            }
                             true
                         }
                     })
@@ -68,7 +80,7 @@ fn prepare(model: &ReleaseModel, settings: &[&ModelSettings]) -> (Vec<ParameterL
                 Some(CatalogParameter::Unsupported) | None => false,
             };
             if valid {
-                layer.overrides.insert(parameter, value.clone());
+                layer.overrides.insert(parameter, normalized);
             } else {
                 notes.push(format!(
                     "{}: saved {name} is invalid or no longer supported and is ignored",

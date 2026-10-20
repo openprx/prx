@@ -409,16 +409,17 @@ async fn selected_levels_replace_adapter_output_defaults_but_preserve_explicit_c
             "/inferenceConfig/maxTokens",
         ),
     ] {
-        let settings = Settings {
-            models: Some(Arc::new(
+        let settings = Settings::new(
+            Some(Arc::new(
                 [(
                     format!("{provider}/{model}"),
                     serde_json::from_value(json!({"level":"low"})).unwrap(),
                 )]
                 .into(),
             )),
-            ..Default::default()
-        };
+            None,
+            None,
+        );
         let original = body.pointer(path).unwrap().clone();
         let unchanged =
             serde_json::to_value(request(provider, format, model, &body).with_default_output_limit()).unwrap();
@@ -633,4 +634,53 @@ async fn stale_saved_model_and_route_settings_serve_real_requests_with_safe_wire
             .get(&crate::providers::catalog::ModelParameter::ReasoningEffort),
         Some(&json!("medium"))
     );
+}
+
+#[test]
+fn stale_settings_warn_once_for_repeated_and_inherited_requests_per_generation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    struct Warnings(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> Layer<S> for Warnings {
+        fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let warnings = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Warnings(Arc::clone(&warnings)));
+    tracing::subscriber::with_default(subscriber, || {
+        let models: Arc<BTreeMap<String, ModelSettings>> = Arc::new(
+            [(
+                "openai/gpt-5.6".into(),
+                serde_json::from_value(json!({"level":"future","max_output_tokens":0})).unwrap(),
+            )]
+            .into(),
+        );
+        let prepare = || {
+            let body = json!({"temperature":0.7});
+            let prepared = serde_json::to_value(crate::providers::parameter_wire::request(
+                "openai",
+                crate::providers::parameter_wire::Format::OpenAiChat,
+                "gpt-5.6",
+                &body,
+            ))
+            .unwrap();
+            assert_eq!(prepared.get("max_completion_tokens"), Some(&json!(1)));
+        };
+        for generation in 1..=2 {
+            let settings = Settings::new(Some(Arc::clone(&models)), None, None);
+            CURRENT.sync_scope(settings.clone(), || {
+                prepare();
+                assert_eq!(warnings.load(Ordering::Relaxed), generation * 2);
+                prepare();
+                CURRENT.sync_scope(inherited().0, prepare);
+                assert_eq!(warnings.load(Ordering::Relaxed), generation * 2);
+            });
+            CURRENT.sync_scope(settings, prepare);
+            assert_eq!(warnings.load(Ordering::Relaxed), generation * 2);
+        }
+    });
 }
