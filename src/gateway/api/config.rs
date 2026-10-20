@@ -1104,6 +1104,7 @@ mod tests {
 
     fn route(provider: &str, api_key: Option<&str>) -> crate::config::ModelRouteConfig {
         crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: provider.into(),
             model: "route-model".into(),
@@ -3821,6 +3822,7 @@ mod tests {
     async fn post_config_removing_a_named_route_lists_every_dependent() {
         let (_dir, state, base, server) = on_disk(|config| {
             config.model_routes = vec![crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "fast".into(),
                 provider: "openrouter".into(),
                 model: "vendor/model-a".into(),

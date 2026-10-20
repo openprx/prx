@@ -68,6 +68,11 @@ pub enum RootCredential {
 
 /// One management operation.
 pub enum ManagedChange {
+    /// Persist a validated model level and explicit parameter overrides.
+    SetModelSettings {
+        model: String,
+        settings: crate::config::model_settings::ModelSettings,
+    },
     /// Add a provider to the configured set: appended to
     /// `reliability.fallback_providers` (the default is chosen with
     /// [`ManagedChange::SetDefault`]).
@@ -87,6 +92,7 @@ pub enum ManagedChange {
     RemoveModel { provider: String, model: Option<String> },
     /// Set the default model for an operation.
     SetDefault {
+        settings: Option<crate::config::model_settings::ModelSettings>,
         operation: SelectionOperation,
         provider: String,
         model: String,
@@ -1313,6 +1319,12 @@ fn candidate(current: &Config, change: &ManagedChange) -> Result<Config, ManageE
     let mut next = current.clone();
     let default_id = ProviderId::of(crate::providers::selection::default_provider(current));
     match change {
+        ManagedChange::SetModelSettings { model, settings } => {
+            settings
+                .validate(model)
+                .map_err(|error| ManageError::Invalid(error.to_string()))?;
+            next.model_settings.insert(model.clone(), settings.clone());
+        }
         ManagedChange::AddProvider { provider } => {
             let (provider, id) = provider_arg(provider)?;
             let configured = id == default_id
@@ -1428,6 +1440,7 @@ fn candidate(current: &Config, change: &ManagedChange) -> Result<Config, ManageE
             }
         }
         ManagedChange::SetDefault {
+            settings,
             operation: SelectionOperation::Chat,
             provider,
             model,
@@ -1454,15 +1467,30 @@ fn candidate(current: &Config, change: &ManagedChange) -> Result<Config, ManageE
                     }
                 }
             }
+            if let Some(settings) = settings {
+                let release = crate::providers::catalog::ReleaseCatalog::embedded_ref()
+                    .map_err(|error| ManageError::Invalid(error.to_string()))?;
+                let row = release
+                    .model(&id, &model)
+                    .ok_or_else(|| ManageError::Invalid("model settings require a release catalog model".into()))?;
+                settings
+                    .validate(&row.id)
+                    .map_err(|error| ManageError::Invalid(error.to_string()))?;
+                next.model_settings.insert(row.id.clone(), settings.clone());
+            }
             next.default_provider = Some(provider);
             next.default_model = Some(model);
         }
         ManagedChange::SetDefault {
+            settings,
             operation: SelectionOperation::Embedding,
             provider,
             model,
             root_credential,
         } => {
+            if settings.is_some() {
+                return Err(ManageError::Invalid("model levels apply to chat defaults only".into()));
+            }
             // The embedder's root credential is owner-bound on its own; the
             // chat root-connection choice means nothing here (D-085 F-9).
             if *root_credential != RootCredential::Refuse {
@@ -1501,6 +1529,7 @@ fn candidate(current: &Config, change: &ManagedChange) -> Result<Config, ManageE
             }
             match operation {
                 SelectionOperation::Chat => next.model_routes.push(ModelRouteConfig {
+                    settings: Default::default(),
                     hint,
                     provider,
                     model,
@@ -1675,6 +1704,7 @@ mod tests {
 
     fn route(hint: &str, provider: &str, model: &str) -> ModelRouteConfig {
         ModelRouteConfig {
+            settings: Default::default(),
             hint: hint.into(),
             provider: provider.into(),
             model: model.into(),
@@ -2088,6 +2118,7 @@ mod tests {
         let config = loaded(dir.path(), |config| config.api_key = Some(SECRET.into())).await;
         let service = service_for(config);
         let switch = |root_credential| ManagedChange::SetDefault {
+            settings: None,
             operation: SelectionOperation::Chat,
             provider: "anthropic".into(),
             model: "claude-sonnet-4-5".into(),
@@ -2382,6 +2413,7 @@ mod tests {
             let Err(error) = candidate(
                 &config,
                 &ManagedChange::SetDefault {
+                    settings: None,
                     operation: SelectionOperation::Embedding,
                     provider: "openai".into(),
                     model: "text-embedding-3-small".into(),
@@ -2432,5 +2464,44 @@ mod tests {
             panic!("test: an unresolvable provider is refused");
         };
         assert!(!error.to_string().contains(SECRET), "{error}");
+    }
+    #[tokio::test]
+    async fn model_settings_are_planned_atomically_persisted_and_revision_guarded() {
+        use crate::config::model_settings::ModelSettings;
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = loaded(dir.path(), |_| {}).await;
+        let service = ManagementService::deferred(crate::config::new_shared(config.clone()));
+        let settings: ModelSettings =
+            serde_json::from_value(serde_json::json!({"level":"high","max_output_tokens":64000})).unwrap();
+        let change = ManagedChange::SetDefault {
+            operation: SelectionOperation::Chat,
+            provider: "openai".into(),
+            model: "gpt-5.6".into(),
+            root_credential: RootCredential::Refuse,
+            settings: Some(settings.clone()),
+        };
+        let before = std::fs::read(&config.config_path).unwrap();
+        let first = service.plan(&change, ConfigActor::Cli).await.unwrap();
+        let stale = service.plan(&change, ConfigActor::Cli).await.unwrap();
+        assert!(first.text().contains("model_settings"));
+        assert_eq!(
+            std::fs::read(&config.config_path).unwrap(),
+            before,
+            "planning must not write"
+        );
+        let outcome = service.apply(first, ConfigActor::Cli, None).await.unwrap();
+        assert!(outcome.record_id.is_some());
+        let written = Config::load_from_path(&config.config_path, config.workspace_dir.clone()).unwrap();
+        assert_eq!(written.default_model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(written.model_settings.get("openai/gpt-5.6"), Some(&settings));
+        let committed = std::fs::read(&config.config_path).unwrap();
+        assert!(service.apply(stale, ConfigActor::Cli, None).await.is_err());
+        assert_eq!(std::fs::read(&config.config_path).unwrap(), committed);
+        let invalid = ManagedChange::SetModelSettings {
+            model: "openai/gpt-5.6".into(),
+            settings: serde_json::from_value(serde_json::json!({"max_output_tokens":0})).unwrap(),
+        };
+        assert!(service.plan(&invalid, ConfigActor::Cli).await.is_err());
+        assert_eq!(std::fs::read(&config.config_path).unwrap(), committed);
     }
 }

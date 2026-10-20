@@ -688,6 +688,7 @@ fn a_hint_default_passes_the_channel_start_up_check() {
     let mut config = decision_only_config("openrouter");
     config.default_model = Some("hint:fast".to_string());
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: "openrouter".to_string(),
         model: "vendor/fast-chat".to_string(),
@@ -754,6 +755,7 @@ async fn a_model_switch_to_a_hint_is_accepted() {
     let mut config = decision_only_config("openrouter");
     config.default_model = Some("vendor/chat-model".to_string());
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: "openrouter".to_string(),
         model: "vendor/fast-chat".to_string(),
@@ -803,6 +805,7 @@ async fn channel_default_hint_turn_uses_only_selected_route_key_on_wire() {
     config.default_model = Some("hint:fast".to_string());
     config.api_key = Some("PRX-CHANNEL-ROOT-KEY".to_string());
     config.model_routes.push(crate::config::ModelRouteConfig {
+        settings: Default::default(),
         hint: "fast".to_string(),
         provider: route.custom_provider(),
         model: PROBE_MODEL.to_string(),

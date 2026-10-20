@@ -2940,6 +2940,7 @@ mod tests {
 
     fn d5_route(model: &str) -> crate::config::ModelRouteConfig {
         crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "d5".into(),
             provider: D5_ENDPOINT.into(),
             model: model.into(),
@@ -3068,6 +3069,7 @@ mod tests {
         let service = fixture.service();
         let mut config = fixture.desired();
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "d5".into(),
             provider: "openrouter".into(),
             model: "vendor/never-seen-model".into(),
@@ -3105,6 +3107,7 @@ mod tests {
             &fixture,
             |config| {
                 config.model_routes.push(crate::config::ModelRouteConfig {
+                    settings: Default::default(),
                     hint: "d5".into(),
                     provider: "openrouter".into(),
                     model: "vendor/never-seen-model".into(),
@@ -3208,6 +3211,7 @@ mod tests {
             &fixture,
             |config| {
                 config.model_routes.push(crate::config::ModelRouteConfig {
+                    settings: Default::default(),
                     hint: "gone".into(),
                     provider: "openrouter".into(),
                     model: "vendor/image-maker".into(),

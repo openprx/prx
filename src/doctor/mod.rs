@@ -2866,6 +2866,7 @@ mod tests {
             ..Config::default()
         };
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "openai".into(),
             model: "pmmh-unlisted-route-model".into(),
@@ -3687,6 +3688,7 @@ mod tests {
     fn config_validation_warns_empty_model_route() {
         let mut config = Config::default();
         config.model_routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "groq".into(),
             model: String::new(),
@@ -4300,6 +4302,7 @@ mod tests {
         config.reliability.fallback_providers =
             vec![label(2), "custom:http://u:SECRET-fixture-pw@127.0.0.1:99999/v1".into()];
         config.model_routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "custom:http://u:SECRET-fixture-pw@127.0.0.1:99998/v1".into(),
             model: "m".into(),

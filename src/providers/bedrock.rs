@@ -1087,12 +1087,10 @@ impl BedrockProvider {
         model: &str,
         request_body: &ConverseRequest,
     ) -> anyhow::Result<ConverseResponse> {
-        let payload = serde_json::to_vec(&super::parameter_wire::request(
-            "bedrock",
-            super::parameter_wire::Format::Bedrock,
-            model,
-            request_body,
-        ))?;
+        let payload = serde_json::to_vec(
+            &super::parameter_wire::request("bedrock", super::parameter_wire::Format::Bedrock, model, request_body)
+                .with_default_output_limit(),
+        )?;
         let url = Self::endpoint_url(&credentials.region, model);
         let canonical_uri = Self::canonical_uri(model);
         let now = chrono::Utc::now();
@@ -1146,12 +1144,10 @@ impl BedrockProvider {
         model: String,
         request_body: ConverseRequest,
     ) -> anyhow::Result<reqwest::Response> {
-        let payload = serde_json::to_vec(&super::parameter_wire::request(
-            "bedrock",
-            super::parameter_wire::Format::Bedrock,
-            &model,
-            &request_body,
-        ))?;
+        let payload = serde_json::to_vec(
+            &super::parameter_wire::request("bedrock", super::parameter_wire::Format::Bedrock, &model, &request_body)
+                .with_default_output_limit(),
+        )?;
         let url = Self::stream_endpoint_url(&credentials.region, &model);
         let canonical_uri = Self::stream_canonical_uri(&model);
         let now = chrono::Utc::now();

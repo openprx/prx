@@ -31,6 +31,7 @@ pub(super) fn base_manifest(workspace: &Path, capability: &str) -> WorkerManifes
         route_uses_root_connection: false,
         direct_uses_root_connection: false,
         temperature: 0.7,
+        temperature_override: None,
         config_dir: workspace.join("config"),
         config_generation: "0".repeat(64),
         runtime_config_generation_id: None,

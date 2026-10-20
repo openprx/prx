@@ -2832,3 +2832,12 @@ is separate from durable decision review, claim and one-use execution authority;
 it does not extend approvals to another entry point.
 
 Admitted Cron/Xin model turns now obtain a source-bound decision after recording their raw input. Enabled mode requires an exact durable owner-scoped event; disabled mode may use in-memory input without inventing an event ID. The proof pins task/run/configuration, actual provider/model selection and creator execution actor. Selected decisions drive recall, constrained execution and terminal settlement. Operator-created tasks retain the existing CLI execution tuple and semantic mirror eligibility; other tasks retain their creator-derived context and effective policy. Admission does not enable interactive clarification or an approval delivery channel.
+
+## Per-model levels and parameters
+
+`[model_settings."<canonical catalog ID>"]` stores an optional `level`
+(`low`, `medium`, `high`) and explicit declared parameters. Route entries can
+set their own level and parameters, above the model settings. Durable changes
+are validated and written through PMM transactions; invalid values are refused
+before writing. See [model levels and selection commands](model-catalog.md#saving-a-model-level)
+for examples, precedence, session-only chat choices and rollback.

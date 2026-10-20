@@ -149,3 +149,12 @@ older binary, verify its parser, credential references and storage readers
 against the actual configuration and retained data. Never delete unknown schema
 metadata to force compatibility. Final release-specific downgrade instructions
 and complete PMM acceptance are still pending.
+
+## Model settings transactions
+
+`ManagedChange::SetModelSettings` replaces a model's persisted level and
+explicit parameter overrides. Default selection accepts optional settings in
+the same transaction. Both operations validate against the release catalog,
+retain revision/history/rollback checks and refuse invalid durable values.
+The Console generates controls from catalog declarations and submits the
+existing plan/apply protocol. See [commands and API examples](model-catalog.md#saving-a-model-level).

@@ -34,10 +34,10 @@ it is distinct from a provider's `reasoning_effort` value.
 Request parameter declarations use the closed vocabulary `temperature`,
 `top_p`, `max_output_tokens`, `reasoning_effort`, `thinking_budget`, `verbosity`,
 `service_tier`, and `seed`. Resolution starts with parameter defaults and the
-model's default level. The resolver accepts increasingly specific model, route
-and caller layers; persisted model/route level selection is a C3 dependency
-and is not wired into the C2 runtime. Until C3, production applies only the
-base request's explicit caller fields after defaults. A layer's explicit values follow its level. A later value removes
+model's default level, then the selected level (the route level when present,
+otherwise the model level), explicit model parameters, explicit route parameters,
+and explicit caller values. An explicit model `reasoning_effort = "low"` therefore
+survives a route `level = "high"` without explicit route parameters. A later value removes
 mutually exclusive earlier values, including exclusions declared in the reverse
 direction. Unsupported or undeclared overrides are dropped; numeric values are
 clamped to the declared range and step. Invalid types, fractional token counts,
@@ -93,8 +93,8 @@ They describe request preparation, not confirmed transport or billed usage;
 physical attempt and cost records retain those roles. Records include only the
 canonical model, release revision and resolved parameter values. Concurrent
 turns and nested streaming tasks keep separate captures, and disabled recording
-does not borrow an outer turn's recorder. Selection surfaces and TOML settings
-remain the next catalog phase.
+does not borrow an outer turn's recorder. Selection surfaces persist TOML
+settings through the PMM transactions described below.
 
 Release `2026-10-19.2` carries Kimi Code's fixed temperature, Codex
 effort/verbosity declarations, and explicit declarations for the shipped OpenAI,
@@ -229,6 +229,67 @@ real CLI model listing through the management service and proves release rows
 carry catalog provenance.
 
 Finding 98 rollback: reverting the fix commits restores the C2 adapter
-serialization and pending-allowance lifecycle. C3 model/route selection remains
-a separate phase. Ordinary-child allowance carving is deferred to the next phase;
+serialization and pending-allowance lifecycle. Ordinary-child allowance
+carving is deferred to the next phase;
 ordinary children retain independent per-child allowances during closeout.
+
+## Saving a model level
+
+Model choices remain in TOML. Use a canonical catalog ID as the settings key:
+
+```toml
+[model_settings."openai/gpt-5.6"]
+level = "high"
+max_output_tokens = 64000
+
+[[model_routes]]
+hint = "quick"
+provider = "openai"
+model = "gpt-5.6"
+level = "low"
+```
+
+Inspect the catalog and plan a change before applying it:
+
+```bash
+prx models levels openai/gpt-5.6
+prx models settings openai/gpt-5.6
+prx models settings openai/gpt-5.6 --level high --set max_output_tokens=64000
+prx models settings openai/gpt-5.6 --level high --set max_output_tokens=64000 --yes
+prx models default set openai gpt-5.6 --level high --yes
+```
+
+`--set` accepts a declared parameter name and a JSON value, or an unquoted
+string such as `reasoning_effort=low`. Repeated names are refused. Settings
+replace the model's saved level and explicit overrides together. Plan-time
+validation refuses unknown levels, unsupported parameters, invalid types,
+out-of-range values and invalid steps; it does not silently clamp a durable
+choice. Runtime caller overrides retain the catalog's clamp/drop rules.
+
+The Console Models page loads the selected model's declarations and generates
+its level selector and numeric/enum controls from them. A settings change uses
+the existing review-and-apply flow, revision guard and configuration history.
+`GET /api/models/settings?provider=openai&model=gpt-5.6` returns declarations
+and saved settings. `PUT /api/models/settings` accepts
+`{"model":"openai/gpt-5.6","settings":{"level":"high"}}`; the same operation
+is `{"kind":"set_model_settings",...}` on the configuration plan/apply
+endpoints. `PUT /api/defaults` accepts optional `settings` atomically with the
+provider and model. Authorization and root-credential ownership checks still
+apply.
+
+In terminal chat, `/model <name> [low|medium|high]` switches the model and
+optional level, and `/level <name>` changes the current model's level. These
+choices affect subsequent turns in that chat process. `/model save-default`
+writes the current model and its settings through PMM; it can refuse a provider
+change that would hand over the existing root credential. The interactive
+onboarding wizard offers the catalog's three levels; both onboarding paths
+write the chosen configuration through the transaction layer after safe
+initialization.
+
+Model settings belong to the configuration used to construct each provider
+chain. Each route selects its own level before explicit model parameters and
+explicit route parameters apply, even when two routes use the same model. Retries and streaming
+requests retain these settings; actual resolved values continue to enter the
+existing request preparation provenance. Revert a choice through configuration
+history, or apply a new settings transaction. A binary rollback retains the
+TOML file; check that the older binary understands these settings.

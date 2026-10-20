@@ -1044,8 +1044,8 @@ fn config_writes_route_through_the_transaction_layer() {
         (
             "src/onboard/wizard.rs",
             "write_split_config(",
-            3,
-            "not yet migrated: onboarding (offline)",
+            2,
+            "offline channel repair and safe first-run defaults",
         ),
         (
             "src/runtime/mode.rs",

@@ -436,7 +436,14 @@
     "unset": "Not declared",
     "planAdd": "Preview add",
     "planUpdate": "Preview update",
-    "planRemove": "Preview removal"
+    "planRemove": "Preview removal",
+    "settings": "Model settings",
+    "level": "Model level",
+    "defaultValue": "Default",
+    "useLevelValue": "Use level value",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "reviewSettings": "Review settings change"
   },
   "routing": {
     "title": "Defaults, routes and agents",

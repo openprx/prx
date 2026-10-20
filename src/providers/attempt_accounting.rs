@@ -84,7 +84,10 @@ pub(crate) async fn chat_traced(
         deadline,
         ACCOUNTING.scope(
             accounting,
-            capture.scope(provider.chat_traced(request, model, temperature)),
+            super::model_settings::with_temperature(
+                Some(temperature),
+                capture.scope(provider.chat_traced(request, model, temperature)),
+            ),
         ),
     )
     .await

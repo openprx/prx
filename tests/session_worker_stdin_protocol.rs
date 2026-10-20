@@ -279,6 +279,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     config.sessions_spawn.cleanup_on_complete = false;
     config.tool_tiering.always_include.push("sessions_spawn".to_string());
     config.model_routes.push(openprx::config::ModelRouteConfig {
+        settings: openprx::config::model_settings::ModelSettings::default(),
         hint: "fast".to_string(),
         provider: destination.clone(),
         model: "probe-model".to_string(),
@@ -350,6 +351,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         .set(&destination, "prx-agent-route", "PRX-WORKER-AGENT-KEY")
         .expect("store isolated agent credential");
     config.model_routes.push(openprx::config::ModelRouteConfig {
+        settings: openprx::config::model_settings::ModelSettings::default(),
         hint: "agent".to_string(),
         provider: destination.clone(),
         model: "agent-model".to_string(),
@@ -1082,6 +1084,7 @@ fn manifest_for(config_dir: &Path, workspace_dir: &Path) -> WorkerManifest {
         route_uses_root_connection: false,
         direct_uses_root_connection: false,
         temperature: 0.7,
+        temperature_override: None,
         config_dir: config_dir.to_path_buf(),
         config_generation: "0".repeat(64),
         runtime_config_generation_id: None,

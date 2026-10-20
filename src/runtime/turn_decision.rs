@@ -7172,6 +7172,7 @@ mod tests {
         config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         config.model_routes.push(crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".to_string(),
             provider: "openai".to_string(),
             model: "gpt-4o-mini".to_string(),

@@ -697,6 +697,7 @@ mod tests {
         let served = serve_config(|config| {
             config.reliability.fallback_providers = vec!["openrouter".into()];
             config.model_routes = vec![crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "fast".into(),
                 provider: "openrouter".into(),
                 model: "openai/gpt-4o-mini".into(),

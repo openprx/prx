@@ -446,20 +446,26 @@ impl GeminiProvider {
                 };
                 self.http_client()
                     .post(url)
-                    .json(&super::parameter_wire::request(
-                        "gemini",
-                        super::parameter_wire::Format::Gemini,
-                        parameter_model,
-                        &internal_request,
-                    ))
+                    .json(
+                        &super::parameter_wire::request(
+                            "gemini",
+                            super::parameter_wire::Format::Gemini,
+                            parameter_model,
+                            &internal_request,
+                        )
+                        .with_default_output_limit(),
+                    )
                     .bearer_auth(token)
             }
-            _ => self.http_client().post(url).json(&super::parameter_wire::request(
-                "gemini",
-                super::parameter_wire::Format::Gemini,
-                parameter_model,
-                request,
-            )),
+            _ => self.http_client().post(url).json(
+                &super::parameter_wire::request(
+                    "gemini",
+                    super::parameter_wire::Format::Gemini,
+                    parameter_model,
+                    request,
+                )
+                .with_default_output_limit(),
+            ),
         }
     }
 }
@@ -1179,25 +1185,26 @@ impl Provider for GeminiProvider {
                     client
                         .post(&url)
                         .header("accept", "text/event-stream")
-                        .json(&super::parameter_wire::request(
-                            "gemini",
-                            super::parameter_wire::Format::Gemini,
-                            &model_owned,
-                            &envelope,
-                        ))
+                        .json(
+                            &super::parameter_wire::request(
+                                "gemini",
+                                super::parameter_wire::Format::Gemini,
+                                &model_owned,
+                                &envelope,
+                            )
+                            .with_default_output_limit(),
+                        )
                         .bearer_auth(token)
                 }
-                OwnedGeminiAuth::ExplicitKey => {
-                    client
-                        .post(&url)
-                        .header("accept", "text/event-stream")
-                        .json(&super::parameter_wire::request(
-                            "gemini",
-                            super::parameter_wire::Format::Gemini,
-                            &model_owned,
-                            &request_body,
-                        ))
-                }
+                OwnedGeminiAuth::ExplicitKey => client.post(&url).header("accept", "text/event-stream").json(
+                    &super::parameter_wire::request(
+                        "gemini",
+                        super::parameter_wire::Format::Gemini,
+                        &model_owned,
+                        &request_body,
+                    )
+                    .with_default_output_limit(),
+                ),
             };
 
             let response = match request_builder.send().await {

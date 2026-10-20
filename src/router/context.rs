@@ -459,6 +459,7 @@ mod tests {
     fn resolves_hint_route_before_model_lookup() {
         let router = router_with_model("openrouter", "wide", 1_000_000);
         let routes = vec![ModelRouteConfig {
+            settings: Default::default(),
             hint: "reasoning".to_string(),
             provider: "openrouter".to_string(),
             model: "wide".to_string(),

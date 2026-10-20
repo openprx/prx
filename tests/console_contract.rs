@@ -53,6 +53,7 @@ const MANAGEMENT_API: &[(&str, &str)] = &[
     ("removeProviderCredential", "`/api/providers/"),
     ("testProvider", "`/api/providers/"),
     ("getModels", "`/api/models"),
+    ("getModelSettings", "`/api/models/settings"),
     ("getDefaults", "'/api/defaults'"),
     ("getRoutes", "`/api/routes"),
     ("getAgents", "'/api/agents'"),
@@ -840,4 +841,26 @@ fn every_language_has_every_management_key() {
             assert!(english.contains(&key), "{path} names the missing key `{key}`");
         }
     }
+}
+
+#[test]
+fn model_settings_controls_use_catalog_constraints_and_the_transaction_flow() {
+    let page = read("console/src/pages/ModelsPage.svelte");
+    for fragment in [
+        "api.getModelSettings(entry.provider, entry.model)",
+        "settingsCatalog.levels",
+        "settingsCatalog.parameters",
+        "declaration.min",
+        "declaration.max",
+        "declaration.step",
+        "declaration.levels",
+        "set_model_settings",
+        "flow.preview(",
+    ] {
+        assert!(page.contains(fragment), "missing model settings contract: {fragment}");
+    }
+    assert!(
+        page.contains("request !== settingsRequest"),
+        "late reads must not overwrite the active model"
+    );
 }

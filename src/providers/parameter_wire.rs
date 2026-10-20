@@ -132,6 +132,7 @@ pub(crate) struct Request<'a, T: ?Sized> {
     model: &'a str,
     body: &'a T,
     record: bool,
+    default_output_limit: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +153,7 @@ pub(crate) const fn request_for<'a, T: Serialize + ?Sized>(
         model,
         body,
         record: true,
+        default_output_limit: false,
     }
 }
 
@@ -167,6 +169,16 @@ pub(crate) const fn request<'a, T: Serialize + ?Sized>(
         model,
         body,
         record: true,
+        default_output_limit: false,
+    }
+}
+
+impl<T: ?Sized> Request<'_, T> {
+    /// This limit comes from the adapter, not an explicit caller value.
+    #[must_use]
+    pub(crate) const fn with_default_output_limit(mut self) -> Self {
+        self.default_output_limit = true;
+        self
     }
 }
 
@@ -184,9 +196,16 @@ impl<T: Serialize + ?Sized> Serialize for Request<'_, T> {
         if model.parameters.is_empty() {
             return self.body.serialize(serializer);
         }
-        encode_recorded(self.body, self.format, model, &catalog.revision, self.record)
-            .map_err(S::Error::custom)?
-            .serialize(serializer)
+        encode_recorded(
+            self.body,
+            self.format,
+            model,
+            &catalog.revision,
+            self.record,
+            self.default_output_limit,
+        )
+        .map_err(S::Error::custom)?
+        .serialize(serializer)
     }
 }
 
@@ -203,6 +222,7 @@ pub(crate) const fn retry_request<'a, T: Serialize + ?Sized>(
         model,
         body,
         record: false,
+        default_output_limit: false,
     }
 }
 
@@ -213,7 +233,7 @@ fn encode<T: Serialize + ?Sized>(
     model: &super::catalog::ReleaseModel,
     revision: &str,
 ) -> anyhow::Result<Value> {
-    encode_recorded(original, format, model, revision, true)
+    encode_recorded(original, format, model, revision, true, false)
 }
 
 fn encode_recorded<T: Serialize + ?Sized>(
@@ -222,6 +242,7 @@ fn encode_recorded<T: Serialize + ?Sized>(
     model: &super::catalog::ReleaseModel,
     revision: &str,
     record: bool,
+    default_output_limit: bool,
 ) -> anyhow::Result<Value> {
     let mut body = serde_json::to_value(original)?;
     // OAuth Gemini transports wrap generationConfig inside `request`.
@@ -253,7 +274,53 @@ fn encode_recorded<T: Serialize + ?Sized>(
             caller.overrides.insert(parameter, value.clone());
         }
     }
-    let resolved = parameters::resolve(model, revision, &[caller])?;
+    let selected = super::model_settings::selected(&model.id);
+    let settings_layers =
+        crate::config::model_settings::parameter_layers(&model.id, &selected.iter().collect::<Vec<_>>())?;
+    if default_output_limit
+        && settings_layers.iter().any(|settings| {
+            settings.overrides.contains_key(&ModelParameter::MaxOutputTokens)
+                || settings
+                    .level
+                    .as_ref()
+                    .and_then(|level| model.levels.get(level))
+                    .is_some_and(|values| values.contains_key(ModelParameter::MaxOutputTokens.as_str()))
+        })
+    {
+        caller.overrides.remove(&ModelParameter::MaxOutputTokens);
+    }
+    let mut layers = Vec::new();
+    if let Some(temperature) = super::model_settings::default_temperature() {
+        let mut baseline = parameters::ParameterLayer::default();
+        baseline
+            .overrides
+            .insert(ModelParameter::Temperature, Value::from(temperature));
+        layers.push(baseline);
+        // Ordinary turns pass the configured global baseline through the
+        // legacy f64 API. A separately scoped caller can override even with
+        // the same value, without losing that caller's explicit intent.
+        if caller
+            .overrides
+            .get(&ModelParameter::Temperature)
+            .and_then(Value::as_f64)
+            == Some(temperature)
+            && super::model_settings::caller_temperature().is_none()
+        {
+            caller.overrides.remove(&ModelParameter::Temperature);
+        }
+    }
+    if let Some(temperature) = super::model_settings::caller_temperature() {
+        caller
+            .overrides
+            .insert(ModelParameter::Temperature, Value::from(temperature));
+    }
+    layers.extend(settings_layers);
+    let resolved = if layers.is_empty() {
+        parameters::resolve(model, revision, std::slice::from_ref(&caller))?
+    } else {
+        layers.push(caller);
+        parameters::resolve(model, revision, &layers)?
+    };
     // Effort alone must never leave a partial/adaptive thinking object in an
     // Anthropic request. Budget-based thinking is emitted only when resolved.
     if !resolved.values.contains_key(&ModelParameter::ThinkingBudget) {
@@ -263,6 +330,7 @@ fn encode_recorded<T: Serialize + ?Sized>(
             _ => {}
         }
     }
+
     for parameter in [
         ModelParameter::Temperature,
         ModelParameter::TopP,

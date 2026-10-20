@@ -68,7 +68,7 @@ models before local-only ids.
   Both streaming and non-streaming requests carry tools.
 - OpenAI (direct) sends native `tools` with `tool_choice: "auto"` and parses
   streamed `tool_calls` deltas. Both the system-prompt and full-history streaming
-  entry points use this transport.
+  entry points use this transport and retain the selected model settings.
   Both streaming and non-streaming requests carry tools.
 - Gemini sends native `functionDeclarations`, parses `functionCall`, sends
   `functionResponse` on the next turn, and converts validated image markers to
@@ -884,3 +884,11 @@ provider. Keyless providers still build when that lookup finds nothing. OpenAI
 Codex is the exception in the other direction: it always uses its own login and
 ignores Root API keys, URL and rotation keys. A Root connection is never
 released to a different provider identity.
+
+## Selecting model levels
+
+The embedded catalog defines model levels and the parameters each adapter can
+express. Inspect them with `prx models levels <canonical-id>` and manage saved
+choices with `prx models settings <canonical-id>`. The CLI, Console and
+onboarding use the same configuration transaction boundary. See
+[saving a model level](model-catalog.md#saving-a-model-level).

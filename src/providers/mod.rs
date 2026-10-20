@@ -27,6 +27,7 @@ pub mod credentials;
 pub mod gemini;
 pub(crate) mod generation;
 mod identity;
+pub(crate) mod model_settings;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
@@ -1284,6 +1285,10 @@ pub struct ToolCallDialectDeclaration {
 
 #[derive(Debug, Clone)]
 pub struct ProviderRuntimeOptions {
+    /// The global baseline; invocation-specific temperatures remain higher precedence.
+    pub default_temperature: Option<f64>,
+    pub model_settings:
+        Option<std::sync::Arc<std::collections::BTreeMap<String, crate::config::model_settings::ModelSettings>>>,
     pub auth_profile_override: Option<String>,
     pub openprx_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
@@ -1344,6 +1349,8 @@ impl ProviderRuntimeOptions {
 impl Default for ProviderRuntimeOptions {
     fn default() -> Self {
         Self {
+            default_temperature: None,
+            model_settings: Default::default(),
             auth_profile_override: None,
             openprx_dir: None,
             secrets_encrypt: true,
@@ -1363,6 +1370,8 @@ impl Default for ProviderRuntimeOptions {
 #[must_use]
 pub fn provider_runtime_options_from_config(config: &crate::config::Config) -> ProviderRuntimeOptions {
     ProviderRuntimeOptions {
+        default_temperature: Some(config.default_temperature),
+        model_settings: (!config.model_settings.is_empty()).then(|| std::sync::Arc::new(config.model_settings.clone())),
         auth_profile_override: None,
         openprx_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
@@ -3161,6 +3170,23 @@ pub fn create_provider_for(
             });
         }
     }
+    let route_settings = resolved
+        .route_settings()
+        .map(|settings| -> anyhow::Result<_> {
+            let release = catalog.release_catalog()?;
+            let row = release
+                .model(resolved.provider(), resolved.model())
+                .ok_or_else(|| anyhow::anyhow!("route settings require a release catalog model"))?;
+            let mut selected = Vec::new();
+            if let Some(model) = options.model_settings.as_ref().and_then(|models| models.get(&row.id)) {
+                selected.push(model);
+            }
+            selected.push(settings);
+            let layers = crate::config::model_settings::parameter_layers(&row.id, &selected)?;
+            catalog::parameters::resolve(row, &release.revision, &layers)?;
+            Ok((row.id.clone(), settings.clone()))
+        })
+        .transpose()?;
     let credential = resolved.credential();
     create_resilient_provider_from_resolved(
         label,
@@ -3171,6 +3197,14 @@ pub fn create_provider_for(
         ResolvedPrimary::new(resolved),
         fallback_admission,
     )
+    .map(|provider| {
+        model_settings::wrap(
+            provider,
+            options.model_settings.clone(),
+            route_settings,
+            options.default_temperature,
+        )
+    })
 }
 
 /// Build the routed chat provider for one resolver-released default selection.
@@ -4275,6 +4309,7 @@ Connection: close\r\n\
         );
         config.model_routes = vec![
             crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "foreign".to_string(),
                 provider: "anthropic".to_string(),
                 model: "claude-3-5-sonnet-20241022".to_string(),
@@ -4282,6 +4317,7 @@ Connection: close\r\n\
                 credential_ref: None,
             },
             crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "owned".to_string(),
                 provider: "anthropic".to_string(),
                 model: "claude-3-5-sonnet-20241022".to_string(),
@@ -6344,6 +6380,8 @@ Connection: close\r\n\
     /// operator's real configuration.
     fn byo_isolated_options(temp: &TempDir) -> ProviderRuntimeOptions {
         ProviderRuntimeOptions {
+            default_temperature: None,
+            model_settings: Default::default(),
             auth_profile_override: None,
             openprx_dir: Some(temp.path().to_path_buf()),
             secrets_encrypt: false,
@@ -7079,6 +7117,7 @@ mod credential_containment_tests {
         let temp = tempfile::tempdir().expect("test: temp config dir");
         let probe = CredentialProbe::start_with_statuses(vec![429]).await;
         let routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "probe".to_string(),
             provider: probe.custom_provider(),
             model: PROBE_MODEL.to_string(),
@@ -7112,6 +7151,7 @@ mod credential_containment_tests {
         let temp = tempfile::tempdir().expect("test: temp config dir");
         let probe = CredentialProbe::start_with_statuses(vec![429]).await;
         let routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "probe".to_string(),
             provider: probe.custom_provider(),
             model: PROBE_MODEL.to_string(),
@@ -7150,6 +7190,7 @@ mod credential_containment_tests {
         let temp = tempfile::tempdir().expect("test: temp config dir");
         let probe = CredentialProbe::start().await;
         let routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "probe".to_string(),
             provider: probe.custom_provider(),
             model: PROBE_MODEL.to_string(),
@@ -7230,6 +7271,7 @@ mod credential_containment_tests {
         config.default_provider = None;
         config.reliability.fallback_providers = vec!["anthropic".to_string()];
         config.model_routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".to_string(),
             provider: "custom:http://127.0.0.1:8080/v1".to_string(),
             model: "m".to_string(),
@@ -7357,6 +7399,7 @@ mod credential_containment_tests {
             Some(ROOT_SENTINEL),
             Some("https://gateway.corp.example/v1"),
             vec![crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "primary".to_string(),
                 provider: "OpenAI".to_string(),
                 model: "gpt-4o".to_string(),
@@ -7381,6 +7424,7 @@ mod credential_containment_tests {
             Some(ROOT_SENTINEL),
             Some("https://gateway.corp.example/v1"),
             vec![crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "owned".to_string(),
                 provider: "OpenAI".to_string(),
                 model: "gpt-4o".to_string(),
@@ -7408,6 +7452,7 @@ mod credential_containment_tests {
             Some(ROOT_SENTINEL),
             Some("https://gw/v1"),
             vec![crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "foreign".to_string(),
                 provider: "groq".to_string(),
                 model: "llama-3.3-70b-versatile".to_string(),
@@ -7446,6 +7491,7 @@ mod credential_containment_tests {
         let primary = probe.custom_provider();
         let respelled = format!("{primary}/");
         let routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "probe".to_string(),
             provider: respelled,
             model: PROBE_MODEL.to_string(),

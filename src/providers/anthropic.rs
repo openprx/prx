@@ -776,12 +776,15 @@ impl AnthropicProvider {
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&super::parameter_wire::request_for(
-                &self.parameter_provider,
-                super::parameter_wire::Format::Anthropic,
-                &native_request.model,
-                &native_request,
-            ));
+            .json(
+                &super::parameter_wire::request_for(
+                    &self.parameter_provider,
+                    super::parameter_wire::Format::Anthropic,
+                    &native_request.model,
+                    &native_request,
+                )
+                .with_default_output_limit(),
+            );
 
         let response = self.apply_auth(req, &credential).send().await?;
 
@@ -792,12 +795,15 @@ impl AnthropicProvider {
                     .post(format!("{}/v1/messages", self.base_url))
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
-                    .json(&super::parameter_wire::request_for(
-                        &self.parameter_provider,
-                        super::parameter_wire::Format::Anthropic,
-                        &native_request.model,
-                        &native_request,
-                    ));
+                    .json(
+                        &super::parameter_wire::request_for(
+                            &self.parameter_provider,
+                            super::parameter_wire::Format::Anthropic,
+                            &native_request.model,
+                            &native_request,
+                        )
+                        .with_default_output_limit(),
+                    );
                 let retry_response = self.apply_auth(retry_req, &new_credential).send().await?;
                 if !retry_response.status().is_success() {
                     return Err(super::api_error("Anthropic", retry_response).await);
@@ -1317,12 +1323,15 @@ impl Provider for AnthropicProvider {
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&super::parameter_wire::request_for(
-                &self.parameter_provider,
-                super::parameter_wire::Format::Anthropic,
-                &body.model,
-                &body,
-            ));
+            .json(
+                &super::parameter_wire::request_for(
+                    &self.parameter_provider,
+                    super::parameter_wire::Format::Anthropic,
+                    &body.model,
+                    &body,
+                )
+                .with_default_output_limit(),
+            );
 
         let response = self.apply_auth(req, &credential).send().await?;
 
@@ -1334,12 +1343,15 @@ impl Provider for AnthropicProvider {
                     .post(format!("{}/v1/messages", self.base_url))
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
-                    .json(&super::parameter_wire::request_for(
-                        &self.parameter_provider,
-                        super::parameter_wire::Format::Anthropic,
-                        &body.model,
-                        &body,
-                    ));
+                    .json(
+                        &super::parameter_wire::request_for(
+                            &self.parameter_provider,
+                            super::parameter_wire::Format::Anthropic,
+                            &body.model,
+                            &body,
+                        )
+                        .with_default_output_limit(),
+                    );
                 let retry_response = self.apply_auth(retry_req, &new_credential).send().await?;
                 if !retry_response.status().is_success() {
                     return Err(super::api_error("Anthropic", retry_response).await);
@@ -1533,12 +1545,15 @@ impl Provider for AnthropicProvider {
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
-                .json(&super::parameter_wire::request_for(
-                    &parameter_provider,
-                    super::parameter_wire::Format::Anthropic,
-                    &request_body.model,
-                    &request_body,
-                ));
+                .json(
+                    &super::parameter_wire::request_for(
+                        &parameter_provider,
+                        super::parameter_wire::Format::Anthropic,
+                        &request_body.model,
+                        &request_body,
+                    )
+                    .with_default_output_limit(),
+                );
             req = if use_bearer {
                 req.header("Authorization", format!("Bearer {credential}"))
                     .header("anthropic-beta", "oauth-2025-04-20")

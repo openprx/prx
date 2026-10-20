@@ -300,6 +300,10 @@ pub struct Config {
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     pub default_temperature: f64,
 
+    /// Catalog model levels and explicit parameters, keyed by canonical release ID.
+    #[serde(default)]
+    pub model_settings: std::collections::BTreeMap<String, crate::config::model_settings::ModelSettings>,
+
     /// Provider-specific runtime options (`[providers.<name>]`).
     #[serde(default)]
     pub providers: ProvidersConfig,
@@ -4200,6 +4204,9 @@ impl Default for SchedulerConfig {
 /// Usage: pass `hint:reasoning` as the model parameter to route the request.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelRouteConfig {
+    /// Route-selected level; explicit route parameters override explicit model parameters.
+    #[serde(default, flatten)]
+    pub settings: crate::config::model_settings::ModelSettings,
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
     /// Provider to route to (must match a known provider name)
@@ -5916,6 +5923,7 @@ impl Default for Config {
                 .and_then(crate::providers::catalog::ReleaseCatalog::global_default_model)
                 .map(str::to_string),
             default_temperature: 0.7,
+            model_settings: Default::default(),
             providers: ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -7878,6 +7886,7 @@ mod tests {
     async fn a_selection_names_an_inline_key_or_a_credential_reference() {
         let mut config = Config::default();
         config.model_routes.push(ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "openai".into(),
             model: "gpt-4o-mini".into(),
@@ -8336,6 +8345,7 @@ min_chars = 12
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             default_temperature: 0.5,
+            model_settings: Default::default(),
             providers: ProvidersConfig::default(),
             observability: ObservabilityConfig {
                 backend: "log".into(),
@@ -8916,6 +8926,7 @@ low_priority_tools = ["sessions_spawn", "delegate"]
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             default_temperature: 0.9,
+            model_settings: Default::default(),
             providers: ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),

@@ -320,6 +320,12 @@ async fn run_owned_manifest(
         .context("worker source requires authenticated transport")?
         .verify_manifest(&manifest)?;
     anyhow::ensure!(
+        manifest
+            .temperature_override
+            .is_none_or(|value| value.is_finite() && value.to_bits() == manifest.temperature.to_bits()),
+        "worker caller temperature differs from its sealed temperature"
+    );
+    anyhow::ensure!(
         manifest.child_source.is_some() || manifest.ordinary_source.is_some() || manifest.operator_source.is_some(),
         "worker requires an authenticated decision source"
     );
@@ -1036,6 +1042,7 @@ async fn run_owned_manifest(
         let multimodal_ref = &config.multimodal;
         let low_priority_tools_ref: &[String] = &config.agent.low_priority_tools;
         let temperature = manifest.temperature;
+        let temperature_override = manifest.temperature_override;
         let read_only_window = config.agent.read_only_tool_concurrency_window;
         let priority_scheduling_enabled = config.agent.priority_scheduling_enabled;
         let tools_registry_ref = &tools_registry;
@@ -1170,59 +1177,63 @@ async fn run_owned_manifest(
                     });
                     let loop_scope = child_scope.as_ref().or(scope_ctx_ref);
                     let loop_result = cleanup
-                        .run(run_turn(
-                            &mut segment_history,
-                            crate::agent::turn_request::TurnRequest {
-                                channel_name: "session-worker",
-                                scope: loop_scope,
-                                mode: crate::agent::turn_contracts::ChatMode::default(),
-                                silent: true,
-                                expose_stay_silent: false,
-                                multimodal: multimodal_ref,
-                                schedule: crate::agent::turn_request::TurnSchedule {
-                                    read_only_tool_concurrency_window: read_only_window,
-                                    priority_scheduling_enabled,
-                                    low_priority_tool_names: low_priority_tools_ref.to_vec(),
+                        .run(crate::providers::model_settings::with_temperature(
+                            temperature_override,
+                            run_turn(
+                                &mut segment_history,
+                                crate::agent::turn_request::TurnRequest {
+                                    channel_name: "session-worker",
+                                    scope: loop_scope,
+                                    mode: crate::agent::turn_contracts::ChatMode::default(),
+                                    silent: true,
+                                    expose_stay_silent: false,
+                                    multimodal: multimodal_ref,
+                                    schedule: crate::agent::turn_request::TurnSchedule {
+                                        read_only_tool_concurrency_window: read_only_window,
+                                        priority_scheduling_enabled,
+                                        low_priority_tool_names: low_priority_tools_ref.to_vec(),
+                                    },
+                                    compaction: child_turn
+                                        .as_ref()
+                                        .map(|turn| turn.compaction())
+                                        .or(compaction_config_ref),
+                                    // The parent already selected and sealed this worker's
+                                    // capability set. Reapplying language-dependent intent
+                                    // tiering here would silently hide inherited tools and
+                                    // make process mode weaker than task mode.
+                                    decision: admitted_turn.routing(),
                                 },
-                                compaction: child_turn
-                                    .as_ref()
-                                    .map(|turn| turn.compaction())
-                                    .or(compaction_config_ref),
-                                // The parent already selected and sealed this worker's
-                                // capability set. Reapplying language-dependent intent
-                                // tiering here would silently hide inherited tools and
-                                // make process mode weaker than task mode.
-                                decision: admitted_turn.routing(),
-                            },
-                            crate::agent::turn_request::TurnServices {
-                                provider: provider_ref,
-                                provider_name: provider_name_ref,
-                                model: model_ref,
-                                temperature,
-                                tools_registry,
-                                observer: observer_ref,
-                                hooks: hooks_ref,
-                                approval: None,
-                                approval_resolver: None,
-                                runtime_adapter: adapter,
-                                // The ledger comes from `memory` directly: a session worker without a
-                                // resolved ingest scope must still be able to run side-effecting tools.
-                                memory: crate::agent::turn_request::ToolLoopMemory::new(
-                                    &memory,
-                                    workspace_dir_ref,
-                                    loop_scope.map(|ctx| {
-                                        DocumentIngestRuntime::from_scope(Arc::clone(&memory), ctx).into_nested_turn()
-                                    }),
-                                )
-                                .with_event_fabric(request_event_fabric),
-                            },
-                            crate::agent::turn_request::TurnDelivery {
-                                // Steering cancels the in-flight segment; without a token the
-                                // worker could only append after the loop finished on its own.
-                                cancellation: Some(cancel.clone()),
-                                on_delta: None,
-                                on_tool_call: None,
-                            },
+                                crate::agent::turn_request::TurnServices {
+                                    provider: provider_ref,
+                                    provider_name: provider_name_ref,
+                                    model: model_ref,
+                                    temperature,
+                                    tools_registry,
+                                    observer: observer_ref,
+                                    hooks: hooks_ref,
+                                    approval: None,
+                                    approval_resolver: None,
+                                    runtime_adapter: adapter,
+                                    // The ledger comes from `memory` directly: a session worker without a
+                                    // resolved ingest scope must still be able to run side-effecting tools.
+                                    memory: crate::agent::turn_request::ToolLoopMemory::new(
+                                        &memory,
+                                        workspace_dir_ref,
+                                        loop_scope.map(|ctx| {
+                                            DocumentIngestRuntime::from_scope(Arc::clone(&memory), ctx)
+                                                .into_nested_turn()
+                                        }),
+                                    )
+                                    .with_event_fabric(request_event_fabric),
+                                },
+                                crate::agent::turn_request::TurnDelivery {
+                                    // Steering cancels the in-flight segment; without a token the
+                                    // worker could only append after the loop finished on its own.
+                                    cancellation: Some(cancel.clone()),
+                                    on_delta: None,
+                                    on_tool_call: None,
+                                },
+                            ),
                         ))
                         .await;
                     if let Some(turn) = child_turn.as_ref() {

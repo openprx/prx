@@ -57,7 +57,8 @@ where
     // No active scope is the same as explicitly disabled recording. A child
     // inherits that absence as well, rather than borrowing a sibling's scope.
     let records = CURRENT.try_with(Clone::clone).unwrap_or_default();
-    tokio::spawn(CURRENT.scope(records, work))
+    let settings = super::model_settings::inherited();
+    tokio::spawn(super::model_settings::scope(settings, CURRENT.scope(records, work)))
 }
 
 #[cfg(test)]

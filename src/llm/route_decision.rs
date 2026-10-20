@@ -1230,6 +1230,7 @@ mod tests {
     fn route_decision_from_model_routes_records_candidates_and_hint_filters() {
         let routes = vec![
             ModelRouteConfig {
+                settings: Default::default(),
                 hint: "fast".to_string(),
                 provider: "openrouter".to_string(),
                 model: "openai/gpt-4o-mini".to_string(),
@@ -1237,6 +1238,7 @@ mod tests {
                 credential_ref: None,
             },
             ModelRouteConfig {
+                settings: Default::default(),
                 hint: "reasoning".to_string(),
                 provider: "anthropic".to_string(),
                 model: "claude-sonnet-4".to_string(),

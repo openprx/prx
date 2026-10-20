@@ -2204,6 +2204,7 @@ mod tests {
         config.config_path = dir.join("config.toml");
         config.workspace_dir = dir.join("workspace");
         config.model_routes = vec![crate::config::ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: route_provider.into(),
             model: "route-model".into(),
@@ -2642,6 +2643,7 @@ mod tests {
             .expect("test: reference for another provider");
         config.model_routes = vec![
             crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "fast".into(),
                 provider: route_provider.clone(),
                 model: "route-model".into(),
@@ -2649,6 +2651,7 @@ mod tests {
                 credential_ref: Some("cred-route".into()),
             },
             crate::config::ModelRouteConfig {
+                settings: Default::default(),
                 hint: "wrong".into(),
                 provider: route_provider.clone(),
                 model: "route-model".into(),
@@ -3647,6 +3650,7 @@ classifier_provider = "custom:http://grace:userinfo-sentinel-classifier@127.0.0.
         }
         sections!(
             providers,
+            model_settings,
             observability,
             autonomy,
             runtime,

@@ -502,6 +502,7 @@ mod tests {
             ..Config::default()
         };
         config.model_routes.push(ModelRouteConfig {
+            settings: Default::default(),
             hint: "fast".into(),
             provider: "openai".into(),
             model: "gpt-4o-mini".into(),

@@ -237,7 +237,7 @@ pub async fn run(
         .as_deref()
         .unwrap_or_else(|| providers::selection::default_model(&config));
 
-    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
+    let mut provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
     let (startup_connection, startup_provider) = chat_provider_chain(
         &config,
@@ -1947,19 +1947,72 @@ pub async fn run(
         // subtask actually requests on the next turn), and (c) dispatching ModelChanged so the reducer
         // updates session.model → the status bar reflects it immediately. A bare `/model` (no
         // argument) is still handed to dispatch, which shows the current model.
-        if let Some(raw) = user_input.strip_prefix("/model ") {
-            let new_model = raw.trim();
-            if new_model.is_empty() {
-                emit_chat_output("Usage: /model <name>");
+        if user_input == "/model save-default" {
+            let saved = async {
+                use crate::config::manage::{ConfigActor, ManagedChange, ManagementService, RootCredential, SelectionOperation};
+                let release = providers::catalog::ReleaseCatalog::embedded_ref()?;
+                let settings = release.model(&providers::ProviderId::of(provider_name), &current_model_owned)
+                    .and_then(|row| provider_runtime_options.model_settings.as_ref().and_then(|settings| settings.get(&row.id))).cloned();
+                let config_path = config.config_path.clone();
+                let workspace_dir = config.workspace_dir.clone();
+                let current = crate::runtime::blocking::spawn_blocking(move || {
+                    Config::load_from_path(&config_path, workspace_dir)
+                }).await??;
+                let service = ManagementService::deferred(crate::config::new_shared(current));
+                let change = ManagedChange::SetDefault {
+                    operation: SelectionOperation::Chat, provider: provider_name.to_owned(), model: current_model_owned.clone(),
+                    root_credential: RootCredential::Refuse, settings,
+                };
+                let plan = service.plan(&change, ConfigActor::Cli).await?;
+                service.apply(plan, ConfigActor::Cli, None).await?;
+                Ok::<(), anyhow::Error>(())
+            }.await;
+            match saved {
+                Ok(()) => emit_chat_output("Saved the current model and level as the default."),
+                Err(error) => emit_chat_output(&format!("Cannot save model default: {}", providers::sanitize_api_error(&error.to_string()))),
+            }
+            continue;
+        }
+        let model_command = user_input.strip_prefix("/model ");
+        let level_command = user_input.strip_prefix("/level ");
+        if model_command.is_some() || level_command.is_some() {
+            let parts: Vec<&str> = model_command.or(level_command).unwrap_or_default().split_whitespace().collect();
+            let (new_model, level) = if level_command.is_some() {
+                (current_model_owned.clone(), parts.first().copied())
+            } else {
+                (parts.first().copied().unwrap_or_default().to_string(), parts.get(1).copied())
+            };
+            let expected = if level_command.is_some() { 1 } else { 2 };
+            if new_model.is_empty() || parts.len() > expected || (level_command.is_some() && level.is_none()) {
+                emit_chat_output("Usage: /model <name> [low|medium|high] or /level <low|medium|high>");
                 continue;
             }
+            let mut candidate_options = provider_runtime_options.clone();
+            if let Some(level) = level {
+                let validated = (|| -> anyhow::Result<()> {
+                    let release = providers::catalog::ReleaseCatalog::embedded_ref()?;
+                    let row = release.model(&providers::ProviderId::of(provider_name), &new_model)
+                        .ok_or_else(|| anyhow::anyhow!("model levels require a release catalog model"))?;
+                    let mut settings = candidate_options.model_settings.as_ref().and_then(|settings| settings.get(&row.id)).cloned().unwrap_or_default();
+                    settings.level = Some(level.to_owned());
+                    settings.validate(&row.id)?;
+                    let model_settings = candidate_options.model_settings.get_or_insert_with(|| Arc::new(Default::default()));
+                    Arc::make_mut(model_settings).insert(row.id.clone(), settings);
+                    Ok(())
+                })();
+                if let Err(error) = validated {
+                    emit_chat_output(&format!("Cannot select model level: {error}"));
+                    continue;
+                }
+            }
+            let new_model = new_model.as_str();
             let rebuilt = chat_model_switch(&config, provider_name, new_model).and_then(|()| {
                 chat_provider_chain(
                     &config,
                     provider_name,
                     configured_provider_name,
                     new_model,
-                    &provider_runtime_options,
+                    &candidate_options,
                 )
             });
             match rebuilt {
@@ -1980,6 +2033,7 @@ pub async fn run(
                             continue;
                         }
                     };
+                    provider_runtime_options = candidate_options;
                     provider_binding = binding;
                     provider = Arc::clone(&new_provider_arc);
                     #[cfg(feature = "terminal-tui")]

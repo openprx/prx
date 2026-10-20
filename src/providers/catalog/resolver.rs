@@ -267,6 +267,7 @@ impl fmt::Debug for ResolvedCredential {
 /// A model the resolver released for one operation.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedModel {
+    route_settings: Option<crate::config::model_settings::ModelSettings>,
     provider: ProviderId,
     label: Arc<str>,
     model: Arc<str>,
@@ -280,6 +281,13 @@ pub struct ResolvedModel {
 }
 
 impl ResolvedModel {
+    pub(crate) fn set_route_settings(&mut self, settings: crate::config::model_settings::ModelSettings) {
+        self.route_settings = (settings.level.is_some() || !settings.overrides.is_empty()).then_some(settings);
+    }
+
+    pub(crate) const fn route_settings(&self) -> Option<&crate::config::model_settings::ModelSettings> {
+        self.route_settings.as_ref()
+    }
     /// The provider identity.
     #[must_use]
     pub const fn provider(&self) -> &ProviderId {
@@ -402,6 +410,7 @@ pub fn resolve(
     let credential = release_credential(&provider, label, &shown, &selection.credential, credentials)?;
 
     Ok(ResolvedModel {
+        route_settings: None,
         provider,
         label: Arc::from(label),
         model: Arc::from(model),
