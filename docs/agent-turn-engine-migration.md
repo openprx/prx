@@ -100,3 +100,10 @@ summaries, and persistence live in `src/onboard/wizard/`. Its root is 397
 lines; the largest production child is 1,416 lines and the largest test child
 is 943 lines. All 77 original tests remain. Source guards cover the root and
 production children; moved test files retain explicit test-only scope.
+
+The chat entry point keeps its event loop in `src/chat/run.rs` (4,961 lines).
+Eleven contiguous startup and teardown blocks live in `run/startup.rs` (727
+lines), with explicit arguments and one private borrowed UI context. The
+original statements, error propagation, primitive await order, guard lifetimes,
+and 238 clone calls are preserved. All chat tests remain unchanged; source
+guards cover the new production child alongside the root.
