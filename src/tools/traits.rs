@@ -95,6 +95,12 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// The live hook manager this tool controls, so sub-agents without their
+    /// own runtime can share their parent's (see `tools::child_hooks`).
+    fn live_hook_manager(&self) -> Option<std::sync::Arc<crate::hooks::HookManager>> {
+        None
+    }
+
     /// Whether this tool can be reconstructed and executed inside a process
     /// worker. Tools backed by the interactive parent's event loop opt out.
     fn process_worker_compatible(&self) -> bool {

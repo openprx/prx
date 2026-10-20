@@ -960,6 +960,10 @@ pub struct HooksStatusTool {
 
 #[async_trait]
 impl crate::tools::Tool for HooksStatusTool {
+    fn live_hook_manager(&self) -> Option<std::sync::Arc<HookManager>> {
+        Some(self.manager.clone())
+    }
+
     fn name(&self) -> &str {
         "hooks_status"
     }
