@@ -927,6 +927,10 @@ billed. Kimi K2.6's public model card lists 0.95 input, 4 output and 0.16 cache
 hit. K2 cache misses use the input rate, including the catalog's cache-write
 accounting field. All values are USD per million tokens.
 
+OpenAI documents `gpt-5.6` as an alias routing to GPT-5.6 Sol, so the alias row
+uses the [Sol model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
+This alias relationship was checked on 2026-10-20; the catalog prices are unchanged.
+
 <!-- catalog-tariff-citations:start -->
 | Exact catalog row or zero-rule scope | Published source or documented zero rule |
 | --- | --- |
@@ -944,7 +948,7 @@ accounting field. All values are USD per million tokens.
 | `openai/gpt-4o` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-4o) |
 | `openai/gpt-4o-mini` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-4o-mini) |
 | `openai/gpt-5.2-codex` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.2-codex) |
-| `openai/gpt-5.6` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
+| `openai/gpt-5.6` | [GPT-5.6 alias of GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
 | `openai/gpt-5.6-luna` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-luna) |
 | `openai/gpt-5.6-sol` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
 | `openai/gpt-5.6-terra` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-terra) |
