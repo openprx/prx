@@ -719,6 +719,9 @@ impl SessionsSpawnTool {
             })
             .unwrap_or_default();
         let tools = self.tools.get()?;
+        let parent_hooks = tools
+            .as_deref()
+            .and_then(|registry| crate::tools::child_hooks::parent_hook_manager(registry.as_slice()));
         if let Some(registry) = &tools {
             refresh_tools_for_explicit_allowlist(registry, &allowed_tools).await?;
         } else if !allowed_tools.is_empty() {
@@ -1712,6 +1715,7 @@ impl SessionsSpawnTool {
                         restore_active_runs,
                         restore_run_id,
                         Arc::clone(&task_progress),
+                        parent_hooks,
                     )
                 });
                 let result = run_cleanup_scope
