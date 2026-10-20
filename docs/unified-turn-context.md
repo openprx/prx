@@ -112,7 +112,7 @@ history lookup without copying prompt text into the database:
   context-budget preflight planned the request against; they are `null` only
   on a turn that runs without a compaction config. No production call site of
   the loop engine passes a literal `None` any more, which
-  `tests/architecture_boundaries.rs` pins; the
+  `tests/architecture_boundaries/main.rs` pins; the
   session worker budgets when its manifest carries a compaction config. The
   Gateway webhook turn (`POST /webhook` and the WhatsApp, Linq and Nextcloud
   Talk webhooks) is budgeted like the CLI, TUI, chat, IM channels and Console

@@ -995,7 +995,7 @@ itself is unaffected and remains searchable by its owner.
 
 The `Agent::run_single` shell runs through the same service as of 0.8.128;
 approval there is fail-closed for the same reason.
-`tests/architecture_boundaries.rs` pins the inventory of production call sites
+`tests/architecture_boundaries/main.rs` pins the inventory of production call sites
 that invoke a tool directly, so a new bypass fails a test, and
 `tests/tool_schema_contract.rs` sweeps the whole static tool inventory: every
 published contract must accept a document derived from itself and reject one

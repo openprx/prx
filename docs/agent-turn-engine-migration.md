@@ -62,7 +62,7 @@ why its current contents remain cohesive. Future growth still requires review.
 | 11,698 | `src/chat/dispatcher.rs` | Owns the reducer effect executor and admitted Chat driver with behavioral tests that pin action/effect ordering. |
 | 11,033 | `src/chat/state.rs` | Owns the pure Chat reducer, effect vocabulary, state transitions, and exhaustive reducer tests. |
 | 10,755 | `src/memory/postgres.rs` | Owns the PostgreSQL `Memory` adapter, pool, RLS, schema/migrations, SQL projections, and backend-specific tests. |
-| 10,040 | `tests/architecture_boundaries.rs` | Centralizes declarative source scanners, exact allowlists, and mutation probes so architectural exceptions cannot diverge across test binaries. |
+| < 1,500 per file | `tests/architecture_boundaries/main.rs` + sibling modules | One integration target with concern-based guard modules and shared helpers; exact allowlists and mutation probes remain together in the target. The metaguard reads every module declared by its thin root. |
 | 9,819 | `src/gateway/mod.rs` | Owns Axum ingress, production registry assembly, gateway runtime lifecycle, and root integration fixtures; API and compatibility handlers are already separate modules. |
 | 8,881 | `src/runtime/turn_decision.rs` | Owns decision-service integration and its policy matrix; routing and supporting decision concerns are already factored into child modules. |
 | 7,493 | `src/providers/mod.rs` | Owns provider factory, route/credential resolution, dialect selection, and factory tests while concrete provider protocols remain separate. |
