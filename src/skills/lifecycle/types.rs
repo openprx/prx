@@ -34,7 +34,9 @@ pub enum LifecycleError {
     UnsafeStorePath { path: PathBuf, reason: String },
     #[error("{path} has mode {mode:o}; owner-only permissions are required")]
     PermissionsTooOpen { path: PathBuf, mode: u32 },
-    #[error("record belongs to owner scope {found:?}, expected {expected:?}")]
+    #[error(
+        "record belongs to owner scope {found:?}, expected {expected:?}: a lifecycle store keeps the owner scope it was first written with; set skills_lifecycle.owner_scope back to {found:?}, or move the store directory self/skill-lifecycle aside to start a new store"
+    )]
     OwnerMismatch { expected: String, found: String },
     #[error("unsupported {what} schema version {found}")]
     UnsupportedSchema { what: &'static str, found: u32 },

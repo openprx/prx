@@ -116,7 +116,10 @@ Settings are operator-owned and read at process start; restart after changing
 them. With `enabled = false`, no lifecycle store is opened and no lifecycle
 actions are offered to the model. Set `owner_scope` to the exact trusted owner
 of the sessions being managed. An owner-isolated caller without its own owner
-id never matches. A configured suite entry registers an already frozen suite;
+id never matches. A store keeps the owner scope it was first written with:
+after changing `owner_scope`, records fail with an owner-mismatch error that
+names both scopes. Set the old scope back, or move `self/skill-lifecycle`
+aside to start a new store. Nothing is migrated between owners. A configured suite entry registers an already frozen suite;
 it is not a command to generate or import evaluation cases.
 
 | Mode | Allowed work |
