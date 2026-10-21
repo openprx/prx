@@ -366,6 +366,17 @@ pub(super) fn resolve_revision(
     }))
 }
 
+/// Whether `skill_name` is lifecycle-managed in the store of `owner` (a binding
+/// exists for it, enabled or not). Used to refuse an unpinned fallback to the
+/// legacy path for a managed skill.
+pub fn is_managed_skill(workspace_dir: &Path, owner: &OwnerScope, skill_name: &str) -> Result<bool, LifecycleError> {
+    match SkillLifecycleStore::open_existing(workspace_dir, owner.clone()) {
+        Ok(Some(store)) => Ok(store.find_binding_by_name(skill_name)?.is_some()),
+        Ok(None) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Resolves the skill through the owner's lifecycle store and reads one
 /// resource of its revision.
 ///

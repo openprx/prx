@@ -11,7 +11,7 @@
 use super::evaluate::{candidate_bundle, fixture_candidate_unwritten, skill as fixture_skill};
 use super::gate::stage_draft;
 use super::{entry, exec_entry, owner};
-use crate::skills::lifecycle::test_support::publish_revision;
+use crate::skills::lifecycle::test_support::{publish_reviewed_executable, publish_revision};
 use crate::skills::lifecycle::{
     Bundle, BundleEntry, ExecutableError, ExecutableImport, ExecutionIdentity, LifecycleError, LifecycleMode,
     MigrationAction, NewRevision, OwnerScope, PrepareRequest, PreparedExecution, RevisionId, ServiceError, SkillId,
@@ -83,7 +83,13 @@ fn env(tag: &str) -> Env {
 }
 
 impl Env {
+    /// An executable revision the operator reviewed (an executable import).
     fn publish(&self, bundle: &Bundle, expected_generation: u64) -> RevisionId {
+        publish_reviewed_executable(&self.store, &self.skill, bundle, expected_generation)
+    }
+
+    /// An executable revision with no review: what a store migrated before SL11 holds.
+    fn publish_unreviewed(&self, bundle: &Bundle, expected_generation: u64) -> RevisionId {
         publish_revision(
             &self.store,
             &self.skill,
@@ -498,8 +504,14 @@ fn a_staged_run_is_a_private_exact_copy_removed_by_finish_or_drop() {
 fn a_stale_run_directory_of_a_dead_process_is_swept_by_the_next_preparation() {
     let env = env("sweep");
     env.publish(&bundle(b"#!/bin/sh\necho A\n"), 0);
+    // Created the way production creates them, whatever the host umask is.
+    let private = |path: &Path| {
+        fs::create_dir_all(path).expect("test: dir");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("test: chmod");
+    };
+    private(&env.run_root());
     let stale = env.run_root().join("run-deadbeef");
-    fs::create_dir_all(&stale).expect("test: stale dir");
+    private(&stale);
     fs::write(stale.join("x"), b"x").expect("test: file");
     let old = std::time::SystemTime::now() - std::time::Duration::from_hours(48);
     fs::File::open(&stale)
@@ -920,4 +932,167 @@ fn a_trial_cannot_be_offered_a_tool_with_non_replayable_external_effects() {
         assert!(build(tool).is_err(), "{tool} must not be offered to a trial");
     }
     assert!(build("file_write").is_ok());
+}
+
+// ---- only reviewed bytes execute ---------------------------------------------------------
+
+#[test]
+fn an_executable_revision_without_a_review_lineage_is_refused_at_execute() {
+    let env = env("unreviewed");
+    // What a store migrated before SL11 holds: an operator revision, no review.
+    env.publish_unreviewed(&bundle(b"#!/bin/sh\necho A\n"), 0);
+    let task = unique("task");
+    let refused = env.prepare(Some(&task), "run", None, &AllowAll);
+    assert!(
+        matches!(&refused, Err(ExecutableError::NotReviewedForExecution { reason, .. }) if reason.contains("no operator review")),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .map(|_| ())
+            .unwrap_err()
+            .to_string()
+            .contains("lifecycle_import_executable")
+    );
+    assert_eq!(env.leftover_runs(), 0);
+    release_task_pins(&env.owner, &task);
+}
+
+/// A revision of the proposer: parent = the reviewed revision, `SKILL.md` text
+/// the only difference. Written the way `install_candidate` writes it.
+fn learned_child(env: &Env, parent: &RevisionId, list: Vec<BundleEntry>, generation: u64) -> RevisionId {
+    let mut new = NewRevision::new(env.skill.clone(), SourceKind::Learned);
+    new.parent_revision_id = Some(parent.clone());
+    new.capability_requirements = vec!["filesystem:native:shell".to_string()];
+    let written = env
+        .store
+        .write_revision(&new, &Bundle::from_entries(list).expect("test: child bundle"))
+        .expect("test: write child");
+    env.store
+        .publish(&crate::skills::lifecycle::PublishRequest {
+            transaction_id: crate::skills::lifecycle::TransactionId::generate(),
+            skill_id: env.skill.clone(),
+            candidate: written.revision.revision_id.clone(),
+            candidate_record_digest: written.record_digest,
+            expected_generation: generation,
+            enabled: true,
+        })
+        .expect("test: publish child");
+    written.revision.revision_id
+}
+
+#[test]
+fn a_skill_md_only_revision_of_a_reviewed_executable_executes_and_nothing_else_does() {
+    let env = env("lineage");
+    let reviewed = env.publish(&bundle(b"#!/bin/sh\necho A\n"), 0);
+    let with_body = |body: &str, script: &[u8], executable: bool, extra: bool| {
+        let mut list = entries(script, executable, RUN_TOOL);
+        list[0] = entry("SKILL.md", skill_md().replace("Run the report", body).as_bytes());
+        if extra {
+            list.push(entry("references/new.md", b"new"));
+        }
+        list
+    };
+    let child = learned_child(
+        &env,
+        &reviewed,
+        with_body("Run the report twice", b"#!/bin/sh\necho A\n", true, false),
+        1,
+    );
+    let task = unique("task");
+    let prepared = env
+        .prepare(Some(&task), "run", None, &AllowAll)
+        .expect("test: a SKILL.md-only revision is reviewed through its parent")
+        .expect("test: managed");
+    assert_eq!(prepared.pin.revision_id, child);
+    assert!(staged_script(&prepared).contains("echo A"));
+    prepared.finish().expect("test: finish");
+    release_task_pins(&env.owner, &task);
+
+    // Written around the capability check, a revision that changes a script,
+    // a mode or adds a file is not covered by the parent's review.
+    for (generation, (what, list)) in [
+        ("script bytes", with_body("x1", b"#!/bin/sh\necho EVIL\n", true, false)),
+        ("a reference", with_body("x2", b"#!/bin/sh\necho A\n", true, true)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        learned_child(&env, &child, list, 2 + u64::try_from(generation).expect("test: index"));
+        let task = unique("task");
+        let refused = env.prepare(Some(&task), "run", None, &AllowAll);
+        assert!(
+            matches!(refused, Err(ExecutableError::NotReviewedForExecution { .. })),
+            "{what}: {refused:?}"
+        );
+        release_task_pins(&env.owner, &task);
+    }
+}
+
+#[test]
+fn a_rollback_to_an_unreviewed_executable_revision_is_refused_at_execute() {
+    let env = env("rollback");
+    let unreviewed = env.publish_unreviewed(&bundle(b"#!/bin/sh\necho OLD\n"), 0);
+    env.publish(&bundle(b"#!/bin/sh\necho NEW\n"), 1);
+    let task = unique("task");
+    env.prepare(Some(&task), "run", None, &AllowAll)
+        .expect("test: the reviewed revision runs")
+        .expect("test: managed")
+        .finish()
+        .expect("test: finish");
+    release_task_pins(&env.owner, &task);
+
+    env.store
+        .rollback(&crate::skills::lifecycle::RollbackRequest {
+            transaction_id: crate::skills::lifecycle::TransactionId::generate(),
+            skill_id: env.skill.clone(),
+            target: unreviewed,
+            expected_generation: 2,
+        })
+        .expect("test: rollback");
+    let after = unique("task");
+    let refused = env.prepare(Some(&after), "run", None, &AllowAll);
+    assert!(
+        matches!(refused, Err(ExecutableError::NotReviewedForExecution { .. })),
+        "{refused:?}"
+    );
+    release_task_pins(&env.owner, &after);
+    assert_eq!(env.leftover_runs(), 0);
+}
+
+#[test]
+fn the_review_lineage_walk_is_bounded() {
+    let env = env("deep");
+    let mut parent = env.publish_unreviewed(&bundle(b"#!/bin/sh\necho 0\n"), 0);
+    for n in 1..=66_u64 {
+        let mut list = entries(b"#!/bin/sh\necho 0\n", true, RUN_TOOL);
+        list[0] = entry(
+            "SKILL.md",
+            skill_md().replace("Run the report", &format!("body {n}")).as_bytes(),
+        );
+        parent = learned_child(&env, &parent, list, n);
+    }
+    let task = unique("task");
+    let refused = env.prepare(Some(&task), "run", None, &AllowAll);
+    assert!(
+        matches!(&refused, Err(ExecutableError::NotReviewedForExecution { reason, .. }) if reason.contains("longer than") || reason.contains("no operator review")),
+        "{refused:?}"
+    );
+    release_task_pins(&env.owner, &task);
+}
+
+#[test]
+fn an_over_open_run_root_is_refused_with_the_fix_named() {
+    let env = env("open-root");
+    env.publish(&bundle(b"#!/bin/sh\necho A\n"), 0);
+    fs::create_dir_all(env.run_root()).expect("test: dir");
+    fs::set_permissions(env.run_root(), fs::Permissions::from_mode(0o755)).expect("test: chmod");
+    let refused = env.prepare(None, "run", None, &AllowAll);
+    let text = refused
+        .map(|_| ())
+        .expect_err("an over-open run root must be refused")
+        .to_string();
+    assert!(text.contains("chmod 700"), "{text}");
+    fs::set_permissions(env.run_root(), fs::Permissions::from_mode(0o700)).expect("test: chmod");
+    assert!(env.prepare(None, "run", None, &AllowAll).is_ok());
 }

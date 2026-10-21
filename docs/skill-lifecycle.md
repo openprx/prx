@@ -232,16 +232,35 @@ SL11 adds reviewed executable revisions: a bundle with scripts or declared
   generation is a next-phase package and is not shipped.
 - **Execution.** `skill_execute` for a managed skill resolves the tool from the
   revision the task is pinned to (the pin `skill_read` uses), so a task that
-  used revision A runs A after B is published. The whole bundle is verified,
-  staged into a private run directory with its exact modes and verified again
-  before anything runs; a tampered or missing file fails the call. Arguments
-  must be names the pinned manifest declares, scalar and bounded. The policy
-  must grant the tool of the kind (`shell` or `http_request`) and every
-  capability the revision requires; a manifest cannot grant access. The call
-  uses the existing shell/HTTP adapters under a five-minute deadline, the
-  process group is ended when the call exits, times out or is cancelled, and the
-  run directory is removed. Limit: a script that deliberately starts a process in
-  a new session escapes the group.
+  used revision A runs A after B is published. Only reviewed bytes execute: the
+  revision must be an operator import that recorded the review of its own bundle
+  hash, or descend (bounded walk, at most 64 parents) from one while differing
+  from it in `SKILL.md` only, with every other file and mode byte-identical. A
+  store migrated before SL11, a rollback to an unreviewed revision and any
+  hand-written candidate are refused with an instruction to re-import the
+  directory through `lifecycle_import_executable`. The whole bundle is verified,
+  staged into a private run directory with its exact modes, verified again, and
+  the files the tool runs are hashed once more immediately before the process
+  spawns; a tampered or missing file fails the call. Arguments must be names the
+  pinned manifest declares, scalar and bounded. The policy must grant the tool of
+  the kind (`shell` or `http_request`) and every capability the revision
+  requires; those required capability tools are checked for "not denied"
+  (a tool that is `Ask` under supervision passes), and only the `skill_execute`
+  call itself is approved at the orchestration boundary. A manifest cannot grant
+  access. A managed skill never falls back to the unpinned legacy path: a call
+  with no trusted owner, or from another owner, is refused when the skill is
+  managed in the configured owner's store.
+- **Environment.** A managed script does not inherit the PRX environment. On the
+  native runtime the process starts with an empty environment plus `PATH`, `LANG`,
+  `LC_*` and `TZ` from the parent, `HOME` set to its run directory, `TMPDIR`
+  inside it, and the `PRX_SKILL_ARG_*` values of the call, so no provider key,
+  token or credential reaches it. Unmanaged shell callers are unchanged.
+- **Process containment.** The call uses the existing shell/HTTP adapters under a
+  five-minute deadline; the process group is ended when the leader exits, times
+  out or is cancelled, and the run directory is removed. Limit: a script that
+  deliberately starts a process in a new session (`setsid`) escapes the group.
+  Today the containment for that case is the docker `RuntimeAdapter`; a cgroup v2
+  `cgroup.kill` based teardown is next-phase backlog.
 - **Evaluation.** Executable revisions use the same frozen-suite evaluator.
   Trials can only be offered read tools and workspace file writes, so scripts,
   mail, payments and other external effects are never run in a trial.

@@ -996,6 +996,8 @@ impl Tool for SkillsManageTool {
     }
 }
 
+mod execute_managed;
+
 pub struct SkillExecuteTool {
     workspace_dir: PathBuf,
     config: Config,
@@ -1004,32 +1006,6 @@ pub struct SkillExecuteTool {
     security: Arc<SecurityPolicy>,
     runtime_name: String,
     managed_timeout: Duration,
-}
-
-/// What the operator's policy grants a managed skill call: the tools the run
-/// excludes are not granted, and a tool the security policy denies this
-/// caller is not granted. A manifest contributes nothing to it, so a skill
-/// cannot grant its own access.
-struct PolicyGrant {
-    security: Arc<SecurityPolicy>,
-    excluded: Vec<String>,
-    sender: String,
-    channel: String,
-    chat_type: String,
-}
-
-impl crate::skills::lifecycle::ToolGrant for PolicyGrant {
-    fn permits(&self, tool: &str) -> Result<(), String> {
-        if self.excluded.iter().any(|excluded| excluded == tool) {
-            return Err("it is excluded from this run's tool surface".to_string());
-        }
-        match self.security.decide(tool, &self.sender, &self.channel, &self.chat_type) {
-            crate::security::policy::ToolDecision::Deny => {
-                Err("the security policy denies it for this caller".to_string())
-            }
-            crate::security::policy::ToolDecision::Allow | crate::security::policy::ToolDecision::Ask => Ok(()),
-        }
-    }
 }
 
 impl SkillExecuteTool {
@@ -1285,142 +1261,6 @@ impl SkillExecuteTool {
                 error: Some(format!("Skill tool timed out after {limit:?} and was killed")),
             }),
             Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Runs a declared tool of a lifecycle-managed skill from the revision the
-    /// task is pinned to. `Ok(None)` means the skill is not managed for the
-    /// caller and the legacy path applies.
-    ///
-    /// The whole pinned bundle is verified and staged in a private run
-    /// directory before anything runs, the policy must grant the tool's kind and
-    /// every capability the revision declares, and the call goes through the
-    /// same shell/HTTP adapters, under a deadline. The process tree is killed and
-    /// reaped by the adapter on completion, timeout and cancellation; the run
-    /// directory is removed afterwards (or when the call is dropped).
-    async fn execute_managed(
-        &self,
-        skill_name: &str,
-        tool_name: &str,
-        args: &serde_json::Value,
-        cancellation: Option<CancellationToken>,
-    ) -> anyhow::Result<Option<ToolResult>> {
-        use crate::skills::lifecycle;
-        let Some(owner_id) = super::sessions_read_model::effective_run_owner(args) else {
-            return Ok(None);
-        };
-        let owner = match lifecycle::OwnerScope::new(&owner_id) {
-            Ok(owner) => owner,
-            Err(error) => {
-                tracing::warn!(%error, "skill_execute owner id is not a valid lifecycle owner scope; using the legacy path");
-                return Ok(None);
-            }
-        };
-        let task_id = lifecycle::task_key(
-            trusted_scope_field(args, &["task_id"]).as_deref(),
-            trusted_scope_field(args, &["run_id"]).as_deref(),
-            trusted_scope_field(args, &["parent_run_id"]).as_deref(),
-        );
-        let caller = |key: &str| trusted_scope_field(args, &[key]).unwrap_or_else(|| "unknown".to_string());
-        let grant = PolicyGrant {
-            security: Arc::clone(&self.security),
-            excluded: self.config.tool_tiering.always_exclude.clone(),
-            sender: caller("sender"),
-            channel: caller("channel"),
-            chat_type: caller("chat_type"),
-        };
-        let workspace = self.workspace_dir.clone();
-        let (skill, tool) = (skill_name.to_string(), tool_name.to_string());
-        let call_arguments = args.get("arguments").cloned();
-        let (prepared, grant) = tokio::task::spawn_blocking(move || {
-            let prepared = lifecycle::prepare_execution(&lifecycle::PrepareRequest {
-                workspace_dir: &workspace,
-                owner: &owner,
-                skill_name: &skill,
-                tool_name: &tool,
-                task_id: task_id.as_deref(),
-                arguments: call_arguments.as_ref(),
-                grant: &grant,
-            });
-            (prepared, grant)
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("managed skill preparation failed: {error}"))?;
-        let prepared = prepared
-            .map_err(|error| anyhow::anyhow!("Managed skill '{skill_name}' tool '{tool_name}' was refused: {error}"))?;
-        let Some(prepared) = prepared else {
-            return Ok(None);
-        };
-
-        // The identity of this run covers the complete bundle, the tool and
-        // its argument schema, and the settings, environment and policy it runs
-        // under. It names the run in the side-effect audit record.
-        let policy = format!(
-            "autonomy={:?};caller={}/{}/{};direct_tool={:?};excluded={}",
-            self.security.autonomy,
-            grant.sender,
-            grant.channel,
-            grant.chat_type,
-            self.security.decide(
-                lifecycle::equivalent_direct_tool(&prepared.tool.kind),
-                &grant.sender,
-                &grant.channel,
-                &grant.chat_type
-            ),
-            grant.excluded.join(",")
-        );
-        let identity = lifecycle::ExecutionIdentity {
-            revision_id: &prepared.pin.revision_id,
-            tool: &prepared.tool,
-            files: &prepared.files,
-            settings: &format!("timeout_ms={}", self.managed_timeout.as_millis()),
-            environment: &format!(
-                "runtime={};workspace={}",
-                self.runtime_name,
-                self.workspace_dir.display()
-            ),
-            policy: &policy,
-        }
-        .digest();
-        let operation = format!(
-            "skill_execute:run:{}:{}:{}",
-            prepared.pin.skill_id,
-            prepared.tool.name,
-            identity.get(..16).unwrap_or(&identity)
-        );
-        // Approval was taken once, by the orchestration boundary, for the
-        // `skill_execute` call itself. The gate here refuses a read-only
-        // installation and writes the audit record bound to the run identity.
-        SideEffectGate::new(self.security.as_ref())
-            .authorize_resource_operation(self.name(), &operation, ResourceRiskLevel::Low, None)
-            .map_err(|error| anyhow::anyhow!("Managed skill '{skill_name}' tool '{tool_name}' was refused: {error}"))?;
-
-        let root = prepared
-            .root()
-            .map_or_else(|| self.workspace_dir.clone(), Path::to_path_buf);
-        let outcome = self
-            .execute_resolved(
-                &root,
-                &prepared.tool,
-                prepared.arguments.clone(),
-                cancellation,
-                Some(self.managed_timeout),
-            )
-            .await;
-        // The adapter has killed and reaped the process tree and joined its
-        // output readers by now, whichever way the call ended.
-        let cleanup = prepared.finish();
-        match (outcome, cleanup) {
-            (Ok(result), Ok(())) => Ok(Some(result)),
-            (Ok(_), Err(error)) => Err(anyhow::anyhow!(
-                "Managed skill '{skill_name}' tool '{tool_name}' ran but left its run directory: {error}"
-            )),
-            (Err(error), cleanup) => {
-                if let Err(cleanup_error) = cleanup {
-                    tracing::warn!(%cleanup_error, "failed to remove a skill run directory after a failed call");
-                }
-                Err(error)
-            }
         }
     }
 

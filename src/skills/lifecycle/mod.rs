@@ -61,8 +61,8 @@ use agent_executor::read_usage_for_test as agent_executor_read_usage_for_test;
 pub use agent_executor::{AccountingOwner, AgentCaseExecutor};
 pub use authorize::{Finalization, ForceClose, MAX_PUBLICATION_ATTEMPTS, PublicationOutcome};
 pub use binding::{
-    MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedReadRequest, ManagedSkillRead, ORPHAN_PIN_AGE, read_managed_resource,
-    release_task_pins, task_pin,
+    MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedReadRequest, ManagedSkillRead, ORPHAN_PIN_AGE, is_managed_skill,
+    read_managed_resource, release_task_pins, task_pin,
 };
 pub use bundle::{
     BUNDLE_FORMAT_VERSION, Bundle, BundleEntry, BundleError, BundleFile, MAX_BUNDLE_COMPONENT_BYTES, MAX_BUNDLE_DEPTH,

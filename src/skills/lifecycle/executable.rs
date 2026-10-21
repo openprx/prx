@@ -24,8 +24,8 @@
 use super::binding::{ResolvedRevision, resolve_revision};
 use super::bundle::{Bundle, normalize_relative_path};
 use super::manifest::validate_manifest_strict;
-use super::store::{ensure_real_dir, write_private_file};
-use super::types::{LifecycleError, OwnerScope, PinnedSkillRevision, RevisionId};
+use super::store::{SkillLifecycleStore, VerifiedRevision, ensure_real_dir, write_private_file};
+use super::types::{LifecycleError, OwnerScope, PinnedSkillRevision, RevisionId, SourceKind};
 use crate::skills::SkillTool;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,6 +46,10 @@ const RUN_DIR_PREFIX: &str = "run-";
 const STALE_RUN_AGE: Duration = Duration::from_hours(6);
 const MAX_RUN_SCAN: usize = 256;
 const MAX_TOOLS: usize = 32;
+/// Longest parent chain walked to find the reviewed revision of an executable.
+const MAX_REVIEW_LINEAGE: usize = 64;
+const REVIEW_RECEIPT_PREFIX: &str = "executable-review-";
+const SKILL_MD: &str = "SKILL.md";
 const MAX_TOOL_NAME_BYTES: usize = 64;
 const MAX_COMMAND_BYTES: usize = 4096;
 const MAX_ARGS: usize = 32;
@@ -77,6 +81,11 @@ pub enum ExecutableError {
     UntrustedOrigin,
     #[error("the bundle hashes to {found}, not to the revision {reviewed} the operator reviewed")]
     NotReviewed { reviewed: String, found: String },
+    #[error(
+        "revision {revision} was not reviewed for execution: {reason}; the operator re-imports the reviewed \
+         directory with lifecycle_import_executable"
+    )]
+    NotReviewedForExecution { revision: String, reason: String },
     #[error("invalid arguments: {0}")]
     InvalidArguments(String),
     #[error("tool {tool:?} is not granted: {reason}")]
@@ -109,6 +118,11 @@ pub struct FileDigest {
 pub struct ExecutableReview {
     pub tools: Vec<String>,
     pub executables: Vec<FileDigest>,
+}
+
+/// The receipt id an operator import records for the bundle `revision`.
+pub(super) fn review_receipt_id(revision: &RevisionId) -> String {
+    format!("{REVIEW_RECEIPT_PREFIX}{}", revision.digest_hex())
 }
 
 /// Whether the tool kind is run by `skill_execute`.
@@ -453,12 +467,86 @@ impl PreparedExecution {
         self.run.as_ref().map(|run| run.path.as_path())
     }
 
+    /// Re-reads the files the tool runs from the staged copy and compares
+    /// them with the digests of the verified bundle. Called immediately before
+    /// the process is spawned, so the read-back done at staging is not the last
+    /// check.
+    pub fn verify_before_spawn(&self) -> Result<(), ExecutableError> {
+        let Some(root) = self.root() else {
+            return Ok(());
+        };
+        for file in &self.files {
+            let target = root.join(&file.path);
+            let bytes = fs::read(&target).map_err(|e| stage_error(&target, e))?;
+            if sha256_hex(&bytes) != file.sha256 {
+                return Err(ExecutableError::StagedFileDiffers {
+                    path: file.path.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Ends the run: removes the run directory. Call it after the process
     /// tree was killed and reaped; a failure is an error, not a warning,
     /// because nothing may outlive the call.
     pub fn finish(mut self) -> Result<(), ExecutableError> {
         self.run.as_mut().map_or(Ok(()), RunDir::remove)
     }
+}
+
+/// Only reviewed bytes execute. A revision runs when it is an operator
+/// import that recorded the review of exactly its own bundle hash, or when a
+/// chain of parents (bounded) leads to one and the revision differs from it in
+/// `SKILL.md` only: every other file and every mode is byte-identical to the
+/// reviewed revision. A store migrated before SL11, a rollback to an
+/// unreviewed revision and any hand-written candidate end here.
+fn require_review_lineage(store: &SkillLifecycleStore, current: &VerifiedRevision) -> Result<(), ExecutableError> {
+    let refuse = |reason: String| ExecutableError::NotReviewedForExecution {
+        revision: current.revision.revision_id.to_string(),
+        reason,
+    };
+    let reviewed = |revision: &VerifiedRevision| {
+        revision.revision.source_kind == SourceKind::Operator
+            && revision
+                .revision
+                .review_receipt_ids
+                .contains(&review_receipt_id(&revision.revision.revision_id))
+    };
+    let mut cursor = current.clone();
+    for _ in 0..=MAX_REVIEW_LINEAGE {
+        if reviewed(&cursor) {
+            return carried_from_review(&cursor, current).map_err(refuse);
+        }
+        let Some(parent) = cursor.revision.parent_revision_id.clone() else {
+            return Err(refuse(
+                "no operator review is recorded for it or any ancestor".to_string(),
+            ));
+        };
+        cursor = store.read_revision(&current.revision.skill_id, &parent, None)?;
+    }
+    Err(refuse(format!(
+        "its ancestry is longer than {MAX_REVIEW_LINEAGE} revisions"
+    )))
+}
+
+fn carried_from_review(anchor: &VerifiedRevision, current: &VerifiedRevision) -> Result<(), String> {
+    if anchor.revision.revision_id == current.revision.revision_id {
+        return Ok(());
+    }
+    let (reviewed, now) = (&anchor.bundle, &current.bundle);
+    for file in reviewed.files() {
+        let same = now.file(file.path()).is_some_and(|next| {
+            next.is_executable() == file.is_executable() && (file.path() == SKILL_MD || next.bytes() == file.bytes())
+        });
+        if !same {
+            return Err(format!("{} differs from the reviewed revision", file.path()));
+        }
+    }
+    if let Some(extra) = now.files().iter().find(|file| reviewed.file(file.path()).is_none()) {
+        return Err(format!("{} is not part of the reviewed revision", extra.path()));
+    }
+    Ok(())
 }
 
 /// One `skill_execute` call to resolve.
@@ -499,6 +587,8 @@ pub fn prepare_execution(request: &PrepareRequest<'_>) -> Result<Option<Prepared
     else {
         return Ok(None);
     };
+    review_executable_bundle(&verified.bundle)?;
+    require_review_lineage(&store, &verified)?;
     let tools = declared_tools(&verified.bundle)?;
     let tool = tools
         .into_iter()
@@ -580,7 +670,17 @@ fn stage_error(path: &Path, error: impl std::fmt::Display) -> ExecutableError {
 /// Writes the complete bundle into a fresh private directory, then reads every
 /// file back and compares bytes and execute bit with the verified bundle.
 fn stage_bundle(run_root: &Path, bundle: &Bundle) -> Result<RunDir, ExecutableError> {
-    ensure_real_dir(run_root, true)?;
+    // The run root is created owner-only by this module. One that is wider
+    // (made by hand, or by something else) is refused rather than trusted, and
+    // the error names the fix.
+    ensure_real_dir(run_root, true).map_err(|error| match error {
+        LifecycleError::PermissionsTooOpen { path, mode } => ExecutableError::Stage(format!(
+            "{} has mode {mode:o}; it holds executable run directories and must be owner-only: run `chmod 700 {}` or remove it",
+            path.display(),
+            path.display()
+        )),
+        other => ExecutableError::from(other),
+    })?;
     reap_stale_runs(run_root);
     let path = run_root.join(format!("{RUN_DIR_PREFIX}{}", uuid::Uuid::new_v4().simple()));
     create_run_dir(&path).map_err(|e| stage_error(&path, e))?;

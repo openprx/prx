@@ -1,8 +1,10 @@
 //! Publication of an operator-authored executable bundle (SL11).
 //!
-//! The only way a revision with scripts or executable tools enters the store,
-//! besides the legacy migration of a directory the operator reviewed (which
-//! uses this same function). The caller names the complete bundle hash the
+//! The only way a revision with scripts or executable tools enters the store.
+//! Migration only plans a legacy executable directory
+//! (`ExecutableNeedsReview`); the operator publishes it through this function
+//! like any other reviewed directory, and execution refuses a revision whose
+//! lineage has no such review. The caller names the complete bundle hash the
 //! operator reviewed; the directory must hash to exactly that, pass
 //! [`review_executable_bundle`], and the revision is written with `Operator`
 //! provenance and published through the ordinary generation-checked
@@ -10,7 +12,7 @@
 //! the compatibility projection behave as for any other revision.
 
 use super::bundle::Bundle;
-use super::executable::{ExecutableError, review_executable_bundle};
+use super::executable::{ExecutableError, review_executable_bundle, review_receipt_id};
 use super::manifest::validate_manifest_strict;
 use super::publish::PublishRequest;
 use super::store::SkillLifecycleStore;
@@ -69,7 +71,7 @@ impl SkillLifecycleStore {
         };
         let mut new = NewRevision::new(skill_id.clone(), SourceKind::Operator);
         new.parent_revision_id.clone_from(&parent);
-        new.review_receipt_ids = vec![format!("executable-review-{}", bundle.revision_id().digest_hex())];
+        new.review_receipt_ids = vec![review_receipt_id(bundle.revision_id())];
         let written = self.write_revision(&new, &bundle)?;
         let outcome = self.publish(&PublishRequest {
             transaction_id: TransactionId::generate(),

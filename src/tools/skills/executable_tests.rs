@@ -70,10 +70,9 @@ fn managed(tag: &str) -> Managed {
 
 impl Managed {
     fn publish(&self, bundle: &Bundle, generation: u64) {
-        crate::skills::lifecycle::test_support::publish_revision(
+        crate::skills::lifecycle::test_support::publish_reviewed_executable(
             &self.store,
             &self.skill,
-            SourceKind::Operator,
             bundle,
             generation,
         );
@@ -108,6 +107,7 @@ impl Managed {
     fn config(&self) -> Config {
         let mut config = Config::default();
         config.workspace_dir = self.tmp.path().to_path_buf();
+        config.skills_lifecycle.owner_scope = Some(self.owner.clone());
         config.skills.open_skills_dir = Some(self.tmp.path().join("missing-open").to_string_lossy().to_string());
         config.skills.openclaw_skills_dir = Some(self.tmp.path().join("missing-claw").to_string_lossy().to_string());
         config
@@ -377,7 +377,7 @@ async fn a_long_running_script_is_killed_and_reaped_on_timeout() {
     let marks = m.marks();
     m.publish(&bundle(SPAWNING_SCRIPT), 0);
     let task = unique("task");
-    let tool = m.tool().with_managed_timeout(Duration::from_millis(800));
+    let tool = m.tool().with_managed_timeout(Duration::from_secs(3));
     let started = std::time::Instant::now();
     let result = tool
         .execute(m.call(&task, "run", &json!({"marks": marks.to_string_lossy()})))
@@ -685,4 +685,100 @@ fn the_runtime_mints_the_import_operation_the_tool_checks() {
         )
         .is_none()
     );
+}
+
+// ---- environment, fallback, review ---------------------------------------------------------------
+
+#[tokio::test]
+async fn a_managed_script_does_not_inherit_the_prx_environment() {
+    let m = managed("env");
+    m.publish(&bundle("#!/bin/sh\nenv\n"), 0);
+    let task = unique("task");
+    let result = m
+        .tool()
+        .execute(m.call(&task, "run", &json!({"message": "hi"})))
+        .await
+        .expect("test: execute");
+    assert!(result.success, "{:?}", result.error);
+    for line in result.output.lines() {
+        let key = line.split('=').next().unwrap_or_default();
+        assert!(
+            matches!(
+                key,
+                "PATH" | "LANG" | "TZ" | "HOME" | "TMPDIR" | "PWD" | "OLDPWD" | "SHLVL" | "_"
+            ) || key.starts_with("LC_")
+                || key.starts_with("PRX_SKILL_ARG_"),
+            "the script sees {key}"
+        );
+    }
+    // Every other variable of the test process stays behind.
+    let foreign: Vec<String> = std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .filter(|key| {
+            !(matches!(
+                key.as_str(),
+                "PATH" | "LANG" | "TZ" | "HOME" | "TMPDIR" | "PWD" | "OLDPWD" | "SHLVL" | "_"
+            ) || key.starts_with("LC_"))
+        })
+        .collect();
+    assert!(!foreign.is_empty(), "the test process has variables to leak");
+    for key in &foreign {
+        assert!(!result.output.contains(&format!("{key}=")), "{key} leaked");
+    }
+    assert!(result.output.contains("PRX_SKILL_ARG_MESSAGE=hi"), "{}", result.output);
+    assert!(
+        result.output.contains("HOME=") && result.output.contains(".tmp"),
+        "{}",
+        result.output
+    );
+    m.release(&[&task]);
+}
+
+#[tokio::test]
+async fn a_managed_skill_never_falls_back_to_the_unpinned_legacy_path() {
+    let m = managed("fallback");
+    let marks = m.marks();
+    m.publish(&bundle("#!/bin/sh\necho ran >> \"$PRX_SKILL_ARG_MARKS/ran\"\n"), 0);
+    let args = json!({"marks": marks.to_string_lossy()});
+    // No trusted scope at all: the call has no owner to pin for.
+    let untrusted = m
+        .tool()
+        .execute(json!({"skill": NAME, "tool": "run", "arguments": args}))
+        .await;
+    assert!(untrusted.is_err(), "{untrusted:?}");
+    // A trusted caller of another owner.
+    let mut other = m.call(&unique("task"), "run", &args);
+    other["_zc_scope"]["owner_id"] = json!("owner:ws:cli:someone-else");
+    let foreign = m.tool().execute(other).await;
+    assert!(foreign.is_err(), "{foreign:?}");
+    assert!(
+        foreign
+            .map(|_| ())
+            .unwrap_err()
+            .to_string()
+            .contains("trusted owner scope"),
+    );
+    assert!(!marks.join("ran").exists(), "the projection was never run unpinned");
+}
+
+#[tokio::test]
+async fn an_unreviewed_executable_revision_is_refused_by_the_tool() {
+    let m = managed("unreviewed");
+    let marks = m.marks();
+    crate::skills::lifecycle::test_support::publish_revision(
+        &m.store,
+        &m.skill,
+        SourceKind::Operator,
+        &bundle("#!/bin/sh\necho ran >> \"$PRX_SKILL_ARG_MARKS/ran\"\n"),
+        0,
+    );
+    let task = unique("task");
+    let refused = m
+        .tool()
+        .execute(m.call(&task, "run", &json!({"marks": marks.to_string_lossy()})))
+        .await
+        .expect_err("a revision no operator reviewed must not execute");
+    assert!(refused.to_string().contains("lifecycle_import_executable"), "{refused}");
+    assert!(!marks.join("ran").exists());
+    m.release(&[&task]);
 }
