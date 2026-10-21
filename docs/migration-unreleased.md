@@ -99,9 +99,11 @@ enabled = false
 - Recursive delegation stays disabled unless explicitly permitted in operator
   configuration and requested by the caller. Existing configurations do not
   gain recursive authority. See [recursive child grants](tools.md#recursive-child-grants).
-- Dependency policy retains a dated `RUSTSEC-2026-0381` exception only for the
+- Dependency policy retains the dated `RUSTSEC-2026-0381` exception for the
   `webpki-roots` 0.26.11 bridge to patched 1.0.10 roots, reviewed by 2026-11-21
-  or when upstream removes the bridge. This is not a clean raw advisory scan;
+  or when upstream removes the bridge. The older `RUSTSEC-2025-0141` exception
+  remains in both `deny.toml` and `.cargo/audit.toml`; the latter also retains
+  `RUSTSEC-2024-0388`. This is not a clean raw advisory scan;
   see [the dependency exception](security.md#dependency-advisory-exception).
 - Source-layout changes (`agent::loop_` removal, memory backend and chat module
   splits): no stored-data or configuration conversion. See

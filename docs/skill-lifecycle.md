@@ -97,7 +97,9 @@ it is not a command to generate or import evaluation cases.
 The fixed `storage_dir`, mandatory holdout, `min_cases_floor` range 3–128,
 evaluation concurrency range 1–8, proposals-per-cycle range 1–32, edit-token
 range 1–100,000 and finite edit fraction greater than zero and at most one are
-validated at load. These limits are policy settings, not a running scheduler.
+validated at load. Raising `max_edit_tokens` or `max_edit_fraction` does not
+loosen the proposer's fixed 300-token / 20% cap. These limits are policy
+settings, not a running scheduler.
 
 ## Operator commands and agent actions
 
