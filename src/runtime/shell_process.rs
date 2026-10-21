@@ -113,6 +113,27 @@ impl ShellProcessAdapter {
     }
 
     pub async fn execute(&self, request: ShellProcessRequest<'_>) -> Result<ShellProcessOutcome, ShellProcessError> {
+        self.execute_with(request, false).await
+    }
+
+    /// Like [`Self::execute`], and additionally ends the whole process group
+    /// the moment the command's leader exits, so nothing the command started
+    /// outlives the call (and a child holding the output pipes open cannot keep
+    /// the call waiting). Cancellation and timeout already tear the group down
+    /// in both forms. Used where a run must be fully joined, such as a
+    /// lifecycle-managed skill tool.
+    pub async fn execute_joined(
+        &self,
+        request: ShellProcessRequest<'_>,
+    ) -> Result<ShellProcessOutcome, ShellProcessError> {
+        self.execute_with(request, true).await
+    }
+
+    async fn execute_with(
+        &self,
+        request: ShellProcessRequest<'_>,
+        end_group_on_exit: bool,
+    ) -> Result<ShellProcessOutcome, ShellProcessError> {
         if request.git == ShellGitPolicy::RefuseGit
             && crate::security::git_launch::shell_command_runs_git(request.command)
         {
@@ -191,6 +212,11 @@ impl ShellProcessAdapter {
             }
             status = process.wait() => status.map_err(ShellProcessError::Wait)?,
         };
+        if end_group_on_exit {
+            // The leader was reaped by `wait`; the signal reaches whatever it
+            // left running in its group.
+            process.kill_process_tree();
+        }
 
         enum DrainResult {
             Complete(Result<io::Result<(CapturedOutput, CapturedOutput)>, tokio::task::JoinError>),

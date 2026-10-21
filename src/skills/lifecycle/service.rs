@@ -23,8 +23,10 @@
 use super::authorize::{Finalization, ForceClose, PublicationOutcome};
 use super::evaluate::{CaseExecutor, EvaluationError};
 use super::evaluator::{EvaluationRequest, RecordedEvaluation};
+use super::executable::ExecutableError;
 use super::gate::{GateError, GateOutcome, GatePolicy, GateRequest};
 use super::gate_judge::GateJudge;
+use super::operator_import::ExecutableImport;
 use super::proposal::{ProposalStatus, SkillProposal, bounded};
 use super::publish::{RecoveryReport, RollbackRequest, TransactionOutcome};
 use super::store::SkillLifecycleStore;
@@ -34,6 +36,7 @@ use super::{EvaluationPin, SourceReviewOutcome, SourceReviewRecord, TransactionI
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -238,6 +241,8 @@ pub enum ServiceError {
     Gate(GateError),
     #[error(transparent)]
     Evaluation(EvaluationError),
+    #[error(transparent)]
+    Executable(ExecutableError),
     #[error("lifecycle worker failed: {0}")]
     Worker(String),
 }
@@ -269,6 +274,15 @@ impl From<GateError> for ServiceError {
             GateError::Lifecycle(inner) => inner.into(),
             GateError::Evaluation(inner) => inner.into(),
             other => Self::Gate(other),
+        }
+    }
+}
+
+impl From<ExecutableError> for ServiceError {
+    fn from(error: ExecutableError) -> Self {
+        match error {
+            ExecutableError::Lifecycle(inner) => inner.into(),
+            other => Self::Executable(other),
         }
     }
 }
@@ -852,6 +866,19 @@ impl SkillsLifecycleService {
             target: target.clone(),
             expected_generation,
         })?)
+    }
+
+    /// Publishes an operator-authored executable bundle the operator reviewed
+    /// (SL11): `source` is a real directory, `reviewed` the complete bundle hash
+    /// the operator approved. It never goes through a proposal; the proposer
+    /// cannot produce an executable revision. Same gate as publication: `Auto`
+    /// mode under a valid publication policy, and the tool boundary asks for a
+    /// signed one-shot grant bound to `reviewed` before it calls this.
+    ///
+    /// Blocking: file I/O and locks.
+    pub fn import_executable(&self, source: &Path, reviewed: &RevisionId) -> Result<ExecutableImport, ServiceError> {
+        self.require_publication("publishing a reviewed executable revision")?;
+        Ok(self.store.import_reviewed_executable(source, reviewed)?)
     }
 
     /// Operator repair: closes a `PublicationAuthorized` proposal whose

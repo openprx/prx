@@ -71,7 +71,9 @@ pub enum SkillsLifecycleConfigError {
     HoldoutRequired,
     #[error("skills_lifecycle.min_cases_floor = {0} is refused: it must be 3..=128")]
     CasesFloorOutOfRange(u32),
-    #[error("skills_lifecycle.allow_executable_proposals = true is refused: executable bundles are not supported yet")]
+    #[error(
+        "skills_lifecycle.allow_executable_proposals = true is refused: the proposer never creates or edits scripts (script generation is a next-phase package); reviewed executable revisions enter only through an operator import"
+    )]
     ExecutableProposalsUnsupported,
     #[error("skills_lifecycle.{field} is out of range: {detail}")]
     LimitOutOfRange { field: &'static str, detail: String },
@@ -120,8 +122,11 @@ pub struct SkillsLifecycleConfig {
     /// Edit budget of a proposal as a fraction of the skill body, in (0, 1].
     #[serde(default = "default_max_edit_fraction")]
     pub max_edit_fraction: f64,
-    /// Allow proposals that touch executable files. `true` is refused until
-    /// reviewed executable bundles exist.
+    /// Allow proposals that touch executable files. `true` is refused: a
+    /// proposal changes `SKILL.md` text only, also for a skill that has
+    /// scripts. Reviewed executable revisions (SL11) come from an operator
+    /// import, never from the proposer; script generation is a next-phase
+    /// package.
     #[serde(default)]
     pub allow_executable_proposals: bool,
     /// The frozen suite per skill. Operator-owned: it is the only source of

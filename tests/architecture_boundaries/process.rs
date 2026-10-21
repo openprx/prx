@@ -452,7 +452,8 @@ fn shell_sites_refuse_or_harden_git() {
             .unwrap_or_else(|error| panic!("read {relative}: {error}"));
         function_body(&production_part(&source), function)
     };
-    let adapter = body("src/runtime/shell_process.rs", "execute");
+    // `execute` and `execute_joined` both run `execute_with`, the one body.
+    let adapter = body("src/runtime/shell_process.rs", "execute_with");
     for required in [
         "git_launch::shell_command_runs_git(request.command)",
         "ShellProcessError::GitRefused",
@@ -460,7 +461,7 @@ fn shell_sites_refuse_or_harden_git() {
     ] {
         assert!(
             adapter.contains(required),
-            "ShellProcessAdapter::execute must use {required}"
+            "ShellProcessAdapter::execute_with must use {required}"
         );
     }
     for (relative, function) in [

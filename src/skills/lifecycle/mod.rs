@@ -27,6 +27,7 @@ mod capture;
 mod consolidate;
 mod evaluate;
 mod evaluator;
+mod executable;
 mod facts;
 mod gate;
 mod gate_judge;
@@ -35,6 +36,7 @@ mod journal;
 mod knowledge;
 mod manifest;
 mod migrate;
+mod operator_import;
 mod projection;
 mod proposal;
 mod propose;
@@ -79,6 +81,11 @@ pub use evaluate::{
     RunReceipt, RunTerminal, ValidatorOutcome, VerifiedEvaluation,
 };
 pub use evaluator::{EvaluationRequest, RecordedEvaluation};
+pub use executable::{
+    ExecutableError, ExecutableReview, ExecutionIdentity, FileDigest, PrepareRequest, PreparedExecution, ToolGrant,
+    declared_tools, equivalent_direct_tool, is_executable_bundle, is_executable_kind, prepare_execution,
+    review_executable_bundle, validate_arguments,
+};
 pub use facts::{
     Adherence, Exclusion, FactState, MAX_ADHERENCE_NAMES, MAX_ADHERENCE_SKILLS, ObservedCallStatus, ObservedToolCall,
     ProviderEnd, SkillAdherence, TerminalFacts, TerminalObservations,
@@ -100,6 +107,7 @@ pub use knowledge::{
 };
 pub use manifest::{ManifestError, ManifestInfo, validate_manifest, validate_manifest_strict};
 pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationReport, apply_migration, plan_migration};
+pub use operator_import::ExecutableImport;
 pub use projection::ProjectionRepair;
 pub use proposal::{
     AppliedEdit, AttemptOutcome, AttemptRecord, AuthorBinding, BoundedDiff, BudgetRecord, DescriptionChange, EditOp,

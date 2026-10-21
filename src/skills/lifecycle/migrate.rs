@@ -5,11 +5,14 @@
 //! [`plan_migration`] is the dry run: it classifies every entry and changes
 //! nothing. [`apply_migration`] imports only the entries the plan marked
 //! [`MigrationAction::Import`], and only if the directory still hashes to the
-//! planned revision. Neither function writes into, renames or deletes anything
+//! planned revision. A directory with scripts or executable tools is planned
+//! as [`MigrationAction::ExecutableNeedsReview`] and is never imported here.
+//! Neither function writes into, renames or deletes anything
 //! below `skills/`: the legacy directory remains the compatibility projection,
 //! and applying a migration is separate from any later cleanup.
 
 use super::bundle::Bundle;
+use super::executable::is_executable_bundle;
 use super::journal::{TransactionId, TransactionState};
 use super::manifest::validate_manifest;
 use super::publish::PublishRequest;
@@ -29,6 +32,12 @@ const MAX_IMPORT_ATTEMPTS: u32 = 8;
 pub enum MigrationAction {
     /// Import this exact bundle and create generation 1 of the binding.
     Import { revision_id: RevisionId, enabled: bool },
+    /// The directory has scripts or executable tools. It is not imported by
+    /// [`apply_migration`]: an executable revision needs the operator's
+    /// artifact review of exactly this bundle hash, which is given through
+    /// `SkillsLifecycleService::import_executable` (SL11). Until then the skill
+    /// keeps its legacy behaviour.
+    ExecutableNeedsReview { revision_id: RevisionId, enabled: bool },
     /// A binding already points at a revision identical to the directory.
     AlreadyImported { revision_id: RevisionId },
     /// A binding exists but the directory no longer matches its revision. The
@@ -182,10 +191,14 @@ fn classify(
             bound: binding.revision_id,
             directory: revision_id,
         },
-        None => MigrationAction::Import {
-            revision_id,
-            enabled: !crate::skills::disabled_skill_marker(workspace_dir, directory).is_file(),
-        },
+        None => {
+            let enabled = !crate::skills::disabled_skill_marker(workspace_dir, directory).is_file();
+            if is_executable_bundle(&bundle) {
+                MigrationAction::ExecutableNeedsReview { revision_id, enabled }
+            } else {
+                MigrationAction::Import { revision_id, enabled }
+            }
+        }
     };
     Ok(MigrationEntry {
         directory: directory.to_string(),

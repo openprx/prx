@@ -5,10 +5,12 @@ revisions, task receipts, evidence-linked knowledge, bounded proposal staging,
 frozen-suite evaluation, publication gates, journaled promotion and rollback.
 It is disabled by default. Enabling it does not start automatic learning:
 proposal scheduling is not wired in this candidate, and there is no CLI
-`propose` command. Executable lifecycle bundles are not shipped yet (SL11);
-`allow_executable_proposals = true` is refused when configuration loads.
-Existing manifest shell/script/HTTP skills are a separate execution surface;
-see [skill catalog trust and execution](skills-catalog-security.md).
+`propose` command. Reviewed executable bundles ship as SL11 (see
+[Executable bundles](#executable-bundles)); the proposer never creates or edits
+a script, and `allow_executable_proposals = true` is refused when configuration
+loads. Unmanaged manifest shell/script/HTTP skills are a separate execution
+surface that SL11 leaves unchanged; see
+[skill catalog trust and execution](skills-catalog-security.md).
 
 ## Content and evidence
 
@@ -206,3 +208,40 @@ For a lifecycle-managed skill, `active/<skill-id>.json` is the authority and `sk
 - A first publication refuses, before anything is committed, to replace an existing `skills/<dir>/` that is not its own revision. A symlinked `skills/` or `skills/.openprx-projection/` is refused too.
 - Recovery resets the `skills/.openprx-disabled/<dir>` marker of every bound skill to the binding's `enabled` state. A gateway toggle of a bound skill therefore does not survive a recovery pass; change the state with a lifecycle publication or rollback.
 - Skills without a binding (legacy skills) are never touched.
+
+## Executable bundles
+
+SL11 adds reviewed executable revisions: a bundle with scripts or declared
+`shell`/`script`/`http` tools in `SKILL.toml`.
+
+- **Identity.** The revision id hashes every file, so a script, a reference or
+  a file's execute mode each change it; a mode-only change is a new revision.
+- **Entry.** An executable revision enters only through an operator. Migration
+  plans a legacy executable directory as `ExecutableNeedsReview` and never
+  imports it on its own. The operator reviews the directory and publishes it
+  with `skills_manage` action `lifecycle_import_executable` (`source`,
+  `revision_id`). It needs a signed one-shot grant bound to the directory and
+  the complete bundle hash, in every autonomy level, and runs only in `auto`
+  mode under a valid publication policy, like any publication. The review
+  requires well-formed tools, script paths inside the bundle that are marked
+  executable, no executable file that no tool runs, and no untrusted-origin
+  marker.
+- **Proposer.** A proposal of a managed executable skill may change `SKILL.md`
+  text only. Scripts, references, `SKILL.toml` and every mode are carried
+  byte-identical, and the capability check refuses any other change. Script
+  generation is a next-phase package and is not shipped.
+- **Execution.** `skill_execute` for a managed skill resolves the tool from the
+  revision the task is pinned to (the pin `skill_read` uses), so a task that
+  used revision A runs A after B is published. The whole bundle is verified,
+  staged into a private run directory with its exact modes and verified again
+  before anything runs; a tampered or missing file fails the call. Arguments
+  must be names the pinned manifest declares, scalar and bounded. The policy
+  must grant the tool of the kind (`shell` or `http_request`) and every
+  capability the revision requires; a manifest cannot grant access. The call
+  uses the existing shell/HTTP adapters under a five-minute deadline, the
+  process group is ended when the call exits, times out or is cancelled, and the
+  run directory is removed. Limit: a script that deliberately starts a process in
+  a new session escapes the group.
+- **Evaluation.** Executable revisions use the same frozen-suite evaluator.
+  Trials can only be offered read tools and workspace file writes, so scripts,
+  mail, payments and other external effects are never run in a trial.
