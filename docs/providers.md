@@ -696,6 +696,14 @@ published pricing: [Anthropic](https://platform.claude.com/docs/en/about-claude/
 [Gemini](https://ai.google.dev/gemini-api/docs/pricing), and
 [xAI pricing](https://docs.x.ai/developers/pricing), and
 [Moonshot/Kimi token tariffs](https://platform.kimi.ai/docs/pricing/chat).
+An unpriced Kimi Code or OpenRouter selection is refused by G6 before a model
+call, even when credentials, subscription and model capabilities are valid.
+Selecting it explicitly does not bypass that gate. Supply an operator price
+override as described below or select a priced model. The generic user-facing
+policy reply does not expose configuration; operator logs, `prx doctor`, and
+`prx providers test` name the missing tariff and its configuration key. Selecting
+an unpriced default also prints a warning in the configuration change plan.
+
 An uncertain model-specific price is omitted instead of inferred from another
 generation. Router ranking cost is a separate catalog hint and is never used as
 the input/output billing tariff.
@@ -779,6 +787,56 @@ by [OpenRouter](https://openrouter.ai/docs/guides/features/server-tools/web-sear
 When neither source has a matching price, only `ollama` is treated as zero-cost.
 LM Studio, llama.cpp, vLLM, and custom loopback endpoints need an explicit
 `cost.prices` entry before PRX can produce a cost estimate.
+
+### Unpriced models and operator overrides
+
+For example, the following is an **illustrative operator budget tariff**, not a
+published Kimi Code price. Replace all four rates with the tariff you intend to
+use for budget accounting (USD per million tokens):
+
+```toml
+[cost.prices."kimi-code/kimi-for-coding"]
+input = 1.0
+output = 2.0
+cache_read = 0.5
+cache_write = 1.0
+```
+
+For a model ID that already contains `/`, use that exact model ID as the key:
+for example `[cost.prices."deepseek/deepseek-v3.2"]` on OpenRouter, with the same
+four fields set to your chosen rates. Do not prepend another `openrouter/` to
+that key. These overrides affect accounting and admission, not upstream billing.
+
+OpenRouter chat traces retain reported prompt, completion, cached-input and
+cache-write token counts, using the provider's
+[usage fields](https://github.com/OpenRouterTeam/docs/blob/main/cookbook/administration/usage-accounting.mdx).
+A priced turn is settled into `<workspace>/state/costs.jsonl`; missing usage
+is not invented as a reported zero. Use `/cost` inside `prx chat` for the current
+cost summary. There is no standalone `prx cost` command.
+
+### Configuring fallback model IDs
+
+`prx providers add <provider> --fallback` adds a provider, which is offered the
+primary model ID. It has no model flag. An incompatible pair is refused with a
+pointer to `[reliability.model_fallbacks]`; for example, Kimi Code cannot serve
+`anthropic/claude-sonnet-5` inherited from an OpenRouter default.
+
+Configure an alternate model in the existing model fallback table, for example
+on an OpenRouter primary:
+
+```toml
+[reliability.model_fallbacks]
+"anthropic/claude-sonnet-5" = ["openai/gpt-5.6"]
+```
+
+The map supplies model alternatives; it does not change provider compatibility.
+Validation checks every configured provider/model pair, so adding a Kimi Code
+fallback to that OpenRouter example still fails. Use models the configured
+provider chain can serve, and supply missing prices before execution. Change
+these non-secret settings through the existing configuration editor/API; enter
+credentials through the provider credential commands.
+
+### Router pricing and accounting
 
 The Router's built-in candidates are limited to active release rows with a
 published billing tariff. Retired or unpriced rows remain available only through

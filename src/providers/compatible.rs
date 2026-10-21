@@ -2,6 +2,9 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
+mod usage;
+use usage::OpenAiCompatibleUsage;
+
 use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
 use crate::multimodal;
 use crate::providers::traits::{
@@ -764,41 +767,6 @@ struct NativeChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamUsageOptions>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-struct OpenAiCompatibleUsage {
-    #[serde(default, deserialize_with = "optional_u32_from_any")]
-    prompt_tokens: Option<u32>,
-    #[serde(default, deserialize_with = "optional_u32_from_any")]
-    completion_tokens: Option<u32>,
-    #[serde(default, deserialize_with = "optional_u32_from_any")]
-    total_tokens: Option<u32>,
-}
-
-impl OpenAiCompatibleUsage {
-    fn into_reported(self) -> Option<TokenUsage> {
-        let total = self.total_tokens.or_else(|| {
-            self.prompt_tokens
-                .zip(self.completion_tokens)
-                .map(|(p, c)| p.saturating_add(c))
-        });
-        if total.is_some() || self.prompt_tokens.zip(self.completion_tokens).is_some() {
-            Some(TokenUsage::reported(self.prompt_tokens, self.completion_tokens, total))
-        } else {
-            None
-        }
-    }
-}
-
-fn optional_u32_from_any<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value
-        .and_then(|value| value.as_u64())
-        .and_then(|value| u32::try_from(value).ok()))
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]

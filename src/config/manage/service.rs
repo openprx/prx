@@ -2457,6 +2457,54 @@ mod tests {
         assert!(!listed.contains("sentinel-query-token"), "{listed}");
     }
 
+    #[tokio::test]
+    async fn incompatible_fallback_error_names_model_fallback_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = loaded(dir.path(), |config| {
+            config.default_provider = Some("openrouter".into());
+            config.default_model = Some("anthropic/claude-sonnet-5".into());
+        })
+        .await;
+        let service = service_for(config);
+        let error = service
+            .plan(
+                &ManagedChange::AddProvider {
+                    provider: "kimi-code".into(),
+                },
+                ConfigActor::Cli,
+            )
+            .await
+            .expect_err("incompatible primary is refused");
+        let shown = error.to_string();
+        assert!(shown.contains("not compatible"), "{shown}");
+        assert!(shown.contains("[reliability.model_fallbacks]"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn selecting_unpriced_default_warns_without_changing_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = loaded(dir.path(), |_| {}).await;
+        let service = service_for(config);
+        let plan = service
+            .plan(
+                &ManagedChange::SetDefault {
+                    operation: SelectionOperation::Chat,
+                    provider: "kimi-code".into(),
+                    model: "kimi-for-coding".into(),
+                    settings: None,
+                    root_credential: RootCredential::Refuse,
+                },
+                ConfigActor::Cli,
+            )
+            .await
+            .unwrap();
+        assert!(
+            plan.warnings()
+                .iter()
+                .any(|warning| warning.contains(r#"[cost.prices."kimi-code/kimi-for-coding"]"#))
+        );
+    }
+
     #[test]
     fn an_unresolvable_provider_is_refused_without_echoing_it() {
         let config = Config::default();

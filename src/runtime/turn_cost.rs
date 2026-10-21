@@ -176,9 +176,13 @@ fn estimate_cost_with_validity(
     let usd = match price {
         crate::llm::route_decision::UsagePrice::Priced(cost) => cost,
         crate::llm::route_decision::UsagePrice::Missing if zero_price_exempt => 0.0,
-        crate::llm::route_decision::UsagePrice::Missing | crate::llm::route_decision::UsagePrice::Invalid => {
+        crate::llm::route_decision::UsagePrice::Missing => {
+            if let Some(warning) = crate::providers::selection::pricing_warning(model, pricing) {
+                tracing::warn!(target: "providers::selection", "{warning}");
+            }
             return None;
         }
+        crate::llm::route_decision::UsagePrice::Invalid => return None,
     };
     let micro = u64::try_from(crate::cost::tracker::ceil_micro_usd(usd).ok()?).ok()?;
     Some(CostEstimate {
@@ -362,6 +366,30 @@ mod tests {
                 .estimate_terminal()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn missing_price_estimate_warns_with_the_effective_override_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("warnings.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::fs::File::create(&path).unwrap())
+            .finish();
+        let config = crate::config::Config::default();
+        let selected = model(&config, "openrouter", "deepseek/deepseek-v3.2");
+        tracing::subscriber::with_default(subscriber, || {
+            let observed = BTreeMap::new();
+            let costs = RuntimeCostModel::new(&selected, &config, &observed);
+            assert!(costs.estimate_terminal().is_none());
+        });
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(
+            log.contains("G6 budget admission refuses unpriced model 'openrouter/deepseek/deepseek-v3.2'"),
+            "{log}"
+        );
+        assert!(log.contains(r#"[cost.prices."deepseek/deepseek-v3.2"]"#), "{log}");
     }
 
     #[test]

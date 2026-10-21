@@ -170,7 +170,15 @@ release price. A missing catalog and override price remains unpriced, with the
 existing Ollama-only zero-price exemption. OpenRouter rows without a duplicated
 tariff resolve stable upstream Anthropic, Google/Gemini, Moonshot, OpenAI and
 xAI model prices from those providers' release rows; unknown or dynamic proxy
-models remain unpriced. Compaction reads the effective
+models remain unpriced. G6 refuses these selections before a model call until
+an operator supplies `[cost.prices]`, even for subscription-billed Kimi Code.
+Logs, `prx doctor`, `prx providers test`, and a new default's change plan explain
+the missing price. See the [price override example](providers.md#unpriced-models-and-operator-overrides):
+use `[cost.prices."kimi-code/kimi-for-coding"]` for Kimi Code, or the exact
+slash-containing model ID such as `[cost.prices."deepseek/deepseek-v3.2"]` for
+OpenRouter. Set `input`, `output`, `cache_read` and `cache_write` in USD per
+million tokens; these are operator accounting rates, not invented catalog prices.
+Compaction reads the effective
 descriptor's context window after explicit agent and `[[router.models]]`
 overrides. The default Router candidate list uses active rows with `router`
 hints and an effective billing tariff, including configured `[cost.prices]`

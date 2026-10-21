@@ -484,6 +484,19 @@ pub(crate) fn check_affected_selections(
             Err(refusal) => refusals.push(refusal),
         }
     }
+    if current.is_none_or(|current| {
+        selection::default_provider(current) != selection::default_provider(candidate)
+            || selection::default_model(current) != selection::default_model(candidate)
+    }) && let Ok(resolved) = selection::check(
+        candidate,
+        selection::default_provider(candidate),
+        selection::default_model(candidate),
+        &Requirement::chat(),
+        UnknownPolicy::Invocation,
+    ) && let Some(warning) = selection::pricing_warning(&resolved, &candidate.cost)
+    {
+        warnings.push(warning);
+    }
     // The decision backend: the same check a reload runs (CDP-12).
     match check_decision_plane(current, candidate) {
         Ok(Some(warning)) => warnings.push(warning),
@@ -541,7 +554,13 @@ fn lost_route(current_sites: &[SelectionSite], site: &SelectionSite) -> Option<S
 /// Resolve one selection. `Ok(Some(warning))` when it is accepted as
 /// unverified.
 fn check_site(catalog: &CatalogView, site: &SelectionSite, policy: UnknownPolicy) -> Result<Option<String>, String> {
-    let refused = |reason: &dyn std::fmt::Display| format!("{} refused: {reason}", site.name);
+    let refused = |reason: &dyn std::fmt::Display| {
+        let mut message = format!("{} refused: {reason}", site.name);
+        if site.name.starts_with("fallback provider ") {
+            message.push_str("; provider fallbacks inherit the primary model. Configure alternate model IDs in [reliability.model_fallbacks]; every configured provider/model pair must still be compatible (see docs/providers.md)");
+        }
+        message
+    };
     let unverified = match site.kind {
         SiteKind::Chat => {
             selection::check_model_unproven(catalog, &site.provider, &site.model, &Requirement::chat(), policy)
