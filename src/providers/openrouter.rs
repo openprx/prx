@@ -50,9 +50,16 @@ struct NativeChatRequest {
     temperature: f64,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<UsageRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UsageRequest {
+    include: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -294,6 +301,7 @@ impl OpenRouterProvider {
             messages: Self::convert_messages(request.messages),
             temperature,
             stream: false,
+            usage: None,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
@@ -564,6 +572,7 @@ impl Provider for OpenRouterProvider {
             messages: native_messages,
             temperature,
             stream: false,
+            usage: None,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
         };
@@ -634,16 +643,18 @@ impl Provider for OpenRouterProvider {
             messages: Self::convert_messages(messages),
             temperature,
             stream: true,
+            usage: Some(UsageRequest { include: true }),
             tool_choice: options.tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
         let client = self.http_client();
         let count_tokens = options.count_tokens;
+        let endpoint = self.chat_endpoint().to_owned();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
         crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
             let response = match client
-                .post("https://openrouter.ai/api/v1/chat/completions")
+                .post(endpoint)
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("HTTP-Referer", "https://github.com/openprx/prx")
                 .header("X-Title", "OpenPRX")
@@ -1040,6 +1051,7 @@ mod tests {
             }],
             temperature: 0.2,
             stream: true,
+            usage: Some(UsageRequest { include: true }),
             tools: None,
             tool_choice: None,
         };
@@ -1054,3 +1066,7 @@ mod tests {
         assert!(provider.supports_streaming());
     }
 }
+
+#[cfg(test)]
+#[path = "openrouter/metering_tests.rs"]
+mod metering_tests;

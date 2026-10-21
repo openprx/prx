@@ -1,6 +1,7 @@
 //! Cost and latency estimates pinned before one turn's candidate generation.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
 use crate::causal_tree::branch::CapabilityRef;
@@ -28,6 +29,7 @@ pub(super) struct RuntimeCostModel<'a> {
     observed_latency_ms: &'a BTreeMap<String, u32>,
     prices_valid: bool,
     zero_price_exempt: bool,
+    warned_unpriced: AtomicBool,
 }
 
 impl<'a> RuntimeCostModel<'a> {
@@ -42,6 +44,7 @@ impl<'a> RuntimeCostModel<'a> {
             observed_latency_ms,
             prices_valid: config.cost.prices.values().all(|price| price.is_finite_nonnegative()),
             zero_price_exempt: zero_price_exempt(model),
+            warned_unpriced: AtomicBool::new(false),
         }
     }
 }
@@ -54,6 +57,7 @@ impl CostEstimateSource for RuntimeCostModel<'_> {
             entry.schema_bytes,
             self.prices_valid,
             self.zero_price_exempt,
+            &self.warned_unpriced,
         )?;
         let latency = self
             .observed_latency_ms
@@ -64,7 +68,14 @@ impl CostEstimateSource for RuntimeCostModel<'_> {
     }
 
     fn estimate_terminal(&self) -> Option<(CostEstimate, u32)> {
-        let cost = estimate_cost_with_validity(self.model, self.pricing, 0, self.prices_valid, self.zero_price_exempt)?;
+        let cost = estimate_cost_with_validity(
+            self.model,
+            self.pricing,
+            0,
+            self.prices_valid,
+            self.zero_price_exempt,
+            &self.warned_unpriced,
+        )?;
         Some((cost, default_latency_ms(CapabilityTarget::None)))
     }
 }
@@ -125,7 +136,14 @@ pub(super) fn build_cost_model(
 #[cfg(test)]
 fn estimate_cost(model: &ResolvedModel, pricing: &CostConfig, schema_bytes: usize) -> Option<CostEstimate> {
     let prices_valid = pricing.prices.values().all(|price| price.is_finite_nonnegative());
-    estimate_cost_with_validity(model, pricing, schema_bytes, prices_valid, zero_price_exempt(model))
+    estimate_cost_with_validity(
+        model,
+        pricing,
+        schema_bytes,
+        prices_valid,
+        zero_price_exempt(model),
+        &AtomicBool::new(false),
+    )
 }
 
 fn zero_price_exempt(model: &ResolvedModel) -> bool {
@@ -153,6 +171,7 @@ fn estimate_cost_with_validity(
     schema_bytes: usize,
     prices_valid: bool,
     zero_price_exempt: bool,
+    warned_unpriced: &AtomicBool,
 ) -> Option<CostEstimate> {
     // Even a local model cannot turn a configured but invalid tariff into a
     // zero-cost fallback. Normal config loading rejects these values; this
@@ -177,7 +196,9 @@ fn estimate_cost_with_validity(
         crate::llm::route_decision::UsagePrice::Priced(cost) => cost,
         crate::llm::route_decision::UsagePrice::Missing if zero_price_exempt => 0.0,
         crate::llm::route_decision::UsagePrice::Missing => {
-            if let Some(warning) = crate::providers::selection::pricing_warning(model, pricing) {
+            if !warned_unpriced.swap(true, Ordering::Relaxed)
+                && let Some(warning) = crate::providers::selection::pricing_warning(model, pricing)
+            {
                 tracing::warn!(target: "providers::selection", "{warning}");
             }
             return None;
@@ -390,6 +411,43 @@ mod tests {
             "{log}"
         );
         assert!(log.contains(r#"[cost.prices."deepseek/deepseek-v3.2"]"#), "{log}");
+    }
+
+    #[test]
+    fn repeated_unpriced_capability_estimates_warn_once_per_cost_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("warnings.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::fs::File::create(&path).unwrap())
+            .finish();
+        let config = Config::default();
+        let selected = model(&config, "openrouter", "deepseek/deepseek-v3.2");
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(SizedSchemaTool {
+            name: "prx_probe",
+            payload: "schema".into(),
+        })];
+        let catalog = CapabilityCatalog::build(&tools, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let view = catalog.view(&Default::default());
+        assert!(!view.entries().is_empty());
+        tracing::subscriber::with_default(subscriber, || {
+            let observed = BTreeMap::new();
+            for expected_warnings in 1..=2 {
+                let costs = RuntimeCostModel::new(&selected, &config, &observed);
+                for _ in 0..3 {
+                    assert!(costs.estimate_terminal().is_none());
+                    for entry in view.entries() {
+                        assert!(costs.estimate_entry(entry).is_none());
+                    }
+                }
+                let log = std::fs::read_to_string(&path).unwrap();
+                assert_eq!(
+                    log.matches("G6 budget admission refuses unpriced model").count(),
+                    expected_warnings
+                );
+            }
+        });
     }
 
     #[test]
