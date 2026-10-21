@@ -1,7 +1,8 @@
-# Instruction skill lifecycle
+# Skill lifecycle
 
-PRX ships the owner-scoped, instruction-only lifecycle: immutable skill
-revisions, task receipts, evidence-linked knowledge, bounded proposal staging,
+PRX ships an owner-scoped lifecycle for instruction skills and reviewed
+executable bundles: immutable revisions, task receipts, evidence-linked
+knowledge, bounded proposal staging,
 frozen-suite evaluation, publication gates, journaled promotion and rollback.
 It is disabled by default. Enabling it does not start automatic learning:
 proposal scheduling is not wired in this candidate, and there is no CLI
@@ -70,9 +71,10 @@ A skill can also be created from repeated work that no managed skill covered.
   and permission causes are both positively absent, is kept. The runtime records
   a completed turn as a success and has no task-outcome check, so this is
   evidence of recurring uncovered work, not of failed tasks. A pattern of class
-  `missing_skill` needs at least two distinct root tasks. Recording stops once a
-  store holds 4096 experience records; no retention policy prunes them yet, so
-  that cap is the only bound.
+  `missing_skill` needs at least two distinct root tasks. New uncovered-task
+  recording stops at the 4096-experience threshold; this is not a hard cap on
+  the whole store, since managed-skill experiences can still be recorded.
+  Automatic experience retention is not wired.
 - **Proposal.** `propose_new_skill` writes a fixed skeleton from the request
   (name, description, required tools) and the model may only append text, within
   the same 300-token cap. The bundle is `SKILL.md` alone: no scripts and no
@@ -164,12 +166,15 @@ When enabled and opened successfully, `skills_manage` adds these actions:
 | `lifecycle_publish` | `proposal_id` |
 | `lifecycle_cancel` | `proposal_id`, optional `reason` |
 | `lifecycle_rollback` | `skill_id`, `revision_id`, nonnegative integer `expected_generation` |
+| `lifecycle_import_executable` | `source` directory, `revision_id` (the complete reviewed bundle hash) |
 
 Calls must match the configured owner. Mutations retain the common side-effect
 boundary. Agent publication and rollback additionally require a signed,
 one-shot approval grant bound to the exact proposal, or the rollback's skill,
 revision and observed generation, at every autonomy level. Tool output or a
-model's decision cannot supply that authority. There is no agent
+model's decision cannot supply that authority. Executable import also requires
+a signed one-shot grant, bound to both `source` and `revision_id`, and `auto`
+mode; see [executable bundles](#executable-bundles). There is no agent
 `force-close`, `propose`, suite-authoring or evaluation action.
 
 ## Recovery, status and rollback
@@ -198,12 +203,22 @@ trace fields the older reader rejects. Do not delete learning evidence to make
 an older binary accept the store. See the
 [upgrade and compatibility notes](migration-unreleased.md).
 
+## Compatibility projection
 
-## Compatibility projection (skills/<dir>/)
+For a lifecycle-managed skill, `active/<skill-id>.json` is the authority and
+`skills/<dir>/` is a plain directory copy of the active revision, kept for
+existing consumers such as discovery. Publish and rollback replace the copy
+after the binding commits, using a staged write under
+`skills/.openprx-projection/`. Linux uses an atomic exchange where supported.
+macOS, and Linux filesystems without exchange support, use two renames: the
+skill may be briefly absent, but the replacement tree is never half-written.
+An atomic macOS projection swap remains unimplemented.
 
-For a lifecycle-managed skill, `active/<skill-id>.json` is the authority and `skills/<dir>/` is a plain directory copy of the active revision, kept for existing consumers such as discovery. Publish and rollback replace the copy after the binding commits (staged write under `skills/.openprx-projection/`, then an atomic swap on Linux; elsewhere two renames, which can leave the skill briefly absent but never half-written) and drop the cached catalog snapshots.
+Refresh invalidates the catalog snapshots containing metadata and embeddings.
+The separate process embedding cache is keyed by description text, so a changed
+description cannot reuse the old description's vector.
 
-- A failure after the commit is reported as `CommittedRepairRequired`. Retrying the same transaction, or the startup recovery sweep, repairs the projection.
+- A failure after the commit is reported as `CommittedRepairRequired`: the new binding is already live, so this is not an aborted publication. Retrying the same transaction, or the startup recovery sweep, repairs the projection.
 - Only the first publication refuses an unmanaged directory; after that the bound `skills/<dir>/` belongs to the lifecycle, and later generations, rollbacks and recovery overwrite it (a hand edit of a bound directory does not survive).
 - A first publication refuses, before anything is committed, to replace an existing `skills/<dir>/` that is not its own revision. A symlinked `skills/` or `skills/.openprx-projection/` is refused too.
 - Recovery resets the `skills/.openprx-disabled/<dir>` marker of every bound skill to the binding's `enabled` state. A gateway toggle of a bound skill therefore does not survive a recovery pass; change the state with a lifecycle publication or rollback.
@@ -249,15 +264,21 @@ SL11 adds reviewed executable revisions: a bundle with scripts or declared
   call itself is approved at the orchestration boundary. A manifest cannot grant
   access. A managed skill never falls back to the unpinned legacy path: a call
   with no trusted owner, or from another owner, is refused when the skill is
-  managed in the configured owner's store.
+  managed in the configured owner's store. Independently of the configured
+  `owner_scope` (including when it is unset), the legacy `skill_execute` path
+  refuses any `skills/<dir>/` that is a lifecycle projection. An invalid
+  configured `owner_scope` or an unreadable lifecycle store causes refusal,
+  never fallback to legacy execution.
 - **Environment.** A managed script does not inherit the PRX environment. On the
   native runtime the process starts with an empty environment plus `PATH`, `LANG`,
   `LC_*` and `TZ` from the parent, `HOME` set to its run directory, `TMPDIR`
   inside it, and the `PRX_SKILL_ARG_*` values of the call, so no provider key,
   token or credential reaches it. Unmanaged shell callers are unchanged.
-- **Process containment.** The call uses the existing shell/HTTP adapters under a
-  five-minute deadline; the process group is ended when the leader exits, times
-  out or is cancelled, and the run directory is removed. Limit: a script that
+- **Process containment.** The call uses the existing shell/HTTP adapters.
+  Managed shell/script runs have a five-minute deadline and joined cleanup:
+  the process group is ended when the leader exits, times out or is cancelled;
+  the adapter reaps the child and joins the output readers before normal call
+  completion, then removes the run directory. Limit: a script that
   deliberately starts a process in a new session (`setsid`) escapes the group.
   Today the containment for that case is the docker `RuntimeAdapter`; a cgroup v2
   `cgroup.kill` based teardown is next-phase backlog.
