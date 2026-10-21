@@ -175,6 +175,7 @@ an older binary accept the store. See the
 For a lifecycle-managed skill, `active/<skill-id>.json` is the authority and `skills/<dir>/` is a plain directory copy of the active revision, kept for existing consumers such as discovery. Publish and rollback replace the copy after the binding commits (staged write under `skills/.openprx-projection/`, then an atomic swap on Linux; elsewhere two renames, which can leave the skill briefly absent but never half-written) and drop the cached catalog snapshots.
 
 - A failure after the commit is reported as `CommittedRepairRequired`. Retrying the same transaction, or the startup recovery sweep, repairs the projection.
+- Only the first publication refuses an unmanaged directory; after that the bound `skills/<dir>/` belongs to the lifecycle, and later generations, rollbacks and recovery overwrite it (a hand edit of a bound directory does not survive).
 - A first publication refuses, before anything is committed, to replace an existing `skills/<dir>/` that is not its own revision. A symlinked `skills/` or `skills/.openprx-projection/` is refused too.
 - Recovery resets the `skills/.openprx-disabled/<dir>` marker of every bound skill to the binding's `enabled` state. A gateway toggle of a bound skill therefore does not survive a recovery pass; change the state with a lifecycle publication or rollback.
 - Skills without a binding (legacy skills) are never touched.
