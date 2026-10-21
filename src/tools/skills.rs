@@ -1626,7 +1626,8 @@ mod tests {
         assert_eq!(unpinned.get("pinned").unwrap(), &json!(false));
 
         // Callers without a trusted owner, and other owners, read the legacy
-        // projection, which publication refreshed to the committed revision.
+        // projection. Publication refreshed it, so they now see the committed
+        // revision's content, not the pre-publication bytes.
         let legacy = read(json!({"name": "demo"})).await;
         assert!(
             legacy

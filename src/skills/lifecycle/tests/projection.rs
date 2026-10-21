@@ -79,18 +79,40 @@ fn on_disk(dir: &Path) -> RevisionId {
         .clone()
 }
 
-/// Descriptions the discovery catalog shows for the workspace.
-fn discovered(workspace: &Path) -> Vec<(String, String)> {
+fn config_for(workspace: &Path) -> crate::config::Config {
     let quiet = workspace.join("quiet-community");
     fs::create_dir_all(&quiet).expect("test: quiet dir");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.to_path_buf();
     config.skills.open_skills_dir = Some(quiet.to_string_lossy().into_owned());
     config.skills.openclaw_skills_dir = Some(quiet.to_string_lossy().into_owned());
-    crate::skills::catalog_skill_metadata(workspace, &config)
+    config
+}
+
+/// Descriptions the discovery catalog shows for the workspace.
+fn discovered(workspace: &Path) -> Vec<(String, String)> {
+    crate::skills::catalog_skill_metadata(workspace, &config_for(workspace))
         .into_iter()
         .map(|m| (m.name, m.description))
         .collect()
+}
+
+/// Descriptions of the cached skill catalog snapshot.
+fn cached_descriptions(workspace: &Path) -> Vec<String> {
+    crate::skills::load_skills_with_config(workspace, &config_for(workspace))
+        .into_iter()
+        .map(|skill| skill.description)
+        .collect()
+}
+
+fn leftover_names(workspace: &Path) -> Vec<String> {
+    fs::read_dir(workspace.join("skills/.openprx-projection"))
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn no_leftovers(workspace: &Path) {
@@ -318,7 +340,7 @@ fn recovery_repairs_a_missing_projection_and_sweeps_leftover_trees() {
 
 #[cfg(unix)]
 #[test]
-fn a_symlinked_projection_path_is_reported_never_followed() {
+fn a_symlinked_projection_path_is_refused_before_the_commit_and_never_followed() {
     let (tmp, store) = setup();
     let outside = TempDir::new().expect("test: outside");
     fs::write(outside.path().join("SKILL.md"), b"outside").expect("test: outside file");
@@ -328,13 +350,12 @@ fn a_symlinked_projection_path_is_reported_never_followed() {
     let err = store
         .publish(&publish_req("t1", &skill(), &a, 0, true))
         .expect_err("test: refused");
-    assert!(matches!(err, LifecycleError::CommittedRepairRequired { .. }), "{err}");
+    assert!(matches!(err, LifecycleError::UnsafeStorePath { .. }), "{err}");
+    assert!(store.active_binding(&skill()).expect("test: binding").is_none());
     assert_eq!(
         fs::read(outside.path().join("SKILL.md")).expect("test: read"),
         b"outside"
     );
-    let report = store.recover(Duration::ZERO).expect("test: recover");
-    assert_eq!(report.projections.failed.len(), 1);
     no_leftovers(tmp.path());
 }
 
@@ -430,4 +451,218 @@ fn a_pinned_task_survives_a_projection_failure_and_its_repair() {
     assert_eq!(on_disk(&projection(tmp.path())), b.0);
     assert!(managed_read(tmp.path(), &task).contains("alpha-desc"));
     release_task_pins(&owner(OWNER), &task);
+}
+
+#[test]
+fn an_unmanaged_directory_survives_and_the_first_publication_is_refused() {
+    let (tmp, store) = setup();
+    let mine = projection(tmp.path());
+    fs::create_dir_all(&mine).expect("test: user dir");
+    fs::write(mine.join("SKILL.md"), b"my own skill").expect("test: user file");
+    let a = write(&store, &skill(), "alpha-desc");
+    let err = store
+        .publish(&publish_req("t1", &skill(), &a, 0, true))
+        .expect_err("test: refused");
+    assert!(matches!(err, LifecycleError::UnsafeStorePath { .. }), "{err}");
+    assert_eq!(fs::read(mine.join("SKILL.md")).expect("test: read"), b"my own skill");
+    assert_eq!(fs::read_dir(&mine).expect("test: dir").count(), 1);
+    assert!(store.active_binding(&skill()).expect("test: binding").is_none());
+    let tx = TransactionId::parse("t1").expect("test: tx");
+    assert!(
+        store.journal_entry(&tx).expect("test: journal").is_none(),
+        "no mutation"
+    );
+}
+
+#[test]
+fn the_projection_itself_refuses_an_unmanaged_tree_for_a_first_generation() {
+    let (tmp, store) = setup();
+    let a = write(&store, &skill(), "alpha-desc");
+    store
+        .publish(&publish_req("t1", &skill(), &a, 0, true))
+        .expect("test: publish");
+    fs::remove_dir_all(projection(tmp.path())).expect("test: drop projection");
+    fs::create_dir_all(projection(tmp.path())).expect("test: user dir");
+    fs::write(projection(tmp.path()).join("SKILL.md"), b"mine").expect("test: user file");
+    let binding = store
+        .active_binding(&skill())
+        .expect("test: binding")
+        .expect("test: bound");
+    let lock = store.lock_skill(&skill(), Duration::from_secs(5)).expect("test: lock");
+    let err = store.refresh_projection(&lock, &binding).expect_err("test: refused");
+    assert!(matches!(err, LifecycleError::UnsafeStorePath { .. }), "{err}");
+    drop(lock);
+    assert_eq!(
+        fs::read(projection(tmp.path()).join("SKILL.md")).expect("test: read"),
+        b"mine"
+    );
+    let report = store.recover(Duration::ZERO).expect("test: recover");
+    assert_eq!(report.projections.failed.len(), 1);
+    assert_eq!(
+        fs::read(projection(tmp.path()).join("SKILL.md")).expect("test: read"),
+        b"mine"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_skills_directory_is_refused_before_the_commit() {
+    let (tmp, store) = setup();
+    let outside = TempDir::new().expect("test: outside");
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("skills")).expect("test: symlink");
+    let a = write(&store, &skill(), "alpha-desc");
+    let err = store
+        .publish(&publish_req("t1", &skill(), &a, 0, true))
+        .expect_err("test: refused");
+    assert!(matches!(err, LifecycleError::UnsafeStorePath { .. }), "{err}");
+    assert!(store.active_binding(&skill()).expect("test: binding").is_none());
+    assert_eq!(fs::read_dir(outside.path()).expect("test: outside").count(), 0);
+}
+
+#[test]
+fn the_directory_cap_ignores_dot_entries_and_refuses_before_the_commit() {
+    let (tmp, store) = setup();
+    let skills = tmp.path().join("skills");
+    fs::create_dir_all(&skills).expect("test: skills");
+    for n in 0..1100 {
+        fs::create_dir(skills.join(format!(".hidden-{n}"))).expect("test: dot dir");
+    }
+    let a = write(&store, &skill(), "alpha-desc");
+    store
+        .publish(&publish_req("t1", &skill(), &a, 0, true))
+        .expect("test: dot entries do not count");
+    for n in 0..1030 {
+        fs::create_dir(skills.join(format!("other-{n}"))).expect("test: plain dir");
+    }
+    let b = write(&store, &skill(), "beta-desc");
+    let err = store
+        .publish(&publish_req("t2", &skill(), &b, 1, true))
+        .expect_err("test: over the cap");
+    assert!(matches!(err, LifecycleError::InvalidRecord { .. }), "{err}");
+    let bound = store
+        .active_binding(&skill())
+        .expect("test: binding")
+        .expect("test: bound");
+    assert_eq!(
+        (bound.generation, &bound.revision_id),
+        (1, &a.0),
+        "refused before the commit"
+    );
+}
+
+#[test]
+fn the_two_rename_fallback_leaves_the_skill_absent_and_recovery_restores_it() {
+    let (tmp, store) = setup();
+    let (a, b) = (
+        write(&store, &skill(), "alpha-desc"),
+        write(&store, &skill(), "beta-desc"),
+    );
+    store
+        .publish(&publish_req("t1", &skill(), &a, 0, true))
+        .expect("test: publish a");
+    crash_hooks::force_two_step(true);
+    crash_hooks::arm("projection_swapped_out");
+    let err = store
+        .publish(&publish_req("t2", &skill(), &b, 1, true))
+        .expect_err("test: crash between the renames");
+    assert!(matches!(err, LifecycleError::CommittedRepairRequired { .. }), "{err}");
+    assert!(
+        !projection(tmp.path()).exists(),
+        "the skill is absent, not half-written"
+    );
+    let left = leftover_names(tmp.path());
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left.iter().all(|n| n.ends_with(".old")), "{left:?}");
+
+    let report = store.recover(Duration::ZERO).expect("test: recover");
+    crash_hooks::force_two_step(false);
+    assert_eq!(report.projections.repaired, [skill()]);
+    assert_eq!(on_disk(&projection(tmp.path())), b.0);
+    no_leftovers(tmp.path());
+}
+
+#[test]
+fn a_failed_repair_keeps_the_previous_tree_until_a_repair_succeeds() {
+    let (tmp, store) = setup();
+    let (a, b) = (
+        write(&store, &skill(), "alpha-desc"),
+        write(&store, &skill(), "beta-desc"),
+    );
+    store
+        .publish(&publish_req("t1", &skill(), &a, 0, true))
+        .expect("test: publish a");
+    crash_hooks::force_two_step(true);
+    crash_hooks::arm("projection_swapped_out");
+    store
+        .publish(&publish_req("t2", &skill(), &b, 1, true))
+        .expect_err("test: crash between the renames");
+    // Something in the way makes the repair fail.
+    fs::write(projection(tmp.path()), b"in the way").expect("test: blocker");
+    let report = store.recover(Duration::ZERO).expect("test: recover");
+    assert_eq!(report.projections.failed.len(), 1);
+    assert_eq!(report.swept_staging, 0, "nothing is swept for a failed skill");
+    let left = leftover_names(tmp.path());
+    assert_eq!(left.len(), 1, "the previous tree survives: {left:?}");
+
+    fs::remove_file(projection(tmp.path())).expect("test: remove blocker");
+    let report = store.recover(Duration::ZERO).expect("test: recover again");
+    crash_hooks::force_two_step(false);
+    assert_eq!(report.projections.repaired, [skill()]);
+    assert_eq!(on_disk(&projection(tmp.path())), b.0);
+    no_leftovers(tmp.path());
+}
+
+#[test]
+fn a_crash_after_the_swap_leaves_a_stale_cache_that_recovery_invalidates() {
+    let (tmp, store) = setup();
+    let (a, b) = (
+        write(&store, &skill(), "alpha-desc"),
+        write(&store, &skill(), "beta-desc"),
+    );
+    store
+        .publish(&publish_req("t1", &skill(), &a, 0, true))
+        .expect("test: publish a");
+    assert_eq!(cached_descriptions(tmp.path()), ["alpha-desc"]);
+    crash_hooks::arm("projection_written");
+    let err = store
+        .publish(&publish_req("t2", &skill(), &b, 1, true))
+        .expect_err("test: crash before the cache is invalidated");
+    assert!(matches!(err, LifecycleError::CommittedRepairRequired { .. }), "{err}");
+    assert_eq!(on_disk(&projection(tmp.path())), b.0);
+    assert_eq!(
+        cached_descriptions(tmp.path()),
+        ["alpha-desc"],
+        "the snapshot is stale until repair"
+    );
+    let report = store.recover(Duration::ZERO).expect("test: recover");
+    assert!(report.projections.repaired.is_empty(), "the tree was already current");
+    assert_eq!(cached_descriptions(tmp.path()), ["beta-desc"]);
+}
+
+#[test]
+fn one_unreadable_binding_does_not_abort_recovery_or_lose_the_report() {
+    let (tmp, store) = setup();
+    let a = write(&store, &skill(), "alpha-desc");
+    store
+        .publish(&publish_req("t1", &skill(), &a, 0, true))
+        .expect("test: publish a");
+    let b = write(&store, &skill(), "beta-desc");
+    crash_hooks::arm("after_prepared");
+    store
+        .publish(&publish_req("t2", &skill(), &b, 1, true))
+        .expect_err("test: crash");
+    let bad = store.root().join("active/broken-skill.json");
+    fs::write(&bad, b"{ not json").expect("test: corrupt binding");
+    let leftover = tmp.path().join(format!(
+        "skills/.openprx-projection/deploy-helper.{}.new",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&leftover).expect("test: leftover tree");
+    let report = store
+        .recover(Duration::ZERO)
+        .expect("test: recover still returns its report");
+    assert_eq!(report.aborted, [TransactionId::parse("t2").expect("test: tx")]);
+    assert_eq!(report.projections.failed.len(), 1, "{:?}", report.projections.failed);
+    assert_eq!(report.swept_staging, 1);
+    assert!(!leftover.exists());
 }

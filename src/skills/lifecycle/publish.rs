@@ -101,6 +101,17 @@ pub(super) mod crash_hooks {
     thread_local! {
         static ARMED: RefCell<Option<&'static str>> = const { RefCell::new(None) };
         static ACTION: RefCell<Option<(&'static str, Box<dyn FnOnce()>)>> = const { RefCell::new(None) };
+        static TWO_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Forces the projection swap onto its two-rename fallback on this thread.
+    pub(in crate::skills::lifecycle) fn force_two_step(on: bool) {
+        TWO_STEP.with(|f| f.set(on));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(in crate::skills::lifecycle) fn two_step_forced() -> bool {
+        TWO_STEP.with(std::cell::Cell::get)
     }
 
     /// Runs `action` once, on this thread, when execution reaches `point`
@@ -413,6 +424,9 @@ impl SkillLifecycleStore {
         // Verifies record, owner, manifest and the full bundle hash, and that
         // the record still has the digest pinned at write time.
         self.read_revision(skill, candidate, Some(candidate_digest))?;
+        // Refuse before anything is journaled when the projection cannot be
+        // written (unsafe or unmanaged target, too many skill directories).
+        self.precheck_projection(skill, candidate, predecessor.is_some())?;
 
         let mut entry = JournalEntry {
             schema_version: SCHEMA_VERSION,
@@ -582,10 +596,12 @@ impl SkillLifecycleStore {
                 _ => report.aborted.push(entry.transaction_id),
             }
         }
+        // Repair first: the sweep keeps the previous tree of a skill whose
+        // repair failed, so a failed repair never deletes its only copy.
+        report.projections = self.repair_projections(lock_timeout);
         report.swept_staging = self
             .sweep_staging(staging_min_age)?
-            .saturating_add(self.sweep_projection_staging(staging_min_age)?);
-        report.projections = self.repair_projections(lock_timeout)?;
+            .saturating_add(self.sweep_projection_staging(staging_min_age, &report.projections.keep));
         Ok(report)
     }
 
