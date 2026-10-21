@@ -15,7 +15,8 @@
 //! `renameat2(RENAME_EXCHANGE)`, so a reader sees the old tree or the new one.
 //! Elsewhere the old tree is renamed away first, which leaves a short window
 //! in which the skill is absent (never half-written); the sweep restores a
-//! projection that is absent. No symlink is created or followed.
+//! projection that is absent and keeps the `.old` tree of any skill whose
+//! repair failed. No symlink is created or followed.
 //!
 //! Only skills that have an active binding are touched. A legacy skill with no
 //! binding is never read or written here.
@@ -23,9 +24,9 @@
 use super::bundle::Bundle;
 use super::generation::{ActiveBinding, SkillLock};
 use super::store::{SkillLifecycleStore, sync_dir, sync_tree_dirs};
-use super::types::{LifecycleError, SkillId};
+use super::types::{LifecycleError, RevisionId, SkillId};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Hidden directory below `skills/` used for staging and replaced trees.
@@ -52,9 +53,13 @@ pub(super) enum ProjectionChange {
 pub struct ProjectionRepair {
     /// Skills whose projection was missing or stale and was rewritten.
     pub repaired: Vec<SkillId>,
-    /// Skills whose projection could not be repaired, with the reason. The
-    /// next sweep or a retry of the committed transaction tries again.
-    pub failed: Vec<(SkillId, String)>,
+    /// What could not be repaired (a skill id, or `bindings` when the binding
+    /// list itself was unreadable), with the reason. The next sweep or a retry
+    /// of the committed transaction tries again.
+    pub failed: Vec<(String, String)>,
+    /// Skills whose previous projection tree (`.old`) must be kept because
+    /// their repair failed.
+    pub(super) keep: Vec<SkillId>,
 }
 
 fn unsafe_path(path: &Path, reason: &str) -> LifecycleError {
@@ -82,22 +87,57 @@ impl SkillLifecycleStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(skill.to_string()),
             Err(e) => return Err(LifecycleError::io(skills_root, e)),
         };
-        for (scanned, entry) in entries.enumerate() {
-            if scanned >= MAX_PROJECTION_SCAN {
+        let mut scanned = 0_usize;
+        for entry in entries {
+            let entry = entry.map_err(|e| LifecycleError::io(skills_root, e))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            scanned = scanned.saturating_add(1);
+            if scanned > MAX_PROJECTION_SCAN {
                 return Err(LifecycleError::InvalidRecord {
                     path: skills_root.to_path_buf(),
                     reason: format!("more than {MAX_PROJECTION_SCAN} skill directories"),
                 });
             }
-            let entry = entry.map_err(|e| LifecycleError::io(skills_root, e))?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if !name.starts_with('.') && SkillId::from_legacy_dir(&name).is_ok_and(|id| &id == skill) {
+            if SkillId::from_legacy_dir(&name).is_ok_and(|id| &id == skill) {
                 return Ok(name);
             }
         }
         Ok(skill.to_string())
+    }
+
+    /// Verifies, before the binding commit, that the projection of a
+    /// transition can be written: `skills/` and its staging directory are real
+    /// directories, the directory scan stays within its cap, and a first
+    /// publication does not land on a tree the skill does not own. Nothing is
+    /// swapped; a refusal here leaves no mutation.
+    pub(super) fn precheck_projection(
+        &self,
+        skill: &SkillId,
+        candidate: &RevisionId,
+        has_predecessor: bool,
+    ) -> Result<(), LifecycleError> {
+        let (_, skills_root, _) = self.projection_roots()?;
+        let directory = self.projection_dir_name(&skills_root, skill)?;
+        if !has_predecessor {
+            refuse_unmanaged(&skills_root.join(directory), candidate)?;
+        }
+        Ok(())
+    }
+
+    /// Workspace, `skills/` and `skills/.openprx-projection/`, each ensured to
+    /// be a real directory (never a symlink).
+    fn projection_roots(&self) -> Result<(&Path, PathBuf, PathBuf), LifecycleError> {
+        let workspace = self.workspace_dir()?;
+        let skills_root = crate::skills::skills_dir(workspace);
+        ensure_plain_dir(&skills_root)?;
+        let staging_root = skills_root.join(PROJECTION_STAGING_DIR);
+        ensure_plain_dir(&staging_root)?;
+        Ok((workspace, skills_root, staging_root))
     }
 
     /// Makes `skills/<directory>/` hold exactly the bytes of the binding's
@@ -117,17 +157,18 @@ impl SkillLifecycleStore {
             ));
         }
         let verified = self.read_revision(&binding.skill_id, &binding.revision_id, Some(&binding.record_digest))?;
-        let workspace = self.workspace_dir()?;
-        let skills_root = crate::skills::skills_dir(workspace);
-        fs::create_dir_all(&skills_root).map_err(|e| LifecycleError::io(&skills_root, e))?;
+        let (workspace, skills_root, staging_root) = self.projection_roots()?;
         let directory = self.projection_dir_name(&skills_root, &binding.skill_id)?;
         let target = skills_root.join(&directory);
 
         let change = if projection_is_current(&target, &verified.bundle) {
             ProjectionChange::Unchanged
         } else {
-            let staging_root = skills_root.join(PROJECTION_STAGING_DIR);
-            fs::create_dir_all(&staging_root).map_err(|e| LifecycleError::io(&staging_root, e))?;
+            // Defence for the pre-commit refusal: the first generation of a
+            // skill never replaces a tree that is not its own revision.
+            if binding.generation <= 1 {
+                refuse_unmanaged(&target, &binding.revision_id)?;
+            }
             let stage = staging_root.join(format!("{}.{}{NEW_SUFFIX}", binding.skill_id, uuid::Uuid::new_v4()));
             let staged = write_tree(&stage, &verified.bundle).and_then(|()| {
                 crash_point!("projection_staged");
@@ -150,65 +191,97 @@ impl SkillLifecycleStore {
     }
 
     /// Recovery pass: for every active binding, rewrites a projection that is
-    /// missing or differs from the committed revision. Bounded by
-    /// [`super::binding::MAX_ACTIVE_BINDINGS`] and idempotent (a projection that
-    /// already matches is only compared, never rewritten). One failing skill
-    /// does not stop the others.
-    pub(super) fn repair_projections(&self, lock_timeout: Duration) -> Result<ProjectionRepair, LifecycleError> {
+    /// missing or differs from the committed revision, and resets the
+    /// `skills/.openprx-disabled/<dir>` marker of every bound skill to the
+    /// binding's `enabled` state (a gateway toggle of a bound skill does not
+    /// survive recovery). Bounded by [`super::binding::MAX_ACTIVE_BINDINGS`]
+    /// and idempotent. It never fails as a whole: every problem becomes an
+    /// entry of [`ProjectionRepair::failed`] and the pass continues.
+    pub(super) fn repair_projections(&self, lock_timeout: Duration) -> ProjectionRepair {
         let mut report = ProjectionRepair::default();
-        for listed in self.list_active_bindings()? {
+        let bindings = match self.list_active_bindings() {
+            Ok(bindings) => bindings,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to list active skill bindings for projection repair");
+                report.failed.push(("bindings".to_string(), e.to_string()));
+                return report;
+            }
+        };
+        for listed in bindings {
             let skill = listed.skill_id;
-            let lock = match self.lock_skill(&skill, lock_timeout) {
-                Ok(lock) => lock,
-                Err(e @ LifecycleError::LockTimeout { .. }) => {
-                    report.failed.push((skill, e.to_string()));
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            // Re-read under the lock: a writer may have moved the binding.
-            let Some(binding) = self.active_binding(&skill)? else {
-                continue;
-            };
-            match self.refresh_projection(&lock, &binding) {
-                Ok(ProjectionChange::Written) => report.repaired.push(skill),
-                Ok(ProjectionChange::Unchanged) => {}
+            let outcome = self.lock_skill(&skill, lock_timeout).and_then(|lock| {
+                // Re-read under the lock: a writer may have moved the binding.
+                self.active_binding(&skill)?
+                    .map(|binding| self.refresh_projection(&lock, &binding))
+                    .transpose()
+            });
+            match outcome {
+                Ok(Some(ProjectionChange::Written)) => report.repaired.push(skill),
+                Ok(Some(ProjectionChange::Unchanged) | None) => {}
                 Err(e) => {
                     tracing::warn!(skill = %skill, error = %e, "failed to repair a skill projection");
-                    report.failed.push((skill, e.to_string()));
+                    report.failed.push((skill.to_string(), e.to_string()));
+                    report.keep.push(skill);
                 }
             }
         }
-        Ok(report)
+        report
     }
 
     /// Removes staged and replaced projection trees older than `min_age`
-    /// whose skill lock is free. Returns how many were removed.
-    pub(super) fn sweep_projection_staging(&self, min_age: Duration) -> Result<usize, LifecycleError> {
-        let staging_root = crate::skills::skills_dir(self.workspace_dir()?).join(PROJECTION_STAGING_DIR);
+    /// whose skill lock is free, except those of skills in `keep` (their
+    /// repair failed, so the previous tree may be the only copy). Never
+    /// fails: problems are logged and the entry is left for the next sweep.
+    /// Returns how many were removed.
+    pub(super) fn sweep_projection_staging(&self, min_age: Duration, keep: &[SkillId]) -> usize {
+        let staging_root = match self.workspace_dir() {
+            Ok(workspace) => crate::skills::skills_dir(workspace).join(PROJECTION_STAGING_DIR),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot locate the skill projection staging directory");
+                return 0;
+            }
+        };
         let entries = match fs::read_dir(&staging_root) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(LifecycleError::io(&staging_root, e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(e) => {
+                tracing::warn!(path = %staging_root.display(), error = %e, "cannot read the skill projection staging directory");
+                return 0;
+            }
         };
-        let mut removed = 0;
+        let mut removed = 0_usize;
         for entry in entries {
-            let entry = entry.map_err(|e| LifecycleError::io(&staging_root, e))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(path = %staging_root.display(), error = %e, "cannot read a skill projection staging entry");
+                    continue;
+                }
+            };
             let path = entry.path();
-            let age = fs::symlink_metadata(&path)
-                .ok()
-                .and_then(|meta| meta.modified().ok())
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                .unwrap_or_default();
+            let age = match fs::symlink_metadata(&path).and_then(|meta| meta.modified()) {
+                Ok(modified) => SystemTime::now().duration_since(modified).unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "cannot read the age of a skill projection leftover; treating it as new");
+                    continue;
+                }
+            };
             if age < min_age {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            let _skill_lock = match staged_tree_skill(&name) {
+            let owner = staged_tree_skill(&name);
+            if owner.as_ref().is_some_and(|skill| keep.contains(skill)) {
+                continue;
+            }
+            let _skill_lock = match owner {
                 Some(skill) => match self.lock_skill(&skill, Duration::ZERO) {
                     Ok(lock) => Some(lock),
                     Err(LifecycleError::LockTimeout { .. }) => continue,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(skill = %skill, error = %e, "cannot lock a skill to sweep its projection leftover");
+                        continue;
+                    }
                 },
                 None => None,
             };
@@ -218,14 +291,49 @@ impl SkillLifecycleStore {
                 fs::remove_file(&path)
             };
             match result {
-                Ok(()) => removed += 1,
+                Ok(()) => removed = removed.saturating_add(1),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "failed to sweep a skill projection leftover")
+                    tracing::warn!(path = %path.display(), error = %e, "failed to sweep a skill projection leftover");
                 }
             }
         }
-        Ok(removed)
+        removed
+    }
+}
+
+/// Creates `path` when missing; refuses a symlink or a non-directory.
+fn ensure_plain_dir(path: &Path) -> Result<(), LifecycleError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            Err(unsafe_path(path, "must be a real directory, not a symlink or file"))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(LifecycleError::io(path, e)),
+        },
+        Err(e) => Err(LifecycleError::io(path, e)),
+    }
+}
+
+/// Refuses to project onto an existing tree that is not the candidate's own
+/// revision: such a tree belongs to the operator, not to the lifecycle.
+fn refuse_unmanaged(target: &Path, candidate: &RevisionId) -> Result<(), LifecycleError> {
+    match fs::symlink_metadata(target) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(LifecycleError::io(target, e)),
+        Ok(meta) => {
+            if meta.is_dir() && Bundle::from_dir(target).is_ok_and(|found| found.revision_id() == candidate) {
+                Ok(())
+            } else {
+                Err(unsafe_path(
+                    target,
+                    "an unmanaged skill already occupies this directory; it is never replaced by a first publication",
+                ))
+            }
+        }
     }
 }
 
@@ -298,16 +406,21 @@ fn swap_in(stage: &Path, target: &Path, staging_root: &Path, skill: &SkillId) ->
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use rustix::fs::{CWD, RenameFlags, renameat_with};
-        match renameat_with(CWD, stage, CWD, target, RenameFlags::EXCHANGE) {
-            Ok(()) => {
-                // `stage` now names the previous tree.
-                remove_tree(stage);
-                return Ok(());
+        use rustix::io::Errno;
+        if !two_step_forced() {
+            match renameat_with(CWD, stage, CWD, target, RenameFlags::EXCHANGE) {
+                Ok(()) => {
+                    // `stage` now names the previous tree.
+                    remove_tree(stage);
+                    return Ok(());
+                }
+                Err(Errno::INVAL | Errno::NOSYS | Errno::NOTSUP) => {
+                    tracing::warn!(
+                        "renameat2 exchange is unsupported here; replacing the skill projection in two steps"
+                    );
+                }
+                Err(errno) => return Err(LifecycleError::io(target, std::io::Error::from(errno))),
             }
-            Err(errno) if errno == rustix::io::Errno::INVAL || errno == rustix::io::Errno::NOSYS => {
-                tracing::warn!("renameat2 exchange is unsupported here; replacing the skill projection in two steps");
-            }
-            Err(errno) => return Err(LifecycleError::io(target, std::io::Error::from(errno))),
         }
     }
     let old = staging_root.join(format!("{skill}.{}{OLD_SUFFIX}", uuid::Uuid::new_v4()));
@@ -322,6 +435,17 @@ fn swap_in(stage: &Path, target: &Path, staging_root: &Path, skill: &SkillId) ->
     }
     remove_tree(&old);
     Ok(())
+}
+
+/// Test seam: forces the two-rename fallback so it runs on Linux too.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+fn two_step_forced() -> bool {
+    super::publish::crash_hooks::two_step_forced()
+}
+
+#[cfg(all(not(test), any(target_os = "linux", target_os = "android")))]
+const fn two_step_forced() -> bool {
+    false
 }
 
 fn remove_tree(path: &Path) {
