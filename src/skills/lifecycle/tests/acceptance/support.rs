@@ -439,8 +439,10 @@ impl World {
     /// and the terminal of the same task for the experience's lock, a slow
     /// disk could make one of their bounded lock waits expire.
     pub async fn run_task_selected(&self, config: &Config, prompt: &str) -> anyhow::Result<String> {
-        self.loopback
-            .set_hook(Some(Loopback::selection_gate(self.loopback.requests() + 1, &self.store)));
+        self.loopback.set_hook(Some(Loopback::selection_gate(
+            self.loopback.requests() + 1,
+            &self.store,
+        )));
         let result = self.run_task(config, prompt).await;
         self.loopback.set_hook(None);
         result

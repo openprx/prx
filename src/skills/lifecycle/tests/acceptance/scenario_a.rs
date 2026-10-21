@@ -394,3 +394,51 @@ async fn evidence_that_does_not_show_uncovered_work_cannot_back_a_new_skill() {
     let refused = try_consolidate_uncovered(&covered, "Covered work.", &[nth(&hydrated, 0).record_id.clone()]);
     assert!(format!("{refused:?}").contains("covered"), "{refused:?}");
 }
+
+#[tokio::test]
+async fn a_new_skill_never_overwrites_an_unmanaged_directory_of_the_same_name() {
+    let world = World::new().await;
+    let suite = notes_suite(&world.owner, RELEASE_TOKEN, "hotfix-v1");
+    let auto = world.production_config(SkillsLifecycleModeConfig::Auto, &[(&skill(), &suite)]);
+    let service = world.service(&auto);
+    // Someone's own skill directory, not managed by the lifecycle, holds the name.
+    let own = world.ws.join("skills").join(super::support::SKILL_DIR);
+    std::fs::create_dir_all(&own).expect("test: unmanaged dir");
+    let own_text = "---\nname: someone-elses\ndescription: Not managed\n---\n\nKeep me.\n";
+    std::fs::write(own.join("SKILL.md"), own_text).expect("test: unmanaged skill");
+
+    for build in [4, 5] {
+        world
+            .run_task(
+                &auto,
+                &format!("TASK[release] Write the release notes for build {build}."),
+            )
+            .await
+            .expect("test: run without a managed skill");
+    }
+    let evidence: Vec<String> = world
+        .uncovered_runs(2)
+        .await
+        .iter()
+        .map(|r| r.record_id.clone())
+        .collect();
+    let pattern = consolidate_uncovered(&world, "Release notes recur and no skill covers them.", &evidence);
+    let proposer = ScriptedProposer::new(vec![append_patch("write the release procedure", NEW_SKILL_TEXT)]);
+    let proposal = staged(
+        propose_new(&world, new_skill_request("req-collide", &pattern), &proposer)
+            .await
+            .expect("test: propose"),
+    );
+    let (_, gated) = review_evaluate_gate(&world, &service, &suite, &proposal.proposal_id).await;
+    assert_eq!(gated.proposal.status, ProposalStatus::Eligible);
+
+    let refused = service.publish(&proposal.proposal_id);
+    let text = format!("{refused:?}");
+    assert!(refused.is_err() && text.contains("UnsafeStorePath"), "{text}");
+    assert!(world.store.active_binding(&skill()).expect("test: binding").is_none());
+    assert_eq!(
+        std::fs::read_to_string(own.join("SKILL.md")).expect("test: read"),
+        own_text,
+        "the unmanaged directory is untouched"
+    );
+}
