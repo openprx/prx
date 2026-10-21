@@ -113,6 +113,34 @@ impl ShellProcessAdapter {
     }
 
     pub async fn execute(&self, request: ShellProcessRequest<'_>) -> Result<ShellProcessOutcome, ShellProcessError> {
+        self.execute_with(request, false).await
+    }
+
+    /// Like [`Self::execute`], for a run that must be fully contained:
+    ///
+    /// * the whole process group ends the moment the command's leader exits,
+    ///   so nothing the command started outlives the call (and a child holding
+    ///   the output pipes open cannot keep the call waiting). Cancellation and
+    ///   timeout already tear the group down in both forms;
+    /// * on the native runtime the command does not inherit the PRX
+    ///   environment: it gets `PATH`, `LANG`, `LC_*` and `TZ` from the parent,
+    ///   `HOME` set to the request's working directory and `TMPDIR` to a
+    ///   directory inside it. No provider key, token or other credential
+    ///   reaches it. A container runtime isolates the environment itself.
+    ///
+    /// Used where a lifecycle-managed skill script runs.
+    pub async fn execute_joined(
+        &self,
+        request: ShellProcessRequest<'_>,
+    ) -> Result<ShellProcessOutcome, ShellProcessError> {
+        self.execute_with(request, true).await
+    }
+
+    async fn execute_with(
+        &self,
+        request: ShellProcessRequest<'_>,
+        end_group_on_exit: bool,
+    ) -> Result<ShellProcessOutcome, ShellProcessError> {
         if request.git == ShellGitPolicy::RefuseGit
             && crate::security::git_launch::shell_command_runs_git(request.command)
         {
@@ -138,6 +166,10 @@ impl ShellProcessAdapter {
             .runtime
             .build_shell_command_with_env(request.command, request.workspace_dir, &git_environment)
             .map_err(ShellProcessError::Runtime)?;
+        if end_group_on_exit && self.runtime.name() == "native" {
+            command.env_clear();
+            command.envs(contained_environment(request.workspace_dir).map_err(ShellProcessError::Runtime)?);
+        }
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -191,6 +223,16 @@ impl ShellProcessAdapter {
             }
             status = process.wait() => status.map_err(ShellProcessError::Wait)?,
         };
+        if end_group_on_exit {
+            // The leader was reaped by `wait`; the signal reaches whatever it
+            // left running in its group. Known window: once the leader is
+            // reaped and every member has exited, the group id could in
+            // principle be reused by an unrelated process before this
+            // `killpg`. The same window exists in the timeout and cancel
+            // paths; it is a few microseconds after `wait` returns, and the
+            // signal goes to the group id this adapter created.
+            process.kill_process_tree();
+        }
 
         enum DrainResult {
             Complete(Result<io::Result<(CapturedOutput, CapturedOutput)>, tokio::task::JoinError>),
@@ -245,6 +287,29 @@ impl ShellProcessAdapter {
     fn active_output_reader_count(&self) -> usize {
         self.active_output_readers.load(Ordering::SeqCst)
     }
+}
+
+/// The only environment a contained run gets (see
+/// [`ShellProcessAdapter::execute_joined`]).
+fn contained_environment(home: &Path) -> anyhow::Result<Vec<(String, std::ffi::OsString)>> {
+    let tmp = home.join(".tmp");
+    match std::fs::create_dir(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => anyhow::bail!("cannot create {}: {e}", tmp.display()),
+    }
+    let mut environment: Vec<(String, std::ffi::OsString)> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            (matches!(key.as_str(), "PATH" | "LANG" | "TZ") || key.starts_with("LC_")).then_some((key, value))
+        })
+        .collect();
+    if !environment.iter().any(|(key, _)| key == "PATH") {
+        environment.push(("PATH".to_string(), "/usr/local/bin:/usr/bin:/bin".into()));
+    }
+    environment.push(("HOME".to_string(), home.as_os_str().to_owned()));
+    environment.push(("TMPDIR".to_string(), tmp.into_os_string()));
+    Ok(environment)
 }
 
 async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
@@ -720,6 +785,66 @@ mod tests {
         assert!(outcome.stdout.contains("/dev/null"), "{}", outcome.stdout);
         assert!(outcome.stdout.trim_end().ends_with('1'), "{}", outcome.stdout);
         assert!(!marker.exists(), "the repository's fsmonitor ran in an operator job");
+    }
+
+    #[tokio::test]
+    async fn a_joined_run_gets_only_the_contained_environment() {
+        let temp = TempDir::new().expect("temp dir");
+        fn request<'a>(command: &'a str, dir: &'a Path) -> ShellProcessRequest<'a> {
+            ShellProcessRequest {
+                command,
+                workspace_dir: dir,
+                timeout: None,
+                cancellation: None,
+                git: ShellGitPolicy::RefuseGit,
+            }
+        }
+        // A plain run inherits the test process's variables; a joined one must
+        // see none that is not on the allowlist.
+        let plain = adapter().execute(request("env", temp.path())).await.expect("plain run");
+        let foreign: Vec<String> = std::env::vars_os()
+            .filter_map(|(key, _)| key.into_string().ok())
+            .filter(|key| {
+                !(matches!(
+                    key.as_str(),
+                    "PATH" | "LANG" | "TZ" | "HOME" | "TMPDIR" | "PWD" | "OLDPWD" | "SHLVL" | "_"
+                ) || key.starts_with("LC_"))
+            })
+            .collect();
+        assert!(!foreign.is_empty(), "the test process has variables to leak");
+        assert!(
+            foreign.iter().any(|key| plain.stdout.contains(&format!("{key}="))),
+            "the parent environment is inherited"
+        );
+        let joined = adapter()
+            .execute_joined(request("env", temp.path()))
+            .await
+            .expect("joined run");
+        let dir = std::fs::canonicalize(temp.path()).expect("canonical");
+        for line in joined.stdout.lines() {
+            let key = line.split('=').next().unwrap_or_default();
+            assert!(
+                matches!(
+                    key,
+                    "PATH" | "LANG" | "TZ" | "HOME" | "TMPDIR" | "PWD" | "OLDPWD" | "SHLVL" | "_"
+                ) || key.starts_with("LC_"),
+                "unexpected variable in a contained run: {key}"
+            );
+        }
+        for key in &foreign {
+            assert!(!joined.stdout.contains(&format!("{key}=")), "{key} leaked");
+        }
+        assert!(
+            joined.stdout.contains(&format!("HOME={}", temp.path().display())),
+            "{}",
+            joined.stdout
+        );
+        assert!(
+            joined
+                .stdout
+                .contains(&format!("TMPDIR={}", temp.path().join(".tmp").display()))
+        );
+        assert!(dir.join(".tmp").is_dir());
     }
 
     #[tokio::test]

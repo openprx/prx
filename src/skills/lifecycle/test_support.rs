@@ -36,3 +36,31 @@ pub(crate) fn publish_revision(
         .expect("test: publish revision");
     written.revision.revision_id
 }
+
+/// Like [`publish_revision`], for an executable bundle the operator reviewed:
+/// the revision records the review of its own bundle hash, as an executable
+/// import does.
+///
+/// # Panics
+/// Panics when the store refuses either step; test fixtures only.
+pub(crate) fn publish_reviewed_executable(
+    store: &SkillLifecycleStore,
+    skill: &SkillId,
+    bundle: &Bundle,
+    expected_generation: u64,
+) -> RevisionId {
+    let mut new = NewRevision::new(skill.clone(), SourceKind::Operator);
+    new.review_receipt_ids = vec![super::executable::review_receipt_id(bundle.revision_id())];
+    let written = store.write_revision(&new, bundle).expect("test: write revision");
+    store
+        .publish(&PublishRequest {
+            transaction_id: TransactionId::generate(),
+            skill_id: skill.clone(),
+            candidate: written.revision.revision_id.clone(),
+            candidate_record_digest: written.record_digest,
+            expected_generation,
+            enabled: true,
+        })
+        .expect("test: publish revision");
+    written.revision.revision_id
+}

@@ -295,28 +295,33 @@ pub struct ManagedReadRequest<'a> {
     pub max_bytes: u64,
 }
 
-/// Resolves the skill through the owner's lifecycle store and reads one
-/// resource of its revision.
+/// A skill name resolved to the one revision a call must use.
+pub(super) struct ResolvedRevision {
+    pub store: SkillLifecycleStore,
+    pub pin: PinnedSkillRevision,
+    /// Whether the revision came from a task pin.
+    pub pinned: bool,
+    /// The revision, with its bundle hash, owner scope and record digest
+    /// verified at this moment.
+    pub verified: VerifiedRevision,
+}
+
+/// Resolves `skill_name` to its revision for one call, the single resolution
+/// shared by `skill_read` and `skill_execute`: a task that holds a pin for the
+/// skill keeps it (even if the binding was renamed, disabled or removed since)
+/// and is never moved to a newer revision; otherwise the active binding is
+/// verified and, with `pin_task_id`, pinned for the task.
 ///
-/// `Ok(None)` means the skill is not lifecycle-managed for this owner (no
-/// store, a store of another owner, or no binding), and the caller keeps the
-/// legacy behaviour. A managed skill that is disabled, whose revision is
-/// missing or tampered, or whose resource is absent or too large is an error:
-/// nothing falls back to another revision. A successful read with a task id
-/// records a hydration receipt; a capture failure is logged and marks the
-/// experience as having dropped evidence, but never fails the read.
-pub fn read_managed_resource(request: &ManagedReadRequest<'_>) -> Result<Option<ManagedSkillRead>, LifecycleError> {
-    let ManagedReadRequest {
-        workspace_dir,
-        owner,
-        skill_name,
-        resource_path,
-        task_id,
-        pin_task,
-        max_bytes,
-        ..
-    } = *request;
-    let pin_task_id = task_id.filter(|_| pin_task);
+/// `Ok(None)` means the skill is not lifecycle-managed for this owner and the
+/// caller keeps the legacy behaviour. A managed skill that is disabled, or
+/// whose revision is missing or tampered, is an error: nothing falls back to
+/// another revision.
+pub(super) fn resolve_revision(
+    workspace_dir: &Path,
+    owner: &OwnerScope,
+    skill_name: &str,
+    pin_task_id: Option<&str>,
+) -> Result<Option<ResolvedRevision>, LifecycleError> {
     // A task that already holds a pin for this skill name keeps it, even if
     // the active binding was renamed, disabled or removed since.
     let held = pin_task_id.and_then(|task| TASK_PINS.find_by_name(owner, task, skill_name));
@@ -352,6 +357,55 @@ pub fn read_managed_resource(request: &ManagedReadRequest<'_>) -> Result<Option<
             }
             None => (issued, false, verified),
         }
+    };
+    Ok(Some(ResolvedRevision {
+        store,
+        pin,
+        pinned,
+        verified,
+    }))
+}
+
+/// Whether `skill_name` is lifecycle-managed in the store of `owner` (a binding
+/// exists for it, enabled or not). Used to refuse an unpinned fallback to the
+/// legacy path for a managed skill.
+pub fn is_managed_skill(workspace_dir: &Path, owner: &OwnerScope, skill_name: &str) -> Result<bool, LifecycleError> {
+    match SkillLifecycleStore::open_existing(workspace_dir, owner.clone()) {
+        Ok(Some(store)) => Ok(store.find_binding_by_name(skill_name)?.is_some()),
+        Ok(None) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Resolves the skill through the owner's lifecycle store and reads one
+/// resource of its revision.
+///
+/// `Ok(None)` means the skill is not lifecycle-managed for this owner (no
+/// store, a store of another owner, or no binding), and the caller keeps the
+/// legacy behaviour. A managed skill that is disabled, whose revision is
+/// missing or tampered, or whose resource is absent or too large is an error:
+/// nothing falls back to another revision. A successful read with a task id
+/// records a hydration receipt; a capture failure is logged and marks the
+/// experience as having dropped evidence, but never fails the read.
+pub fn read_managed_resource(request: &ManagedReadRequest<'_>) -> Result<Option<ManagedSkillRead>, LifecycleError> {
+    let ManagedReadRequest {
+        workspace_dir,
+        owner,
+        skill_name,
+        resource_path,
+        task_id,
+        pin_task,
+        max_bytes,
+        ..
+    } = *request;
+    let Some(ResolvedRevision {
+        store,
+        pin,
+        pinned,
+        verified,
+    }) = resolve_revision(workspace_dir, owner, skill_name, task_id.filter(|_| pin_task))?
+    else {
+        return Ok(None);
     };
     let file = select_resource(&verified.bundle, resource_path)?;
     let size = u64::try_from(file.bytes().len()).unwrap_or(u64::MAX);

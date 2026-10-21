@@ -4,13 +4,17 @@
 //! - no new declared capability requirement;
 //! - no new executable file, and no executable whose bytes changed;
 //! - no new `[[tools]]` entry in `SKILL.toml`, and no file a tool entry
-//!   references (a bundle path named in its command) whose bytes changed.
+//!   references (a bundle path named in its command) whose bytes changed;
+//! - for a baseline that is an executable bundle (SL11), no change at all
+//!   outside `SKILL.md`: scripts, references, `SKILL.toml` and every execute
+//!   mode are carried byte-identical, and no file is added or removed.
 //!
 //! The check reads both revisions from the store again at publication, so a
 //! candidate that changed after the source review (or was written by another
 //! path) cannot widen what the skill may do. Files are compared by SHA-256.
 
 use super::bundle::{Bundle, BundleFile};
+use super::executable::is_executable_bundle;
 use super::manifest::validate_manifest;
 use super::proposal::{SkillProposal, bounded};
 use super::store::SkillLifecycleStore;
@@ -19,6 +23,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 const SKILL_TOML: &str = "SKILL.toml";
+const SKILL_MD: &str = "SKILL.md";
 
 fn executables(bundle: &Bundle) -> BTreeSet<&str> {
     bundle
@@ -80,12 +85,46 @@ fn declared_tools(bundle: &Bundle) -> Result<BTreeSet<String>, String> {
     Ok(tools)
 }
 
+/// A revision of an executable bundle changes `SKILL.md` text and nothing
+/// else (SL11): every other file, scripts, references and `SKILL.toml`, is
+/// carried byte for byte from the baseline with the same execute bit, and no
+/// file is added or removed. The proposer cannot create or edit a script, and
+/// a candidate written by any other path is refused here the same way.
+fn executable_carry_problems(baseline: &Bundle, candidate: &Bundle) -> Vec<String> {
+    if !is_executable_bundle(baseline) {
+        return Vec::new();
+    }
+    let mut problems = Vec::new();
+    for file in baseline.files() {
+        match candidate.file(file.path()) {
+            None => problems.push(format!("{} of the executable bundle is removed", bounded(file.path()))),
+            Some(next) if next.is_executable() != file.is_executable() => {
+                problems.push(format!("{} changes its execute mode", bounded(file.path())));
+            }
+            Some(next) if file.path() != SKILL_MD && next.bytes() != file.bytes() => {
+                problems.push(format!(
+                    "{} of the executable bundle changed; only {SKILL_MD} may",
+                    bounded(file.path())
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for file in candidate.files() {
+        if baseline.file(file.path()).is_none() {
+            problems.push(format!("{} is added to an executable bundle", bounded(file.path())));
+        }
+    }
+    problems
+}
+
 impl SkillLifecycleStore {
     /// The capability check of a NEW skill, which has no baseline to compare
     /// with: it is instruction-only (`SKILL.md` alone, not executable, no
     /// `SKILL.toml` and so no declared tool), its recorded requirements equal
     /// its manifest's, and they stay within the capabilities the patterns it
-    /// rests on are scoped to. Executable bundles are refused until SL11.
+    /// rests on are scoped to. A proposer never creates an executable bundle:
+    /// script generation is a next-phase package.
     fn check_new_skill_capabilities(
         &self,
         proposal: &SkillProposal,
@@ -200,6 +239,7 @@ impl SkillLifecycleStore {
                 problems.push(format!("{} is run by a declared tool and changed", bounded(&path)));
             }
         }
+        problems.extend(executable_carry_problems(&baseline.bundle, &candidate.bundle));
         match (declared_tools(&baseline.bundle), declared_tools(&candidate.bundle)) {
             (Ok(before), Ok(after)) => {
                 if !after.is_subset(&before) {

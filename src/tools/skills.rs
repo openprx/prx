@@ -9,10 +9,14 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const MAX_SKILL_RESOURCE_BYTES: u64 = 64 * 1024;
 const MAX_SKILL_ALIAS_SPECS: usize = 32;
+/// Deadline of a lifecycle-managed executable skill call. A direct shell call
+/// has none; a managed one never runs unbounded.
+const MANAGED_EXECUTION_TIMEOUT: Duration = Duration::from_mins(5);
 
 fn executable_skill_tool_kind(kind: &str) -> bool {
     matches!(kind.to_ascii_lowercase().as_str(), "shell" | "script" | "http")
@@ -451,8 +455,12 @@ pub(crate) const LIFECYCLE_READ_ACTIONS: [&str; 3] = ["lifecycle_status", "lifec
 /// Lifecycle actions an agent may be offered that mutate. Each one goes
 /// through the lifecycle service under the operator's settings; none of them
 /// takes a suite, a policy, a mode or a revision body from the caller.
-pub(crate) const LIFECYCLE_MUTATING_ACTIONS: [&str; 3] =
-    ["lifecycle_publish", "lifecycle_cancel", "lifecycle_rollback"];
+pub(crate) const LIFECYCLE_MUTATING_ACTIONS: [&str; 4] = [
+    "lifecycle_publish",
+    "lifecycle_cancel",
+    "lifecycle_rollback",
+    "lifecycle_import_executable",
+];
 /// Operations that are never an agent action: they choose what judges a
 /// proposal, or spend on evaluation, and belong to the operator and the
 /// scheduler only.
@@ -597,6 +605,28 @@ impl SkillsManageTool {
                 })
                 .await
             }
+            "lifecycle_import_executable" => {
+                // The operator reviewed this directory as exactly this bundle
+                // hash; the service refuses a directory that hashes otherwise.
+                let source = PathBuf::from(Self::required_string(args, "source")?);
+                let source = if source.is_absolute() {
+                    source
+                } else {
+                    self.workspace_dir.join(source)
+                };
+                let revision = RevisionId::parse(Self::required_string(args, "revision_id")?)?;
+                tokio::task::spawn_blocking(move || {
+                    service.import_executable(&source, &revision).map(|import| {
+                        json!({
+                            "skill_id": import.skill_id.as_str(),
+                            "revision_id": import.revision_id.as_str(),
+                            "generation": import.generation,
+                            "replaced": import.replaced.as_ref().map(RevisionId::as_str),
+                        })
+                    })
+                })
+                .await
+            }
             _ => anyhow::bail!("Unsupported skills_manage action: {action}"),
         }
         .map_err(|error| anyhow::anyhow!("lifecycle worker failed: {error}"));
@@ -636,7 +666,7 @@ impl SkillsManageTool {
         }
         let risk = match action {
             "enable" | "disable" | "validate" => ResourceRiskLevel::Low,
-            "lifecycle_publish" | "lifecycle_rollback" => ResourceRiskLevel::High,
+            "lifecycle_publish" | "lifecycle_rollback" | "lifecycle_import_executable" => ResourceRiskLevel::High,
             _ => ResourceRiskLevel::Medium,
         };
         let arg = |key: &str| args.get(key).and_then(serde_json::Value::as_str).map(str::trim);
@@ -655,6 +685,13 @@ impl SkillsManageTool {
                 (Some(skill), Some(revision), Some(generation)) => Some(format!("{skill}:{revision}:{generation}")),
                 _ => None,
             },
+            // The complete bundle hash the operator reviewed is part of the
+            // operation: a grant for one reviewed artifact cannot publish
+            // another, and an edited script is a different hash.
+            "lifecycle_import_executable" => match (arg("source"), arg("revision_id")) {
+                (Some(source), Some(revision)) => Some(format!("{source}:{revision}")),
+                _ => None,
+            },
             _ => None,
         };
         let operation = target.as_ref().map_or_else(
@@ -662,7 +699,10 @@ impl SkillsManageTool {
             |target| format!("skills_manage:{action}:{target}"),
         );
         let grant = Self::approval_grant(args);
-        if matches!(action, "lifecycle_publish" | "lifecycle_rollback") {
+        if matches!(
+            action,
+            "lifecycle_publish" | "lifecycle_rollback" | "lifecycle_import_executable"
+        ) {
             // Publication changes what every future task reads, so it needs an
             // explicit grant bound to its target in every autonomy level, also
             // under full autonomy where the gate would otherwise let it pass.
@@ -698,8 +738,10 @@ impl SkillsManageTool {
         // a restart forgets it, which is acceptable because runtime grants
         // live about a minute, a repeated publish is idempotent by proposal
         // state, and a repeated rollback fails its expected_generation CAS.
-        if matches!(action, "lifecycle_publish" | "lifecycle_rollback")
-            && self.security.autonomy == crate::security::AutonomyLevel::Full
+        if matches!(
+            action,
+            "lifecycle_publish" | "lifecycle_rollback" | "lifecycle_import_executable"
+        ) && self.security.autonomy == crate::security::AutonomyLevel::Full
             && !grant.as_ref().is_some_and(ApprovalGrant::consume_single_use)
         {
             return Err(ToolResult {
@@ -749,7 +791,7 @@ impl Tool for SkillsManageTool {
 
     fn description(&self) -> &str {
         if self.lifecycle.is_some() {
-            "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Lifecycle proposals of learned revisions: 'lifecycle_status', 'lifecycle_list' and 'lifecycle_inspect' only read; 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes one and 'lifecycle_rollback' re-activates an earlier revision, all under the operator's lifecycle mode and policy. Mutating actions are approval-gated."
+            "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Lifecycle proposals of learned revisions: 'lifecycle_status', 'lifecycle_list' and 'lifecycle_inspect' only read; 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes one and 'lifecycle_rollback' re-activates an earlier revision and 'lifecycle_import_executable' publishes an operator-authored executable bundle from a directory, bound to the complete bundle hash the operator reviewed, all under the operator's lifecycle mode and policy. Mutating actions are approval-gated."
         } else {
             "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Mutating actions are approval-gated."
         }
@@ -763,7 +805,7 @@ impl Tool for SkillsManageTool {
         actions.extend(lifecycle.iter().copied());
         let mut action_description = "Skill action: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, 'remove' deletes one".to_string();
         if !lifecycle.is_empty() {
-            action_description.push_str(", 'lifecycle_status' reports the lifecycle mode and proposal counts, 'lifecycle_list' lists proposals, 'lifecycle_inspect' shows one proposal, 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes a proposal, 'lifecycle_rollback' re-activates an earlier revision");
+            action_description.push_str(", 'lifecycle_status' reports the lifecycle mode and proposal counts, 'lifecycle_list' lists proposals, 'lifecycle_inspect' shows one proposal, 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes a proposal, 'lifecycle_rollback' re-activates an earlier revision, 'lifecycle_import_executable' publishes a reviewed executable bundle");
         }
         let mut schema = json!({
             "type": "object",
@@ -774,7 +816,7 @@ impl Tool for SkillsManageTool {
                     "description": action_description
                 },
                 "name": {"type": "string", "description": "Workspace skill name; required for 'create', 'update', 'enable', 'disable', 'validate' and 'remove'"},
-                "source": {"type": "string", "description": "Git URL or explicit local directory; required for 'install'"},
+                "source": {"type": "string", "description": "Git URL or explicit local directory; required for 'install'. For 'lifecycle_import_executable', the directory of the reviewed executable bundle"},
                 "description": {"type": "string", "description": "Short description of the skill; required for 'create'"},
                 "instructions": {"type": "string", "description": "SKILL.md instructions; required for 'create'"}
             },
@@ -786,7 +828,7 @@ impl Tool for SkillsManageTool {
         {
             properties.insert("proposal_id".to_string(), json!({"type": "string", "description": "Lifecycle proposal id; required for 'lifecycle_inspect', 'lifecycle_publish' and 'lifecycle_cancel'"}));
             properties.insert("skill_id".to_string(), json!({"type": "string", "description": "Lifecycle skill id; optional filter for 'lifecycle_list', required for 'lifecycle_rollback'"}));
-            properties.insert("revision_id".to_string(), json!({"type": "string", "description": "An earlier published revision id; required for 'lifecycle_rollback'"}));
+            properties.insert("revision_id".to_string(), json!({"type": "string", "description": "An earlier published revision id, required for 'lifecycle_rollback'; for 'lifecycle_import_executable' the complete bundle hash the operator reviewed"}));
             properties.insert("expected_generation".to_string(), json!({"type": "integer", "minimum": 0, "description": "Active generation the caller observed; required for 'lifecycle_rollback'"}));
             properties.insert(
                 "reason".to_string(),
@@ -840,6 +882,10 @@ impl Tool for SkillsManageTool {
                 crate::tools::schema::ActionRequirement {
                     action: "lifecycle_rollback",
                     required: &["skill_id", "revision_id", "expected_generation"],
+                },
+                crate::tools::schema::ActionRequirement {
+                    action: "lifecycle_import_executable",
+                    required: &["source", "revision_id"],
                 },
             ]);
         }
@@ -950,11 +996,16 @@ impl Tool for SkillsManageTool {
     }
 }
 
+mod execute_managed;
+
 pub struct SkillExecuteTool {
     workspace_dir: PathBuf,
     config: Config,
     shell: ShellProcessAdapter,
     http: super::HttpRequestTool,
+    security: Arc<SecurityPolicy>,
+    runtime_name: String,
+    managed_timeout: Duration,
 }
 
 impl SkillExecuteTool {
@@ -966,17 +1017,28 @@ impl SkillExecuteTool {
         browser_config: &crate::config::BrowserConfig,
         http_config: &crate::config::HttpRequestConfig,
     ) -> Self {
+        let runtime_name = runtime.name().to_string();
         Self {
             workspace_dir,
             config,
             shell: ShellProcessAdapter::new(runtime),
             http: super::HttpRequestTool::new(
-                security,
+                Arc::clone(&security),
                 browser_config.allowed_domains.clone(),
                 http_config.max_response_size,
                 http_config.timeout_secs,
             ),
+            security,
+            runtime_name,
+            managed_timeout: MANAGED_EXECUTION_TIMEOUT,
         }
+    }
+
+    /// Overrides the deadline of a lifecycle-managed executable call.
+    #[must_use]
+    pub const fn with_managed_timeout(mut self, timeout: Duration) -> Self {
+        self.managed_timeout = timeout;
+        self
     }
 
     fn alias_component(value: &str) -> String {
@@ -1103,10 +1165,11 @@ impl SkillExecuteTool {
         &self,
         root: &Path,
         tool: &crate::skills::SkillTool,
-        arguments: Option<&serde_json::Value>,
+        arguments: BTreeMap<String, String>,
         cancellation: Option<CancellationToken>,
+        // `Some` for a lifecycle-managed run: it has a deadline and is joined.
+        timeout: Option<Duration>,
     ) -> anyhow::Result<ToolResult> {
-        let arguments = Self::scalar_arguments(tool, arguments)?;
         if tool.command.trim().is_empty() {
             anyhow::bail!("Skill tool '{}' has an empty command", tool.name);
         }
@@ -1167,16 +1230,20 @@ impl SkillExecuteTool {
             );
         };
 
-        let outcome = self
-            .shell
-            .execute(ShellProcessRequest {
-                command: &command,
-                workspace_dir: root,
-                timeout: None,
-                cancellation,
-                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
-            })
-            .await;
+        let request = ShellProcessRequest {
+            command: &command,
+            workspace_dir: root,
+            timeout,
+            cancellation,
+            git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
+        };
+        // A deadline marks a managed run, which is also joined: the process
+        // group ends with its leader.
+        let outcome = if timeout.is_some() {
+            self.shell.execute_joined(request).await
+        } else {
+            self.shell.execute(request).await
+        };
         match outcome {
             Ok(outcome) => Ok(ToolResult {
                 success: outcome.status.success(),
@@ -1187,6 +1254,11 @@ impl SkillExecuteTool {
                 success: false,
                 output: String::new(),
                 error: Some(super::traits::TOOL_EXECUTION_CANCELLED.to_string()),
+            }),
+            Err(ShellProcessError::Timeout(limit)) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Skill tool timed out after {limit:?} and was killed")),
             }),
             Err(error) => Err(error.into()),
         }
@@ -1279,9 +1351,15 @@ impl Tool for SkillExecuteTool {
             self.parse_alias(name)
                 .ok_or_else(|| anyhow::anyhow!("Unknown skill tool alias '{name}'"))?
         };
+        if let Some(result) = self
+            .execute_managed(&skill_name, &tool_name, &args, cancellation.clone())
+            .await?
+        {
+            return Ok(result);
+        }
         let (root, tool) = self.resolve(&skill_name, &tool_name)?;
-        self.execute_resolved(&root, &tool, args.get("arguments"), cancellation)
-            .await
+        let arguments = Self::scalar_arguments(&tool, args.get("arguments"))?;
+        self.execute_resolved(&root, &tool, arguments, cancellation, None).await
     }
 
     fn tier(&self) -> ToolTier {
@@ -2537,3 +2615,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod executable_tests;

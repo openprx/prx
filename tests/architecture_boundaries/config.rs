@@ -481,6 +481,9 @@ const ALLOWED_HOME_DIRECTORY_LOOKUPS: &[&str] = &[
     // Reports whether `HOME` is set at all; nothing is read under it.
     "src/doctor/mod.rs::check_environment",
     "src/runtime/shell_process.rs::<module>",
+    // Sets `HOME` of a contained skill run to the run directory; nothing is read
+    // under the real home.
+    "src/runtime/shell_process.rs::contained_environment",
     // The stdio MCP launch allowlist (D-045) names `HOME` (and, on Windows,
     // `USERPROFILE`) as a variable the child inherits; nothing is read under
     // it here.

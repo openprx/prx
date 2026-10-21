@@ -208,6 +208,16 @@ fn skills_manage_lifecycle_operation(
             format!("skills_manage:lifecycle_cancel:{}", arg("proposal_id")?),
             RiskLevel::Medium,
         )),
+        // Bound to the directory and to the complete bundle hash the operator
+        // reviewed (SL11); the same text `SkillsManageTool::authorize` builds.
+        "lifecycle_import_executable" => Some((
+            format!(
+                "skills_manage:lifecycle_import_executable:{}:{}",
+                arg("source")?,
+                arg("revision_id")?
+            ),
+            RiskLevel::High,
+        )),
         "lifecycle_rollback" => {
             let generation = args.get("expected_generation").and_then(serde_json::Value::as_u64)?;
             Some((

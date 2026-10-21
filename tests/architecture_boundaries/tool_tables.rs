@@ -586,8 +586,9 @@ pub(super) const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
         evidence_file: "src/tools/skills.rs",
         evidence: "shell: ShellProcessAdapter",
         reason: "the skills tool runs a resolved skill command through the same shared \
-                 child-process adapter; its `self.http` call in the same function stays in the \
-                 direct-invocation inventory",
+                 child-process adapter (`execute` for an unmanaged skill, `execute_joined` for a \
+                 lifecycle-managed one, which also ends the process group when the leader exits); \
+                 its `self.http` call in the same function stays in the direct-invocation inventory",
     },
     NonToolCallSite {
         entry: "src/webhook/mod.rs::fail_blocking",
