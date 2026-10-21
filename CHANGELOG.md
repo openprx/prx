@@ -20,9 +20,21 @@ and the migration warnings below before upgrading.
   and generation-checked publication, rollback and recovery. The lifecycle
   service exposes approval-bound management actions and
   `prx skills lifecycle status|list|inspect|publish|cancel|rollback|force-close`.
-  It defaults to disabled and `draft_only`; executable proposals are refused,
-  and automatic proposal scheduling is not wired. See
-  [instruction skill lifecycle](docs/skill-lifecycle.md).
+  It defaults to disabled and `draft_only`; automatic proposal scheduling is
+  not wired. See [skill lifecycle](docs/skill-lifecycle.md).
+- Zero-baseline instruction-skill proposals from repeated uncovered completed
+  root tasks, compared against a frozen no-skill baseline before gated first
+  publication. This evidence does not verify task success or establish learning;
+  local acceptance scenarios prove mechanics only. Uncovered-task recording
+  stops at the 4096-experience threshold; automatic retention is not wired.
+- Reviewed executable lifecycle bundles through operator-authorized
+  `skills_manage` action `lifecycle_import_executable`, with a signed one-shot
+  grant bound to the source directory and complete bundle hash. Managed
+  execution checks the pinned revision's review lineage, clears the native
+  process environment down to an allowlist, and joins process cleanup.
+  Proposals may change only `SKILL.md`; script generation remains unsupported.
+  A native child that deliberately escapes with `setsid` is outside process-group
+  cleanup; docker runtime containment is the current option for that case.
 - Release catalog inspection and retired-model migration commands, plus
   persistent `low`/`medium`/`high` levels and typed model parameter selections
   through transactional configuration management. CLI, chat, onboarding and
@@ -35,6 +47,17 @@ and the migration warnings below before upgrading.
 
 ### Changed
 
+- Lifecycle publish and rollback now refresh the `skills/<dir>/` compatibility
+  projection and invalidate catalog snapshots after the binding commits.
+  `CommittedRepairRequired` means the binding is live but repair remains;
+  recovery repairs the projection and resets its disabled marker to the
+  binding's enabled state. First publication refuses an unmanaged directory
+  with different content. macOS replacement uses two renames and can briefly
+  leave the projection absent. See [projection recovery](docs/skill-lifecycle.md#compatibility-projection).
+- Migration marks legacy executable bundles `ExecutableNeedsReview` and skips
+  automatic import. Managed execution of an older unreviewed revision, including
+  after rollback, requires operator re-import of the reviewed bundle. See the
+  [upgrade actions](docs/migration-unreleased.md).
 - Skill lifecycle evidence: the terminal experience record now stores
   infrastructure, permission and adherence facts, and the execution trace
   snapshot gains an optional `unavailable_attempts` counter. Rollback note:

@@ -375,7 +375,7 @@ top_k = 32
 enabled = false
 
 # See docs/skill-lifecycle.md for concepts, commands and recovery.
-# Skill lifecycle: learned revisions of skills are proposed, evaluated against an
+# Skill lifecycle: new instruction skills and revisions are evaluated against an
 # operator-owned frozen suite, gated and only then published. Everything here is
 # operator-owned; no tool or model output can change it. The section is read at
 # process start (changing it needs a restart) and is validated when the
@@ -386,8 +386,9 @@ enabled = false
 #   mode = "auto"        publishes an eligible proposal after every gate
 # A weaker publication policy is refused at load, not downgraded:
 # `require_holdout = false` and `min_cases_floor` below 3 do not load, and
-# neither does `allow_executable_proposals = true` (reviewed executable bundles
-# are not available yet). `storage_dir` only accepts the default, the location
+# neither does `allow_executable_proposals = true`. Reviewed executable bundles
+# enter through an operator import; proposals change SKILL.md only, never scripts.
+# `storage_dir` only accepts the default, the location
 # `skill_read` and recovery use. `owner_scope` names the owner whose store this
 # installation manages and is required when enabled; an agent run from another
 # owner, or from a caller whose owner the runtime cannot derive, does not reach
@@ -406,14 +407,18 @@ enabled = false
 # rollback|force-close`. `force-close` (CLI only) closes an authorized proposal
 # stuck on a transaction conflict as failed or stale with a recorded reason; it
 # never publishes and leaves the active revision as it is (a publication that
-# turns out to be live is recorded Committed instead of closed). Proposing is not
-# wired yet, so a lifecycle with no proposals stays idle. With the daemon, an
-# enabled lifecycle runs a recovery sweep at start (retrying with backoff while
+# turns out to be live is recorded Committed instead of closed). Automatic
+# proposal scheduling is not wired; enabling it does not start proposal runs.
+# With the daemon, an enabled lifecycle runs a recovery sweep at start
+# (retrying with backoff while
 # another process holds the store lock) and `status` lists any proposal it had
 # to skip. Publishing or rolling back through `skills_manage` needs a signed
 # one-shot approval grant bound to the proposal (or to skill, revision and
 # observed generation for a rollback), in every autonomy level; the grant is
-# spent on use.
+# spent on use. `skills_manage` action `lifecycle_import_executable` publishes a
+# reviewed directory in auto mode, with a signed one-shot grant bound to `source`
+# and `revision_id` (the complete bundle hash). Enabling the lifecycle does not
+# authorize executable imports or waive execution-time review lineage checks.
 [skills_lifecycle]
 enabled = false
 mode = "draft_only"
@@ -2848,9 +2853,22 @@ Admitted Cron/Xin model turns now obtain a source-bound decision after recording
 
 ## Skill lifecycle guide
 
-See [Instruction skill lifecycle](skill-lifecycle.md) for bundle and receipt
-semantics, the lifecycle CLI and agent actions, publication gates, recovery,
-and the limits of the shipped instruction-only implementation.
+See [Skill lifecycle](skill-lifecycle.md) for new instruction skills from
+uncovered completed root tasks, frozen no-skill baselines, reviewed executable
+imports, publication gates and recovery. Completed turns are not verified task
+success, and local acceptance is not evidence of learning. Uncovered-task
+recording stops at the 4096-experience threshold; automatic retention is not
+wired and this is not a hard cap on managed-skill experiences.
+
+Publication and rollback refresh the compatibility projection after commit;
+`CommittedRepairRequired` leaves the binding live for recovery to repair.
+Recovery resets the disabled marker to the binding's enabled state. First
+publication refuses different unmanaged content; macOS uses a non-atomic
+two-rename replacement. Legacy executables are marked `ExecutableNeedsReview`
+and need operator re-import to run managed. Managed native execution clears
+the environment down to an allowlist and joins process cleanup; deliberate
+`setsid` escape requires docker runtime containment today. See the
+[upgrade actions](migration-unreleased.md) before adopting managed execution.
 
 ## Per-model levels and parameters
 

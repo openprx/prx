@@ -16,6 +16,8 @@ live in the linked pages and in the `[Unreleased]` section of the
 | Plugin outbound requests | An empty `http_allowlist` now denies every URL. Use URL patterns such as `https://api.example.com/*`, not string prefixes such as `https://api.example.com*`. The SSRF guard still refuses private, loopback and other unsafe destinations. See [plugin trust and networking](plugin-developer-guide.md). | For plugins needing outbound HTTP |
 | Workspace command hooks default off | Set `[security] workspace_hooks = "on"` only after reviewing workspace commands. Remove non-null `cwd` from `hooks.json`: the whole candidate file is refused. Commands now start with a cleared environment in the dedicated directory beside `config.toml`; use explicit paths and allowed `env` entries. See [workspace command hooks](configuration.md#workspace-command-hooks). | To run workspace command hooks |
 | Terminal learning evidence format | Older binaries with strict terminal/trace readers cannot read the newly written `TerminalFacts`, experience records and optional `unavailable_attempts` field. Retain the newer binary and evidence for recovery; do not erase records to force a downgrade. | Before a binary downgrade |
+| Legacy executable lifecycle skills | Migration marks these `ExecutableNeedsReview` and does not automatically import them. Review the bundle and re-import with `skills_manage` action `lifecycle_import_executable`, `source` and `revision_id`, in `auto` mode with a signed one-shot grant bound to that directory and complete bundle hash. Managed execution refuses an older unreviewed revision, including after rollback. See [executable bundles](skill-lifecycle.md#executable-bundles). | To run legacy executables as managed skills |
+| Managed skill compatibility directories | Treat `skills/<dir>/` as a projection of the active binding. Later publication, rollback and recovery overwrite local edits; recovery also resets the disabled marker to the binding's enabled state. First publication refuses different unmanaged content. `CommittedRepairRequired` means the binding already committed: retain the store and allow recovery to repair the copy. macOS replacement is not atomic and may briefly leave the directory absent. See [projection recovery](skill-lifecycle.md#compatibility-projection). | For lifecycle-managed skills |
 | `[causal_tree]` schema (decision plane) and new default `enabled = true` | An old file is mapped on load and rewritten on the next save. **The decision plane turns on after upgrade** when the file has no `schema_version` and its `enabled = false` is the old default (the merged `[causal_tree]` table holds nothing but `enabled = false`, as the old `prx init` template wrote, or it also holds a legacy-only key: `w_confidence`, `write_decision_log`, `write_metrics`, or `policy.max_branches` / `rehearsal_timeout_ms` / `default_side_effect_mode` / `circuit_breaker_threshold` / `circuit_breaker_cooldown_secs`): that false is dropped as unset. An unversioned `enabled = false` alongside other `causal_tree` keys (including in a `config.d` fragment) stays off. To keep it off, set the current `schema_version = 2` and `enabled = false` (example below). Fix any file refused with a file/key error as listed in the changelog. | Only to keep it off, or if the load is refused |
 | Serialized 500 ms decision latency budget | Schema 1 saves wrote `causal_tree.policy.extra_latency_budget_ms = 500` even when the operator never set it. The one-time schema 1 to 2 migration treats that exact value as unset, and a hosted decision backend adopts its catalog recommendation on the next backend change. Reapply 500 under schema 2 only if that lower budget is intentional; it then remains explicit, and PRX warns when it is below the selected backend's recommendation. | Only to retain an intentional 500 ms override |
 | `agent.tool_dispatcher` is never read | Delete the key. It still loads and logs a deprecation warning. | No |
@@ -85,12 +87,17 @@ enabled = false
 
 ## No action needed
 
-- The [instruction skill lifecycle](skill-lifecycle.md) is opt-in and defaults
+- The [skill lifecycle](skill-lifecycle.md) is opt-in and defaults
   to disabled / `draft_only`. Its CLI and approval-bound agent actions manage
-  existing proposals and revisions; automatic proposal scheduling and
-  executable lifecycle bundles are not shipped yet. Existing skill directories
-  are not rewritten on enablement, and `skill_read` keeps its existing behavior
-  until a managed binding applies.
+  proposals and revisions, including reviewed executable imports. Automatic
+  proposal scheduling and script generation remain unsupported. New instruction
+  skills can be staged from repeated uncovered completed root tasks and tested
+  against a frozen no-skill baseline; this is not a learning claim. Uncovered
+  recording stops at the 4096-experience threshold, with no automatic retention.
+  Unmanaged directories are not rewritten merely by enabling the lifecycle;
+  managed bindings use the projection and migration rules above. Managed native
+  scripts receive a cleared, allowlisted environment and joined cleanup, but
+  deliberate `setsid` escape requires docker runtime containment today.
 - Model levels and parameter overrides remain TOML settings committed through
   transactional configuration management. Catalog updates arrive only with the
   binary. Retired selections remain loadable; preview
