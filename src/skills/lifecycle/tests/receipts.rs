@@ -45,6 +45,13 @@ fn request<'a>(tmp: &'a TempDir, enabled: bool, names: &'a [&'a str]) -> Selecti
     }
 }
 
+/// Background-write tests use their own run id: the test drain hook is keyed
+/// by run, so a shared id would let a concurrent test await (and take) the
+/// other test's pending write.
+fn with_run<'a>(request: SelectionRequest<'a>, run_id: &'a str) -> SelectionRequest<'a> {
+    SelectionRequest { run_id, ..request }
+}
+
 fn observation(kind: TerminalKind, verified: bool) -> TerminalObservation {
     TerminalObservation {
         kind,
@@ -226,28 +233,37 @@ async fn a_recovered_terminal_keeps_the_join_the_live_path_made() {
 #[tokio::test(flavor = "current_thread")]
 async fn scheduled_receipts_do_not_wait_for_a_locked_store_and_dedupe_in_memory() {
     let (tmp, store) = setup();
-    let exp = SkillId::parse(&experience_id(&owner(OWNER), "run-1")).expect("test: experience id");
+    let exp = SkillId::parse(&experience_id(&owner(OWNER), "run-locked")).expect("test: experience id");
     let held = store
         .lock_skill(&exp, std::time::Duration::from_secs(1))
         .expect("test: hold the experience lock");
     let started = std::time::Instant::now();
-    assert_eq!(schedule_selection_receipts(&request(&tmp, true, &[NAME])), 1);
+    assert_eq!(
+        schedule_selection_receipts(&with_run(request(&tmp, true, &[NAME]), "run-locked")),
+        1
+    );
     // The repeat assemblies of the same turn never reach the store.
-    assert_eq!(schedule_selection_receipts(&request(&tmp, true, &[NAME])), 0);
-    assert_eq!(schedule_selection_receipts(&request(&tmp, true, &[NAME])), 0);
+    assert_eq!(
+        schedule_selection_receipts(&with_run(request(&tmp, true, &[NAME]), "run-locked")),
+        0
+    );
+    assert_eq!(
+        schedule_selection_receipts(&with_run(request(&tmp, true, &[NAME]), "run-locked")),
+        0
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_millis(250),
         "scheduling must not wait for the lock: {:?}",
         started.elapsed()
     );
     drop(held);
-    drain_background_for_test("run-1").await;
+    drain_background_for_test("run-locked").await;
     let experience = store
-        .read_experience("run-1")
+        .read_experience("run-locked")
         .expect("test: read")
         .expect("test: record");
     assert_eq!(experience.selection_receipts.len(), 1);
-    release_task_pins(&owner(OWNER), "run-1");
+    release_task_pins(&owner(OWNER), "run-locked");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -259,21 +275,32 @@ async fn a_disabled_lifecycle_schedules_nothing() {
 #[test]
 fn scheduling_outside_a_runtime_is_skipped_and_keeps_the_claim_free() {
     let (tmp, store) = setup();
-    assert_eq!(schedule_selection_receipts(&request(&tmp, true, &[NAME])), 0);
-    assert!(store.read_experience("run-1").expect("test: read").is_none());
+    assert_eq!(
+        schedule_selection_receipts(&with_run(request(&tmp, true, &[NAME]), "run-outside-runtime")),
+        0
+    );
+    assert!(
+        store
+            .read_experience("run-outside-runtime")
+            .expect("test: read")
+            .is_none()
+    );
     // A later call inside a runtime still records the skill.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .expect("test: runtime");
     runtime.block_on(async {
-        assert_eq!(schedule_selection_receipts(&request(&tmp, true, &[NAME])), 1);
-        drain_background_for_test("run-1").await;
+        assert_eq!(
+            schedule_selection_receipts(&with_run(request(&tmp, true, &[NAME]), "run-outside-runtime")),
+            1
+        );
+        drain_background_for_test("run-outside-runtime").await;
     });
     let experience = store
-        .read_experience("run-1")
+        .read_experience("run-outside-runtime")
         .expect("test: read")
         .expect("test: record");
     assert_eq!(experience.selection_receipts.len(), 1);
-    release_task_pins(&owner(OWNER), "run-1");
+    release_task_pins(&owner(OWNER), "run-outside-runtime");
 }
