@@ -658,11 +658,40 @@ fn one_unreadable_binding_does_not_abort_recovery_or_lose_the_report() {
         uuid::Uuid::new_v4()
     ));
     fs::create_dir_all(&leftover).expect("test: leftover tree");
+    let old = tmp.path().join(format!(
+        "skills/.openprx-projection/deploy-helper.{}.old",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&old).expect("test: replaced tree");
     let report = store
         .recover(Duration::ZERO)
         .expect("test: recover still returns its report");
     assert_eq!(report.aborted, [TransactionId::parse("t2").expect("test: tx")]);
-    assert_eq!(report.projections.failed.len(), 1, "{:?}", report.projections.failed);
-    assert_eq!(report.swept_staging, 1);
+    assert!(
+        report.projections.listing_error.is_some(),
+        "the listing failure is reported"
+    );
+    assert_eq!(report.projections.failed.len(), 0);
+    assert_eq!(report.swept_staging, 1, "only the .new leftover goes");
     assert!(!leftover.exists());
+    assert!(
+        old.exists(),
+        "a .old tree may be the only copy while bindings are unreadable"
+    );
+}
+
+#[test]
+fn recovery_resets_the_disabled_marker_of_a_bound_skill_to_the_binding() {
+    let (tmp, store) = setup();
+    let a = write(&store, &skill(), "alpha-desc");
+    store
+        .publish(&publish_req("t1", &skill(), &a, 0, true))
+        .expect("test: publish");
+    let marker = tmp.path().join("skills/.openprx-disabled/deploy-helper");
+    fs::create_dir_all(marker.parent().expect("test: parent")).expect("test: marker dir");
+    fs::write(&marker, b"").expect("test: gateway toggle");
+    assert_eq!(discovered(tmp.path()).len(), 0, "the toggle hides the skill");
+    store.recover(Duration::ZERO).expect("test: recover");
+    assert!(!marker.exists(), "the binding is enabled, so the marker is cleared");
+    assert_eq!(discovered(tmp.path()), [(NAME.to_string(), "alpha-desc".to_string())]);
 }

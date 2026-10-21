@@ -18,6 +18,13 @@
 //! projection that is absent and keeps the `.old` tree of any skill whose
 //! repair failed. No symlink is created or followed.
 //!
+//! A first publication refuses to replace an existing `skills/<dir>/` that is
+//! not its own revision (an unmanaged tree). After that the bound directory
+//! belongs to the lifecycle: later generations and rollbacks overwrite it, and
+//! recovery rewrites it when it differs from the active binding and resets its
+//! disabled marker to the binding's `enabled` state on every pass (see
+//! `sync_disabled_marker`).
+//!
 //! Only skills that have an active binding are touched. A legacy skill with no
 //! binding is never read or written here.
 
@@ -53,10 +60,12 @@ pub(super) enum ProjectionChange {
 pub struct ProjectionRepair {
     /// Skills whose projection was missing or stale and was rewritten.
     pub repaired: Vec<SkillId>,
-    /// What could not be repaired (a skill id, or `bindings` when the binding
-    /// list itself was unreadable), with the reason. The next sweep or a retry
-    /// of the committed transaction tries again.
-    pub failed: Vec<(String, String)>,
+    /// Skills that could not be repaired, with the reason. The next sweep or a
+    /// retry of the committed transaction tries again.
+    pub failed: Vec<(SkillId, String)>,
+    /// Set when the active bindings could not be listed at all, so no skill
+    /// was examined. The sweep then keeps every replaced (`.old`) tree.
+    pub listing_error: Option<String>,
     /// Skills whose previous projection tree (`.old`) must be kept because
     /// their repair failed.
     pub(super) keep: Vec<SkillId>,
@@ -203,7 +212,7 @@ impl SkillLifecycleStore {
             Ok(bindings) => bindings,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to list active skill bindings for projection repair");
-                report.failed.push(("bindings".to_string(), e.to_string()));
+                report.listing_error = Some(e.to_string());
                 return report;
             }
         };
@@ -220,7 +229,7 @@ impl SkillLifecycleStore {
                 Ok(Some(ProjectionChange::Unchanged) | None) => {}
                 Err(e) => {
                     tracing::warn!(skill = %skill, error = %e, "failed to repair a skill projection");
-                    report.failed.push((skill.to_string(), e.to_string()));
+                    report.failed.push((skill.clone(), e.to_string()));
                     report.keep.push(skill);
                 }
             }
@@ -228,12 +237,15 @@ impl SkillLifecycleStore {
         report
     }
 
-    /// Removes staged and replaced projection trees older than `min_age`
-    /// whose skill lock is free, except those of skills in `keep` (their
-    /// repair failed, so the previous tree may be the only copy). Never
-    /// fails: problems are logged and the entry is left for the next sweep.
-    /// Returns how many were removed.
-    pub(super) fn sweep_projection_staging(&self, min_age: Duration, keep: &[SkillId]) -> usize {
+    /// Removes staged (`.new`) and replaced (`.old`) projection trees older
+    /// than `min_age` whose skill lock is free. The `.old` tree of a skill in
+    /// `repair.keep` is kept (its repair failed, so it may be the only copy),
+    /// and so is every `.old` tree when the bindings could not be listed.
+    /// Never fails: problems are logged and the entry is left for the next
+    /// sweep. Returns how many were removed.
+    pub(super) fn sweep_projection_staging(&self, min_age: Duration, repair: &ProjectionRepair) -> usize {
+        let keep = repair.keep.as_slice();
+        let keep_all_old = repair.listing_error.is_some();
         let staging_root = match self.workspace_dir() {
             Ok(workspace) => crate::skills::skills_dir(workspace).join(PROJECTION_STAGING_DIR),
             Err(e) => {
@@ -271,7 +283,8 @@ impl SkillLifecycleStore {
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             let owner = staged_tree_skill(&name);
-            if owner.as_ref().is_some_and(|skill| keep.contains(skill)) {
+            let is_old = name.ends_with(OLD_SUFFIX);
+            if is_old && (keep_all_old || owner.as_ref().is_some_and(|skill| keep.contains(skill))) {
                 continue;
             }
             let _skill_lock = match owner {

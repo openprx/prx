@@ -601,7 +601,7 @@ impl SkillLifecycleStore {
         report.projections = self.repair_projections(lock_timeout);
         report.swept_staging = self
             .sweep_staging(staging_min_age)?
-            .saturating_add(self.sweep_projection_staging(staging_min_age, &report.projections.keep));
+            .saturating_add(self.sweep_projection_staging(staging_min_age, &report.projections));
         Ok(report)
     }
 
