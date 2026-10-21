@@ -89,8 +89,13 @@ pub(super) fn stage_draft(fx: &Fixture, request_id: &str, bundle: &Bundle, new_t
         .expect("test: baseline")
         .bundle;
     let baseline_md = String::from_utf8_lossy(baseline.file("SKILL.md").expect("test: SKILL.md").bytes()).into_owned();
-    let figures = crate::skills::lifecycle::propose::reapply_diff(&baseline_md, "Writes release notes", &diff)
-        .expect("test: the edit applies to the baseline");
+    let figures = crate::skills::lifecycle::propose::reapply(
+        crate::skills::lifecycle::propose::Mode::Revise,
+        &baseline_md,
+        "Writes release notes",
+        &diff,
+    )
+    .expect("test: the edit applies to the baseline");
     diff.changed_tokens = figures.changed_tokens;
     diff.baseline_tokens = figures.baseline_tokens;
     diff.allowed_tokens = figures.allowed_tokens;
@@ -104,7 +109,7 @@ pub(super) fn stage_draft(fx: &Fixture, request_id: &str, bundle: &Bundle, new_t
         skill_id: skill(),
         requested_patterns: Vec::new(),
         expected_generation: 1,
-        baseline_revision: fx.baseline.clone(),
+        baseline_revision: Some(fx.baseline.clone()),
         candidate_revision: Some(bundle.revision_id().clone()),
         pattern_ids: Vec::new(),
         evidence_ids: Vec::new(),
@@ -1146,7 +1151,7 @@ async fn an_evaluation_of_other_revisions_is_unbound() {
     let fx = fixture();
     let (proposal, pin) = evaluated(&fx, &suite, &all_better()).await;
     let candidate = fx.candidate.clone();
-    edit_proposal(&fx, &proposal.proposal_id, |p| p.baseline_revision = candidate);
+    edit_proposal(&fx, &proposal.proposal_id, |p| p.baseline_revision = Some(candidate));
     assert!(matches!(
         gate(&fx, &proposal, &suite, &[pin], &policy(), None).await,
         Err(GateError::Unbound(_))

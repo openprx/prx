@@ -230,14 +230,19 @@ pub struct AuthorBinding {
 #[serde(deny_unknown_fields)]
 pub struct ProposalBasis {
     /// Distinct root tasks whose stored experience is learning-eligible, ended
-    /// in a failure terminal and hydrated the baseline revision.
+    /// in a failure terminal and hydrated the baseline revision. For a new
+    /// skill (despite the name): the distinct completed root tasks that ran
+    /// without any managed skill. The runtime records a completed turn as a
+    /// success and has no task-outcome check, so these are uncovered work, not
+    /// verified failures.
     pub failed_tasks_on_baseline: usize,
     /// Distinct root tasks that contradict the patterns on the same revision.
     pub contradicting_tasks: usize,
     /// `true` when every supporting experience carries a verified adherence
     /// fact for the baseline revision (its declared tools were called) and
     /// positively no infrastructure or permission cause. Experiences whose
-    /// facts are unknown (older records) never qualify as support.
+    /// facts are unknown (older records) never qualify as support. Always
+    /// `false` for a new skill: there is nothing yet to adhere to.
     pub adherence_verified: bool,
 }
 
@@ -331,7 +336,10 @@ pub struct SkillProposal {
     /// Active generation the proposal was prepared against; publication must
     /// recheck it.
     pub expected_generation: u64,
-    pub baseline_revision: RevisionId,
+    /// The active revision the proposal revises; `None` for a NEW skill
+    /// (`operation == Create`), whose baseline is doing the task without the
+    /// skill and whose expected generation is 0.
+    pub baseline_revision: Option<RevisionId>,
     /// Identity of the staged candidate bundle; `None` until one is staged.
     pub candidate_revision: Option<RevisionId>,
     pub pattern_ids: Vec<PatternId>,
@@ -568,6 +576,11 @@ impl SkillLifecycleStore {
             || record.evidence_ids.len() > MAX_PATTERN_EVIDENCE
         {
             return Err(tampered("proposal lists exceed their bounds"));
+        }
+        if (record.operation == ProposalOperation::Create) != record.baseline_revision.is_none() {
+            return Err(tampered(
+                "a new skill has no baseline revision and a revision of one has",
+            ));
         }
         if record.candidate_revision.is_some() != record.diff.is_some() {
             return Err(tampered("candidate revision and diff must be present together"));

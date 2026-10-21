@@ -72,6 +72,8 @@ pub enum LifecycleError {
     TerminalConflict { task_id: String },
     #[error("skill name {0:?} is bound to more than one skill id")]
     AmbiguousSkillName(String),
+    #[error("skill name {name:?} is already held by skill {holder}")]
+    SkillNameTaken { name: String, holder: String },
     #[error("skill {0:?} is disabled")]
     SkillDisabled(String),
     #[error("resource unavailable in the pinned revision: {0}")]

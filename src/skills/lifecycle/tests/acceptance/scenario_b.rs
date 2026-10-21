@@ -7,7 +7,9 @@
 //! already running on A keeps reading A.
 
 use super::flows::{capture_failed_tasks, propose, review_evaluate_gate, staged};
-use super::support::{ScriptedProposer, World, consolidate, notes_suite, nth, replace_patch, skill, skill_text};
+use super::support::{
+    Loopback, ScriptedProposer, World, consolidate, notes_suite, nth, replace_patch, skill, skill_text,
+};
 use crate::config::skills_lifecycle::SkillsLifecycleModeConfig;
 use crate::skills::lifecycle::ProposalStatus;
 use std::sync::Arc;
@@ -30,7 +32,7 @@ async fn a_bounded_revision_replaces_the_active_one_while_a_running_task_keeps_i
 
     // A demonstrated procedural failure on A, then the bounded revision.
     let pre = world
-        .run_task(&auto, "TASK[release] Write the release notes for build 4.")
+        .run_task_selected(&auto, "TASK[release] Write the release notes for build 4.")
         .await
         .expect("test: run on A");
     assert_eq!(pre, "FINAL:changelog-v1", "A follows its own (wrong) rule");
@@ -85,7 +87,10 @@ async fn a_bounded_revision_replaces_the_active_one_while_a_running_task_keeps_i
     let start = world.loopback.requests();
     let publisher = Arc::clone(&service);
     let id = proposal.proposal_id.clone();
+    // The selection receipt of this run is on record before B goes live.
+    let selected = Loopback::selection_gate(start + 1, &world.store);
     world.loopback.set_hook(Some(Arc::new(move |number| {
+        selected(number);
         if number == start + 3 {
             publisher.publish(&id).expect("test: publish during the running task");
         }
@@ -119,19 +124,34 @@ async fn a_bounded_revision_replaces_the_active_one_while_a_running_task_keeps_i
     assert_ne!(running_exp.hydration_receipts.len(), 0);
     assert!(running_exp.hydration_receipts.iter().all(|h| h.revision_id == a));
     assert!(
-        running_exp.selection_receipts.iter().all(|s| s.revision_id == a),
-        "a selection receipt, when written, names A"
+        !running_exp.selection_receipts.is_empty(),
+        "the run selected the skill: {running_exp:?}"
     );
+    assert!(
+        running_exp.selection_receipts.iter().all(|s| s.revision_id == a),
+        "the selection receipts name A, the revision selected when the task started"
+    );
+    assert_eq!(running_exp.late_evidence, 0);
 
     // New tasks use B.
+    let begin = world.loopback.requests();
+    world
+        .loopback
+        .set_hook(Some(Loopback::selection_gate(begin + 1, &world.store)));
     let fresh = world
         .run_task(&auto, "TASK[release] Write the release notes for build 42.")
         .await
         .expect("test: new task");
+    world.loopback.set_hook(None);
     assert_eq!(fresh, "FINAL:changelog-v2");
     let latest = world.production_runs(3).await;
     let newest = nth(&latest, 2);
     assert!(newest.hydration_receipts.iter().all(|h| h.revision_id == b));
+    assert!(!newest.selection_receipts.is_empty(), "the new task selected the skill");
+    assert!(
+        newest.selection_receipts.iter().all(|s| s.revision_id == b),
+        "the selection receipts name B"
+    );
     assert_eq!(
         world
             .store

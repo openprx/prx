@@ -20,7 +20,8 @@ use unicode_normalization::UnicodeNormalization;
 
 /// Evidence references kept per pattern (evidence and counterevidence each).
 pub const MAX_PATTERN_EVIDENCE: usize = 256;
-/// Distinct tasks a pattern needs before it may back a skill-revision proposal.
+/// Distinct root tasks a pattern needs before it may back a skill-revision or
+/// new-skill proposal.
 pub const MIN_DISTINCT_TASKS_FOR_PROPOSAL: usize = 2;
 /// Withdrawn evidence ids a pattern lists; the rest is only counted.
 pub(super) const MAX_WITHDRAWN_KEPT: usize = 64;
@@ -53,13 +54,20 @@ pub enum FailureClass {
     /// The wrong skill was retrieved: improve metadata or retrieval, evaluated
     /// separately.
     WrongSkillRetrieved,
+    /// Repeated work that no managed skill covered: the zero-baseline path. Its
+    /// evidence is completed root tasks (the runtime records a completed turn
+    /// as a success and has no task-outcome check) that read no managed skill.
+    /// Such a pattern is about no skill yet (`skill_id` is `None`), and the only
+    /// thing it may lead to is a proposal for a NEW instruction skill.
+    MissingSkill,
 }
 
 /// What a pattern of a class may be used for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PatternKind {
-    /// Procedural guidance; may back a skill revision.
+    /// Procedural guidance; may back a skill revision or, when no skill covers
+    /// the work, a new instruction skill.
     Guidance,
     /// An adherence lapse of correct content.
     Adherence,
@@ -74,7 +82,7 @@ impl FailureClass {
     #[must_use]
     pub const fn kind(self) -> PatternKind {
         match self {
-            Self::MissingGuidance => PatternKind::Guidance,
+            Self::MissingGuidance | Self::MissingSkill => PatternKind::Guidance,
             Self::GuidanceNotFollowed => PatternKind::Adherence,
             Self::WrongSkillRetrieved => PatternKind::Retrieval,
             Self::InfrastructureUnavailable
@@ -88,6 +96,12 @@ impl FailureClass {
     #[must_use]
     pub const fn allows_skill_revision(self) -> bool {
         matches!(self, Self::MissingGuidance)
+    }
+
+    /// Only work that no managed skill covered may lead to a new skill.
+    #[must_use]
+    pub const fn allows_new_skill(self) -> bool {
+        matches!(self, Self::MissingSkill)
     }
 }
 
@@ -107,6 +121,8 @@ pub struct FailureFacts {
     pub correct_guidance_not_followed: bool,
     /// The needed guidance was absent from, or wrong in, the loaded skill.
     pub guidance_missing_or_wrong: bool,
+    /// The work recurs and no managed skill covered it at all.
+    pub no_skill_covers_the_work: bool,
 }
 
 /// Classifies a failure. The order puts causes that are least attributable to
@@ -129,6 +145,8 @@ pub const fn classify_failure(facts: &FailureFacts) -> Option<FailureClass> {
         Some(FailureClass::GuidanceNotFollowed)
     } else if facts.guidance_missing_or_wrong {
         Some(FailureClass::MissingGuidance)
+    } else if facts.no_skill_covers_the_work {
+        Some(FailureClass::MissingSkill)
     } else {
         None
     }
@@ -312,6 +330,18 @@ impl KnowledgePattern {
             }
         }
         hex::encode(hasher.finalize())
+    }
+
+    /// Whether the pattern may back a proposal for a NEW skill: it records
+    /// repeated work no skill covered (it is about no skill), supported by
+    /// enough distinct root tasks, and the contradicting evidence does not
+    /// reach the supporting evidence.
+    #[must_use]
+    pub const fn usable_for_new_skill(&self) -> bool {
+        self.failure_class.allows_new_skill()
+            && self.skill_id.is_none()
+            && self.confidence_basis.distinct_tasks >= MIN_DISTINCT_TASKS_FOR_PROPOSAL
+            && self.confidence_basis.counter_distinct_tasks < self.confidence_basis.distinct_tasks
     }
 
     /// Whether the pattern may back a skill revision proposal: it is guidance

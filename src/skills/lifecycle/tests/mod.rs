@@ -14,6 +14,7 @@ mod manifest;
 mod migrate;
 mod projection;
 mod propose;
+mod propose_new;
 mod publish;
 mod receipts;
 mod service;

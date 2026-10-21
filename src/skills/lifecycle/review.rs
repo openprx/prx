@@ -12,9 +12,10 @@
 use super::bundle::Bundle;
 use super::manifest::validate_manifest;
 use super::proposal::{ProposalFailure, ProposalFailureKind, ProposalStatus, SkillProposal, bounded, is_proposal_id};
-use super::propose::{MAX_EDIT_TOKENS, MAX_EDITS, reapply_diff};
+use super::propose::{MAX_EDIT_TOKENS, MAX_EDITS, Mode, reapply};
+use super::propose_new::{skeleton_bundle, skeleton_text};
 use super::rejection::ProposalOperation;
-use super::store::{SkillLifecycleStore, VerifiedRevision, check_private, read_record, record_bytes};
+use super::store::{SkillLifecycleStore, check_private, read_record, record_bytes};
 use super::types::{LifecycleError, OwnerScope, RevisionId, SCHEMA_VERSION, SkillId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -77,7 +78,8 @@ pub struct SourceReviewRecord {
     pub owner_scope: OwnerScope,
     pub proposal_id: String,
     pub skill_id: SkillId,
-    pub baseline_revision: RevisionId,
+    /// `None` for a new skill.
+    pub baseline_revision: Option<RevisionId>,
     pub candidate_revision: RevisionId,
     /// Who asked for the review (an operator or the service); the verdict
     /// itself comes from [`SOURCE_REVIEW_IDENTITY`].
@@ -110,6 +112,12 @@ fn seal_digest(review: &SourceReviewRecord) -> Result<String, LifecycleError> {
     hasher.update(SCHEMA_VERSION.to_be_bytes());
     hasher.update(bytes);
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// What a review compares the candidate with.
+struct Base {
+    bundle: Bundle,
+    description: String,
 }
 
 /// What a review did.
@@ -199,6 +207,7 @@ fn safety_problems(baseline: &Bundle, candidate: &Bundle) -> Vec<String> {
 /// and reproduces the candidate exactly.
 fn bounded_problems(
     proposal: &SkillProposal,
+    mode: Mode,
     baseline: &Bundle,
     baseline_description: &str,
     candidate: &Bundle,
@@ -232,7 +241,7 @@ fn bounded_problems(
             .map(str::to_string)
     };
     match (skill_md(baseline), skill_md(candidate)) {
-        (Some(original), Some(staged)) => match reapply_diff(&original, baseline_description, diff) {
+        (Some(original), Some(staged)) => match reapply(mode, &original, baseline_description, diff) {
             Ok(rebuilt) => {
                 if rebuilt.skill_md != staged {
                     problems.push("the recorded diff does not reproduce the staged candidate".to_string());
@@ -438,59 +447,97 @@ impl SkillLifecycleStore {
         }
         let mut applicability = Vec::new();
         let mut moved = false;
-        if proposal.operation != ProposalOperation::Revise {
-            applicability.push("only revisions of an existing skill are reviewed".to_string());
+        let mode = Mode::of(proposal.operation);
+        if proposal.operation == ProposalOperation::Disable {
+            applicability.push("only revisions and new skills are reviewed".to_string());
         }
-        if candidate_id == proposal.baseline_revision {
+        if proposal.baseline_revision.as_ref() == Some(&candidate_id) {
             applicability.push("the candidate equals its baseline".to_string());
         }
-        let baseline: Option<VerifiedRevision> =
-            match self.read_revision(&proposal.skill_id, &proposal.baseline_revision, None) {
-                Ok(verified) => Some(verified),
+        // What the candidate is compared with: the active revision, or for a
+        // new skill the skeleton its frontmatter fixes (instruction-only: the
+        // skeleton is `SKILL.md` alone, so any other file is an addition).
+        let baseline: Option<Base> = match &proposal.baseline_revision {
+            Some(revision) => match self.read_revision(&proposal.skill_id, revision, None) {
+                Ok(verified) => Some(Base {
+                    description: verified.revision.description.clone(),
+                    bundle: verified.bundle,
+                }),
                 Err(e) => {
                     applicability.push(format!("the baseline revision cannot be read: {e}"));
                     None
                 }
-            };
-        match self.active_binding(&proposal.skill_id)? {
-            Some(binding)
-                if binding.revision_id == proposal.baseline_revision
-                    && binding.generation == proposal.expected_generation => {}
-            _ => {
-                moved = true;
-                applicability
-                    .push("the active revision is no longer the baseline the proposal was made against".to_string());
+            },
+            None => match validate_manifest(&candidate) {
+                Ok(info) => {
+                    match skeleton_bundle(&skeleton_text(&info.name, &info.description, &info.required_tools)) {
+                        Ok(bundle) => Some(Base {
+                            bundle,
+                            description: info.description,
+                        }),
+                        Err(e) => {
+                            applicability.push(format!("the skeleton cannot be rebuilt: {e}"));
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    applicability.push(format!("the candidate manifest is invalid: {e}"));
+                    None
+                }
+            },
+        };
+        let binding = self.active_binding(&proposal.skill_id)?;
+        let current = match (&proposal.baseline_revision, binding) {
+            (Some(revision), Some(binding)) => {
+                binding.revision_id == *revision && binding.generation == proposal.expected_generation
             }
+            (None, None) => proposal.expected_generation == 0,
+            _ => false,
+        };
+        if !current {
+            moved = true;
+            applicability.push(match mode {
+                Mode::Revise => {
+                    "the active revision is no longer the baseline the proposal was made against".to_string()
+                }
+                Mode::New => "the skill has been published since the proposal was made".to_string(),
+            });
         }
         let mut findings = Vec::new();
         let missing = || vec!["no baseline to compare the candidate with".to_string()];
         let (bounded_list, safety_list) = baseline.as_ref().map_or_else(
             || (missing(), missing()),
-            |verified| {
-                match (validate_manifest(&verified.bundle), validate_manifest(&candidate)) {
-                    (Ok(before), Ok(after)) => {
-                        if (before.name.as_str(), &before.semantic_version)
-                            != (after.name.as_str(), &after.semantic_version)
-                        {
-                            applicability.push("the candidate changes the skill name or version".to_string());
+            |base| {
+                if mode == Mode::Revise {
+                    match (validate_manifest(&base.bundle), validate_manifest(&candidate)) {
+                        (Ok(before), Ok(after)) => {
+                            if (before.name.as_str(), &before.semantic_version)
+                                != (after.name.as_str(), &after.semantic_version)
+                            {
+                                applicability.push("the candidate changes the skill name or version".to_string());
+                            }
+                            if before.required_tools != after.required_tools {
+                                applicability.push("the candidate changes the required tools".to_string());
+                            }
                         }
-                        if before.required_tools != after.required_tools {
-                            applicability.push("the candidate changes the required tools".to_string());
-                        }
+                        (_, Err(e)) => applicability.push(format!("the candidate manifest is invalid: {e}")),
+                        (Err(e), _) => applicability.push(format!("the baseline manifest is invalid: {e}")),
                     }
-                    (_, Err(e)) => applicability.push(format!("the candidate manifest is invalid: {e}")),
-                    (Err(e), _) => applicability.push(format!("the baseline manifest is invalid: {e}")),
                 }
                 (
-                    bounded_problems(proposal, &verified.bundle, &verified.revision.description, &candidate),
-                    safety_problems(&verified.bundle, &candidate),
+                    bounded_problems(proposal, mode, &base.bundle, &base.description, &candidate),
+                    safety_problems(&base.bundle, &candidate),
                 )
             },
         );
         findings.push(finding(
             ReviewCheck::Applicability,
             applicability,
-            "the candidate revises the active revision of its skill",
+            match mode {
+                Mode::Revise => "the candidate revises the active revision of its skill",
+                Mode::New => "the candidate is a new instruction skill on its fixed skeleton",
+            },
         ));
         findings.push(finding(
             ReviewCheck::BoundedChanges,

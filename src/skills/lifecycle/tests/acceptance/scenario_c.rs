@@ -13,8 +13,8 @@ use super::support::{
 };
 use crate::config::skills_lifecycle::SkillsLifecycleModeConfig;
 use crate::skills::lifecycle::{
-    EvalSplit, EvaluationPin, EvaluationRequest, GateError, GateReason, KnowledgePattern, ProposalStatus,
-    ProposeOutcome, RevisionId, ServiceError, SuppressionStage,
+    EvalSplit, EvaluationPin, EvaluationRequest, GateError, GateReason, KnowledgePattern, ProposalFailureKind,
+    ProposalStatus, ProposeOutcome, RevisionId, ServiceError, SuppressionStage,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -70,25 +70,36 @@ fn assert_nothing_changed(s: &Setup) {
     );
 }
 
-#[tokio::test]
-async fn a_suite_with_the_critical_cases_filtered_out_cannot_gate_a_proposal() {
-    let s = setup().await;
-    let patch = multi_patch(
+/// The patch that fixes the release rule and quietly breaks the critical hotfix rule.
+fn hotfix_breaking_patch() -> String {
+    multi_patch(
         "fix the release rule",
         &[
             (OLD_RELEASE, NEW_RELEASE),
             ("RULE hotfix => hotfix-v1", "RULE hotfix => hotfix-v0"),
         ],
-    );
-    let proposer = ScriptedProposer::new(vec![patch.clone(), patch.clone()]);
+    )
+}
+
+/// Proposes the hotfix-breaking change, evaluates the validation split with
+/// the `rigged` suite instead of the registered one, and gates the result.
+/// Returns the rigged evaluation's summary, the gate result and the proposal id.
+async fn gate_with_a_rigged_suite(
+    s: &Setup,
+    rigged: &crate::skills::lifecycle::FrozenSuite,
+) -> (
+    crate::skills::lifecycle::EvaluationSummary,
+    Result<crate::skills::lifecycle::GateOutcome, ServiceError>,
+    String,
+) {
+    let patch = hotfix_breaking_patch();
+    let proposer = ScriptedProposer::new(vec![patch.clone(), patch]);
     let proposal = staged(propose(&s.world, "req-c1", &s.pattern, &proposer).await);
 
-    // A suite with the critical cases filtered out would let it through; the
-    // service refuses to even store such a suite, and an evaluation made with
-    // one cannot be gated.
-    let filtered = without_hotfix(&s.suite);
+    // The service refuses to even store a suite that is not the registered one.
+    assert_ne!(rigged.digest(), s.suite.digest());
     assert!(matches!(
-        s.service.install_operator_suite(&filtered),
+        s.service.install_operator_suite(rigged),
         Err(ServiceError::SuiteNotRegistered { .. })
     ));
     s.service.install_operator_suite(&s.suite).expect("test: install suite");
@@ -99,12 +110,12 @@ async fn a_suite_with_the_critical_cases_filtered_out_cannot_gate_a_proposal() {
         .begin_evaluation(&proposal.proposal_id, "acceptance")
         .expect("test: begin");
     let candidate = proposal.candidate_revision.clone().expect("test: candidate");
-    let rigged = s
+    let recorded = s
         .world
         .store
         .evaluate(
             &EvaluationRequest {
-                suite: &filtered,
+                suite: rigged,
                 split: EvalSplit::Validation,
                 baseline: Some(s.a.clone()),
                 candidate,
@@ -115,36 +126,98 @@ async fn a_suite_with_the_critical_cases_filtered_out_cannot_gate_a_proposal() {
         )
         .await
         .expect("test: rigged evaluation");
-    let rigged_pin = EvaluationPin {
-        evaluation_id: rigged.receipt.record_id.clone(),
-        receipt_digest: rigged.receipt_digest,
+    let verified = s
+        .world
+        .store
+        .verify_evaluation(&recorded.receipt.record_id, Some(&recorded.receipt_digest))
+        .expect("test: verify the rigged evaluation");
+    let pin = EvaluationPin {
+        evaluation_id: recorded.receipt.record_id.clone(),
+        receipt_digest: recorded.receipt_digest,
     };
     s.service
         .finish_evaluation(&proposal.proposal_id, "rigged")
         .expect("test: finish");
-    let refused = s
+    let gated = s
         .service
-        .gate(&proposal.proposal_id, &[rigged_pin], None, &CancellationToken::new())
+        .gate(&proposal.proposal_id, &[pin], None, &CancellationToken::new())
         .await;
-    assert!(
-        matches!(
-            refused,
-            Err(ServiceError::Gate(
-                GateError::SuiteChanged(_) | GateError::Unbound(_) | GateError::MissingEvaluation { .. }
-            ))
-        ),
-        "{refused:?}"
-    );
+    (verified.summary, gated, proposal.proposal_id)
+}
+
+fn assert_not_eligible(s: &Setup, proposal_id: &str) {
     assert_ne!(
         s.world
             .store
-            .read_proposal(&proposal.proposal_id)
+            .read_proposal(proposal_id)
             .expect("test: read")
             .expect("test: present")
             .status,
         ProposalStatus::Eligible
     );
-    assert_nothing_changed(&s);
+    assert_nothing_changed(s);
+}
+
+#[tokio::test]
+async fn a_suite_with_the_critical_cases_filtered_out_cannot_gate_a_proposal() {
+    let s = setup().await;
+    let filtered = without_hotfix(&s.suite);
+    let (summary, gated, id) = gate_with_a_rigged_suite(&s, &filtered).await;
+    assert_eq!(
+        summary.critical_regressions, 0,
+        "the filtered suite cannot see the regression"
+    );
+    assert!(
+        matches!(&gated, Err(ServiceError::Gate(GateError::SuiteChanged(_)))),
+        "{gated:?}"
+    );
+    assert_not_eligible(&s, &id);
+}
+
+#[tokio::test]
+async fn a_suite_with_a_renamed_critical_case_cannot_gate_a_proposal() {
+    let s = setup().await;
+    // Same cases and prompts; the critical hotfix cases carry other ids, as if
+    // the regression were filed under a case the policy does not know.
+    let mut altered = s.suite.suite().clone();
+    for case in altered.cases.iter_mut().filter(|case| case.task_family == "hotfix") {
+        case.case_id = format!("{}-renamed", case.case_id);
+    }
+    let renamed = altered.freeze().expect("test: freeze the renamed suite");
+    let (summary, gated, id) = gate_with_a_rigged_suite(&s, &renamed).await;
+    assert!(
+        summary.critical_regressions >= 1,
+        "the regression is still measurable: {summary:?}"
+    );
+    assert!(
+        matches!(&gated, Err(ServiceError::Gate(GateError::SuiteChanged(_)))),
+        "{gated:?}"
+    );
+    assert_not_eligible(&s, &id);
+}
+
+#[tokio::test]
+async fn a_suite_with_a_renamed_critical_family_cannot_gate_a_proposal() {
+    let s = setup().await;
+    // The hotfix family is renamed and loses its critical mark: this is the
+    // rigging that would let the regression through if the suite content, not
+    // its frozen digest, decided what is critical.
+    let mut altered = s.suite.suite().clone();
+    for case in altered.cases.iter_mut().filter(|case| case.task_family == "hotfix") {
+        case.task_family = "notes".to_string();
+        case.critical = false;
+    }
+    let renamed = altered.freeze().expect("test: freeze the renamed suite");
+    let (summary, gated, id) = gate_with_a_rigged_suite(&s, &renamed).await;
+    assert_eq!(
+        summary.critical_regressions, 0,
+        "the renamed family hides the critical regression"
+    );
+    assert!(
+        matches!(&gated, Err(ServiceError::Gate(GateError::SuiteChanged(_)))),
+        "{gated:?}"
+    );
+    assert_not_eligible(&s, &id);
 }
 
 #[tokio::test]
@@ -254,6 +327,8 @@ async fn a_change_that_only_fails_the_holdout_is_rejected() {
 #[tokio::test]
 async fn a_change_that_widens_the_required_tools_never_becomes_eligible() {
     let s = setup().await;
+    let mode_before = s.service.mode();
+    let settings_before = format!("{:?}", s.service.settings());
     let widened = format!("required-tools: [{REQUIRED_TOOL}, filesystem:native:shell]");
     let patch = multi_patch(
         "fix the release rule and use the shell",
@@ -269,5 +344,74 @@ async fn a_change_that_widens_the_required_tools_never_becomes_eligible() {
     };
     assert_eq!(proposal.status, ProposalStatus::Failed);
     assert!(proposal.candidate_revision.is_none(), "nothing was staged");
+
+    // The refusal and its reason are on record in the store, not just in the
+    // returned value.
+    let stored = s
+        .world
+        .store
+        .read_proposal(&proposal.proposal_id)
+        .expect("test: read")
+        .expect("test: the refused proposal is persisted");
+    assert_eq!(stored.status, ProposalStatus::Failed);
+    assert!(stored.candidate_revision.is_none() && stored.diff.is_none());
+    let failure = stored.failure.expect("test: the reason is persisted");
+    // The frontmatter, where the required tools live, is not text the
+    // proposer can edit: its replace target is not in the body.
+    assert_eq!(failure.kind, ProposalFailureKind::PatchNotApplicable);
+    assert!(
+        failure.detail.contains("does not occur in the body"),
+        "{}",
+        failure.detail
+    );
+    let listed = s.service.list_proposals(Some(&skill())).expect("test: list");
+    assert!(
+        listed
+            .iter()
+            .any(|p| p.proposal_id == proposal.proposal_id && p.status == "failed"),
+        "{listed:?}"
+    );
+
+    // The service mode and the policy did not move.
+    assert_eq!(s.service.mode(), mode_before);
+    assert_eq!(format!("{:?}", s.service.settings()), settings_before);
+    assert_nothing_changed(&s);
+}
+
+#[tokio::test]
+async fn a_candidate_whose_manifest_widens_the_required_tools_is_refused_by_the_capability_check() {
+    use crate::skills::lifecycle::{LifecycleError, NewRevision, SourceKind};
+    let s = setup().await;
+    let patch = multi_patch("fix the release rule", &[(OLD_RELEASE, NEW_RELEASE)]);
+    let proposer = ScriptedProposer::new(vec![patch]);
+    let proposal = staged(propose(&s.world, "req-c5", &s.pattern, &proposer).await);
+
+    // A candidate revision that a proposer could not produce, written by another
+    // path: its manifest and record add the shell to the baseline's tools.
+    let base = s.world.store.read_revision(&skill(), &s.a, None).expect("test: A");
+    let text = String::from_utf8(base.bundle.file("SKILL.md").expect("test: SKILL.md").bytes().to_vec())
+        .expect("test: utf8")
+        .replace(
+            &format!("required-tools: [{REQUIRED_TOOL}]"),
+            &format!("required-tools: [{REQUIRED_TOOL}, filesystem:native:shell]"),
+        );
+    let widened = crate::skills::lifecycle::Bundle::from_entries(vec![crate::skills::lifecycle::BundleEntry {
+        path: "SKILL.md".into(),
+        bytes: text.into_bytes(),
+        executable: false,
+    }])
+    .expect("test: bundle");
+    let mut new = NewRevision::new(skill(), SourceKind::Learned);
+    new.parent_revision_id = Some(s.a.clone());
+    new.capability_requirements = vec![REQUIRED_TOOL.to_string(), "filesystem:native:shell".to_string()];
+    let written = s.world.store.write_revision(&new, &widened).expect("test: write");
+    let mut tampered = proposal;
+    tampered.candidate_revision = Some(written.revision.revision_id);
+    let refused = s.world.store.check_capabilities(&tampered, None);
+    assert!(
+        matches!(&refused, Err(LifecycleError::CapabilityExpansion { reason, .. })
+            if reason.contains("newly requires the capability") && reason.contains("filesystem:native:shell")),
+        "{refused:?}"
+    );
     assert_nothing_changed(&s);
 }

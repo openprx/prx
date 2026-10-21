@@ -831,7 +831,7 @@ fn a_candidate_with_a_new_executable_or_tool_widens_capabilities() {
         &candidate_bundle("ANSWER=report-v2"),
         "ANSWER=report-v2",
     );
-    draft.baseline_revision = base.revision.revision_id;
+    draft.baseline_revision = Some(base.revision.revision_id);
     draft.candidate_revision = Some(same.revision.revision_id);
     assert!(fx.store.check_capabilities(&draft, None).is_ok());
     draft.candidate_revision = Some(more.revision.revision_id);
@@ -909,7 +909,7 @@ fn a_learned_candidate_cannot_change_the_required_tools() {
         &candidate_bundle("ANSWER=report-v2"),
         "ANSWER=report-v2",
     );
-    draft.baseline_revision = base.revision.revision_id;
+    draft.baseline_revision = Some(base.revision.revision_id);
     let check = |draft: &SkillProposal| fx.store.check_capabilities(draft, None);
 
     // Same list, same record: fine.
@@ -1152,7 +1152,7 @@ fn a_changed_executable_or_tool_script_widens_capabilities() {
         &candidate_bundle("ANSWER=report-v2"),
         "ANSWER=report-v2",
     );
-    draft.baseline_revision = base;
+    draft.baseline_revision = Some(base);
     draft.candidate_revision = Some(same);
     assert!(fx.store.check_capabilities(&draft, None).is_ok());
     for changed in [edited_exec, edited_tool_file] {

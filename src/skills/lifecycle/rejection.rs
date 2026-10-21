@@ -35,6 +35,7 @@ const NO_REQUIREMENTS: EvidenceUse<'static> = EvidenceUse {
     skill: None,
     requires_hydration: false,
     rejects_success: false,
+    uncovered: false,
 };
 
 /// What a proposal would do to its skill.
@@ -399,7 +400,7 @@ impl SkillLifecycleStore {
                 r.operation == operation && r.fingerprint == fingerprint && r.environment_binding == environment_binding
             })
             .collect();
-        self.first_unlifted(skill, matching, evidence_ids)
+        self.first_unlifted(skill, operation, matching, evidence_ids)
     }
 
     /// Like [`Self::suppressing_rejection`], for the moment before a proposal
@@ -426,7 +427,7 @@ impl SkillLifecycleStore {
                 r.operation == operation && r.environment_binding == environment_binding && r.pattern_ids == wanted
             })
             .collect();
-        self.first_unlifted(skill, matching, evidence_ids)
+        self.first_unlifted(skill, operation, matching, evidence_ids)
     }
 
     /// The first of `matching` when no evidence in `evidence_ids` lifts the
@@ -434,6 +435,7 @@ impl SkillLifecycleStore {
     fn first_unlifted(
         &self,
         skill: &SkillId,
+        operation: ProposalOperation,
         matching: Vec<RejectionRecord>,
         evidence_ids: &[String],
     ) -> Result<Option<RejectionRecord>, LifecycleError> {
@@ -449,11 +451,22 @@ impl SkillLifecycleStore {
             }
         }
         // Anything beyond that lifts suppression only if it hydrated this
-        // skill, did not end in success, and is eligible.
-        let same_skill = EvidenceUse {
-            skill: Some(skill),
-            requires_hydration: true,
-            rejects_success: true,
+        // skill, did not end in success, and is eligible. For a new skill there
+        // is nothing to hydrate: new evidence is eligible work no skill covered.
+        let same_skill = if operation == ProposalOperation::Create {
+            EvidenceUse {
+                skill: None,
+                requires_hydration: false,
+                rejects_success: false,
+                uncovered: true,
+            }
+        } else {
+            EvidenceUse {
+                skill: Some(skill),
+                requires_hydration: true,
+                rejects_success: true,
+                uncovered: false,
+            }
         };
         for id in evidence_ids {
             if known.contains(id) {

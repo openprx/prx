@@ -228,6 +228,22 @@ impl Loopback {
     pub fn requests(&self) -> usize {
         self.bodies.lock().len()
     }
+
+    /// Holds the chat request numbered `number` until one more experience of
+    /// the owner store holds a selection receipt than it does now, so that the
+    /// receipt of the coming run (written off the turn path) is on record
+    /// before the turn can end. Without it the write could land after the
+    /// terminal and count as late evidence. Returns the hook; the caller
+    /// installs it (alone, or inside a larger hook).
+    pub fn selection_gate(number: usize, store: &Arc<SkillLifecycleStore>) -> Hook {
+        let before = selection_count(store);
+        let store = Arc::clone(store);
+        Arc::new(move |at| {
+            if at == number {
+                wait_for_selection_beyond(&store, before);
+            }
+        })
+    }
 }
 
 impl Drop for Loopback {
@@ -417,6 +433,21 @@ impl World {
             .map_err(|_| anyhow::anyhow!("the agent run did not finish within 60s"))?
     }
 
+    /// [`Self::run_task`] for a task that selects a catalog skill, with the
+    /// selection receipt of the run on record before the turn can end. The
+    /// receipt is written off the turn path; left to race with the hydration
+    /// and the terminal of the same task for the experience's lock, a slow
+    /// disk could make one of their bounded lock waits expire.
+    pub async fn run_task_selected(&self, config: &Config, prompt: &str) -> anyhow::Result<String> {
+        self.loopback.set_hook(Some(Loopback::selection_gate(
+            self.loopback.requests() + 1,
+            &self.store,
+        )));
+        let result = self.run_task(config, prompt).await;
+        self.loopback.set_hook(None);
+        result
+    }
+
     /// The executor evaluation runs use: the real agent entry in fresh
     /// workspaces, charged to the operator ledger.
     pub fn executor(&self) -> AgentCaseExecutor {
@@ -454,6 +485,38 @@ impl World {
         records
     }
 
+    /// The experiences of `expected` root tasks that ran through the agent
+    /// entry without reading any managed skill, oldest first, once their
+    /// terminal is joined. The terminal creates these records itself, so the
+    /// run has finished by the time one exists.
+    pub async fn uncovered_runs(&self, expected: usize) -> Vec<SkillExperience> {
+        for _ in 0..200 {
+            let runs: Vec<SkillExperience> = self
+                .experiences()
+                .into_iter()
+                .filter(|record| record.hydration_receipts.is_empty() && record.selection_receipts.is_empty())
+                .collect();
+            if runs.len() == expected && runs.iter().all(|record| record.terminal.is_some()) {
+                return runs;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let seen: Vec<String> = self
+            .experiences()
+            .iter()
+            .map(|r| {
+                format!(
+                    "task={} hyd={} sel={} term={:?}",
+                    r.task_id,
+                    r.hydration_receipts.len(),
+                    r.selection_receipts.len(),
+                    r.terminal.as_ref().map(|t| t.outcome)
+                )
+            })
+            .collect();
+        panic!("test: {expected} uncovered runs did not appear: {seen:#?}");
+    }
+
     /// The experiences of `expected` real agent runs (they carry a run id and
     /// a hydration), oldest first, once their terminal is joined:
     /// the terminal join is awaited by the run itself. The selection receipt is
@@ -486,6 +549,41 @@ impl World {
             .collect();
         panic!("test: {expected} settled production runs did not appear: {seen:#?}");
     }
+}
+
+/// How many experiences of `store` hold a selection receipt.
+pub(super) fn selection_count(store: &SkillLifecycleStore) -> usize {
+    let dir = store.root().join("experiences");
+    std::fs::read_dir(&dir).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .filter(|id| id.starts_with("exp-"))
+                    .is_some_and(|id| {
+                        store
+                            .read_experience_by_id(id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|record| !record.selection_receipts.is_empty())
+                    })
+            })
+            .count()
+    })
+}
+
+/// Waits (bounded) until more than `before` experiences hold a selection receipt.
+pub(super) fn wait_for_selection_beyond(store: &SkillLifecycleStore, before: usize) -> bool {
+    for _ in 0..100 {
+        if selection_count(store) > before {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    false
 }
 
 // ---- suites -----------------------------------------------------------------------
@@ -697,6 +795,7 @@ pub(super) async fn settle(world: &World, task: &str, kind: TerminalKind, observ
             awaiting_approval: false,
             verified: true,
             recovered: false,
+            root: true,
         },
         observations,
     )
@@ -722,6 +821,44 @@ pub(super) fn consolidate(world: &World, statement: &str, evidence: &[String]) -
         })
         .expect("test: consolidate")
         .pattern
+}
+
+/// A pattern of repeated work that no skill covered (the zero-baseline class).
+pub(super) fn consolidate_uncovered(world: &World, statement: &str, evidence: &[String]) -> KnowledgePattern {
+    try_consolidate_uncovered(world, statement, evidence).expect("test: consolidate uncovered work")
+}
+
+pub(super) fn try_consolidate_uncovered(
+    world: &World,
+    statement: &str,
+    evidence: &[String],
+) -> Result<KnowledgePattern, crate::skills::lifecycle::LifecycleError> {
+    world
+        .store
+        .consolidate_pattern(&ConsolidationRequest {
+            task_family: "release".to_string(),
+            failure_class: FailureClass::MissingSkill,
+            skill_id: None,
+            scope: PatternScope {
+                environment: "local".to_string(),
+                capabilities: vec![REQUIRED_TOOL.to_string()],
+            },
+            statement: statement.to_string(),
+            applicability: vec!["release notes tasks".to_string()],
+            exceptions: Vec::new(),
+            evidence: evidence.to_vec(),
+            counterevidence: Vec::new(),
+        })
+        .map(|outcome| outcome.pattern)
+}
+
+/// A proposer patch for a new skill: text appended to its skeleton.
+pub(super) fn append_patch(summary: &str, text: &str) -> String {
+    serde_json::json!({
+        "summary": summary,
+        "edits": [{"file": "SKILL.md", "op": "append", "new": text}]
+    })
+    .to_string()
 }
 
 pub(super) fn exp_id(world: &World, task: &str) -> String {

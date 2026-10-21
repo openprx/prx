@@ -81,6 +81,68 @@ fn declared_tools(bundle: &Bundle) -> Result<BTreeSet<String>, String> {
 }
 
 impl SkillLifecycleStore {
+    /// The capability check of a NEW skill, which has no baseline to compare
+    /// with: it is instruction-only (`SKILL.md` alone, not executable, no
+    /// `SKILL.toml` and so no declared tool), its recorded requirements equal
+    /// its manifest's, and they stay within the capabilities the patterns it
+    /// rests on are scoped to. Executable bundles are refused until SL11.
+    fn check_new_skill_capabilities(
+        &self,
+        proposal: &SkillProposal,
+        candidate: &super::store::VerifiedRevision,
+    ) -> Result<(), LifecycleError> {
+        // The prepare step checked the name; another skill may have taken it
+        // since, so it is checked again before the first publication.
+        if let Some((holder, _)) = self.find_binding_by_name(&candidate.revision.display_name)?
+            && holder.skill_id != proposal.skill_id
+        {
+            return Err(LifecycleError::SkillNameTaken {
+                name: candidate.revision.display_name.clone(),
+                holder: holder.skill_id.to_string(),
+            });
+        }
+        let mut problems = Vec::new();
+        for file in candidate.bundle.files() {
+            if file.path() != "SKILL.md" {
+                problems.push(format!(
+                    "{} is not allowed in a new instruction skill",
+                    bounded(file.path())
+                ));
+            } else if file.is_executable() {
+                problems.push("SKILL.md is marked executable".to_string());
+            }
+        }
+        match validate_manifest(&candidate.bundle) {
+            Ok(info) => {
+                if candidate.revision.capability_requirements != info.required_tools {
+                    problems.push("its recorded requirements differ from its manifest".to_string());
+                }
+                let mut scoped: BTreeSet<String> = BTreeSet::new();
+                for id in &proposal.pattern_ids {
+                    match self.read_pattern(id)? {
+                        Some(pattern) => scoped.extend(pattern.scope.capabilities),
+                        None => problems.push(format!("pattern {id} it rests on is missing")),
+                    }
+                }
+                for required in info.required_tools.iter().filter(|tool| !scoped.contains(*tool)) {
+                    problems.push(format!(
+                        "it requires {:?}, outside the capabilities its patterns are scoped to",
+                        bounded(required)
+                    ));
+                }
+            }
+            Err(e) => problems.push(format!("its manifest is invalid: {e}")),
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(LifecycleError::CapabilityExpansion {
+                proposal_id: proposal.proposal_id.clone(),
+                reason: bounded(&problems.join("; ")),
+            })
+        }
+    }
+
     /// Refuses a candidate that asks for more than its baseline had, with
     /// [`LifecycleError::CapabilityExpansion`]. The candidate record is read
     /// pinned to `candidate_record_digest` when given.
@@ -94,7 +156,10 @@ impl SkillLifecycleStore {
             .as_ref()
             .ok_or_else(|| LifecycleError::ProposalRefused("the proposal has no staged candidate".to_string()))?;
         let candidate = self.read_revision(&proposal.skill_id, candidate_id, candidate_record_digest)?;
-        let baseline = self.read_revision(&proposal.skill_id, &proposal.baseline_revision, None)?;
+        let Some(baseline_revision) = &proposal.baseline_revision else {
+            return self.check_new_skill_capabilities(proposal, &candidate);
+        };
+        let baseline = self.read_revision(&proposal.skill_id, baseline_revision, None)?;
         let mut problems = Vec::new();
         let allowed: BTreeSet<&String> = baseline.revision.capability_requirements.iter().collect();
         for required in &candidate.revision.capability_requirements {

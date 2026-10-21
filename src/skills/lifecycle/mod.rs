@@ -38,6 +38,7 @@ mod migrate;
 mod projection;
 mod proposal;
 mod propose;
+mod propose_new;
 mod proposer_model;
 mod publish;
 mod receipts;
@@ -68,7 +69,7 @@ pub use bundle::{
 pub use capture::{
     CAPTURE_LOCK_TIMEOUT, Correlation, ExperienceOutcome, ExperienceRetention, HydrationReceipt,
     MAX_HYDRATION_RECEIPTS, MAX_SELECTION_RECEIPTS, SelectionReceipt, SkillExperience, TaskTerminal, TerminalJoin,
-    TerminalJoinOutcome, experience_id, on_task_terminal, task_key,
+    TerminalJoinOutcome, UNCOVERED_RECORDING_LIMIT, experience_id, on_task_terminal, task_key,
 };
 pub use consolidate::{ConsolidationOutcome, ConsolidationRequest};
 pub use evaluate::{
@@ -109,6 +110,7 @@ pub use propose::{
     MAX_EDIT_PERCENT, MAX_EDIT_TOKENS, MAX_EDITS, MAX_PROPOSAL_PATTERNS, ProposeOutcome, ProposeRequest,
     ProposerBudget, SYSTEM_PROMPT_VERSION, SuppressionStage, propose_revision,
 };
+pub use propose_new::{NEW_SKILL_PROMPT_VERSION, NewSkillRequest, propose_new_skill};
 pub use proposer_model::{
     ManagedProviderModel, ModelBinding, ModelCallError, ModelReply, ProposerModel, ReportedUsage,
 };

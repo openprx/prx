@@ -94,6 +94,7 @@ fn terminal_facts(
             terminal_receipt_id: "term-1",
             outcome: ExperienceOutcome::Failure,
             observations,
+            root_task: false,
         },
     )
     .expect("test: terminal")

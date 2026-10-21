@@ -18,14 +18,15 @@
 //! memory the rejection history keeps of a material change, and a new attempt
 //! must propose different content.
 
+use super::manifest::validate_manifest_strict;
 use super::proposal::{ProposalStatus, SkillProposal};
 use super::store::{SkillLifecycleStore, WriteOutcome};
 use super::types::{LifecycleError, NewRevision, SourceKind};
 
 impl SkillLifecycleStore {
     /// Writes the candidate of `proposal_id` into the main store with
-    /// `proposal_id = this proposal`, `parent = baseline` and `Learned`
-    /// provenance, after verifying the staged bundle against the proposal's
+    /// `proposal_id = this proposal`, `parent = baseline` (none for a new
+    /// skill) and `Learned` provenance, after verifying the staged bundle against the proposal's
     /// candidate id. Idempotent for the same proposal.
     ///
     /// Requires a `SourceReviewed` (or, for a retry, `Inconclusive`) proposal
@@ -71,13 +72,19 @@ impl SkillLifecycleStore {
                 other: other.proposal_id.clone(),
             });
         }
-        let baseline = self.read_revision(&proposal.skill_id, &proposal.baseline_revision, None)?;
         let mut new = NewRevision::new(proposal.skill_id.clone(), SourceKind::Learned);
-        new.parent_revision_id = Some(proposal.baseline_revision.clone());
         new.proposal_id = Some(proposal.proposal_id.clone());
         new.pattern_ids = proposal.pattern_ids.iter().map(ToString::to_string).collect();
-        // The candidate may use what its baseline used and nothing more.
-        new.capability_requirements = baseline.revision.capability_requirements;
+        if let Some(baseline_revision) = &proposal.baseline_revision {
+            let baseline = self.read_revision(&proposal.skill_id, baseline_revision, None)?;
+            new.parent_revision_id = Some(baseline_revision.clone());
+            // The candidate may use what its baseline used and nothing more.
+            new.capability_requirements = baseline.revision.capability_requirements;
+        } else {
+            // A new skill has no parent; it requires what its own manifest
+            // declares (publication re-checks that against the patterns' scope).
+            new.capability_requirements = validate_manifest_strict(&bundle)?.required_tools;
+        }
         new.review_receipt_ids = vec![review.record_id];
         self.write_revision(&new, &bundle).map_err(|error| match error {
             LifecycleError::RevisionConflict { revision, field } => LifecycleError::CandidateRevisionConflict {

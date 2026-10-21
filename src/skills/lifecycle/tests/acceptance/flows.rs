@@ -4,11 +4,14 @@
 //! capturing failed tasks, consolidating, proposing, and driving a proposal
 //! through review, evaluation and the gate.
 
-use super::support::{ScriptedProposer, World, complete_observations, exp_id, read_skill_in_task, settle, skill};
+use super::support::{
+    REQUIRED_TOOL, SKILL_DIR, ScriptedProposer, World, complete_observations, exp_id, read_skill_in_task, settle, skill,
+};
 use crate::config::Config;
 use crate::skills::lifecycle::{
-    EvalSplit, EvaluationPin, GateOutcome, KnowledgePattern, ProposeOutcome, ProposeRequest, ProposerBudget,
-    SkillProposal, SkillsLifecycleService, TerminalKind, propose_revision,
+    EvalSplit, EvaluationPin, GateOutcome, KnowledgePattern, LifecycleError, NewSkillRequest, ProposeOutcome,
+    ProposeRequest, ProposerBudget, SkillProposal, SkillsLifecycleService, TerminalKind, propose_new_skill,
+    propose_revision,
 };
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -52,6 +55,34 @@ pub(super) async fn propose(
     )
     .await
     .expect("test: propose")
+}
+
+/// A request for the new skill of the acceptance world.
+pub(super) fn new_skill_request(request_id: &str, pattern: &KnowledgePattern) -> NewSkillRequest {
+    NewSkillRequest {
+        request_id: request_id.to_string(),
+        skill_id: skill(),
+        name: SKILL_DIR.to_string(),
+        description: "Writes release notes and hotfix notes for a build".to_string(),
+        required_tools: vec![REQUIRED_TOOL.to_string()],
+        pattern_ids: vec![pattern.pattern_id.clone()],
+        budget: budget(),
+    }
+}
+
+/// Proposes a NEW skill from a zero-baseline pattern.
+pub(super) async fn propose_new(
+    world: &World,
+    request: NewSkillRequest,
+    proposer: &ScriptedProposer,
+) -> Result<ProposeOutcome, LifecycleError> {
+    propose_new_skill(
+        std::sync::Arc::clone(&world.store),
+        request,
+        proposer,
+        &CancellationToken::new(),
+    )
+    .await
 }
 
 /// The staged proposal of an outcome that must have staged one.
