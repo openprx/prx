@@ -1625,10 +1625,17 @@ mod tests {
         );
         assert_eq!(unpinned.get("pinned").unwrap(), &json!(false));
 
-        // Callers without a trusted owner, and other owners, keep the legacy
-        // projection exactly as before.
+        // Callers without a trusted owner, and other owners, read the legacy
+        // projection, which publication refreshed to the committed revision.
         let legacy = read(json!({"name": "demo"})).await;
-        assert!(legacy.get("content").unwrap().as_str().unwrap().contains("legacy body"));
+        assert!(
+            legacy
+                .get("content")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("revised body")
+        );
         assert!(legacy.get("managed").is_none());
         let other = read(scoped_args("owner:ws:cli:bob", "task-tool-3", json!({"name": "demo"}))).await;
         assert!(other.get("managed").is_none());

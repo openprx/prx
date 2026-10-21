@@ -306,6 +306,25 @@ fn a_plan_made_before_someone_else_published_is_stale() {
         true,
     );
 
+    // Their publication refreshed the projection, so the directory no longer
+    // matches the plan.
+    let report = apply_migration(&store, tmp.path(), &plan);
+    assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+    assert_eq!(report.failed.first().map(|f| f.0.as_str()), Some("alpha"));
+    assert!(
+        report
+            .failed
+            .first()
+            .is_some_and(|f| f.1.contains("changed since the plan")),
+        "{:?}",
+        report.failed
+    );
+    // With the directory restored to the planned bytes, the generation check refuses.
+    write(
+        &tmp.path().join("skills/alpha/SKILL.md"),
+        md("Alpha", "First skill").as_bytes(),
+    );
+    write(&tmp.path().join("skills/alpha/references/note.md"), b"note\r\n");
     let report = apply_migration(&store, tmp.path(), &plan);
     assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
     assert_eq!(report.failed.first().map(|f| f.0.as_str()), Some("alpha"));

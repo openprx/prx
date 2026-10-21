@@ -402,7 +402,14 @@ async fn a_bounded_candidate_is_staged_and_nothing_is_activated() {
         ),
         "the candidate is not a revision"
     );
-    assert!(!f.tmp.path().join("skills").exists(), "no compatibility projection");
+    // The projection written by the baseline publication is untouched.
+    assert_eq!(
+        crate::skills::lifecycle::Bundle::from_dir(&f.tmp.path().join("skills").join(skill().as_str()))
+            .expect("test: projection")
+            .revision_id(),
+        &before.revision_id,
+        "the compatibility projection still holds the baseline"
+    );
     assert_eq!(
         f.store.read_proposal(&proposal.proposal_id).expect("test: read"),
         Some(proposal.clone())
