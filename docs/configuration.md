@@ -32,6 +32,11 @@ configuration tree the run reads and writes: `config.toml`, `config.d/`,
 `workspace/`, `daemon.lock`, `daemon_state.json`, and the key material under
 `keys/`.
 
+An explicit `--config-dir <DIR>` takes precedence over `OPENPRX_WORKSPACE`:
+the run's workspace is `<DIR>/workspace`, even when that environment variable
+names a different directory. Omit `--config-dir` (and `OPENPRX_CONFIG_DIR`) when
+you intend to select the workspace through `OPENPRX_WORKSPACE`.
+
 The session-worker transport key at `keys/session_worker.secret` is published
 atomically on first use. Concurrent minting and verification use the same
 complete 32-byte key. Existing key material is never overwritten by initialization;

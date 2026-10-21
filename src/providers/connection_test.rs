@@ -45,8 +45,8 @@ pub struct LocalCheck {
     pub resolved: bool,
     /// Whether the evidence proves every requirement.
     pub verified: bool,
-    /// The refusal or the unverified warning, in one sentence; empty when
-    /// verified. Never a credential.
+    /// Resolver and pricing diagnostics. Verified capabilities can still
+    /// carry an unpriced-model warning. Never a credential.
     pub detail: String,
 }
 
@@ -122,11 +122,18 @@ pub async fn test_connection(
     let (local, resolved) = match resolved {
         Ok(resolved) => {
             let verified = matches!(resolved.verification(), Verification::Verified);
+            let mut detail = resolved.warning().unwrap_or_default();
+            if let Some(warning) = selection::pricing_warning(&resolved, &config.cost) {
+                if !detail.is_empty() {
+                    detail.push_str("; ");
+                }
+                detail.push_str(&warning);
+            }
             (
                 LocalCheck {
                     resolved: true,
                     verified,
-                    detail: resolved.warning().unwrap_or_default(),
+                    detail,
                 },
                 Some(resolved),
             )
@@ -447,6 +454,9 @@ impl std::fmt::Display for ConnectionReport {
         } else {
             "resolves (unverified)"
         })?;
+        if !self.local.detail.is_empty() {
+            write!(f, "; {}", self.local.detail)?;
+        }
         if let Some(live) = &self.live {
             match &live.error {
                 None => write!(
@@ -467,6 +477,36 @@ impl std::fmt::Display for ConnectionReport {
 mod tests {
     use super::*;
     use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
+
+    #[tokio::test]
+    async fn unpriced_model_probe_explains_g6_without_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_for(dir.path(), "kimi-code");
+        config.default_model = Some("kimi-for-coding".into());
+        let report = test_connection(&config, None, None, ProbeMode::Local).await;
+        assert!(report.local.resolved);
+        assert!(report.live.is_none());
+        let shown = report.to_string();
+        assert!(
+            shown.contains("G6 budget admission refuses unpriced model 'kimi-code/kimi-for-coding'"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(r#"[cost.prices."kimi-code/kimi-for-coding"]"#),
+            "{shown}"
+        );
+        config.cost.prices.insert(
+            "kimi-code/kimi-for-coding".into(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.5,
+                cache_write: 1.0,
+            },
+        );
+        let priced = test_connection(&config, None, None, ProbeMode::Local).await;
+        assert!(!priced.to_string().contains("G6"));
+    }
 
     /// A credential-shaped sentinel. Not a real secret.
     const KEY: &str = "pmmd7-probe-sentinel";

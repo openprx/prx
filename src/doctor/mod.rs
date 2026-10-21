@@ -1328,6 +1328,17 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
 /// unverified), verified is fine.
 fn check_model_selection(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "models";
+    if let Ok(resolved) = crate::providers::selection::check(
+        config,
+        crate::providers::selection::default_provider(config),
+        crate::providers::selection::default_model(config),
+        &crate::providers::catalog::Requirement::chat(),
+        crate::providers::catalog::UnknownPolicy::Invocation,
+    ) && let Some(warning) = crate::providers::selection::pricing_warning(&resolved, &config.cost)
+    {
+        items.push(DiagItem::warn(cat, warning));
+    }
+
     match crate::config::model_settings::warnings(config) {
         Ok(warnings) => items.extend(warnings.into_iter().map(|warning| DiagItem::warn(cat, warning))),
         Err(error) => items.push(DiagItem::error(cat, error.to_string())),
@@ -2577,6 +2588,20 @@ mod tests {
     )]
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn doctor_names_unpriced_model_and_override() {
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = dir.path().join("workspace");
+        config.config_path = dir.path().join("config.toml");
+        config.default_provider = Some("kimi-code".into());
+        config.default_model = Some("kimi-for-coding".into());
+        let mut items = Vec::new();
+        check_model_selection(&config, &mut items);
+        assert!(items.iter().any(|item| item.severity == Severity::Warn
+            && item.message.contains(r#"[cost.prices."kimi-code/kimi-for-coding"]"#)));
+    }
 
     #[test]
     fn doctor_reports_invalid_saved_model_settings_as_repairable_warnings() {

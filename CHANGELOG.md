@@ -51,6 +51,13 @@ and the migration warnings below before upgrading.
 
 ### Changed
 
+- OpenAI-compatible providers now retain reported cached prompt tokens and
+  account for them at the effective `cache_read` and `cache_write` rates; these
+  detail fields were previously dropped, so all prompt tokens used the input
+  rate. Existing price overrides keep their values,
+  so review cache rates and budget expectations before upgrading. This changes
+  PRX accounting, not provider invoices. See [migration notes](docs/migration-unreleased.md).
+
 - Lifecycle publish and rollback now refresh the `skills/<dir>/` compatibility
   projection and invalidate catalog snapshots after the binding commits.
   `CommittedRepairRequired` means the binding is live but repair remains;

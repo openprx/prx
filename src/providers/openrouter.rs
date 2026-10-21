@@ -1,6 +1,7 @@
+use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
-    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, ChatTrace, Provider,
+    StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -10,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
+    #[cfg(test)]
+    chat_endpoint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,9 +50,16 @@ struct NativeChatRequest {
     temperature: f64,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<UsageRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UsageRequest {
+    include: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,6 +105,40 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct NativeChatResponse {
     choices: Vec<NativeChoice>,
+    #[serde(default)]
+    usage: Option<OpenRouterUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterUsage {
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    total_tokens: Option<u32>,
+    prompt_tokens_details: Option<PromptTokenDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokenDetails {
+    cached_tokens: Option<u32>,
+    cache_write_tokens: Option<u32>,
+}
+
+impl OpenRouterUsage {
+    fn into_tokens(self) -> TokenUsage {
+        TokenUsage::reported_with_cache(
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.total_tokens.or_else(|| {
+                self.prompt_tokens
+                    .zip(self.completion_tokens)
+                    .map(|(input, output)| input.saturating_add(output))
+            }),
+            self.prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cache_write_tokens),
+            self.prompt_tokens_details.and_then(|details| details.cached_tokens),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,6 +158,8 @@ impl OpenRouterProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
+            #[cfg(test)]
+            chat_endpoint: None,
         }
     }
 
@@ -229,6 +275,68 @@ impl OpenRouterProvider {
             tool_calls,
             reasoning_content: None,
         }
+    }
+
+    const fn chat_endpoint(&self) -> &str {
+        #[cfg(test)]
+        if let Some(endpoint) = &self.chat_endpoint {
+            return endpoint.as_str();
+        }
+        "https://openrouter.ai/api/v1/chat/completions"
+    }
+
+    async fn chat_metered(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<(ProviderChatResponse, TokenUsage)> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("OpenRouter API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openrouter`.")
+        })?;
+
+        let tools = self.convert_tools(request.tools)?;
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature,
+            stream: false,
+            usage: None,
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+        };
+
+        let response = self
+            .http_client()
+            .post(self.chat_endpoint())
+            .header("Authorization", format!("Bearer {credential}"))
+            .header("HTTP-Referer", "https://github.com/openprx/prx")
+            .header("X-Title", "OpenPRX")
+            .json(&super::parameter_wire::request(
+                "openrouter",
+                super::parameter_wire::Format::OpenRouter,
+                &native_request.model,
+                &native_request,
+            ))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenRouter", response).await);
+        }
+
+        let native_response: NativeChatResponse = response.json().await?;
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
+        let tokens = native_response
+            .usage
+            .map(OpenRouterUsage::into_tokens)
+            .unwrap_or_default();
+        Ok((Self::parse_native_response(message), tokens))
     }
 
     fn http_client(&self) -> Client {
@@ -383,47 +491,36 @@ impl Provider for OpenRouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenRouter API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openrouter`.")
-        })?;
+        self.chat_metered(request, model, temperature)
+            .await
+            .map(|(response, _)| response)
+    }
 
-        let tools = self.convert_tools(request.tools)?;
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            messages: Self::convert_messages(request.messages),
-            temperature,
-            stream: false,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
-            tools,
-        };
-
-        let response = self
-            .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/openprx/prx")
-            .header("X-Title", "OpenPRX")
-            .json(&super::parameter_wire::request(
-                "openrouter",
-                super::parameter_wire::Format::OpenRouter,
-                &native_request.model,
-                &native_request,
-            ))
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
-        }
-
-        let native_response: NativeChatResponse = response.json().await?;
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        Ok(Self::parse_native_response(message))
+    async fn chat_traced(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatTrace> {
+        let started_at = chrono::Utc::now();
+        let (response, tokens_used) = self.chat_metered(request, model, temperature).await?;
+        Ok(ChatTrace {
+            response,
+            attempts: vec![ProviderAttempt {
+                seq: 1,
+                provider: "openrouter".to_string(),
+                model: model.to_string(),
+                started_at,
+                finished_at: chrono::Utc::now(),
+                status: AttemptStatus::Success,
+                error_class: None,
+                error_message: None,
+            }],
+            final_provider: "openrouter".to_string(),
+            final_model: model.to_string(),
+            served_member: None,
+            tokens_used,
+        })
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -475,6 +572,7 @@ impl Provider for OpenRouterProvider {
             messages: native_messages,
             temperature,
             stream: false,
+            usage: None,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
         };
@@ -545,16 +643,18 @@ impl Provider for OpenRouterProvider {
             messages: Self::convert_messages(messages),
             temperature,
             stream: true,
+            usage: Some(UsageRequest { include: true }),
             tool_choice: options.tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
         let client = self.http_client();
         let count_tokens = options.count_tokens;
+        let endpoint = self.chat_endpoint().to_owned();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
         crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
             let response = match client
-                .post("https://openrouter.ai/api/v1/chat/completions")
+                .post(endpoint)
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("HTTP-Referer", "https://github.com/openprx/prx")
                 .header("X-Title", "OpenPRX")
@@ -614,6 +714,74 @@ impl Provider for OpenRouterProvider {
 mod tests {
     use super::*;
     use crate::providers::traits::{ChatMessage, Provider};
+
+    #[test]
+    fn usage_preserves_cache_counts_and_missing_fields() {
+        let response: NativeChatResponse = serde_json::from_value(serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens":100,"completion_tokens":20,
+                "prompt_tokens_details":{"cached_tokens":30,"cache_write_tokens":10}}
+        }))
+        .unwrap();
+        let usage = response.usage.unwrap().into_tokens();
+        assert_eq!(
+            usage,
+            TokenUsage::reported_with_cache(Some(100), Some(20), Some(120), Some(10), Some(30))
+        );
+        for value in [serde_json::json!({}), serde_json::json!({"total_tokens":12})] {
+            let usage: OpenRouterUsage = serde_json::from_value(value).unwrap();
+            let tokens = usage.into_tokens();
+            assert_eq!(tokens.prompt_tokens, None);
+            assert_eq!(tokens.completion_tokens, None);
+            assert_eq!(tokens.cache_read_input_tokens, None);
+            assert_eq!(tokens.cache_creation_input_tokens, None);
+        }
+        let response: NativeChatResponse = serde_json::from_str(r#"{"choices":[]}"#).unwrap();
+        assert!(response.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn priced_openrouter_turn_writes_cost_ledger() -> anyhow::Result<()> {
+        use crate::agent::agent::Agent;
+        use crate::agent::dispatcher::XmlToolDispatcher;
+        use crate::providers::credential_probe::{CredentialProbe, PROBE_REPLY};
+        use std::sync::Arc;
+        let workspace = tempfile::tempdir()?;
+        let probe = CredentialProbe::start().await;
+        let mut provider = OpenRouterProvider::new(Some("prx-test-credential"));
+        provider.chat_endpoint = Some(format!("{}/chat/completions", probe.base_url()));
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        config.config_path = workspace.path().join("config.toml");
+        config.default_provider = Some("openrouter".into());
+        config.default_model = Some("anthropic/claude-sonnet-5".into());
+        config.api_key = Some("prx-test-credential".into());
+        config.auth.codex_auth_json_auto_import = false;
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
+        let mut agent = Agent::builder()
+            .runtime_config(config, "openrouter")
+            .provider(Box::new(provider))
+            .tools(Vec::new())
+            .memory(memory)
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .build()?;
+        assert_eq!(agent.turn("What is 2 + 2?").await?, PROBE_REPLY);
+        assert_eq!(probe.requests().len(), 1);
+        let ledger = std::fs::read_to_string(workspace.path().join("state/costs.jsonl"))?;
+        let rows: Vec<crate::cost::types::CostRecord> =
+            ledger.lines().map(serde_json::from_str).collect::<Result<_, _>>()?;
+        assert_eq!(rows.len(), 1);
+        let row = rows.first().unwrap();
+        assert_eq!(row.settlement_provider.as_deref(), Some("openrouter"));
+        assert_eq!(row.usage.model, "openrouter/anthropic/claude-sonnet-5");
+        assert_eq!(row.usage.input_tokens, 1);
+        assert_eq!(row.usage.output_tokens, 1);
+        assert!(row.usage.cost_usd > 0.0);
+        assert!(row.settlement_id.is_some());
+        Ok(())
+    }
 
     #[test]
     fn creates_with_key() {
@@ -883,6 +1051,7 @@ mod tests {
             }],
             temperature: 0.2,
             stream: true,
+            usage: Some(UsageRequest { include: true }),
             tools: None,
             tool_choice: None,
         };
@@ -897,3 +1066,7 @@ mod tests {
         assert!(provider.supports_streaming());
     }
 }
+
+#[cfg(test)]
+#[path = "openrouter/metering_tests.rs"]
+mod metering_tests;

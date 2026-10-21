@@ -484,6 +484,19 @@ pub(crate) fn check_affected_selections(
             Err(refusal) => refusals.push(refusal),
         }
     }
+    if current.is_none_or(|current| {
+        selection::default_provider(current) != selection::default_provider(candidate)
+            || selection::default_model(current) != selection::default_model(candidate)
+    }) && let Ok(resolved) = selection::check(
+        candidate,
+        selection::default_provider(candidate),
+        selection::default_model(candidate),
+        &Requirement::chat(),
+        UnknownPolicy::Invocation,
+    ) && let Some(warning) = selection::pricing_warning(&resolved, &candidate.cost)
+    {
+        warnings.push(warning);
+    }
     // The decision backend: the same check a reload runs (CDP-12).
     match check_decision_plane(current, candidate) {
         Ok(Some(warning)) => warnings.push(warning),
@@ -541,7 +554,18 @@ fn lost_route(current_sites: &[SelectionSite], site: &SelectionSite) -> Option<S
 /// Resolve one selection. `Ok(Some(warning))` when it is accepted as
 /// unverified.
 fn check_site(catalog: &CatalogView, site: &SelectionSite, policy: UnknownPolicy) -> Result<Option<String>, String> {
-    let refused = |reason: &dyn std::fmt::Display| format!("{} refused: {reason}", site.name);
+    let refused = |reason: &dyn std::fmt::Display| {
+        let mut message = format!("{} refused: {reason}", site.name);
+        if site.name
+            == format!(
+                "fallback provider '{}'",
+                super::service::redact_provider_text(&site.provider)
+            )
+        {
+            message.push_str("; provider fallbacks inherit the primary model. Configure alternate model IDs in [reliability.model_fallbacks]; every configured provider/model pair must still be compatible (see docs/providers.md)");
+        }
+        message
+    };
     let unverified = match site.kind {
         SiteKind::Chat => {
             selection::check_model_unproven(catalog, &site.provider, &site.model, &Requirement::chat(), policy)
@@ -919,6 +943,29 @@ mod tests {
             refusal.contains("fallback provider 'anthropic' serving model fallback 'openai/gpt-4o'"),
             "{refusal}"
         );
+    }
+
+    #[test]
+    fn model_fallback_hint_is_only_for_the_plain_fallback_provider_site() {
+        let (_dir, config) = isolated();
+        let catalog = CatalogView::from_config(&config);
+        for (name, expected_hint) in [
+            ("fallback provider 'kimi-code'", true),
+            ("fallback provider 'kimi-code' serving model route `hint:code`", false),
+            (
+                "fallback provider 'kimi-code' serving model fallback 'anthropic/claude-sonnet-5' of 'kimi-for-coding'",
+                false,
+            ),
+        ] {
+            let site = SelectionSite::new(name, "kimi-code", "anthropic/claude-sonnet-5", SiteKind::Chat);
+            let refusal = check_site(&catalog, &site, UnknownPolicy::OperatorSelection).unwrap_err();
+            assert!(refusal.contains("not compatible"), "{refusal}");
+            assert_eq!(
+                refusal.contains("[reliability.model_fallbacks]"),
+                expected_hint,
+                "{refusal}"
+            );
+        }
     }
 
     /// RED before PMMDtail-i (D-083 C-3): a route's chain keeps the

@@ -619,6 +619,37 @@ pub(crate) fn resolve_route(
     .map_err(|refusal| anyhow::anyhow!("model route `hint:{}` is refused: {refusal}", route.hint))
 }
 
+/// Diagnose the same missing tariff that leaves G6 without a cost estimate.
+/// This reports configuration to the operator; it never changes admission.
+pub(crate) fn pricing_warning(
+    resolved: &catalog::ResolvedModel,
+    cost: &crate::config::schema::CostConfig,
+) -> Option<String> {
+    use crate::llm::route_decision::{UsagePrice, usage_cost_resolution};
+    let provider = resolved.provider_label();
+    let model = resolved.model();
+    if !matches!(
+        usage_cost_resolution(provider, model, 64, 64, 0, 0, cost),
+        UsagePrice::Missing
+    ) || crate::runtime::turn_cost::provider_is_zero_price_exempt(
+        resolved.provider(),
+        resolved.credential().api_url(),
+    ) {
+        return None;
+    }
+    let key = if model.contains('/') {
+        model.to_string()
+    } else {
+        format!("{provider}/{model}")
+    };
+    let key = crate::security::redaction::redact_provider_text(&key);
+    let provider = crate::security::redaction::redact_provider_text(provider);
+    let model = crate::security::redaction::redact_provider_text(model);
+    Some(format!(
+        "G6 budget admission refuses unpriced model '{provider}/{model}'; configure [cost.prices.{key:?}] with input, output, cache_read and cache_write in USD per 1M tokens, or select a priced model"
+    ))
+}
+
 /// How the configured default resolves, in one line for `prx doctor` and
 /// `prx models list`: `Ok` with the line when it is verified or only
 /// unverified (the line then says so), `Err` with the refusal otherwise.
