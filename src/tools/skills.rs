@@ -1358,6 +1358,7 @@ impl Tool for SkillExecuteTool {
             return Ok(result);
         }
         let (root, tool) = self.resolve(&skill_name, &tool_name)?;
+        self.refuse_projection(&root, &skill_name, &tool_name)?;
         let arguments = Self::scalar_arguments(&tool, args.get("arguments"))?;
         self.execute_resolved(&root, &tool, arguments, cancellation, None).await
     }
