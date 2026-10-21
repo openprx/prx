@@ -2,7 +2,7 @@
 //! [`SkillExecuteTool`] kept in its own file.
 
 use super::{
-    Arc, CancellationToken, Path, ResourceRiskLevel, SecurityPolicy, SideEffectGate, SkillExecuteTool, Tool,
+    Arc, CancellationToken, Path, PathBuf, ResourceRiskLevel, SecurityPolicy, SideEffectGate, SkillExecuteTool, Tool,
     ToolResult, trusted_scope_field,
 };
 
@@ -38,33 +38,49 @@ impl SkillExecuteTool {
     /// not managed at all may run unpinned. A store that cannot be read is a
     /// refusal too, never a fallback.
     fn refuse_if_managed(&self, skill_name: &str, tool_name: &str) -> anyhow::Result<()> {
+        let refused =
+            |why: String| anyhow::anyhow!("Managed skill '{skill_name}' tool '{tool_name}' was refused: {why}");
         let Some(configured) = self.config.skills_lifecycle.owner_scope.as_deref() else {
             return Ok(());
         };
-        let Ok(owner) = crate::skills::lifecycle::OwnerScope::new(configured) else {
-            return Ok(());
-        };
+        // A configured owner that is not valid cannot be checked: fail closed.
+        let owner = crate::skills::lifecycle::OwnerScope::new(configured)
+            .map_err(|error| refused(format!("the configured lifecycle owner scope is invalid ({error})")))?;
         match crate::skills::lifecycle::is_managed_skill(&self.workspace_dir, &owner, skill_name) {
             Ok(false) => Ok(()),
-            Ok(true) => Err(anyhow::anyhow!(
-                "Managed skill '{skill_name}' tool '{tool_name}' was refused: a lifecycle-managed skill runs only for a caller with a trusted owner scope, pinned to its revision"
+            Ok(true) => Err(refused(
+                "a lifecycle-managed skill runs only for a caller with a trusted owner scope, pinned to its revision"
+                    .to_string(),
             )),
-            Err(error) => Err(anyhow::anyhow!(
-                "Managed skill '{skill_name}' tool '{tool_name}' was refused: its lifecycle store cannot be read ({error})"
-            )),
+            Err(error) => Err(refused(format!("its lifecycle store cannot be read ({error})"))),
         }
     }
 
-    /// Runs a declared tool of a lifecycle-managed skill from the revision the
-    /// task is pinned to. `Ok(None)` means the skill is not managed for the
-    /// caller and the legacy path applies.
-    ///
-    /// The whole pinned bundle is verified and staged in a private run
-    /// directory before anything runs, the policy must grant the tool's kind and
-    /// every capability the revision declares, and the call goes through the
-    /// same shell/HTTP adapters, under a deadline. The process tree is killed and
-    /// reaped by the adapter on completion, timeout and cancellation; the run
-    /// directory is removed afterwards (or when the call is dropped).
+    /// The legacy path never runs a lifecycle projection unpinned: a skill
+    /// directory below `skills/` that projects a binding of any owner's store
+    /// in this workspace is refused, whatever `owner_scope` is configured.
+    pub(super) fn refuse_projection(&self, root: &Path, skill_name: &str, tool_name: &str) -> anyhow::Result<()> {
+        let refused =
+            |why: String| anyhow::anyhow!("Managed skill '{skill_name}' tool '{tool_name}' was refused: {why}");
+        let skills = std::fs::canonicalize(crate::skills::skills_dir(&self.workspace_dir))
+            .map_err(|error| refused(format!("the skills directory cannot be resolved ({error})")))?;
+        if root.parent() != Some(skills.as_path()) {
+            return Ok(());
+        }
+        let Some(directory) = root.file_name().and_then(|name| name.to_str()) else {
+            return Err(refused("the skill directory name is not UTF-8".to_string()));
+        };
+        match crate::skills::lifecycle::is_projection_dir(&self.workspace_dir, directory) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(refused(
+                "it is the projection of a lifecycle-managed skill, which runs only for a caller with a trusted \
+                 owner scope, pinned to its revision"
+                    .to_string(),
+            )),
+            Err(error) => Err(refused(format!("its lifecycle store cannot be read ({error})"))),
+        }
+    }
+
     pub(super) async fn execute_managed(
         &self,
         skill_name: &str,
@@ -162,9 +178,18 @@ impl SkillExecuteTool {
         prepared
             .verify_before_spawn()
             .map_err(|error| anyhow::anyhow!("Managed skill '{skill_name}' tool '{tool_name}' was refused: {error}"))?;
-        let root = prepared
-            .root()
-            .map_or_else(|| self.workspace_dir.clone(), Path::to_path_buf);
+        // Only an http tool has no staged directory, and it never uses the
+        // path; any other kind without one is refused, never run in the
+        // real workspace.
+        let root = match prepared.root() {
+            Some(root) => root.to_path_buf(),
+            None if prepared.tool.kind.eq_ignore_ascii_case("http") => PathBuf::new(),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Managed skill '{skill_name}' tool '{tool_name}' was refused: no staged run directory"
+                ));
+            }
+        };
         let outcome = self
             .execute_resolved(
                 &root,

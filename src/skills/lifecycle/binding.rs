@@ -377,6 +377,28 @@ pub fn is_managed_skill(workspace_dir: &Path, owner: &OwnerScope, skill_name: &s
     }
 }
 
+/// Whether `skills/<directory>` is the compatibility projection of a lifecycle
+/// binding, whichever owner the store belongs to: the active binding record of
+/// the skill id the directory projects exists in the workspace's store (the
+/// legacy id of the directory name, or the directory named by the id itself).
+/// A store that cannot be read is an error, never "not managed".
+pub fn is_projection_dir(workspace_dir: &Path, directory: &str) -> Result<bool, LifecycleError> {
+    let workspace = workspace_dir
+        .canonicalize()
+        .map_err(|e| LifecycleError::io(workspace_dir, e))?;
+    let active = workspace.join("self").join("skill-lifecycle").join(ACTIVE_DIR);
+    let ids = [SkillId::from_legacy_dir(directory).ok(), SkillId::parse(directory).ok()];
+    for id in ids.into_iter().flatten() {
+        let record = active.join(format!("{}.json", id.as_str()));
+        match fs::symlink_metadata(&record) {
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(LifecycleError::io(record, e)),
+        }
+    }
+    Ok(false)
+}
+
 /// Resolves the skill through the owner's lifecycle store and reads one
 /// resource of its revision.
 ///

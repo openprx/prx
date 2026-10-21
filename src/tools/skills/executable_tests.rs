@@ -782,3 +782,39 @@ async fn an_unreviewed_executable_revision_is_refused_by_the_tool() {
     assert!(!marks.join("ran").exists());
     m.release(&[&task]);
 }
+
+#[tokio::test]
+async fn the_legacy_path_never_runs_a_projection_whatever_owner_scope_is_configured() {
+    let m = managed("projection");
+    let marks = m.marks();
+    m.publish(&bundle("#!/bin/sh\necho ran >> \"$PRX_SKILL_ARG_MARKS/ran\"\n"), 0);
+    let args = json!({"marks": marks.to_string_lossy()});
+    let mut no_owner = m.config();
+    no_owner.skills_lifecycle.owner_scope = None;
+    let tool = m.tool_with(m.policy(AutonomyLevel::Full), no_owner.clone());
+
+    // No configured owner, no trusted scope: the projection is not run.
+    let bare = tool
+        .execute(json!({"skill": NAME, "tool": "run", "arguments": args}))
+        .await;
+    let text = bare
+        .map(|_| ())
+        .expect_err("a projection must not run unpinned")
+        .to_string();
+    assert!(text.contains("projection"), "{text}");
+    // A skill managed under another owner of the same workspace.
+    let mut foreign = m.call(&unique("task"), "run", &args);
+    foreign["_zc_scope"]["owner_id"] = json!("owner:ws:cli:someone-else");
+    assert!(tool.execute(foreign).await.is_err());
+    assert!(!marks.join("ran").exists(), "the projection never ran");
+
+    // An invalid configured owner fails closed.
+    let mut invalid = no_owner;
+    invalid.skills_lifecycle.owner_scope = Some("not a valid owner".to_string());
+    let closed = m
+        .tool_with(m.policy(AutonomyLevel::Full), invalid)
+        .execute(json!({"skill": NAME, "tool": "run", "arguments": args}))
+        .await;
+    assert!(closed.is_err());
+    assert!(!marks.join("ran").exists());
+}
