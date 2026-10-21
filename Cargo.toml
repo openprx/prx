@@ -218,7 +218,7 @@ opentelemetry_sdk = { version = "0.31", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"] }
 
 # probe-rs for STM32/Nucleo memory read (Phase B)
-probe-rs = { version = "0.31", optional = true }
+probe-rs = { version = "0.32", optional = true }
 
 tokio-stream = { version = "0.1.18", features = ["full"] }
 
