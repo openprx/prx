@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Scenario E: verify through real entrypoints, up to the boundary.
 //!
 //! What runs here is the single-shot agent entry (`prx agent -m`, i.e.

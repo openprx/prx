@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! The steps the scenarios share, each one through the production entry:
 //! capturing failed tasks, consolidating, proposing, and driving a proposal
 //! through review, evaluation and the gate.

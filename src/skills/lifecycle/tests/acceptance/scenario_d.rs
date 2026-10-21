@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Scenario D: roll back after a production regression. A published revision
 //! passes the frozen suite but silently breaks a task family the suite does not
 //! cover (an owned, controlled regression). The operator rolls back through

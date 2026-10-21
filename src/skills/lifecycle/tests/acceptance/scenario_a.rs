@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Scenario A: create a skill's missing procedure from observed repeated work.
 //!
 //! The starting skill is a managed stub that knows the hotfix rule only. Real

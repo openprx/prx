@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Scenario B: improve an existing skill. Revision A carries a wrong release
 //! rule; repeated failures lead to a bounded revision B that changes that one
 //! line. A and B are compared on the same frozen suite (critical and negative

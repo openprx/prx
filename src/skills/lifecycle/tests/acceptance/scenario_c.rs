@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Scenario C: reject a plausible harmful change. Each candidate fixes the
 //! failing release rule, so it looks like an improvement, and each one does
 //! something else that the frozen suite or the capability check must catch.

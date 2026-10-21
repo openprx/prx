@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Shared fixtures of the SL10 acceptance scenarios.
 //!
 //! Everything runs on this machine: the "model" is a loopback HTTP server on
