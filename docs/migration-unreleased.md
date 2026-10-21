@@ -11,6 +11,11 @@ live in the linked pages and in the `[Unreleased]` section of the
 | Change | Action | Required |
 | --- | --- | --- |
 | Matrix is opt-in (`channel-matrix` Cargo feature) | Source builders that use a `[channels_config.matrix]` channel must build with `--features channel-matrix`. Prebuilt default and release binaries omit Matrix. | Only with Matrix configured |
+| Known Codex model default effort | Declared Codex rows now use `medium` rather than `xhigh`. Set an explicit supported effort if the former behavior is required. Unknown rows keep the legacy `medium` verbosity / `xhigh` effort base. See [model levels and parameters](model-catalog.md). | Only to retain the former effort |
+| WASM plugins off by default | Set `[plugins] enabled = true` and restart only after reviewing each plugin; install or update with `wasm_plugins_manage` and explicit `grant_permissions` to write `plugin-trust.json` beside `config.toml`. The configuration directory and `plugin-cache/` must be outside the workspace. A `.prx-managed` marker grants no trust. | To use WASM plugins |
+| Plugin outbound requests | An empty `http_allowlist` now denies every URL. Use URL patterns such as `https://api.example.com/*`, not string prefixes such as `https://api.example.com*`. The SSRF guard still refuses private, loopback and other unsafe destinations. See [plugin trust and networking](plugin-developer-guide.md). | For plugins needing outbound HTTP |
+| Workspace command hooks default off | Set `[security] workspace_hooks = "on"` only after reviewing workspace commands. Remove non-null `cwd` from `hooks.json`: the whole candidate file is refused. Commands now start with a cleared environment in the dedicated directory beside `config.toml`; use explicit paths and allowed `env` entries. See [workspace command hooks](configuration.md#workspace-command-hooks). | To run workspace command hooks |
+| Terminal learning evidence format | Older binaries with strict terminal/trace readers cannot read the newly written `TerminalFacts`, experience records and optional `unavailable_attempts` field. Retain the newer binary and evidence for recovery; do not erase records to force a downgrade. | Before a binary downgrade |
 | `[causal_tree]` schema (decision plane) and new default `enabled = true` | An old file is mapped on load and rewritten on the next save. **The decision plane turns on after upgrade** when the file has no `schema_version` and its `enabled = false` is the old default (the merged `[causal_tree]` table holds nothing but `enabled = false`, as the old `prx init` template wrote, or it also holds a legacy-only key: `w_confidence`, `write_decision_log`, `write_metrics`, or `policy.max_branches` / `rehearsal_timeout_ms` / `default_side_effect_mode` / `circuit_breaker_threshold` / `circuit_breaker_cooldown_secs`): that false is dropped as unset. An unversioned `enabled = false` alongside other `causal_tree` keys (including in a `config.d` fragment) stays off. To keep it off, set the current `schema_version = 2` and `enabled = false` (example below). Fix any file refused with a file/key error as listed in the changelog. | Only to keep it off, or if the load is refused |
 | Serialized 500 ms decision latency budget | Schema 1 saves wrote `causal_tree.policy.extra_latency_budget_ms = 500` even when the operator never set it. The one-time schema 1 to 2 migration treats that exact value as unset, and a hosted decision backend adopts its catalog recommendation on the next backend change. Reapply 500 under schema 2 only if that lower budget is intentional; it then remains explicit, and PRX warns when it is below the selected backend's recommendation. | Only to retain an intentional 500 ms override |
 | `agent.tool_dispatcher` is never read | Delete the key. It still loads and logs a deprecation warning. | No |
@@ -80,10 +85,26 @@ enabled = false
 
 ## No action needed
 
-- Skill lifecycle (immutable revisions, publication journal, legacy import):
-  store-level only in this candidate. No command creates managed revisions yet,
-  and `skill_read` keeps serving the existing skill files until a managed
-  binding exists for the caller. Existing skill directories are not rewritten.
+- The [instruction skill lifecycle](skill-lifecycle.md) is opt-in and defaults
+  to disabled / `draft_only`. Its CLI and approval-bound agent actions manage
+  existing proposals and revisions; automatic proposal scheduling and
+  executable lifecycle bundles are not shipped yet. Existing skill directories
+  are not rewritten on enablement, and `skill_read` keeps its existing behavior
+  until a managed binding applies.
+- Model levels and parameter overrides remain TOML settings committed through
+  transactional configuration management. Catalog updates arrive only with the
+  binary. Retired selections remain loadable; preview
+  `prx models migrate-retired` before applying replacements. See the
+  [release model catalog](model-catalog.md).
+- Recursive delegation stays disabled unless explicitly permitted in operator
+  configuration and requested by the caller. Existing configurations do not
+  gain recursive authority. See [recursive child grants](tools.md#recursive-child-grants).
+- Dependency policy retains the dated `RUSTSEC-2026-0381` exception for the
+  `webpki-roots` 0.26.11 bridge to patched 1.0.10 roots, reviewed by 2026-11-21
+  or when upstream removes the bridge. The older `RUSTSEC-2025-0141` exception
+  remains in both `deny.toml` and `.cargo/audit.toml`; the latter also retains
+  `RUSTSEC-2024-0388`. This is not a clean raw advisory scan;
+  see [the dependency exception](security.md#dependency-advisory-exception).
 - Source-layout changes (`agent::loop_` removal, memory backend and chat module
   splits): no stored-data or configuration conversion. See
   [agent turn engine migration](agent-turn-engine-migration.md).

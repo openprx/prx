@@ -31,7 +31,7 @@ content is not stored.
 [compliance.interaction_notice]
 applicability = "required"
 version = "v1"
-message = "You are interacting with an AI system."
+text = "You are interacting with an AI system."
 ```
 
 An exception is a legal/policy decision and must be explicit:

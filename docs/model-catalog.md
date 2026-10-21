@@ -70,8 +70,14 @@ seed) participate in resolution before unsupported fields are removed.
 Ollama's boolean `think` is adapter-owned and survives catalog rewriting.
 Anthropic effort maps only to `output_config.effort`; it does not activate
 adaptive thinking, because signed thinking-block replay is not implemented.
-Anthropic and Bedrock thinking budgets must be strictly less than the output
-limit. Other adapters retain their own output-cutoff semantics.
+Anthropic and Bedrock output limits resolve from catalog defaults/levels,
+saved settings and explicit caller values before falling back to the adapter's
+required output limit. The fallback is clamped to a declared range and step;
+it must be a positive integer. An undeclared output field therefore cannot
+remove the adapter's required limit. A generic wrapper with neither an adapter
+limit nor a catalog default preserves absence. Thinking budgets must be
+strictly less than any present output limit; a conflicting budget is refused
+locally. Other adapters retain their own output-cutoff semantics.
 Compatible providers bind lookup to their configured canonical identity, not
 their display name. A streaming usage-option retry retains one preparation
 record for the logical request. The resolved values and catalog revision

@@ -108,7 +108,6 @@ original statements, error propagation, primitive await order, guard lifetimes,
 and 238 clone calls are preserved. All chat tests remain unchanged; source
 guards cover the new production child alongside the root.
 
-
 ## Finding 104 split and current inventory (2026-10-21)
 
 The architecture guards remain one integration target, `architecture_boundaries`,
@@ -123,3 +122,22 @@ A fresh scan of 1,279 tracked first-party Rust, JavaScript, TypeScript, and Svel
 files, excluding `vendor/` and `console/dist/`, finds no file above 5,000 physical
 lines. The largest is `src/providers/compatible.rs` at 4,991 lines. The dated
 2026-10-15 inventory above is retained as the historical baseline.
+
+## Current source paths (2026-10-21)
+
+The dated inventories above describe their captured source. For current code,
+follow these module roots and responsibility-specific files after the splits:
+
+| Area | Current paths |
+| --- | --- |
+| Config schema | `src/config/schema.rs` re-exports domain types from `src/config/schema/`; loading and validation are in `lifecycle.rs`, deprecated keys in `legacy.rs`, launch policy and channel exclusions in `security.rs`, persistence in `atomic.rs`, tests in `tests/` |
+| Config schema contract | `tests/fixtures/config-schema.json` is the golden schema used by `tests/config_persistence.rs` |
+| Onboarding | `src/onboard/wizard.rs` retains entrypoints; `src/onboard/wizard/` owns models, provider, workspace, preferences, channels, tunnel, summary and persistence |
+| Chat startup | `src/chat/run.rs` owns the event loop; `src/chat/run/startup.rs` owns extracted startup and teardown helpers |
+| Providers | `src/providers/mod.rs` retains factory wiring; `aliases.rs`, `credential_resolution.rs`, `errors.rs`, `info.rs`, `oauth.rs`, `redaction.rs` and `runtime_options.rs` own supporting concerns |
+| Reliable provider | `src/providers/reliable.rs` owns retry/fallback execution; `src/providers/reliable/tests.rs` and `src/providers/reliable/tests/` own its tests |
+| Compatible provider | `src/providers/compatible.rs` retains transport; `src/providers/compatible/` contains factored helpers and tests |
+| Turn decisions | `src/runtime/turn_decision.rs` assembles `src/runtime/turn_decision/` modules for accounting, issued authority, request parameters, preparation, approval, delegation, discovery, execution and routing |
+| Architecture guards | One Cargo integration target rooted at `tests/architecture_boundaries/main.rs`, with source readers in `helpers.rs` and guards under `tests/architecture_boundaries/` |
+
+These are source moves, not operator configuration or stored-data migrations.
