@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+mod acceptance;
 mod authorize;
 mod binding;
 mod bundle;
