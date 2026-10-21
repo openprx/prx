@@ -32,6 +32,10 @@ and the migration warnings below before upgrading.
   grant bound to the source directory and complete bundle hash. Managed
   execution checks the pinned revision's review lineage, clears the native
   process environment down to an allowlist, and joins process cleanup.
+  The legacy `skill_execute` path refuses lifecycle projections under
+  `skills/<dir>/` regardless of `owner_scope`, including when it is unset.
+  An invalid configured owner scope or an unreadable lifecycle store causes
+  refusal, never fallback to legacy execution.
   Proposals may change only `SKILL.md`; script generation remains unsupported.
   A native child that deliberately escapes with `setsid` is outside process-group
   cleanup; docker runtime containment is the current option for that case.

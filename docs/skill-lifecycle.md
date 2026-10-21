@@ -264,7 +264,11 @@ SL11 adds reviewed executable revisions: a bundle with scripts or declared
   call itself is approved at the orchestration boundary. A manifest cannot grant
   access. A managed skill never falls back to the unpinned legacy path: a call
   with no trusted owner, or from another owner, is refused when the skill is
-  managed in the configured owner's store.
+  managed in the configured owner's store. Independently of the configured
+  `owner_scope` (including when it is unset), the legacy `skill_execute` path
+  refuses any `skills/<dir>/` that is a lifecycle projection. An invalid
+  configured `owner_scope` or an unreadable lifecycle store causes refusal,
+  never fallback to legacy execution.
 - **Environment.** A managed script does not inherit the PRX environment. On the
   native runtime the process starts with an empty environment plus `PATH`, `LANG`,
   `LC_*` and `TZ` from the parent, `HOME` set to its run directory, `TMPDIR`
