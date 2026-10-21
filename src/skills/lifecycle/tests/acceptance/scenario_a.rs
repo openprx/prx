@@ -216,7 +216,7 @@ async fn repeated_work_without_a_skill_becomes_a_published_skill_that_unseen_tas
     // 7. Unseen tasks through the production entry use the new skill.
     for build in [31, 32, 33] {
         let answer = world
-            .run_task(
+            .run_task_selected(
                 &auto,
                 &format!("TASK[release] Write the release notes for build {build}."),
             )
@@ -226,7 +226,7 @@ async fn repeated_work_without_a_skill_becomes_a_published_skill_that_unseen_tas
     }
     assert_eq!(
         world
-            .run_task(&auto, "TASK[hotfix] Write the hotfix note for patch 9.")
+            .run_task_selected(&auto, "TASK[hotfix] Write the hotfix note for patch 9.")
             .await
             .expect("test: hotfix"),
         "FINAL:hotfix-v1"
@@ -387,7 +387,7 @@ async fn evidence_that_does_not_show_uncovered_work_cannot_back_a_new_skill() {
     covered.onboard(&super::support::skill_text(&[("hotfix", "hotfix-v1")]));
     let covered_config = covered.production_config(SkillsLifecycleModeConfig::Auto, &[]);
     covered
-        .run_task(&covered_config, "TASK[hotfix] Write the hotfix note for patch 3.")
+        .run_task_selected(&covered_config, "TASK[hotfix] Write the hotfix note for patch 3.")
         .await
         .expect("test: run on a skill");
     let hydrated = covered.production_runs(1).await;

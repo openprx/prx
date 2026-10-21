@@ -32,7 +32,7 @@ async fn a_bounded_revision_replaces_the_active_one_while_a_running_task_keeps_i
 
     // A demonstrated procedural failure on A, then the bounded revision.
     let pre = world
-        .run_task(&auto, "TASK[release] Write the release notes for build 4.")
+        .run_task_selected(&auto, "TASK[release] Write the release notes for build 4.")
         .await
         .expect("test: run on A");
     assert_eq!(pre, "FINAL:changelog-v1", "A follows its own (wrong) rule");

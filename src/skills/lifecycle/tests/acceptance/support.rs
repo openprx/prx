@@ -433,6 +433,19 @@ impl World {
             .map_err(|_| anyhow::anyhow!("the agent run did not finish within 60s"))?
     }
 
+    /// [`Self::run_task`] for a task that selects a catalog skill, with the
+    /// selection receipt of the run on record before the turn can end. The
+    /// receipt is written off the turn path; left to race with the hydration
+    /// and the terminal of the same task for the experience's lock, a slow
+    /// disk could make one of their bounded lock waits expire.
+    pub async fn run_task_selected(&self, config: &Config, prompt: &str) -> anyhow::Result<String> {
+        self.loopback
+            .set_hook(Some(Loopback::selection_gate(self.loopback.requests() + 1, &self.store)));
+        let result = self.run_task(config, prompt).await;
+        self.loopback.set_hook(None);
+        result
+    }
+
     /// The executor evaluation runs use: the real agent entry in fresh
     /// workspaces, charged to the operator ledger.
     pub fn executor(&self) -> AgentCaseExecutor {
