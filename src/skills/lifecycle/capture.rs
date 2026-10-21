@@ -579,12 +579,25 @@ pub struct TaskTerminal<'a> {
     /// What the runtime observed (tool calls, refusals, provider end); `None`
     /// leaves every fact unknown.
     pub observations: Option<&'a TerminalObservations>,
+    /// The task is a root task (it has no parent run). Only a root task that
+    /// used no managed skill leaves a record of that, see [`on_task_terminal`].
+    pub root_task: bool,
 }
 
 /// The one call-in for a task terminal: joins the terminal to the task's
 /// experience (when the owner has a lifecycle store) and releases the task's
 /// revision pins. Pins are released even when the join fails, so a capture
-/// problem can never leak them. Blocking; async callers use `spawn_blocking`.
+/// problem can never leak them.
+///
+/// A root task that finished as a success or a failure without touching any
+/// managed skill has no experience yet. This is the one place that records it:
+/// the zero-baseline path (spec scenario A) needs work that ran without a
+/// skill as attributable evidence, so the terminal creates the record with the
+/// facts derived from the runtime's observations, and no second recording path
+/// exists. Children, cancelled, blocked and unverified terminals leave nothing
+/// (they could never support a claim), and a store that already holds
+/// [`UNCOVERED_RECORDING_LIMIT`] experiences stops recording them.
+/// Blocking; async callers use `spawn_blocking`.
 pub fn on_task_terminal(
     workspace_dir: &std::path::Path,
     owner: &OwnerScope,
@@ -594,9 +607,9 @@ pub fn on_task_terminal(
     super::binding::release_task_pins(owner, terminal.task_id);
     match SkillLifecycleStore::open_existing(workspace_dir, owner.clone()) {
         Ok(Some(store)) => {
-            // A task that never touched a managed skill has no experience and
-            // needs none; do not create an empty record for it.
             match store.read_experience(terminal.task_id)? {
+                None if terminal.root_task => store.record_uncovered_terminal(terminal),
+                None => Ok(None),
                 Some(experience) => {
                     // The facts of a terminal that is already joined stand.
                     let facts = if experience.terminal.is_some() {
@@ -608,11 +621,81 @@ pub fn on_task_terminal(
                         .join_terminal_with(terminal.task_id, terminal.terminal_receipt_id, terminal.outcome, &facts)
                         .map(Some)
                 }
-                None => Ok(None),
             }
         }
         Ok(None) | Err(LifecycleError::OwnerMismatch { .. }) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// Experience records after which tasks that used no managed skill stop
+/// leaving one. Nothing prunes experiences by itself yet, so recording the work
+/// of every task must not grow a store without bound.
+pub const UNCOVERED_RECORDING_LIMIT: usize = 4096;
+
+impl SkillLifecycleStore {
+    /// Number of experience records, counting at most `limit`.
+    fn experience_count_up_to(&self, limit: usize) -> Result<usize, LifecycleError> {
+        let dir = self.root().join(EXPERIENCES_DIR);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(LifecycleError::io(&dir, e)),
+        };
+        let mut count = 0;
+        for entry in entries {
+            let entry = entry.map_err(|e| LifecycleError::io(&dir, e))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("exp-") && name.ends_with(".json") {
+                count += 1;
+                if count >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Creates the experience of a root task that used no managed skill and
+    /// joins its terminal. Only `Success` and `Failure` are recorded.
+    fn record_uncovered_terminal(
+        &self,
+        terminal: &TaskTerminal<'_>,
+    ) -> Result<Option<TerminalJoinOutcome>, LifecycleError> {
+        if !matches!(
+            terminal.outcome,
+            ExperienceOutcome::Success | ExperienceOutcome::Failure
+        ) {
+            return Ok(None);
+        }
+        if self.experience_count_up_to(UNCOVERED_RECORDING_LIMIT)? >= UNCOVERED_RECORDING_LIMIT {
+            tracing::warn!(
+                limit = UNCOVERED_RECORDING_LIMIT,
+                "the experience store is full; a task without a managed skill leaves no record"
+            );
+            return Ok(None);
+        }
+        // No receipts yet, so the derivation sees no skill: only the
+        // infrastructure and permission facts are taken from the observations.
+        let empty = SkillExperience {
+            schema_version: SCHEMA_VERSION,
+            record_id: experience_id(self.owner_scope(), terminal.task_id),
+            owner_scope: self.owner_scope().clone(),
+            task_id: terminal.task_id.to_string(),
+            correlation: Correlation::default(),
+            selection_receipts: Vec::new(),
+            hydration_receipts: Vec::new(),
+            terminal: None,
+            outcome: ExperienceOutcome::Incomplete,
+            dropped_evidence: 0,
+            late_evidence: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let facts = derive(self, &empty, terminal.observations);
+        self.join_terminal_with(terminal.task_id, terminal.terminal_receipt_id, terminal.outcome, &facts)
+            .map(Some)
     }
 }
 

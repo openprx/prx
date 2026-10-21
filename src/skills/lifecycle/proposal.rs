@@ -230,14 +230,16 @@ pub struct AuthorBinding {
 #[serde(deny_unknown_fields)]
 pub struct ProposalBasis {
     /// Distinct root tasks whose stored experience is learning-eligible, ended
-    /// in a failure terminal and hydrated the baseline revision.
+    /// in a failure terminal and hydrated the baseline revision. For a new
+    /// skill: the distinct root tasks that ran without any managed skill.
     pub failed_tasks_on_baseline: usize,
     /// Distinct root tasks that contradict the patterns on the same revision.
     pub contradicting_tasks: usize,
     /// `true` when every supporting experience carries a verified adherence
     /// fact for the baseline revision (its declared tools were called) and
     /// positively no infrastructure or permission cause. Experiences whose
-    /// facts are unknown (older records) never qualify as support.
+    /// facts are unknown (older records) never qualify as support. Always
+    /// `false` for a new skill: there is nothing yet to adhere to.
     pub adherence_verified: bool,
 }
 
@@ -331,7 +333,10 @@ pub struct SkillProposal {
     /// Active generation the proposal was prepared against; publication must
     /// recheck it.
     pub expected_generation: u64,
-    pub baseline_revision: RevisionId,
+    /// The active revision the proposal revises; `None` for a NEW skill
+    /// (`operation == Create`), whose baseline is doing the task without the
+    /// skill and whose expected generation is 0.
+    pub baseline_revision: Option<RevisionId>,
     /// Identity of the staged candidate bundle; `None` until one is staged.
     pub candidate_revision: Option<RevisionId>,
     pub pattern_ids: Vec<PatternId>,

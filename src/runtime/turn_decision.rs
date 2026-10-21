@@ -1800,6 +1800,7 @@ impl TurnDecisionService {
             terminal_id.to_owned(),
             crate::skills::lifecycle::TerminalObservation {
                 recovered: true,
+                root: event.parent_run_id.is_none(),
                 ..terminal_status.skill_observation(awaiting_approval, verified)
             },
         );

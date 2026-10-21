@@ -249,6 +249,9 @@ pub struct TerminalObservation {
     /// Reported by restart recovery. A terminal the live path already joined
     /// is kept as it is: the recovered view never replaces or conflicts with it.
     pub recovered: bool,
+    /// The task is a root task (it has no parent run). Only root tasks leave a
+    /// record of work that used no managed skill.
+    pub root: bool,
 }
 
 impl TerminalObservation {
@@ -293,6 +296,7 @@ pub async fn settle_task_terminal(
     };
     let outcome = observation.outcome();
     let recovered = observation.recovered;
+    let root = observation.root;
     let workspace = workspace_dir.to_path_buf();
     let terminal_id = terminal_id.to_string();
     let call_in = tokio::task::spawn_blocking(move || {
@@ -312,6 +316,7 @@ pub async fn settle_task_terminal(
                 terminal_receipt_id: &terminal_id,
                 outcome,
                 observations: observations.as_ref(),
+                root_task: root,
             },
         )
         .map(|_| ())

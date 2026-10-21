@@ -641,6 +641,7 @@ async fn release_skill_lifecycle(
     terminal_id: &str,
     status: TurnTerminalStatus,
     awaiting_approval: bool,
+    root: bool,
     observations: crate::skills::lifecycle::TerminalObservations,
 ) {
     crate::skills::lifecycle::settle_task_terminal(
@@ -648,7 +649,10 @@ async fn release_skill_lifecycle(
         owner,
         task_key,
         terminal_id,
-        status.skill_observation(awaiting_approval, true),
+        crate::skills::lifecycle::TerminalObservation {
+            root,
+            ..status.skill_observation(awaiting_approval, true)
+        },
         Some(observations),
     )
     .await;
@@ -673,6 +677,7 @@ impl TurnTerminalStatus {
             awaiting_approval,
             verified,
             recovered: false,
+            root: true,
         }
     }
 }
@@ -1019,6 +1024,7 @@ async fn finalize_turn_impl(
         ensure_runtime_authority(&commit.scope, "terminal-marker").await?;
         let skill_owner = commit.scope.owner_id.clone();
         let skill_task = skill_task_key(&commit.scope);
+        let skill_root = commit.scope.parent_run_id.is_none();
         let terminal_event = fabric
             .record_runtime_event_idempotent(
                 commit.scope,
@@ -1067,6 +1073,7 @@ async fn finalize_turn_impl(
             &commit.terminal_id,
             commit.status,
             awaiting_approval,
+            skill_root,
             observations,
         )
         .await;
@@ -2719,6 +2726,7 @@ mod tests {
             "silent-term",
             TurnTerminalStatus::Silent,
             false,
+            true,
             crate::skills::lifecycle::TerminalObservations::default(),
         )
         .await;
@@ -2758,6 +2766,7 @@ mod tests {
             "child-term",
             TurnTerminalStatus::Completed,
             false,
+            false,
             crate::skills::lifecycle::TerminalObservations::default(),
         )
         .await;
@@ -2771,6 +2780,7 @@ mod tests {
             "parent-term",
             TurnTerminalStatus::Failed,
             false,
+            true,
             crate::skills::lifecycle::TerminalObservations::default(),
         )
         .await;
@@ -2795,6 +2805,7 @@ mod tests {
             Some("approval-run".to_string()),
             "approval-term",
             TurnTerminalStatus::Completed,
+            true,
             true,
             crate::skills::lifecycle::TerminalObservations::default(),
         )

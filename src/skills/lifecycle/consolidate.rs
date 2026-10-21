@@ -165,6 +165,9 @@ impl ConsolidationRequest {
         if self.skill_id.is_none() && needs_skill(self.failure_class) {
             return Err(invalid("a skill-related failure class needs the skill it is about"));
         }
+        if self.skill_id.is_some() && self.failure_class.allows_new_skill() {
+            return Err(invalid("work that no skill covers is about no skill"));
+        }
         Ok(())
     }
 
@@ -194,6 +197,40 @@ pub(super) struct EvidenceUse<'a> {
     pub requires_hydration: bool,
     /// An experience that ended in success cannot support a failure of guidance.
     pub rejects_success: bool,
+    /// Zero-baseline evidence: the task used no managed skill (no hydration),
+    /// ended in a success or failure terminal, and no infrastructure or
+    /// permission cause is present. A failure also needs both causes positively
+    /// absent: an unknown fact never supports a failure.
+    pub uncovered: bool,
+}
+
+/// Whether `experience` shows work that no managed skill covered, with the
+/// reason when it does not.
+pub(super) fn check_uncovered(experience: &super::capture::SkillExperience) -> Result<(), &'static str> {
+    use super::facts::FactState;
+    if !experience.hydration_receipts.is_empty() {
+        return Err("the task read a managed skill, so it was covered");
+    }
+    let Some(terminal) = experience.terminal.as_ref() else {
+        return Err("the task has no joined terminal");
+    };
+    if terminal.facts.infrastructure_unavailable == FactState::Present {
+        return Err("the task ended because infrastructure was unavailable");
+    }
+    if terminal.facts.permission_refused == FactState::Present {
+        return Err("a tool call of the task was refused by policy or approval");
+    }
+    match terminal.outcome {
+        ExperienceOutcome::Success => Ok(()),
+        ExperienceOutcome::Failure
+            if terminal.facts.infrastructure_unavailable == FactState::Absent
+                && terminal.facts.permission_refused == FactState::Absent =>
+        {
+            Ok(())
+        }
+        ExperienceOutcome::Failure => Err("a failure whose infrastructure and permission facts are not verified"),
+        _ => Err("only success and verified failure terminals show repeated work"),
+    }
 }
 
 /// Identities of an evidence experience, used to find the root task it belongs to.
@@ -345,6 +382,9 @@ fn verify_content(pattern: &KnowledgePattern) -> Result<(), LifecycleError> {
     }
     if pattern.skill_id.is_none() && needs_skill(pattern.failure_class) {
         return Err(invalid("a skill-related pattern needs its skill"));
+    }
+    if pattern.skill_id.is_some() && pattern.failure_class.allows_new_skill() {
+        return Err(invalid("a pattern of uncovered work is about no skill"));
     }
     if pattern.supersedes.len() > 1 {
         return Err(invalid("a pattern supersedes at most one pattern"));
@@ -516,6 +556,9 @@ impl SkillLifecycleStore {
                 "the task ended in success, so it shows no failure of the guidance",
             ));
         }
+        if usage.uncovered {
+            check_uncovered(&experience).map_err(unusable)?;
+        }
         if usage.requires_hydration
             && let Some(skill) = usage.skill
             && !experience.used_skills().contains(&skill)
@@ -593,11 +636,13 @@ impl SkillLifecycleStore {
                     request.failure_class,
                     FailureClass::MissingGuidance | FailureClass::GuidanceNotFollowed
                 ),
+                uncovered: request.failure_class.allows_new_skill(),
             },
             EvidenceUse {
                 skill: request.skill_id.as_ref(),
                 requires_hydration: false,
                 rejects_success: false,
+                uncovered: false,
             },
         );
         // Requested evidence must be usable now. Evidence carried over from

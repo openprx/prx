@@ -348,7 +348,7 @@ async fn a_bounded_candidate_is_staged_and_nothing_is_activated() {
         "every support fact is a verified-adherence failure"
     );
     assert_eq!(proposal.expected_generation, before.generation);
-    assert_eq!(proposal.baseline_revision, before.revision_id);
+    assert_eq!(proposal.baseline_revision, Some(before.revision_id.clone()));
     let diff = proposal.diff.as_ref().expect("test: diff");
     let new_step = "Step 3: run the check number 3 and the migration step before continuing.";
     assert_eq!(diff.changed_tokens, tokens(OLD_STEP).max(tokens(new_step)));
@@ -2062,6 +2062,7 @@ fn run_through_terminal(f: &Fixture, task: &str, observed: &[&str]) -> String {
             terminal_receipt_id: "term",
             outcome: ExperienceOutcome::Failure,
             observations: Some(&observations),
+            root_task: false,
         },
     )
     .expect("test: terminal");
@@ -2182,6 +2183,7 @@ mod from_trace {
                 terminal_receipt_id: "term",
                 outcome: ExperienceOutcome::Failure,
                 observations: Some(&observations),
+                root_task: false,
             },
         )
         .expect("test: terminal");

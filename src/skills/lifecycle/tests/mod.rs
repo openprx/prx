@@ -13,6 +13,7 @@ mod knowledge;
 mod manifest;
 mod migrate;
 mod propose;
+mod propose_new;
 mod publish;
 mod receipts;
 mod service;

@@ -2,9 +2,10 @@
 
 use super::{activate, entry, md, owner};
 use crate::skills::lifecycle::{
-    Bundle, Correlation, ExperienceOutcome, ExperienceRetention, LifecycleError, MAX_HYDRATION_RECEIPTS,
-    MAX_SELECTION_RECEIPTS, ManagedReadRequest, NewRevision, PinnedSkillRevision, SkillId, SkillLifecycleStore,
-    SourceKind, TaskTerminal, experience_id, on_task_terminal, read_managed_resource, task_key, task_pin,
+    Bundle, Correlation, ExperienceOutcome, ExperienceRetention, FactState, LifecycleError, MAX_HYDRATION_RECEIPTS,
+    MAX_SELECTION_RECEIPTS, ManagedReadRequest, NewRevision, PinnedSkillRevision, ProviderEnd, SkillId,
+    SkillLifecycleStore, SourceKind, TaskTerminal, TerminalObservations, UNCOVERED_RECORDING_LIMIT, experience_id,
+    on_task_terminal, read_managed_resource, task_key, task_pin,
 };
 use std::fs;
 use tempfile::TempDir;
@@ -291,6 +292,7 @@ fn the_task_terminal_call_in_joins_and_always_releases_pins() {
         terminal_receipt_id: "term-9",
         outcome: ExperienceOutcome::Failure,
         observations: None,
+        root_task: false,
     };
     let joined = on_task_terminal(tmp.path(), &who, &terminal)
         .expect("test: terminal")
@@ -313,6 +315,7 @@ fn the_task_terminal_call_in_joins_and_always_releases_pins() {
         terminal_receipt_id: "term-9",
         outcome: ExperienceOutcome::Success,
         observations: None,
+        root_task: false,
     };
     assert!(on_task_terminal(tmp.path(), &who, &conflicting).is_err());
     let mut reissued = false;
@@ -324,12 +327,14 @@ fn the_task_terminal_call_in_joins_and_always_releases_pins() {
     assert!(reissued, "pins are released even when the join fails");
     crate::skills::lifecycle::release_task_pins(&who, "task-term");
 
-    // A task that never touched a managed skill gets no experience record.
+    // A task that never touched a managed skill and is not a root task (a
+    // child run) gets no experience record.
     let untouched = TaskTerminal {
         task_id: "task-none",
         terminal_receipt_id: "term-0",
         outcome: ExperienceOutcome::Success,
         observations: None,
+        root_task: false,
     };
     assert!(
         on_task_terminal(tmp.path(), &who, &untouched)
@@ -561,4 +566,120 @@ fn pruning_removes_orphan_dropped_markers_by_age() {
         .prune_experiences(&retention, later, |_| false)
         .expect("test: prune");
     assert!(!marker.exists(), "an old orphan marker is removed");
+}
+
+fn uncovered_terminal<'a>(
+    task: &'a str,
+    outcome: ExperienceOutcome,
+    observations: Option<&'a TerminalObservations>,
+    root_task: bool,
+) -> TaskTerminal<'a> {
+    TaskTerminal {
+        task_id: task,
+        terminal_receipt_id: "term-u",
+        outcome,
+        observations,
+        root_task,
+    }
+}
+
+/// Observations of a run whose provider served it and whose trace was whole.
+fn served() -> TerminalObservations {
+    TerminalObservations {
+        complete: true,
+        provider: ProviderEnd::Served,
+        ..TerminalObservations::default()
+    }
+}
+
+#[test]
+fn a_root_task_without_a_managed_skill_leaves_an_attributable_record() {
+    let (tmp, store, _pin) = setup();
+    let who = owner(OWNER);
+    let observations = served();
+    let joined = on_task_terminal(
+        tmp.path(),
+        &who,
+        &uncovered_terminal("task-uncovered", ExperienceOutcome::Success, Some(&observations), true),
+    )
+    .expect("test: terminal")
+    .expect("test: a record was created");
+    assert!(!joined.replayed);
+    let record = store
+        .read_experience("task-uncovered")
+        .expect("test: read")
+        .expect("test: present");
+    assert!(record.hydration_receipts.is_empty() && record.selection_receipts.is_empty());
+    let terminal = record.terminal.as_ref().expect("test: joined");
+    assert_eq!(terminal.outcome, ExperienceOutcome::Success);
+    assert_eq!(terminal.facts.infrastructure_unavailable, FactState::Absent);
+    assert_eq!(terminal.facts.permission_refused, FactState::Absent);
+    assert_eq!(terminal.facts.adherence.len(), 0);
+    assert!(record.learning_eligible());
+
+    // The same terminal again is a replay, not a second record.
+    let again = on_task_terminal(
+        tmp.path(),
+        &who,
+        &uncovered_terminal("task-uncovered", ExperienceOutcome::Success, Some(&observations), true),
+    )
+    .expect("test: terminal")
+    .expect("test: joined");
+    assert!(again.replayed);
+
+    // Without observations nothing is claimed about the causes.
+    on_task_terminal(
+        tmp.path(),
+        &who,
+        &uncovered_terminal("task-blind", ExperienceOutcome::Failure, None, true),
+    )
+    .expect("test: terminal");
+    let blind = store
+        .read_experience("task-blind")
+        .expect("test: read")
+        .expect("test: present");
+    let facts = &blind.terminal.as_ref().expect("test: joined").facts;
+    assert_eq!(
+        (facts.infrastructure_unavailable, facts.permission_refused),
+        (FactState::Unknown, FactState::Unknown)
+    );
+}
+
+#[test]
+fn only_root_successes_and_failures_without_a_skill_are_recorded() {
+    let (tmp, store, _pin) = setup();
+    let who = owner(OWNER);
+    for (task, outcome, root) in [
+        ("task-child", ExperienceOutcome::Success, false),
+        ("task-cancelled", ExperienceOutcome::Cancelled, true),
+        ("task-blocked", ExperienceOutcome::Blocked, true),
+        ("task-unknown", ExperienceOutcome::Unknown, true),
+    ] {
+        let recorded =
+            on_task_terminal(tmp.path(), &who, &uncovered_terminal(task, outcome, None, root)).expect("test: terminal");
+        assert!(recorded.is_none(), "{task} leaves nothing");
+        assert!(store.read_experience(task).expect("test: read").is_none(), "{task}");
+    }
+}
+
+#[test]
+fn a_full_experience_store_stops_recording_uncovered_work() {
+    let (tmp, store, _pin) = setup();
+    let who = owner(OWNER);
+    let dir = store.root().join("experiences");
+    fs::create_dir_all(&dir).expect("test: dir");
+    for n in 0..UNCOVERED_RECORDING_LIMIT {
+        fs::write(dir.join(format!("exp-{n:032x}.json")), b"{}").expect("test: filler");
+    }
+    let recorded = on_task_terminal(
+        tmp.path(),
+        &who,
+        &uncovered_terminal("task-over-limit", ExperienceOutcome::Success, None, true),
+    )
+    .expect("test: terminal");
+    assert!(recorded.is_none());
+    assert!(
+        !dir.join(format!("{}.json", experience_id(&who, "task-over-limit")))
+            .exists()
+    );
 }

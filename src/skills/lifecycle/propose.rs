@@ -69,12 +69,12 @@ pub const MAX_PROPOSAL_PATTERNS: usize = 8;
 /// Edits one reply may carry.
 pub const MAX_EDITS: usize = 8;
 
-const SKILL_MD: &str = "SKILL.md";
+pub(super) const SKILL_MD: &str = "SKILL.md";
 const MAX_EDIT_TEXT_BYTES: usize = 4096;
-const MAX_SUMMARY_BYTES: usize = 500;
-const MAX_DESCRIPTION_EDIT_BYTES: usize = 300;
-const MAX_PROMPT_REJECTIONS: usize = 5;
-const MAX_PROMPT_EVIDENCE: usize = 16;
+pub(super) const MAX_SUMMARY_BYTES: usize = 500;
+pub(super) const MAX_DESCRIPTION_EDIT_BYTES: usize = 300;
+pub(super) const MAX_PROMPT_REJECTIONS: usize = 5;
+pub(super) const MAX_PROMPT_EVIDENCE: usize = 16;
 const MAX_BUDGET_INPUT_BYTES: usize = 256 * 1024;
 const MAX_BUDGET_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_BUDGET_TIMEOUT: Duration = Duration::from_secs(600);
@@ -94,7 +94,7 @@ A refusal, a permission problem or an unavailable provider or tool is not a reas
 /// configuration error, not unlimited execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProposerBudget {
-    max_input_bytes: usize,
+    pub(super) max_input_bytes: usize,
     max_output_bytes: usize,
     call_timeout: Duration,
 }
@@ -122,7 +122,7 @@ impl ProposerBudget {
         })
     }
 
-    fn record(self) -> BudgetRecord {
+    pub(super) fn record(self) -> BudgetRecord {
         BudgetRecord {
             max_input_bytes: self.max_input_bytes,
             max_output_bytes: self.max_output_bytes,
@@ -184,11 +184,13 @@ pub(super) enum CallResult {
 }
 
 pub(super) struct Prepared {
-    proposal: SkillProposal,
-    baseline: Bundle,
-    system: String,
-    user: String,
-    budget: ProposerBudget,
+    pub(super) proposal: SkillProposal,
+    /// The bundle the candidate is built from: the active revision, or for a
+    /// new skill the fixed skeleton.
+    pub(super) baseline: Bundle,
+    pub(super) system: String,
+    pub(super) user: String,
+    pub(super) budget: ProposerBudget,
 }
 
 pub(super) enum Prepare {
@@ -210,6 +212,17 @@ pub async fn propose_revision(
         let (store, request) = (Arc::clone(&store), request.clone());
         blocking(move || store.prepare_proposal(&request, &binding)).await?
     };
+    drive(store, prepared, model, cancel).await
+}
+
+/// The model call and the recording of a prepared proposal; shared by the
+/// revision and the new-skill proposers.
+pub(super) async fn drive(
+    store: Arc<SkillLifecycleStore>,
+    prepared: Prepare,
+    model: &dyn ProposerModel,
+    cancel: &CancellationToken,
+) -> Result<ProposeOutcome, LifecycleError> {
     let prepared = match prepared {
         Prepare::Reused(proposal) => return Ok(ProposeOutcome::Reused(*proposal)),
         Prepare::Suppressed(rejection) => {
@@ -245,7 +258,7 @@ pub async fn propose_revision(
     blocking(move || store.finish_proposal(prepared, call)).await
 }
 
-async fn blocking<T, F>(work: F) -> Result<T, LifecycleError>
+pub(super) async fn blocking<T, F>(work: F) -> Result<T, LifecycleError>
 where
     F: FnOnce() -> Result<T, LifecycleError> + Send + 'static,
     T: Send + 'static,
@@ -255,14 +268,14 @@ where
         .map_err(|e| LifecycleError::ProposalRefused(format!("proposal worker failed: {e}")))?
 }
 
-fn refuse(reason: impl Into<String>) -> LifecycleError {
+pub(super) fn refuse(reason: impl Into<String>) -> LifecycleError {
     LifecycleError::ProposalRefused(reason.into())
 }
 
 /// Instruction tokens of `text`: the larger of its words and a quarter of its
 /// non-whitespace characters, so text without spaces (or CJK) cannot hide
 /// behind a word count of one.
-fn count_tokens(text: &str) -> u64 {
+pub(super) fn count_tokens(text: &str) -> u64 {
     let words = text.split_whitespace().count();
     let chars = text.chars().filter(|c| !c.is_whitespace()).count();
     u64::try_from(words.max(chars / 4)).unwrap_or(u64::MAX)
@@ -295,7 +308,7 @@ fn allowed_tokens(baseline_tokens: u64) -> u64 {
     MAX_EDIT_TOKENS.min(baseline_tokens.saturating_mul(MAX_EDIT_PERCENT) / 100)
 }
 
-fn sha256_hex(parts: &[&str]) -> String {
+pub(super) fn sha256_hex(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
@@ -395,7 +408,7 @@ impl SkillLifecycleStore {
 
     /// Re-consolidates `pattern` against the stored experiences and returns
     /// the refreshed head, which may be a successor with withdrawn evidence.
-    fn refresh_pattern(
+    pub(super) fn refresh_pattern(
         &self,
         pattern: &KnowledgePattern,
         support: Vec<String>,
@@ -575,7 +588,7 @@ impl SkillLifecycleStore {
         let rejections = self.rejections_for(skill)?;
 
         let now = Utc::now();
-        let user = build_user_prompt(skill_text, &patterns, &evidence_ids, &rejections, allowed);
+        let user = build_user_prompt(skill_text, "failed", &patterns, &evidence_ids, &rejections, allowed);
         if user.len() > request.budget.max_input_bytes {
             return Err(refuse(format!(
                 "the prompt is {} bytes, over the input budget of {}",
@@ -594,7 +607,7 @@ impl SkillLifecycleStore {
             skill_id: skill.clone(),
             requested_patterns: requested,
             expected_generation: active.generation,
-            baseline_revision,
+            baseline_revision: Some(baseline_revision),
             candidate_revision: None,
             pattern_ids: refreshed_ids,
             evidence_ids,
@@ -770,16 +783,23 @@ impl SkillLifecycleStore {
                 ),
             );
         }
-        let candidate = match build_candidate(baseline, &reply.text) {
+        let mode = Mode::of(proposal.operation);
+        let candidate = match build_candidate(baseline, &reply.text, mode) {
             Ok(candidate) => candidate,
             Err(refusal) => return failed(refusal.kind, refusal.detail),
         };
-        // The active revision may have moved while the model was working.
-        let still_current = self.active_binding(&proposal.skill_id)?.is_some_and(|binding| {
-            binding.enabled
-                && binding.generation == proposal.expected_generation
-                && binding.revision_id == proposal.baseline_revision
-        });
+        // The active revision may have moved while the model was working; for
+        // a new skill, somebody may have published the skill meanwhile.
+        let binding = self.active_binding(&proposal.skill_id)?;
+        let still_current = match (&proposal.baseline_revision, binding) {
+            (Some(baseline), Some(binding)) => {
+                binding.enabled
+                    && binding.generation == proposal.expected_generation
+                    && binding.revision_id == *baseline
+            }
+            (None, None) => proposal.expected_generation == 0,
+            _ => false,
+        };
         if !still_current {
             proposal.status = ProposalStatus::Stale;
             proposal.status_reason = Some(
@@ -793,7 +813,7 @@ impl SkillLifecycleStore {
         let material_refs: Vec<&str> = material.iter().map(String::as_str).collect();
         if let Some(rejection) = self.suppressing_rejection(
             &proposal.skill_id,
-            ProposalOperation::Revise,
+            proposal.operation,
             &material_refs,
             &proposal.evidence_ids,
             &proposal.environment_binding,
@@ -888,8 +908,9 @@ fn data_fence(skill_text: &str, patterns: &[KnowledgePattern], rejections: &[Rej
     format!("DATA-{}", sha256_hex(&parts).get(..24).unwrap_or_default())
 }
 
-fn build_user_prompt(
+pub(super) fn build_user_prompt(
     skill_text: &str,
+    noun: &str,
     patterns: &[KnowledgePattern],
     evidence_ids: &[String],
     rejections: &[RejectionRecord],
@@ -925,7 +946,7 @@ fn build_user_prompt(
         }
         let _ = writeln!(
             prompt,
-            "supported by {} failed task(s), contradicted by {}",
+            "supported by {} {noun} task(s), contradicted by {}",
             pattern.confidence_basis.distinct_tasks, pattern.confidence_basis.counter_distinct_tasks
         );
     }
@@ -967,6 +988,34 @@ fn refusal(kind: ProposalFailureKind, detail: impl Into<String>) -> Refusal {
 struct Candidate {
     bundle: Bundle,
     diff: BoundedDiff,
+}
+
+/// What a proposal builds on, and so which bounds apply to its edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Mode {
+    /// A revision of an active skill: any edit of `SKILL.md`, within
+    /// `min(300 tokens, 20%)` of the baseline body.
+    Revise,
+    /// A new skill on a fixed skeleton: appended text only, the frontmatter is
+    /// the request's, within [`MAX_EDIT_TOKENS`] flat (the skeleton has no body
+    /// to take a percentage of).
+    New,
+}
+
+impl Mode {
+    pub(super) const fn of(operation: ProposalOperation) -> Self {
+        match operation {
+            ProposalOperation::Create => Self::New,
+            ProposalOperation::Revise | ProposalOperation::Disable => Self::Revise,
+        }
+    }
+
+    fn allowed_tokens(self, baseline_body_tokens: u64) -> u64 {
+        match self {
+            Self::Revise => allowed_tokens(baseline_body_tokens),
+            Self::New => MAX_EDIT_TOKENS,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1014,7 +1063,7 @@ fn check_edit_text(what: &str, text: &str) -> Result<(), Refusal> {
 
 /// Splits `SKILL.md` into its frontmatter (delimiters and trailing newline
 /// included) and the body.
-fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
+pub(super) fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
     let rest = text.strip_prefix("---")?;
     let close = rest.find("\n---")?;
     let after = close + "\n---".len();
@@ -1156,12 +1205,19 @@ pub(super) struct Reapplied {
 
 /// Applies a recorded diff to a baseline `SKILL.md` exactly the way the
 /// proposer did. `baseline_description` is the baseline manifest's own
-/// description; a recorded description change must start from it.
-pub(super) fn reapply_diff(
+/// description; a recorded description change must start from it. A new
+/// skill's recorded diff holds appended text only and no description change.
+pub(super) fn reapply(
+    mode: Mode,
     original: &str,
     baseline_description: &str,
     diff: &BoundedDiff,
 ) -> Result<Reapplied, String> {
+    if mode == Mode::New
+        && (diff.description_change.is_some() || diff.edits.iter().any(|edit| edit.op != EditOp::Append))
+    {
+        return Err("a new skill's diff may only append text".to_string());
+    }
     let (front, body) = split_frontmatter(original).ok_or_else(|| "the baseline has no frontmatter".to_string())?;
     let mut new_body = body.to_string();
     let mut changed: u64 = 0;
@@ -1185,7 +1241,7 @@ pub(super) fn reapply_diff(
         None => front.to_string(),
     };
     let baseline_tokens = count_tokens(body);
-    let allowed = allowed_tokens(baseline_tokens);
+    let allowed = mode.allowed_tokens(baseline_tokens);
     Ok(Reapplied {
         skill_md: format!("{new_front}{new_body}"),
         changed_tokens: changed,
@@ -1197,7 +1253,7 @@ pub(super) fn reapply_diff(
 }
 
 /// Parses and applies a model reply to the baseline. Every refusal is typed.
-fn build_candidate(baseline: &Bundle, reply: &str) -> Result<Candidate, Refusal> {
+fn build_candidate(baseline: &Bundle, reply: &str, mode: Mode) -> Result<Candidate, Refusal> {
     let patch: ModelPatch = serde_json::from_str(strip_fence(reply)).map_err(|e| {
         refusal(
             ProposalFailureKind::MalformedOutput,
@@ -1221,6 +1277,20 @@ fn build_candidate(baseline: &Bundle, reply: &str) -> Result<Candidate, Refusal>
             return Err(refusal(
                 ProposalFailureKind::OutOfScope,
                 format!("an edit targets {:?}; only {SKILL_MD} may change", bounded(&edit.file)),
+            ));
+        }
+    }
+    if mode == Mode::New {
+        if patch.description.is_some() {
+            return Err(refusal(
+                ProposalFailureKind::OutOfScope,
+                "the description of a new skill is fixed by the request",
+            ));
+        }
+        if patch.edits.iter().any(|edit| edit.op != EditOp::Append) {
+            return Err(refusal(
+                ProposalFailureKind::OutOfScope,
+                "a new skill is written by appending text to its skeleton",
             ));
         }
     }
@@ -1292,13 +1362,19 @@ fn build_candidate(baseline: &Bundle, reply: &str) -> Result<Candidate, Refusal>
 
     // The frontmatter is identity and routing metadata, not instructions.
     let baseline_tokens = count_tokens(body);
-    let allowed = allowed_tokens(baseline_tokens);
+    let allowed = mode.allowed_tokens(baseline_tokens);
     if changed > allowed || changed_bytes > allowed.saturating_mul(BYTES_PER_TOKEN) {
+        let rule = match mode {
+            Mode::Revise => {
+                format!("min of {MAX_EDIT_TOKENS} and {MAX_EDIT_PERCENT}% of the baseline body's {baseline_tokens}")
+            }
+            Mode::New => format!("the {MAX_EDIT_TOKENS}-token cap of a new skill"),
+        };
         return Err(refusal(
             ProposalFailureKind::EditBudgetExceeded,
             format!(
                 "the patch changes {changed} tokens ({changed_bytes} bytes); at most {allowed} tokens are allowed \
-                 (min of {MAX_EDIT_TOKENS} and {MAX_EDIT_PERCENT}% of the baseline body's {baseline_tokens})"
+                 ({rule})"
             ),
         ));
     }

@@ -354,7 +354,8 @@ pub struct ProposalSummary {
     pub skill_id: String,
     pub status: &'static str,
     pub status_reason: Option<String>,
-    pub baseline_revision: String,
+    /// `None` for a new skill, which has no baseline revision.
+    pub baseline_revision: Option<String>,
     pub candidate_revision: Option<String>,
     pub expected_generation: u64,
     pub evaluation_epoch: u32,
@@ -625,7 +626,7 @@ impl SkillsLifecycleService {
             skill_id: proposal.skill_id.to_string(),
             status: proposal.status.as_str(),
             status_reason: proposal.status_reason.clone(),
-            baseline_revision: proposal.baseline_revision.to_string(),
+            baseline_revision: proposal.baseline_revision.as_ref().map(ToString::to_string),
             candidate_revision: proposal.candidate_revision.as_ref().map(ToString::to_string),
             expected_generation: proposal.expected_generation,
             evaluation_epoch: proposal.evaluation_epoch,
@@ -771,7 +772,7 @@ impl SkillsLifecycleService {
         let request = EvaluationRequest {
             suite: &suite,
             split,
-            baseline: Some(proposal.baseline_revision.clone()),
+            baseline: proposal.baseline_revision.clone(),
             candidate,
             observed_generation: proposal.expected_generation,
         };

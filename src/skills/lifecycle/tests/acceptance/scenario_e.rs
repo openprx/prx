@@ -19,7 +19,9 @@
 //!   the current worker/browser blockers.
 
 use super::flows::{capture_failed_tasks, propose, staged};
-use super::support::{ScriptedProposer, World, consolidate, notes_suite, nth, replace_patch, skill, skill_text};
+use super::support::{
+    Loopback, ScriptedProposer, World, consolidate, notes_suite, nth, replace_patch, skill, skill_text,
+};
 use crate::SkillLifecycleCommands;
 use crate::config::skills_lifecycle::SkillsLifecycleModeConfig;
 use crate::skills::lifecycle::{Adherence, ExperienceOutcome, ProposalStatus};
@@ -36,6 +38,9 @@ async fn the_agent_entry_leaves_the_selection_hydration_tool_terminal_and_side_e
     config.autonomy.level = crate::security::AutonomyLevel::Full;
     config.tool_tiering.always_include = ["skill_read", "file_read", "file_write"].map(str::to_string).to_vec();
 
+    // The selection receipt of this run (written off the turn path) is on
+    // record before the turn can end.
+    world.loopback.set_hook(Some(Loopback::selection_gate(1, &world.store)));
     let answer = world
         .run_task(&config, "TASK[report] Write the release notes report for build 5.")
         .await
@@ -92,9 +97,13 @@ async fn the_agent_entry_leaves_the_selection_hydration_tool_terminal_and_side_e
     );
     assert_eq!(terminal.facts.adherence_of(&skill(), &revision), Adherence::Followed);
     assert_eq!((run.dropped_evidence, run.late_evidence), (0, 0));
-    // The selection receipt is written off the turn path and follows retrieval;
-    // when it exists it names the same revision.
+    // The selection receipt names the revision the run selected, then read.
+    assert!(
+        !run.selection_receipts.is_empty(),
+        "the run selected the skill: {run:?}"
+    );
     assert!(run.selection_receipts.iter().all(|s| s.revision_id == revision));
+    assert!(run.selection_receipts.iter().all(|s| s.skill_id == skill()));
 }
 
 #[tokio::test]

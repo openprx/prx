@@ -353,7 +353,9 @@ pub struct SkillGateDecision {
     pub epoch: u32,
     pub operation: ProposalOperation,
     pub skill_id: SkillId,
-    pub baseline_revision: RevisionId,
+    /// The revision the candidate is compared with; `None` for a new skill,
+    /// whose baseline is doing the same tasks without the skill.
+    pub baseline_revision: Option<RevisionId>,
     pub candidate_revision: RevisionId,
     pub expected_generation: u64,
     pub suite_digest: String,
@@ -867,7 +869,7 @@ impl SkillLifecycleStore {
             }
             if receipt.skill_id != proposal.skill_id
                 || receipt.candidate.revision_id != *candidate
-                || receipt.baseline.as_ref().map(|arm| &arm.revision_id) != Some(&proposal.baseline_revision)
+                || receipt.baseline.as_ref().map(|arm| &arm.revision_id) != proposal.baseline_revision.as_ref()
             {
                 return Err(GateError::Unbound(
                     "the evaluation compares other revisions than the proposal's baseline and candidate".to_string(),
@@ -924,7 +926,7 @@ impl SkillLifecycleStore {
                 && suite_digest == governing
                 && split != EvalSplit::Development
                 && candidate_revision == candidate
-                && baseline == Some(&proposal.baseline_revision)
+                && baseline == proposal.baseline_revision.as_ref()
                 && generation == proposal.expected_generation
         };
         // The reservation (written before the first run) attributes an
@@ -1019,11 +1021,16 @@ impl SkillLifecycleStore {
         }
         // The skill must still be where the proposal found it.
         let binding = self.active_binding(&proposal.skill_id)?;
-        let current = binding.as_ref().is_some_and(|binding| {
-            binding.enabled
-                && binding.generation == proposal.expected_generation
-                && binding.revision_id == proposal.baseline_revision
-        });
+        let current = match (&proposal.baseline_revision, &binding) {
+            (Some(baseline), Some(binding)) => {
+                binding.enabled
+                    && binding.generation == proposal.expected_generation
+                    && binding.revision_id == *baseline
+            }
+            // A new skill: nothing may have been published for it meanwhile.
+            (None, None) => proposal.expected_generation == 0,
+            _ => false,
+        };
         if !current {
             return Err(GateError::Stale(
                 "the active revision or generation changed since the proposal was prepared".to_string(),
@@ -1100,9 +1107,12 @@ impl SkillLifecycleStore {
                 "the proposal has no staged candidate".to_string(),
             ));
         };
-        if proposal.operation != ProposalOperation::Revise {
+        if !matches!(
+            proposal.operation,
+            ProposalOperation::Revise | ProposalOperation::Create
+        ) {
             return Err(GateError::Unsupported(
-                "only revisions of an existing skill are gated".to_string(),
+                "only revisions of an existing skill and new skills are gated".to_string(),
             ));
         }
         let gate_id = gate_id_of(self.owner_scope(), &proposal.proposal_id, proposal.evaluation_epoch);
