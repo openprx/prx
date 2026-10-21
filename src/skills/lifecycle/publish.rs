@@ -12,6 +12,7 @@
 
 use super::generation::{ATOMIC_PREFIX, ATOMIC_SUFFIX, ActiveBinding, SkillLock};
 use super::journal::{JournalEntry, TransactionId, TransactionKind, TransactionState};
+use super::projection::ProjectionRepair;
 use super::store::{STAGING_DIR, SkillLifecycleStore, sync_dir};
 use super::types::{LifecycleError, RevisionId, SCHEMA_VERSION, SkillId};
 use chrono::Utc;
@@ -84,8 +85,11 @@ pub struct RecoveryReport {
     pub committed: Vec<TransactionId>,
     /// PREPARED entries whose binding swap never happened; now ABORTED.
     pub aborted: Vec<TransactionId>,
-    /// Leftover entries removed from `staging/`.
+    /// Leftover entries removed from `staging/` and from the projection staging area.
     pub swept_staging: usize,
+    /// Compatibility projections rewritten (or that could not be) because they
+    /// did not match the committed binding.
+    pub projections: ProjectionRepair,
 }
 
 /// Failure points for crash tests; compiled only under `cfg(test)`.
@@ -97,6 +101,17 @@ pub(super) mod crash_hooks {
     thread_local! {
         static ARMED: RefCell<Option<&'static str>> = const { RefCell::new(None) };
         static ACTION: RefCell<Option<(&'static str, Box<dyn FnOnce()>)>> = const { RefCell::new(None) };
+        static TWO_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Forces the projection swap onto its two-rename fallback on this thread.
+    pub(in crate::skills::lifecycle) fn force_two_step(on: bool) {
+        TWO_STEP.with(|f| f.set(on));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(in crate::skills::lifecycle) fn two_step_forced() -> bool {
+        TWO_STEP.with(std::cell::Cell::get)
     }
 
     /// Runs `action` once, on this thread, when execution reaches `point`
@@ -350,7 +365,21 @@ impl SkillLifecycleStore {
             self.reconcile(lock, &mut entry)?;
         }
         match entry.state {
-            TransactionState::Committed => Ok(Some(TransactionOutcome { entry, replayed: true })),
+            TransactionState::Committed => {
+                // A retry of a committed transaction completes a projection
+                // that an earlier attempt could not finish.
+                if let Some(binding) = self
+                    .active_binding(&entry.skill_id)?
+                    .filter(|b| b.transaction_id == entry.transaction_id)
+                    && let Err(source) = self.refresh_projection(lock, &binding)
+                {
+                    return Err(LifecycleError::CommittedRepairRequired {
+                        transaction_id: entry.transaction_id.to_string(),
+                        reason: source.to_string(),
+                    });
+                }
+                Ok(Some(TransactionOutcome { entry, replayed: true }))
+            }
             state => Err(LifecycleError::TransactionNotCommitted {
                 transaction_id: transaction.to_string(),
                 state: state.as_str(),
@@ -395,6 +424,9 @@ impl SkillLifecycleStore {
         // Verifies record, owner, manifest and the full bundle hash, and that
         // the record still has the digest pinned at write time.
         self.read_revision(skill, candidate, Some(candidate_digest))?;
+        // Refuse before anything is journaled when the projection cannot be
+        // written (unsafe or unmanaged target, too many skill directories).
+        self.precheck_projection(skill, candidate, predecessor.is_some())?;
 
         let mut entry = JournalEntry {
             schema_version: SCHEMA_VERSION,
@@ -447,7 +479,12 @@ impl SkillLifecycleStore {
         crash_point!("after_binding");
         entry.state = TransactionState::Committed;
         entry.finished_at = Some(Utc::now());
-        self.write_journal(entry)
+        self.write_journal(entry)?;
+        crash_point!("after_committed");
+        // Spec 8.3 steps 7-8: the projection and the caches follow the commit.
+        // A failure here leaves the binding live, so the caller sees
+        // `CommittedRepairRequired` (see `classify_failure`).
+        self.refresh_projection(lock, binding).map(|_| ())
     }
 
     /// An error after the swap may have started is not a plain failure: when
@@ -559,7 +596,12 @@ impl SkillLifecycleStore {
                 _ => report.aborted.push(entry.transaction_id),
             }
         }
-        report.swept_staging = self.sweep_staging(staging_min_age)?;
+        // Repair first: the sweep keeps the previous tree of a skill whose
+        // repair failed, so a failed repair never deletes its only copy.
+        report.projections = self.repair_projections(lock_timeout);
+        report.swept_staging = self
+            .sweep_staging(staging_min_age)?
+            .saturating_add(self.sweep_projection_staging(staging_min_age, &report.projections));
         Ok(report)
     }
 

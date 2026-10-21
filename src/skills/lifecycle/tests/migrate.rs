@@ -298,6 +298,9 @@ fn a_plan_made_before_someone_else_published_is_stale() {
     let written = store
         .write_revision(&NewRevision::new(alpha.clone(), SourceKind::Learned), &other)
         .expect("test: write");
+    // The operator removed the legacy directory before the other publication;
+    // a first publication never replaces a different, unmanaged tree.
+    fs::remove_dir_all(tmp.path().join("skills/alpha")).expect("test: remove legacy dir");
     super::activate(
         &store,
         &alpha,
@@ -306,6 +309,13 @@ fn a_plan_made_before_someone_else_published_is_stale() {
         true,
     );
 
+    // The legacy directory is back as planned (the other publication projected
+    // into its own directory), so only the generation check can refuse.
+    write(
+        &tmp.path().join("skills/alpha/SKILL.md"),
+        md("Alpha", "First skill").as_bytes(),
+    );
+    write(&tmp.path().join("skills/alpha/references/note.md"), b"note\r\n");
     let report = apply_migration(&store, tmp.path(), &plan);
     assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
     assert_eq!(report.failed.first().map(|f| f.0.as_str()), Some("alpha"));
