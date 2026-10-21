@@ -91,6 +91,16 @@ impl SkillLifecycleStore {
         proposal: &SkillProposal,
         candidate: &super::store::VerifiedRevision,
     ) -> Result<(), LifecycleError> {
+        // The prepare step checked the name; another skill may have taken it
+        // since, so it is checked again before the first publication.
+        if let Some((holder, _)) = self.find_binding_by_name(&candidate.revision.display_name)?
+            && holder.skill_id != proposal.skill_id
+        {
+            return Err(LifecycleError::SkillNameTaken {
+                name: candidate.revision.display_name.clone(),
+                holder: holder.skill_id.to_string(),
+            });
+        }
         let mut problems = Vec::new();
         for file in candidate.bundle.files() {
             if file.path() != "SKILL.md" {

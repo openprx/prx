@@ -4,8 +4,9 @@
 //! skill (spec section 17 A, finding 108.1).
 //!
 //! Nothing exists at the start. Real tasks run through the agent entry
-//! (`crate::agent::run`) without any managed skill and fail their verifiable
-//! check; the production terminal leaves an attributable experience for each.
+//! (`crate::agent::run`) without any managed skill and complete (this fixture's
+//! replies fail the verifiable check; production has no such check); the
+//! production terminal leaves an attributable experience for each.
 //! Those experiences are consolidated into a pattern of uncovered work, a NEW
 //! instruction skill is proposed from it (provenance, no baseline revision),
 //! evaluated against a frozen no-skill baseline on validation and holdout
@@ -41,8 +42,9 @@ async fn repeated_work_without_a_skill_becomes_a_published_skill_that_unseen_tas
         "the world starts with no skill"
     );
 
-    // 1. Real work without any skill. Each reply fails the verifiable check
-    //    (it lacks the release token); the terminal path records each task.
+    // 1. Real work without any skill. These are completed turns; that the
+    //    replies lack the release token is a property of the fixture model.
+    //    The terminal path records each task.
     for build in [4, 5, 6] {
         let answer = world
             .run_task(
@@ -285,22 +287,29 @@ async fn repeated_work_without_a_skill_becomes_a_published_skill_that_unseen_tas
 }
 
 #[tokio::test]
-async fn a_reply_that_fails_the_check_is_evidence_but_a_failed_run_is_not() {
-    // 108.3: the production terminal attributes real runs, with no hand-fed
-    // observations. A reply that fails the task's check qualifies as evidence
-    // of uncovered work. A run that ENDS IN AN ERROR is recorded as a failure
-    // too, but the runtime labels every agent error as an unknown provider
-    // end, so its infrastructure fact is never positively absent and it
-    // cannot qualify (blocked-internal, see the intake).
+async fn a_completed_run_without_a_skill_is_evidence_but_a_run_that_errors_is_not_recorded() {
+    // 108.3. What qualifies is a completed root run that used no skill: the
+    // production terminal records it (a completed turn is a Success; the runtime
+    // has no task-outcome check) with facts from its own observations, none
+    // hand-fed. That this fixture's reply fails the check is a property of the
+    // loopback model, not something production sees. A run that ENDS IN AN
+    // ERROR would be a Failure, but the runtime labels every agent error as an
+    // unknown provider end, so its infrastructure fact is never positively
+    // absent: it could never qualify and the terminal leaves no record of it.
+    // That production cannot verify a task's outcome stays blocked-internal.
     let world = World::new().await;
     let suite = notes_suite(&world.owner, RELEASE_TOKEN, "hotfix-v1");
     let config = world.production_config(SkillsLifecycleModeConfig::Auto, &[(&skill(), &suite)]);
+    let _service = world.service(&config);
 
     let wrong = world
         .run_task(&config, "TASK[release] Write the release notes for build 7.")
         .await
-        .expect("test: a completed run with a wrong reply");
-    assert!(!wrong.contains(RELEASE_TOKEN), "the check fails: {wrong}");
+        .expect("test: a completed run");
+    assert!(
+        !wrong.contains(RELEASE_TOKEN),
+        "the fixture's reply fails the check: {wrong}"
+    );
     let failing = world
         .run_task(
             &config,
@@ -309,36 +318,11 @@ async fn a_reply_that_fails_the_check_is_evidence_but_a_failed_run_is_not() {
         .await;
     assert!(failing.is_err(), "an empty model reply fails the run: {failing:?}");
 
-    let runs = world.uncovered_runs(2).await;
-    let completed = runs
-        .iter()
-        .find(|run| {
-            run.terminal
-                .as_ref()
-                .is_some_and(|t| t.outcome == ExperienceOutcome::Success)
-        })
-        .expect("test: the completed run was attributed");
-    let errored = runs
-        .iter()
-        .find(|run| {
-            run.terminal
-                .as_ref()
-                .is_some_and(|t| t.outcome == ExperienceOutcome::Failure)
-        })
-        .expect("test: the failed run was attributed");
-    assert_eq!(
-        errored.terminal.as_ref().map(|t| t.facts.infrastructure_unavailable),
-        Some(FactState::Unknown),
-        "an agent error is never classified as served"
-    );
-
-    // The completed run qualifies; the errored one is refused with its reason.
-    let refused = try_consolidate_uncovered(&world, "Release notes recur.", std::slice::from_ref(&errored.record_id));
-    let reason = format!("{refused:?}");
-    assert!(
-        reason.contains("EvidenceNotUsable") && reason.contains("not verified"),
-        "{reason}"
-    );
+    let runs = world.uncovered_runs(1).await;
+    let completed = nth(&runs, 0);
+    let terminal = completed.terminal.as_ref().expect("test: joined");
+    assert_eq!(terminal.outcome, ExperienceOutcome::Success);
+    assert_eq!(terminal.facts.infrastructure_unavailable, FactState::Absent);
     let kept = try_consolidate_uncovered(
         &world,
         "Release notes recur.",
@@ -346,6 +330,22 @@ async fn a_reply_that_fails_the_check_is_evidence_but_a_failed_run_is_not() {
     )
     .expect("test: the completed run qualifies");
     assert_eq!(kept.evidence_ids, vec![completed.record_id.clone()]);
+    assert_eq!(world.experiences().len(), 1, "the errored run left no record");
+}
+
+#[tokio::test]
+async fn a_disabled_lifecycle_records_no_work_even_with_a_store_present() {
+    let world = World::new().await;
+    let suite = notes_suite(&world.owner, RELEASE_TOKEN, "hotfix-v1");
+    let mut config = world.production_config(SkillsLifecycleModeConfig::Auto, &[(&skill(), &suite)]);
+    config.skills_lifecycle.enabled = false;
+    world
+        .run_task(&config, "TASK[release] Write the release notes for build 7.")
+        .await
+        .expect("test: run");
+    // Let any (wrongly) spawned work settle before looking.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(world.experiences().is_empty(), "{:?}", world.experiences());
 }
 
 #[tokio::test]
@@ -353,6 +353,7 @@ async fn evidence_that_does_not_show_uncovered_work_cannot_back_a_new_skill() {
     let world = World::new().await;
     let suite = notes_suite(&world.owner, RELEASE_TOKEN, "hotfix-v1");
     let auto = world.production_config(SkillsLifecycleModeConfig::Auto, &[(&skill(), &suite)]);
+    let _service = world.service(&auto);
     let runs = {
         for build in [4, 5] {
             world

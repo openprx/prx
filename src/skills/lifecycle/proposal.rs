@@ -231,7 +231,10 @@ pub struct AuthorBinding {
 pub struct ProposalBasis {
     /// Distinct root tasks whose stored experience is learning-eligible, ended
     /// in a failure terminal and hydrated the baseline revision. For a new
-    /// skill: the distinct root tasks that ran without any managed skill.
+    /// skill (despite the name): the distinct completed root tasks that ran
+    /// without any managed skill. The runtime records a completed turn as a
+    /// success and has no task-outcome check, so these are uncovered work, not
+    /// verified failures.
     pub failed_tasks_on_baseline: usize,
     /// Distinct root tasks that contradict the patterns on the same revision.
     pub contradicting_tasks: usize,
@@ -573,6 +576,11 @@ impl SkillLifecycleStore {
             || record.evidence_ids.len() > MAX_PATTERN_EVIDENCE
         {
             return Err(tampered("proposal lists exceed their bounds"));
+        }
+        if (record.operation == ProposalOperation::Create) != record.baseline_revision.is_none() {
+            return Err(tampered(
+                "a new skill has no baseline revision and a revision of one has",
+            ));
         }
         if record.candidate_revision.is_some() != record.diff.is_some() {
             return Err(tampered("candidate revision and diff must be present together"));

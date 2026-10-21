@@ -183,6 +183,11 @@ pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
     let run = request.run_id.to_string();
     let task = request.task_id.map(str::to_string);
     let key = run.clone();
+    let dropped = (
+        workspace.clone(),
+        owner.clone(),
+        task_key(request.task_id, Some(request.run_id), None),
+    );
     let handle = runtime.spawn(async move {
         let write = tokio::task::spawn_blocking(move || {
             let names: Vec<&str> = fresh.iter().map(String::as_str).collect();
@@ -197,12 +202,35 @@ pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
         });
         match tokio::time::timeout(SELECTION_BUDGET, write).await {
             Ok(Ok(_)) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "skill selection receipt task failed"),
-            Err(_) => tracing::warn!("skill selection receipts exceeded their time budget; continuing"),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "skill selection receipt task failed");
+                mark_selection_dropped(&dropped);
+            }
+            Err(_) => {
+                tracing::warn!("skill selection receipts exceeded their time budget; continuing");
+                mark_selection_dropped(&dropped);
+            }
         }
     });
     track_background(&key, handle);
     count
+}
+
+/// A selection write that failed or timed out leaves a task that selected a
+/// skill without a receipt. Marking its experience as having dropped evidence
+/// keeps it from ever counting as work that no skill covered.
+fn mark_selection_dropped((workspace, owner, task): &(std::path::PathBuf, String, Option<String>)) {
+    let Some(task) = task else {
+        return;
+    };
+    let Ok(owner) = OwnerScope::new(owner) else {
+        return;
+    };
+    match SkillLifecycleStore::open_existing(workspace, owner) {
+        Ok(Some(store)) => store.mark_dropped_evidence(task),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "could not mark a dropped selection receipt"),
+    }
 }
 
 /// Starts [`settle_task_terminal`] without making the caller wait for it:
@@ -296,7 +324,8 @@ pub async fn settle_task_terminal(
     };
     let outcome = observation.outcome();
     let recovered = observation.recovered;
-    let root = observation.root;
+    // Only an enabled lifecycle records work that used no managed skill.
+    let root = observation.root && crate::skills::lifecycle_runtime::lifecycle_enabled_for(workspace_dir);
     let workspace = workspace_dir.to_path_buf();
     let terminal_id = terminal_id.to_string();
     let call_in = tokio::task::spawn_blocking(move || {

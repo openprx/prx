@@ -54,7 +54,9 @@ pub enum FailureClass {
     /// The wrong skill was retrieved: improve metadata or retrieval, evaluated
     /// separately.
     WrongSkillRetrieved,
-    /// Repeated work that no managed skill covered: the zero-baseline path.
+    /// Repeated work that no managed skill covered: the zero-baseline path. Its
+    /// evidence is completed root tasks (the runtime records a completed turn
+    /// as a success and has no task-outcome check) that read no managed skill.
     /// Such a pattern is about no skill yet (`skill_id` is `None`), and the only
     /// thing it may lead to is a proposal for a NEW instruction skill.
     MissingSkill,

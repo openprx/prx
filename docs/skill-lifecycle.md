@@ -58,6 +58,33 @@ the deterministic checks. Mock results, local smoke runs, fixed improvement
 scores and model self-assessment alone are no evidence of learning and cannot
 establish a learned improvement (specification invariant 11).
 
+## New skills
+
+A skill can also be created from repeated work that no managed skill covered.
+
+- **Evidence.** With the lifecycle enabled, a completed root task (never a
+  child run) that read no managed skill leaves an experience record through the
+  same task-terminal call-in. Only a success, or a failure whose infrastructure
+  and permission causes are both positively absent, is kept. The runtime records
+  a completed turn as a success and has no task-outcome check, so this is
+  evidence of recurring uncovered work, not of failed tasks. A pattern of class
+  `missing_skill` needs at least two distinct root tasks. Recording stops once a
+  store holds 4096 experience records; no retention policy prunes them yet, so
+  that cap is the only bound.
+- **Proposal.** `propose_new_skill` writes a fixed skeleton from the request
+  (name, description, required tools) and the model may only append text, within
+  the same 300-token cap. The bundle is `SKILL.md` alone: no scripts and no
+  executable files. Required tools may not exceed the capabilities the patterns
+  were scoped to, and the name must not be held by another skill (checked again
+  before the first publication).
+- **Gate.** The candidate is compared with a frozen no-skill baseline on the
+  same suite, validation and holdout, critical cases included. Review,
+  authorization and publication are those of a revision; the first publication
+  creates the skill and its binding at generation 1 and refuses a `skills/<dir>`
+  that the skill does not own.
+- **Not a learning claim.** Runs against a mock or loopback model, and a
+  scripted proposer, prove the mechanics only.
+
 ## Configuration
 
 The full section and owner derivation are in the

@@ -377,3 +377,41 @@ async fn a_change_that_widens_the_required_tools_never_becomes_eligible() {
     assert_eq!(format!("{:?}", s.service.settings()), settings_before);
     assert_nothing_changed(&s);
 }
+
+#[tokio::test]
+async fn a_candidate_whose_manifest_widens_the_required_tools_is_refused_by_the_capability_check() {
+    use crate::skills::lifecycle::{LifecycleError, NewRevision, SourceKind};
+    let s = setup().await;
+    let patch = multi_patch("fix the release rule", &[(OLD_RELEASE, NEW_RELEASE)]);
+    let proposer = ScriptedProposer::new(vec![patch]);
+    let proposal = staged(propose(&s.world, "req-c5", &s.pattern, &proposer).await);
+
+    // A candidate revision that a proposer could not produce, written by another
+    // path: its manifest and record add the shell to the baseline's tools.
+    let base = s.world.store.read_revision(&skill(), &s.a, None).expect("test: A");
+    let text = String::from_utf8(base.bundle.file("SKILL.md").expect("test: SKILL.md").bytes().to_vec())
+        .expect("test: utf8")
+        .replace(
+            &format!("required-tools: [{REQUIRED_TOOL}]"),
+            &format!("required-tools: [{REQUIRED_TOOL}, filesystem:native:shell]"),
+        );
+    let widened = crate::skills::lifecycle::Bundle::from_entries(vec![crate::skills::lifecycle::BundleEntry {
+        path: "SKILL.md".into(),
+        bytes: text.into_bytes(),
+        executable: false,
+    }])
+    .expect("test: bundle");
+    let mut new = NewRevision::new(skill(), SourceKind::Learned);
+    new.parent_revision_id = Some(s.a.clone());
+    new.capability_requirements = vec![REQUIRED_TOOL.to_string(), "filesystem:native:shell".to_string()];
+    let written = s.world.store.write_revision(&new, &widened).expect("test: write");
+    let mut tampered = proposal;
+    tampered.candidate_revision = Some(written.revision.revision_id);
+    let refused = s.world.store.check_capabilities(&tampered, None);
+    assert!(
+        matches!(&refused, Err(LifecycleError::CapabilityExpansion { reason, .. })
+            if reason.contains("newly requires the capability") && reason.contains("filesystem:native:shell")),
+        "{refused:?}"
+    );
+    assert_nothing_changed(&s);
+}

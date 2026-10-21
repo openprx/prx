@@ -22,7 +22,7 @@
 //! as having dropped evidence through a lock-free path (a marker file plus an
 //! in-process flag) that the terminal join consults.
 
-use super::facts::{TerminalFacts, TerminalObservations, derive};
+use super::facts::{FactState, TerminalFacts, TerminalObservations, derive};
 use super::generation::ensure_dir_synced;
 use super::store::{SkillLifecycleStore, check_private, read_record, record_bytes, sync_dir};
 use super::types::{LifecycleError, OwnerScope, PinnedSkillRevision, RevisionId, SCHEMA_VERSION, SkillId};
@@ -633,6 +633,24 @@ pub fn on_task_terminal(
 /// of every task must not grow a store without bound.
 pub const UNCOVERED_RECORDING_LIMIT: usize = 4096;
 
+/// Records created since the last directory count of a store, per store root.
+/// The count is taken again only when the store may be near the limit, so a
+/// busy store does not list its directory at every task terminal.
+static RECORDING_ESTIMATE: LazyLock<Mutex<std::collections::HashMap<PathBuf, RecordingEstimate>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+/// Stores remembered in [`RECORDING_ESTIMATE`].
+const MAX_ESTIMATED_STORES: usize = 64;
+/// Distance from the limit under which every terminal counts again.
+const RECOUNT_MARGIN: usize = 64;
+/// Shortest time between two warnings that a store is full.
+const FULL_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+struct RecordingEstimate {
+    counted: usize,
+    created_since: usize,
+    last_warning: Option<std::time::Instant>,
+}
+
 impl SkillLifecycleStore {
     /// Number of experience records, counting at most `limit`.
     fn experience_count_up_to(&self, limit: usize) -> Result<usize, LifecycleError> {
@@ -657,8 +675,56 @@ impl SkillLifecycleStore {
         Ok(count)
     }
 
+    /// Whether another uncovered-work record may be created. Far from the
+    /// limit this answers from an estimate; near it, from a fresh count.
+    fn may_record_uncovered(&self) -> Result<bool, LifecycleError> {
+        let root = self.root().to_path_buf();
+        {
+            let mut estimates = RECORDING_ESTIMATE.lock();
+            if let Some(known) = estimates.get_mut(&root)
+                && known
+                    .counted
+                    .saturating_add(known.created_since)
+                    .saturating_add(RECOUNT_MARGIN)
+                    < UNCOVERED_RECORDING_LIMIT
+            {
+                known.created_since += 1;
+                return Ok(true);
+            }
+        }
+        let counted = self.experience_count_up_to(UNCOVERED_RECORDING_LIMIT)?;
+        let mut estimates = RECORDING_ESTIMATE.lock();
+        if estimates.len() >= MAX_ESTIMATED_STORES && !estimates.contains_key(&root) {
+            estimates.clear();
+        }
+        let known = estimates.entry(root).or_insert(RecordingEstimate {
+            counted,
+            created_since: 0,
+            last_warning: None,
+        });
+        known.counted = counted;
+        known.created_since = 0;
+        if counted < UNCOVERED_RECORDING_LIMIT {
+            known.created_since = 1;
+            return Ok(true);
+        }
+        if known
+            .last_warning
+            .is_none_or(|at| at.elapsed() >= FULL_WARNING_INTERVAL)
+        {
+            known.last_warning = Some(std::time::Instant::now());
+            tracing::warn!(
+                limit = UNCOVERED_RECORDING_LIMIT,
+                "the experience store is full; a task without a managed skill leaves no record"
+            );
+        }
+        Ok(false)
+    }
+
     /// Creates the experience of a root task that used no managed skill and
-    /// joins its terminal. Only `Success` and `Failure` are recorded.
+    /// joins its terminal. Only a record that could ever qualify as evidence is
+    /// written: a success, or a failure whose infrastructure and permission
+    /// causes are both positively absent, and never one with such a cause present.
     fn record_uncovered_terminal(
         &self,
         terminal: &TaskTerminal<'_>,
@@ -667,13 +733,6 @@ impl SkillLifecycleStore {
             terminal.outcome,
             ExperienceOutcome::Success | ExperienceOutcome::Failure
         ) {
-            return Ok(None);
-        }
-        if self.experience_count_up_to(UNCOVERED_RECORDING_LIMIT)? >= UNCOVERED_RECORDING_LIMIT {
-            tracing::warn!(
-                limit = UNCOVERED_RECORDING_LIMIT,
-                "the experience store is full; a task without a managed skill leaves no record"
-            );
             return Ok(None);
         }
         // No receipts yet, so the derivation sees no skill: only the
@@ -694,6 +753,15 @@ impl SkillLifecycleStore {
             updated_at: Utc::now(),
         };
         let facts = derive(self, &empty, terminal.observations);
+        let clean = |state: FactState| state != FactState::Present;
+        let absent =
+            facts.infrastructure_unavailable == FactState::Absent && facts.permission_refused == FactState::Absent;
+        let qualifies = clean(facts.infrastructure_unavailable)
+            && clean(facts.permission_refused)
+            && (terminal.outcome == ExperienceOutcome::Success || absent);
+        if !qualifies || !self.may_record_uncovered()? {
+            return Ok(None);
+        }
         self.join_terminal_with(terminal.task_id, terminal.terminal_receipt_id, terminal.outcome, &facts)
             .map(Some)
     }

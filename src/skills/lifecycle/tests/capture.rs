@@ -627,22 +627,46 @@ fn a_root_task_without_a_managed_skill_leaves_an_attributable_record() {
     .expect("test: joined");
     assert!(again.replayed);
 
-    // Without observations nothing is claimed about the causes.
-    on_task_terminal(
+    // Without observations a failure's causes are unknown, so it could never
+    // qualify as evidence and leaves nothing.
+    let blind = on_task_terminal(
         tmp.path(),
         &who,
         &uncovered_terminal("task-blind", ExperienceOutcome::Failure, None, true),
     )
     .expect("test: terminal");
-    let blind = store
-        .read_experience("task-blind")
-        .expect("test: read")
-        .expect("test: present");
-    let facts = &blind.terminal.as_ref().expect("test: joined").facts;
-    assert_eq!(
-        (facts.infrastructure_unavailable, facts.permission_refused),
-        (FactState::Unknown, FactState::Unknown)
+    assert!(blind.is_none());
+    assert!(store.read_experience("task-blind").expect("test: read").is_none());
+    // A failure whose causes are positively absent is recorded.
+    on_task_terminal(
+        tmp.path(),
+        &who,
+        &uncovered_terminal(
+            "task-clean-failure",
+            ExperienceOutcome::Failure,
+            Some(&observations),
+            true,
+        ),
+    )
+    .expect("test: terminal");
+    assert!(
+        store
+            .read_experience("task-clean-failure")
+            .expect("test: read")
+            .is_some()
     );
+    // An outage is a cause outside the work: nothing is recorded.
+    let outage = TerminalObservations {
+        provider: ProviderEnd::Unavailable,
+        ..served()
+    };
+    on_task_terminal(
+        tmp.path(),
+        &who,
+        &uncovered_terminal("task-outage", ExperienceOutcome::Success, Some(&outage), true),
+    )
+    .expect("test: terminal");
+    assert!(store.read_experience("task-outage").expect("test: read").is_none());
 }
 
 #[test]

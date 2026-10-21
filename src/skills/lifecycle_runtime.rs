@@ -76,6 +76,15 @@ pub fn open_service(
     Ok(Some(shared))
 }
 
+/// Whether a lifecycle service of an enabled `[skills_lifecycle]` section was
+/// built in this process for `workspace_dir`. Nothing is recorded for a
+/// workspace without one: a disabled lifecycle (or one never configured) must
+/// not leave experiences behind, even when an old store directory exists.
+#[must_use]
+pub fn lifecycle_enabled_for(workspace_dir: &Path) -> bool {
+    SERVICES.lock().keys().any(|(workspace, _)| workspace == workspace_dir)
+}
+
 /// Runs `call` again while it reports a store locked by another process
 /// ([`ServiceError::Busy`]), up to `retry.attempts` calls with a doubling wait.
 /// Any other result, and the last `Busy`, is returned.

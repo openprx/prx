@@ -520,7 +520,8 @@ async fn publication_checks_that_a_new_skill_is_instruction_only() {
         &["filesystem:native:shell"],
     );
     assert!(
-        matches!(check(wide), Err(LifecycleError::CapabilityExpansion { reason, .. }) if reason.contains("scoped"))
+        matches!(check(wide), Err(LifecycleError::CapabilityExpansion { reason, .. }) if reason.contains("outside the capabilities its patterns are scoped to")),
+        "a widened manifest is refused with its exact reason"
     );
     let mismatch = install(
         vec![entry("SKILL.md", format!("{skeleton}\nmismatch\n").as_bytes())],
@@ -562,4 +563,61 @@ async fn a_skill_published_meanwhile_makes_the_new_skill_proposal_stale() {
         .expect("test: review");
     assert!(!outcome.record.passed && outcome.record.skill_moved);
     assert_eq!(outcome.proposal.status, ProposalStatus::Stale);
+}
+
+#[tokio::test]
+async fn a_name_taken_after_the_proposal_is_refused_before_publication() {
+    let f = fixture();
+    let pattern = two_task_pattern(&f);
+    let model = Scripted::new(&[append("Step 1: list the changes.\n")]);
+    let ProposeOutcome::Staged(proposal) = run(&f, &model, request("req-1", &pattern))
+        .await
+        .expect("test: propose")
+    else {
+        panic!("test: expected a staged proposal");
+    };
+    // The name is free at prepare; another skill is published under it later.
+    let rival = SkillId::parse("rival-skill").expect("test: skill id");
+    let bundle =
+        Bundle::from_entries(vec![entry("SKILL.md", md(NAME, "Rival notes").as_bytes())]).expect("test: bundle");
+    let written = f
+        .store
+        .write_revision(&NewRevision::new(rival.clone(), SourceKind::Operator), &bundle)
+        .expect("test: write");
+    activate(
+        &f.store,
+        &rival,
+        &(written.revision.revision_id, written.record_digest),
+        0,
+        true,
+    );
+
+    let skeleton =
+        format!("---\nname: {NAME}\ndescription: {DESCRIPTION}\nrequired-tools: [{TOOL}]\n---\n\n# {NAME}\n");
+    let mut new = NewRevision::new(skill(), SourceKind::Learned);
+    new.capability_requirements = vec![TOOL.to_string()];
+    new.proposal_id = Some(proposal.proposal_id.clone());
+    let candidate = f
+        .store
+        .write_revision(
+            &new,
+            &Bundle::from_entries(vec![entry("SKILL.md", skeleton.as_bytes())]).expect("test: bundle"),
+        )
+        .expect("test: write")
+        .revision
+        .revision_id;
+    let mut staged = proposal;
+    staged.candidate_revision = Some(candidate);
+    let refused = f.store.check_capabilities(&staged, None);
+    assert!(
+        matches!(&refused, Err(LifecycleError::SkillNameTaken { holder, .. }) if holder == "rival-skill"),
+        "{refused:?}"
+    );
+    let binding = f
+        .store
+        .active_binding(&rival)
+        .expect("test: binding")
+        .expect("test: bound");
+    assert_eq!(binding.generation, 1, "the first binding is unchanged");
+    assert!(f.store.active_binding(&skill()).expect("test: binding").is_none());
 }

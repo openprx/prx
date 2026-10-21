@@ -71,10 +71,10 @@ pub const MAX_EDITS: usize = 8;
 
 pub(super) const SKILL_MD: &str = "SKILL.md";
 const MAX_EDIT_TEXT_BYTES: usize = 4096;
-pub(super) const MAX_SUMMARY_BYTES: usize = 500;
+const MAX_SUMMARY_BYTES: usize = 500;
 pub(super) const MAX_DESCRIPTION_EDIT_BYTES: usize = 300;
-pub(super) const MAX_PROMPT_REJECTIONS: usize = 5;
-pub(super) const MAX_PROMPT_EVIDENCE: usize = 16;
+const MAX_PROMPT_REJECTIONS: usize = 5;
+const MAX_PROMPT_EVIDENCE: usize = 16;
 const MAX_BUDGET_INPUT_BYTES: usize = 256 * 1024;
 const MAX_BUDGET_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_BUDGET_TIMEOUT: Duration = Duration::from_secs(600);
