@@ -698,7 +698,7 @@ pub(super) fn write_private_file(path: &Path, bytes: &[u8], executable: bool) ->
 }
 
 /// Syncs `path` and every directory below it.
-fn sync_tree_dirs(path: &Path) -> Result<(), LifecycleError> {
+pub(super) fn sync_tree_dirs(path: &Path) -> Result<(), LifecycleError> {
     for item in fs::read_dir(path).map_err(|e| LifecycleError::io(path, e))? {
         let item = item.map_err(|e| LifecycleError::io(path, e))?;
         if item

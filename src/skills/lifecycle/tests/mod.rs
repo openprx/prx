@@ -12,6 +12,7 @@ mod gate;
 mod knowledge;
 mod manifest;
 mod migrate;
+mod projection;
 mod propose;
 mod propose_new;
 mod publish;

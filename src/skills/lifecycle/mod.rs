@@ -35,6 +35,7 @@ mod journal;
 mod knowledge;
 mod manifest;
 mod migrate;
+mod projection;
 mod proposal;
 mod propose;
 mod propose_new;
@@ -99,6 +100,7 @@ pub use knowledge::{
 };
 pub use manifest::{ManifestError, ManifestInfo, validate_manifest, validate_manifest_strict};
 pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationReport, apply_migration, plan_migration};
+pub use projection::ProjectionRepair;
 pub use proposal::{
     AppliedEdit, AttemptOutcome, AttemptRecord, AuthorBinding, BoundedDiff, BudgetRecord, DescriptionChange, EditOp,
     MAX_PROPOSAL_ATTEMPTS, MAX_PROPOSAL_LISTING, ProposalBasis, ProposalFailure, ProposalFailureKind, ProposalStatus,
