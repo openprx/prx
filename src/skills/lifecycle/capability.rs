@@ -92,7 +92,11 @@ impl SkillLifecycleStore {
         candidate: &super::store::VerifiedRevision,
     ) -> Result<(), LifecycleError> {
         // The prepare step checked the name; another skill may have taken it
-        // since, so it is checked again before the first publication.
+        // since, so it is checked again before the first publication. At
+        // publication this runs under the proposals lock, which serialises
+        // every proposal-driven publication in the store (across processes),
+        // so two new skills cannot both pass it. Writers outside proposals
+        // (migration imports, operator publishes) are not covered by it.
         if let Some((holder, _)) = self.find_binding_by_name(&candidate.revision.display_name)?
             && holder.skill_id != proposal.skill_id
         {

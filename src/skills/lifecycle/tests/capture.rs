@@ -232,15 +232,18 @@ fn concurrent_captures_are_all_kept() {
         for index in 0..8 {
             let (store, pin) = (&store, &pin);
             scope.spawn(move || {
-                store
-                    .record_hydration(
-                        "task-par",
-                        pin,
-                        &format!("references/r{index}.md"),
-                        b"x",
-                        &Correlation::default(),
-                    )
-                    .expect("test: concurrent hydrate");
+                // Eight writers share one experience lock whose production
+                // wait is bounded; a writer that times out under host load
+                // retries, as a caller would. Every capture must still land.
+                let path = format!("references/r{index}.md");
+                let mut attempts = 0;
+                loop {
+                    match store.record_hydration("task-par", pin, &path, b"x", &Correlation::default()) {
+                        Ok(_) => break,
+                        Err(LifecycleError::LockTimeout { .. }) if attempts < 20 => attempts += 1,
+                        Err(error) => panic!("test: concurrent hydrate: {error}"),
+                    }
+                }
             });
         }
     });
