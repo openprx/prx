@@ -156,3 +156,17 @@ disabled-mode behavior, real interruption/reconciliation and rollback behavior.
 Compilation or a source review alone does not establish these outcomes. The
 existing performance requirements remain unchanged: the 8278 allocation ceiling
 and zero catalog-growth tolerance still apply.
+
+## Dependency advisory exception
+
+The current dependency policy retains `RUSTSEC-2026-0381` for the
+`webpki-roots` 0.26.11 compatibility bridge. On the locked dependency graph this
+bridge re-exports the patched 1.0.10 root set; it has no separate certificate
+bundle. `deny.toml` bans other affected versions while the exception remains.
+The dated review deadline is 2026-11-21, or earlier if upstream removes the
+bridge. The policy files are [deny.toml](../deny.toml) and
+[the audit configuration](../.cargo/audit.toml).
+
+A policy-filtered pass is distinct from a raw advisory scan: the unfiltered
+scan still reports this bridge advisory. These notes make no additional
+advisory or global dependency-acceptance claim.

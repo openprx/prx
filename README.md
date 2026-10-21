@@ -8,14 +8,14 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 
 - **Broad LLM provider catalog** — Anthropic, OpenAI, Google Gemini, GitHub Copilot, Ollama, AWS Bedrock, GLM, OpenAI Codex, local runtimes, and compatible endpoints
 - **LLM Router** — heuristic routing (capability + Elo + cost + latency), KNN semantic routing (cold-start guard + 100ms timeout fallback), and Automix low-confidence auto-upgrade
-- **Causal Tree Engine** — speculative multi-branch prediction with rehearsal, scoring, and circuit breaker; opt-in via `causal_tree.enabled` (disabled by default)
+- **Causal Tree Engine** — admitted decisions with rehearsal, scoring, and circuit breaker; enabled by default with the built-in backend
 - **Multi-channel messaging** — Signal, WhatsApp, Telegram, Discord, Slack, opt-in Matrix, and more
 - **Built-in tools and integrations** — shell, MCP, memory, scheduling, remote nodes, and an integration catalog
 - **Xin (心) task engine** — autonomous heartbeat scheduler with 3 execution modes (Rust/LLM/Shell), 3 built-in maintenance tasks, durable Goal/Step execution, and SQLite persistence
 - **Web Console** — browser-based management interface (`console/`)
 - **Remote Nodes** — control macOS/Linux/Pi devices via `prx-node` agent
 - **Self-Evolution** — autonomous prompt/memory/strategy improvement with dedicated self-system scheduling
-- **Subagent Spawning** — uncapped concurrency and nesting, config inheritance, live runs listed and ended with `prx tasks`
+- **Subagent Spawning** — ordinary fan-out without a global concurrency cap, config inheritance, and explicit bounded recursive grants; live runs listed and ended with `prx tasks`
 - **Extensive automated test suite** — unit, integration, PTY, gateway, migration, and security coverage
 
 ### LLM Router Flags
@@ -26,17 +26,21 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 
 ### Causal Tree Engine Flags
 
-> **Disabled by default.** Set `causal_tree.enabled = true` to activate.
+> **Enabled by default.** `auto` serves the built-in backend without a remote
+> endpoint. Remote processing requires explicit configuration and opt-in.
 
-- `causal_tree.enabled` — master switch for the CTE pipeline (default: `false`)
-- `causal_tree.policy.max_branches` — maximum candidate branches to expand (default: `3`)
-- `causal_tree.policy.commit_threshold` — minimum score to commit a branch (default: `0.62`)
-- `causal_tree.policy.extra_latency_budget_ms` — max additional latency budget in ms (default: `300`)
-- `causal_tree.policy.rehearsal_timeout_ms` — per-rehearsal timeout in ms (default: `5000`)
-- `causal_tree.policy.circuit_breaker_threshold` — consecutive failures before tripping (default: `5`)
-- `causal_tree.w_confidence` — scoring weight for confidence dimension (default: `0.50`)
-- `causal_tree.w_cost` — scoring weight for cost penalty (default: `0.25`)
-- `causal_tree.w_latency` — scoring weight for latency penalty (default: `0.25`)
+- `causal_tree.enabled` — master switch (default: `true`); explicit versioned `false` stays disabled
+- `causal_tree.schema_version` — stored configuration schema (current: `2`)
+- `causal_tree.policy.max_candidates` — maximum candidates (default: `12`)
+- `causal_tree.policy.commit_threshold` — minimum commit score (default: `0.62`)
+- `causal_tree.policy.extra_latency_budget_ms` — additional decision budget (built-in default: `500` ms; hosted backend selection can adopt its catalog recommendation)
+- `causal_tree.rehearsal.timeout_ms` — rehearsal timeout (default: `100` ms)
+- `causal_tree.backend.circuit_breaker.failure_threshold` — consecutive failures (default: `5`)
+- `causal_tree.scoring.weights` — optional scorer-owned weight overrides
+
+See [decision-plane behavior](docs/decision-plane.md) and the
+[configuration reference](docs/configuration.md) for admission, defaults and
+legacy-key migration.
 
 ## Quick Start
 
@@ -112,6 +116,7 @@ cargo build --release --locked --bin prx --features channel-matrix
 | [Tools](docs/tools.md) | Built-in tools, hooks system, webhooks |
 | [Remote Nodes](docs/remote-nodes.md) | `prx-node` agent, device pairing, JSON-RPC |
 | [Web Console](docs/web-console.md) | Browser-based management interface |
+| [Skill Lifecycle](docs/skill-lifecycle.md) | Instruction revisions, evidence, evaluation gates, publication and rollback |
 | [Evolution](docs/evolution.md) | Self-improvement pipeline |
 | [Configuration](docs/configuration.md) | Config reference, workspace files, security |
 | [Router](docs/router.md) | LLM Router config, flow, safety boundaries |

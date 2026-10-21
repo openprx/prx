@@ -22,7 +22,7 @@ and the migration warnings below before upgrading.
   `prx skills lifecycle status|list|inspect|publish|cancel|rollback|force-close`.
   It defaults to disabled and `draft_only`; executable proposals are refused,
   and automatic proposal scheduling is not wired. See
-  [skill lifecycle configuration](docs/configuration.md).
+  [instruction skill lifecycle](docs/skill-lifecycle.md).
 - Release catalog inspection and retired-model migration commands, plus
   persistent `low`/`medium`/`high` levels and typed model parameter selections
   through transactional configuration management. CLI, chat, onboarding and
@@ -40,10 +40,12 @@ and the migration warnings below before upgrading.
   snapshot gains an optional `unavailable_attempts` counter. Rollback note:
   `ExecutionTraceSnapshot`, `TerminalJoin` and the new `TerminalFacts` use
   `deny_unknown_fields`, so a binary from before this change cannot read
-  payloads or experience records written after it; roll back only after
-  removing `experiences/` records and sealed terminal markers written by the
-  new build, or keep the new build. A new optional `required-tools` frontmatter
-  key declares the tools a skill needs (see `docs/skills-catalog-security.md`).
+  payloads or experience records written after it. Retain the newer build and
+  its evidence for recovery; do not delete experience records or terminal
+  markers to force a downgrade. See the
+  [upgrade notes](docs/migration-unreleased.md). A new optional `required-tools`
+  frontmatter key declares the tools a skill needs (see
+  [skill evidence](docs/skills-catalog-security.md)).
 
 - Ordinary causal telemetry reserves channel headroom for Applied/Drain controls.
 
@@ -256,8 +258,11 @@ and the migration warnings below before upgrading.
 
 ### Security
 
-- Raise the minimum Rustls, trusted-root bundle and Wasmtime patch versions
-  to include current upstream security fixes.
+- Raise the minimum Rustls, trusted-root bundle and Wasmtime patch versions.
+  A dated `RUSTSEC-2026-0381` policy exception remains for `webpki-roots` 0.26.11,
+  which re-exports patched 1.0.10 roots; review by 2026-11-21 or when upstream
+  removes the bridge. This exception does not make an unfiltered advisory scan
+  clean. See [dependency policy](docs/security.md#dependency-advisory-exception).
 
 - **Breaking: WASM plugins are off and need operator trust.**
   `[plugins] enabled` defaults to `false`; nothing under `<workspace>/plugins`

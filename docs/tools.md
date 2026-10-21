@@ -97,7 +97,7 @@ hooks fire on the turn exactly as they do in terminal chat. What
 `channel_exclude` removes is the operations surface — the tools that manage or
 inspect those subsystems — because a channel turn is driven by a conversation
 partner rather than by the operator. The default excluded set is
-`DEFAULT_CHANNEL_EXCLUDED_TOOLS` (`src/config/schema.rs`):
+`DEFAULT_CHANNEL_EXCLUDED_TOOLS` (`src/config/schema/security.rs`):
 
 `wasm_plugins_manage`, `wasm_plugin_reload`, `wasm_plugins_status`,
 `hooks_manage`, `hooks_status`, `proxy_config`, `config_reload`, `gateway`,
@@ -1250,6 +1250,8 @@ reduced depth remain bound by the seal. An empty child set cannot derive another
 strict subset. This does not override the explicit agentic `delegate` configuration
 requirements above or bypass the normal launch and execution gates.
 
+### Recursive child grants
+
 An enabled, admitted parent can explicitly request that a `sessions_spawn` child
 may spawn another child by setting `allow_delegation: true` on the spawn request
 or a batch entry. This requires `allow_recursive_delegation = true` in
@@ -1433,7 +1435,7 @@ Create `hooks.json` in the workspace directory:
 - `command` + `args` — executed directly, not via shell (no injection risk)
 - `timeout_ms` — per-hook timeout, default 5000ms; valid range 1–300000ms
 - `cwd` is not supported: a hook always starts in its dedicated `hooks/` directory beside `config.toml`, so a `hooks.json` that sets `cwd` is refused at load with a clear error (remove the field)
-- hooks are observe-only and run off the turn path: an event is queued and a background worker per hook manager delivers it (command hooks in file order, then WASM hooks and the plugin event bus), in emit order. A slow hook never delays a turn; each hook keeps its own timeout. The queue holds 1024 events; when it is full the new event is dropped, counted and logged (first drop, then every 100th). At gateway shutdown queued events are given up to 3 seconds to finish
+- hooks are observe-only and run off the turn path: an event is queued and a background worker per hook manager delivers it (command hooks in file order, then WASM hooks and the plugin event bus), in emit order. A slow hook never delays a turn; each hook keeps its own timeout, and all delivery for one event shares a 300-second bound. The queue holds 1024 events; when it is full the new event is dropped, counted and logged (first drop, then every 100th). At gateway shutdown queued events are given up to 3 seconds to finish
 - `hooks.json` is capped at 256 KiB and hot-reloaded by content generation; an invalid candidate leaves the active generation unchanged
 - payloads are capped at 4 MiB and passed through a restrictive temporary file plus optional stdin
 - timeout covers stdin and process execution; timed-out children are killed and reaped, and temporary payload files are removed on every exit path

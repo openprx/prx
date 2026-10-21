@@ -374,6 +374,7 @@ top_k = 32
 [plugins]
 enabled = false
 
+# See docs/skill-lifecycle.md for concepts, commands and recovery.
 # Skill lifecycle: learned revisions of skills are proposed, evaluated against an
 # operator-owned frozen suite, gated and only then published. Everything here is
 # operator-owned; no tool or model output can change it. The section is read at
@@ -416,7 +417,7 @@ enabled = false
 [skills_lifecycle]
 enabled = false
 mode = "draft_only"
-# owner_scope = "owner:workspace:cli:alice"
+# owner_scope = "<trusted runtime owner id>"
 storage_dir = "self/skill-lifecycle"
 require_holdout = true
 min_cases_floor = 3
@@ -1338,7 +1339,8 @@ every `cargo test`.
 
 ## WhatsApp Web Session Store
 
-The Web-mode WhatsApp channel (`backend = "web"`) keeps its Signal-protocol
+The Web-mode WhatsApp channel (selected by `session_path` when
+`phone_number_id` is absent) keeps its Signal-protocol
 state — identities, sessions, pre-keys, sender keys, app-state MACs — in the
 SQLite database at `session_path`. Every inbound and outbound message performs
 several lookups against it, so under concurrent chats this store, not the
@@ -1351,7 +1353,6 @@ connection.
 
 ```toml
 [channels_config.whatsapp]
-backend = "web"
 session_path = "~/.openprx/state/whatsapp-web/session.db"
 # Concurrent read connections (default: 2 per CPU, clamped to 4..32).
 # Must be greater than 0 when set.
@@ -1425,7 +1426,7 @@ below).
   is redacted with its value, and a configured URL is redacted to its end
   (a value holding `,` or `)` is not cut there). Plans, history records, `428`
   bodies, `GET /api/config`, `GET /api/mcp/servers`, validation refusals,
-  `prx config status`, `prx models default show|list`, `prx providers test`,
+  `prx config status`, `prx models default show`, `prx providers test`,
   `prx doctor`, the `prx` listings and log lines use this one redactor;
   posting a redacted value back unchanged keeps the stored one, and a
   `[redacted]` part anywhere else is refused. When two stored `cost.prices`
@@ -1709,6 +1710,9 @@ Turning it on is a high-risk configuration change. The setting is read at
 every event, so turning it off stops hooks at once. Hooks run in the background, off the turn path (queued, delivered in order,
 dropped and counted when 1024 events are waiting). Hooks owned by a
 sub-agent (`delegate`, `sessions_spawn`) never run workspace command hooks.
+Delivery of each event, across all command hooks, WASM hooks and event-bus
+subscribers, has a shared 300-second bound. At shutdown, queued delivery gets
+up to three seconds to drain; individual command timeouts still apply.
 
 A command hook that runs:
 
@@ -2841,6 +2845,12 @@ is separate from durable decision review, claim and one-use execution authority;
 it does not extend approvals to another entry point.
 
 Admitted Cron/Xin model turns now obtain a source-bound decision after recording their raw input. Enabled mode requires an exact durable owner-scoped event; disabled mode may use in-memory input without inventing an event ID. The proof pins task/run/configuration, actual provider/model selection and creator execution actor. Selected decisions drive recall, constrained execution and terminal settlement. Operator-created tasks retain the existing CLI execution tuple and semantic mirror eligibility; other tasks retain their creator-derived context and effective policy. Admission does not enable interactive clarification or an approval delivery channel.
+
+## Skill lifecycle guide
+
+See [Instruction skill lifecycle](skill-lifecycle.md) for bundle and receipt
+semantics, the lifecycle CLI and agent actions, publication gates, recovery,
+and the limits of the shipped instruction-only implementation.
 
 ## Per-model levels and parameters
 
