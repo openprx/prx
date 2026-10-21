@@ -1063,7 +1063,9 @@ fn a_rollback_to_an_unreviewed_executable_revision_is_refused_at_execute() {
 #[test]
 fn the_review_lineage_walk_is_bounded() {
     let env = env("deep");
-    let mut parent = env.publish_unreviewed(&bundle(b"#!/bin/sh\necho 0\n"), 0);
+    // A REVIEWED anchor, then 66 proposer revisions: the anchor is more than
+    // 64 parents away, so only the bound refuses this chain.
+    let mut parent = env.publish(&bundle(b"#!/bin/sh\necho 0\n"), 0);
     for n in 1..=66_u64 {
         let mut list = entries(b"#!/bin/sh\necho 0\n", true, RUN_TOOL);
         list[0] = entry(
@@ -1075,24 +1077,29 @@ fn the_review_lineage_walk_is_bounded() {
     let task = unique("task");
     let refused = env.prepare(Some(&task), "run", None, &AllowAll);
     assert!(
-        matches!(&refused, Err(ExecutableError::NotReviewedForExecution { reason, .. }) if reason.contains("longer than") || reason.contains("no operator review")),
+        matches!(&refused, Err(ExecutableError::NotReviewedForExecution { reason, .. }) if reason.contains("longer than 64 revisions")),
         "{refused:?}"
     );
     release_task_pins(&env.owner, &task);
 }
 
 #[test]
-fn an_over_open_run_root_is_refused_with_the_fix_named() {
-    let env = env("open-root");
-    env.publish(&bundle(b"#!/bin/sh\necho A\n"), 0);
-    fs::create_dir_all(env.run_root()).expect("test: dir");
-    fs::set_permissions(env.run_root(), fs::Permissions::from_mode(0o755)).expect("test: chmod");
-    let refused = env.prepare(None, "run", None, &AllowAll);
-    let text = refused
-        .map(|_| ())
-        .expect_err("an over-open run root must be refused")
-        .to_string();
-    assert!(text.contains("chmod 700"), "{text}");
-    fs::set_permissions(env.run_root(), fs::Permissions::from_mode(0o700)).expect("test: chmod");
-    assert!(env.prepare(None, "run", None, &AllowAll).is_ok());
+fn a_child_that_only_flips_a_scripts_execute_bit_is_refused() {
+    let env = env("flip");
+    // A shell tool names the script, so the flipped bundle still passes the
+    // bundle review: only the lineage check can refuse it.
+    let reviewed = env.publish(
+        &Bundle::from_entries(entries(b"#!/bin/sh\necho A\n", true, SHELL_TOOL)).expect("test: reviewed"),
+        0,
+    );
+    let flipped = entries(b"#!/bin/sh\necho A\n", false, SHELL_TOOL);
+    assert!(review(flipped.clone()).is_ok(), "the flip alone is not a bundle error");
+    learned_child(&env, &reviewed, flipped, 1);
+    let task = unique("task");
+    let refused = env.prepare(Some(&task), "run", None, &AllowAll);
+    assert!(
+        matches!(&refused, Err(ExecutableError::NotReviewedForExecution { reason, .. }) if reason.contains("scripts/run.sh")),
+        "{refused:?}"
+    );
+    release_task_pins(&env.owner, &task);
 }

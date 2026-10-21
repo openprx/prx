@@ -62,7 +62,7 @@ pub use agent_executor::{AccountingOwner, AgentCaseExecutor};
 pub use authorize::{Finalization, ForceClose, MAX_PUBLICATION_ATTEMPTS, PublicationOutcome};
 pub use binding::{
     MAX_ACTIVE_BINDINGS, MAX_TASK_PINS, ManagedReadRequest, ManagedSkillRead, ORPHAN_PIN_AGE, is_managed_skill,
-    read_managed_resource, release_task_pins, task_pin,
+    is_projection_dir, read_managed_resource, release_task_pins, task_pin,
 };
 pub use bundle::{
     BUNDLE_FORMAT_VERSION, Bundle, BundleEntry, BundleError, BundleFile, MAX_BUNDLE_COMPONENT_BYTES, MAX_BUNDLE_DEPTH,
