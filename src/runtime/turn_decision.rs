@@ -2790,7 +2790,11 @@ impl TurnDecisionService {
                         }
                         return Err(AgentDecisionError::Cancelled);
                     }
-                    allow_terminal_answer = observed.fresh_read || observed.completed_ok;
+                    // A completed empty read finishes the retrieval only for a
+                    // turn that actually asks for something; a blank message
+                    // has nothing to answer and stays closed.
+                    allow_terminal_answer =
+                        observed.fresh_read || (observed.completed_ok && !proof.routing_input().trim().is_empty());
                     selected_retrieved = observed.selected_artifacts;
                     selected_custom_memory_context = observed.custom_context;
                     let mut comparison = observed.state.clone();
