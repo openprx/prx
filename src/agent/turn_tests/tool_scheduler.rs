@@ -1141,5 +1141,100 @@ fn the_unrecoverable_classifier_separates_refusals_from_recoverable_failures() {
     }
 }
 
+/// Counts executions of a `skills_manage` stand-in; the argument contract is
+/// the lifecycle one the real tool publishes for the fields the test sends.
+struct GrantBoundProbe(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Tool for GrantBoundProbe {
+    fn name(&self) -> &str {
+        "skills_manage"
+    }
+
+    fn description(&self) -> &str {
+        "PRX grant-bound lifecycle probe"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "action"},
+                "source": {"type": "string", "description": "source"},
+                "revision_id": {"type": "string", "description": "revision"}
+            }
+        })
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: "ran".to_string(),
+            error: None,
+        })
+    }
+}
+
+/// Finding 113.1(c): a session "Always" answer covers a tool, never a call the
+/// tool only accepts under its own approval. Every grant-bound lifecycle call
+/// is put to the owner, so an "Always" given for one import cannot approve a
+/// later import of a different bundle hash. Calls that need no approval are
+/// unaffected.
+#[tokio::test]
+async fn always_allowlisting_never_approves_a_grant_bound_lifecycle_call() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
+    let executions = Arc::new(AtomicUsize::new(0));
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(GrantBoundProbe(Arc::clone(&executions)))];
+    let policy = crate::security::SecurityPolicy {
+        autonomy: crate::security::AutonomyLevel::Full,
+        ..crate::security::SecurityPolicy::default()
+    };
+    let scope_ctx = scheduler_scope(&policy, "user@example.com");
+    let manager = Arc::new(ApprovalManager::new());
+    manager.record_decision(
+        "skills_manage",
+        &serde_json::json!({"action": "lifecycle_import_executable"}),
+        ApprovalResponse::Always,
+        "telegram",
+    );
+    assert!(manager.is_session_allowlisted("skills_manage"));
+    let resolver = FixedApprovalResolver::new(ApprovalDecision::Deny);
+    let ledger_dir = TempDir::new().expect("test: temp dir should be creatable");
+    let adapter = scoped_scheduler_adapter(
+        tools,
+        &scope_ctx,
+        Some(Arc::clone(&manager)),
+        Some(resolver.clone()),
+        &ledger_dir,
+    );
+    for revision in [format!("r1-{}", "a".repeat(64)), format!("r1-{}", "b".repeat(64))] {
+        let calls = single_call(
+            "skills_manage",
+            serde_json::json!({"action": "lifecycle_import_executable", "source": "/srv/bundle", "revision_id": revision}),
+        );
+        let results =
+            run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
+        assert!(
+            results[0].contains("Denied by user"),
+            "the allowlist must not approve the import of {revision}: {}",
+            results[0]
+        );
+    }
+    assert_eq!(
+        resolver.calls.load(Ordering::SeqCst),
+        2,
+        "each grant-bound call is put to the owner"
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 0, "no import ran");
+
+    // A read of the same tool needs no approval at all.
+    let status = single_call("skills_manage", serde_json::json!({"action": "lifecycle_status"}));
+    let results = run_through_production_scheduler(&status, &adapter, unlimited_schedule(1), ChatMode::default()).await;
+    assert_eq!(results[0], "ran");
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+}
+
 #[path = "tool_scheduler/tracing_context.rs"]
 mod tracing_context;

@@ -2460,12 +2460,18 @@ impl ToolExecutionService {
         }
 
         let decision = self.policy.decide(&descriptor, &context);
+        // A call the tool itself only accepts with a signed one-shot grant
+        // needs a human approval at every autonomy level, also where policy
+        // would allow it. Deny stays Deny.
         let decision = if decision != ToolExecutionDecision::Deny
-            && context
+            && (crate::security::approval_operation::requires_explicit_grant(
+                &descriptor.public_name,
+                &command.arguments,
+            ) || context
                 .execution_bindings
                 .as_ref()
                 .and_then(|bindings| bindings.get(&command.name))
-                .is_some_and(|binding| binding.requires_approval())
+                .is_some_and(|binding| binding.requires_approval()))
         {
             ToolExecutionDecision::Ask
         } else {
