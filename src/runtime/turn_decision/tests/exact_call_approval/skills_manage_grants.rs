@@ -897,3 +897,65 @@ async fn supervised_named_non_grant_bound_action_is_not_collected() {
     }
     assert!(matches!(drained, Ok(true)));
 }
+
+/// The request names a grant-bound action but the model proposes a plain one
+/// while collecting. The lease declines with an owner-readable message before
+/// anything is persisted: no pending approval, no collected receipt, nothing run.
+#[tokio::test]
+async fn collection_declines_a_plain_action_the_model_proposes() {
+    let env = env(AutonomyLevel::Supervised, Case::Import).await;
+    let result = std::panic::AssertUnwindSafe(Box::pin(async {
+        let cancel = CancellationToken::new();
+        let (proof, _) = recorded_approval_source(
+            &env.generation,
+            Arc::clone(&env.memory),
+            "Use skills_manage to run lifecycle_import_executable",
+            ChatMode::Edit,
+            "prx_grant_declined",
+            30,
+        )
+        .await;
+        let context = env
+            .service
+            .decide_agent_initial(proof.as_ref(), AgentTurnKind::Repl, &cancel)
+            .await
+            .expect("test: decision");
+        assert!(context.approval_collection_proof().is_some());
+        let lease = env
+            .service
+            .begin_approval_collection(proof.as_ref(), &context)
+            .expect("test: lease");
+        let error = lease
+            .record(
+                crate::providers::ToolCall {
+                    id: "prx_declined_call".to_owned(),
+                    name: "skills_manage".to_owned(),
+                    arguments: serde_json::json!({"action": "lifecycle_status"}).to_string(),
+                },
+                crate::tools::schema::ToolSchemaDialect::Raw,
+                &cancel,
+            )
+            .await
+            .expect_err("a plain action is not collected");
+        let declined = error
+            .downcast_ref::<crate::runtime::turn_decision::pending_approval::collection::CollectionDeclined>()
+            .expect("a typed decline, not a collection failure");
+        assert!(declined.0.contains("lifecycle_status") && declined.0.contains("nothing was recorded"));
+        assert!(context.collected_pending_event().is_none());
+        assert!(
+            env.service
+                .load_pending_decision_approval(proof.owner_id(), proof.session_key(), context.decision_id())
+                .await
+                .is_err()
+        );
+        env.assert_untouched(Case::Import);
+    }))
+    .catch_unwind()
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let drained = tokio::time::timeout_at(deadline.into(), env.service.drain_writes(deadline)).await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(matches!(drained, Ok(true)));
+}

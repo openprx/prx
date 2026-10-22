@@ -7,6 +7,14 @@ use anyhow::Context;
 use std::sync::{Arc, atomic::Ordering};
 use tokio_util::sync::CancellationToken;
 
+/// The model proposed a call that needs no approval of its own (a read or a
+/// non-grant-bound `skills_manage` action) while the turn was collecting a
+/// grant-bound one. Nothing was recorded or executed; the message is written
+/// for the owner and the turn ends as an ordinary failed terminal with it.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct CollectionDeclined(pub(crate) String);
+
 pub(crate) struct ApprovalCollectionLease {
     service: Arc<TurnDecisionService>,
     context: Arc<TurnDecisionContext>,
@@ -98,11 +106,23 @@ impl ApprovalCollectionLease {
             )
         } else if entry.collects_exact_call() {
             // The operation is the one the tool itself checks, bound to the
-            // exact target in the arguments. A call that names no grant-bound
-            // target has no exact operation and cannot be reviewed.
+            // exact target in the arguments. An action with no grant-bound
+            // operation needs no collected approval: decline before anything
+            // is persisted so the owner gets an explanation, not a failure of
+            // the collection itself.
             match crate::security::approval_operation::grant_op_for_call(&call.name, &arguments) {
                 Some(crate::security::approval_operation::GrantOp::ResourceExact(operation, risk)) => (operation, risk),
-                _ => anyhow::bail!("collection call names no exact approval operation"),
+                _ => {
+                    let action = arguments
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("the requested action");
+                    return Err(CollectionDeclined(format!(
+                        "skills_manage {action} needs no approval, so nothing was recorded or run. \
+                         Ask for it again without naming publish, rollback or executable import."
+                    ))
+                    .into());
+                }
             }
         } else {
             let path = arguments
