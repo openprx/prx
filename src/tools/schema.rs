@@ -61,6 +61,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
+mod execution_contract;
+pub use execution_contract::ToolArgumentError;
+#[cfg(test)]
+pub(crate) use execution_contract::assert_flat_execution_contract;
+pub(crate) use execution_contract::{publish_flat_schema, validate_execution_contract};
+
 /// One discriminator-specific set of required tool arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActionRequirement<'a> {

@@ -58,14 +58,15 @@ fn mentions_action(text: &str, action: &str) -> bool {
 /// own matrix goes further, but running the shared one here keeps the five
 /// compressed schemas on one enforceable standard rather than one of them
 /// being the only place the convention is written down.
-#[test]
-fn schema_names_every_action_in_the_parameters_it_requires() {
+#[tokio::test]
+async fn schema_names_every_action_in_the_parameters_it_requires() {
     let (ch, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+    crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
     crate::tools::schema::action_contract::assert_action_tool_contract(
         "sessions_spawn",
         tool.description(),
-        &tool.parameters_schema(),
+        &tool.execution_schema(),
     );
 }
 
@@ -78,7 +79,7 @@ fn schema_names_every_action_in_the_parameters_it_requires() {
 fn every_parameter_names_every_action_that_reads_it() {
     let (ch, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-    let schema = tool.parameters_schema();
+    let schema = tool.execution_schema();
     for (parameter, actions) in PARAMETER_ACTION_MATRIX {
         let description = schema["properties"][parameter]["description"]
             .as_str()
@@ -104,7 +105,7 @@ fn every_parameter_names_every_action_that_reads_it() {
 fn the_matrix_covers_every_declared_parameter() {
     let (ch, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-    let schema = tool.parameters_schema();
+    let schema = tool.execution_schema();
     let mut declared: Vec<&str> = schema["properties"]
         .as_object()
         .expect("schema properties")
@@ -128,7 +129,7 @@ fn the_matrix_covers_every_declared_parameter() {
 fn every_action_is_named_where_the_model_reads_it() {
     let (ch, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-    let schema = tool.parameters_schema();
+    let schema = tool.execution_schema();
     let action_description = schema["properties"]["action"]["description"]
         .as_str()
         .expect("the action parameter's description");

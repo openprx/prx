@@ -203,17 +203,8 @@ impl ScheduledInputTool {
     }
 }
 
-#[async_trait]
-impl Tool for ScheduledInputTool {
-    fn name(&self) -> &str {
-        "chat_schedule"
-    }
-
-    fn description(&self) -> &str {
-        "Schedule a future message back into the current PRX chat main session: 'schedule' creates a wake-up, 'list' shows pending, delivered and cancelled wake-ups, and 'cancel' aborts a pending one. Use this for dispatcher self-wake observation loops after the current turn completes."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl ScheduledInputTool {
+    fn execution_schema(&self) -> serde_json::Value {
         crate::tools::schema::with_action_requirements(
             json!({
                 "type": "object",
@@ -262,12 +253,28 @@ impl Tool for ScheduledInputTool {
             ],
         )
     }
+}
+
+#[async_trait]
+impl Tool for ScheduledInputTool {
+    fn name(&self) -> &str {
+        "chat_schedule"
+    }
+
+    fn description(&self) -> &str {
+        "Schedule a future message back into the current PRX chat main session: 'schedule' creates a wake-up, 'list' shows pending, delivered and cancelled wake-ups, and 'cancel' aborts a pending one. Use this for dispatcher self-wake observation loops after the current turn completes."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
 
     fn process_worker_compatible(&self) -> bool {
         false
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         let action = args
             .get("action")
             .and_then(|value| value.as_str())
@@ -358,20 +365,21 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn chat_schedule_action_tool_contract() {
+    #[tokio::test]
+    async fn chat_schedule_action_tool_contract() {
         let tool = ScheduledInputTool::new(ScheduledInputHandle::default());
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            &tool.execution_schema(),
         );
     }
 
     #[test]
     fn schema_declares_action_specific_requirements() {
         let tool = ScheduledInputTool::new(ScheduledInputHandle::default());
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
 
         assert!(
             !validate_tool_arguments(&schema, &json!({})).is_empty(),

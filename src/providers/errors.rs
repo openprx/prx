@@ -89,6 +89,22 @@ pub fn sanitize_api_error(input: &str) -> String {
     format!("{}...", &scrubbed[..end])
 }
 
+/// Keep upstream bodies bounded and redacted, but retain an actionable hint
+/// when the schema rejection itself falls beyond the ordinary preview.
+fn sanitized_provider_error(provider: &str, body: &str) -> String {
+    let sanitized = sanitize_api_error(body);
+    if provider == "OpenRouter"
+        && body.contains("input_schema")
+        && ["allOf", "anyOf", "oneOf"].iter().any(|keyword| body.contains(keyword))
+    {
+        format!(
+            "{sanitized} Tool schema rejected: Anthropic models require no root allOf/anyOf/oneOf. Republish the named tool with a flat schema and strict execution validation, or exclude it with [tool_tiering]."
+        )
+    } else {
+        sanitized
+    }
+}
+
 /// Build a sanitized provider error from a failed HTTP response.
 ///
 /// The real `Retry-After` header is read *before* `response.text()` consumes the
@@ -103,7 +119,7 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
     let status = response.status();
     let retry_after_ms = traits::retry_after_ms_from_headers(response.headers());
     let body = read_error_body(response).await;
-    let sanitized = sanitize_api_error(&body);
+    let sanitized = sanitized_provider_error(provider, &body);
     let message = format!("{provider} API error ({status}): {sanitized}");
     match retry_after_ms {
         Some(millis) => anyhow::Error::new(rate_limit::RetryAfterHint { millis }).context(message),
@@ -128,7 +144,7 @@ pub async fn stream_api_error(provider: &str, response: reqwest::Response) -> tr
     let code = status.as_u16();
     let retry_after_ms = traits::retry_after_ms_from_headers(response.headers());
     let body = read_error_body(response).await;
-    let sanitized = sanitize_api_error(&body);
+    let sanitized = sanitized_provider_error(provider, &body);
     if code == 429 || code == 503 {
         StreamError::RateLimited {
             status: code,
@@ -207,4 +223,21 @@ pub fn tool_schema_refused_tools(error: &anyhow::Error) -> Option<Vec<String>> {
         .map(ToString::to_string)
         .find(|text| is_tool_schema_refusal_text(text))
         .and_then(|text| crate::tools::ToolSchemaRefusals::tool_names_in(&text))
+}
+
+#[cfg(test)]
+mod schema_hint_tests {
+    #[test]
+    fn root_schema_hint_survives_clipping_without_exposing_the_body() {
+        let body = format!(
+            "{} input_schema does not support allOf {}",
+            "x".repeat(240),
+            ["sk", "-", "prxfixturecredential"].concat()
+        );
+        let message = super::sanitized_provider_error("OpenRouter", &body);
+        assert!(message.contains("[tool_tiering]"));
+        assert!(message.contains("no root allOf/anyOf/oneOf"));
+        assert!(!message.contains("prxfixturecredential"));
+        assert!(!super::sanitized_provider_error("OpenRouter", "unrelated error").contains("[tool_tiering]"));
+    }
 }

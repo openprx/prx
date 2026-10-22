@@ -834,7 +834,7 @@ fn provider_aliases_agree_with_the_declared_schema_dialect() {
         let expected = match alias {
             "gemini" | "google" | "google-gemini" => crate::tools::ToolSchemaDialect::Gemini,
             "anthropic" | "claude-code" | "claude-cli" | "anthropic-custom:https://endpoint.invalid/v1" => {
-                crate::tools::ToolSchemaDialect::Anthropic
+                crate::tools::ToolSchemaDialect::NoRootCombinators
             }
             _ => crate::tools::ToolSchemaDialect::Raw,
         };
@@ -876,7 +876,7 @@ fn byo_label_spellings_resolve_the_dialect_the_constructed_provider_declares() {
         let provider = create_provider(label, Some("test-key"))
             .unwrap_or_else(|error| panic!("test: provider {label} constructs: {error}"));
         let expected = match byo_dialect_of(label) {
-            Some(ByoDialect::AnthropicCompatible) => crate::tools::ToolSchemaDialect::Anthropic,
+            Some(ByoDialect::AnthropicCompatible) => crate::tools::ToolSchemaDialect::NoRootCombinators,
             Some(ByoDialect::OpenAiCompatible) => crate::tools::ToolSchemaDialect::Raw,
             None => panic!("test: '{label}' is a bring-your-own label"),
         };
@@ -1066,7 +1066,7 @@ fn a_mixed_family_chain_declares_raw_rather_than_the_widest_rewrite() {
 /// `Raw` must not manufacture a refusal either — `Raw` puts the published
 /// document on the wire and enforces the same document.
 #[test]
-fn a_mixed_chain_of_anthropic_and_no_root_combinators_resolves_raw_without_refusing() {
+fn a_mixed_chain_of_gemini_and_no_root_combinators_resolves_raw_without_refusing() {
     let declared = "custom:https://endpoint.invalid/v1";
     let options = ProviderRuntimeOptions {
         tool_schema_dialects: vec![ToolSchemaDialectDeclaration {
@@ -1087,8 +1087,8 @@ fn a_mixed_chain_of_anthropic_and_no_root_combinators_resolves_raw_without_refus
     let chain = reliable::ReliableProvider::new(
         vec![
             (
-                "anthropic".to_string(),
-                create_provider("anthropic", Some("test-key")).expect("test: anthropic constructs"),
+                "gemini".to_string(),
+                create_provider("gemini", Some("test-key")).expect("test: gemini constructs"),
             ),
             (declared.to_string(), lowering),
         ],
@@ -1120,6 +1120,47 @@ fn a_mixed_chain_of_anthropic_and_no_root_combinators_resolves_raw_without_refus
     assert_eq!(&*resolved.enforceable_schema(&conditional), &conditional);
 }
 
+#[test]
+fn native_anthropic_and_declared_no_root_chain_retains_the_shared_restriction() {
+    let declared = "custom:https://endpoint.invalid/v1";
+    let options = ProviderRuntimeOptions {
+        tool_schema_dialects: vec![ToolSchemaDialectDeclaration {
+            provider: declared.to_string(),
+            model: None,
+            dialect: crate::tools::ToolSchemaDialect::NoRootCombinators,
+        }],
+        ..ProviderRuntimeOptions::default()
+    };
+    let chain = reliable::ReliableProvider::new(
+        vec![
+            (
+                "anthropic".to_owned(),
+                create_provider("anthropic", Some("test-key")).unwrap(),
+            ),
+            (
+                declared.to_owned(),
+                create_provider_with_options(declared, Some("test-key"), &options).unwrap(),
+            ),
+        ],
+        1,
+        50,
+    );
+    assert_eq!(
+        chain.tool_schema_dialect(),
+        crate::tools::ToolSchemaDialect::NoRootCombinators
+    );
+    let conditional = serde_json::json!({
+        "type":"object", "properties":{"path":{"type":"string"},"key":{"type":"string"}},
+        "anyOf":[{"required":["path"]},{"required":["key"]}]
+    });
+    assert!(
+        chain
+            .tool_schema_dialect()
+            .wire_schema("fixture_alternatives", &conditional)
+            .is_err()
+    );
+}
+
 /// The two labels that do rewrite their schemas must not decay to `Raw`,
 /// which would put the validator back on the published document.
 #[test]
@@ -1130,7 +1171,7 @@ fn cleaning_providers_declare_a_non_raw_dialect() {
             .tool_schema_dialect()
     };
     assert_eq!(dialect("gemini"), crate::tools::ToolSchemaDialect::Gemini);
-    assert_eq!(dialect("anthropic"), crate::tools::ToolSchemaDialect::Anthropic);
+    assert_eq!(dialect("anthropic"), crate::tools::ToolSchemaDialect::NoRootCombinators);
     assert_eq!(dialect("openai"), crate::tools::ToolSchemaDialect::Raw);
 }
 

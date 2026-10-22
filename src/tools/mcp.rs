@@ -1554,19 +1554,8 @@ impl McpTool {
     }
 }
 
-#[async_trait]
-impl Tool for McpTool {
-    fn name(&self) -> &str {
-        MCP_ROOT_NAME
-    }
-
-    fn description(&self) -> &str {
-        "Call tools exposed by configured MCP servers: 'call' invokes a remote tool, \
-         'list' and 'status' report discovery results and errors, and 'refresh' forces rediscovery. \
-         Supports hot config reload from workspace/mcp.json and dynamic aliases."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl McpTool {
+    fn execution_schema(&self) -> serde_json::Value {
         // The root schema is independent of catalog size. Exact remote names
         // and schemas are supplied only by turn-scoped capability discovery.
         let server_schema = json!({
@@ -1606,6 +1595,23 @@ impl Tool for McpTool {
                 required: &["server", "tool"],
             }],
         )
+    }
+}
+
+#[async_trait]
+impl Tool for McpTool {
+    fn name(&self) -> &str {
+        MCP_ROOT_NAME
+    }
+
+    fn description(&self) -> &str {
+        "Call tools exposed by configured MCP servers: 'call' invokes a remote tool, \
+         'list' and 'status' report discovery results and errors, and 'refresh' forces rediscovery. \
+         Supports hot config reload from workspace/mcp.json and dynamic aliases."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
     fn specs(&self) -> Vec<ToolSpec> {
@@ -1665,7 +1671,10 @@ impl Tool for McpTool {
         self.execute_named(MCP_ROOT_NAME, args).await
     }
 
-    async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn execute_named(&self, name: &str, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if name == MCP_ROOT_NAME {
+            crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        }
         #[cfg(test)]
         self.test_invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let action = if name == MCP_ROOT_NAME {
@@ -2416,17 +2425,18 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn mcp_call_action_tool_contract() {
+    #[tokio::test]
+    async fn mcp_call_action_tool_contract() {
         let tool = McpTool::new(
             Arc::new(SecurityPolicy::default()),
             McpConfig::default(),
             std::env::temp_dir(),
         );
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            &tool.execution_schema(),
         );
     }
 
@@ -2457,7 +2467,7 @@ mod tests {
             McpConfig::default(),
             std::env::temp_dir(),
         );
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
         let actions = schema["properties"]["action"]["enum"]
             .as_array()
             .expect("test: action enum");
@@ -2488,7 +2498,7 @@ mod tests {
             McpConfig::default(),
             std::env::temp_dir(),
         );
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
         assert!(schema["properties"]["server"].get("enum").is_none());
         assert!(schema["properties"]["tool"].get("enum").is_none());
     }
@@ -3043,7 +3053,7 @@ for line in sys.stdin:
         );
 
         tool.refresh_catalog_config();
-        let _ = tool.parameters_schema();
+        let _ = tool.execution_schema();
         assert!(tool.config_error().is_some());
         assert_eq!(
             tool.availability().level,

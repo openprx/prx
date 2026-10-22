@@ -440,21 +440,8 @@ fn truncate_str(input: &str, max_chars: usize) -> String {
     out
 }
 
-#[async_trait]
-impl Tool for CronTool {
-    fn name(&self) -> &str {
-        "cron"
-    }
-
-    fn description(&self) -> &str {
-        "Unified cron/scheduler management — the single entry point for ALL scheduled-task \
-         operations. Actions: 'add'/'schedule' (recurring job: `expression`+`command`, or a \
-         `schedule` object with `payload`/`job_type`); 'once' (one-shot shell job via `delay` \
-         or `run_at`); 'list'; 'get'; 'remove'/'cancel'; 'update'/'patch'; 'run'; \
-         'runs'/'history'; 'events'; 'pause'; 'resume'; 'status'."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl CronTool {
+    fn execution_schema(&self) -> serde_json::Value {
         crate::tools::schema::with_action_exclusive_alternatives(
             crate::tools::schema::with_action_alternatives(
                 crate::tools::schema::with_action_alternatives(
@@ -667,8 +654,28 @@ impl Tool for CronTool {
             &[&["delay"], &["run_at"]],
         )
     }
+}
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+#[async_trait]
+impl Tool for CronTool {
+    fn name(&self) -> &str {
+        "cron"
+    }
+
+    fn description(&self) -> &str {
+        "Unified cron/scheduler management — the single entry point for ALL scheduled-task \
+         operations. Actions: 'add'/'schedule' (recurring job: `expression`+`command`, or a \
+         `schedule` object with `payload`/`job_type`); 'once' (one-shot shell job via `delay` \
+         or `run_at`); 'list'; 'get'; 'remove'/'cancel'; 'update'/'patch'; 'run'; \
+         'runs'/'history'; 'events'; 'pause'; 'resume'; 'status'."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         let cfg = self.config.load_full();
         let action = match args.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
@@ -1316,15 +1323,16 @@ mod tests {
     /// `cron` lost the convention silently once: the quotes around the action
     /// names were dropped during a schema compression and no test noticed,
     /// because the contract lived only inside `sessions_spawn`.
-    #[test]
-    fn schema_names_every_action_in_the_parameters_it_requires() {
+    #[tokio::test]
+    async fn schema_names_every_action_in_the_parameters_it_requires() {
         let config = new_shared(Config::default());
         let snapshot = config.load_full();
         let tool = CronTool::new(Arc::clone(&config), test_security(&snapshot));
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             "cron",
             tool.description(),
-            &tool.parameters_schema(),
+            &tool.execution_schema(),
         );
     }
 
@@ -1333,7 +1341,7 @@ mod tests {
         let config = new_shared(Config::default());
         let snapshot = config.load_full();
         let tool = CronTool::new(Arc::clone(&config), test_security(&snapshot));
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
 
         assert!(
             !validate_tool_arguments(&schema, &json!({"action": "add"})).is_empty(),
@@ -1508,9 +1516,21 @@ mod tests {
                 "job_type": "agent"
             }))
             .await
+            .unwrap_err();
+        let typed = result
+            .downcast_ref::<crate::tools::schema::ToolArgumentError>()
             .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("Missing prompt"));
+        assert!(!typed.issues.is_empty(), "invalid input must carry a validation issue");
+        assert!(cron::list_jobs(&cfg_snap).unwrap().is_empty());
+        let valid = tool
+            .execute(json!({
+                "action": "add", "schedule": {"kind": "cron", "expr": "*/5 * * * *"},
+                "job_type": "agent", "prompt": "fixture task"
+            }))
+            .await
+            .unwrap();
+        assert!(valid.success, "{:?}", valid.error);
+        assert_eq!(cron::list_jobs(&cfg_snap).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1771,9 +1791,12 @@ mod tests {
         let cfg = test_config(&tmp).await;
         let cfg_snap = cfg.load_full();
         let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
-        let result = tool.execute(json!({"action": "explode"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("Unknown action"));
+        let error = tool.execute(json!({"action": "explode"})).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.action"));
+        assert!(Arc::ptr_eq(&cfg_snap, &cfg.load_full()));
+        assert!(cron::list_jobs(&cfg_snap).unwrap().is_empty());
+        assert!(tool.execute(json!({"action":"list"})).await.unwrap().success);
     }
 
     // ── Focused agent-add coverage (fields easily lost in the consolidation) ──
@@ -2210,10 +2233,21 @@ mod tests {
                 "delivery": { "mode": 123 }
             }))
             .await
+            .unwrap_err();
+        let typed = result
+            .downcast_ref::<crate::tools::schema::ToolArgumentError>()
             .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("Invalid delivery config"));
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.delivery.mode"));
         assert!(cron::list_jobs(&cfg_snap).unwrap().is_empty());
+        let valid = tool
+            .execute(json!({
+                "action": "add", "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+                "job_type": "agent", "prompt": "x", "delivery": {"mode": "none"}
+            }))
+            .await
+            .unwrap();
+        assert!(valid.success, "{:?}", valid.error);
+        assert_eq!(cron::list_jobs(&cfg_snap).unwrap().len(), 1);
     }
 
     /// `delete_after_run` defaults to false for recurring (cron) agent jobs.

@@ -279,25 +279,8 @@ impl GatewayTool {
     }
 }
 
-#[async_trait]
-impl Tool for GatewayTool {
-    fn name(&self) -> &str {
-        "gateway"
-    }
-
-    fn description(&self) -> &str {
-        "Manage the OpenPRX gateway daemon. \
-         Actions: 'config.get' (read current config), 'config.patch' (merge patch config), \
-         'status' (uptime/model/channels), 'version' (build version), \
-         'components' (active channels/providers/memory/tools), \
-         'restart' (send SIGHUP for graceful restart). \
-         'config.patch' and 'restart' are available only to the local operator in the terminal UI; \
-         they are refused for remote channels, gateway/webhook, console and external MCP callers. \
-         'config.patch' never changes `[causal_tree]` (the decision plane: its backend, remote processing, \
-         policy and thresholds are the operator's)."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl GatewayTool {
+    fn execution_schema(&self) -> serde_json::Value {
         crate::tools::schema::with_action_requirements(
             json!({
                 "type": "object",
@@ -330,9 +313,33 @@ impl Tool for GatewayTool {
             }],
         )
     }
+}
+
+#[async_trait]
+impl Tool for GatewayTool {
+    fn name(&self) -> &str {
+        "gateway"
+    }
+
+    fn description(&self) -> &str {
+        "Manage the OpenPRX gateway daemon. \
+         Actions: 'config.get' (read current config), 'config.patch' (merge patch config), \
+         'status' (uptime/model/channels), 'version' (build version), \
+         'components' (active channels/providers/memory/tools), \
+         'restart' (send SIGHUP for graceful restart). \
+         'config.patch' and 'restart' are available only to the local operator in the terminal UI; \
+         they are refused for remote channels, gateway/webhook, console and external MCP callers. \
+         'config.patch' never changes `[causal_tree]` (the decision plane: its backend, remote processing, \
+         policy and thresholds are the operator's)."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
 
     #[allow(unsafe_code)]
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         let action = match args.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
             None => {
@@ -616,14 +623,15 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn gateway_action_tool_contract() {
+    #[tokio::test]
+    async fn gateway_action_tool_contract() {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            &tool.execution_schema(),
         );
     }
 
@@ -677,18 +685,24 @@ mod tests {
     async fn unknown_action_returns_error() {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.execute(json!({"action": "explode"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("Unknown action"));
+        let before = tool.config.load_full();
+        let error = tool.execute(json!({"action": "explode"})).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path.contains("action")));
+        assert!(Arc::ptr_eq(&before, &tool.config.load_full()));
+        assert!(tool.execute(json!({"action":"status"})).await.unwrap().success);
     }
 
     #[tokio::test]
     async fn missing_action_returns_error() {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.execute(json!({})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("Missing 'action'"));
+        let before = tool.config.load_full();
+        let error = tool.execute(json!({})).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path.contains("action")));
+        assert!(Arc::ptr_eq(&before, &tool.config.load_full()));
+        assert!(tool.execute(json!({"action":"status"})).await.unwrap().success);
     }
 
     #[tokio::test]
@@ -1331,7 +1345,7 @@ mod tests {
         let result = tool.execute(args).await.unwrap();
         assert!(result.success, "{:?}", result.error);
 
-        let schema = tool.parameters_schema().to_string();
+        let schema = tool.execution_schema().to_string();
         assert!(schema.contains("\"revision\""), "{schema}");
     }
 
@@ -1456,7 +1470,7 @@ mod tests {
     #[test]
     fn config_patch_description_names_every_high_risk_reason() {
         let tool = GatewayTool::new(new_shared(Config::default()), "anthropic", "claude-sonnet-4-6", vec![]);
-        let schema = tool.parameters_schema().to_string();
+        let schema = tool.execution_schema().to_string();
         for reason in [
             "who is admitted",
             "environment",

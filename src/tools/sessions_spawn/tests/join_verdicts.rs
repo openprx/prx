@@ -816,7 +816,7 @@ async fn a_batch_member_cannot_turn_its_own_announcement_back_on() {
 fn schema_advertises_the_announce_switch_and_its_batch_default() {
     let (ch, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-    let schema = tool.parameters_schema();
+    let schema = tool.execution_schema();
     assert_eq!(schema["properties"]["announce"]["type"].as_str(), Some("boolean"));
     let description = schema["properties"]["announce"]["description"]
         .as_str()

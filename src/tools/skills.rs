@@ -783,21 +783,8 @@ impl SkillsManageTool {
     }
 }
 
-#[async_trait]
-impl Tool for SkillsManageTool {
-    fn name(&self) -> &str {
-        "skills_manage"
-    }
-
-    fn description(&self) -> &str {
-        if self.lifecycle.is_some() {
-            "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Lifecycle proposals of learned revisions: 'lifecycle_status', 'lifecycle_list' and 'lifecycle_inspect' only read; 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes one and 'lifecycle_rollback' re-activates an earlier revision and 'lifecycle_import_executable' publishes an operator-authored executable bundle from a directory, bound to the complete bundle hash the operator reviewed, all under the operator's lifecycle mode and policy. Mutating actions are approval-gated."
-        } else {
-            "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Mutating actions are approval-gated."
-        }
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl SkillsManageTool {
+    fn execution_schema(&self) -> serde_json::Value {
         let mut actions = vec![
             "create", "install", "update", "enable", "disable", "validate", "sync", "remove",
         ];
@@ -891,8 +878,28 @@ impl Tool for SkillsManageTool {
         }
         crate::tools::schema::with_action_requirements(schema, "action", &requirements)
     }
+}
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+#[async_trait]
+impl Tool for SkillsManageTool {
+    fn name(&self) -> &str {
+        "skills_manage"
+    }
+
+    fn description(&self) -> &str {
+        if self.lifecycle.is_some() {
+            "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Lifecycle proposals of learned revisions: 'lifecycle_status', 'lifecycle_list' and 'lifecycle_inspect' only read; 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes one and 'lifecycle_rollback' re-activates an earlier revision and 'lifecycle_import_executable' publishes an operator-authored executable bundle from a directory, bound to the complete bundle hash the operator reviewed, all under the operator's lifecycle mode and policy. Mutating actions are approval-gated."
+        } else {
+            "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Mutating actions are approval-gated."
+        }
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         let action = Self::required_string(&args, "action")?;
         if action.starts_with("lifecycle_") {
             if !self.lifecycle_actions().contains(&action) {
@@ -1410,14 +1417,15 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn skills_manage_action_tool_contract() {
+    #[tokio::test]
+    async fn skills_manage_action_tool_contract() {
         let workspace = TempDir::new().unwrap();
         let tool = SkillsManageTool::new(
             workspace.path().to_path_buf(),
             test_config(workspace.path()),
             Arc::new(SecurityPolicy::default()),
         );
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
@@ -1870,7 +1878,7 @@ mod tests {
         crate::tools::schema::action_contract::assert_action_tool_contract(
             plain.name(),
             plain.description(),
-            &plain.parameters_schema(),
+            &plain.execution_schema(),
         );
 
         let tool = lifecycle_tool(workspace.path(), crate::skills::lifecycle::LifecycleMode::Shadow);
@@ -1885,7 +1893,7 @@ mod tests {
                 "{forbidden} must never be offered"
             );
         }
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
         let properties = schema.get("properties").and_then(serde_json::Value::as_object).unwrap();
         for forbidden in [
             "suite",

@@ -42,6 +42,21 @@ pub use resolver::{
 use crate::providers::{ProviderId, ProviderNamespace, TOOL_DIALECT_DECLARABLE_CATALOG, ToolCallDialect};
 use crate::tools::ToolSchemaDialect;
 
+/// Built-in model-family schema restrictions, shared by the catalog and transport.
+/// Model identity is authoritative; endpoint URLs never select a dialect.
+pub(crate) fn builtin_tool_schema_dialect(provider: &ProviderId, model: &str) -> ToolSchemaDialect {
+    if provider.catalog_name() == Some("openrouter")
+        && model
+            .trim()
+            .split_once('/')
+            .is_some_and(|(family, _)| family.eq_ignore_ascii_case("anthropic"))
+    {
+        ToolSchemaDialect::NoRootCombinators
+    } else {
+        adapter_bound(provider).dialects.tool_schema
+    }
+}
+
 /// Why an operation is unsupported when a declaration lists others only.
 const NOT_DECLARED: &str = "the operator declaration for this model does not list it";
 
@@ -425,6 +440,7 @@ impl CatalogView {
         descriptor.features = descriptor.features.within(&bound.features);
 
         descriptor.dialects = bound.dialects;
+        descriptor.dialects.tool_schema = builtin_tool_schema_dialect(provider, model);
         if reads_dialect_declarations(provider) {
             if let Some(tool_schema) = curated.tool_schema {
                 descriptor.dialects.tool_schema = tool_schema;

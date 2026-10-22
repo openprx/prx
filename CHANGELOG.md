@@ -51,6 +51,14 @@ and the migration warnings below before upgrading.
 
 ### Changed
 
+- Built-in tools now publish flat object schemas without root combinators for
+  Anthropic compatibility. Conditional and alternative requirements move to
+  equally strict, typed execution validation. Native Anthropic and OpenRouter
+  `anthropic/*` reject unlowerable external tool schemas locally before transport;
+  upstream OpenRouter schema errors include a remediation hint. External schema
+  consumers must handle execution-time conditional errors. See
+  [upgrade actions](docs/migration-unreleased.md).
+
 - OpenAI-compatible providers now retain reported cached prompt tokens and
   account for them at the effective `cache_read` and `cache_write` rates; these
   detail fields were previously dropped, so all prompt tokens used the input

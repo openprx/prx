@@ -181,7 +181,7 @@ async fn task_mode_no_tools_preserves_single_turn_trace_usage() {
 fn schema_has_required_fields() {
     let (ch, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-    let schema = tool.parameters_schema();
+    let schema = tool.execution_schema();
     // The executor treats an omitted action as 'spawn', so the published
     // contract defaults it rather than requiring it.
     let required = schema["required"].as_array().unwrap();

@@ -148,7 +148,10 @@ async fn an_unknown_disposition_is_rejected_rather_than_folded_into_the_default(
         .execute(chat_assign_args(&registration.session_id, Some("right-now")))
         .await
         .expect_err("an unknown disposition is a tool error");
-    assert!(error.to_string().contains("right-now"), "{error}");
+    let typed = error
+        .downcast_ref::<crate::tools::schema::ToolArgumentError>()
+        .expect("typed rejection");
+    assert!(typed.issues.iter().any(|issue| issue.path == "$.disposition"));
 
     let listed = crate::runtime::chat_sessions::list();
     let session = listed
@@ -156,6 +159,15 @@ async fn an_unknown_disposition_is_rejected_rather_than_folded_into_the_default(
         .find(|session| session.session_id == registration.session_id)
         .expect("registered");
     assert_eq!(session.queued, 0, "a rejected disposition must queue nothing");
+    let valid = tool
+        .execute(chat_assign_args(&registration.session_id, Some("queue")))
+        .await
+        .expect("valid assignment");
+    assert!(valid.success, "{:?}", valid.error);
+    let pulled =
+        crate::runtime::chat_sessions::pull(&registration.session_id, &registration.token, &[], None).expect("pull");
+    assert_eq!(pulled.assignments.len(), 1);
+    assert_eq!(pulled.assignments[0].disposition.as_str(), "queue");
     crate::runtime::chat_sessions::deregister(&registration.session_id);
 }
 
@@ -335,7 +347,7 @@ async fn chat_sessions_is_refused_without_a_trusted_scope() {
 fn the_schema_advertises_the_chat_assignment_actions_on_this_tool() {
     let (ch, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-    let schema = tool.parameters_schema();
+    let schema = tool.execution_schema();
     let actions: Vec<&str> = schema["properties"]["action"]["enum"]
         .as_array()
         .expect("enumerated actions")

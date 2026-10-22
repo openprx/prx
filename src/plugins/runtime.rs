@@ -1336,6 +1336,10 @@ pub(crate) const PLUGIN_MANAGE_DESCRIPTION: &str = "Inspect, manage and invoke w
 /// Kept as a free function so the schema contract can be asserted without
 /// standing up a plugin runtime.
 pub(crate) fn plugin_manage_parameters_schema() -> serde_json::Value {
+    crate::tools::schema::publish_flat_schema(plugin_manage_execution_schema())
+}
+
+fn plugin_manage_execution_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -1420,7 +1424,8 @@ impl Tool for PluginManageTool {
         plugin_manage_parameters_schema()
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &plugin_manage_execution_schema(), &mut args)?;
         let action = Self::required_string(&args, "action")?;
         let identity = if matches!(action, "install" | "update") {
             match self.authorize_trust_grant(action, &args) {
@@ -1847,7 +1852,7 @@ mod tests {
         crate::tools::schema::action_contract::assert_action_tool_contract(
             "wasm_plugins_manage",
             PLUGIN_MANAGE_DESCRIPTION,
-            &plugin_manage_parameters_schema(),
+            &plugin_manage_execution_schema(),
         );
     }
 
@@ -1942,7 +1947,8 @@ optional = []
             ..crate::config::Config::default()
         };
         let manage = runtime.manage_tool(crate::runtime::bootstrap::build_security_policy(&config));
-        let schema = manage.parameters_schema();
+        crate::tools::schema::assert_flat_execution_contract(manage.as_ref(), &plugin_manage_execution_schema()).await;
+        let schema = plugin_manage_execution_schema();
         let conditions = schema
             .get("allOf")
             .and_then(serde_json::Value::as_array)

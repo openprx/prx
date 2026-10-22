@@ -541,10 +541,22 @@ impl AnthropicProvider {
                         capability: "tool_schema_dialect".to_string(),
                         message: error.to_string(),
                     })?;
+            let input_schema = crate::tools::schema::SchemaCleanr::clean_for_anthropic(input_schema.into_owned());
+            // Resolving a root reference can expose a combinator too.
+            let input_schema = match dialect.wire_schema(&tool.name, &input_schema).map_err(|error| {
+                super::ProviderCapabilityError {
+                    provider: "anthropic".to_string(),
+                    capability: "tool_schema_dialect".to_string(),
+                    message: error.to_string(),
+                }
+            })? {
+                std::borrow::Cow::Borrowed(_) => input_schema,
+                std::borrow::Cow::Owned(lowered) => lowered,
+            };
             native_tools.push(NativeToolSpec {
                 name: &tool.name,
                 description: &tool.description,
-                input_schema: input_schema.into_owned(),
+                input_schema,
                 cache_control: None,
             });
         }
@@ -1296,7 +1308,7 @@ impl Provider for AnthropicProvider {
     /// `SchemaCleanr::clean_for_anthropic`, which inlines the definitions
     /// instead. The model answers against the inlined document.
     fn tool_schema_dialect(&self) -> crate::tools::ToolSchemaDialect {
-        crate::tools::ToolSchemaDialect::Anthropic
+        crate::tools::ToolSchemaDialect::NoRootCombinators
     }
 
     async fn chat_with_system(
@@ -2299,6 +2311,62 @@ mod tests {
         AnthropicProvider::apply_cache_to_last_message(&mut messages);
         // Should not panic
         assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn root_combinator_tools_are_refused_before_native_transport() {
+        let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+        let provider = AnthropicProvider::with_base_url(Some("prx-test-credential"), Some(probe.base_url().as_str()));
+        let tools = vec![ToolSpec {
+            name: "mcp_fixture".into(),
+            description: "fixture".into(),
+            parameters: serde_json::json!({"type":"object","oneOf":[{"required":["a"]},{"required":["b"]}]}),
+        }];
+        let Err(error) = provider.convert_tools(Some(&tools)) else {
+            panic!("test: schema must be refused");
+        };
+        assert!(error.downcast_ref::<super::super::ProviderCapabilityError>().is_some());
+        for expected in ["mcp_fixture", "oneOf", "no_root_combinators", "tool_tiering"] {
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let messages = vec![ChatMessage::user("fixture")];
+        let error = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "fixture",
+                0.0,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<super::super::ProviderCapabilityError>().is_some());
+        let streamed = provider
+            .stream_chat_with_history(
+                &messages,
+                "fixture",
+                0.0,
+                StreamOptions {
+                    tools: Some(tools.clone()),
+                    ..StreamOptions::default()
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(streamed.len(), 1);
+        assert!(
+            streamed[0]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("no_root_combinators")
+        );
+        assert!(probe.requests().is_empty());
+        assert_eq!(
+            provider.tool_schema_dialect(),
+            crate::tools::ToolSchemaDialect::NoRootCombinators
+        );
     }
 
     #[test]

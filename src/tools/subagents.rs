@@ -418,17 +418,8 @@ const fn status_label(status: &SubAgentStatus) -> &'static str {
     }
 }
 
-#[async_trait]
-impl Tool for SubagentsTool {
-    fn name(&self) -> &str {
-        "subagents"
-    }
-
-    fn description(&self) -> &str {
-        "Manage sub-agents spawned by sessions_spawn: 'list' shows active and recent runs, 'kill' terminates a run, and 'steer' sends a message into a running one."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl SubagentsTool {
+    fn execution_schema(&self) -> serde_json::Value {
         crate::tools::schema::with_default_action_requirements(
             json!({
                 "type": "object",
@@ -478,8 +469,24 @@ impl Tool for SubagentsTool {
             ],
         )
     }
+}
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+#[async_trait]
+impl Tool for SubagentsTool {
+    fn name(&self) -> &str {
+        "subagents"
+    }
+
+    fn description(&self) -> &str {
+        "Manage sub-agents spawned by sessions_spawn: 'list' shows active and recent runs, 'kill' terminates a run, and 'steer' sends a message into a running one."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
         // OWNER-VIS: list, kill and steer reach only the runs this caller's
@@ -548,13 +555,14 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn subagents_action_tool_contract() {
+    #[tokio::test]
+    async fn subagents_action_tool_contract() {
         let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            &tool.execution_schema(),
         );
     }
 
@@ -1033,7 +1041,7 @@ mod tests {
     #[test]
     fn schema_has_action_enum() {
         let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
         let actions = schema["properties"]["action"]["enum"]
             .as_array()
             .expect("test: action enum");
@@ -1099,7 +1107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_relaxed_executor_limit_is_clamped_by_subagents() {
+    async fn gemini_relaxed_executor_limit_is_rejected_by_subagents() {
         let runs = (0..=MAX_LIMIT)
             .map(|index| {
                 let mut run = make_run(&format!("run-{index:03}"), SubAgentStatus::Running);
@@ -1108,14 +1116,21 @@ mod tests {
             })
             .collect();
         let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
         let wire = crate::tools::ToolSchemaDialect::Gemini
             .wire_schema(tool.name(), &schema)
             .expect("Gemini schema lowering");
         assert!(wire.pointer("/properties/limit/maximum").is_none());
 
-        let result = tool
+        let error = tool
             .execute(json!({"action": "list", "limit": u64::MAX}))
+            .await
+            .unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.limit"));
+        assert_eq!(tool.active_runs.read().await.len(), MAX_LIMIT + 1);
+        let result = tool
+            .execute(json!({"action": "list", "limit": MAX_LIMIT}))
             .await
             .expect("subagents execution");
 
@@ -1233,10 +1248,13 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_action_fails() {
-        let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
-        let result = tool.execute(json!({"action": "nuke"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Unsupported"));
+        let runs = Arc::new(RwLock::new(Vec::new()));
+        let tool = SubagentsTool::new(Arc::clone(&runs));
+        let error = tool.execute(json!({"action": "nuke"})).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.action"));
+        assert!(runs.read().await.is_empty());
+        assert!(tool.execute(json!({"action":"list"})).await.unwrap().success);
     }
 
     // ── Output formatting ───────────────────────────────────────

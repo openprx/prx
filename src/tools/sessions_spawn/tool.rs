@@ -8,21 +8,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-#[async_trait]
-impl Tool for SessionsSpawnTool {
-    fn name(&self) -> &str {
-        "sessions_spawn"
-    }
-
-    fn description(&self) -> &str {
-        "Hand work to an async sub-agent or to a live `prx chat` session, and manage what is running. \
-         Actions and their parameters: 'spawn' (default) task -> run_id; 'spawn_batch' tasks -> batch_id; \
-         'join' batch_id (waits for every member, returns all results); 'list'; 'kill' run_id; \
-         'history' run_id; 'steer' run_id + message; 'chat_sessions'; 'chat_assign' session_id + task. \
-         Work text always goes in `task`, never `message`."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl SessionsSpawnTool {
+    pub(super) fn execution_schema(&self) -> serde_json::Value {
         let available_agents = self
             .agents
             .iter()
@@ -169,6 +156,25 @@ impl Tool for SessionsSpawnTool {
             ],
         )
     }
+}
+
+#[async_trait]
+impl Tool for SessionsSpawnTool {
+    fn name(&self) -> &str {
+        "sessions_spawn"
+    }
+
+    fn description(&self) -> &str {
+        "Hand work to an async sub-agent or to a live `prx chat` session, and manage what is running. \
+         Actions and their parameters: 'spawn' (default) task -> run_id; 'spawn_batch' tasks -> batch_id; \
+         'join' batch_id (waits for every member, returns all results); 'list'; 'kill' run_id; \
+         'history' run_id; 'steer' run_id + message; 'chat_sessions'; 'chat_assign' session_id + task. \
+         Work text always goes in `task`, never `message`."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
 
     async fn set_active_recipient(&self, recipient: &str) {
         *self.default_recipient.write().await = Some(recipient.to_string());
@@ -183,7 +189,8 @@ impl Tool for SessionsSpawnTool {
         *self.channel.write().await = channel;
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         crate::tools::execution::verify_current_child_call("sessions_spawn")?;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("spawn");
         if action == "spawn_batch" {

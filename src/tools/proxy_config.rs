@@ -386,17 +386,8 @@ impl ProxyConfigTool {
     }
 }
 
-#[async_trait]
-impl Tool for ProxyConfigTool {
-    fn name(&self) -> &str {
-        "proxy_config"
-    }
-
-    fn description(&self) -> &str {
-        "Manage ZeroClaw proxy settings (scope: environment | prx | services): 'get' reads the effective settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, and 'clear_env' removes it"
-    }
-
-    fn parameters_schema(&self) -> Value {
+impl ProxyConfigTool {
+    fn execution_schema(&self) -> Value {
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -451,8 +442,24 @@ impl Tool for ProxyConfigTool {
             }]
         })
     }
+}
 
-    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+#[async_trait]
+impl Tool for ProxyConfigTool {
+    fn name(&self) -> &str {
+        "proxy_config"
+    }
+
+    fn description(&self) -> &str {
+        "Manage ZeroClaw proxy settings (scope: environment | prx | services): 'get' reads the effective settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, and 'clear_env' removes it"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    async fn execute(&self, mut args: Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         let action = args
             .get("action")
             .and_then(Value::as_str)
@@ -575,13 +582,14 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn proxy_config_action_tool_contract() {
+    #[tokio::test]
+    async fn proxy_config_action_tool_contract() {
         let tool = ProxyConfigTool::new(crate::config::new_shared(Config::default()), test_security());
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            &tool.execution_schema(),
         );
     }
 
@@ -601,6 +609,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
 
+        let before = fs::read(&tool.config.load().config_path).unwrap();
         let result = tool
             .execute(json!({
                 "action": "set",
@@ -610,17 +619,27 @@ mod tests {
                 "services": []
             }))
             .await
+            .unwrap_err();
+        let typed = result
+            .downcast_ref::<crate::tools::schema::ToolArgumentError>()
             .unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("proxy.scope='services'"));
+        assert!(!typed.issues.is_empty(), "invalid input must carry a validation issue");
+        assert_eq!(fs::read(&tool.config.load().config_path).unwrap(), before);
+        let valid = tool
+            .execute(json!({
+                "action": "set", "scope": "services",
+                "http_proxy": "http://127.0.0.1:7890", "services": ["provider.openai"]
+            }))
+            .await
+            .unwrap();
+        assert!(valid.success, "{:?}", valid.error);
     }
 
     #[tokio::test]
     async fn schema_requires_nonempty_services_for_service_scope_aliases() {
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
 
         for scope in ["services", "service"] {
             assert!(
@@ -708,7 +727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_null_proxy_url_clears_existing_value() {
+    async fn set_rejects_null_proxy_url_and_empty_string_clears_existing_value() {
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
 
@@ -721,10 +740,24 @@ mod tests {
             .unwrap();
         assert!(set_result.success, "{:?}", set_result.error);
 
+        let before = fs::read(&tool.config.load().config_path).unwrap();
+        let rejected = tool
+            .execute(json!({"action": "set", "http_proxy": null}))
+            .await
+            .unwrap_err();
+        let typed = rejected
+            .downcast_ref::<crate::tools::schema::ToolArgumentError>()
+            .unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.http_proxy"));
+        assert_eq!(fs::read(&tool.config.load().config_path).unwrap(), before);
+        assert_eq!(
+            tool.config.desired().config.proxy.http_proxy.as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
         let clear_result = tool
             .execute(json!({
                 "action": "set",
-                "http_proxy": null
+                "http_proxy": ""
             }))
             .await
             .unwrap();

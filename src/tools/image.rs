@@ -82,20 +82,8 @@ impl ImageTool {
     }
 }
 
-#[async_trait]
-impl Tool for ImageTool {
-    fn name(&self) -> &str {
-        "image"
-    }
-
-    fn description(&self) -> &str {
-        "Analyze one or more images with a vision model. \
-         Accepts local file paths or HTTPS URLs. Supports asking questions about image content, \
-         describing scenes, reading text (OCR), identifying objects, and visual reasoning. \
-         Only use this tool when images are NOT already provided in the current message."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl ImageTool {
+    fn execution_schema(&self) -> serde_json::Value {
         crate::tools::schema::with_required_alternatives(
             json!({
                 "type": "object",
@@ -121,8 +109,27 @@ impl Tool for ImageTool {
             &[&["image"], &["images"]],
         )
     }
+}
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+#[async_trait]
+impl Tool for ImageTool {
+    fn name(&self) -> &str {
+        "image"
+    }
+
+    fn description(&self) -> &str {
+        "Analyze one or more images with a vision model. \
+         Accepts local file paths or HTTPS URLs. Supports asking questions about image content, \
+         describing scenes, reading text (OCR), identifying objects, and visual reasoning. \
+         Only use this tool when images are NOT already provided in the current message."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         let (provider, model, temperature, capabilities) = if let Some(resolver) = &self.pinned_provider_resolver {
             let generation_id = crate::tools::execution::current_child_call_context()
                 .and_then(|caller| caller.context().envelope.config_generation_id)
@@ -396,14 +403,15 @@ mod tests {
         assert!(tool.description().contains("vision"));
     }
 
-    #[test]
-    fn schema_has_expected_fields() {
+    #[tokio::test]
+    async fn schema_has_expected_fields() {
         let p = Arc::new(VisionProvider {
             response: "".into(),
             has_vision: true,
         });
         let tool = make_tool(p);
-        let schema = tool.parameters_schema();
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        let schema = tool.execution_schema();
         assert!(schema["properties"]["image"].is_object());
         assert!(schema["properties"]["images"].is_object());
         assert!(schema["properties"]["prompt"].is_object());
@@ -423,14 +431,40 @@ mod tests {
 
     #[tokio::test]
     async fn no_image_returns_error() {
-        let p = Arc::new(VisionProvider {
-            response: "ok".into(),
-            has_vision: true,
+        let provider = Arc::new(CatalogVisionProvider {
+            calls: AtomicUsize::new(0),
         });
-        let tool = make_tool(p);
-        let result = tool.execute(json!({})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("No image provided"));
+        let provider_dyn: Arc<dyn Provider> = provider.clone();
+        let mut config = crate::config::Config::default();
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"codellama\"\noperations = [\"chat\"]\nvision_input = true\n",
+            )
+            .expect("test: operator model declaration"),
+        );
+        let tool = ImageTool::new(
+            provider_dyn,
+            "codellama",
+            0.0,
+            test_security(),
+            MultimodalConfig::default(),
+        )
+        .with_provider_name("ollama")
+        .with_model_catalog(crate::providers::selection::catalog_for(&config));
+
+        let error = tool.execute(json!({})).await.unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::tools::schema::ToolArgumentError>()
+                .is_some()
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let valid = tool
+            .execute(json!({"image": "data:image/png;base64,iVBORw0KGgo="}))
+            .await
+            .unwrap();
+        assert!(valid.success, "{:?}", valid.error);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

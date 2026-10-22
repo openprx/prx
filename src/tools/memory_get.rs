@@ -152,17 +152,8 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     })
 }
 
-#[async_trait]
-impl Tool for MemoryGetTool {
-    fn name(&self) -> &str {
-        "memory_get"
-    }
-
-    fn description(&self) -> &str {
-        "Read memory by key from the configured backend with ACL observe/enforce mode."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl MemoryGetTool {
+    fn execution_schema(&self) -> serde_json::Value {
         crate::tools::schema::with_required_alternatives(
             json!({
                 "type": "object",
@@ -196,8 +187,24 @@ impl Tool for MemoryGetTool {
             &[&["path"], &["key"]],
         )
     }
+}
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+#[async_trait]
+impl Tool for MemoryGetTool {
+    fn name(&self) -> &str {
+        "memory_get"
+    }
+
+    fn description(&self) -> &str {
+        "Read memory by key from the configured backend with ACL observe/enforce mode."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         let path = args
             .get("path")
             .or_else(|| args.get("key"))
@@ -597,11 +604,12 @@ mod tests {
         assert!(result.output.contains("No memory entry found for key"));
     }
 
-    #[test]
-    fn schema_exposes_openclaw_parameters() {
+    #[tokio::test]
+    async fn schema_exposes_openclaw_parameters() {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(&tmp, true);
-        let schema = tool.parameters_schema();
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        let schema = tool.execution_schema();
 
         assert_eq!(tool.name(), "memory_get");
         assert!(schema["properties"]["path"].is_object());

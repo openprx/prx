@@ -102,17 +102,8 @@ fn parse_tags(args: &serde_json::Value, notices: &mut Vec<String>) -> anyhow::Re
     Ok(Some(tags))
 }
 
-#[async_trait]
-impl Tool for ChatProfileUpdateTool {
-    fn name(&self) -> &str {
-        "chat_profile_update"
-    }
-
-    fn description(&self) -> &str {
-        "Record what this group or direct chat is for: its purpose, useful notes, and short tags. Provide only purpose/notes/tags; the target conversation is determined automatically. Prefer this over general memory tools for conversation purpose, notes, and tags."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl ChatProfileUpdateTool {
+    fn execution_schema(&self) -> serde_json::Value {
         crate::tools::schema::with_required_alternatives(
             json!({
                 "type": "object",
@@ -139,8 +130,24 @@ impl Tool for ChatProfileUpdateTool {
             &[&["purpose"], &["notes"], &["tags"]],
         )
     }
+}
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+#[async_trait]
+impl Tool for ChatProfileUpdateTool {
+    fn name(&self) -> &str {
+        "chat_profile_update"
+    }
+
+    fn description(&self) -> &str {
+        "Record what this group or direct chat is for: its purpose, useful notes, and short tags. Provide only purpose/notes/tags; the target conversation is determined automatically. Prefer this over general memory tools for conversation purpose, notes, and tags."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         if args.get("channel").is_some() || args.get("chat_id").is_some() {
             return Ok(ToolResult {
                 success: false,
@@ -288,12 +295,13 @@ mod tests {
         args.as_object_mut().unwrap().insert(key.to_string(), value);
     }
 
-    #[test]
-    fn schema_requires_at_least_one_profile_field() {
+    #[tokio::test]
+    async fn schema_requires_at_least_one_profile_field() {
         let tmp = TempDir::new().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let tool = ChatProfileUpdateTool::new(memory, Arc::new(SecurityPolicy::default()));
-        let schema = tool.parameters_schema();
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        let schema = tool.execution_schema();
 
         assert!(
             !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
@@ -348,7 +356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_model_supplied_target_and_truncates_tags() {
+    async fn rejects_model_supplied_target_and_oversized_tags() {
         let tmp = TempDir::new().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let tool = ChatProfileUpdateTool::new(memory.clone(), Arc::new(SecurityPolicy::default()));
@@ -357,9 +365,12 @@ mod tests {
         insert_arg(&mut rejected, "channel", json!("telegram"));
         insert_arg(&mut rejected, "chat_id", json!("group-b"));
         insert_arg(&mut rejected, "purpose", json!("wrong target"));
-        let result = tool.execute(rejected).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("determined automatically"));
+        let error = tool.execute(rejected).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path.contains("channel")));
+        assert!(typed.issues.iter().any(|issue| issue.path.contains("chat_id")));
+        assert!(memory.get_chat_profile("telegram", "group-a").await.unwrap().is_none());
+        assert!(memory.get_chat_profile("telegram", "group-b").await.unwrap().is_none());
 
         let mut args = approved_args("telegram", "group-a", "group");
         insert_arg(
@@ -367,9 +378,17 @@ mod tests {
             "tags",
             json!(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"]),
         );
+        let error = tool.execute(args.clone()).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.tags"));
+        assert!(memory.get_chat_profile("telegram", "group-a").await.unwrap().is_none());
+        insert_arg(
+            &mut args,
+            "tags",
+            json!(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]),
+        );
         let result = tool.execute(args).await.unwrap();
         assert!(result.success, "{result:?}");
-        assert!(result.output.contains("tags truncated to 10 items"));
         let profile = memory.get_chat_profile("telegram", "group-a").await.unwrap().unwrap();
         assert_eq!(profile.tags.len(), 10);
     }

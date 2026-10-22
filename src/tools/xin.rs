@@ -373,21 +373,8 @@ fn parse_xin_lineage_scope(cfg: &Config, args: &serde_json::Value) -> XinLineage
     }
 }
 
-#[async_trait]
-impl Tool for XinTool {
-    fn name(&self) -> &str {
-        "xin"
-    }
-
-    fn description(&self) -> &str {
-        "Xin autonomous task heartbeat engine: tasks and durable goal/step workflows, with execution \
-         and history. Tasks: 'add', 'list', 'get', 'update', 'remove', 'pause', 'resume', 'cancel', \
-         'run', 'runs', 'events', 'status'. Goals: 'goal_add', 'goal_list', 'goal_get', 'goal_pause', \
-         'goal_resume', 'goal_cancel', 'goal_remove'. Steps: 'step_add', 'step_list', 'step_get', \
-         'step_retry'."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl XinTool {
+    fn execution_schema(&self) -> serde_json::Value {
         crate::tools::schema::with_action_alternatives(
             crate::tools::schema::with_action_requirements(
                 json!({
@@ -580,8 +567,28 @@ impl Tool for XinTool {
             ],
         )
     }
+}
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+#[async_trait]
+impl Tool for XinTool {
+    fn name(&self) -> &str {
+        "xin"
+    }
+
+    fn description(&self) -> &str {
+        "Xin autonomous task heartbeat engine: tasks and durable goal/step workflows, with execution \
+         and history. Tasks: 'add', 'list', 'get', 'update', 'remove', 'pause', 'resume', 'cancel', \
+         'run', 'runs', 'events', 'status'. Goals: 'goal_add', 'goal_list', 'goal_get', 'goal_pause', \
+         'goal_resume', 'goal_cancel', 'goal_remove'. Steps: 'step_add', 'step_list', 'step_get', \
+         'step_retry'."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         let cfg = self.config.load_full();
         let action = match args.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
@@ -1407,15 +1414,16 @@ mod tests {
     /// See `cron`'s copy of this test: the contract is derived from the schema's
     /// own conditional-required clauses, so a compressed or rewritten
     /// description that stops naming its actions turns this red.
-    #[test]
-    fn schema_names_every_action_in_the_parameters_it_requires() {
+    #[tokio::test]
+    async fn schema_names_every_action_in_the_parameters_it_requires() {
         let config = Config::default();
         let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         let tool = XinTool::new(new_shared(config), security);
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             "xin",
             tool.description(),
-            &tool.parameters_schema(),
+            &tool.execution_schema(),
         );
     }
 
@@ -1424,7 +1432,7 @@ mod tests {
         let config = Config::default();
         let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         let tool = XinTool::new(new_shared(config), security);
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
 
         assert!(
             !validate_tool_arguments(&schema, &json!({"action": "update"})).is_empty(),

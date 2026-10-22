@@ -662,17 +662,8 @@ impl PorcelainStatus {
     }
 }
 
-#[async_trait]
-impl Tool for GitOperationsTool {
-    fn name(&self) -> &str {
-        "git_operations"
-    }
-
-    fn description(&self) -> &str {
-        "Perform structured Git operations: 'status', 'diff', 'log', 'branch', 'commit', 'add', 'checkout', 'stash', 'push' and 'reset_hard'. The 'stash' operation takes an action of 'push' (save), 'pop' (restore), 'list' (show entries) or 'drop' (delete one). Provides parsed JSON output and integrates with security policy for autonomy controls."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl GitOperationsTool {
+    fn execution_schema(&self) -> serde_json::Value {
         crate::tools::schema::with_action_requirements(
             json!({
                 "type": "object",
@@ -743,8 +734,24 @@ impl Tool for GitOperationsTool {
             ],
         )
     }
+}
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+#[async_trait]
+impl Tool for GitOperationsTool {
+    fn name(&self) -> &str {
+        "git_operations"
+    }
+
+    fn description(&self) -> &str {
+        "Perform structured Git operations: 'status', 'diff', 'log', 'branch', 'commit', 'add', 'checkout', 'stash', 'push' and 'reset_hard'. The 'stash' operation takes an action of 'push' (save), 'pop' (restore), 'list' (show entries) or 'drop' (delete one). Provides parsed JSON output and integrates with security policy for autonomy controls."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         let operation = match args.get("operation").and_then(|v| v.as_str()) {
             Some(op) => op,
             None => {
@@ -897,14 +904,15 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn git_operations_action_tool_contract() {
+    #[tokio::test]
+    async fn git_operations_action_tool_contract() {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            &tool.execution_schema(),
         );
     }
 
@@ -1192,9 +1200,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
 
-        let result = tool.execute(json!({})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Missing 'operation'"));
+        let error = tool.execute(json!({})).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path.contains("operation")));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        init_git_repo(tmp.path()).await;
+        let status = tool.execute(json!({"operation":"status"})).await.unwrap();
+        assert!(status.success, "{:?}", status.error);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status.output)
+                .unwrap()
+                .get("clean")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -1205,9 +1224,18 @@ mod tests {
 
         let tool = test_tool(tmp.path());
 
-        let result = tool.execute(json!({"operation": "fetch_all"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Unknown operation"));
+        let error = tool.execute(json!({"operation": "fetch_all"})).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path.contains("operation")));
+        let status = tool.execute(json!({"operation":"status"})).await.unwrap();
+        assert!(status.success, "{:?}", status.error);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status.output)
+                .unwrap()
+                .get("clean")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     // ── GIT-ENV (D-098): a repository's configuration is a launch definition ──

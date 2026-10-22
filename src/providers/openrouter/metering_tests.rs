@@ -1,4 +1,6 @@
 //! Loopback proofs for refused and streaming OpenRouter turns.
+#![cfg(test)]
+
 use super::*;
 use std::sync::{
     Arc,

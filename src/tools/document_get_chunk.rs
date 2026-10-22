@@ -23,17 +23,8 @@ impl DocumentGetChunkTool {
     }
 }
 
-#[async_trait]
-impl Tool for DocumentGetChunkTool {
-    fn name(&self) -> &str {
-        "document_get_chunk"
-    }
-
-    fn description(&self) -> &str {
-        "Retrieve one durable source document chunk by chunk_id when visible to the current owner/workspace scope."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+impl DocumentGetChunkTool {
+    fn execution_schema(&self) -> serde_json::Value {
         crate::tools::schema::with_required_alternatives(
             json!({
                 "type": "object",
@@ -52,8 +43,24 @@ impl Tool for DocumentGetChunkTool {
             &[&["chunk_id"], &["chunkId"]],
         )
     }
+}
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+#[async_trait]
+impl Tool for DocumentGetChunkTool {
+    fn name(&self) -> &str {
+        "document_get_chunk"
+    }
+
+    fn description(&self) -> &str {
+        "Retrieve one durable source document chunk by chunk_id when visible to the current owner/workspace scope."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
         let chunk_id = args
             .get("chunk_id")
             .or_else(|| args.get("chunkId"))
@@ -262,12 +269,13 @@ mod tests {
     use crate::memory::{DocumentIngestInput, Memory, MemoryVisibility, SqliteMemory};
     use tempfile::TempDir;
 
-    #[test]
-    fn schema_accepts_both_chunk_id_spellings() {
+    #[tokio::test]
+    async fn schema_accepts_both_chunk_id_spellings() {
         let tmp = TempDir::new().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let tool = DocumentGetChunkTool::new(tmp.path().to_path_buf(), memory);
-        let schema = tool.parameters_schema();
+        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        let schema = tool.execution_schema();
 
         assert!(
             !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
