@@ -108,13 +108,28 @@ async fn a_webhook_memory_store_never_reaches_another_surfaces_system_prompt() {
         "client-a",
     )
     .await;
+    // The turn now reaches the model (an empty memory read no longer closes a
+    // clear request with a policy refusal); the approval-required write the
+    // model asks for is not exposed on this surface and is never executed.
     assert!(
-        withheld.contains("I can't complete this request under the current policy."),
+        withheld.contains("tool 'memory_store' was not exposed for this turn and was not executed"),
         "test: the webhook must report the withheld write: {withheld}"
     );
     assert!(
-        provider.seen.lock().is_empty(),
-        "the approval-required webhook write must be withheld before provider execution"
+        !withheld.contains(SHARED_PROMPT_INJECTION),
+        "the withheld write must not echo the proposed payload: {withheld}"
+    );
+    assert!(
+        provider
+            .system_seen
+            .lock()
+            .iter()
+            .all(|system| !system.contains(SHARED_PROMPT_INJECTION)),
+        "no request's system prompt may carry the proposed payload"
+    );
+    assert!(
+        !provider.tools_seen.lock().iter().any(|name| name == "memory_store"),
+        "the approval-required memory_store must not be published on the webhook surface"
     );
     assert!(
         state

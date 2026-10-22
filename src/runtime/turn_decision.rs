@@ -1258,9 +1258,18 @@ impl TurnDecisionContext {
     }
 }
 
+/// Whether a finished memory read lets the turn answer: new evidence always
+/// does; a completed read that found nothing does only for a message that asks
+/// for something. A blank message has nothing to answer and stays closed.
+fn read_finishes_retrieval(observed: &MemoryHopObservation, routing_input: &str) -> bool {
+    observed.fresh_read || (observed.completed_ok && !routing_input.trim().is_empty())
+}
+
 struct MemoryHopObservation {
     state: CausalState,
     fresh_read: bool,
+    /// The read completed with status Ok, even when it returned nothing new.
+    completed_ok: bool,
     selected_artifacts: Vec<ObservedArtifact>,
     custom_context: Option<String>,
 }
@@ -2151,6 +2160,7 @@ impl TurnDecisionService {
         Ok(MemoryHopObservation {
             state: next,
             fresh_read,
+            completed_ok: status == ObservedStepStatus::Ok,
             selected_artifacts,
             custom_context,
         })
@@ -2787,7 +2797,7 @@ impl TurnDecisionService {
                         }
                         return Err(AgentDecisionError::Cancelled);
                     }
-                    allow_terminal_answer = observed.fresh_read;
+                    allow_terminal_answer = read_finishes_retrieval(&observed, proof.routing_input());
                     selected_retrieved = observed.selected_artifacts;
                     selected_custom_memory_context = observed.custom_context;
                     let mut comparison = observed.state.clone();

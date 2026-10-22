@@ -336,6 +336,95 @@ async fn cli_single_shot_plain_message_reaches_provider_with_default_causal_conf
     );
 }
 
+/// Finding 112.1: a tool-flavoured request on a fresh workspace (empty memory)
+/// at full autonomy must reach the model with the shell published and execute
+/// the model's shell call. The empty memory read used to stop the hops and
+/// close the turn with a `hop_stopped` refusal before any model call.
+#[tokio::test]
+async fn cli_full_autonomy_shell_request_with_empty_memory_reaches_model_and_runs_shell() {
+    use crate::providers::credential_probe::{CredentialProbe, PROBE_REPLY};
+
+    let tmp = TempDir::new().expect("test: tempdir");
+    let probe = CredentialProbe::start_with_tool_reply(
+        "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"touch f112-shell-ran.txt\"}}\n</tool_call>",
+    )
+    .await;
+    let config = cli_agent_probe_config(tmp.path(), &probe);
+    assert_eq!(config.autonomy.level, crate::security::AutonomyLevel::Full);
+
+    let reply = run_with_runtime_envelope(
+        config.clone(),
+        Some("Run the shell command: echo hi".to_string()),
+        None,
+        None,
+        0.0,
+        CancellationToken::new(),
+        None,
+        None,
+    )
+    .await
+    .expect("test: the shell turn completes");
+
+    assert!(
+        reply.contains(PROBE_REPLY),
+        "model answered after the tool round: {reply:?}"
+    );
+    assert!(cli_agent_probe_saw_a_chat_request(&probe), "the turn reached the model");
+    assert!(
+        config.workspace_dir.join("f112-shell-ran.txt").exists(),
+        "the published shell tool executed the model's call"
+    );
+}
+
+/// The same request at read-only autonomy stays closed for the right reason:
+/// no legal path, no model call, and nothing executed.
+#[tokio::test]
+async fn cli_readonly_shell_request_is_refused_by_policy_before_the_model() {
+    use crate::providers::credential_probe::CredentialProbe;
+
+    let tmp = TempDir::new().expect("test: tempdir");
+    let probe = CredentialProbe::start_with_tool_reply(
+        "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"touch f112-readonly-ran.txt\"}}\n</tool_call>",
+    )
+    .await;
+    let mut config = cli_agent_probe_config(tmp.path(), &probe);
+    config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+
+    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_enabled_builtin_model(
+        config.clone(),
+        "Run the shell command: echo hi",
+        Arc::new(vec![Box::new(crate::tools::shell::ShellTool::new(
+            Arc::new(crate::runtime::NativeRuntime::new()),
+            config.workspace_dir.clone(),
+        )) as Box<dyn crate::tools::Tool>]),
+        Arc::new(SqliteMemory::new(&config.workspace_dir).expect("test: memory")),
+        ("ollama", "prx-local-model"),
+    )
+    .await;
+    match admission.decision().context.directive() {
+        crate::causal_tree::directive::TurnExecutionDirective::Refuse { policy_code } => {
+            assert_eq!(policy_code, "no_legal_path");
+        }
+        other => panic!("read-only shell request must refuse with no_legal_path: {other:?}"),
+    }
+
+    let reply = run_with_runtime_envelope(
+        config.clone(),
+        Some("Run the shell command: echo hi".to_string()),
+        None,
+        None,
+        0.0,
+        CancellationToken::new(),
+        None,
+        None,
+    )
+    .await
+    .expect("test: a refused turn still returns its terminal text");
+    assert!(!reply.contains(crate::providers::credential_probe::PROBE_REPLY));
+    assert!(!cli_agent_probe_saw_a_chat_request(&probe), "refused before the model");
+    assert!(!config.workspace_dir.join("f112-readonly-ran.txt").exists());
+}
+
 /// The CLI entrypoint must carry the configured deny policy into the real
 /// provider -> parser -> tool-service path. A default policy would write this
 /// file, so the absent file is the negative wire assertion.
