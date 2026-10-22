@@ -409,7 +409,13 @@ async fn run(env: &Env, autonomy: AutonomyLevel, case: Case) {
     let (proof, envelope) = recorded_approval_source(
         &env.generation,
         Arc::clone(&env.memory),
-        "Use skills_manage to carry out the reviewed lifecycle change",
+        &format!(
+            "Use skills_manage to run {}",
+            spec.arguments
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+        ),
         ChatMode::Edit,
         "prx_grant_original",
         1,
@@ -834,4 +840,60 @@ async fn read_only_autonomy_denies_the_import_in_the_execution_service() {
     assert_eq!(outcome.status, ToolExecutionStatus::Denied);
     assert_eq!(outcome.decision, Some(crate::tools::ToolExecutionDecision::Deny));
     assert_eq!(active, None);
+}
+
+/// At supervised autonomy a request that names `skills_manage` for an action
+/// with no grant-bound operation is not collected: collecting it could only end
+/// in a turn error. It takes the ordinary path, which opens no approval, runs
+/// nothing and fails no turn.
+#[tokio::test]
+async fn supervised_named_non_grant_bound_action_is_not_collected() {
+    let env = env(AutonomyLevel::Supervised, Case::Import).await;
+    let result = std::panic::AssertUnwindSafe(Box::pin(async {
+        let cancel = CancellationToken::new();
+        for (turn, action) in ["lifecycle_status", "lifecycle_list", "create", "enable"]
+            .into_iter()
+            .enumerate()
+        {
+            let (proof, _) = recorded_approval_source(
+                &env.generation,
+                Arc::clone(&env.memory),
+                &format!("Use skills_manage to run {action}"),
+                ChatMode::Edit,
+                &format!("prx_grant_plain_{turn}"),
+                20 + u64::try_from(turn).unwrap_or_default(),
+            )
+            .await;
+            let context = env
+                .service
+                .decide_agent_initial(proof.as_ref(), AgentTurnKind::Repl, &cancel)
+                .await
+                .expect("a plain action is a decision, not a turn error");
+            assert!(context.approval_collection_proof().is_none(), "{action}");
+            assert!(
+                !matches!(
+                    context.disposition().expect("test: disposition"),
+                    TurnDisposition::CollectApprovalArguments
+                ),
+                "{action}"
+            );
+            assert!(context.execution_refs().is_empty(), "{action}");
+            assert!(
+                env.service
+                    .load_pending_decision_approval(proof.owner_id(), proof.session_key(), context.decision_id())
+                    .await
+                    .is_err(),
+                "{action}: no approval was opened"
+            );
+        }
+        env.assert_untouched(Case::Import);
+    }))
+    .catch_unwind()
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let drained = tokio::time::timeout_at(deadline.into(), env.service.drain_writes(deadline)).await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(matches!(drained, Ok(true)));
 }

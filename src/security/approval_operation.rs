@@ -253,6 +253,11 @@ fn skills_manage_lifecycle_operation(
     Some((action.operation?, action.risk))
 }
 
+/// The `skills_manage` actions the tool accepts only under a grant bound to
+/// their target. A unit test pins this list to the table above.
+pub(crate) const SKILLS_MANAGE_GRANT_BOUND_ACTIONS: [&str; 3] =
+    ["lifecycle_publish", "lifecycle_rollback", "lifecycle_import_executable"];
+
 /// True when the call can only succeed with its own human approval: the tool
 /// itself demands a signed one-shot grant bound to the exact target, at every
 /// autonomy level. Execution upgrades an Allow decision to Ask for these, and
@@ -404,6 +409,24 @@ mod grant_requirement_tests {
             "shell",
             &json!({"action": "lifecycle_publish", "proposal_id": "prop-1"})
         ));
+    }
+
+    #[test]
+    fn the_published_action_list_matches_the_table() {
+        use super::SKILLS_MANAGE_GRANT_BOUND_ACTIONS;
+        for action in SKILLS_MANAGE_GRANT_BOUND_ACTIONS {
+            assert!(
+                requires_explicit_grant("skills_manage", &json!({"action": action})),
+                "{action}"
+            );
+        }
+        for action in ["lifecycle_cancel", "lifecycle_status", "create", "enable"] {
+            assert!(!SKILLS_MANAGE_GRANT_BOUND_ACTIONS.contains(&action));
+            assert!(
+                !requires_explicit_grant("skills_manage", &json!({"action": action})),
+                "{action}"
+            );
+        }
     }
 
     /// The predicate and the minted operation come from one table: every call

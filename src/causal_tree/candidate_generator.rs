@@ -256,6 +256,9 @@ impl CausalCandidateGenerator {
         } else {
             return None;
         };
+        if entry.collects_exact_call() && !entry.names_collectable_action(&folded) {
+            return None;
+        }
         let candidate = from_entry(
             CausalActionKind::UseTool,
             entry.family,
@@ -3420,5 +3423,58 @@ mod tests {
         assert!(!names_entry("write a poem about spring", write));
         assert!(!names_entry("search the docs for write", write));
         assert!(names_entry("please call mcp__prx_server__write now", write));
+    }
+
+    /// Only the built-in native `skills_manage` is collectable by name; an
+    /// entry of the same name from another source is not.
+    #[test]
+    fn only_the_built_in_skills_manage_entry_is_collectable() {
+        use crate::tools::capability::catalog::ExecutionTarget;
+        let mut sources = CatalogSources::default();
+        sources.mcp.push(McpCapabilitySpec {
+            server: "prx_server".into(),
+            tool: "write".into(),
+            state_digest: [3; 32],
+            spec: ToolSpec {
+                name: "mcp__prx_server__write".into(),
+                description: "Write remote data".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        });
+        let catalog = CapabilityCatalog::build(&[], &sources, &SurfacePolicy::default()).expect("test: catalog");
+        let view = catalog.view(&CatalogScope::default());
+        let mut builtin = view
+            .entries()
+            .iter()
+            .find(|entry| entry.public_name == "mcp__prx_server__write")
+            .map(|entry| CapabilityEntry::clone(entry))
+            .expect("test: mcp entry");
+        // The entry as the native registry publishes it.
+        builtin.public_name = "skills_manage".into();
+        builtin.root = "skills_manage".into();
+        builtin.family = CapabilityTarget::NativeTool;
+        builtin.target = ExecutionTarget::Tool("skills_manage".into());
+        builtin.op_ids = Vec::new();
+        assert!(builtin.collects_exact_call());
+        assert!(collectable_approval_entry(&builtin));
+        assert!(builtin.names_collectable_action("run lifecycle_import_executable"));
+        assert!(!builtin.names_collectable_action("run lifecycle_status"));
+
+        let mut mcp = builtin.clone();
+        mcp.family = CapabilityTarget::Mcp;
+        let mut plugin = builtin.clone();
+        plugin.root = "wasm_plugin_call".into();
+        let mut skill = builtin.clone();
+        skill.family = CapabilityTarget::Skill;
+        skill.target = ExecutionTarget::Skill {
+            name: "skills_manage".into(),
+            root: "skill_execute".into(),
+        };
+        for other in [&mcp, &plugin, &skill] {
+            assert!(!other.collects_exact_call());
+            assert!(!other.names_collectable_action("run lifecycle_import_executable"));
+        }
+        assert!(!collectable_approval_entry(&plugin));
+        assert!(!collectable_approval_entry(&skill));
     }
 }
