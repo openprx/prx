@@ -326,6 +326,17 @@ mod tests {
     }
 
     #[test]
+    fn raw_secret_array_rotation_and_growth_preserve_count_despite_a_blank() {
+        let current = tree("[gateway]\npaired_tokens = ['prx-token-a', 'prx-token-b']\n");
+        let posted = tree("[gateway]\npaired_tokens = ['', 'prx-token-c', 'prx-token-d']\n");
+        assert!(check_raw_secret_removal(&posted, Some(&current), false).is_ok());
+
+        let shrunk = tree("[gateway]\npaired_tokens = ['', 'prx-token-c']\n");
+        let error = check_raw_secret_removal(&shrunk, Some(&current), false).unwrap_err();
+        assert!(error.contains("gateway.paired_tokens[1]"), "{error}");
+    }
+
+    #[test]
     fn raw_secret_removal_guidance_is_not_scrubbed_by_substring() {
         let current = tree("api_key = 'config'\n");
         let error = check_raw_secret_removal(&tree(""), Some(&current), false).unwrap_err();

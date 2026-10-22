@@ -110,7 +110,10 @@ confirmation.
 
 Rotating a populated string-array secret (for example, replacing one paired
 token with another) does not require the clear flag. Reducing its populated
-count does. If the stored file cannot be read or parsed, replacement is refused
+count does. This compares the number of non-empty entries, not their positions:
+`['A', 'B']` to `['', 'C', 'D']` still has two populated entries and is accepted
+without clear permission. The rotation and array growth do not count as a drop;
+ordinary risk confirmation still applies. If the stored file cannot be read or parsed, replacement is refused
 unless clearing is explicitly allowed, because its secret slots cannot be
 checked. Invalid posted TOML is refused before the secret-omission check, with
 a location-only parse error.

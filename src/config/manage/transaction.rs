@@ -1247,7 +1247,8 @@ fn posted_file_trees(
         ConfigTransactionError::Invalid(anyhow::anyhow!(
             "Cannot inspect stored secrets in {filename}: the stored file cannot be read or parsed. \
              Repair it before using PUT /api/config/secrets, or explicitly permit raw-file replacement \
-             with the CLI --allow-credential-clear flag. Nothing was written."
+             with the CLI --allow-credential-clear flag or \
+             PUT /api/config/files/{filename}?allow_secret_clear=true. Nothing was written."
         ))
     };
     let current = match std::fs::read_to_string(&target) {
@@ -2239,6 +2240,10 @@ mod tests {
             for expected in ["Cannot inspect stored secrets", filename, "--allow-credential-clear"] {
                 assert!(error.contains(expected), "{error}");
             }
+            assert!(
+                error.contains(&format!("PUT /api/config/files/{filename}?allow_secret_clear=true")),
+                "{error}"
+            );
             assert!(!error.contains("prx-stored-fixture"), "{error}");
             assert_eq!(fixture.tree(), before);
             let plan = fixture
