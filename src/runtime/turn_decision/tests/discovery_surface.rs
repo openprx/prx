@@ -717,6 +717,58 @@ async fn discovered_tools_are_capped_per_turn_and_admitted_in_search_rank_order(
             ["skills_list"],
             "the first hit in search order, not alphabetically"
         );
+        // The production cap: ten per turn, counted over every admission.
+        let reference_of = |name: &str| {
+            let entry = service.catalog.entry_for_public_name(name).expect("catalog entry");
+            CapabilityRef {
+                id: entry.id.clone(),
+                fingerprint: entry.fingerprint,
+                generation: entry.generation,
+            }
+        };
+        let core = reference_of("file_read");
+        assert!(context.execution_refs().contains(&core));
+        {
+            // A core capability offered again is never counted as newly admitted.
+            context
+                .discovery_offers
+                .get_or_init(Default::default)
+                .lock()
+                .insert("file_read".to_owned(), core.clone());
+            assert_eq!(service.admit_offered_discoveries(&proof, &context, |_, _| false), 1);
+            assert!(context.discovery_admission("file_read").is_none());
+        }
+        assert_eq!(super::super::discovery::MAX_DISCOVERED_TOOLS_PER_TURN, 10);
+        {
+            let mut admissions = context.discovery_admissions.get_or_init(Default::default).lock();
+            let held = admissions.len();
+            for index in held..super::super::discovery::MAX_DISCOVERED_TOOLS_PER_TURN {
+                admissions.insert(
+                    format!("held_{index}"),
+                    super::super::discovery::DiscoveryAdmission {
+                        reference: core.clone(),
+                        requires_approval: true,
+                    },
+                );
+            }
+            assert_eq!(admissions.len(), super::super::discovery::MAX_DISCOVERED_TOOLS_PER_TURN);
+        }
+        context
+            .discovery_offers
+            .get_or_init(Default::default)
+            .lock()
+            .insert("skill_read".to_owned(), reference_of("skill_read"));
+        assert_eq!(
+            service.admit_offered_discoveries(&proof, &context, |_, _| false),
+            0,
+            "the production cap refuses an eleventh admission"
+        );
+        assert!(context.discovery_admission("skill_read").is_none());
+        // Control: the same offer passes once the cap is raised.
+        assert_eq!(
+            service.admit_offered_discoveries_up_to(&proof, &context, 11, |_, _| false),
+            1
+        );
         assert_eq!(context.execution_refs(), &original_refs);
         assert_eq!(dispatches.load(Ordering::SeqCst), 0);
         context.terminal_execution_trace();

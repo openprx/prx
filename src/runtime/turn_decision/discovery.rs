@@ -11,6 +11,8 @@ use crate::tools::ToolSpec;
 use crate::tools::capability::search::CatalogSearch;
 use crate::tools::capability::search_tool::{CapabilitySearchPort, MAX_QUERY_BYTES, MAX_SEARCH_HITS};
 pub(super) use append::DiscoveryAdmission;
+#[cfg(test)]
+pub(super) use append::MAX_DISCOVERED_TOOLS_PER_TURN;
 use std::sync::Weak;
 
 /// Offers in the order searches returned them (best rank first), so a bounded
@@ -19,7 +21,7 @@ use std::sync::Weak;
 pub(in crate::runtime::turn_decision) struct DiscoveryOffers(Vec<(String, CapabilityRef)>);
 
 impl DiscoveryOffers {
-    fn insert(&mut self, name: String, reference: CapabilityRef) {
+    pub(in crate::runtime::turn_decision) fn insert(&mut self, name: String, reference: CapabilityRef) {
         if let Some(slot) = self.0.iter_mut().find(|(existing, _)| *existing == name) {
             slot.1 = reference;
         } else {

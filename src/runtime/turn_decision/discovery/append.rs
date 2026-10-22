@@ -152,6 +152,10 @@ impl TurnDecisionService {
                     continue;
                 }
             };
+            // A core capability is already declared; it is never "newly admitted".
+            if context.execution_refs().contains(&proposal.reference) {
+                continue;
+            }
             if proposal.admission != GateOutcome::Passed || excluded(&proposal.spec.name, &proposal.root) {
                 continue;
             }
