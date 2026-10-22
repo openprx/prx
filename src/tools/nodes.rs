@@ -407,87 +407,92 @@ impl NodesTool {
 }
 
 impl NodesTool {
-    fn execution_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_requirements(
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["list", "status", "exec", "read", "write", "cancel"],
-                        "description": "Action to perform: 'list' enumerates the configured nodes, 'status' probes one, 'exec' runs a shell command, 'read' fetches a file, 'write' stores a file, 'cancel' aborts a running task."
-                    },
-                    "node": {
-                        "type": "string",
-                        "description": "Node ID; required for 'status', 'exec', 'read', 'write' and 'cancel'"
-                    },
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command; required for 'exec'"
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Timeout override in milliseconds"
-                    },
-                    "cwd": {
-                        "type": "string",
-                        "description": "Working directory for 'exec'"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "File path; required for 'read' and 'write'"
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Byte offset for 'read'"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Byte limit for 'read'"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "File content; required for 'write'"
-                    },
-                    "create_dirs": {
-                        "type": "boolean",
-                        "description": "Create parent directories for 'write'"
-                    },
-                    "task_id": {
-                        "type": "string",
-                        "description": "Task ID; required for 'cancel'"
-                    }
-                },
-                "required": ["action"]
-            }),
-            "action",
-            &[
-                crate::tools::schema::ActionRequirement {
-                    action: "status",
-                    required: &["node"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "exec",
-                    required: &["node", "command"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "read",
-                    required: &["node", "path"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "write",
-                    required: &["node", "path", "content"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "cancel",
-                    required: &["node", "task_id"],
-                },
-            ],
-        )
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_action_requirements(
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["list", "status", "exec", "read", "write", "cancel"],
+                                "description": "Action to perform: 'list' enumerates the configured nodes, 'status' probes one, 'exec' runs a shell command, 'read' fetches a file, 'write' stores a file, 'cancel' aborts a running task."
+                            },
+                            "node": {
+                                "type": "string",
+                                "description": "Node ID; required for 'status', 'exec', 'read', 'write' and 'cancel'"
+                            },
+                            "command": {
+                                "type": "string",
+                                "description": "Shell command; required for 'exec'"
+                            },
+                            "timeout_ms": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Timeout override in milliseconds"
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": "Working directory for 'exec'"
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "File path; required for 'read' and 'write'"
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Byte offset for 'read'"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Byte limit for 'read'"
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "File content; required for 'write'"
+                            },
+                            "create_dirs": {
+                                "type": "boolean",
+                                "description": "Create parent directories for 'write'"
+                            },
+                            "task_id": {
+                                "type": "string",
+                                "description": "Task ID; required for 'cancel'"
+                            }
+                        },
+                        "required": ["action"]
+                    }),
+                    "action",
+                    &[
+                        crate::tools::schema::ActionRequirement {
+                            action: "status",
+                            required: &["node"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "exec",
+                            required: &["node", "command"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "read",
+                            required: &["node", "path"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "write",
+                            required: &["node", "path", "content"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "cancel",
+                            required: &["node", "task_id"],
+                        },
+                    ],
+                )
+            })
+        });
+        &SCHEMA
     }
 }
 
@@ -519,8 +524,12 @@ impl Tool for NodesTool {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         // A transport error can quote the node URL, userinfo included
         // (`error sending request for url (...)`); the model never sees it.
         self.execute_action(args)
@@ -651,11 +660,11 @@ mod tests {
     #[tokio::test]
     async fn nodes_action_tool_contract() {
         let tool = make_tool();
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.execution_schema(),
+            tool.execution_schema(),
         );
     }
 

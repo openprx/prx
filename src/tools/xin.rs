@@ -374,198 +374,203 @@ fn parse_xin_lineage_scope(cfg: &Config, args: &serde_json::Value) -> XinLineage
 }
 
 impl XinTool {
-    fn execution_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_alternatives(
-            crate::tools::schema::with_action_requirements(
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": [
-                                "list", "get", "events", "runs", "add", "update", "remove", "pause", "resume", "cancel", "run", "status",
-                                "goal_list", "goal_get", "goal_add", "goal_pause", "goal_resume", "goal_cancel", "goal_remove",
-                                "step_list", "step_get", "step_add", "step_retry"
-                            ],
-                            "description": "Task actions: create with 'add'; inspect with \
-                                            'list'/'get'/'runs'/'events'/'status'; change with 'update'; \
-                                            control with 'pause'/'resume'/'cancel'/'run'; delete with 'remove'. \
-                                            Goal-workflow actions: 'goal_add', 'goal_list', 'goal_get', \
-                                            'goal_pause', 'goal_resume', 'goal_cancel', 'goal_remove'. \
-                                            Step actions within a goal: 'step_add', 'step_list', 'step_get', \
-                                            'step_retry'."
-                        },
-                        "task_id": {
-                            "type": "string",
-                            "description": "Task ID for 'get'/'runs'/'update'/'run'/'pause'/'resume'/'cancel'/'remove'; the Goal ID when 'events' is called on a goal."
-                        },
-                        "goal_id": {
-                            "type": "string",
-                            "description": "Goal ID for 'goal_get'/'goal_pause'/'goal_resume'/'goal_cancel'/'goal_remove'/'step_list'/'step_add'."
-                        },
-                        "step_id": {
-                            "type": "string",
-                            "description": "Step ID for 'step_get'/'step_retry'."
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Name: the task for 'add', the goal for 'goal_add', the step for 'step_add'; also one of the fields 'update' may change."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Free-text description for 'add' and 'step_add'; also one of the fields 'update' may change."
-                        },
-                        "payload": {
-                            "type": "string",
-                            "description": "Work to run — prompt for agent_session, command for shell. Required by 'add' and 'step_add'; also one of the fields 'update' may change."
-                        },
-                        "execution_mode": {
-                            "type": "string",
-                            "enum": ["agent_session", "shell"],
-                            "description": "agent_session (LLM, default) or shell (command)."
-                        },
-                        "priority": {
-                            "type": "string",
-                            "enum": ["low", "normal", "high", "critical"],
-                            "description": "Priority (default normal); also one of the fields 'update' may change."
-                        },
-                        "recurring": {
-                            "type": "boolean",
-                            "description": "Repeat the task (default false)."
-                        },
-                        "interval_secs": {
-                            "type": "integer",
-                            "description": "Repeat interval in seconds (recurring only); also one of the fields 'update' may change."
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Max run-history entries (1-50, default 20)."
-                        },
-                        "sequence": {
-                            "type": "integer",
-                            "description": "One-based step sequence for 'step_add'."
-                        },
-                        "lease_ttl_secs": {
-                            "type": "integer",
-                            "description": "Per-step lease TTL; 0 uses the execution-mode default."
-                        },
-                        "target_completion_at": {
-                            "type": "string",
-                            "description": "RFC3339 target time for 'goal_add'."
-                        },
-                        "steps": {
-                            "type": "array",
-                            "description": "Initial ordered steps for 'goal_add'.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "sequence": {"type": "integer"},
-                                    "name": {"type": "string"},
-                                    "description": {"type": "string"},
-                                    "payload": {"type": "string"},
-                                    "execution_mode": {"type": "string", "enum": ["agent_session", "shell"]},
-                                    "lease_ttl_secs": {"type": "integer"}
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_action_alternatives(
+                    crate::tools::schema::with_action_requirements(
+                        json!({
+                            "type": "object",
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "enum": [
+                                        "list", "get", "events", "runs", "add", "update", "remove", "pause", "resume", "cancel", "run", "status",
+                                        "goal_list", "goal_get", "goal_add", "goal_pause", "goal_resume", "goal_cancel", "goal_remove",
+                                        "step_list", "step_get", "step_add", "step_retry"
+                                    ],
+                                    "description": "Task actions: create with 'add'; inspect with \
+                                                    'list'/'get'/'runs'/'events'/'status'; change with 'update'; \
+                                                    control with 'pause'/'resume'/'cancel'/'run'; delete with 'remove'. \
+                                                    Goal-workflow actions: 'goal_add', 'goal_list', 'goal_get', \
+                                                    'goal_pause', 'goal_resume', 'goal_cancel', 'goal_remove'. \
+                                                    Step actions within a goal: 'step_add', 'step_list', 'step_get', \
+                                                    'step_retry'."
                                 },
-                                "required": ["name", "payload"]
-                            }
-                        }
-                    },
-                    "required": ["action"]
-                }),
-                "action",
-                &[
-                    crate::tools::schema::ActionRequirement {
-                        action: "get",
-                        required: &["task_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "events",
-                        required: &["task_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "runs",
-                        required: &["task_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "add",
-                        required: &["name", "payload"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "update",
-                        required: &["task_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "remove",
-                        required: &["task_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "pause",
-                        required: &["task_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "resume",
-                        required: &["task_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "cancel",
-                        required: &["task_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "run",
-                        required: &["task_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "goal_get",
-                        required: &["goal_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "goal_add",
-                        required: &["name"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "goal_pause",
-                        required: &["goal_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "goal_resume",
-                        required: &["goal_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "goal_cancel",
-                        required: &["goal_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "goal_remove",
-                        required: &["goal_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "step_list",
-                        required: &["goal_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "step_get",
-                        required: &["step_id"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "step_add",
-                        required: &["goal_id", "name", "payload"],
-                    },
-                    crate::tools::schema::ActionRequirement {
-                        action: "step_retry",
-                        required: &["step_id"],
-                    },
-                ],
-            ),
-            "action",
-            "update",
-            &[
-                &["task_id", "name"],
-                &["task_id", "description"],
-                &["task_id", "priority"],
-                &["task_id", "payload"],
-                &["task_id", "interval_secs"],
-            ],
-        )
+                                "task_id": {
+                                    "type": "string",
+                                    "description": "Task ID for 'get'/'runs'/'update'/'run'/'pause'/'resume'/'cancel'/'remove'; the Goal ID when 'events' is called on a goal."
+                                },
+                                "goal_id": {
+                                    "type": "string",
+                                    "description": "Goal ID for 'goal_get'/'goal_pause'/'goal_resume'/'goal_cancel'/'goal_remove'/'step_list'/'step_add'."
+                                },
+                                "step_id": {
+                                    "type": "string",
+                                    "description": "Step ID for 'step_get'/'step_retry'."
+                                },
+                                "name": {
+                                    "type": "string",
+                                    "description": "Name: the task for 'add', the goal for 'goal_add', the step for 'step_add'; also one of the fields 'update' may change."
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "Free-text description for 'add' and 'step_add'; also one of the fields 'update' may change."
+                                },
+                                "payload": {
+                                    "type": "string",
+                                    "description": "Work to run — prompt for agent_session, command for shell. Required by 'add' and 'step_add'; also one of the fields 'update' may change."
+                                },
+                                "execution_mode": {
+                                    "type": "string",
+                                    "enum": ["agent_session", "shell"],
+                                    "description": "agent_session (LLM, default) or shell (command)."
+                                },
+                                "priority": {
+                                    "type": "string",
+                                    "enum": ["low", "normal", "high", "critical"],
+                                    "description": "Priority (default normal); also one of the fields 'update' may change."
+                                },
+                                "recurring": {
+                                    "type": "boolean",
+                                    "description": "Repeat the task (default false)."
+                                },
+                                "interval_secs": {
+                                    "type": "integer",
+                                    "description": "Repeat interval in seconds (recurring only); also one of the fields 'update' may change."
+                                },
+                                "limit": {
+                                    "type": "integer",
+                                    "description": "Max run-history entries (1-50, default 20)."
+                                },
+                                "sequence": {
+                                    "type": "integer",
+                                    "description": "One-based step sequence for 'step_add'."
+                                },
+                                "lease_ttl_secs": {
+                                    "type": "integer",
+                                    "description": "Per-step lease TTL; 0 uses the execution-mode default."
+                                },
+                                "target_completion_at": {
+                                    "type": "string",
+                                    "description": "RFC3339 target time for 'goal_add'."
+                                },
+                                "steps": {
+                                    "type": "array",
+                                    "description": "Initial ordered steps for 'goal_add'.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "sequence": {"type": "integer"},
+                                            "name": {"type": "string"},
+                                            "description": {"type": "string"},
+                                            "payload": {"type": "string"},
+                                            "execution_mode": {"type": "string", "enum": ["agent_session", "shell"]},
+                                            "lease_ttl_secs": {"type": "integer"}
+                                        },
+                                        "required": ["name", "payload"]
+                                    }
+                                }
+                            },
+                            "required": ["action"]
+                        }),
+                        "action",
+                        &[
+                            crate::tools::schema::ActionRequirement {
+                                action: "get",
+                                required: &["task_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "events",
+                                required: &["task_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "runs",
+                                required: &["task_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "add",
+                                required: &["name", "payload"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "update",
+                                required: &["task_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "remove",
+                                required: &["task_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "pause",
+                                required: &["task_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "resume",
+                                required: &["task_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "cancel",
+                                required: &["task_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "run",
+                                required: &["task_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "goal_get",
+                                required: &["goal_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "goal_add",
+                                required: &["name"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "goal_pause",
+                                required: &["goal_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "goal_resume",
+                                required: &["goal_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "goal_cancel",
+                                required: &["goal_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "goal_remove",
+                                required: &["goal_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "step_list",
+                                required: &["goal_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "step_get",
+                                required: &["step_id"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "step_add",
+                                required: &["goal_id", "name", "payload"],
+                            },
+                            crate::tools::schema::ActionRequirement {
+                                action: "step_retry",
+                                required: &["step_id"],
+                            },
+                        ],
+                    ),
+                    "action",
+                    "update",
+                    &[
+                        &["task_id", "name"],
+                        &["task_id", "description"],
+                        &["task_id", "priority"],
+                        &["task_id", "payload"],
+                        &["task_id", "interval_secs"],
+                    ],
+                )
+            })
+        });
+        &SCHEMA
     }
 }
 
@@ -587,8 +592,12 @@ impl Tool for XinTool {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let cfg = self.config.load_full();
         let action = match args.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
@@ -1419,11 +1428,11 @@ mod tests {
         let config = Config::default();
         let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         let tool = XinTool::new(new_shared(config), security);
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             "xin",
             tool.description(),
-            &tool.execution_schema(),
+            tool.execution_schema(),
         );
     }
 
@@ -1435,16 +1444,16 @@ mod tests {
         let schema = tool.execution_schema();
 
         assert!(
-            !validate_tool_arguments(&schema, &json!({"action": "update"})).is_empty(),
+            !validate_tool_arguments(schema, &json!({"action": "update"})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
-            !validate_tool_arguments(&schema, &json!({"action": "update", "task_id": "task-1"})).is_empty(),
+            !validate_tool_arguments(schema, &json!({"action": "update", "task_id": "task-1"})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
             validate_tool_arguments(
-                &schema,
+                schema,
                 &json!({"action": "update", "task_id": "task-1", "priority": "high"})
             )
             .is_empty(),

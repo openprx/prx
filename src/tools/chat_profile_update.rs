@@ -103,32 +103,37 @@ fn parse_tags(args: &serde_json::Value, notices: &mut Vec<String>) -> anyhow::Re
 }
 
 impl ChatProfileUpdateTool {
-    fn execution_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_required_alternatives(
-            json!({
-                "type": "object",
-                "properties": {
-                    "purpose": {
-                        "type": "string",
-                        "maxLength": PURPOSE_MAX_CHARS,
-                        "description": "What the current conversation is for. Max 300 characters."
-                    },
-                    "notes": {
-                        "type": "string",
-                        "maxLength": NOTES_MAX_CHARS,
-                        "description": "Brief operational notes about the current conversation. Max 1024 characters."
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "maxItems": TAGS_MAX,
-                        "description": "Up to 10 short tags for the current conversation."
-                    }
-                },
-                "additionalProperties": false
-            }),
-            &[&["purpose"], &["notes"], &["tags"]],
-        )
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_required_alternatives(
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "purpose": {
+                                "type": "string",
+                                "maxLength": PURPOSE_MAX_CHARS,
+                                "description": "What the current conversation is for. Max 300 characters."
+                            },
+                            "notes": {
+                                "type": "string",
+                                "maxLength": NOTES_MAX_CHARS,
+                                "description": "Brief operational notes about the current conversation. Max 1024 characters."
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "maxItems": TAGS_MAX,
+                                "description": "Up to 10 short tags for the current conversation."
+                            }
+                        },
+                        "additionalProperties": false
+                    }),
+                    &[&["purpose"], &["notes"], &["tags"]],
+                )
+            })
+        });
+        &SCHEMA
     }
 }
 
@@ -139,15 +144,22 @@ impl Tool for ChatProfileUpdateTool {
     }
 
     fn description(&self) -> &str {
-        "Record what this group or direct chat is for: its purpose, useful notes, and short tags. Provide only purpose/notes/tags; the target conversation is determined automatically. Prefer this over general memory tools for conversation purpose, notes, and tags."
+        "Record what this group or direct chat is for: its purpose, useful notes, and short tags. Provide at least one of purpose, notes, or tags; provide only these fields; the target conversation is determined automatically. Prefer this over general memory tools for conversation purpose, notes, and tags."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
+        // Gemini removes additionalProperties and bounds, so its service calls
+        // still reach the target and truncation checks. Required alternatives
+        // survive lowering; schema validation already rejects an empty update.
         if args.get("channel").is_some() || args.get("chat_id").is_some() {
             return Ok(ToolResult {
                 success: false,
@@ -194,14 +206,6 @@ impl Tool for ChatProfileUpdateTool {
                 });
             }
         };
-
-        if purpose.is_none() && notes.is_none() && tags.is_none() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Provide at least one of purpose, notes, or tags".into()),
-            });
-        }
 
         let target_ref = format!("{channel}:{chat_id}");
         let operation_name = op_id::op_id(self.name(), "update", &[&target_ref]);
@@ -300,11 +304,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let tool = ChatProfileUpdateTool::new(memory, Arc::new(SecurityPolicy::default()));
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         let schema = tool.execution_schema();
 
         assert!(
-            !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
+            !crate::tools::schema::validate_tool_arguments(schema, &json!({})).is_empty(),
             "expected a non-empty value"
         );
         for arguments in [
@@ -313,7 +317,7 @@ mod tests {
             json!({"tags": ["tag"]}),
         ] {
             assert!(
-                crate::tools::schema::validate_tool_arguments(&schema, &arguments).is_empty(),
+                crate::tools::schema::validate_tool_arguments(schema, &arguments).is_empty(),
                 "expected an empty value"
             );
         }
@@ -353,6 +357,56 @@ mod tests {
             0,
             "chat profiles must not write memories table"
         );
+    }
+
+    #[tokio::test]
+    async fn gemini_keeps_required_fields_target_hint_and_tag_clamp() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let tool = ChatProfileUpdateTool::new(memory.clone(), Arc::new(SecurityPolicy::default()));
+        crate::tools::schema::with_execution_contract(
+            tool.execution_parameters_schema(),
+            crate::tools::schema::ToolSchemaDialect::Gemini,
+            async {
+                let mut args = approved_args("telegram", "group-a", "group");
+                let empty = tool.execute(args.clone()).await.unwrap_err();
+                let typed = empty.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+                assert!(
+                    typed
+                        .issues
+                        .iter()
+                        .any(|issue| issue.path == "$" && issue.message.contains("required-field set"))
+                );
+                assert!(
+                    tool.description()
+                        .contains("Provide at least one of purpose, notes, or tags")
+                );
+                insert_arg(&mut args, "channel", json!("telegram"));
+                insert_arg(&mut args, "chat_id", json!("group-b"));
+                insert_arg(&mut args, "purpose", json!("wrong target"));
+                let target = tool.execute(args).await.unwrap();
+                assert!(!target.success);
+                assert_eq!(
+                    target.error.as_deref(),
+                    Some("chat_profile_update target is determined automatically; do not provide channel or chat_id")
+                );
+                assert!(memory.get_chat_profile("telegram", "group-a").await.unwrap().is_none());
+                assert!(memory.get_chat_profile("telegram", "group-b").await.unwrap().is_none());
+                let mut args = approved_args("telegram", "group-a", "group");
+                insert_arg(
+                    &mut args,
+                    "tags",
+                    json!(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"]),
+                );
+                let result = tool.execute(args).await.unwrap();
+                assert!(result.success, "{result:?}");
+                assert!(result.output.contains("tags truncated to 10 items"));
+                let profile = memory.get_chat_profile("telegram", "group-a").await.unwrap().unwrap();
+                assert_eq!(profile.tags, vec!["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+                assert_eq!(memory.count().await.unwrap(), 0);
+            },
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -1060,8 +1060,12 @@ model is added.
 Native Anthropic (including its aliases) and OpenRouter `anthropic/*` models
 apply `no_root_combinators` to tool schemas. OpenRouter resolves this by model
 identity through the catalog; other hosted model families retain their dialect.
-Built-in tools publish flat schemas and enforce conditional requirements at
-execution. An external/MCP schema with a root conditional or alternative that
+Claude through other gateways needs an explicit `[[providers.tool_dialects]]`
+declaration for that provider/model with `tool_schema = "no_root_combinators"`;
+the gateway URL does not imply the dialect. Built-in tools publish flat schemas
+and validate their full conditional contract before approval, using the selected
+dialect's existing lowering rules. Direct calls without a dialect enforce the
+full original contract. An external/MCP schema with a root conditional or alternative that
 cannot be lowered losslessly fails locally before streaming or non-streaming
 transport. The error names the tool and how to republish or exclude it through
 `[tool_tiering]`. An upstream OpenRouter root-schema rejection also carries a

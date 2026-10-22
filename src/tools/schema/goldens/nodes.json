@@ -1,0 +1,161 @@
+{
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "status"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "node"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "exec"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "node",
+          "command"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "read"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "node",
+          "path"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "write"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "node",
+          "path",
+          "content"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "cancel"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "node",
+          "task_id"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "description": "Action to perform: 'list' enumerates the configured nodes, 'status' probes one, 'exec' runs a shell command, 'read' fetches a file, 'write' stores a file, 'cancel' aborts a running task.",
+      "enum": [
+        "list",
+        "status",
+        "exec",
+        "read",
+        "write",
+        "cancel"
+      ],
+      "type": "string"
+    },
+    "command": {
+      "description": "Shell command; required for 'exec'",
+      "minLength": 1,
+      "type": "string"
+    },
+    "content": {
+      "description": "File content; required for 'write'",
+      "minLength": 1,
+      "type": "string"
+    },
+    "create_dirs": {
+      "description": "Create parent directories for 'write'",
+      "type": "boolean"
+    },
+    "cwd": {
+      "description": "Working directory for 'exec'",
+      "type": "string"
+    },
+    "limit": {
+      "description": "Byte limit for 'read'",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "node": {
+      "description": "Node ID; required for 'status', 'exec', 'read', 'write' and 'cancel'",
+      "minLength": 1,
+      "type": "string"
+    },
+    "offset": {
+      "description": "Byte offset for 'read'",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "path": {
+      "description": "File path; required for 'read' and 'write'",
+      "minLength": 1,
+      "type": "string"
+    },
+    "task_id": {
+      "description": "Task ID; required for 'cancel'",
+      "minLength": 1,
+      "type": "string"
+    },
+    "timeout_ms": {
+      "description": "Timeout override in milliseconds",
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "action"
+  ],
+  "type": "object"
+}

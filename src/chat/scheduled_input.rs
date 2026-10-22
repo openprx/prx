@@ -204,54 +204,59 @@ impl ScheduledInputTool {
 }
 
 impl ScheduledInputTool {
-    fn execution_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_requirements(
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["schedule", "list", "cancel"],
-                        "description": "'schedule' creates a future main-session wake-up; 'list' shows pending, delivered and cancelled wake-ups; 'cancel' aborts a pending wake-up."
-                    },
-                    "message": {
-                        "type": "string",
-                        "description": "Message to inject into the main chat session when the wake-up fires; required for 'schedule'."
-                    },
-                    "delay_seconds": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_DELAY_SECONDS,
-                        "default": DEFAULT_DELAY_SECONDS,
-                        "description": "Delay before injecting the message for 'schedule'. Defaults to 60 seconds."
-                    },
-                    "priority": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "When true, 'schedule' injects the wake-up as a priority /now message."
-                    },
-                    "id": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Wake-up id; required for 'cancel' and reported by 'list'."
-                    }
-                }
-                ,
-                "required": ["action"]
-            }),
-            "action",
-            &[
-                crate::tools::schema::ActionRequirement {
-                    action: "schedule",
-                    required: &["message"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "cancel",
-                    required: &["id"],
-                },
-            ],
-        )
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_action_requirements(
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["schedule", "list", "cancel"],
+                                "description": "'schedule' creates a future main-session wake-up; 'list' shows pending, delivered and cancelled wake-ups; 'cancel' aborts a pending wake-up."
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": "Message to inject into the main chat session when the wake-up fires; required for 'schedule'."
+                            },
+                            "delay_seconds": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": MAX_DELAY_SECONDS,
+                                "default": DEFAULT_DELAY_SECONDS,
+                                "description": "Delay before injecting the message for 'schedule'. Defaults to 60 seconds."
+                            },
+                            "priority": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "When true, 'schedule' injects the wake-up as a priority /now message."
+                            },
+                            "id": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Wake-up id; required for 'cancel' and reported by 'list'."
+                            }
+                        }
+                        ,
+                        "required": ["action"]
+                    }),
+                    "action",
+                    &[
+                        crate::tools::schema::ActionRequirement {
+                            action: "schedule",
+                            required: &["message"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "cancel",
+                            required: &["id"],
+                        },
+                    ],
+                )
+            })
+        });
+        &SCHEMA
     }
 }
 
@@ -269,12 +274,16 @@ impl Tool for ScheduledInputTool {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     fn process_worker_compatible(&self) -> bool {
         false
     }
 
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let action = args
             .get("action")
             .and_then(|value| value.as_str())
@@ -368,11 +377,11 @@ mod tests {
     #[tokio::test]
     async fn chat_schedule_action_tool_contract() {
         let tool = ScheduledInputTool::new(ScheduledInputHandle::default());
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.execution_schema(),
+            tool.execution_schema(),
         );
     }
 
@@ -382,27 +391,27 @@ mod tests {
         let schema = tool.execution_schema();
 
         assert!(
-            !validate_tool_arguments(&schema, &json!({})).is_empty(),
+            !validate_tool_arguments(schema, &json!({})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
-            !validate_tool_arguments(&schema, &json!({"action": "schedule"})).is_empty(),
+            !validate_tool_arguments(schema, &json!({"action": "schedule"})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
-            !validate_tool_arguments(&schema, &json!({"action": "cancel"})).is_empty(),
+            !validate_tool_arguments(schema, &json!({"action": "cancel"})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
-            validate_tool_arguments(&schema, &json!({"action": "schedule", "message": "wake"})).is_empty(),
+            validate_tool_arguments(schema, &json!({"action": "schedule", "message": "wake"})).is_empty(),
             "expected an empty value"
         );
         assert!(
-            validate_tool_arguments(&schema, &json!({"action": "cancel", "id": 1})).is_empty(),
+            validate_tool_arguments(schema, &json!({"action": "cancel", "id": 1})).is_empty(),
             "expected an empty value"
         );
         assert!(
-            validate_tool_arguments(&schema, &json!({"action": "list"})).is_empty(),
+            validate_tool_arguments(schema, &json!({"action": "list"})).is_empty(),
             "expected an empty value"
         );
     }

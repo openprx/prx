@@ -579,57 +579,62 @@ impl ComposioTool {
 }
 
 impl ComposioTool {
-    fn execution_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_alternatives(
-            crate::tools::schema::with_action_alternatives(
-                json!({
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "description": "The operation: 'list' (list available actions), 'list_accounts'/'connected_accounts' (list connected accounts), 'execute' (run an action), or 'connect' (get OAuth URL)",
-                            "enum": ["list", "list_accounts", "connected_accounts", "execute", "connect"]
-                        },
-                        "app": {
-                            "type": "string",
-                            "description": "Toolkit slug filter for 'list' or 'list_accounts', optional app hint for 'execute', or toolkit/app for 'connect' (e.g. 'gmail', 'notion', 'github')"
-                        },
-                        "action_name": {
-                            "type": "string",
-                            "description": "Action/tool identifier for 'execute' (legacy aliases supported)"
-                        },
-                        "tool_slug": {
-                            "type": "string",
-                            "description": "Preferred v3 tool slug for 'execute' (alias of action_name)"
-                        },
-                        "params": {
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_action_alternatives(
+                    crate::tools::schema::with_action_alternatives(
+                        json!({
                             "type": "object",
-                            "description": "Parameters to pass to the action"
-                        },
-                        "entity_id": {
-                            "type": "string",
-                            "description": "Entity/user ID for multi-user setups (defaults to composio.entity_id from config)"
-                        },
-                        "auth_config_id": {
-                            "type": "string",
-                            "description": "Optional Composio v3 auth config id for the 'connect' flow"
-                        },
-                        "connected_account_id": {
-                            "type": "string",
-                            "description": "Optional connected account ID for execute flow when a specific account is required"
-                        }
-                    },
-                    "required": ["action"]
-                }),
-                "action",
-                "connect",
-                &[&["app"], &["auth_config_id"]],
-            ),
-            "action",
-            "execute",
-            &[&["tool_slug"], &["action_name"]],
-        )
+                            "additionalProperties": false,
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "description": "The operation: 'list' (list available actions), 'list_accounts'/'connected_accounts' (list connected accounts), 'execute' (run an action), or 'connect' (get OAuth URL)",
+                                    "enum": ["list", "list_accounts", "connected_accounts", "execute", "connect"]
+                                },
+                                "app": {
+                                    "type": "string",
+                                    "description": "Toolkit slug filter for 'list' or 'list_accounts', optional app hint for 'execute', or toolkit/app for 'connect' (e.g. 'gmail', 'notion', 'github')"
+                                },
+                                "action_name": {
+                                    "type": "string",
+                                    "description": "Action/tool identifier for 'execute' (legacy aliases supported)"
+                                },
+                                "tool_slug": {
+                                    "type": "string",
+                                    "description": "Preferred v3 tool slug for 'execute' (alias of action_name)"
+                                },
+                                "params": {
+                                    "type": "object",
+                                    "description": "Parameters to pass to the action"
+                                },
+                                "entity_id": {
+                                    "type": "string",
+                                    "description": "Entity/user ID for multi-user setups (defaults to composio.entity_id from config)"
+                                },
+                                "auth_config_id": {
+                                    "type": "string",
+                                    "description": "Optional Composio v3 auth config id for the 'connect' flow"
+                                },
+                                "connected_account_id": {
+                                    "type": "string",
+                                    "description": "Optional connected account ID for execute flow when a specific account is required"
+                                }
+                            },
+                            "required": ["action"]
+                        }),
+                        "action",
+                        "connect",
+                        &[&["app"], &["auth_config_id"]],
+                    ),
+                    "action",
+                    "execute",
+                    &[&["tool_slug"], &["action_name"]],
+                )
+            })
+        });
+        &SCHEMA
     }
 }
 
@@ -651,8 +656,12 @@ impl Tool for ComposioTool {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -1198,11 +1207,11 @@ mod tests {
     #[tokio::test]
     async fn composio_action_tool_contract() {
         let tool = ComposioTool::new("test-key", None, test_security());
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.execution_schema(),
+            tool.execution_schema(),
         );
     }
 
@@ -1254,24 +1263,24 @@ mod tests {
         assert!(required.contains(&json!("action")));
         assert!(
             crate::tools::schema::validate_tool_arguments(
-                &schema,
+                schema,
                 &json!({"action": "execute", "action_name": "legacy"})
             )
             .is_empty(),
             "expected an empty value"
         );
         assert!(
-            !crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "connect"})).is_empty(),
+            !crate::tools::schema::validate_tool_arguments(schema, &json!({"action": "connect"})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
-            crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "connect", "app": "github"}))
+            crate::tools::schema::validate_tool_arguments(schema, &json!({"action": "connect", "app": "github"}))
                 .is_empty(),
             "expected an empty value"
         );
         assert!(
             crate::tools::schema::validate_tool_arguments(
-                &schema,
+                schema,
                 &json!({"action": "connect", "auth_config_id": "config"})
             )
             .is_empty(),

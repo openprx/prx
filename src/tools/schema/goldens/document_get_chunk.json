@@ -1,0 +1,28 @@
+{
+  "additionalProperties": false,
+  "anyOf": [
+    {
+      "required": [
+        "chunk_id"
+      ]
+    },
+    {
+      "required": [
+        "chunkId"
+      ]
+    }
+  ],
+  "properties": {
+    "chunkId": {
+      "description": "Alias of chunk_id",
+      "minLength": 1,
+      "type": "string"
+    },
+    "chunk_id": {
+      "description": "Stable document chunk id returned by document_search",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

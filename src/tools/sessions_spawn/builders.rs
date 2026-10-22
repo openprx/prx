@@ -124,6 +124,7 @@ impl SessionsSpawnTool {
             hint_config: None,
             default_route_source: None,
             agents: Arc::new(agents),
+            execution_schema: std::sync::OnceLock::new(),
             fallback_api_key,
             cost_config: crate::config::schema::CostConfig::default(),
             memory: None,

@@ -498,6 +498,7 @@ fn a_scheduled_scope_carries_the_configured_policy_for_its_creator() {
         backend_name: name.to_string(),
         description: String::new(),
         parameters: serde_json::json!({"type": "object"}),
+        execution_parameters: None,
         tier: ToolTier::Standard,
         categories: Vec::new(),
         effect: ToolEffect::Act,

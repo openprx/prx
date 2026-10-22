@@ -83,31 +83,36 @@ impl ImageTool {
 }
 
 impl ImageTool {
-    fn execution_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_required_alternatives(
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "image": {
-                        "type": "string",
-                        "description": "Path to a local image file or an HTTPS URL. Supports jpg, png, gif, webp."
-                    },
-                    "images": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 1,
-                        "maxItems": 20,
-                        "description": "Multiple image paths or URLs (up to 20)."
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "What to analyze or ask about the image(s). Defaults to 'Describe this image in detail.'"
-                    }
-                },
-            }),
-            &[&["image"], &["images"]],
-        )
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_required_alternatives(
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "image": {
+                                "type": "string",
+                                "description": "Path to a local image file or an HTTPS URL. Supports jpg, png, gif, webp."
+                            },
+                            "images": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "minItems": 1,
+                                "maxItems": 20,
+                                "description": "Multiple image paths or URLs (up to 20)."
+                            },
+                            "prompt": {
+                                "type": "string",
+                                "description": "What to analyze or ask about the image(s). Defaults to 'Describe this image in detail.'"
+                            }
+                        },
+                    }),
+                    &[&["image"], &["images"]],
+                )
+            })
+        });
+        &SCHEMA
     }
 }
 
@@ -118,7 +123,7 @@ impl Tool for ImageTool {
     }
 
     fn description(&self) -> &str {
-        "Analyze one or more images with a vision model. \
+        "Analyze one or more images with a vision model. Provide at least one of image or images. \
          Accepts local file paths or HTTPS URLs. Supports asking questions about image content, \
          describing scenes, reading text (OCR), identifying objects, and visual reasoning. \
          Only use this tool when images are NOT already provided in the current message."
@@ -128,8 +133,12 @@ impl Tool for ImageTool {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let (provider, model, temperature, capabilities) = if let Some(resolver) = &self.pinned_provider_resolver {
             let generation_id = crate::tools::execution::current_child_call_context()
                 .and_then(|caller| caller.context().envelope.config_generation_id)
@@ -410,21 +419,21 @@ mod tests {
             has_vision: true,
         });
         let tool = make_tool(p);
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         let schema = tool.execution_schema();
         assert!(schema["properties"]["image"].is_object());
         assert!(schema["properties"]["images"].is_object());
         assert!(schema["properties"]["prompt"].is_object());
         assert!(
-            !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
+            !crate::tools::schema::validate_tool_arguments(schema, &json!({})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
-            crate::tools::schema::validate_tool_arguments(&schema, &json!({"image": "image.png"})).is_empty(),
+            crate::tools::schema::validate_tool_arguments(schema, &json!({"image": "image.png"})).is_empty(),
             "expected an empty value"
         );
         assert!(
-            crate::tools::schema::validate_tool_arguments(&schema, &json!({"images": ["image.png"]})).is_empty(),
+            crate::tools::schema::validate_tool_arguments(schema, &json!({"images": ["image.png"]})).is_empty(),
             "expected an empty value"
         );
     }

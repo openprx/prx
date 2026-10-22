@@ -685,6 +685,7 @@ fn with_spawn_grant(mut args: serde_json::Value) -> serde_json::Value {
 /// channels, batch rosters, and child registry.
 fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
     SessionsSpawnTool {
+        execution_schema: std::sync::OnceLock::new(),
         channel: Arc::clone(&tool.channel),
         test_worker_executable: tool.test_worker_executable.clone(),
         channels: Arc::clone(&tool.channels),

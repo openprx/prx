@@ -387,60 +387,65 @@ impl ProxyConfigTool {
 }
 
 impl ProxyConfigTool {
-    fn execution_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["get", "set", "list_services", "apply_env", "clear_env"],
-                    "default": "get",
-                    "description": "Action to perform: 'get' reads the effective proxy settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, 'clear_env' removes it. Defaults to 'get'."
-                },
-                "scope": {
-                    "type": "string",
-                    "enum": ["environment", "env", "prx", "internal", "core", "services", "service"],
-                    "description": "Proxy scope. Canonical values: environment, prx, services."
-                },
-                "http_proxy": {
-                    "type": "string",
-                    "description": "HTTP proxy URL"
-                },
-                "https_proxy": {
-                    "type": "string",
-                    "description": "HTTPS proxy URL"
-                },
-                "all_proxy": {
-                    "type": "string",
-                    "description": "Fallback proxy URL for all protocols"
-                },
-                "no_proxy": {
-                    "description": "Comma-separated string or array of NO_PROXY entries",
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
-                },
-                "services": {
-                    "description": "Comma-separated string or array of service selectors; required when 'set' targets scope=services",
-                    "oneOf": [
-                        {"type": "string", "minLength": 1},
-                        {"type": "array", "items": {"type": "string"}, "minItems": 1}
-                    ]
-                }
-            },
-            "allOf": [{
-                "if": {
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
                     "properties": {
-                        "action": {"const": "set"},
-                        "scope": {"enum": ["services", "service"]}
+                        "action": {
+                            "type": "string",
+                            "enum": ["get", "set", "list_services", "apply_env", "clear_env"],
+                            "default": "get",
+                            "description": "Action to perform: 'get' reads the effective proxy settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, 'clear_env' removes it. Defaults to 'get'."
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["environment", "env", "prx", "internal", "core", "services", "service"],
+                            "description": "Proxy scope. Canonical values: environment, prx, services."
+                        },
+                        "http_proxy": {
+                            "type": "string",
+                            "description": "HTTP proxy URL"
+                        },
+                        "https_proxy": {
+                            "type": "string",
+                            "description": "HTTPS proxy URL"
+                        },
+                        "all_proxy": {
+                            "type": "string",
+                            "description": "Fallback proxy URL for all protocols"
+                        },
+                        "no_proxy": {
+                            "description": "Comma-separated string or array of NO_PROXY entries",
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}}
+                            ]
+                        },
+                        "services": {
+                            "description": "Comma-separated string or array of service selectors; required when 'set' targets scope=services",
+                            "oneOf": [
+                                {"type": "string", "minLength": 1},
+                                {"type": "array", "items": {"type": "string"}, "minItems": 1}
+                            ]
+                        }
                     },
-                    "required": ["action", "scope"]
-                },
-                "then": {"required": ["services"]}
-            }]
-        })
+                    "allOf": [{
+                        "if": {
+                            "properties": {
+                                "action": {"const": "set"},
+                                "scope": {"enum": ["services", "service"]}
+                            },
+                            "required": ["action", "scope"]
+                        },
+                        "then": {"required": ["services"]}
+                    }]
+                })
+            })
+        });
+        &SCHEMA
     }
 }
 
@@ -458,8 +463,12 @@ impl Tool for ProxyConfigTool {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     async fn execute(&self, mut args: Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let action = args
             .get("action")
             .and_then(Value::as_str)
@@ -585,11 +594,11 @@ mod tests {
     #[tokio::test]
     async fn proxy_config_action_tool_contract() {
         let tool = ProxyConfigTool::new(crate::config::new_shared(Config::default()), test_security());
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.execution_schema(),
+            tool.execution_schema(),
         );
     }
 
@@ -623,7 +632,8 @@ mod tests {
         let typed = result
             .downcast_ref::<crate::tools::schema::ToolArgumentError>()
             .unwrap();
-        assert!(!typed.issues.is_empty(), "invalid input must carry a validation issue");
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.services"));
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.enabled"));
         assert_eq!(fs::read(&tool.config.load().config_path).unwrap(), before);
         let valid = tool
             .execute(json!({
@@ -643,13 +653,13 @@ mod tests {
 
         for scope in ["services", "service"] {
             assert!(
-                !crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "set", "scope": scope}))
+                !crate::tools::schema::validate_tool_arguments(schema, &json!({"action": "set", "scope": scope}))
                     .is_empty(),
                 "expected a non-empty value"
             );
             assert!(
                 crate::tools::schema::validate_tool_arguments(
-                    &schema,
+                    schema,
                     &json!({"action": "set", "scope": scope, "services": ["provider.openai"]})
                 )
                 .is_empty(),

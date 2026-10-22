@@ -477,6 +477,7 @@ pub(crate) const LIFECYCLE_OPERATOR_ONLY: [&str; 8] = [
 ];
 
 pub struct SkillsManageTool {
+    execution_schema: std::sync::OnceLock<Arc<serde_json::Value>>,
     workspace_dir: PathBuf,
     config: Config,
     security: Arc<SecurityPolicy>,
@@ -492,6 +493,7 @@ impl SkillsManageTool {
             config,
             security,
             lifecycle: None,
+            execution_schema: std::sync::OnceLock::new(),
         }
     }
 
@@ -517,6 +519,7 @@ impl SkillsManageTool {
     #[must_use]
     pub fn with_lifecycle(mut self, service: Arc<crate::skills::lifecycle::SkillsLifecycleService>) -> Self {
         self.lifecycle = Some(service);
+        self.execution_schema.take();
         self
     }
 
@@ -784,99 +787,103 @@ impl SkillsManageTool {
 }
 
 impl SkillsManageTool {
-    fn execution_schema(&self) -> serde_json::Value {
-        let mut actions = vec![
-            "create", "install", "update", "enable", "disable", "validate", "sync", "remove",
-        ];
-        let lifecycle = self.lifecycle_actions();
-        actions.extend(lifecycle.iter().copied());
-        let mut action_description = "Skill action: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, 'remove' deletes one".to_string();
-        if !lifecycle.is_empty() {
-            action_description.push_str(", 'lifecycle_status' reports the lifecycle mode and proposal counts, 'lifecycle_list' lists proposals, 'lifecycle_inspect' shows one proposal, 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes a proposal, 'lifecycle_rollback' re-activates an earlier revision, 'lifecycle_import_executable' publishes a reviewed executable bundle");
-        }
-        let mut schema = json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": actions,
-                    "description": action_description
-                },
-                "name": {"type": "string", "description": "Workspace skill name; required for 'create', 'update', 'enable', 'disable', 'validate' and 'remove'"},
-                "source": {"type": "string", "description": "Git URL or explicit local directory; required for 'install'. For 'lifecycle_import_executable', the directory of the reviewed executable bundle"},
-                "description": {"type": "string", "description": "Short description of the skill; required for 'create'"},
-                "instructions": {"type": "string", "description": "SKILL.md instructions; required for 'create'"}
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        });
-        if !lifecycle.is_empty()
-            && let Some(properties) = schema.get_mut("properties").and_then(serde_json::Value::as_object_mut)
-        {
-            properties.insert("proposal_id".to_string(), json!({"type": "string", "description": "Lifecycle proposal id; required for 'lifecycle_inspect', 'lifecycle_publish' and 'lifecycle_cancel'"}));
-            properties.insert("skill_id".to_string(), json!({"type": "string", "description": "Lifecycle skill id; optional filter for 'lifecycle_list', required for 'lifecycle_rollback'"}));
-            properties.insert("revision_id".to_string(), json!({"type": "string", "description": "An earlier published revision id, required for 'lifecycle_rollback'; for 'lifecycle_import_executable' the complete bundle hash the operator reviewed"}));
-            properties.insert("expected_generation".to_string(), json!({"type": "integer", "minimum": 0, "description": "Active generation the caller observed; required for 'lifecycle_rollback'"}));
-            properties.insert(
+    fn execution_schema(&self) -> &std::sync::Arc<serde_json::Value> {
+        self.execution_schema.get_or_init(|| {
+            std::sync::Arc::new({
+                let mut actions = vec![
+                    "create", "install", "update", "enable", "disable", "validate", "sync", "remove",
+                ];
+                let lifecycle = self.lifecycle_actions();
+                actions.extend(lifecycle.iter().copied());
+                let mut action_description = "Skill action: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, 'remove' deletes one".to_string();
+                if !lifecycle.is_empty() {
+                    action_description.push_str(", 'lifecycle_status' reports the lifecycle mode and proposal counts, 'lifecycle_list' lists proposals, 'lifecycle_inspect' shows one proposal, 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes a proposal, 'lifecycle_rollback' re-activates an earlier revision, 'lifecycle_import_executable' publishes a reviewed executable bundle");
+                }
+                let mut schema = json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": actions,
+                            "description": action_description
+                        },
+                        "name": {"type": "string", "description": "Workspace skill name; required for 'create', 'update', 'enable', 'disable', 'validate' and 'remove'"},
+                        "source": {"type": "string", "description": "Git URL or explicit local directory; required for 'install'. For 'lifecycle_import_executable', the directory of the reviewed executable bundle"},
+                        "description": {"type": "string", "description": "Short description of the skill; required for 'create'"},
+                        "instructions": {"type": "string", "description": "SKILL.md instructions; required for 'create'"}
+                    },
+                    "required": ["action"],
+                    "additionalProperties": false
+                });
+                if !lifecycle.is_empty()
+                    && let Some(properties) = schema.get_mut("properties").and_then(serde_json::Value::as_object_mut)
+                {
+                    properties.insert("proposal_id".to_string(), json!({"type": "string", "description": "Lifecycle proposal id; required for 'lifecycle_inspect', 'lifecycle_publish' and 'lifecycle_cancel'"}));
+                    properties.insert("skill_id".to_string(), json!({"type": "string", "description": "Lifecycle skill id; optional filter for 'lifecycle_list', required for 'lifecycle_rollback'"}));
+                    properties.insert("revision_id".to_string(), json!({"type": "string", "description": "An earlier published revision id, required for 'lifecycle_rollback'; for 'lifecycle_import_executable' the complete bundle hash the operator reviewed"}));
+                    properties.insert("expected_generation".to_string(), json!({"type": "integer", "minimum": 0, "description": "Active generation the caller observed; required for 'lifecycle_rollback'"}));
+                    properties.insert(
                 "reason".to_string(),
                 json!({"type": "string", "description": "Why the proposal is closed; optional for 'lifecycle_cancel'"}),
             );
-        }
-        let mut requirements = vec![
-            crate::tools::schema::ActionRequirement {
-                action: "create",
-                required: &["name", "description", "instructions"],
-            },
-            crate::tools::schema::ActionRequirement {
-                action: "install",
-                required: &["source"],
-            },
-            crate::tools::schema::ActionRequirement {
-                action: "update",
-                required: &["name"],
-            },
-            crate::tools::schema::ActionRequirement {
-                action: "enable",
-                required: &["name"],
-            },
-            crate::tools::schema::ActionRequirement {
-                action: "disable",
-                required: &["name"],
-            },
-            crate::tools::schema::ActionRequirement {
-                action: "validate",
-                required: &["name"],
-            },
-            crate::tools::schema::ActionRequirement {
-                action: "remove",
-                required: &["name"],
-            },
-        ];
-        if !lifecycle.is_empty() {
-            requirements.extend([
-                crate::tools::schema::ActionRequirement {
-                    action: "lifecycle_inspect",
-                    required: &["proposal_id"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "lifecycle_publish",
-                    required: &["proposal_id"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "lifecycle_cancel",
-                    required: &["proposal_id"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "lifecycle_rollback",
-                    required: &["skill_id", "revision_id", "expected_generation"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "lifecycle_import_executable",
-                    required: &["source", "revision_id"],
-                },
-            ]);
-        }
-        crate::tools::schema::with_action_requirements(schema, "action", &requirements)
+                }
+                let mut requirements = vec![
+                    crate::tools::schema::ActionRequirement {
+                        action: "create",
+                        required: &["name", "description", "instructions"],
+                    },
+                    crate::tools::schema::ActionRequirement {
+                        action: "install",
+                        required: &["source"],
+                    },
+                    crate::tools::schema::ActionRequirement {
+                        action: "update",
+                        required: &["name"],
+                    },
+                    crate::tools::schema::ActionRequirement {
+                        action: "enable",
+                        required: &["name"],
+                    },
+                    crate::tools::schema::ActionRequirement {
+                        action: "disable",
+                        required: &["name"],
+                    },
+                    crate::tools::schema::ActionRequirement {
+                        action: "validate",
+                        required: &["name"],
+                    },
+                    crate::tools::schema::ActionRequirement {
+                        action: "remove",
+                        required: &["name"],
+                    },
+                ];
+                if !lifecycle.is_empty() {
+                    requirements.extend([
+                        crate::tools::schema::ActionRequirement {
+                            action: "lifecycle_inspect",
+                            required: &["proposal_id"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "lifecycle_publish",
+                            required: &["proposal_id"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "lifecycle_cancel",
+                            required: &["proposal_id"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "lifecycle_rollback",
+                            required: &["skill_id", "revision_id", "expected_generation"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "lifecycle_import_executable",
+                            required: &["source", "revision_id"],
+                        },
+                    ]);
+                }
+                crate::tools::schema::with_action_requirements(schema, "action", &requirements)
+            })
+        })
     }
 }
 
@@ -898,8 +905,12 @@ impl Tool for SkillsManageTool {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let action = Self::required_string(&args, "action")?;
         if action.starts_with("lifecycle_") {
             if !self.lifecycle_actions().contains(&action) {
@@ -1425,7 +1436,7 @@ mod tests {
             test_config(workspace.path()),
             Arc::new(SecurityPolicy::default()),
         );
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
@@ -1878,10 +1889,16 @@ mod tests {
         crate::tools::schema::action_contract::assert_action_tool_contract(
             plain.name(),
             plain.description(),
-            &plain.execution_schema(),
+            plain.execution_schema(),
         );
 
         let tool = lifecycle_tool(workspace.path(), crate::skills::lifecycle::LifecycleMode::Shadow);
+        let configured = plain.with_lifecycle(Arc::clone(tool.lifecycle.as_ref().unwrap()));
+        assert_eq!(
+            configured.execution_schema(),
+            tool.execution_schema(),
+            "attaching lifecycle must invalidate the cached plain contract"
+        );
         let mut expected: Vec<String> = legacy.iter().map(|a| (*a).to_string()).collect();
         expected.extend(LIFECYCLE_READ_ACTIONS.iter().map(|a| (*a).to_string()));
         expected.extend(LIFECYCLE_MUTATING_ACTIONS.iter().map(|a| (*a).to_string()));
@@ -1894,6 +1911,7 @@ mod tests {
             );
         }
         let schema = tool.execution_schema();
+        crate::tools::schema::assert_execution_schema_golden("skills_manage_lifecycle", schema);
         let properties = schema.get("properties").and_then(serde_json::Value::as_object).unwrap();
         for forbidden in [
             "suite",
@@ -1910,7 +1928,7 @@ mod tests {
                 "{forbidden} must not be a parameter"
             );
         }
-        crate::tools::schema::action_contract::assert_action_tool_contract(tool.name(), tool.description(), &schema);
+        crate::tools::schema::action_contract::assert_action_tool_contract(tool.name(), tool.description(), schema);
     }
 
     #[tokio::test]

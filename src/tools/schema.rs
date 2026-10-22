@@ -64,7 +64,10 @@ use std::sync::{Arc, LazyLock};
 mod execution_contract;
 pub use execution_contract::ToolArgumentError;
 #[cfg(test)]
-pub(crate) use execution_contract::assert_flat_execution_contract;
+pub(crate) use execution_contract::{assert_execution_schema_golden, assert_flat_execution_contract};
+pub(crate) use execution_contract::{
+    deserialize_execution_parameters, serialize_execution_parameters, with_execution_contract, with_public_arguments,
+};
 pub(crate) use execution_contract::{publish_flat_schema, validate_execution_contract};
 
 /// One discriminator-specific set of required tool arguments.

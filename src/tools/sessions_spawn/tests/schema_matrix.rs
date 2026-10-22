@@ -62,11 +62,11 @@ fn mentions_action(text: &str, action: &str) -> bool {
 async fn schema_names_every_action_in_the_parameters_it_requires() {
     let (ch, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-    crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+    crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
     crate::tools::schema::action_contract::assert_action_tool_contract(
         "sessions_spawn",
         tool.description(),
-        &tool.execution_schema(),
+        tool.execution_schema(),
     );
 }
 

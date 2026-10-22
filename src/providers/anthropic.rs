@@ -2342,6 +2342,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<super::super::ProviderCapabilityError>().is_some());
+        let legacy = tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function", "function": {
+                        "name": tool.name, "description": tool.description, "parameters": tool.parameters,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let error = provider
+            .chat_with_tools(&messages, &legacy, "fixture", 0.0)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<super::super::ProviderCapabilityError>().is_some());
+        assert!(error.to_string().contains("mcp_fixture"));
         let streamed = provider
             .stream_chat_with_history(
                 &messages,

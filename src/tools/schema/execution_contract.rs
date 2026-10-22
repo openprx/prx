@@ -1,6 +1,8 @@
 //! Built-in schemas whose conditional requirements are enforced by the executor.
 
-use super::{ArgumentValidationIssue, compiled_tool_schema, describe_argument_validation_issues};
+use super::{
+    ArgumentValidationIssue, ToolSchemaDialect, compiled_tool_schema_for_dialect, describe_argument_validation_issues,
+};
 use serde_json::Value;
 
 /// An invalid built-in tool invocation, rejected before any tool side effect.
@@ -15,7 +17,8 @@ pub struct ToolArgumentError {
 /// Publish the fields of an explicitly migrated built-in contract. Its full
 /// conditional schema remains private and is checked on every execution.
 /// All migrated contracts already declare every field at the root.
-pub(crate) fn publish_flat_schema(mut schema: Value) -> Value {
+pub(crate) fn publish_flat_schema(schema: &Value) -> Value {
+    let mut schema = schema.clone();
     if let Some(root) = schema.as_object_mut() {
         for keyword in ["allOf", "anyOf", "oneOf"] {
             root.remove(keyword);
@@ -29,19 +32,16 @@ pub(crate) fn validate_execution_contract(
     schema: &Value,
     args: &mut Value,
 ) -> Result<(), ToolArgumentError> {
-    let compiled = compiled_tool_schema(tool, schema);
-    // The execution service validates public arguments before adding trusted
-    // scope and approval metadata. Validate the same public document here;
-    // leave runtime metadata intact for the tool's authority checks.
-    let public = args
-        .as_object()
-        .filter(|root| root.keys().any(|key| super::super::execution::is_runtime_only_arg(key)))
-        .map(|root| {
-            let mut root = root.clone();
-            super::super::execution::strip_runtime_only_args(&mut root);
-            Value::Object(root)
-        });
-    let issues = compiled.validate_tool_arguments(public.as_ref().unwrap_or(args));
+    let dialect = EXECUTION_CONTRACT
+        .try_with(|(contract, dialect)| {
+            contract
+                .as_deref()
+                .filter(|contract| std::ptr::eq(*contract, schema))
+                .map_or(ToolSchemaDialect::Raw, |_| *dialect)
+        })
+        .unwrap_or(ToolSchemaDialect::Raw);
+    let compiled = compiled_tool_schema_for_dialect(tool, dialect, schema);
+    let issues = with_public_arguments(args, |public| compiled.validate_tool_arguments(public));
     if !issues.is_empty() {
         return Err(ToolArgumentError {
             tool: tool.to_owned(),
@@ -53,12 +53,99 @@ pub(crate) fn validate_execution_contract(
     Ok(())
 }
 
+// Task-local and bound to the exact immutable contract the service validated.
+// No argument field can select a dialect or bypass validation. A nested tool
+// with another contract, or a direct call outside the service, stays Raw.
+tokio::task_local! {
+    static EXECUTION_CONTRACT: (Option<std::sync::Arc<Value>>, ToolSchemaDialect);
+}
+
+pub(crate) async fn with_execution_contract<F: std::future::Future>(
+    schema: Option<std::sync::Arc<Value>>,
+    dialect: ToolSchemaDialect,
+    future: F,
+) -> F::Output {
+    EXECUTION_CONTRACT.scope((schema, dialect), future).await
+}
+
+/// Temporarily move runtime metadata out of the public argument document.
+/// Payload values are never cloned, and metadata is restored even on rejection.
+pub(crate) fn with_public_arguments<R>(args: &mut Value, validate: impl FnOnce(&Value) -> R) -> R {
+    let mut metadata = Vec::new();
+    if let Some(root) = args.as_object_mut() {
+        root.retain(|key, value| {
+            if super::super::execution::is_runtime_only_arg(key) {
+                metadata.push((key.clone(), value.take()));
+                false
+            } else {
+                true
+            }
+        });
+    }
+    let issues = validate(args);
+    if let Some(root) = args.as_object_mut() {
+        root.extend(metadata);
+    }
+    issues
+}
+
+// Arc's serde support must not depend on a transitive `serde/rc` feature.
+pub(crate) fn serialize_execution_parameters<S: serde::Serializer>(
+    value: &Option<std::sync::Arc<Value>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&value.as_deref(), serializer)
+}
+
+pub(crate) fn deserialize_execution_parameters<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<std::sync::Arc<Value>>, D::Error> {
+    <Option<Value> as serde::Deserialize>::deserialize(deserializer).map(|value| value.map(std::sync::Arc::new))
+}
+
+#[cfg(test)]
+pub(crate) fn assert_execution_schema_golden(name: &str, schema: &Value) {
+    let expected = match name {
+        "chat_profile_update" => include_str!("goldens/chat_profile_update.json"),
+        "chat_schedule" => include_str!("goldens/chat_schedule.json"),
+        "composio" => include_str!("goldens/composio.json"),
+        "cron" => include_str!("goldens/cron.json"),
+        "document_get_chunk" => include_str!("goldens/document_get_chunk.json"),
+        "document_ingest" => include_str!("goldens/document_ingest.json"),
+        "gateway" => include_str!("goldens/gateway.json"),
+        "git_operations" => include_str!("goldens/git_operations.json"),
+        "hooks_manage" => include_str!("goldens/hooks_manage.json"),
+        "image" => include_str!("goldens/image.json"),
+        "managed_session" => include_str!("goldens/managed_session.json"),
+        "mcp_call" => include_str!("goldens/mcp_call.json"),
+        "memory_get" => include_str!("goldens/memory_get.json"),
+        "nodes" => include_str!("goldens/nodes.json"),
+        "proxy_config" => include_str!("goldens/proxy_config.json"),
+        "sessions_spawn" => include_str!("goldens/sessions_spawn.json"),
+        "skills_manage" => include_str!("goldens/skills_manage.json"),
+        "skills_manage_lifecycle" => include_str!("goldens/skills_manage_lifecycle.json"),
+        "subagents" => include_str!("goldens/subagents.json"),
+        "wasm_plugins_manage" => include_str!("goldens/wasm_plugins_manage.json"),
+        "xin" => include_str!("goldens/xin.json"),
+        _ => panic!("missing baseline execution schema for {name}"),
+    };
+    let expected: Value = serde_json::from_str(expected).expect("test: baseline JSON");
+    assert_eq!(schema, &expected, "{name}: execution contract changed from 4c61e2a9");
+}
+
 /// Exercise direct execution with invalid documents derived from each original
 /// contract. Valid documents are checked without causing external side effects;
 /// each tool's existing success tests still exercise its real implementation.
 #[cfg(test)]
 pub(crate) async fn assert_flat_execution_contract(tool: &dyn crate::tools::Tool, original: &Value) {
     use serde_json::json;
+    assert_execution_schema_golden(tool.name(), original);
+    let contract = tool.execution_parameters_schema().expect("test: private contract");
+    assert!(std::sync::Arc::ptr_eq(
+        &contract,
+        &tool.execution_parameters_schema().unwrap()
+    ));
+    assert_eq!(contract.as_ref(), original);
     let published = tool.parameters_schema();
     for keyword in ["allOf", "anyOf", "oneOf"] {
         assert!(published.get(keyword).is_none(), "{}: {keyword}", tool.name());
@@ -159,6 +246,22 @@ pub(crate) async fn assert_flat_execution_contract(tool: &dyn crate::tools::Tool
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn dialect_scope_is_bound_to_the_validated_contract() {
+        let schema = std::sync::Arc::new(json!({
+            "type":"object", "properties":{"count":{"type":"integer","maximum":2}}
+        }));
+        let other = schema.as_ref().clone();
+        let mut args = json!({"count":3});
+        assert!(validate_execution_contract("fixture", &schema, &mut args).is_err());
+        with_execution_contract(Some(std::sync::Arc::clone(&schema)), ToolSchemaDialect::Gemini, async {
+            validate_execution_contract("fixture", &schema, &mut args).unwrap();
+            assert!(validate_execution_contract("nested", &other, &mut args).is_err());
+        })
+        .await;
+        assert!(validate_execution_contract("fixture", &schema, &mut args).is_err());
+    }
 
     #[test]
     fn runtime_metadata_does_not_bypass_validation_or_get_removed() {

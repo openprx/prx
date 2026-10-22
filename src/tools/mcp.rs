@@ -1555,46 +1555,51 @@ impl McpTool {
 }
 
 impl McpTool {
-    fn execution_schema(&self) -> serde_json::Value {
-        // The root schema is independent of catalog size. Exact remote names
-        // and schemas are supplied only by turn-scoped capability discovery.
-        let server_schema = json!({
-            "type": "string",
-            "description": "Configured MCP server name; required for 'call'"
-        });
-        let tool_schema = json!({
-            "type": "string",
-            "description": "Remote MCP tool name to invoke; required for 'call'"
-        });
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                // The root schema is independent of catalog size. Exact remote names
+                // and schemas are supplied only by turn-scoped capability discovery.
+                let server_schema = json!({
+                    "type": "string",
+                    "description": "Configured MCP server name; required for 'call'"
+                });
+                let tool_schema = json!({
+                    "type": "string",
+                    "description": "Remote MCP tool name to invoke; required for 'call'"
+                });
 
-        crate::tools::schema::with_default_action_requirements(
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["call", "list", "status", "refresh"],
-                        "default": "call",
-                        "description": "'call' invokes a remote tool; 'list' and 'status' inspect discovery state and errors; 'refresh' forces rediscovery"
-                    },
-                    "server": server_schema,
-                    "tool": tool_schema,
-                    "arguments": {
+                crate::tools::schema::with_default_action_requirements(
+                    json!({
                         "type": "object",
-                        "description": "Arguments object forwarded to MCP call_tool for 'call'",
-                        "default": {}
-                    }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }),
-            "action",
-            "call",
-            &[crate::tools::schema::ActionRequirement {
-                action: "call",
-                required: &["server", "tool"],
-            }],
-        )
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["call", "list", "status", "refresh"],
+                                "default": "call",
+                                "description": "'call' invokes a remote tool; 'list' and 'status' inspect discovery state and errors; 'refresh' forces rediscovery"
+                            },
+                            "server": server_schema,
+                            "tool": tool_schema,
+                            "arguments": {
+                                "type": "object",
+                                "description": "Arguments object forwarded to MCP call_tool for 'call'",
+                                "default": {}
+                            }
+                        },
+                        "required": ["action"],
+                        "additionalProperties": false
+                    }),
+                    "action",
+                    "call",
+                    &[crate::tools::schema::ActionRequirement {
+                        action: "call",
+                        required: &["server", "tool"],
+                    }],
+                )
+            })
+        });
+        &SCHEMA
     }
 }
 
@@ -1612,6 +1617,10 @@ impl Tool for McpTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
     }
 
     fn specs(&self) -> Vec<ToolSpec> {
@@ -1673,7 +1682,7 @@ impl Tool for McpTool {
 
     async fn execute_named(&self, name: &str, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if name == MCP_ROOT_NAME {
-            crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+            crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         }
         #[cfg(test)]
         self.test_invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2432,11 +2441,11 @@ mod tests {
             McpConfig::default(),
             std::env::temp_dir(),
         );
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.execution_schema(),
+            tool.execution_schema(),
         );
     }
 
@@ -2478,15 +2487,15 @@ mod tests {
         // make the discriminator mandatory.
         assert_eq!(schema["required"], json!([]));
         assert_eq!(schema["properties"]["action"]["default"], "call");
-        let issues = crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "call"}));
+        let issues = crate::tools::schema::validate_tool_arguments(schema, &json!({"action": "call"}));
         assert!(issues.iter().any(|issue| issue.path == "$.server"));
         assert!(issues.iter().any(|issue| issue.path == "$.tool"));
         // Omitting the action selects 'call', so its requirements still bind.
-        let implicit = crate::tools::schema::validate_tool_arguments(&schema, &json!({}));
+        let implicit = crate::tools::schema::validate_tool_arguments(schema, &json!({}));
         assert!(implicit.iter().any(|issue| issue.path == "$.server"));
         assert!(implicit.iter().any(|issue| issue.path == "$.tool"));
         assert!(
-            crate::tools::schema::validate_tool_arguments(&schema, &json!({"server": "s", "tool": "t"})).is_empty(),
+            crate::tools::schema::validate_tool_arguments(schema, &json!({"server": "s", "tool": "t"})).is_empty(),
             "expected an empty value"
         );
     }

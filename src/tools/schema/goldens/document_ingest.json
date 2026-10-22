@@ -1,0 +1,53 @@
+{
+  "additionalProperties": false,
+  "anyOf": [
+    {
+      "required": [
+        "path"
+      ]
+    },
+    {
+      "required": [
+        "content"
+      ]
+    }
+  ],
+  "properties": {
+    "content": {
+      "description": "Inline document content when path is omitted",
+      "minLength": 1,
+      "type": "string"
+    },
+    "document_id": {
+      "description": "Stable id used to update an existing document",
+      "type": "string"
+    },
+    "mime_type": {
+      "type": "string"
+    },
+    "path": {
+      "description": "Workspace-relative UTF-8 document path",
+      "minLength": 1,
+      "type": "string"
+    },
+    "source_uri": {
+      "description": "Optional source identifier for inline content",
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "visibility": {
+      "enum": [
+        "global",
+        "workspace",
+        "agent",
+        "session",
+        "private",
+        "system"
+      ],
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

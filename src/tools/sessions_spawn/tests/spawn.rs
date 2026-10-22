@@ -201,13 +201,13 @@ fn schema_has_required_fields() {
     let enum_vals = schema["properties"]["action"]["enum"].as_array().unwrap();
     let enum_strs: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
     assert!(enum_strs.contains(&"history"));
-    let issues = crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "spawn"}));
+    let issues = crate::tools::schema::validate_tool_arguments(schema, &json!({"action": "spawn"}));
     assert!(issues.iter().any(|issue| issue.path == "$.task"));
     // An omitted action selects 'spawn', so 'task' is still required.
-    let implicit = crate::tools::schema::validate_tool_arguments(&schema, &json!({}));
+    let implicit = crate::tools::schema::validate_tool_arguments(schema, &json!({}));
     assert!(implicit.iter().any(|issue| issue.path == "$.task"));
     assert!(
-        crate::tools::schema::validate_tool_arguments(&schema, &json!({"task": "do it"})).is_empty(),
+        crate::tools::schema::validate_tool_arguments(schema, &json!({"task": "do it"})).is_empty(),
         "expected an empty value"
     );
     assert!(enum_strs.contains(&"steer"));

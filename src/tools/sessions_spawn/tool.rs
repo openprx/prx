@@ -9,152 +9,156 @@ use serde_json::json;
 use std::sync::Arc;
 
 impl SessionsSpawnTool {
-    pub(super) fn execution_schema(&self) -> serde_json::Value {
-        let available_agents = self
-            .agents
-            .iter()
-            .filter(|(_, cfg)| cfg.spawn_enabled.unwrap_or(true))
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>();
-        crate::tools::schema::with_default_action_requirements(
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["spawn", "spawn_batch", "join", "list", "kill", "history", "steer", "chat_sessions", "chat_assign"],
-                        "default": "spawn",
-                        "description": "Action to perform, with the parameter it reads: 'spawn' task; \
-                         'spawn_batch' tasks; 'join' batch_id; 'list' none; 'kill' run_id; 'history' run_id; \
-                         'steer' run_id + message; 'chat_sessions' none; 'chat_assign' session_id + task."
-                    },
-                    "session_id": {
-                        "type": "string",
-                        "description": "For 'chat_assign': the live `prx chat` session that gets the task, as listed by 'chat_sessions'. A chat session id, not a sub-agent run_id."
-                    },
-                    "disposition": {
-                        "type": "string",
-                        "enum": ["queue", "steer", "interrupt"],
-                        "default": "queue",
-                        "description": "For 'chat_assign': how to handle a turn that session is already running. 'queue' (default) waits, 'steer' feeds the task to the running turn, 'interrupt' stops it first. Prefer 'queue'."
-                    },
-                    "tasks": {
-                        "type": "array",
-                        "minItems": 1,
-                        "description": "For 'spawn_batch': tasks to launch together. Ordinary batches have no fixed member cap; recursive grants permit one child. Each entry is a task string or an object {task, agent?, model?, provider?, allow_delegation?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
-                        "items": {
-                            "anyOf": [
-                                {"type": "string", "minLength": 1},
-                                Self::batch_member_entry_schema()
-                            ]
-                        }
-                    },
-                    "batch_id": {
-                        "type": "string",
-                        "description": "For 'join': the batch identifier returned by 'spawn_batch'. 'join' blocks until every member has finished, however long that takes."
-                    },
-                    "task": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "The work to be done, as instructions. Required by 'spawn' and by 'chat_assign' \
-                                        ('chat_assign' has no `message`, `prompt` or `text` parameter). Use `tasks` for \
-                                        'spawn_batch' and `message` for 'steer'."
-                    },
-                    "run_id": {
-                        "type": "string",
-                        "description": "Sub-agent run id returned by 'spawn' and listed by 'list'. Required by 'kill', 'history' and 'steer'. Not a chat session id."
-                    },
-                    "message": {
-                        "type": "string",
-                        "description": "For 'steer': text injected into an already-running sub-agent to redirect it. \
-                                        Not how work is handed out — 'spawn' and 'chat_assign' take their instructions in `task`."
-                    },
-                    "model": {
-                        "type": "string",
-                        "description": "For 'spawn' and 'spawn_batch': model override. Defaults to the gateway model."
-                    },
-                    "provider": {
-                        "type": "string",
-                        "description": "For 'spawn' and 'spawn_batch': provider override. Must be a provider the operator configured (the gateway provider, a named agent's provider, a fallback provider or a model route); any other provider, including an unconfigured 'custom:<url>', is refused. Defaults to the agent config provider, then the gateway provider."
-                    },
-                    "allow_delegation": delegation::request_schema(),
-                    "agent": {
-                        "type": "string",
-                        "description": format!(
-                            "For 'spawn' and 'spawn_batch': identity agent name. Available: {}",
-                            if available_agents.is_empty() {
-                                "(none configured)".to_string()
-                            } else {
-                                available_agents.join(", ")
+    pub(super) fn execution_schema(&self) -> &std::sync::Arc<serde_json::Value> {
+        self.execution_schema.get_or_init(|| {
+            std::sync::Arc::new({
+                let available_agents = self
+                    .agents
+                    .iter()
+                    .filter(|(_, cfg)| cfg.spawn_enabled.unwrap_or(true))
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>();
+                crate::tools::schema::with_default_action_requirements(
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["spawn", "spawn_batch", "join", "list", "kill", "history", "steer", "chat_sessions", "chat_assign"],
+                                "default": "spawn",
+                                "description": "Action to perform, with the parameter it reads: 'spawn' task; \
+                                 'spawn_batch' tasks; 'join' batch_id; 'list' none; 'kill' run_id; 'history' run_id; \
+                                 'steer' run_id + message; 'chat_sessions' none; 'chat_assign' session_id + task."
+                            },
+                            "session_id": {
+                                "type": "string",
+                                "description": "For 'chat_assign': the live `prx chat` session that gets the task, as listed by 'chat_sessions'. A chat session id, not a sub-agent run_id."
+                            },
+                            "disposition": {
+                                "type": "string",
+                                "enum": ["queue", "steer", "interrupt"],
+                                "default": "queue",
+                                "description": "For 'chat_assign': how to handle a turn that session is already running. 'queue' (default) waits, 'steer' feeds the task to the running turn, 'interrupt' stops it first. Prefer 'queue'."
+                            },
+                            "tasks": {
+                                "type": "array",
+                                "minItems": 1,
+                                "description": "For 'spawn_batch': tasks to launch together. Ordinary batches have no fixed member cap; recursive grants permit one child. Each entry is a task string or an object {task, agent?, model?, provider?, allow_delegation?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
+                                "items": {
+                                    "anyOf": [
+                                        {"type": "string", "minLength": 1},
+                                        Self::batch_member_entry_schema()
+                                    ]
+                                }
+                            },
+                            "batch_id": {
+                                "type": "string",
+                                "description": "For 'join': the batch identifier returned by 'spawn_batch'. 'join' blocks until every member has finished, however long that takes."
+                            },
+                            "task": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "The work to be done, as instructions. Required by 'spawn' and by 'chat_assign' \
+                                                ('chat_assign' has no `message`, `prompt` or `text` parameter). Use `tasks` for \
+                                                'spawn_batch' and `message` for 'steer'."
+                            },
+                            "run_id": {
+                                "type": "string",
+                                "description": "Sub-agent run id returned by 'spawn' and listed by 'list'. Required by 'kill', 'history' and 'steer'. Not a chat session id."
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": "For 'steer': text injected into an already-running sub-agent to redirect it. \
+                                                Not how work is handed out — 'spawn' and 'chat_assign' take their instructions in `task`."
+                            },
+                            "model": {
+                                "type": "string",
+                                "description": "For 'spawn' and 'spawn_batch': model override. Defaults to the gateway model."
+                            },
+                            "provider": {
+                                "type": "string",
+                                "description": "For 'spawn' and 'spawn_batch': provider override. Must be a provider the operator configured (the gateway provider, a named agent's provider, a fallback provider or a model route); any other provider, including an unconfigured 'custom:<url>', is refused. Defaults to the agent config provider, then the gateway provider."
+                            },
+                            "allow_delegation": delegation::request_schema(),
+                            "agent": {
+                                "type": "string",
+                                "description": format!(
+                                    "For 'spawn' and 'spawn_batch': identity agent name. Available: {}",
+                                    if available_agents.is_empty() {
+                                        "(none configured)".to_string()
+                                    } else {
+                                        available_agents.join(", ")
+                                    }
+                                )
+                            },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["task", "process"],
+                                "default": "task",
+                                "description": "For 'spawn' and 'spawn_batch': 'task' runs in-process (default), 'process' launches an isolated OS process."
+                            },
+                            "recipient": {
+                                "type": "string",
+                                "description": "For 'spawn': recipient (phone number, group ID, …) of the result announcement and any \
+                                                kill notice; defaults to the current sender. Under 'spawn_batch' it routes only the \
+                                                kill notice. 'chat_assign' always replies into the assigning conversation."
+                            },
+                            "announce": {
+                                "type": "boolean",
+                                "description": "For 'spawn', default true: whether the sub-agent posts its own result to the channel. \
+                                                A 'spawn_batch' member never announces; collect a batch with 'join' and report it once."
+                            },
+                            "last_n": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 200,
+                                "description": "For 'history': return the last N entries (default 20, keeping final proof markers visible)."
+                            },
+                            "max_chars_per_entry": {
+                                "type": "integer",
+                                "minimum": 80,
+                                "maximum": 4000,
+                                "description": "For 'history': maximum characters per returned entry (default 800)."
                             }
-                        )
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["task", "process"],
-                        "default": "task",
-                        "description": "For 'spawn' and 'spawn_batch': 'task' runs in-process (default), 'process' launches an isolated OS process."
-                    },
-                    "recipient": {
-                        "type": "string",
-                        "description": "For 'spawn': recipient (phone number, group ID, …) of the result announcement and any \
-                                        kill notice; defaults to the current sender. Under 'spawn_batch' it routes only the \
-                                        kill notice. 'chat_assign' always replies into the assigning conversation."
-                    },
-                    "announce": {
-                        "type": "boolean",
-                        "description": "For 'spawn', default true: whether the sub-agent posts its own result to the channel. \
-                                        A 'spawn_batch' member never announces; collect a batch with 'join' and report it once."
-                    },
-                    "last_n": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 200,
-                        "description": "For 'history': return the last N entries (default 20, keeping final proof markers visible)."
-                    },
-                    "max_chars_per_entry": {
-                        "type": "integer",
-                        "minimum": 80,
-                        "maximum": 4000,
-                        "description": "For 'history': maximum characters per returned entry (default 800)."
-                    }
-                },
-                "required": ["action"]
-            }),
-            "action",
-            "spawn",
-            &[
-                crate::tools::schema::ActionRequirement {
-                    action: "spawn",
-                    required: &["task"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "spawn_batch",
-                    required: &["tasks"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "kill",
-                    required: &["run_id"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "history",
-                    required: &["run_id"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "steer",
-                    required: &["run_id", "message"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "chat_assign",
-                    required: &["session_id", "task"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "join",
-                    required: &["batch_id"],
-                },
-            ],
-        )
+                        },
+                        "required": ["action"]
+                    }),
+                    "action",
+                    "spawn",
+                    &[
+                        crate::tools::schema::ActionRequirement {
+                            action: "spawn",
+                            required: &["task"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "spawn_batch",
+                            required: &["tasks"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "kill",
+                            required: &["run_id"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "history",
+                            required: &["run_id"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "steer",
+                            required: &["run_id", "message"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "chat_assign",
+                            required: &["session_id", "task"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "join",
+                            required: &["batch_id"],
+                        },
+                    ],
+                )
+            })
+        })
     }
 }
 
@@ -176,6 +180,10 @@ impl Tool for SessionsSpawnTool {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     async fn set_active_recipient(&self, recipient: &str) {
         *self.default_recipient.write().await = Some(recipient.to_string());
     }
@@ -190,7 +198,7 @@ impl Tool for SessionsSpawnTool {
     }
 
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         crate::tools::execution::verify_current_child_call("sessions_spawn")?;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("spawn");
         if action == "spawn_batch" {

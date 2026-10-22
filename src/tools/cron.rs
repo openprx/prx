@@ -441,218 +441,223 @@ fn truncate_str(input: &str, max_chars: usize) -> String {
 }
 
 impl CronTool {
-    fn execution_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_exclusive_alternatives(
-            crate::tools::schema::with_action_alternatives(
-                crate::tools::schema::with_action_alternatives(
-                    crate::tools::schema::with_action_requirements(
-                        json!({
-                        "type": "object",
-                        "properties": {
-                            "action": {
-                                "type": "string",
-                                "enum": [
-                                    "add", "schedule", "once",
-                                    "list",
-                                    "get",
-                                    "remove", "cancel",
-                                    "update", "patch",
-                                    "run",
-                                    "runs", "history",
-                                    "events",
-                                    "pause", "resume",
-                                    "status"
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_action_exclusive_alternatives(
+                    crate::tools::schema::with_action_alternatives(
+                        crate::tools::schema::with_action_alternatives(
+                            crate::tools::schema::with_action_requirements(
+                                json!({
+                                "type": "object",
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": [
+                                            "add", "schedule", "once",
+                                            "list",
+                                            "get",
+                                            "remove", "cancel",
+                                            "update", "patch",
+                                            "run",
+                                            "runs", "history",
+                                            "events",
+                                            "pause", "resume",
+                                            "status"
+                                        ],
+                                        "description": "Create a job with 'add'/'schedule' (recurring) or 'once' \
+                                                        (one-shot); inspect with 'list'/'get'/'runs'/'history'/'events'/'status'; \
+                                                        change one with 'update'/'patch'; trigger it now with 'run'; \
+                                                        halt or resume it with 'pause'/'resume'; delete it with 'remove'/'cancel'."
+                                    },
+                                    "job_id": {
+                                        "type": "string",
+                                        "description": "Job ID for 'get'/'runs'/'history'/'events'/'update'/'patch'/'run'/'pause'/'resume'/'remove'/'cancel'."
+                                    },
+                                    "expression": {
+                                        "type": "string",
+                                        "description": "Cron expression (e.g. `*/5 * * * *`) for 'add'/'schedule'; alternative to 'schedule'."
+                                    },
+                                    "command": {
+                                        "type": "string",
+                                        "description": "Shell command to run; required by 'once' and one way to give 'add'/'schedule' its work."
+                                    },
+                                    "delay": {
+                                        "type": "string",
+                                        "description": "One-shot delay for 'once' (e.g. `30m`, `2h`); alternative to 'run_at'."
+                                    },
+                                    "run_at": {
+                                        "type": "string",
+                                        "description": "One-shot absolute RFC3339 time for 'once'; alternative to 'delay'."
+                                    },
+                                    "schedule": {
+                                        "type": "object",
+                                        "description": "'add'/'schedule': {kind:cron,expr,tz?} | {kind:at,at} | {kind:every,every_ms}. Alternative to 'expression'.",
+                                        "properties": {
+                                            "kind": { "type": "string", "enum": ["cron", "at", "every"] },
+                                            "expr": { "type": "string", "minLength": 1 },
+                                            "tz": { "type": "string", "minLength": 1 },
+                                            "at": { "type": "string", "minLength": 1 },
+                                            "every_ms": { "type": "integer", "minimum": 1 }
+                                        },
+                                        "required": ["kind"],
+                                        "allOf": [
+                                            {
+                                                "if": { "properties": { "kind": { "const": "cron" } }, "required": ["kind"] },
+                                                "then": { "required": ["expr"] }
+                                            },
+                                            {
+                                                "if": { "properties": { "kind": { "const": "at" } }, "required": ["kind"] },
+                                                "then": { "required": ["at"] }
+                                            },
+                                            {
+                                                "if": { "properties": { "kind": { "const": "every" } }, "required": ["kind"] },
+                                                "then": { "required": ["every_ms"] }
+                                            }
+                                        ]
+                                    },
+                                    "name": {
+                                        "type": "string",
+                                        "description": "Human-readable job name."
+                                    },
+                                    "payload": {
+                                        "type": "object",
+                                        "description": "'add'/'schedule' payload: {kind:agentTurn,message} runs an isolated LLM turn; {kind:systemEvent,text} injects text into the main session.",
+                                        "properties": {
+                                            "kind": { "type": "string", "enum": ["agentTurn", "systemEvent"] },
+                                            "message": { "type": "string", "minLength": 1, "description": "agentTurn prompt." },
+                                            "text": { "type": "string", "minLength": 1, "description": "systemEvent text." }
+                                        },
+                                        "required": ["kind"],
+                                        "anyOf": [
+                                            { "required": ["message"] },
+                                            { "required": ["text"] }
+                                        ]
+                                    },
+                                    "job_type": {
+                                        "type": "string",
+                                        "enum": ["shell", "agent"],
+                                        "description": "Legacy alternative to 'payload'. 'agent' runs an LLM turn."
+                                    },
+                                    "prompt": {
+                                        "type": "string",
+                                        "description": "LLM prompt for agent jobs on 'add'/'schedule'; overridden by payload."
+                                    },
+                                    "session_target": {
+                                        "type": "string",
+                                        "enum": ["isolated", "main"],
+                                        "description": "Agent-job target: isolated=new context (default), main=inject into main session."
+                                    },
+                                    "model": {
+                                        "type": "string",
+                                        "description": "Model override for agent jobs."
+                                    },
+                                    "delivery": {
+                                        "type": "object",
+                                        "description": "Agent-job result delivery: {mode:'announce',channel,to} or {mode:'none'}.",
+                                        "properties": {
+                                            "mode": { "type": "string", "enum": ["none", "announce"] },
+                                            "channel": { "type": "string", "enum": ["signal", "telegram", "discord", "slack", "mattermost"] },
+                                            "to": { "type": "string", "description": "E.164 phone, UUID, or group:<groupId>" },
+                                            "best_effort": { "type": "boolean", "default": true }
+                                        }
+                                    },
+                                    "delete_after_run": {
+                                        "type": "boolean",
+                                        "description": "Auto-delete one-shot jobs after success (default true for 'at')."
+                                    },
+                                    "patch": {
+                                        "type": "object",
+                                        "description": "Fields to update for 'update'/'patch'."
+                                    },
+                                    "limit": {
+                                        "type": "integer",
+                                        "description": "Max entries for 'runs' (default 10)."
+                                    },
+                                },
+                                        "required": ["action"]
+                                    }),
+                                "action",
+                                &[
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "get",
+                                        required: &["job_id"],
+                                    },
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "runs",
+                                        required: &["job_id"],
+                                    },
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "history",
+                                        required: &["job_id"],
+                                    },
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "events",
+                                        required: &["job_id"],
+                                    },
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "once",
+                                        required: &["command"],
+                                    },
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "remove",
+                                        required: &["job_id"],
+                                    },
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "cancel",
+                                        required: &["job_id"],
+                                    },
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "update",
+                                        required: &["job_id", "patch"],
+                                    },
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "patch",
+                                        required: &["job_id", "patch"],
+                                    },
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "run",
+                                        required: &["job_id"],
+                                    },
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "pause",
+                                        required: &["job_id"],
+                                    },
+                                    crate::tools::schema::ActionRequirement {
+                                        action: "resume",
+                                        required: &["job_id"],
+                                    },
                                 ],
-                                "description": "Create a job with 'add'/'schedule' (recurring) or 'once' \
-                                                (one-shot); inspect with 'list'/'get'/'runs'/'history'/'events'/'status'; \
-                                                change one with 'update'/'patch'; trigger it now with 'run'; \
-                                                halt or resume it with 'pause'/'resume'; delete it with 'remove'/'cancel'."
-                            },
-                            "job_id": {
-                                "type": "string",
-                                "description": "Job ID for 'get'/'runs'/'history'/'events'/'update'/'patch'/'run'/'pause'/'resume'/'remove'/'cancel'."
-                            },
-                            "expression": {
-                                "type": "string",
-                                "description": "Cron expression (e.g. `*/5 * * * *`) for 'add'/'schedule'; alternative to 'schedule'."
-                            },
-                            "command": {
-                                "type": "string",
-                                "description": "Shell command to run; required by 'once' and one way to give 'add'/'schedule' its work."
-                            },
-                            "delay": {
-                                "type": "string",
-                                "description": "One-shot delay for 'once' (e.g. `30m`, `2h`); alternative to 'run_at'."
-                            },
-                            "run_at": {
-                                "type": "string",
-                                "description": "One-shot absolute RFC3339 time for 'once'; alternative to 'delay'."
-                            },
-                            "schedule": {
-                                "type": "object",
-                                "description": "'add'/'schedule': {kind:cron,expr,tz?} | {kind:at,at} | {kind:every,every_ms}. Alternative to 'expression'.",
-                                "properties": {
-                                    "kind": { "type": "string", "enum": ["cron", "at", "every"] },
-                                    "expr": { "type": "string", "minLength": 1 },
-                                    "tz": { "type": "string", "minLength": 1 },
-                                    "at": { "type": "string", "minLength": 1 },
-                                    "every_ms": { "type": "integer", "minimum": 1 }
-                                },
-                                "required": ["kind"],
-                                "allOf": [
-                                    {
-                                        "if": { "properties": { "kind": { "const": "cron" } }, "required": ["kind"] },
-                                        "then": { "required": ["expr"] }
-                                    },
-                                    {
-                                        "if": { "properties": { "kind": { "const": "at" } }, "required": ["kind"] },
-                                        "then": { "required": ["at"] }
-                                    },
-                                    {
-                                        "if": { "properties": { "kind": { "const": "every" } }, "required": ["kind"] },
-                                        "then": { "required": ["every_ms"] }
-                                    }
-                                ]
-                            },
-                            "name": {
-                                "type": "string",
-                                "description": "Human-readable job name."
-                            },
-                            "payload": {
-                                "type": "object",
-                                "description": "'add'/'schedule' payload: {kind:agentTurn,message} runs an isolated LLM turn; {kind:systemEvent,text} injects text into the main session.",
-                                "properties": {
-                                    "kind": { "type": "string", "enum": ["agentTurn", "systemEvent"] },
-                                    "message": { "type": "string", "minLength": 1, "description": "agentTurn prompt." },
-                                    "text": { "type": "string", "minLength": 1, "description": "systemEvent text." }
-                                },
-                                "required": ["kind"],
-                                "anyOf": [
-                                    { "required": ["message"] },
-                                    { "required": ["text"] }
-                                ]
-                            },
-                            "job_type": {
-                                "type": "string",
-                                "enum": ["shell", "agent"],
-                                "description": "Legacy alternative to 'payload'. 'agent' runs an LLM turn."
-                            },
-                            "prompt": {
-                                "type": "string",
-                                "description": "LLM prompt for agent jobs on 'add'/'schedule'; overridden by payload."
-                            },
-                            "session_target": {
-                                "type": "string",
-                                "enum": ["isolated", "main"],
-                                "description": "Agent-job target: isolated=new context (default), main=inject into main session."
-                            },
-                            "model": {
-                                "type": "string",
-                                "description": "Model override for agent jobs."
-                            },
-                            "delivery": {
-                                "type": "object",
-                                "description": "Agent-job result delivery: {mode:'announce',channel,to} or {mode:'none'}.",
-                                "properties": {
-                                    "mode": { "type": "string", "enum": ["none", "announce"] },
-                                    "channel": { "type": "string", "enum": ["signal", "telegram", "discord", "slack", "mattermost"] },
-                                    "to": { "type": "string", "description": "E.164 phone, UUID, or group:<groupId>" },
-                                    "best_effort": { "type": "boolean", "default": true }
-                                }
-                            },
-                            "delete_after_run": {
-                                "type": "boolean",
-                                "description": "Auto-delete one-shot jobs after success (default true for 'at')."
-                            },
-                            "patch": {
-                                "type": "object",
-                                "description": "Fields to update for 'update'/'patch'."
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Max entries for 'runs' (default 10)."
-                            },
-                        },
-                                "required": ["action"]
-                            }),
+                            ),
+                            "action",
+                            "add",
+                            &[
+                                &["expression", "command"],
+                                &["schedule", "command"],
+                                &["expression", "prompt"],
+                                &["schedule", "prompt"],
+                                &["expression", "payload"],
+                                &["schedule", "payload"],
+                            ],
+                        ),
                         "action",
+                        "schedule",
                         &[
-                            crate::tools::schema::ActionRequirement {
-                                action: "get",
-                                required: &["job_id"],
-                            },
-                            crate::tools::schema::ActionRequirement {
-                                action: "runs",
-                                required: &["job_id"],
-                            },
-                            crate::tools::schema::ActionRequirement {
-                                action: "history",
-                                required: &["job_id"],
-                            },
-                            crate::tools::schema::ActionRequirement {
-                                action: "events",
-                                required: &["job_id"],
-                            },
-                            crate::tools::schema::ActionRequirement {
-                                action: "once",
-                                required: &["command"],
-                            },
-                            crate::tools::schema::ActionRequirement {
-                                action: "remove",
-                                required: &["job_id"],
-                            },
-                            crate::tools::schema::ActionRequirement {
-                                action: "cancel",
-                                required: &["job_id"],
-                            },
-                            crate::tools::schema::ActionRequirement {
-                                action: "update",
-                                required: &["job_id", "patch"],
-                            },
-                            crate::tools::schema::ActionRequirement {
-                                action: "patch",
-                                required: &["job_id", "patch"],
-                            },
-                            crate::tools::schema::ActionRequirement {
-                                action: "run",
-                                required: &["job_id"],
-                            },
-                            crate::tools::schema::ActionRequirement {
-                                action: "pause",
-                                required: &["job_id"],
-                            },
-                            crate::tools::schema::ActionRequirement {
-                                action: "resume",
-                                required: &["job_id"],
-                            },
+                            &["expression", "command"],
+                            &["schedule", "command"],
+                            &["expression", "prompt"],
+                            &["schedule", "prompt"],
+                            &["expression", "payload"],
+                            &["schedule", "payload"],
                         ],
                     ),
                     "action",
-                    "add",
-                    &[
-                        &["expression", "command"],
-                        &["schedule", "command"],
-                        &["expression", "prompt"],
-                        &["schedule", "prompt"],
-                        &["expression", "payload"],
-                        &["schedule", "payload"],
-                    ],
-                ),
-                "action",
-                "schedule",
-                &[
-                    &["expression", "command"],
-                    &["schedule", "command"],
-                    &["expression", "prompt"],
-                    &["schedule", "prompt"],
-                    &["expression", "payload"],
-                    &["schedule", "payload"],
-                ],
-            ),
-            "action",
-            "once",
-            &[&["delay"], &["run_at"]],
-        )
+                    "once",
+                    &[&["delay"], &["run_at"]],
+                )
+            })
+        });
+        &SCHEMA
     }
 }
 
@@ -674,8 +679,12 @@ impl Tool for CronTool {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let cfg = self.config.load_full();
         let action = match args.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
@@ -1328,11 +1337,11 @@ mod tests {
         let config = new_shared(Config::default());
         let snapshot = config.load_full();
         let tool = CronTool::new(Arc::clone(&config), test_security(&snapshot));
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             "cron",
             tool.description(),
-            &tool.execution_schema(),
+            tool.execution_schema(),
         );
     }
 
@@ -1344,16 +1353,16 @@ mod tests {
         let schema = tool.execution_schema();
 
         assert!(
-            !validate_tool_arguments(&schema, &json!({"action": "add"})).is_empty(),
+            !validate_tool_arguments(schema, &json!({"action": "add"})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
-            !validate_tool_arguments(&schema, &json!({"action": "add", "expression": "0 9 * * *"})).is_empty(),
+            !validate_tool_arguments(schema, &json!({"action": "add", "expression": "0 9 * * *"})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
             validate_tool_arguments(
-                &schema,
+                schema,
                 &json!({"action": "add", "expression": "0 9 * * *", "command": "date"})
             )
             .is_empty(),
@@ -1361,7 +1370,7 @@ mod tests {
         );
         assert!(
             validate_tool_arguments(
-                &schema,
+                schema,
                 &json!({
                     "action": "schedule",
                     "schedule": {"kind": "every", "every_ms": 1000},
@@ -1373,7 +1382,7 @@ mod tests {
         );
         assert!(
             !validate_tool_arguments(
-                &schema,
+                schema,
                 &json!({
                     "action": "schedule",
                     "schedule": {"kind": "cron"},
@@ -1384,16 +1393,16 @@ mod tests {
             "expected a non-empty value"
         );
         assert!(
-            !validate_tool_arguments(&schema, &json!({"action": "once", "command": "date"})).is_empty(),
+            !validate_tool_arguments(schema, &json!({"action": "once", "command": "date"})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
-            validate_tool_arguments(&schema, &json!({"action": "once", "command": "date", "delay": "5m"})).is_empty(),
+            validate_tool_arguments(schema, &json!({"action": "once", "command": "date", "delay": "5m"})).is_empty(),
             "expected an empty value"
         );
         assert!(
             validate_tool_arguments(
-                &schema,
+                schema,
                 &json!({"action": "once", "command": "date", "run_at": "2030-01-01T00:00:00Z"})
             )
             .is_empty(),
@@ -1401,7 +1410,7 @@ mod tests {
         );
         assert!(
             !validate_tool_arguments(
-                &schema,
+                schema,
                 &json!({
                     "action": "once",
                     "command": "date",
@@ -1520,7 +1529,12 @@ mod tests {
         let typed = result
             .downcast_ref::<crate::tools::schema::ToolArgumentError>()
             .unwrap();
-        assert!(!typed.issues.is_empty(), "invalid input must carry a validation issue");
+        assert!(
+            typed
+                .issues
+                .iter()
+                .any(|issue| issue.path == "$" && issue.message.contains("required-field set"))
+        );
         assert!(cron::list_jobs(&cfg_snap).unwrap().is_empty());
         let valid = tool
             .execute(json!({

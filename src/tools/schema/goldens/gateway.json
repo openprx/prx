@@ -1,0 +1,52 @@
+{
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "config.patch"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "patch"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "description": "Action to perform: 'config.get' reads the current config, 'config.patch' merges a JSON merge patch into it, 'status' reports uptime/model/channels, 'version' reports the build version, 'components' lists active channels/providers/memory/tools, 'restart' sends SIGHUP for a graceful restart.",
+      "enum": [
+        "config.get",
+        "config.patch",
+        "status",
+        "version",
+        "components",
+        "restart"
+      ],
+      "type": "string"
+    },
+    "confirm_high_risk": {
+      "description": "For action='config.patch': confirms a high-risk patch: one that writes a credential, turns secrets.encrypt off, re-points an endpoint that receives a credential (a provider, proxy, MCP server, node, channel server, memory database), changes an MCP server's environment or launch command, changes who is admitted (paired tokens, webhook or channel verify secrets, pairing, JWT or SPIFFE trust, sender allow-lists, identity bindings, tunnel exposure), widens what a principal may do (privilege_widened: user policies, autonomy scopes or level, workspace or path limits, exposed MCP tools, node commands, the custom tunnel command, the sandbox runtime, its network, a writable root filesystem, a mounted workspace or wider workspace roots, fetchable domains, operator tools offered to channels, the audit log's size or location), or any change while the stored configuration does not load (baseline_unavailable). Such a patch is refused without it; set it only when the operator asked for exactly that change, together with 'revision'.",
+      "type": "boolean"
+    },
+    "patch": {
+      "description": "JSON merge patch payload, required for action='config.patch'.",
+      "type": "object"
+    },
+    "revision": {
+      "description": "For action='config.patch' with confirm_high_risk: the revision the refusal of this exact patch reported. The confirmation is bound to it; without it, or after the configuration changed, the patch is refused again.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "action"
+  ],
+  "type": "object"
+}

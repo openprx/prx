@@ -1,0 +1,98 @@
+{
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "validate"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "content"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "replace"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "content"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "test"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "event"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "description": "Action to perform: 'status' reports the active hooks configuration, 'refresh' reloads it from disk, 'validate' checks a candidate hooks.json, 'replace' installs one atomically, 'remove' deletes it, 'test' fires a synthetic event",
+      "enum": [
+        "status",
+        "refresh",
+        "validate",
+        "replace",
+        "remove",
+        "test"
+      ],
+      "type": "string"
+    },
+    "content": {
+      "description": "Complete hooks.json; required for 'validate' and 'replace'",
+      "minLength": 1,
+      "type": "string"
+    },
+    "event": {
+      "description": "Lifecycle event to fire; required for 'test'",
+      "enum": [
+        "agent_start",
+        "agent_end",
+        "llm_request",
+        "llm_response",
+        "tool_call_start",
+        "tool_call",
+        "turn_complete",
+        "error"
+      ],
+      "minLength": 1,
+      "type": "string"
+    },
+    "payload": {
+      "description": "Synthetic payload for 'test'",
+      "type": "object"
+    }
+  },
+  "required": [
+    "action"
+  ],
+  "type": "object"
+}

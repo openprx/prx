@@ -324,8 +324,10 @@ fn common_schema(require_path: bool) -> serde_json::Value {
 }
 
 impl DocumentIngestTool {
-    fn execution_schema(&self) -> serde_json::Value {
-        common_schema(false)
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> =
+            std::sync::LazyLock::new(|| std::sync::Arc::new(common_schema(false)));
+        &SCHEMA
     }
 }
 
@@ -343,8 +345,12 @@ impl Tool for DocumentIngestTool {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         self.0.ingest(self.name(), args, false).await
     }
 
@@ -454,7 +460,7 @@ mod tests {
     async fn flat_ingest_contract_rejects_invalid_calls_before_side_effects() {
         let temp = TempDir::new().unwrap();
         let (_, tool) = ingest_tool_fixture(&temp);
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
     }
 
     #[test]

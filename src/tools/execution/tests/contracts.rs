@@ -601,9 +601,9 @@ async fn invalid_arguments_are_typed_and_adapter_is_not_called() {
 
     assert_eq!(outcome.status, ToolExecutionStatus::InvalidArguments);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-    // Validation now precedes approval and preparation, so a structurally
+    // Validation now precedes policy, approval and preparation, so a structurally
     // invalid call never reaches either.
-    assert_eq!(&*fixture.stages.lock(), &["policy", "audit"]);
+    assert_eq!(&*fixture.stages.lock(), &["audit"]);
 }
 
 #[tokio::test]
@@ -639,6 +639,7 @@ fn security_policy_adapter_preserves_all_autonomy_modes() {
         backend_name: name.to_string(),
         description: name.to_string(),
         parameters: serde_json::json!({"type":"object"}),
+        execution_parameters: None,
         tier: ToolTier::Core,
         categories: Vec::new(),
         effect: if crate::security::policy::is_read_only_tool(name) {

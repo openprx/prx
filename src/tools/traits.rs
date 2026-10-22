@@ -87,6 +87,12 @@ pub trait Tool: Send + Sync {
     /// JSON schema for parameters
     fn parameters_schema(&self) -> serde_json::Value;
 
+    /// Full private contract for a built-in whose published schema is flat.
+    /// None uses the published schema unchanged, including dynamic aliases.
+    fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
+        None
+    }
+
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 

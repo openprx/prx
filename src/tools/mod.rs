@@ -257,6 +257,10 @@ impl Tool for ArcDelegatingTool {
         self.inner.parameters_schema()
     }
 
+    fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
+        self.inner.execution_parameters_schema()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }

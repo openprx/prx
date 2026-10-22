@@ -53,7 +53,9 @@ and the migration warnings below before upgrading.
 
 - Built-in tools now publish flat object schemas without root combinators for
   Anthropic compatibility. Conditional and alternative requirements move to
-  equally strict, typed execution validation. Native Anthropic and OpenRouter
+  typed validation before policy, approval and idempotency reservation, with the
+  existing dialect lowering (including Gemini clamps) preserved. Direct calls
+  retain the full original contract. Native Anthropic and OpenRouter
   `anthropic/*` reject unlowerable external tool schemas locally before transport;
   upstream OpenRouter schema errors include a remediation hint. External schema
   consumers must handle execution-time conditional errors. See

@@ -1060,11 +1060,9 @@ fn a_mixed_family_chain_declares_raw_rather_than_the_widest_rewrite() {
     );
 }
 
-/// `Anthropic` and `NoRootCombinators` are the pair the rank ordering got
-/// most wrong: it declared the structural rewrite for a chain that may be
-/// served by a provider which never restructures anything. Resolving to
-/// `Raw` must not manufacture a refusal either — `Raw` puts the published
-/// document on the wire and enforces the same document.
+/// Gemini strips keywords while NoRootCombinators preserves constraints and
+/// may refuse a structural rewrite. A mixed chain resolves Raw, preserving
+/// both wire and enforcement documents without inventing a local refusal.
 #[test]
 fn a_mixed_chain_of_gemini_and_no_root_combinators_resolves_raw_without_refusing() {
     let declared = "custom:https://endpoint.invalid/v1";

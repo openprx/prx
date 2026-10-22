@@ -24,24 +24,29 @@ impl DocumentGetChunkTool {
 }
 
 impl DocumentGetChunkTool {
-    fn execution_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_required_alternatives(
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "chunk_id": {
-                        "type": "string",
-                        "description": "Stable document chunk id returned by document_search"
-                    },
-                    "chunkId": {
-                        "type": "string",
-                        "description": "Alias of chunk_id"
-                    }
-                }
-            }),
-            &[&["chunk_id"], &["chunkId"]],
-        )
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_required_alternatives(
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "chunk_id": {
+                                "type": "string",
+                                "description": "Stable document chunk id returned by document_search"
+                            },
+                            "chunkId": {
+                                "type": "string",
+                                "description": "Alias of chunk_id"
+                            }
+                        }
+                    }),
+                    &[&["chunk_id"], &["chunkId"]],
+                )
+            })
+        });
+        &SCHEMA
     }
 }
 
@@ -52,15 +57,19 @@ impl Tool for DocumentGetChunkTool {
     }
 
     fn description(&self) -> &str {
-        "Retrieve one durable source document chunk by chunk_id when visible to the current owner/workspace scope."
+        "Retrieve one durable source document chunk by chunk_id when visible to the current owner/workspace scope. Provide at least one of chunk_id or chunkId."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        crate::tools::schema::validate_execution_contract(self.name(), &self.execution_schema(), &mut args)?;
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let chunk_id = args
             .get("chunk_id")
             .or_else(|| args.get("chunkId"))
@@ -274,19 +283,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let tool = DocumentGetChunkTool::new(tmp.path().to_path_buf(), memory);
-        crate::tools::schema::assert_flat_execution_contract(&tool, &tool.execution_schema()).await;
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         let schema = tool.execution_schema();
 
         assert!(
-            !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
+            !crate::tools::schema::validate_tool_arguments(schema, &json!({})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
-            crate::tools::schema::validate_tool_arguments(&schema, &json!({"chunk_id": "id"})).is_empty(),
+            crate::tools::schema::validate_tool_arguments(schema, &json!({"chunk_id": "id"})).is_empty(),
             "expected an empty value"
         );
         assert!(
-            crate::tools::schema::validate_tool_arguments(&schema, &json!({"chunkId": "id"})).is_empty(),
+            crate::tools::schema::validate_tool_arguments(schema, &json!({"chunkId": "id"})).is_empty(),
             "expected an empty value"
         );
     }
