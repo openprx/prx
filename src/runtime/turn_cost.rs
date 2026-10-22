@@ -18,7 +18,7 @@ use crate::tools::capability::catalog::CatalogView;
 
 /// V1 family fallback estimates in milliseconds. Complete single-capability
 /// outcomes can replace one capability's default with observed total-turn p50.
-pub(super) const LATENCY_DEFAULT_VERSION: &str = "family-latency-v2";
+pub(super) const LATENCY_DEFAULT_VERSION: &str = "family-latency-v1";
 
 /// Borrowed estimates for only the pinned entries the generator admits.
 /// The pricing validity fact is captured once for the turn; a missing price
@@ -86,16 +86,8 @@ const fn default_latency_ms(target: CapabilityTarget) -> u32 {
         CapabilityTarget::Memory | CapabilityTarget::Session => 40,
         CapabilityTarget::Skill | CapabilityTarget::Hook => 100,
         CapabilityTarget::NativeTool | CapabilityTarget::Filesystem => 150,
-        // G6 compares these with the decision's remaining extra-latency
-        // budget, which starts at its 500 ms default and has already shrunk
-        // by the time candidates are generated. An estimate at the full
-        // default can never pass, so Shell, Web and Im were never offered.
-        CapabilityTarget::Mcp
-        | CapabilityTarget::Wasm
-        | CapabilityTarget::Document
-        | CapabilityTarget::Shell
-        | CapabilityTarget::Web
-        | CapabilityTarget::Im => 300,
+        CapabilityTarget::Mcp | CapabilityTarget::Wasm | CapabilityTarget::Document => 300,
+        CapabilityTarget::Shell | CapabilityTarget::Web | CapabilityTarget::Im => 500,
     }
 }
 
@@ -564,18 +556,9 @@ mod tests {
     }
 
     #[test]
-    fn a_priced_model_gives_shell_web_and_im_an_estimate_that_fits_the_decision_budget() {
+    fn execution_latency_estimates_stay_available_for_scoring() {
         let config = Config::default();
         let selected = model(&config, "openrouter", "anthropic/claude-sonnet-5");
-        let budget = crate::causal_tree::config::CausalPolicy::default().extra_latency_budget_ms;
-        // The budget has already shrunk by the time candidates are generated.
-        let remaining_after_setup = budget - budget / 10;
-        for target in [CapabilityTarget::Shell, CapabilityTarget::Web, CapabilityTarget::Im] {
-            assert!(
-                u64::from(default_latency_ms(target)) <= remaining_after_setup,
-                "{target:?} default latency can never pass G6 inside the default decision budget"
-            );
-        }
         let catalog = one_entry_view_tool("shell");
         let view = catalog.view(&Default::default());
         let entry = view.entries().first().expect("shell fixture entry");
@@ -584,7 +567,12 @@ mod tests {
             .estimate_entry(entry)
             .expect("a priced model estimates the shell candidate");
         assert!(cost.micro_usd > 0);
-        assert!(u64::from(latency) <= remaining_after_setup);
+        assert_eq!(latency, default_latency_ms(CapabilityTarget::Shell));
+        let observed = BTreeMap::from([(entry.id.as_str().to_owned(), 5_000)]);
+        let (_, latency) = RuntimeCostModel::new(&selected, &config, &observed)
+            .estimate_entry(entry)
+            .expect("observed estimate");
+        assert_eq!(latency, 5_000, "the observed p50 replaces the default for scoring");
     }
 
     #[test]

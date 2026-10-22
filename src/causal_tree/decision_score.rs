@@ -450,6 +450,23 @@ mod tests {
     }
 
     #[test]
+    fn execution_latency_still_lowers_the_score() {
+        let weights = ScorerWeights::effective(&ScoringConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+        let fast = ScoreInputs {
+            estimated_latency_ms: 77,
+            remaining_latency_ms: 10_000,
+            ..inputs()
+        };
+        let slow = ScoreInputs {
+            estimated_latency_ms: 5_000,
+            ..fast
+        };
+        let fast = CausalBranchScorer::score(prediction(), fast, &weights).unwrap_or_else(|error| panic!("{error}"));
+        let slow = CausalBranchScorer::score(prediction(), slow, &weights).unwrap_or_else(|error| panic!("{error}"));
+        assert!(slow.execution_utility < fast.execution_utility);
+    }
+
+    #[test]
     fn each_risk_and_uncertainty_coordinate_lowers_an_interior_score() {
         let weights = ScorerWeights::effective(&ScoringConfig::default()).expect("valid default weights");
         let original = CandidatePrediction {

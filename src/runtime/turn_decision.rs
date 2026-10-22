@@ -661,7 +661,7 @@ pub(crate) struct TurnDecisionContext {
     execution_closed: AtomicBool,
     approval_collection_started: AtomicBool,
     collected_pending: std::sync::OnceLock<Box<pending_approval::CollectedPendingCommitment>>,
-    discovery_offers: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<String, CapabilityRef>>>,
+    discovery_offers: std::sync::OnceLock<parking_lot::Mutex<discovery::DiscoveryOffers>>,
     discovery_admissions: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<String, discovery::DiscoveryAdmission>>>,
     engine: EngineDecision,
     /// Completed dependent hops retained for the recorder. Nothing is

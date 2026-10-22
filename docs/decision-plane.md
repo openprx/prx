@@ -230,10 +230,16 @@ A failed write closes further accounting and leaves cleanup unconfirmed. Missing
 or estimated usage retains the pending token and money liability; cancellation does not turn
 an unknown charge into zero. Local budget refusal does not damage backend health.
 Post-prediction gates and scoring use remaining budgets without rewriting the
-fingerprinted request state. A priced direct Answer has zero extra execution
-latency because the serving-model response is the turn's baseline path; its
-token and monetary estimate still pass G6. Retrieval and tool candidates keep
-their own execution-latency estimates. Administrative probes/tests use a
+fingerprinted request state. G6 compares a candidate's decision overhead with
+`extra_latency_budget_ms`, the extra latency one turn may spend deciding. A
+priced direct Answer, a retrieval and a tool candidate add no extra decision
+latency (overhead 0, known exactly when the model is priced; an unpriced model
+still fails G6); their token and monetary estimates still pass G6. The
+execution-latency estimate (the family default or the observed p50) is a
+separate value kept on the candidate for scoring and is never compared with
+that budget. A generator probe rejected by a hard gate is traced at debug level
+(`causal_tree::candidates`) with its candidate id, gate number and reason code.
+Administrative probes/tests use a
 separate owned scope under the existing live-test permission checks. An
 unfunded probe is reported as unprobed, not as successful health evidence.
 

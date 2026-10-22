@@ -585,6 +585,145 @@ async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() 
     }
 }
 
+/// Admission is bounded per turn across repeated searches and follows the
+/// order the searches returned hits, not the alphabet.
+#[tokio::test]
+async fn discovered_tools_are_capped_per_turn_and_admitted_in_search_rank_order() {
+    {
+        let autonomy = crate::security::AutonomyLevel::Full;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        config.causal_tree.enabled = true;
+        config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+        config.autonomy.level = autonomy;
+        config.cost.prices.insert(
+            "prx-local-model".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+            )
+            .unwrap(),
+        );
+        let generation = crate::config::new_shared(config.clone()).pin();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let mut tools: Vec<Box<dyn Tool>> = ["file_read", "skills_list", "skill_read", "shell"]
+            .into_iter()
+            .map(|name| {
+                Box::new(DiscoverySurfaceTool {
+                    name,
+                    dispatches: Arc::clone(&dispatches),
+                }) as Box<dyn Tool>
+            })
+            .collect();
+        tools.push(Box::new(CapabilitySearchTool));
+        let registry = Arc::new(tools);
+        let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
+            Arc::clone(&registry),
+            Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+            Arc::new(DenyApprovalStrategy),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        ));
+        let catalog = ProviderCatalogView::from_config(&config);
+        let transports = CountingTransports(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+        let mut service = build_turn_decision_service(
+            TurnSurfaceKind::AgentLoop,
+            TurnServiceBuild {
+                parent_grant: None,
+                generation: Arc::clone(&generation),
+                registry,
+                execution,
+                catalog_sources: sources(&generation, &config),
+                surface_policy: SurfacePolicy {
+                    direct_names: BTreeSet::from(["file_read".to_owned()]),
+                    ..SurfacePolicy::default()
+                },
+                provider_catalog: &catalog,
+                transports: &transports,
+                events: Arc::new(SilentEvents),
+                memory: Arc::clone(&memory),
+                security,
+            },
+        )
+        .await
+        .unwrap();
+        let predictions = Arc::new(AtomicUsize::new(0));
+        let owning = Arc::get_mut(&mut service).unwrap();
+        owning.factory = DecisionBackendFactory::from_slots(
+            vec![Box::new(ExecuteContextProbeBackend {
+                identity: BackendIdentity {
+                    kind: BackendKind::Mock,
+                    provider: None,
+                    configured_model: Arc::from("prx-local-model"),
+                },
+                calls: Arc::clone(&predictions),
+            })],
+            Arc::clone(&owning.state_key),
+            OutboundSecrets::default(),
+            SlotLimits::default(),
+        );
+        let cli = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
+            &generation,
+            Arc::clone(&memory),
+            "could you make that sound a little friendlier please",
+            "prx_discovery_cap",
+        )
+        .await;
+        let proof = crate::runtime::turn_source::OwnedTurnSourceProof::capture(&cli);
+        let context = service
+            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
+        let original_refs = context.execution_refs().clone();
+        let port = service.capability_search_port(&proof, &context).unwrap();
+        // `skills_list` ranks first although `shell` sorts first alphabetically.
+        for name in ["skills_list", "shell"] {
+            let result = with_search_authority(
+                Some(port.clone()),
+                CapabilitySearchTool.execute(serde_json::json!({"query": name, "limit": 1})),
+            )
+            .await
+            .unwrap();
+            assert!(result.success);
+            let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            assert_eq!(output.get("hits").unwrap().as_array().unwrap().len(), 1, "{name}");
+        }
+        // A turn cap of one, counted across both searches' offers and every pass.
+        let mut admitted = 0;
+        for _ in 0..3 {
+            admitted += service.admit_offered_discoveries_up_to(&proof, &context, 1, |_, _| false);
+        }
+        assert_eq!(admitted, 1);
+        let appended: Vec<_> = service
+            .agent_appended_execution_specs(&proof, &context)
+            .unwrap()
+            .specs
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(
+            appended,
+            ["skills_list"],
+            "the first hit in search order, not alphabetically"
+        );
+        assert_eq!(context.execution_refs(), &original_refs);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        context.terminal_execution_trace();
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+}
+
 #[tokio::test]
 async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_execution() {
     const SKILL_NAME: &str = "prx_skill";

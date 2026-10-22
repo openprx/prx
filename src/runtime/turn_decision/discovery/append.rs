@@ -8,6 +8,9 @@ use crate::causal_tree::candidate_generator::CostEstimateSource;
 use crate::causal_tree::gates::{GateOutcome, HardGates};
 use crate::causal_tree::state::SideEffectMode;
 
+/// Most discovered tools one turn may declare, counted across every search.
+pub(crate) const MAX_DISCOVERED_TOOLS_PER_TURN: usize = 10;
+
 /// A checked proposal, not an execution binding. Approval outcomes must be
 /// handled before a caller publishes or dispatches the definition.
 pub(crate) struct DiscoveredToolProposal {
@@ -96,26 +99,46 @@ impl TurnDecisionService {
     }
 
     /// Offer the hits of a completed `capability_search` to the NEXT model
-    /// request. Every returned hit goes through the same admission as a call by
-    /// name (`admit_discovered_tool`: policy, capability, owner, exclusion and
-    /// budget gates), so the search result itself never grants anything; a
-    /// hit that is blocked, pending approval or hidden by `excluded` is not
-    /// published. The request already sent is not rewritten: call this before
-    /// the next request's tool surface is built. At most `MAX_SEARCH_HITS`
-    /// hits become newly admitted per call. Returns the count newly admitted.
+    /// request. Every returned hit goes through the same gates as a call by
+    /// name (`admit_discovered_tool`: `check_capability_publication`, which
+    /// covers policy, capability, owner and exclusion; it does not apply G6),
+    /// so the search result itself never grants anything; a hit that is
+    /// blocked, pending approval or hidden by `excluded` is not published.
+    /// The request already sent is not rewritten: call this before the next
+    /// request's tool surface is built. Hits are taken in search-rank order, at
+    /// most `MAX_SEARCH_HITS` newly admitted per call and
+    /// `MAX_DISCOVERED_TOOLS_PER_TURN` admitted over the whole turn. Returns
+    /// the count newly admitted.
     pub(crate) fn admit_offered_discoveries(
         &self,
         proof: &dyn TurnSourceProof,
         context: &TurnDecisionContext,
         excluded: impl Fn(&str, &str) -> bool,
     ) -> usize {
+        self.admit_offered_discoveries_up_to(proof, context, MAX_DISCOVERED_TOOLS_PER_TURN, excluded)
+    }
+
+    /// [`Self::admit_offered_discoveries`] with an explicit per-turn cap.
+    pub(crate) fn admit_offered_discoveries_up_to(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+        turn_cap: usize,
+        excluded: impl Fn(&str, &str) -> bool,
+    ) -> usize {
         let Some(offers) = context.discovery_offers.get() else {
             return 0;
         };
-        let names = offers.lock().keys().cloned().collect::<Vec<_>>();
+        let names = offers.lock().names();
         let mut newly_admitted = 0;
         for name in names {
-            if newly_admitted >= crate::tools::capability::search_tool::MAX_SEARCH_HITS {
+            let admitted_this_turn = context
+                .discovery_admissions
+                .get()
+                .map_or(0, |admissions| admissions.lock().len());
+            if newly_admitted >= crate::tools::capability::search_tool::MAX_SEARCH_HITS
+                || admitted_this_turn >= turn_cap
+            {
                 break;
             }
             if context.discovery_admission(&name).is_some() {
@@ -188,13 +211,7 @@ impl TurnDecisionService {
         let Some(offers) = context.discovery_offers.get() else {
             return Ok(None);
         };
-        let reference = {
-            let offers = offers.lock();
-            offers
-                .get(name_or_id)
-                .or_else(|| offers.values().find(|reference| reference.id.as_str() == name_or_id))
-                .cloned()
-        };
+        let reference = offers.lock().find(name_or_id);
         let Some(reference) = reference else {
             return Ok(None);
         };
