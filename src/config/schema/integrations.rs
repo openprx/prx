@@ -102,7 +102,7 @@ pub struct McpServerRuntimeConfig {
     ///
     /// The defaults are all read-only. Every external MCP caller runs
     /// owner-isolated, so only names on the owner-isolation-aware list
-    /// (`crate::tools::execution::OWNER_ISOLATION_AWARE_TOOLS`) can run; any
+    /// (`crate::causal_tree::capability_policy::OWNER_ISOLATION_AWARE_TOOLS`) can run; any
     /// other name is not advertised, is refused with HTTP 403, and is warned
     /// about at config load. An admissible tool with side effects
     /// (`memory_forget`, `memory_store`, `document_ingest`) is advertised with its real effect by

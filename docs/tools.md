@@ -29,6 +29,13 @@ only `mcp_call`. Its schema does not enumerate configured servers or tools.
 | **Infrastructure** | `gateway`, `config_reload`, `proxy_config`, `agents_list` |
 | **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
 
+`web_search_tool` uses DuckDuckGo by default. A non-200 response, bot challenge,
+or unrecognized result page returns an error instead of a successful empty
+search. A recognized no-results page still reports no results. Retry later or
+configure `[web_search] provider = "brave"` with a Brave credential. Public web
+search is available to owner-isolated callers; provider credentials and quota
+remain shared across owners.
+
 Fresh file-write approval in the candidate runtime uses a dedicated argument
 collection path in recorded Chat and Console sessions. Under supervised
 policy, explicitly name `file_write` or `file_edit` in the request. When that
@@ -363,11 +370,12 @@ discovered yet, PRX refreshes the dynamic registries before resolving the
 allowlist. Multiple aliases exported by the same MCP, WASM, or Skill router are
 represented by independent public-name proxies and remain executable.
 
-Every provider-visible tool uses an object JSON Schema. Multi-action tools
-publish discriminator-specific required fields through canonical conditional
-clauses. `ToolExecutionService::execute` — the single path every native, skill,
-MCP alias and WASM plugin call takes — evaluates that same published schema
-against the model's arguments before the policy decision is acted on, before any
+Every provider-visible tool uses an object JSON Schema. Built-in multi-action
+tools publish flat fields and retain their conditional requirements in a private
+execution contract; other tools use their published schema as the contract.
+`ToolExecutionService::execute` — the single path every native, skill,
+MCP alias and WASM plugin call takes — evaluates that contract
+against the model's arguments before the policy decision is requested, before any
 approval prompt, and before the executor runs. Validation covers nested required
 fields, scalar types, enums, constants, string/array lengths, numeric bounds,
 union types, unknown-field rejection where the schema closes its property set,
@@ -378,8 +386,11 @@ the document constrains nothing, and the subtree *below* a cycle is
 unconstrained as well — only the level at which the cycle closes is enforced).
 A structurally invalid call is rejected
 with an `InvalidArguments` outcome that names every offending path, is recorded
-in the tool execution audit like any other terminal outcome, and never reaches
-the backend. Executor checks remain as defense in depth.
+in the tool execution audit with `decision: None`, and never reaches the backend.
+Once resolution, capability and owner-isolation checks pass, this validation
+precedes policy denial: invalid arguments report `InvalidArguments` even if the
+policy would return `Denied`.
+Executor checks remain as defense in depth.
 
 Validation is fail-open on JSON Schema keywords PRX does not model and
 fail-closed on the ones it does: a dynamic MCP or WASM contract that uses
@@ -447,7 +458,8 @@ external MCP caller runs owner-isolated (see "Owner-isolated reads for external
 MCP callers"), and the execution service refuses an owner-isolated caller any
 tool that does not enforce per-owner isolation, before policy and approval are
 evaluated. The list is explicit (`OWNER_ISOLATION_AWARE_TOOLS` in
-`src/tools/execution.rs`): `memory_search`, `memory_recall`, `memory_get`,
+`src/causal_tree/capability_policy.rs`): `capability_search`, `web_search_tool`,
+`memory_search`, `memory_recall`, `memory_get`,
 `document_search`, `document_get_chunk`, `sessions_list`, `sessions_history`,
 `memory_forget`, `memory_store` and `document_ingest`. The name must also be
 served by the tool of that name, so a dynamic MCP, WASM or skill alias that
@@ -460,7 +472,11 @@ owner-isolated caller: it does not enforce per-owner isolation` before any
 idempotency reservation or identity binding is written, and is named by a
 warning when the configuration loads. The entry does not fail config load, so
 a daemon whose configuration exposed such a tool still starts. A tool joins the
-list only after it scopes its own effect by owner. `session_status` and
+list only after it scopes its own effect by owner or reads no private runtime
+state. `web_search_tool` performs stateless public web reads; the configured
+provider credentials and quota are shared across owners, not allocated per owner.
+`skills_manage` remains excluded because its legacy actions mutate the shared
+workspace. `session_status` and
 `sessions_send` scope their effect by owner for in-process turns, but the
 gateway does not register them, so they are kept off the list: exposing them
 over MCP answers the 403 above, before anything is written, rather than a 404
@@ -1562,7 +1578,13 @@ idempotency reservation. Invalid arguments return `InvalidArguments` without
 prompting for approval. Service dispatch applies the selected schema dialect to
 this contract: Gemini retains its existing keyword stripping and executor clamps.
 Direct calls without a service dialect enforce the full original contract and
-return typed argument errors. Flattening does not grant permissions or relax
+return typed argument errors. A nested direct call sharing the active service's
+exact cached contract inherits its dialect, including when two tool instances
+share one static contract. A different contract or a call outside that scope
+uses Raw. Nested calls needing their own dialect, policy, approval or audit must
+go through service dispatch. Missing profile fields report an actionable
+`provide at least one of` hint naming `purpose`, `notes` and `tags`.
+Flattening does not grant permissions or relax
 approval checks. Callers that construct forms from schemas must also handle
 conditional argument errors.
 

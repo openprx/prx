@@ -1923,6 +1923,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_apply_names_the_shadowing_fragment_and_target_repairs_it() {
+        let (dir, config) = fixture(|_| {}).await;
+        let before = stored(&dir);
+        let fragments = dir.path().join("config.d");
+        std::fs::create_dir_all(&fragments).unwrap();
+        let fragment = fragments.join("tools.toml");
+        let original_fragment = "[web_search]\nprovider = 'duckduckgo'\n";
+        std::fs::write(&fragment, original_fragment).unwrap();
+        let mut posted: toml::Value = toml::from_str(std::str::from_utf8(&before).unwrap()).unwrap();
+        *posted.get_mut("web_search").unwrap().get_mut("provider").unwrap() = toml::Value::String("brave".into());
+        let file = dir.path().join("posted.toml");
+        std::fs::write(&file, toml::to_string(&posted).unwrap()).unwrap();
+        let path = file.to_str().unwrap();
+        for args in [
+            vec!["config", "plan", "--file", path],
+            vec!["config", "apply", "--file", path, "--yes"],
+        ] {
+            let (result, out) = run_cli(&args, config.clone(), "", &[]).await;
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("web_search.provider is shadowed by config.d/tools.toml; use --target tools.toml"),
+                "{error}"
+            );
+            assert!(!out.contains("no change"), "{out}");
+            assert_eq!(stored(&dir), before);
+            assert_eq!(std::fs::read_to_string(&fragment).unwrap(), original_fragment);
+        }
+        // A valid unrelated edit must not hide a shadowed field or be partly applied.
+        *posted.get_mut("default_temperature").unwrap() = toml::Value::Float(0.4);
+        std::fs::write(&file, toml::to_string(&posted).unwrap()).unwrap();
+        let (result, _) = run_cli(&["config", "apply", "--file", path, "--yes"], config.clone(), "", &[]).await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("shadowed by config.d/tools.toml")
+        );
+        assert_eq!(stored(&dir), before);
+        assert_eq!(std::fs::read_to_string(&fragment).unwrap(), original_fragment);
+        // Posting an unchanged base is still legal even though the fragment wins.
+        std::fs::write(&file, &before).unwrap();
+        let (result, _) = run_cli(&["config", "plan", "--file", path], config.clone(), "", &[]).await;
+        result.unwrap();
+        // Follow the exact guidance: the target is a basename and other files stay intact.
+        std::fs::write(&file, "[web_search]\nprovider = 'brave'\n").unwrap();
+        let (result, out) = run_cli(
+            &["config", "apply", "--file", path, "--target", "tools.toml", "--yes"],
+            config,
+            "",
+            &[],
+        )
+        .await;
+        result.unwrap();
+        assert!(out.contains("Written and validated"), "{out}");
+        assert_eq!(stored(&dir), before);
+        assert_eq!(reload(&dir).await.web_search.provider, "brave");
+    }
+
+    #[tokio::test]
     async fn stored_deleted_model_settings_can_be_inspected_without_selecting_them() {
         let (dir, config) = fixture(|config| {
             config.model_settings.insert(

@@ -1,0 +1,26 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "notes": {
+      "description": "Brief operational notes about the current conversation. Max 1024 characters.",
+      "maxLength": 1024,
+      "minLength": 1,
+      "type": "string"
+    },
+    "purpose": {
+      "description": "What the current conversation is for. Max 300 characters.",
+      "maxLength": 300,
+      "minLength": 1,
+      "type": "string"
+    },
+    "tags": {
+      "description": "Up to 10 short tags for the current conversation.",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 10,
+      "type": "array"
+    }
+  },
+  "type": "object"
+}

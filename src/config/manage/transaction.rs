@@ -588,6 +588,9 @@ impl ConfigTransactions {
         if let Some(posted) = posted_file {
             boundary::check_stored_candidate(&posted.posted, posted.current.as_ref(), candidate.secrets.encrypt)
                 .map_err(|message| ConfigTransactionError::Invalid(anyhow::anyhow!(message)))?;
+            mutation
+                .refuse_shadowed_raw_changes(&posted.filename, &posted.posted, posted.current.as_ref(), &stored)
+                .map_err(ConfigTransactionError::Invalid)?;
         }
         let current = match Config::load_from_path(&config_path, workspace_dir) {
             Ok(current) => Some(current),
@@ -1203,6 +1206,7 @@ impl ConfigTransactions {
 /// A raw file write: the posted file's own tree and the same file's current
 /// tree (`None` when it does not exist or does not parse).
 struct PostedFile {
+    filename: String,
     posted: toml::Value,
     current: Option<toml::Value>,
 }
@@ -1213,6 +1217,7 @@ fn posted_file_trees(config_path: &Path, filename: &str, contents: &str) -> Post
     let parse = |text: &str| toml::from_str::<toml::Table>(text).ok().map(toml::Value::Table);
     if filename.contains(['/', '\\']) || filename.contains("..") {
         return PostedFile {
+            filename: filename.to_owned(),
             posted: parse(contents).unwrap_or_else(|| toml::Value::Table(toml::Table::new())),
             current: None,
         };
@@ -1231,6 +1236,7 @@ fn posted_file_trees(config_path: &Path, filename: &str, contents: &str) -> Post
         }
     };
     PostedFile {
+        filename: filename.to_owned(),
         posted: parse(contents).unwrap_or_else(|| toml::Value::Table(toml::Table::new())),
         current,
     }

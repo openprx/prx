@@ -1,0 +1,44 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "default": "list",
+      "description": "Action to perform: 'list' shows active and recent runs, 'kill' terminates a run, 'steer' sends a message into a running one. Defaults to 'list' when omitted.",
+      "enum": [
+        "list",
+        "kill",
+        "steer"
+      ],
+      "type": "string"
+    },
+    "limit": {
+      "description": "Maximum number of results for 'list' (default 20).",
+      "maximum": 100,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "message": {
+      "description": "Message to send into the run; required for 'steer'.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "run_id": {
+      "description": "Target run ID; required for 'kill' and 'steer'.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "status": {
+      "default": "all",
+      "description": "Optional status filter for 'list'.",
+      "enum": [
+        "all",
+        "running",
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [],
+  "type": "object"
+}

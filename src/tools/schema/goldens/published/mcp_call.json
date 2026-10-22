@@ -1,0 +1,33 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "default": "call",
+      "description": "'call' invokes a remote tool; 'list' and 'status' inspect discovery state and errors; 'refresh' forces rediscovery Defaults to 'call' when omitted.",
+      "enum": [
+        "call",
+        "list",
+        "status",
+        "refresh"
+      ],
+      "type": "string"
+    },
+    "arguments": {
+      "default": {},
+      "description": "Arguments object forwarded to MCP call_tool for 'call'",
+      "type": "object"
+    },
+    "server": {
+      "description": "Configured MCP server name; required for 'call'",
+      "minLength": 1,
+      "type": "string"
+    },
+    "tool": {
+      "description": "Remote MCP tool name to invoke; required for 'call'",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [],
+  "type": "object"
+}

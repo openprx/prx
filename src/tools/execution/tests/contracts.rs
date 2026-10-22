@@ -3,6 +3,62 @@
 use super::*;
 
 #[tokio::test]
+async fn isolated_web_search_reaches_the_real_tool_and_still_obeys_policy() {
+    for decision in [ToolExecutionDecision::Allow, ToolExecutionDecision::Deny] {
+        let fixture = fixture();
+        let service = ToolExecutionService::from_shared_boxed_registry(
+            Arc::new(vec![Box::new(crate::tools::web_search_tool::WebSearchTool::new(
+                "duckduckgo".to_owned(),
+                None,
+                5,
+                15,
+            )) as Box<dyn Tool>]),
+            Arc::new(FixedPolicy {
+                decision,
+                stages: Arc::clone(&fixture.stages),
+            }),
+            Arc::new(FixedApproval {
+                decision: approved(),
+                stages: Arc::clone(&fixture.stages),
+            }),
+            Arc::new(RecordingPreparation {
+                stages: Arc::clone(&fixture.stages),
+                allowed: true,
+            }),
+            Arc::new(RecordingAudit {
+                records: Arc::clone(&fixture.records),
+                stages: Arc::clone(&fixture.stages),
+            }),
+        );
+        let mut isolated = context();
+        isolated.envelope.owner_isolated = true;
+        // Schema-valid but rejected by the real backend before any network call.
+        let outcome = service
+            .execute(
+                ToolExecutionCommand::new("web_search_tool", serde_json::json!({"query": " "})),
+                isolated,
+                None,
+            )
+            .await;
+        if decision == ToolExecutionDecision::Allow {
+            assert_eq!(outcome.status, ToolExecutionStatus::Failed);
+            assert!(
+                outcome
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Search query cannot be empty")
+            );
+            assert_eq!(&*fixture.stages.lock(), &["policy", "preparation", "audit"]);
+        } else {
+            assert_eq!(outcome.status, ToolExecutionStatus::Denied);
+            assert_eq!(&*fixture.stages.lock(), &["policy", "audit"]);
+        }
+        assert_eq!(fixture.records.lock().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn approval_denial_is_typed_and_fail_closed() {
     let fixture = fixture();
     let service = fixture.service(

@@ -472,7 +472,7 @@ default_provider = "mock"
 default_model = "mock"
 
 [autonomy]
-level = "read_only"
+level = "readonly"
 workspace_only = true
 
 [chat.daemon]

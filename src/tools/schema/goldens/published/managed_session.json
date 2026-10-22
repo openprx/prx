@@ -1,0 +1,34 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "default": "list",
+      "description": "'shell' starts a managed background shell; 'list' shows the sessions; 'logs' reads recent output; 'kill' terminates a shell session. Defaults to 'list' when omitted.",
+      "enum": [
+        "shell",
+        "list",
+        "logs",
+        "kill"
+      ],
+      "type": "string"
+    },
+    "command": {
+      "description": "Shell command to run; required for 'shell'.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "max_lines": {
+      "description": "Maximum recent log lines to return for 'logs'.",
+      "maximum": 500,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "session_id": {
+      "description": "Managed shell session id; required for 'logs' and 'kill'.",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [],
+  "type": "object"
+}

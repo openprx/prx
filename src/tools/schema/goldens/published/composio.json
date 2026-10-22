@@ -1,0 +1,52 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "description": "The operation: 'list' (list available actions), 'list_accounts'/'connected_accounts' (list connected accounts), 'execute' (run an action), or 'connect' (get OAuth URL)",
+      "enum": [
+        "list",
+        "list_accounts",
+        "connected_accounts",
+        "execute",
+        "connect"
+      ],
+      "type": "string"
+    },
+    "action_name": {
+      "description": "Action/tool identifier for 'execute' (legacy aliases supported)",
+      "minLength": 1,
+      "type": "string"
+    },
+    "app": {
+      "description": "Toolkit slug filter for 'list' or 'list_accounts', optional app hint for 'execute', or toolkit/app for 'connect' (e.g. 'gmail', 'notion', 'github')",
+      "minLength": 1,
+      "type": "string"
+    },
+    "auth_config_id": {
+      "description": "Optional Composio v3 auth config id for the 'connect' flow",
+      "minLength": 1,
+      "type": "string"
+    },
+    "connected_account_id": {
+      "description": "Optional connected account ID for execute flow when a specific account is required",
+      "type": "string"
+    },
+    "entity_id": {
+      "description": "Entity/user ID for multi-user setups (defaults to composio.entity_id from config)",
+      "type": "string"
+    },
+    "params": {
+      "description": "Parameters to pass to the action",
+      "type": "object"
+    },
+    "tool_slug": {
+      "description": "Preferred v3 tool slug for 'execute' (alias of action_name)",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "action"
+  ],
+  "type": "object"
+}

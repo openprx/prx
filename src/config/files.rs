@@ -560,6 +560,51 @@ pub fn plan_before_image_restore(
 }
 
 impl ConfigMutationPlan {
+    /// Refuse changed raw-file fields whose effective values come from a later
+    /// managed fragment. Inspect the planned files, not a new disk snapshot.
+    pub(crate) fn refuse_shadowed_raw_changes(
+        &self,
+        filename: &str,
+        posted: &Value,
+        current: Option<&Value>,
+        effective: &Value,
+    ) -> Result<()> {
+        fn at<'a>(tree: &'a Value, path: &[String]) -> Option<&'a Value> {
+            path.iter().try_fold(tree, |node, key| node.get(key.as_str()))
+        }
+        if filename != "config.toml" && !self.managed_fragments.contains_key(filename) {
+            return Ok(());
+        }
+        let later = self
+            .managed_fragments
+            .iter()
+            .filter(|(name, _)| filename == "config.toml" || name.as_str() > filename)
+            .map(|(name, contents)| {
+                toml::from_str::<Value>(contents)
+                    .map(|tree| (name.as_str(), tree))
+                    .context("Cannot inspect a staged configuration fragment")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut changed = Vec::new();
+        changed_raw_paths(current, Some(posted), &mut Vec::new(), &mut changed);
+        let mut shadowed = Vec::new();
+        for path in changed {
+            if at(posted, &path) == at(effective, &path) {
+                continue;
+            }
+            if let Some((name, _)) = later.iter().rev().find(|(_, tree)| at(tree, &path).is_some()) {
+                shadowed.push(format!(
+                    "{} is shadowed by config.d/{name}; use --target {name}",
+                    path.join(".")
+                ));
+            }
+        }
+        if !shadowed.is_empty() {
+            bail!("{}; nothing was written", shadowed.join("; "));
+        }
+        Ok(())
+    }
+
     /// The configuration file this plan writes.
     #[must_use]
     pub fn config_path(&self) -> &Path {
@@ -593,6 +638,38 @@ impl ConfigMutationPlan {
             intended.insert(relative, contents);
         }
         Ok(intended)
+    }
+}
+
+fn changed_raw_paths(
+    before: Option<&Value>,
+    after: Option<&Value>,
+    path: &mut Vec<String>,
+    changed: &mut Vec<Vec<String>>,
+) {
+    if before == after {
+        return;
+    }
+    let before_table = before.and_then(Value::as_table);
+    let after_table = after.and_then(Value::as_table);
+    if (before.is_none() || before_table.is_some()) && (after.is_none() || after_table.is_some()) {
+        let keys = before_table
+            .into_iter()
+            .chain(after_table)
+            .flat_map(|table| table.keys())
+            .collect::<BTreeSet<_>>();
+        for key in keys {
+            path.push(key.clone());
+            changed_raw_paths(
+                before.and_then(|v| v.get(key)),
+                after.and_then(|v| v.get(key)),
+                path,
+                changed,
+            );
+            path.pop();
+        }
+    } else {
+        changed.push(path.clone());
     }
 }
 
