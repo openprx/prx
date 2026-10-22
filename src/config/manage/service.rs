@@ -275,6 +275,8 @@ impl ManagementService {
 
     /// Plan a raw file write (`config.toml` or a `config.d` fragment), as the
     /// Gateway raw editor does; nothing is written.
+    /// `allow_secret_clear` explicitly permits omission of stored secrets;
+    /// mask, encryption, risk and revision checks still apply.
     ///
     /// # Errors
     ///
@@ -284,11 +286,16 @@ impl ManagementService {
         &self,
         filename: String,
         contents: String,
+        allow_secret_clear: bool,
         actor: ConfigActor,
     ) -> Result<ManagedPlan, ManageError> {
         let plan = self
             .transactions
-            .plan(ConfigChange::RawFile { filename, contents })
+            .plan(ConfigChange::RawFile {
+                filename,
+                contents,
+                allow_secret_clear,
+            })
             .await?;
         let warnings = self.transactions.check_selections(&plan, actor).await?;
         let revision = plan.planned_revision().map(str::to_string);

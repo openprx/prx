@@ -467,6 +467,17 @@ fn secret_leaves(root: &Value) -> std::collections::BTreeMap<String, SecretLeaf>
     out
 }
 
+/// Raw-file omissions use the same identities as risk classification, so
+/// shifting an intact keyed route or reordering a token list clears nothing.
+pub(super) fn omitted_secret_paths(before: &Value, after: &Value) -> Vec<String> {
+    let after = secret_leaves(after);
+    secret_leaves(before)
+        .into_iter()
+        .filter(|(identity, leaf)| leaf.value != secret_paths::REDACTION_MASK && !after.contains_key(identity))
+        .map(|(_, leaf)| leaf.display)
+        .collect()
+}
+
 /// One side of the comparison: the unredacted value decides whether
 /// something changed, the redacted one is what is shown.
 #[derive(Clone, Copy)]

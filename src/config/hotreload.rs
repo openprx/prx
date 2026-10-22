@@ -396,6 +396,7 @@ mod tests {
         let first = cli1
             .apply(
                 cli1.plan(ConfigChange::RawFile {
+                    allow_secret_clear: false,
                     filename: "config.toml".to_string(),
                     contents: "default_temperature = 0.4\n".to_string(),
                 })
@@ -414,6 +415,7 @@ mod tests {
         let second = cli2
             .apply(
                 cli2.plan(ConfigChange::RawFile {
+                    allow_secret_clear: false,
                     filename: "config.toml".to_string(),
                     contents: original.to_string(),
                 })

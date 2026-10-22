@@ -59,7 +59,13 @@ pub enum ConfigChange {
     Structured(Box<Config>),
     /// One raw file (`config.toml` or a `config.d` fragment), written as
     /// given; every other file is kept byte for byte.
-    RawFile { filename: String, contents: String },
+    RawFile {
+        filename: String,
+        contents: String,
+        /// Explicit permission to omit or empty stored secret slots.
+        /// Does not bypass mask, encryption, risk or revision checks.
+        allow_secret_clear: bool,
+    },
 }
 
 /// A validated change that has not been written.
@@ -544,8 +550,15 @@ impl ConfigTransactions {
                 }
                 (files::plan_structured_save(&config), None)
             }
-            ConfigChange::RawFile { filename, contents } => {
+            ConfigChange::RawFile {
+                filename,
+                contents,
+                allow_secret_clear,
+            } => {
+                files::validate_raw_config_file_name(&filename).map_err(ConfigTransactionError::Invalid)?;
                 let posted = posted_file_trees(&config_path, &filename, &contents);
+                boundary::check_raw_secret_removal(&posted.posted, posted.current.as_ref(), allow_secret_clear)
+                    .map_err(|message| ConfigTransactionError::Invalid(anyhow::anyhow!(message)))?;
                 (
                     files::plan_config_file_mutation(&config_path, &workspace_dir, &filename, contents),
                     Some(posted),
@@ -2155,6 +2168,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_replacement_protects_secrets_outside_the_effective_config() {
+        for filename in ["tools.toml", "zz-local.toml"] {
+            let fixture = fixture().await;
+            let target = fixture.dir.path().join("config.d").join(filename);
+            let original = std::fs::read_to_string(&target).unwrap_or_default();
+            let stored = format!("{original}\n[future_section]\nclient_secret = 'prx-hidden-fixture'\n");
+            std::fs::write(&target, &stored).unwrap();
+            let before = fixture.tree();
+            let error = fixture
+                .service()
+                .plan(ConfigChange::RawFile {
+                    filename: filename.into(),
+                    contents: original.clone(),
+                    allow_secret_clear: false,
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("future_section.client_secret"), "{error}");
+            assert!(error.to_string().contains("PUT /api/config/secrets"), "{error}");
+            assert!(!error.to_string().contains("prx-hidden-fixture"), "{error}");
+            assert_eq!(fixture.tree(), before);
+            fixture
+                .service()
+                .plan(ConfigChange::RawFile {
+                    filename: filename.into(),
+                    contents: original,
+                    allow_secret_clear: true,
+                })
+                .await
+                .unwrap();
+            assert_eq!(fixture.tree(), before, "planning never writes");
+        }
+    }
+
+    #[tokio::test]
     async fn an_invalid_raw_file_is_refused_before_anything_is_written() {
         let fixture = fixture().await;
         let before = fixture.tree();
@@ -2162,6 +2210,7 @@ mod tests {
 
         let error = service
             .plan(ConfigChange::RawFile {
+                allow_secret_clear: false,
                 filename: "memory.toml".into(),
                 contents: "[memory]\nbackend = 7\n".into(),
             })
@@ -2183,6 +2232,7 @@ mod tests {
         let error = fixture
             .service()
             .plan(ConfigChange::RawFile {
+                allow_secret_clear: false,
                 filename: "config.toml".into(),
                 contents: bogus,
             })
@@ -2343,6 +2393,7 @@ mod tests {
         let main = std::fs::read_to_string(fixture.config_path()).expect("test: read");
         let plan = service
             .plan(ConfigChange::RawFile {
+                allow_secret_clear: false,
                 filename: "config.toml".into(),
                 contents: main.replacen("default_temperature = 0.7", "default_temperature = 0.6", 1),
             })
@@ -2500,6 +2551,7 @@ mod tests {
         let error = fixture
             .service()
             .plan(ConfigChange::RawFile {
+                allow_secret_clear: false,
                 filename: "config.toml".into(),
                 contents: masked,
             })
@@ -2579,6 +2631,7 @@ mod tests {
         let service = fixture.service();
         let plan = service
             .plan(ConfigChange::RawFile {
+                allow_secret_clear: false,
                 filename: "config.toml".into(),
                 contents: hot,
             })
@@ -2614,6 +2667,7 @@ mod tests {
         let service = fixture.service();
         let plan = service
             .plan(ConfigChange::RawFile {
+                allow_secret_clear: false,
                 filename: filename.into(),
                 contents,
             })

@@ -1018,21 +1018,30 @@ fn read_posted_file(path: &std::path::Path) -> Result<(String, config::secret_pa
 
 pub(crate) async fn run_config(command: ConfigCommands, config: Config, io: &mut Io<'_>) -> Result<()> {
     match command {
-        ConfigCommands::Plan { file, target } => {
+        ConfigCommands::Plan {
+            file,
+            target,
+            allow_credential_clear,
+        } => {
             let (contents, scan) = read_posted_file(&file)?;
             let plan = service(config)
-                .plan_file(target, contents, ConfigActor::Cli)
+                .plan_file(target, contents, allow_credential_clear, ConfigActor::Cli)
                 .await
                 .map_err(|error| anyhow::anyhow!("{}", scan.scrub(&error.to_string())))?;
             write!(io.out, "{}", plan.text())?;
             writeln!(io.out, "Revision: {}", plan.revision().unwrap_or("none"))?;
             Ok(())
         }
-        ConfigCommands::Apply { file, target, apply } => {
+        ConfigCommands::Apply {
+            file,
+            target,
+            allow_credential_clear,
+            apply,
+        } => {
             let (contents, scan) = read_posted_file(&file)?;
             let service = service(config);
             let plan = service
-                .plan_file(target, contents, ConfigActor::Cli)
+                .plan_file(target, contents, allow_credential_clear, ConfigActor::Cli)
                 .await
                 .map_err(|error| anyhow::anyhow!("{}", scan.scrub(&error.to_string())))?;
             finish(&service, plan, &apply, io)
@@ -1920,6 +1929,211 @@ mod tests {
         result.expect("test: apply");
         assert!(out.contains("Written and validated"), "{out}");
         assert_ne!(stored(&dir), before);
+    }
+
+    #[tokio::test]
+    async fn raw_config_secret_removal_requires_the_clear_flag_on_plan_and_apply() {
+        for encrypt in [false, true] {
+            for target in ["config.toml", "tools.toml"] {
+                let (dir, mut config) = fixture(|config| {
+                    config.secrets.encrypt = encrypt;
+                    config.web_search.brave_api_key = Some(SECRET.into());
+                })
+                .await;
+                if target == "tools.toml" {
+                    config::files::write_split_config(&config, false).await.unwrap();
+                    config = reload(&dir).await;
+                }
+                let target_path = if target == "config.toml" {
+                    dir.path().join(target)
+                } else {
+                    dir.path().join("config.d").join(target)
+                };
+                let original = std::fs::read_to_string(&target_path).unwrap();
+                let before: toml::Value = toml::from_str(&original).unwrap();
+                let mut omitted = before.clone();
+                omitted
+                    .get_mut("web_search")
+                    .unwrap()
+                    .as_table_mut()
+                    .unwrap()
+                    .remove("brave_api_key");
+                let file = dir.path().join("posted.toml");
+                let path = file.to_str().unwrap();
+                let mut empty = before.clone();
+                *empty.get_mut("web_search").unwrap().get_mut("brave_api_key").unwrap() =
+                    toml::Value::String(String::new());
+                for posted in [&omitted, &empty] {
+                    std::fs::write(&file, toml::to_string(posted).unwrap()).unwrap();
+                    for command in ["plan", "apply"] {
+                        let mut args = vec!["config", command, "--file", path, "--target", target];
+                        if command == "apply" {
+                            args.push("--yes");
+                        }
+                        let (result, out) = run_cli(&args, config.clone(), "", &[]).await;
+                        let error = result.unwrap_err().to_string();
+                        for expected in [
+                            "web_search.brave_api_key",
+                            "PUT /api/config/secrets",
+                            "--allow-credential-clear",
+                        ] {
+                            assert!(error.contains(expected), "{error}");
+                        }
+                        assert!(!error.contains(SECRET), "{error}");
+                        assert!(!out.contains(SECRET), "{out}");
+                        assert_eq!(std::fs::read_to_string(&target_path).unwrap(), original);
+                        assert_eq!(reload(&dir).await.web_search.brave_api_key.as_deref(), Some(SECRET));
+                    }
+                }
+                // Exact stored ciphertext/plaintext is preserved without a clear flag.
+                std::fs::write(&file, &original).unwrap();
+                let (result, _) = run_cli(
+                    &["config", "plan", "--file", path, "--target", target],
+                    config.clone(),
+                    "",
+                    &[],
+                )
+                .await;
+                result.unwrap();
+                // Even explicit clear permission cannot turn a masked read into a write.
+                let mut masked = before.clone();
+                *masked.get_mut("web_search").unwrap().get_mut("brave_api_key").unwrap() =
+                    toml::Value::String("***".into());
+                std::fs::write(&file, toml::to_string(&masked).unwrap()).unwrap();
+                let (result, _) = run_cli(
+                    &[
+                        "config",
+                        "apply",
+                        "--file",
+                        path,
+                        "--target",
+                        target,
+                        "--allow-credential-clear",
+                        "--yes",
+                    ],
+                    config.clone(),
+                    "",
+                    &[],
+                )
+                .await;
+                assert!(result.unwrap_err().to_string().contains("redaction mask"));
+                assert_eq!(std::fs::read_to_string(&target_path).unwrap(), original);
+                if encrypt {
+                    *masked.get_mut("web_search").unwrap().get_mut("brave_api_key").unwrap() =
+                        toml::Value::String("prx-new-plaintext-fixture".into());
+                    std::fs::write(&file, toml::to_string(&masked).unwrap()).unwrap();
+                    let (result, _) = run_cli(
+                        &[
+                            "config",
+                            "apply",
+                            "--file",
+                            path,
+                            "--target",
+                            target,
+                            "--allow-credential-clear",
+                            "--yes",
+                        ],
+                        config.clone(),
+                        "",
+                        &[],
+                    )
+                    .await;
+                    assert!(result.unwrap_err().to_string().contains("plaintext credentials"));
+                    assert_eq!(std::fs::read_to_string(&target_path).unwrap(), original);
+                }
+                std::fs::write(&file, toml::to_string(&omitted).unwrap()).unwrap();
+                let (result, out) = run_cli(
+                    &[
+                        "config",
+                        "plan",
+                        "--file",
+                        path,
+                        "--target",
+                        target,
+                        "--allow-credential-clear",
+                    ],
+                    config.clone(),
+                    "",
+                    &[],
+                )
+                .await;
+                result.unwrap();
+                assert!(!out.contains(SECRET), "{out}");
+                assert_eq!(std::fs::read_to_string(&target_path).unwrap(), original);
+                let revision = out
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Revision: "))
+                    .unwrap()
+                    .to_owned();
+                let (result, _) = run_cli(
+                    &[
+                        "config",
+                        "apply",
+                        "--file",
+                        path,
+                        "--target",
+                        target,
+                        "--allow-credential-clear",
+                        "--yes",
+                    ],
+                    config.clone(),
+                    "",
+                    &[],
+                )
+                .await;
+                assert!(result.unwrap_err().to_string().contains("confirm-high-risk"));
+                assert_eq!(std::fs::read_to_string(&target_path).unwrap(), original);
+                let (result, out) = run_cli(
+                    &[
+                        "config",
+                        "apply",
+                        "--file",
+                        path,
+                        "--target",
+                        target,
+                        "--allow-credential-clear",
+                        "--yes",
+                        "--confirm-high-risk",
+                        &revision,
+                    ],
+                    config,
+                    "",
+                    &[],
+                )
+                .await;
+                result.unwrap();
+                assert!(out.contains("Written and validated"), "{out}");
+                assert!(!out.contains(SECRET), "{out}");
+                assert!(reload(&dir).await.web_search.brave_api_key.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_secret_clear_permission_does_not_confirm_access_changes() {
+        let (dir, config) = fixture(|config| config.gateway.paired_tokens = vec![SECRET.into()]).await;
+        let before = stored(&dir);
+        let mut posted: toml::Value = toml::from_str(std::str::from_utf8(&before).unwrap()).unwrap();
+        *posted.get_mut("gateway").unwrap().get_mut("paired_tokens").unwrap() = toml::Value::Array(Vec::new());
+        let file = dir.path().join("posted.toml");
+        std::fs::write(&file, toml::to_string(&posted).unwrap()).unwrap();
+        let (result, out) = run_cli(
+            &[
+                "config",
+                "apply",
+                "--file",
+                file.to_str().unwrap(),
+                "--allow-credential-clear",
+                "--yes",
+            ],
+            config,
+            "",
+            &[],
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("confirm-high-risk"));
+        assert!(!out.contains(SECRET), "{out}");
+        assert_eq!(stored(&dir), before);
     }
 
     #[tokio::test]

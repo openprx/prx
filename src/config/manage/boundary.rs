@@ -122,6 +122,44 @@ pub(crate) fn check_stored_candidate(
     Ok(())
 }
 
+/// A raw replacement must retain populated secret slots unless the caller
+/// explicitly permits clearing them. Inspect the file itself, including
+/// secrets hidden by another fragment or held in an unmanaged file.
+pub(crate) fn check_raw_secret_removal(
+    candidate: &toml::Value,
+    current: Option<&toml::Value>,
+    allow_secret_clear: bool,
+) -> Result<(), String> {
+    // Clearing permission never makes a redaction mask a stored credential
+    // or a "keep" instruction. Encryption checks still run after staging.
+    check_stored_candidate(candidate, current, false)?;
+    if allow_secret_clear {
+        return Ok(());
+    }
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let current = serde_json::to_value(current).map_err(|_| "Cannot inspect stored secret paths".to_string())?;
+    let candidate = serde_json::to_value(candidate).map_err(|_| "Cannot inspect posted secret paths".to_string())?;
+    let mut dropped = super::plan::omitted_secret_paths(&current, &candidate)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let after_urls = userinfo_urls(&candidate);
+    for (path, url) in userinfo_urls(&current) {
+        if !after_urls.contains_key(&path) && !after_urls.values().any(|value| value == &url) {
+            dropped.insert(path);
+        }
+    }
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Raw file replacement would drop stored secrets at: {}. Keep the stored values or use PUT /api/config/secrets \
+         to change or clear credentials; for an intentional raw-file removal, pass --allow-credential-clear. Nothing was written.",
+        dropped.into_iter().collect::<Vec<_>>().join(", ")
+    ))
+}
+
 /// Secret paths of `candidate` whose value the current configuration holds
 /// at no secret path at all. `None` for `current` (nothing loadable) lists
 /// every secret of the candidate.
@@ -229,6 +267,73 @@ mod tests {
 
     fn tree(text: &str) -> toml::Value {
         toml::Value::Table(toml::from_str(text).expect("test: toml"))
+    }
+
+    #[test]
+    fn raw_replacement_requires_permission_to_drop_secret_slots() {
+        let current = tree(
+            "[web_search]\nbrave_api_key = 'prx-brave-fixture'\n\
+             [gateway]\npaired_tokens = ['prx-token-a', 'prx-token-b']\n\
+             [future_section]\nclient_secret = 'prx-future-fixture'\n\
+             [proxy]\nhttp_proxy = 'http://prx_user:prx-password@example.com'\n",
+        );
+        let posted = tree("[web_search]\nbrave_api_key = ''\n[gateway]\npaired_tokens = ['prx-token-a']\n");
+        let error = check_raw_secret_removal(&posted, Some(&current), false).unwrap_err();
+        for path in [
+            "web_search.brave_api_key",
+            "gateway.paired_tokens[1]",
+            "future_section.client_secret",
+            "proxy.http_proxy",
+        ] {
+            assert!(error.contains(path), "{error}");
+        }
+        assert!(error.contains("PUT /api/config/secrets"), "{error}");
+        assert!(error.contains("--allow-credential-clear"), "{error}");
+        for (_, value) in secret_paths::scan(&current).values_with_paths() {
+            assert!(!error.contains(value), "{error}");
+        }
+        assert!(check_raw_secret_removal(&posted, Some(&current), true).is_ok());
+        assert!(check_raw_secret_removal(&current, Some(&current), false).is_ok());
+        assert!(check_raw_secret_removal(&tree(""), None, false).is_ok());
+    }
+
+    #[test]
+    fn raw_secret_removal_guidance_is_not_scrubbed_by_substring() {
+        let current = tree("api_key = 'config'\n");
+        let error = check_raw_secret_removal(&tree(""), Some(&current), false).unwrap_err();
+        assert!(error.contains("api_key"), "{error}");
+        assert!(error.contains("PUT /api/config/secrets"), "{error}");
+        assert!(error.contains("--allow-credential-clear"), "{error}");
+    }
+
+    #[test]
+    fn raw_secret_clear_permission_never_accepts_a_mask() {
+        let current = tree("[web_search]\nbrave_api_key = 'prx-brave-fixture'\n");
+        let posted = tree("[web_search]\nbrave_api_key = '***'\n");
+        for allow in [false, true] {
+            let error = check_raw_secret_removal(&posted, Some(&current), allow).unwrap_err();
+            assert!(error.contains("redaction mask"), "{error}");
+            assert!(error.contains("web_search.brave_api_key"), "{error}");
+        }
+    }
+
+    #[test]
+    fn raw_secret_rotation_is_not_an_omission() {
+        let current = tree("[web_search]\nbrave_api_key = 'prx-old-fixture'\n");
+        let posted = tree("[web_search]\nbrave_api_key = 'prx-new-fixture'\n");
+        assert!(check_raw_secret_removal(&posted, Some(&current), false).is_ok());
+    }
+
+    #[test]
+    fn raw_route_reordering_keeps_secrets_but_deleting_a_keyed_route_does_not() {
+        let current = tree(
+            "[[model_routes]]\nhint = 'unkeyed'\n[[model_routes]]\nhint = 'keyed'\napi_key = 'prx-route-fixture'\n",
+        );
+        let shifted = tree("[[model_routes]]\nhint = 'keyed'\napi_key = 'prx-route-fixture'\n");
+        assert!(check_raw_secret_removal(&shifted, Some(&current), false).is_ok());
+        let removed = tree("[[model_routes]]\nhint = 'unkeyed'\napi_key = 'prx-route-fixture'\n");
+        let error = check_raw_secret_removal(&removed, Some(&current), false).unwrap_err();
+        assert!(error.contains("model_routes[1].api_key"), "{error}");
     }
 
     #[test]

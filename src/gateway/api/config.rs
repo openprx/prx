@@ -92,6 +92,10 @@ pub struct ConfigWriteQuery {
     /// provider endpoint). Without it such a change answers `428`.
     #[serde(default)]
     confirm_high_risk: bool,
+    /// Explicitly permit a raw file replacement to omit stored secrets.
+    /// Does not confirm risk or bypass optimistic concurrency.
+    #[serde(default)]
+    allow_secret_clear: bool,
 }
 
 /// POST /api/config — merge partial JSON into current config, save to disk.
@@ -688,6 +692,7 @@ pub async fn put_config_file(
     let scrub = |message: &str| secrets.scrub(message);
     let plan = match transactions
         .plan(ConfigChange::RawFile {
+            allow_secret_clear: query.allow_secret_clear,
             filename,
             contents: payload.content,
         })
@@ -3731,6 +3736,11 @@ mod tests {
             .collect::<String>()
             .replacen("require_pairing = true", "require_pairing = false", 1);
         let (status, reply) = put_file(&base, "config.toml", &rewritten).await;
+        assert_eq!(status, 400, "omitting a stored key requires clear permission: {reply}");
+        assert!(reply.contains("api_key"), "{reply}");
+        assert!(reply.contains("PUT /api/config/secrets"), "{reply}");
+        assert_eq!(disk(&state), before_disk, "nothing may be written");
+        let (status, reply) = put_file(&base, "config.toml?allow_secret_clear=true", &rewritten).await;
         assert_eq!(status, 428, "unexpected response: {reply}");
         assert!(reply.contains("baseline_unavailable"), "{reply}");
         assert_eq!(disk(&state), before_disk, "nothing may be written");

@@ -94,6 +94,20 @@ its basename, for example `--target tools.toml` for `web_search.provider`.
 Other files remain unchanged; the tool does not redirect or apply the write
 automatically. An unchanged base file is still accepted.
 
+A raw replacement also refuses to omit or empty a stored secret, including a
+secret inside a removed table or array. The error names the affected path and
+points to `PUT /api/config/secrets`; it never prints the value. This check uses
+the file being replaced, including secrets hidden by other fragments or in an
+unmanaged file. `config show` is a redacted view, not a file backup: `***` is
+never a keep-value marker for a raw replacement. Keep the original stored
+values, or use the secrets API to update a credential (`"value": null` clears
+it). If the raw-file removal is intentional, pass `--allow-credential-clear` to
+both `config plan --file ... --target ...` and `config apply --file ... --target ...`.
+The flag permits the omission; it does not fill in missing values, accept
+`***` or plaintext in encrypted slots, confirm high-risk changes, or bypass
+revision checks. A plan still writes nothing, and apply still needs its normal
+confirmation.
+
 ## Runtime Configuration Generations
 
 The disk transaction barrier above is separate from the process runtime
@@ -1480,6 +1494,11 @@ below).
   stored on disk is accepted; the API never returns ciphertext, so that only
   applies to a copy taken from the file itself. A TOML syntax error is reported by line and column only, and
   validation errors never quote a secret the request carried.
+  Omitting or emptying a stored secret is also refused, naming its path and
+  `PUT /api/config/secrets`. For an intentional raw replacement, this `PUT`
+  accepts `?allow_secret_clear=true`, equivalent to the CLI's
+  `--allow-credential-clear`. This permission does not replace high-risk
+  confirmation or `If-Match`; prefer the secrets API to clear an individual slot.
   In practice this makes the common files read-only in the raw editor: on
   a paired instance `network.toml` holds `gateway.paired_tokens`, and once a
   root `api_key` is stored `config.toml` holds it, so both are served
