@@ -95,6 +95,54 @@ impl TurnDecisionService {
         Ok(Some(proposal))
     }
 
+    /// Offer the hits of a completed `capability_search` to the NEXT model
+    /// request. Every returned hit goes through the same admission as a call by
+    /// name (`admit_discovered_tool`: policy, capability, owner, exclusion and
+    /// budget gates), so the search result itself never grants anything; a
+    /// hit that is blocked, pending approval or hidden by `excluded` is not
+    /// published. The request already sent is not rewritten: call this before
+    /// the next request's tool surface is built. At most `MAX_SEARCH_HITS`
+    /// hits become newly admitted per call. Returns the count newly admitted.
+    pub(crate) fn admit_offered_discoveries(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+        excluded: impl Fn(&str, &str) -> bool,
+    ) -> usize {
+        let Some(offers) = context.discovery_offers.get() else {
+            return 0;
+        };
+        let names = offers.lock().keys().cloned().collect::<Vec<_>>();
+        let mut newly_admitted = 0;
+        for name in names {
+            if newly_admitted >= crate::tools::capability::search_tool::MAX_SEARCH_HITS {
+                break;
+            }
+            if context.discovery_admission(&name).is_some() {
+                continue;
+            }
+            let proposal = match self.prepare_discovered_tool(proof, context, &name) {
+                Ok(Some(proposal)) => proposal,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::debug!(tool = %name, %error, "discovered capability is not offered to the next request");
+                    continue;
+                }
+            };
+            if proposal.admission != GateOutcome::Passed || excluded(&proposal.spec.name, &proposal.root) {
+                continue;
+            }
+            match self.admit_discovered_tool(proof, context, &name) {
+                Ok(Some(admitted)) if admitted.admission == GateOutcome::Passed => newly_admitted += 1,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(tool = %name, %error, "discovered capability admission was refused");
+                }
+            }
+        }
+        newly_admitted
+    }
+
     /// Resolve only separately admitted definitions, with fresh source and
     /// schema gates. This never changes the original decision's exact refs.
     pub(crate) fn agent_appended_execution_specs(
