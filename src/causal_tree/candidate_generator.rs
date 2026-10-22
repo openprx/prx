@@ -3464,7 +3464,7 @@ mod tests {
         mcp.family = CapabilityTarget::Mcp;
         let mut plugin = builtin.clone();
         plugin.root = "wasm_plugin_call".into();
-        let mut skill = builtin.clone();
+        let mut skill = builtin;
         skill.family = CapabilityTarget::Skill;
         skill.target = ExecutionTarget::Skill {
             name: "skills_manage".into(),
