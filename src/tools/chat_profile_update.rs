@@ -377,6 +377,18 @@ mod tests {
                         .iter()
                         .any(|issue| issue.path == "$" && issue.message.contains("required-field set"))
                 );
+                assert!(typed.issues.iter().any(|issue| {
+                    issue.path == "$" && issue.message.contains("provide at least one of: purpose, notes, tags")
+                }));
+                let catalog = crate::tools::execution::ToolCatalog::from_tools([&tool as &dyn Tool]);
+                let descriptor = catalog.descriptor(tool.name()).unwrap();
+                let error = crate::tools::execution::enforce_command_contract(
+                    &mut args.clone(),
+                    descriptor,
+                    crate::tools::schema::ToolSchemaDialect::Gemini,
+                )
+                .unwrap_err();
+                assert!(error.contains("provide at least one of: purpose, notes, tags"));
                 assert!(
                     tool.description()
                         .contains("Provide at least one of purpose, notes, or tags")

@@ -56,6 +56,10 @@ pub(crate) fn validate_execution_contract(
 // Task-local and bound to the exact immutable contract the service validated.
 // No argument field can select a dialect or bypass validation. A nested tool
 // with another contract, or a direct call outside the service, stays Raw.
+// Instances sharing the same static contract also share its pointer identity:
+// a nested direct execute on that contract inherits the active service dialect.
+// Such a call still validates arguments, but must use service dispatch if it
+// needs a separate dialect, policy decision, approval, or audit record.
 tokio::task_local! {
     static EXECUTION_CONTRACT: (Option<std::sync::Arc<Value>>, ToolSchemaDialect);
 }
@@ -133,6 +137,36 @@ pub(crate) fn assert_execution_schema_golden(name: &str, schema: &Value) {
     assert_eq!(schema, &expected, "{name}: execution contract changed from 4c61e2a9");
 }
 
+#[cfg(test)]
+pub(crate) fn assert_published_schema_golden(name: &str, schema: &Value) {
+    let expected = match name {
+        "chat_profile_update" => include_str!("goldens/published/chat_profile_update.json"),
+        "chat_schedule" => include_str!("goldens/published/chat_schedule.json"),
+        "composio" => include_str!("goldens/published/composio.json"),
+        "cron" => include_str!("goldens/published/cron.json"),
+        "document_get_chunk" => include_str!("goldens/published/document_get_chunk.json"),
+        "document_ingest" => include_str!("goldens/published/document_ingest.json"),
+        "gateway" => include_str!("goldens/published/gateway.json"),
+        "git_operations" => include_str!("goldens/published/git_operations.json"),
+        "hooks_manage" => include_str!("goldens/published/hooks_manage.json"),
+        "image" => include_str!("goldens/published/image.json"),
+        "managed_session" => include_str!("goldens/published/managed_session.json"),
+        "mcp_call" => include_str!("goldens/published/mcp_call.json"),
+        "memory_get" => include_str!("goldens/published/memory_get.json"),
+        "nodes" => include_str!("goldens/published/nodes.json"),
+        "proxy_config" => include_str!("goldens/published/proxy_config.json"),
+        "sessions_spawn" => include_str!("goldens/published/sessions_spawn.json"),
+        "skills_manage" => include_str!("goldens/published/skills_manage.json"),
+        "skills_manage_lifecycle" => include_str!("goldens/published/skills_manage_lifecycle.json"),
+        "subagents" => include_str!("goldens/published/subagents.json"),
+        "wasm_plugins_manage" => include_str!("goldens/published/wasm_plugins_manage.json"),
+        "xin" => include_str!("goldens/published/xin.json"),
+        _ => panic!("missing baseline published schema for {name}"),
+    };
+    let expected: Value = serde_json::from_str(expected).expect("test: baseline JSON");
+    assert_eq!(schema, &expected, "{name}: published contract changed from 4d107353");
+}
+
 /// Exercise direct execution with invalid documents derived from each original
 /// contract. Valid documents are checked without causing external side effects;
 /// each tool's existing success tests still exercise its real implementation.
@@ -147,6 +181,7 @@ pub(crate) async fn assert_flat_execution_contract(tool: &dyn crate::tools::Tool
     ));
     assert_eq!(contract.as_ref(), original);
     let published = tool.parameters_schema();
+    assert_published_schema_golden(tool.name(), &published);
     for keyword in ["allOf", "anyOf", "oneOf"] {
         assert!(published.get(keyword).is_none(), "{}: {keyword}", tool.name());
     }

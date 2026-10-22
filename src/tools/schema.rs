@@ -64,7 +64,9 @@ use std::sync::{Arc, LazyLock};
 mod execution_contract;
 pub use execution_contract::ToolArgumentError;
 #[cfg(test)]
-pub(crate) use execution_contract::{assert_execution_schema_golden, assert_flat_execution_contract};
+pub(crate) use execution_contract::{
+    assert_execution_schema_golden, assert_flat_execution_contract, assert_published_schema_golden,
+};
 pub(crate) use execution_contract::{
     deserialize_execution_parameters, serialize_execution_parameters, with_execution_contract, with_public_arguments,
 };
@@ -843,9 +845,18 @@ impl CompiledToolSchema {
         if let Some(any_of) = self.any_of.as_ref()
             && !any_of.iter().any(|candidate| candidate.matches(value))
         {
+            let mut message = "does not contain any accepted required-field set".to_string();
+            if !any_of.is_empty() && any_of.iter().all(|candidate| candidate.required.len() == 1) {
+                let fields: Vec<&str> = any_of
+                    .iter()
+                    .flat_map(|candidate| candidate.required.iter().map(String::as_str))
+                    .collect();
+                message.push_str("; provide at least one of: ");
+                message.push_str(&fields.join(", "));
+            }
             issues.push(ArgumentValidationIssue {
                 path: path.to_string(),
-                message: "does not contain any accepted required-field set".to_string(),
+                message,
             });
         }
         if let Some(one_of) = self.one_of.as_ref() {

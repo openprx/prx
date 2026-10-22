@@ -1065,8 +1065,8 @@ declaration for that provider/model with `tool_schema = "no_root_combinators"`;
 the gateway URL does not imply the dialect. Built-in tools publish flat schemas
 and validate their full conditional contract before approval, using the selected
 dialect's existing lowering rules. Direct calls without a dialect enforce the
-full original contract. An external/MCP schema with a root conditional or alternative that
-cannot be lowered losslessly fails locally before streaming or non-streaming
-transport. The error names the tool and how to republish or exclude it through
-`[tool_tiering]`. An upstream OpenRouter root-schema rejection also carries a
+full original contract. An external/MCP schema with a root conditional or
+alternative that cannot be lowered losslessly fails locally before streaming or
+non-streaming transport. The error names the tool and how to republish or exclude
+it through `[tool_tiering]`. An upstream OpenRouter root-schema rejection also carries a
 fixed remediation hint after the sanitized error preview.

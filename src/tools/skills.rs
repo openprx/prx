@@ -1912,6 +1912,7 @@ mod tests {
         }
         let schema = tool.execution_schema();
         crate::tools::schema::assert_execution_schema_golden("skills_manage_lifecycle", schema);
+        crate::tools::schema::assert_published_schema_golden("skills_manage_lifecycle", &tool.parameters_schema());
         let properties = schema.get("properties").and_then(serde_json::Value::as_object).unwrap();
         for forbidden in [
             "suite",

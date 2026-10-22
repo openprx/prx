@@ -1,0 +1,43 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "description": "Skill action: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, 'remove' deletes one",
+      "enum": [
+        "create",
+        "install",
+        "update",
+        "enable",
+        "disable",
+        "validate",
+        "sync",
+        "remove"
+      ],
+      "type": "string"
+    },
+    "description": {
+      "description": "Short description of the skill; required for 'create'",
+      "minLength": 1,
+      "type": "string"
+    },
+    "instructions": {
+      "description": "SKILL.md instructions; required for 'create'",
+      "minLength": 1,
+      "type": "string"
+    },
+    "name": {
+      "description": "Workspace skill name; required for 'create', 'update', 'enable', 'disable', 'validate' and 'remove'",
+      "minLength": 1,
+      "type": "string"
+    },
+    "source": {
+      "description": "Git URL or explicit local directory; required for 'install'. For 'lifecycle_import_executable', the directory of the reviewed executable bundle",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "action"
+  ],
+  "type": "object"
+}

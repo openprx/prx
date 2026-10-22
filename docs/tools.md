@@ -363,11 +363,12 @@ discovered yet, PRX refreshes the dynamic registries before resolving the
 allowlist. Multiple aliases exported by the same MCP, WASM, or Skill router are
 represented by independent public-name proxies and remain executable.
 
-Every provider-visible tool uses an object JSON Schema. Multi-action tools
-publish discriminator-specific required fields through canonical conditional
-clauses. `ToolExecutionService::execute` — the single path every native, skill,
-MCP alias and WASM plugin call takes — evaluates that same published schema
-against the model's arguments before the policy decision is acted on, before any
+Every provider-visible tool uses an object JSON Schema. Built-in multi-action
+tools publish flat fields and retain their conditional requirements in a private
+execution contract; other tools use their published schema as the contract.
+`ToolExecutionService::execute` — the single path every native, skill,
+MCP alias and WASM plugin call takes — evaluates that contract
+against the model's arguments before the policy decision is requested, before any
 approval prompt, and before the executor runs. Validation covers nested required
 fields, scalar types, enums, constants, string/array lengths, numeric bounds,
 union types, unknown-field rejection where the schema closes its property set,
@@ -378,8 +379,11 @@ the document constrains nothing, and the subtree *below* a cycle is
 unconstrained as well — only the level at which the cycle closes is enforced).
 A structurally invalid call is rejected
 with an `InvalidArguments` outcome that names every offending path, is recorded
-in the tool execution audit like any other terminal outcome, and never reaches
-the backend. Executor checks remain as defense in depth.
+in the tool execution audit with `decision: None`, and never reaches the backend.
+Once resolution, capability and owner-isolation checks pass, this validation
+precedes policy denial: invalid arguments report `InvalidArguments` even if the
+policy would return `Denied`.
+Executor checks remain as defense in depth.
 
 Validation is fail-open on JSON Schema keywords PRX does not model and
 fail-closed on the ones it does: a dynamic MCP or WASM contract that uses
@@ -1562,7 +1566,13 @@ idempotency reservation. Invalid arguments return `InvalidArguments` without
 prompting for approval. Service dispatch applies the selected schema dialect to
 this contract: Gemini retains its existing keyword stripping and executor clamps.
 Direct calls without a service dialect enforce the full original contract and
-return typed argument errors. Flattening does not grant permissions or relax
+return typed argument errors. A nested direct call sharing the active service's
+exact cached contract inherits its dialect, including when two tool instances
+share one static contract. A different contract or a call outside that scope
+uses Raw. Nested calls needing their own dialect, policy, approval or audit must
+go through service dispatch. Missing profile fields report an actionable
+`provide at least one of` hint naming `purpose`, `notes` and `tags`.
+Flattening does not grant permissions or relax
 approval checks. Callers that construct forms from schemas must also handle
 conditional argument errors.
 
