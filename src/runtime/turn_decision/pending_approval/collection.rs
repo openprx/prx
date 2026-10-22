@@ -96,7 +96,7 @@ impl ApprovalCollectionLease {
                 operation.as_str().to_owned(),
                 crate::acl::approval_grant::RiskLevel::High,
             )
-        } else if crate::security::approval_operation::collects_exact_generic_call(&call.name) {
+        } else if entry.collects_exact_call() {
             // The operation is the one the tool itself checks, bound to the
             // exact target in the arguments. A call that names no grant-bound
             // target has no exact operation and cannot be reviewed.

@@ -70,6 +70,14 @@ pub(crate) struct CapabilityEntry {
 }
 
 impl CapabilityEntry {
+    /// A generic tool whose approval operation `grant_op_for_call` derives
+    /// completely from the call's arguments, so a named call can be collected
+    /// and recorded as an exact pending decision before any review, like a file
+    /// mutation.
+    pub(crate) fn collects_exact_call(&self) -> bool {
+        self.public_name == "skills_manage"
+    }
+
     /// Name understood by the execution policy. Synthetic Skill and Node
     /// entries dispatch through their registered root and inherit that root's
     /// read/write classification; public names remain available for search,

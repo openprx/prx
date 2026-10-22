@@ -253,13 +253,6 @@ fn skills_manage_lifecycle_operation(
     Some((action.operation?, action.risk))
 }
 
-/// Generic tools whose approval operation is fully derived from the call's
-/// arguments by `grant_op_for_call`, so a named call can be collected and
-/// recorded as an exact pending decision before any review.
-pub(crate) fn collects_exact_generic_call(tool: &str) -> bool {
-    tool == "skills_manage"
-}
-
 /// True when the call can only succeed with its own human approval: the tool
 /// itself demands a signed one-shot grant bound to the exact target, at every
 /// autonomy level. Execution upgrades an Allow decision to Ask for these, and

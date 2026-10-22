@@ -245,17 +245,12 @@ impl CausalCandidateGenerator {
                 .iter_entries()
                 .filter(|item| collectable_approval_entry(item) && names_entry(&folded, item));
             let only = named.next()?;
-            if named.next().is_some()
-                || (only.family != CapabilityTarget::Mcp
-                    && !crate::security::approval_operation::collects_exact_generic_call(&only.public_name))
-            {
+            if named.next().is_some() || (only.family != CapabilityTarget::Mcp && !only.collects_exact_call()) {
                 return None;
             }
             only
         } else if collectable_approval_entry(entry)
-            && (!(entry.family == CapabilityTarget::Mcp
-                || crate::security::approval_operation::collects_exact_generic_call(&entry.public_name))
-                || names_entry(&folded, entry))
+            && (!(entry.family == CapabilityTarget::Mcp || entry.collects_exact_call()) || names_entry(&folded, entry))
         {
             entry
         } else {
@@ -878,11 +873,7 @@ pub(crate) fn collectable_approval_entry(entry: &CapabilityEntry) -> bool {
         // A generic tool whose lifecycle actions need a grant bound to their
         // exact target derives that operation from the arguments, like a file
         // mutation. Collection asks the model for them before any review.
-        _ => {
-            entry.effect > SideEffectClass::ReadOnly
-                && entry.op_ids.is_empty()
-                && crate::security::approval_operation::collects_exact_generic_call(&entry.public_name)
-        }
+        _ => entry.effect > SideEffectClass::ReadOnly && entry.op_ids.is_empty() && entry.collects_exact_call(),
     }
 }
 
