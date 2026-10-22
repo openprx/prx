@@ -1261,6 +1261,8 @@ impl TurnDecisionContext {
 struct MemoryHopObservation {
     state: CausalState,
     fresh_read: bool,
+    /// The read completed with status Ok, even when it returned nothing new.
+    completed_ok: bool,
     selected_artifacts: Vec<ObservedArtifact>,
     custom_context: Option<String>,
 }
@@ -2151,6 +2153,7 @@ impl TurnDecisionService {
         Ok(MemoryHopObservation {
             state: next,
             fresh_read,
+            completed_ok: status == ObservedStepStatus::Ok,
             selected_artifacts,
             custom_context,
         })
@@ -2787,7 +2790,7 @@ impl TurnDecisionService {
                         }
                         return Err(AgentDecisionError::Cancelled);
                     }
-                    allow_terminal_answer = observed.fresh_read;
+                    allow_terminal_answer = observed.fresh_read || observed.completed_ok;
                     selected_retrieved = observed.selected_artifacts;
                     selected_custom_memory_context = observed.custom_context;
                     let mut comparison = observed.state.clone();

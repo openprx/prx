@@ -758,3 +758,34 @@ async fn real_mode_start_turn_mid_stream_cancel_emits_cancelled() {
     );
     finish_owned_start_turn_fixture(fixture_cleanup).await;
 }
+
+/// Finding 112.2: a clear tool request in interactive chat, with an empty
+/// memory, must admit a Run turn. The completed-but-empty memory read used to
+/// stop the hops and close the turn with the "What specific information..."
+/// clarification before any model call.
+#[tokio::test]
+async fn interactive_chat_clear_shell_request_with_empty_memory_is_not_clarified() {
+    let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+    let (mut deps, _action_rx, _hooks, _temp) = build_deps(memory, CancellationToken::new());
+    let workspace = deps.tool_security_policy.workspace_dir.clone();
+    let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![Box::new(
+        crate::tools::shell::ShellTool::new(Arc::new(crate::runtime::NativeRuntime::new()), workspace),
+    )]);
+    deps.tools_registry = Some(registry);
+    let cleanup =
+        crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new()).expect("test: cleanup owner");
+    cleanup
+        .run(async {
+            let binding = admit_start_turn_fixture(&deps, "draft-f112-chat", "Run the shell command: echo hi", true)
+                .await
+                .expect("test: genuine admission");
+            assert_eq!(
+                binding.fixed_reply().expect("test: decided turn"),
+                None,
+                "a clear request must run, not close with Clarify/Refuse"
+            );
+            Ok(())
+        })
+        .await
+        .expect("test: scoped admission");
+}

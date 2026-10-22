@@ -699,8 +699,16 @@ impl CausalDecisionEngine {
             .completed_steps()
             .iter()
             .any(|step| step.kind() == ObservedStepKind::Discover && step.status() == ObservedStepStatus::Ok);
+        // A completed Ok memory read that found nothing is still a finished
+        // retrieval: the turn may answer directly (G1-G9 still gate every tool
+        // call). Failed or cancelled reads never count.
+        let exhausted_retrieval = state
+            .observed
+            .completed_steps()
+            .iter()
+            .any(|step| step.kind() == ObservedStepKind::Retrieve && step.status() == ObservedStepStatus::Ok);
         let selection = if inputs.allow_terminal_answer
-            && (has_retrieved_evidence || exhausted_discovery)
+            && (has_retrieved_evidence || exhausted_discovery || exhausted_retrieval)
             && Instant::now() < inputs.deadline
         {
             passed(CausalActionKind::Answer).map(|answer| Selection::Commit {

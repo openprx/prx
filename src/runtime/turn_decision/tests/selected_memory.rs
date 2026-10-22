@@ -446,6 +446,10 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             .await
             .expect("empty selected read still records a completed step");
         assert!(!empty_observed.fresh_read);
+        assert!(
+            empty_observed.completed_ok,
+            "an empty read that completed Ok is a finished retrieval"
+        );
         assert!(empty_observed.selected_artifacts.is_empty(), "expected an empty value");
         let mut empty_comparison = empty_observed.state.clone();
         empty_comparison.derived = decision.state.derived.clone();
@@ -463,7 +467,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
         let empty_inputs = EngineInputs {
             state: &empty_next,
             decision_id: DecisionId::new_runtime(),
-            allow_terminal_answer: empty_observed.fresh_read,
+            allow_terminal_answer: empty_observed.fresh_read || empty_observed.completed_ok,
             ..inputs.clone()
         };
         let empty_terminal = CausalDecisionEngine::decide_terminal_prepared(
@@ -479,7 +483,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
                     discovery_limit: 1,
                 },
             ),
-            Ok(TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. })
+            Ok(TurnExecutionDirective::AnswerDirectly)
         ));
         assert!(
             empty_terminal.prediction.is_none(),
@@ -525,6 +529,10 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             .expect("backend failure closes through an observed step");
         assert!(!failed_observation.fresh_read, "prior evidence cannot authorize Answer");
         assert!(
+            !failed_observation.completed_ok,
+            "a failed read is not a finished retrieval"
+        );
+        assert!(
             failed_observation.selected_artifacts.is_empty(),
             "expected an empty value"
         );
@@ -537,7 +545,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
         let failed_inputs = EngineInputs {
             state: &failed_observation.state,
             decision_id: DecisionId::new_runtime(),
-            allow_terminal_answer: failed_observation.fresh_read,
+            allow_terminal_answer: failed_observation.fresh_read || failed_observation.completed_ok,
             ..inputs.clone()
         };
         let failed_terminal = CausalDecisionEngine::decide_terminal_prepared(
@@ -567,6 +575,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             .await
             .expect("selected read timeout closes through an observed step");
         assert!(!cancelled.fresh_read);
+        assert!(!cancelled.completed_ok);
         assert!(cancelled.selected_artifacts.is_empty(), "expected an empty value");
         let [cancelled_step] = cancelled.state.observed.completed_steps() else {
             panic!("one cancelled runtime-owned read step");
@@ -576,7 +585,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
         let cancelled_inputs = EngineInputs {
             state: &cancelled.state,
             decision_id: DecisionId::new_runtime(),
-            allow_terminal_answer: cancelled.fresh_read,
+            allow_terminal_answer: cancelled.fresh_read || cancelled.completed_ok,
             deadline: decision.deadline,
             ..inputs.clone()
         };
