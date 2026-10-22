@@ -155,7 +155,8 @@ pub(crate) fn check_raw_secret_removal(
     }
     Err(format!(
         "Raw file replacement would drop stored secrets at: {}. Keep the stored values or use PUT /api/config/secrets \
-         to change or clear credentials; for an intentional raw-file removal, pass --allow-credential-clear. Nothing was written.",
+         to change or clear credentials; for an intentional raw-file removal, use the CLI --allow-credential-clear flag. \
+         POST /api/config/plans and POST /api/config/apply do not accept a clear flag. Nothing was written.",
         dropped.into_iter().collect::<Vec<_>>().join(", ")
     ))
 }
@@ -289,12 +290,39 @@ mod tests {
         }
         assert!(error.contains("PUT /api/config/secrets"), "{error}");
         assert!(error.contains("--allow-credential-clear"), "{error}");
+        assert!(
+            error.contains("POST /api/config/plans and POST /api/config/apply do not accept a clear flag"),
+            "{error}"
+        );
         for (_, value) in secret_paths::scan(&current).values_with_paths() {
             assert!(!error.contains(value), "{error}");
         }
         assert!(check_raw_secret_removal(&posted, Some(&current), true).is_ok());
         assert!(check_raw_secret_removal(&current, Some(&current), false).is_ok());
         assert!(check_raw_secret_removal(&tree(""), None, false).is_ok());
+    }
+
+    #[test]
+    fn raw_secret_array_rotation_preserves_populated_slots() {
+        let current = tree("[gateway]\npaired_tokens = ['prx-token-a', 'prx-token-b']\n");
+        for tokens in [
+            "['prx-token-a', 'prx-token-c']",
+            "['prx-token-b', 'prx-token-a']",
+            "['prx-token-c', 'prx-token-c']",
+            "['prx-token-c', 'prx-token-d', 'prx-token-e']",
+        ] {
+            let posted = tree(&format!("[gateway]\npaired_tokens = {tokens}\n"));
+            assert!(check_raw_secret_removal(&posted, Some(&current), false).is_ok());
+        }
+        for tokens in ["['prx-token-c']", "['', 'prx-token-c']", "[]"] {
+            let posted = tree(&format!("[gateway]\npaired_tokens = {tokens}\n"));
+            let error = check_raw_secret_removal(&posted, Some(&current), false).unwrap_err();
+            assert!(error.contains("gateway.paired_tokens[1]"), "{error}");
+            assert!(check_raw_secret_removal(&posted, Some(&current), true).is_ok());
+        }
+        let duplicate = tree("[gateway]\npaired_tokens = ['prx-token-a', 'prx-token-a']\n");
+        let shrunk = tree("[gateway]\npaired_tokens = ['prx-token-a']\n");
+        assert!(check_raw_secret_removal(&shrunk, Some(&duplicate), false).is_err());
     }
 
     #[test]

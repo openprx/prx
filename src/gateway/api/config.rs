@@ -3747,6 +3747,92 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn raw_file_secret_clear_commits_only_with_permission_confirmation_and_current_revision() {
+        let (_dir, state, base, server) = on_disk(|config| {
+            config.autonomy.level = AutonomyLevel::Full;
+            config.web_search.brave_api_key = Some(PLAIN.into());
+        })
+        .await;
+        let original = disk(&state);
+        let mut posted: toml::Table = toml::from_str(&original).unwrap();
+        posted
+            .get_mut("web_search")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .remove("brave_api_key");
+        let content = toml::to_string(&posted).unwrap();
+        let body = serde_json::json!({"content": content});
+        let revision = files_revision(&base).await;
+        let clear_url = format!("{base}/api/config/files/config.toml?allow_secret_clear=true");
+        let confirmed_url = format!("{clear_url}&confirm_high_risk=true");
+        for (url, expected_revision, expected_status) in [
+            (
+                format!("{base}/api/config/files/config.toml?confirm_high_risk=true"),
+                revision.as_str(),
+                400,
+            ),
+            (clear_url, revision.as_str(), 428),
+            (confirmed_url.clone(), "00", 409),
+        ] {
+            let (status, reply) =
+                call_with_if_match(reqwest::Method::PUT, &url, Some(expected_revision), body.clone()).await;
+            assert_eq!(status, expected_status, "{reply}");
+            assert!(!reply.contains(PLAIN), "{reply}");
+            assert_eq!(disk(&state), original);
+            assert_eq!(
+                state.config.desired().config.web_search.brave_api_key.as_deref(),
+                Some(PLAIN)
+            );
+        }
+        let (status, reply) = call_with_if_match(reqwest::Method::PUT, &confirmed_url, Some(&revision), body).await;
+        assert_eq!(status, 200, "{reply}");
+        assert!(!reply.contains(PLAIN), "{reply}");
+        assert_ne!(disk(&state), original);
+        assert_ne!(files_revision(&base).await, revision);
+        let desired = state.config.desired();
+        let reloaded =
+            Config::load_from_path(&desired.config.config_path, desired.config.workspace_dir.clone()).unwrap();
+        assert!(reloaded.web_search.brave_api_key.is_none());
+        assert!(desired.config.web_search.brave_api_key.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_file_secret_array_rotation_needs_confirmation_but_not_clear_permission() {
+        let (dir, state, base, server) = on_disk(|config| {
+            config.autonomy.level = AutonomyLevel::Full;
+            config.gateway.paired_tokens = vec!["prx-token-a".into(), "prx-token-b".into()];
+        })
+        .await;
+        let original = disk(&state);
+        let mut posted: toml::Table = toml::from_str(&original).unwrap();
+        let rotated = crate::security::SecretStore::new(dir.path(), true)
+            .encrypt("prx-token-c")
+            .unwrap();
+        *posted
+            .get_mut("gateway")
+            .unwrap()
+            .get_mut("paired_tokens")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .get_mut(1)
+            .unwrap() = toml::Value::String(rotated);
+        let content = toml::to_string(&posted).unwrap();
+        let (status, reply) = put_file(&base, "config.toml", &content).await;
+        assert_eq!(status, 428, "rotation still needs risk confirmation: {reply}");
+        assert_eq!(disk(&state), original);
+        let (status, reply) = put_file_confirmed(&base, "config.toml", &content).await;
+        assert_eq!(status, 200, "rotation is not a clear: {reply}");
+        assert_eq!(
+            state.config.desired().config.gateway.paired_tokens,
+            vec!["prx-token-a", "prx-token-c"]
+        );
+        server.abort();
+    }
+
     /// D-050 item 4, RED before SECRETS-i (R-SECRETSfg P24): tunnel exposure,
     /// the custom tunnel command and a raised autonomy level were Low.
     #[tokio::test]

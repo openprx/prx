@@ -222,8 +222,11 @@ impl ConfigChangeSummary {
         let mut risk_reasons = Vec::new();
         // Secrets are compared by identity, not by position: removing a
         // route before one that holds a key is no secret change (D-101 F-3).
-        let before_secrets = before_raw.as_ref().map(secret_leaves).unwrap_or_default();
-        let after_secrets = secret_leaves(&after_raw);
+        let before_secrets = before_raw
+            .as_ref()
+            .map(|tree| secret_leaves(tree, SecretArrayIdentity::Value))
+            .unwrap_or_default();
+        let after_secrets = secret_leaves(&after_raw, SecretArrayIdentity::Value);
         let written = after_secrets
             .iter()
             .filter(|(identity, leaf)| {
@@ -385,18 +388,26 @@ struct SecretLeaf {
     value: String,
 }
 
+#[derive(Clone, Copy)]
+enum SecretArrayIdentity {
+    Value,
+    PopulatedSlot,
+}
+
 /// Every non-empty secret value of a rendered configuration, keyed by its
 /// identity: the path with every array element named by what identifies it
-/// (a table's `hint`, a string's own value) instead of its position, so a
-/// removed or reordered neighbour changes no secret (D-101 F-3). Identities
-/// are compared in memory only; nothing shows them.
-fn secret_leaves(root: &Value) -> std::collections::BTreeMap<String, SecretLeaf> {
+/// (a table's `hint`, a string's own value for risk classification) instead
+/// of its position, so a removed or reordered neighbour changes no secret
+/// (D-101 F-3). Omission checks use populated string-array slots instead.
+/// Identities are compared in memory only; nothing shows them.
+fn secret_leaves(root: &Value, array_identity: SecretArrayIdentity) -> std::collections::BTreeMap<String, SecretLeaf> {
     fn walk(
         node: &Value,
         raw: &mut Vec<PathElem>,
         display: &mut Vec<PathElem>,
         identity: &mut Vec<String>,
         inside_secret: bool,
+        array_identity: SecretArrayIdentity,
         out: &mut std::collections::BTreeMap<String, SecretLeaf>,
     ) {
         let inside_secret = inside_secret || (!raw.is_empty() && secret_paths::is_secret_path(raw));
@@ -412,7 +423,7 @@ fn secret_leaves(root: &Value) -> std::collections::BTreeMap<String, SecretLeaf>
                     raw.push(PathElem::Key(key.clone()));
                     display.push(PathElem::Key(shown));
                     identity.push(format!(".{key}"));
-                    walk(child, raw, display, identity, inside_secret, out);
+                    walk(child, raw, display, identity, inside_secret, array_identity, out);
                     identity.pop();
                     display.pop();
                     raw.pop();
@@ -420,6 +431,7 @@ fn secret_leaves(root: &Value) -> std::collections::BTreeMap<String, SecretLeaf>
             }
             Value::Array(items) => {
                 let hint_of = |item: &Value| item.get("hint").and_then(Value::as_str).map(str::to_string);
+                let mut populated = 0;
                 for (index, child) in items.iter().enumerate() {
                     let named = match child {
                         // A hint that repeats in the array names its element
@@ -437,13 +449,23 @@ fn secret_leaves(root: &Value) -> std::collections::BTreeMap<String, SecretLeaf>
                                 format!("[hint={hint}]")
                             }
                         }),
-                        Value::String(value) if inside_secret => Some(format!("[={value}]")),
+                        Value::String(value) if inside_secret => match array_identity {
+                            SecretArrayIdentity::Value => Some(format!("[={value}]")),
+                            SecretArrayIdentity::PopulatedSlot => {
+                                if value.is_empty() || value == secret_paths::REDACTION_MASK {
+                                    continue;
+                                }
+                                let slot = populated;
+                                populated += 1;
+                                Some(format!("[populated={slot}]"))
+                            }
+                        },
                         _ => None,
                     };
                     raw.push(PathElem::Index(index));
                     display.push(PathElem::Index(index));
                     identity.push(named.unwrap_or_else(|| format!("[{index}]")));
-                    walk(child, raw, display, identity, inside_secret, out);
+                    walk(child, raw, display, identity, inside_secret, array_identity, out);
                     identity.pop();
                     display.pop();
                     raw.pop();
@@ -463,15 +485,23 @@ fn secret_leaves(root: &Value) -> std::collections::BTreeMap<String, SecretLeaf>
         }
     }
     let mut out = std::collections::BTreeMap::new();
-    walk(root, &mut Vec::new(), &mut Vec::new(), &mut Vec::new(), false, &mut out);
+    walk(
+        root,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        false,
+        array_identity,
+        &mut out,
+    );
     out
 }
 
-/// Raw-file omissions use the same identities as risk classification, so
-/// shifting an intact keyed route or reordering a token list clears nothing.
+/// Raw omissions retain keyed-route identities but compare string arrays by
+/// populated count: rotation is a credential change, not an omitted slot.
 pub(super) fn omitted_secret_paths(before: &Value, after: &Value) -> Vec<String> {
-    let after = secret_leaves(after);
-    secret_leaves(before)
+    let after = secret_leaves(after, SecretArrayIdentity::PopulatedSlot);
+    secret_leaves(before, SecretArrayIdentity::PopulatedSlot)
         .into_iter()
         .filter(|(identity, leaf)| leaf.value != secret_paths::REDACTION_MASK && !after.contains_key(identity))
         .map(|(_, leaf)| leaf.display)

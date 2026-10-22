@@ -108,6 +108,13 @@ The flag permits the omission; it does not fill in missing values, accept
 revision checks. A plan still writes nothing, and apply still needs its normal
 confirmation.
 
+Rotating a populated string-array secret (for example, replacing one paired
+token with another) does not require the clear flag. Reducing its populated
+count does. If the stored file cannot be read or parsed, replacement is refused
+unless clearing is explicitly allowed, because its secret slots cannot be
+checked. Invalid posted TOML is refused before the secret-omission check, with
+a location-only parse error.
+
 ## Runtime Configuration Generations
 
 The disk transaction barrier above is separate from the process runtime
@@ -2418,6 +2425,13 @@ The credential endpoints have no plan; they are High.
 | `POST /api/config/apply` `{"change": {...}}` | the same change, committed; a raw file answers the raw editor's removed-keys `warning` | from the plan |
 | `GET /api/config/history` | the redacted history records with their plan text | read |
 | `POST /api/config/rollback` `{"record_id", "confirm", "restore_credentials"?, "disable_encryption"?}` | restores the configuration from before a record. `plan` is what the restore writes (it also undoes every later change); `undoes` is the recorded change | from the restore plan |
+
+The `raw_file` change on `POST /api/config/plans` and `POST /api/config/apply`
+does not accept a secret-clear option. To intentionally clear stored secrets,
+use `PUT /api/config/secrets`, or use the CLI's `--allow-credential-clear` flag
+for a raw-file replacement. The separate raw editor endpoint,
+`PUT /api/config/files/{name}`, accepts `?allow_secret_clear=true` as described
+above; high-risk confirmation and revision checks still apply.
 
 Rules that hold on every endpoint:
 

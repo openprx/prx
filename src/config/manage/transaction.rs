@@ -556,7 +556,7 @@ impl ConfigTransactions {
                 allow_secret_clear,
             } => {
                 files::validate_raw_config_file_name(&filename).map_err(ConfigTransactionError::Invalid)?;
-                let posted = posted_file_trees(&config_path, &filename, &contents);
+                let posted = posted_file_trees(&config_path, &filename, &contents, allow_secret_clear)?;
                 boundary::check_raw_secret_removal(&posted.posted, posted.current.as_ref(), allow_secret_clear)
                     .map_err(|message| ConfigTransactionError::Invalid(anyhow::anyhow!(message)))?;
                 (
@@ -1217,42 +1217,54 @@ impl ConfigTransactions {
 }
 
 /// A raw file write: the posted file's own tree and the same file's current
-/// tree (`None` when it does not exist or does not parse).
+/// tree (`None` when absent or explicitly permitted to be uninspectable).
 struct PostedFile {
     filename: String,
     posted: toml::Value,
     current: Option<toml::Value>,
 }
 
-/// Parse the posted raw file and the file it replaces. A posted file that
-/// does not parse is refused later by staging; it is checked as empty here.
-fn posted_file_trees(config_path: &Path, filename: &str, contents: &str) -> PostedFile {
-    let parse = |text: &str| toml::from_str::<toml::Table>(text).ok().map(toml::Value::Table);
-    if filename.contains(['/', '\\']) || filename.contains("..") {
-        return PostedFile {
-            filename: filename.to_owned(),
-            posted: parse(contents).unwrap_or_else(|| toml::Value::Table(toml::Table::new())),
-            current: None,
-        };
-    }
+/// Parse the posted document before checking the stored file for secrets.
+/// An unreadable baseline needs explicit clearing permission, because its
+/// populated secret slots cannot be determined. Never quote parser input.
+fn posted_file_trees(
+    config_path: &Path,
+    filename: &str,
+    contents: &str,
+    allow_secret_clear: bool,
+) -> Result<PostedFile, ConfigTransactionError> {
+    let posted = toml::from_str::<toml::Table>(contents)
+        .map(toml::Value::Table)
+        .map_err(|error| {
+            ConfigTransactionError::Invalid(anyhow::anyhow!(super::render::toml_error_location(contents, &error)))
+        })?;
     let target = if filename == "config.toml" {
         config_path.to_path_buf()
     } else {
         files::config_dir_path(config_path).join(filename)
     };
-    let current = match std::fs::read_to_string(&target) {
-        Ok(text) => parse(&text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            tracing::warn!(error = %error, "The file a raw write replaces cannot be read; checking it against an empty file");
-            None
-        }
+    let cannot_inspect = || {
+        ConfigTransactionError::Invalid(anyhow::anyhow!(
+            "Cannot inspect stored secrets in {filename}: the stored file cannot be read or parsed. \
+             Repair it before using PUT /api/config/secrets, or explicitly permit raw-file replacement \
+             with the CLI --allow-credential-clear flag. Nothing was written."
+        ))
     };
-    PostedFile {
+    let current = match std::fs::read_to_string(&target) {
+        Ok(text) => match toml::from_str::<toml::Table>(&text) {
+            Ok(table) => Some(toml::Value::Table(table)),
+            Err(_) if allow_secret_clear => None,
+            Err(_) => return Err(cannot_inspect()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) if allow_secret_clear => None,
+        Err(_) => return Err(cannot_inspect()),
+    };
+    Ok(PostedFile {
         filename: filename.to_owned(),
-        posted: parse(contents).unwrap_or_else(|| toml::Value::Table(toml::Table::new())),
+        posted,
         current,
-    }
+    })
 }
 
 /// The current revision, read before the plan reads the files; `None` when
@@ -2199,6 +2211,78 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(fixture.tree(), before, "planning never writes");
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_replacement_requires_permission_when_the_stored_file_cannot_be_inspected() {
+        for (filename, broken) in [
+            ("tools.toml", b"api_key = 'prx-stored-fixture'\n[broken".as_slice()),
+            ("zz-local.toml", b"api_key = 'prx-stored-fixture'\n[broken".as_slice()),
+            ("zz-local.toml", &[0xff]),
+        ] {
+            let fixture = fixture().await;
+            let target = fixture.dir.path().join("config.d").join(filename);
+            let original = std::fs::read_to_string(&target).unwrap_or_default();
+            std::fs::write(&target, broken).unwrap();
+            let before = fixture.tree();
+            let error = fixture
+                .service()
+                .plan(ConfigChange::RawFile {
+                    filename: filename.into(),
+                    contents: original.clone(),
+                    allow_secret_clear: false,
+                })
+                .await
+                .unwrap_err()
+                .to_string();
+            for expected in ["Cannot inspect stored secrets", filename, "--allow-credential-clear"] {
+                assert!(error.contains(expected), "{error}");
+            }
+            assert!(!error.contains("prx-stored-fixture"), "{error}");
+            assert_eq!(fixture.tree(), before);
+            let plan = fixture
+                .service()
+                .plan(ConfigChange::RawFile {
+                    filename: filename.into(),
+                    contents: original,
+                    allow_secret_clear: true,
+                })
+                .await
+                .unwrap();
+            if filename == "tools.toml" {
+                assert!(plan.summary().risk_reasons.contains(&RiskReason::BaselineUnavailable));
+            }
+            assert_eq!(fixture.tree(), before, "planning a repair never writes");
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_posted_parse_error_precedes_secret_omission_and_uninspectable_storage() {
+        for stored_is_broken in [false, true] {
+            let fixture = fixture().await;
+            if stored_is_broken {
+                std::fs::write(fixture.dir.path().join("config.d/tools.toml"), "[broken").unwrap();
+            }
+            let before = fixture.tree();
+            for allow_secret_clear in [false, true] {
+                let error = fixture
+                    .service()
+                    .plan(ConfigChange::RawFile {
+                        filename: "tools.toml".into(),
+                        contents: "api_key = 'prx-posted-fixture\n".into(),
+                        allow_secret_clear,
+                    })
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("Invalid TOML"), "{error}");
+                assert!(error.contains("line 1"), "{error}");
+                assert!(!error.contains("would drop"), "{error}");
+                assert!(!error.contains("Cannot inspect"), "{error}");
+                assert!(!error.contains("prx-posted-fixture"), "{error}");
+                assert_eq!(fixture.tree(), before);
+            }
         }
     }
 
