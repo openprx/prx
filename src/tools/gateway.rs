@@ -279,6 +279,47 @@ impl GatewayTool {
     }
 }
 
+impl GatewayTool {
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_action_requirements(
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["config.get", "config.patch", "status", "version", "components", "restart"],
+                                "description": "Action to perform: 'config.get' reads the current config, 'config.patch' merges a JSON merge patch into it, 'status' reports uptime/model/channels, 'version' reports the build version, 'components' lists active channels/providers/memory/tools, 'restart' sends SIGHUP for a graceful restart."
+                            },
+                            "patch": {
+                                "type": "object",
+                                "description": "JSON merge patch payload, required for action='config.patch'."
+                            },
+                            "confirm_high_risk": {
+                                "type": "boolean",
+                                "description": "For action='config.patch': confirms a high-risk patch: one that writes a credential, turns secrets.encrypt off, re-points an endpoint that receives a credential (a provider, proxy, MCP server, node, channel server, memory database), changes an MCP server's environment or launch command, changes who is admitted (paired tokens, webhook or channel verify secrets, pairing, JWT or SPIFFE trust, sender allow-lists, identity bindings, tunnel exposure), widens what a principal may do (privilege_widened: user policies, autonomy scopes or level, workspace or path limits, exposed MCP tools, node commands, the custom tunnel command, the sandbox runtime, its network, a writable root filesystem, a mounted workspace or wider workspace roots, fetchable domains, operator tools offered to channels, the audit log's size or location), or any change while the stored configuration does not load (baseline_unavailable). Such a patch is refused without it; set it only when the operator asked for exactly that change, together with 'revision'."
+                            },
+                            "revision": {
+                                "type": "string",
+                                "description": "For action='config.patch' with confirm_high_risk: the revision the refusal of this exact patch reported. The confirmation is bound to it; without it, or after the configuration changed, the patch is refused again."
+                            }
+                        },
+                        "required": ["action"]
+                    }),
+                    "action",
+                    &[crate::tools::schema::ActionRequirement {
+                        action: "config.patch",
+                        required: &["patch"],
+                    }],
+                )
+            })
+        });
+        &SCHEMA
+    }
+}
+
 #[async_trait]
 impl Tool for GatewayTool {
     fn name(&self) -> &str {
@@ -298,41 +339,16 @@ impl Tool for GatewayTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_requirements(
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["config.get", "config.patch", "status", "version", "components", "restart"],
-                        "description": "Action to perform: 'config.get' reads the current config, 'config.patch' merges a JSON merge patch into it, 'status' reports uptime/model/channels, 'version' reports the build version, 'components' lists active channels/providers/memory/tools, 'restart' sends SIGHUP for a graceful restart."
-                    },
-                    "patch": {
-                        "type": "object",
-                        "description": "JSON merge patch payload, required for action='config.patch'."
-                    },
-                    "confirm_high_risk": {
-                        "type": "boolean",
-                        "description": "For action='config.patch': confirms a high-risk patch: one that writes a credential, turns secrets.encrypt off, re-points an endpoint that receives a credential (a provider, proxy, MCP server, node, channel server, memory database), changes an MCP server's environment or launch command, changes who is admitted (paired tokens, webhook or channel verify secrets, pairing, JWT or SPIFFE trust, sender allow-lists, identity bindings, tunnel exposure), widens what a principal may do (privilege_widened: user policies, autonomy scopes or level, workspace or path limits, exposed MCP tools, node commands, the custom tunnel command, the sandbox runtime, its network, a writable root filesystem, a mounted workspace or wider workspace roots, fetchable domains, operator tools offered to channels, the audit log's size or location), or any change while the stored configuration does not load (baseline_unavailable). Such a patch is refused without it; set it only when the operator asked for exactly that change, together with 'revision'."
-                    },
-                    "revision": {
-                        "type": "string",
-                        "description": "For action='config.patch' with confirm_high_risk: the revision the refusal of this exact patch reported. The confirmation is bound to it; without it, or after the configuration changed, the patch is refused again."
-                    }
-                },
-                "required": ["action"]
-            }),
-            "action",
-            &[crate::tools::schema::ActionRequirement {
-                action: "config.patch",
-                required: &["patch"],
-            }],
-        )
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
+    }
+
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
     }
 
     #[allow(unsafe_code)]
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let action = match args.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
             None => {
@@ -616,14 +632,15 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn gateway_action_tool_contract() {
+    #[tokio::test]
+    async fn gateway_action_tool_contract() {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            tool.execution_schema(),
         );
     }
 
@@ -677,18 +694,24 @@ mod tests {
     async fn unknown_action_returns_error() {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.execute(json!({"action": "explode"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("Unknown action"));
+        let before = tool.config.load_full();
+        let error = tool.execute(json!({"action": "explode"})).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path.contains("action")));
+        assert!(Arc::ptr_eq(&before, &tool.config.load_full()));
+        assert!(tool.execute(json!({"action":"status"})).await.unwrap().success);
     }
 
     #[tokio::test]
     async fn missing_action_returns_error() {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
-        let result = tool.execute(json!({})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("Missing 'action'"));
+        let before = tool.config.load_full();
+        let error = tool.execute(json!({})).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path.contains("action")));
+        assert!(Arc::ptr_eq(&before, &tool.config.load_full()));
+        assert!(tool.execute(json!({"action":"status"})).await.unwrap().success);
     }
 
     #[tokio::test]
@@ -1331,7 +1354,7 @@ mod tests {
         let result = tool.execute(args).await.unwrap();
         assert!(result.success, "{:?}", result.error);
 
-        let schema = tool.parameters_schema().to_string();
+        let schema = tool.execution_schema().to_string();
         assert!(schema.contains("\"revision\""), "{schema}");
     }
 
@@ -1456,7 +1479,7 @@ mod tests {
     #[test]
     fn config_patch_description_names_every_high_risk_reason() {
         let tool = GatewayTool::new(new_shared(Config::default()), "anthropic", "claude-sonnet-4-6", vec![]);
-        let schema = tool.parameters_schema().to_string();
+        let schema = tool.execution_schema().to_string();
         for reason in [
             "who is admitted",
             "environment",

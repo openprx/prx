@@ -83,6 +83,8 @@ pub struct ComposioTool {
     default_entity_id: String,
     security: Arc<SecurityPolicy>,
     recent_connected_accounts: RwLock<HashMap<String, String>>,
+    #[cfg(test)]
+    transport: Option<(Client, String)>,
 }
 
 impl ComposioTool {
@@ -92,10 +94,24 @@ impl ComposioTool {
             default_entity_id: normalize_entity_id(default_entity_id.unwrap_or("default")),
             security,
             recent_connected_accounts: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            transport: None,
         }
     }
 
+    const fn api_origin(&self) -> &str {
+        #[cfg(test)]
+        if let Some((_, origin)) = &self.transport {
+            return origin.as_str();
+        }
+        api_origin()
+    }
+
     fn client(&self) -> Client {
+        #[cfg(test)]
+        if let Some((client, _)) = &self.transport {
+            return client.clone();
+        }
         crate::config::build_runtime_proxy_client_with_timeouts("tool.composio", 60, 10)
             .map_err(|e| {
                 tracing::error!("proxy build failed for tool.composio, using direct: {e}");
@@ -123,7 +139,7 @@ impl ComposioTool {
     }
 
     async fn list_actions_v3(&self, app_name: Option<&str>) -> anyhow::Result<Vec<ComposioAction>> {
-        let url = format!("{origin}/api/v3/tools", origin = api_origin());
+        let url = format!("{origin}/api/v3/tools", origin = self.api_origin());
         let req = self
             .client()
             .get(&url)
@@ -144,7 +160,7 @@ impl ComposioTool {
     }
 
     async fn list_actions_v2(&self, app_name: Option<&str>) -> anyhow::Result<Vec<ComposioAction>> {
-        let mut url = format!("{origin}/api/v2/actions", origin = api_origin());
+        let mut url = format!("{origin}/api/v2/actions", origin = self.api_origin());
         if let Some(app) = app_name {
             url = format!("{url}?appNames={app}");
         }
@@ -562,6 +578,66 @@ impl ComposioTool {
     }
 }
 
+impl ComposioTool {
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_action_alternatives(
+                    crate::tools::schema::with_action_alternatives(
+                        json!({
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "description": "The operation: 'list' (list available actions), 'list_accounts'/'connected_accounts' (list connected accounts), 'execute' (run an action), or 'connect' (get OAuth URL)",
+                                    "enum": ["list", "list_accounts", "connected_accounts", "execute", "connect"]
+                                },
+                                "app": {
+                                    "type": "string",
+                                    "description": "Toolkit slug filter for 'list' or 'list_accounts', optional app hint for 'execute', or toolkit/app for 'connect' (e.g. 'gmail', 'notion', 'github')"
+                                },
+                                "action_name": {
+                                    "type": "string",
+                                    "description": "Action/tool identifier for 'execute' (legacy aliases supported)"
+                                },
+                                "tool_slug": {
+                                    "type": "string",
+                                    "description": "Preferred v3 tool slug for 'execute' (alias of action_name)"
+                                },
+                                "params": {
+                                    "type": "object",
+                                    "description": "Parameters to pass to the action"
+                                },
+                                "entity_id": {
+                                    "type": "string",
+                                    "description": "Entity/user ID for multi-user setups (defaults to composio.entity_id from config)"
+                                },
+                                "auth_config_id": {
+                                    "type": "string",
+                                    "description": "Optional Composio v3 auth config id for the 'connect' flow"
+                                },
+                                "connected_account_id": {
+                                    "type": "string",
+                                    "description": "Optional connected account ID for execute flow when a specific account is required"
+                                }
+                            },
+                            "required": ["action"]
+                        }),
+                        "action",
+                        "connect",
+                        &[&["app"], &["auth_config_id"]],
+                    ),
+                    "action",
+                    "execute",
+                    &[&["tool_slug"], &["action_name"]],
+                )
+            })
+        });
+        &SCHEMA
+    }
+}
+
 #[async_trait]
 impl Tool for ComposioTool {
     fn name(&self) -> &str {
@@ -577,59 +653,15 @@ impl Tool for ComposioTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_alternatives(
-            crate::tools::schema::with_action_alternatives(
-                json!({
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "description": "The operation: 'list' (list available actions), 'list_accounts'/'connected_accounts' (list connected accounts), 'execute' (run an action), or 'connect' (get OAuth URL)",
-                            "enum": ["list", "list_accounts", "connected_accounts", "execute", "connect"]
-                        },
-                        "app": {
-                            "type": "string",
-                            "description": "Toolkit slug filter for 'list' or 'list_accounts', optional app hint for 'execute', or toolkit/app for 'connect' (e.g. 'gmail', 'notion', 'github')"
-                        },
-                        "action_name": {
-                            "type": "string",
-                            "description": "Action/tool identifier for 'execute' (legacy aliases supported)"
-                        },
-                        "tool_slug": {
-                            "type": "string",
-                            "description": "Preferred v3 tool slug for 'execute' (alias of action_name)"
-                        },
-                        "params": {
-                            "type": "object",
-                            "description": "Parameters to pass to the action"
-                        },
-                        "entity_id": {
-                            "type": "string",
-                            "description": "Entity/user ID for multi-user setups (defaults to composio.entity_id from config)"
-                        },
-                        "auth_config_id": {
-                            "type": "string",
-                            "description": "Optional Composio v3 auth config id for the 'connect' flow"
-                        },
-                        "connected_account_id": {
-                            "type": "string",
-                            "description": "Optional connected account ID for execute flow when a specific account is required"
-                        }
-                    },
-                    "required": ["action"]
-                }),
-                "action",
-                "connect",
-                &[&["app"], &["auth_config_id"]],
-            ),
-            "action",
-            "execute",
-            &[&["tool_slug"], &["action_name"]],
-        )
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -1172,13 +1204,14 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn composio_action_tool_contract() {
+    #[tokio::test]
+    async fn composio_action_tool_contract() {
         let tool = ComposioTool::new("test-key", None, test_security());
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            tool.execution_schema(),
         );
     }
 
@@ -1218,7 +1251,7 @@ mod tests {
     #[test]
     fn composio_tool_schema_has_required_fields() {
         let tool = ComposioTool::new("test-key", None, test_security());
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
         assert!(schema["properties"]["action"].is_object());
         assert!(schema["properties"]["action_name"].is_object());
         assert!(schema["properties"]["tool_slug"].is_object());
@@ -1230,24 +1263,24 @@ mod tests {
         assert!(required.contains(&json!("action")));
         assert!(
             crate::tools::schema::validate_tool_arguments(
-                &schema,
+                schema,
                 &json!({"action": "execute", "action_name": "legacy"})
             )
             .is_empty(),
             "expected an empty value"
         );
         assert!(
-            !crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "connect"})).is_empty(),
+            !crate::tools::schema::validate_tool_arguments(schema, &json!({"action": "connect"})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
-            crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "connect", "app": "github"}))
+            crate::tools::schema::validate_tool_arguments(schema, &json!({"action": "connect", "app": "github"}))
                 .is_empty(),
             "expected an empty value"
         );
         assert!(
             crate::tools::schema::validate_tool_arguments(
-                &schema,
+                schema,
                 &json!({"action": "connect", "auth_config_id": "config"})
             )
             .is_empty(),
@@ -1280,11 +1313,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_unknown_action_returns_error() {
-        let tool = ComposioTool::new("test-key", None, test_security());
-        let result = tool.execute(json!({"action": "unknown"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Unknown action"));
+    async fn execute_unknown_action_returns_error() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()])?;
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
+            )?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut tool = ComposioTool::new("prx-fixture-credential", None, test_security());
+        tool.transport = Some((
+            Client::builder()
+                .no_proxy()
+                .add_root_certificate(reqwest::Certificate::from_der(cert.cert.der().as_ref())?)
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?,
+            format!("https://{}", listener.local_addr()?),
+        ));
+        let error = tool.execute(json!({"action": "unknown"})).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.action"));
+        assert!(tool.recent_connected_accounts.read().is_empty());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        let request = async {
+            let (socket, _) = listener.accept().await?;
+            let mut tls = acceptor.accept(socket).await?;
+            let mut bytes = Vec::new();
+            while !bytes.ends_with(b"\r\n\r\n") {
+                bytes.push(tls.read_u8().await?);
+                anyhow::ensure!(bytes.len() <= 16384, "bounded fixture request");
+            }
+            assert!(std::str::from_utf8(&bytes)?.starts_with("GET /api/v3/tools?"));
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"items\":[]}").await?;
+            tls.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let (response, sent) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(tool.execute(json!({"action":"list"})), request)
+        })
+        .await?;
+        sent?;
+        let response = response?;
+        assert!(response.success, "{:?}", response.error);
+        assert!(response.output.contains("Found 0 available actions"));
+        assert!(tool.recent_connected_accounts.read().is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -1689,7 +1770,7 @@ mod tests {
     #[test]
     fn schema_enum_includes_connected_accounts_alias() {
         let tool = ComposioTool::new("test-key", None, test_security());
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
         let values: Vec<&str> = schema["properties"]["action"]["enum"]
             .as_array()
             .unwrap()

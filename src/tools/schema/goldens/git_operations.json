@@ -1,0 +1,126 @@
+{
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "commit"
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      },
+      "then": {
+        "required": [
+          "message"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "add"
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      },
+      "then": {
+        "required": [
+          "paths"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "checkout"
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      },
+      "then": {
+        "required": [
+          "branch"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "description": "Sub-action of the 'stash' operation: 'push' saves the working tree, 'pop' restores the latest entry, 'list' shows the entries, 'drop' deletes one by index",
+      "enum": [
+        "push",
+        "pop",
+        "list",
+        "drop"
+      ],
+      "type": "string"
+    },
+    "branch": {
+      "description": "Branch name (for 'checkout' or 'push' operation)",
+      "minLength": 1,
+      "type": "string"
+    },
+    "cached": {
+      "description": "Show staged changes (for 'diff' operation)",
+      "type": "boolean"
+    },
+    "files": {
+      "description": "File or path to diff (for 'diff' operation, default: '.')",
+      "type": "string"
+    },
+    "index": {
+      "description": "Stash index (for 'stash' with 'drop' action)",
+      "type": "integer"
+    },
+    "limit": {
+      "description": "Number of log entries (for 'log' operation, default: 10)",
+      "type": "integer"
+    },
+    "message": {
+      "description": "Commit message (for 'commit' operation)",
+      "minLength": 1,
+      "type": "string"
+    },
+    "operation": {
+      "description": "Git operation to perform",
+      "enum": [
+        "status",
+        "diff",
+        "log",
+        "branch",
+        "commit",
+        "add",
+        "checkout",
+        "stash",
+        "push",
+        "reset_hard"
+      ],
+      "type": "string"
+    },
+    "paths": {
+      "description": "File paths to stage (for 'add' operation)",
+      "minLength": 1,
+      "type": "string"
+    },
+    "remote": {
+      "description": "Remote name (for 'push' operation, default: origin)",
+      "type": "string"
+    },
+    "target": {
+      "description": "Revision target (for 'reset_hard' operation, default: HEAD)",
+      "type": "string"
+    }
+  },
+  "required": [
+    "operation"
+  ],
+  "type": "object"
+}

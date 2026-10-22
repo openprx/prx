@@ -1542,3 +1542,25 @@ Readers continue to accept the previous inline JSON manifest. Non-Unix parents
 retain that existing transport. Parent and child use the same executable; rolling
 back this transport means reverting both writer and reader together. Existing
 control frames and capability-expiry rules are unchanged.
+
+## Flat built-in tool schemas
+
+Built-in tools publish object schemas without root `allOf`, `anyOf`, or `oneOf`.
+Action enums, field types, descriptions, aliases and unconditional requirements
+remain published. Action-dependent requirements and alternative field sets are
+validated against the complete original contract before policy, approval or an
+idempotency reservation. Invalid arguments return `InvalidArguments` without
+prompting for approval. Service dispatch applies the selected schema dialect to
+this contract: Gemini retains its existing keyword stripping and executor clamps.
+Direct calls without a service dialect enforce the full original contract and
+return typed argument errors. Flattening does not grant permissions or relax
+approval checks. Callers that construct forms from schemas must also handle
+conditional argument errors.
+
+Native Anthropic and OpenRouter `anthropic/*` models use the built-in
+`no_root_combinators` restriction. The catalog selects the hosted dialect from
+the provider and model identity. MCP and other external schemas that cannot be
+lowered losslessly are rejected locally before transport, with the tool name,
+keyword and `[tool_tiering]` remediation. Republish such a tool without the root
+combinator while retaining its strict execution validation, or exclude it from
+the affected model's tool set. See [upgrade actions](migration-unreleased.md).

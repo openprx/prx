@@ -152,6 +152,48 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     })
 }
 
+impl MemoryGetTool {
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_required_alternatives(
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Memory key (preferred) or fallback memory file path"
+                            },
+                            "key": {
+                                "type": "string",
+                                "description": "Alias of path; memory key or fallback file path"
+                            },
+                            "from": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "1-based starting line number (default: 1)"
+                            },
+                            "lines": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": MAX_LINE_COUNT,
+                                "description": "Number of lines to return (default: 50, max: 2000)"
+                            },
+                            "session_id": {
+                                "type": "string",
+                                "description": "Optional session scope; required as self_system for reserved router/ keys"
+                            }
+                        }
+                    }),
+                    &[&["path"], &["key"]],
+                )
+            })
+        });
+        &SCHEMA
+    }
+}
+
 #[async_trait]
 impl Tool for MemoryGetTool {
     fn name(&self) -> &str {
@@ -159,45 +201,19 @@ impl Tool for MemoryGetTool {
     }
 
     fn description(&self) -> &str {
-        "Read memory by key from the configured backend with ACL observe/enforce mode."
+        "Read memory by key from the configured backend with ACL observe/enforce mode. Provide at least one of path or key."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_required_alternatives(
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Memory key (preferred) or fallback memory file path"
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "Alias of path; memory key or fallback file path"
-                    },
-                    "from": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "1-based starting line number (default: 1)"
-                    },
-                    "lines": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_LINE_COUNT,
-                        "description": "Number of lines to return (default: 50, max: 2000)"
-                    },
-                    "session_id": {
-                        "type": "string",
-                        "description": "Optional session scope; required as self_system for reserved router/ keys"
-                    }
-                }
-            }),
-            &[&["path"], &["key"]],
-        )
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let path = args
             .get("path")
             .or_else(|| args.get("key"))
@@ -597,11 +613,12 @@ mod tests {
         assert!(result.output.contains("No memory entry found for key"));
     }
 
-    #[test]
-    fn schema_exposes_openclaw_parameters() {
+    #[tokio::test]
+    async fn schema_exposes_openclaw_parameters() {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(&tmp, true);
-        let schema = tool.parameters_schema();
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
+        let schema = tool.execution_schema();
 
         assert_eq!(tool.name(), "memory_get");
         assert!(schema["properties"]["path"].is_object());
@@ -610,15 +627,15 @@ mod tests {
         assert!(schema["properties"]["lines"].is_object());
         assert!(schema["properties"]["session_id"].is_object());
         assert!(
-            !crate::tools::schema::validate_tool_arguments(&schema, &json!({})).is_empty(),
+            !crate::tools::schema::validate_tool_arguments(schema, &json!({})).is_empty(),
             "expected a non-empty value"
         );
         assert!(
-            crate::tools::schema::validate_tool_arguments(&schema, &json!({"path": "key"})).is_empty(),
+            crate::tools::schema::validate_tool_arguments(schema, &json!({"path": "key"})).is_empty(),
             "expected an empty value"
         );
         assert!(
-            crate::tools::schema::validate_tool_arguments(&schema, &json!({"key": "key"})).is_empty(),
+            crate::tools::schema::validate_tool_arguments(schema, &json!({"key": "key"})).is_empty(),
             "expected an empty value"
         );
     }

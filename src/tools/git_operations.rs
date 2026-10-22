@@ -662,6 +662,85 @@ impl PorcelainStatus {
     }
 }
 
+impl GitOperationsTool {
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_action_requirements(
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "operation": {
+                                "type": "string",
+                                "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash", "push", "reset_hard"],
+                                "description": "Git operation to perform"
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": "Commit message (for 'commit' operation)"
+                            },
+                            "paths": {
+                                "type": "string",
+                                "description": "File paths to stage (for 'add' operation)"
+                            },
+                            "branch": {
+                                "type": "string",
+                                "description": "Branch name (for 'checkout' or 'push' operation)"
+                            },
+                            "remote": {
+                                "type": "string",
+                                "description": "Remote name (for 'push' operation, default: origin)"
+                            },
+                            "target": {
+                                "type": "string",
+                                "description": "Revision target (for 'reset_hard' operation, default: HEAD)"
+                            },
+                            "files": {
+                                "type": "string",
+                                "description": "File or path to diff (for 'diff' operation, default: '.')"
+                            },
+                            "cached": {
+                                "type": "boolean",
+                                "description": "Show staged changes (for 'diff' operation)"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Number of log entries (for 'log' operation, default: 10)"
+                            },
+                            "action": {
+                                "type": "string",
+                                "enum": ["push", "pop", "list", "drop"],
+                                "description": "Sub-action of the 'stash' operation: 'push' saves the working tree, 'pop' restores the latest entry, 'list' shows the entries, 'drop' deletes one by index"
+                            },
+                            "index": {
+                                "type": "integer",
+                                "description": "Stash index (for 'stash' with 'drop' action)"
+                            }
+                        },
+                        "required": ["operation"]
+                    }),
+                    "operation",
+                    &[
+                        crate::tools::schema::ActionRequirement {
+                            action: "commit",
+                            required: &["message"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "add",
+                            required: &["paths"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "checkout",
+                            required: &["branch"],
+                        },
+                    ],
+                )
+            })
+        });
+        &SCHEMA
+    }
+}
+
 #[async_trait]
 impl Tool for GitOperationsTool {
     fn name(&self) -> &str {
@@ -673,78 +752,15 @@ impl Tool for GitOperationsTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_requirements(
-            json!({
-                "type": "object",
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash", "push", "reset_hard"],
-                        "description": "Git operation to perform"
-                    },
-                    "message": {
-                        "type": "string",
-                        "description": "Commit message (for 'commit' operation)"
-                    },
-                    "paths": {
-                        "type": "string",
-                        "description": "File paths to stage (for 'add' operation)"
-                    },
-                    "branch": {
-                        "type": "string",
-                        "description": "Branch name (for 'checkout' or 'push' operation)"
-                    },
-                    "remote": {
-                        "type": "string",
-                        "description": "Remote name (for 'push' operation, default: origin)"
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "Revision target (for 'reset_hard' operation, default: HEAD)"
-                    },
-                    "files": {
-                        "type": "string",
-                        "description": "File or path to diff (for 'diff' operation, default: '.')"
-                    },
-                    "cached": {
-                        "type": "boolean",
-                        "description": "Show staged changes (for 'diff' operation)"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of log entries (for 'log' operation, default: 10)"
-                    },
-                    "action": {
-                        "type": "string",
-                        "enum": ["push", "pop", "list", "drop"],
-                        "description": "Sub-action of the 'stash' operation: 'push' saves the working tree, 'pop' restores the latest entry, 'list' shows the entries, 'drop' deletes one by index"
-                    },
-                    "index": {
-                        "type": "integer",
-                        "description": "Stash index (for 'stash' with 'drop' action)"
-                    }
-                },
-                "required": ["operation"]
-            }),
-            "operation",
-            &[
-                crate::tools::schema::ActionRequirement {
-                    action: "commit",
-                    required: &["message"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "add",
-                    required: &["paths"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "checkout",
-                    required: &["branch"],
-                },
-            ],
-        )
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let operation = match args.get("operation").and_then(|v| v.as_str()) {
             Some(op) => op,
             None => {
@@ -897,14 +913,15 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn git_operations_action_tool_contract() {
+    #[tokio::test]
+    async fn git_operations_action_tool_contract() {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            tool.execution_schema(),
         );
     }
 
@@ -1192,9 +1209,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
 
-        let result = tool.execute(json!({})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Missing 'operation'"));
+        let error = tool.execute(json!({})).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path.contains("operation")));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        init_git_repo(tmp.path()).await;
+        let status = tool.execute(json!({"operation":"status"})).await.unwrap();
+        assert!(status.success, "{:?}", status.error);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status.output)
+                .unwrap()
+                .get("clean")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -1205,9 +1233,18 @@ mod tests {
 
         let tool = test_tool(tmp.path());
 
-        let result = tool.execute(json!({"operation": "fetch_all"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Unknown operation"));
+        let error = tool.execute(json!({"operation": "fetch_all"})).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path.contains("operation")));
+        let status = tool.execute(json!({"operation":"status"})).await.unwrap();
+        assert!(status.success, "{:?}", status.error);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status.output)
+                .unwrap()
+                .get("clean")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     // ── GIT-ENV (D-098): a repository's configuration is a launch definition ──

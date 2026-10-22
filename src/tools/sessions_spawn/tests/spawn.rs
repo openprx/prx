@@ -181,7 +181,7 @@ async fn task_mode_no_tools_preserves_single_turn_trace_usage() {
 fn schema_has_required_fields() {
     let (ch, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-    let schema = tool.parameters_schema();
+    let schema = tool.execution_schema();
     // The executor treats an omitted action as 'spawn', so the published
     // contract defaults it rather than requiring it.
     let required = schema["required"].as_array().unwrap();
@@ -201,13 +201,13 @@ fn schema_has_required_fields() {
     let enum_vals = schema["properties"]["action"]["enum"].as_array().unwrap();
     let enum_strs: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
     assert!(enum_strs.contains(&"history"));
-    let issues = crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "spawn"}));
+    let issues = crate::tools::schema::validate_tool_arguments(schema, &json!({"action": "spawn"}));
     assert!(issues.iter().any(|issue| issue.path == "$.task"));
     // An omitted action selects 'spawn', so 'task' is still required.
-    let implicit = crate::tools::schema::validate_tool_arguments(&schema, &json!({}));
+    let implicit = crate::tools::schema::validate_tool_arguments(schema, &json!({}));
     assert!(implicit.iter().any(|issue| issue.path == "$.task"));
     assert!(
-        crate::tools::schema::validate_tool_arguments(&schema, &json!({"task": "do it"})).is_empty(),
+        crate::tools::schema::validate_tool_arguments(schema, &json!({"task": "do it"})).is_empty(),
         "expected an empty value"
     );
     assert!(enum_strs.contains(&"steer"));

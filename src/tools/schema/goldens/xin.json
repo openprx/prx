@@ -1,0 +1,536 @@
+{
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "get"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "task_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "events"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "task_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "runs"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "task_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "add"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "name",
+          "payload"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "update"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "task_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "remove"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "task_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "pause"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "task_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "resume"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "task_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "cancel"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "task_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "run"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "task_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "goal_get"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "goal_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "goal_add"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "goal_pause"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "goal_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "goal_resume"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "goal_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "goal_cancel"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "goal_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "goal_remove"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "goal_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "step_list"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "goal_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "step_get"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "step_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "step_add"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "goal_id",
+          "name",
+          "payload"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "step_retry"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "step_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "update"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "anyOf": [
+          {
+            "required": [
+              "task_id",
+              "name"
+            ]
+          },
+          {
+            "required": [
+              "task_id",
+              "description"
+            ]
+          },
+          {
+            "required": [
+              "task_id",
+              "priority"
+            ]
+          },
+          {
+            "required": [
+              "task_id",
+              "payload"
+            ]
+          },
+          {
+            "required": [
+              "task_id",
+              "interval_secs"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "description": "Task actions: create with 'add'; inspect with 'list'/'get'/'runs'/'events'/'status'; change with 'update'; control with 'pause'/'resume'/'cancel'/'run'; delete with 'remove'. Goal-workflow actions: 'goal_add', 'goal_list', 'goal_get', 'goal_pause', 'goal_resume', 'goal_cancel', 'goal_remove'. Step actions within a goal: 'step_add', 'step_list', 'step_get', 'step_retry'.",
+      "enum": [
+        "list",
+        "get",
+        "events",
+        "runs",
+        "add",
+        "update",
+        "remove",
+        "pause",
+        "resume",
+        "cancel",
+        "run",
+        "status",
+        "goal_list",
+        "goal_get",
+        "goal_add",
+        "goal_pause",
+        "goal_resume",
+        "goal_cancel",
+        "goal_remove",
+        "step_list",
+        "step_get",
+        "step_add",
+        "step_retry"
+      ],
+      "type": "string"
+    },
+    "description": {
+      "description": "Free-text description for 'add' and 'step_add'; also one of the fields 'update' may change.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "execution_mode": {
+      "description": "agent_session (LLM, default) or shell (command).",
+      "enum": [
+        "agent_session",
+        "shell"
+      ],
+      "type": "string"
+    },
+    "goal_id": {
+      "description": "Goal ID for 'goal_get'/'goal_pause'/'goal_resume'/'goal_cancel'/'goal_remove'/'step_list'/'step_add'.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "interval_secs": {
+      "description": "Repeat interval in seconds (recurring only); also one of the fields 'update' may change.",
+      "type": "integer"
+    },
+    "lease_ttl_secs": {
+      "description": "Per-step lease TTL; 0 uses the execution-mode default.",
+      "type": "integer"
+    },
+    "limit": {
+      "description": "Max run-history entries (1-50, default 20).",
+      "type": "integer"
+    },
+    "name": {
+      "description": "Name: the task for 'add', the goal for 'goal_add', the step for 'step_add'; also one of the fields 'update' may change.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "payload": {
+      "description": "Work to run — prompt for agent_session, command for shell. Required by 'add' and 'step_add'; also one of the fields 'update' may change.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "priority": {
+      "description": "Priority (default normal); also one of the fields 'update' may change.",
+      "enum": [
+        "low",
+        "normal",
+        "high",
+        "critical"
+      ],
+      "minLength": 1,
+      "type": "string"
+    },
+    "recurring": {
+      "description": "Repeat the task (default false).",
+      "type": "boolean"
+    },
+    "sequence": {
+      "description": "One-based step sequence for 'step_add'.",
+      "type": "integer"
+    },
+    "step_id": {
+      "description": "Step ID for 'step_get'/'step_retry'.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "steps": {
+      "description": "Initial ordered steps for 'goal_add'.",
+      "items": {
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "execution_mode": {
+            "enum": [
+              "agent_session",
+              "shell"
+            ],
+            "type": "string"
+          },
+          "lease_ttl_secs": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "string"
+          },
+          "sequence": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "payload"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "target_completion_at": {
+      "description": "RFC3339 target time for 'goal_add'.",
+      "type": "string"
+    },
+    "task_id": {
+      "description": "Task ID for 'get'/'runs'/'update'/'run'/'pause'/'resume'/'cancel'/'remove'; the Goal ID when 'events' is called on a goal.",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "action"
+  ],
+  "type": "object"
+}

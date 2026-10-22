@@ -1,0 +1,43 @@
+{
+  "additionalProperties": false,
+  "anyOf": [
+    {
+      "required": [
+        "path"
+      ]
+    },
+    {
+      "required": [
+        "key"
+      ]
+    }
+  ],
+  "properties": {
+    "from": {
+      "description": "1-based starting line number (default: 1)",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "key": {
+      "description": "Alias of path; memory key or fallback file path",
+      "minLength": 1,
+      "type": "string"
+    },
+    "lines": {
+      "description": "Number of lines to return (default: 50, max: 2000)",
+      "maximum": 10000,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "path": {
+      "description": "Memory key (preferred) or fallback memory file path",
+      "minLength": 1,
+      "type": "string"
+    },
+    "session_id": {
+      "description": "Optional session scope; required as self_system for reserved router/ keys",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

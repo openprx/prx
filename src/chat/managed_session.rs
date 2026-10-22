@@ -211,6 +211,60 @@ impl ManagedSessionTool {
     }
 }
 
+impl ManagedSessionTool {
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_default_action_requirements(
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["shell", "list", "logs", "kill"],
+                                "description": "'shell' starts a managed background shell; 'list' shows the sessions; 'logs' reads recent output; 'kill' terminates a shell session."
+                            },
+                            "command": {
+                                "type": "string",
+                                "description": "Shell command to run; required for 'shell'."
+                            },
+                            "session_id": {
+                                "type": "string",
+                                "description": "Managed shell session id; required for 'logs' and 'kill'."
+                            },
+                            "max_lines": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 500,
+                                "description": "Maximum recent log lines to return for 'logs'."
+                            }
+                        },
+                        "required": ["action"]
+                    }),
+                    "action",
+                    "list",
+                    &[
+                        crate::tools::schema::ActionRequirement {
+                            action: "shell",
+                            required: &["command"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "logs",
+                            required: &["session_id"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "kill",
+                            required: &["session_id"],
+                        },
+                    ],
+                )
+            })
+        });
+        &SCHEMA
+    }
+}
+
 #[async_trait]
 impl Tool for ManagedSessionTool {
     fn name(&self) -> &str {
@@ -222,53 +276,15 @@ impl Tool for ManagedSessionTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_default_action_requirements(
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["shell", "list", "logs", "kill"],
-                        "description": "'shell' starts a managed background shell; 'list' shows the sessions; 'logs' reads recent output; 'kill' terminates a shell session."
-                    },
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command to run; required for 'shell'."
-                    },
-                    "session_id": {
-                        "type": "string",
-                        "description": "Managed shell session id; required for 'logs' and 'kill'."
-                    },
-                    "max_lines": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 500,
-                        "description": "Maximum recent log lines to return for 'logs'."
-                    }
-                },
-                "required": ["action"]
-            }),
-            "action",
-            "list",
-            &[
-                crate::tools::schema::ActionRequirement {
-                    action: "shell",
-                    required: &["command"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "logs",
-                    required: &["session_id"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "kill",
-                    required: &["session_id"],
-                },
-            ],
-        )
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
         let result = match action {
             "shell" => {
@@ -378,14 +394,15 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn managed_session_action_tool_contract() {
+    #[tokio::test]
+    async fn managed_session_action_tool_contract() {
         let (sink, _rx) = SessionEventSink::channel();
         let tool = ManagedSessionTool::new(std::env::temp_dir(), Arc::new(Mutex::new(Vec::new())), sink);
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            tool.execution_schema(),
         );
     }
 

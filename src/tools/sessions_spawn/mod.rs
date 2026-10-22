@@ -369,6 +369,7 @@ impl ParentToolRegistry {
 /// Returns immediately with a run ID; results are announced via the active channel
 /// when the sub-agent completes.
 pub struct SessionsSpawnTool {
+    execution_schema: std::sync::OnceLock<Arc<serde_json::Value>>,
     /// Channel for announcing sub-agent results.
     ///
     /// Wrapped in an `RwLock` and updated per-message via

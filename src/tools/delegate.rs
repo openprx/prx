@@ -1659,6 +1659,12 @@ impl Tool for ToolArcRef {
             .map_or_else(|| self.inner.parameters_schema(), |spec| spec.parameters.clone())
     }
 
+    fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
+        (self.name() == self.inner.name())
+            .then(|| self.inner.execution_parameters_schema())
+            .flatten()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(spec) = &self.public_spec {
             self.inner.execute_named(&spec.name, args).await

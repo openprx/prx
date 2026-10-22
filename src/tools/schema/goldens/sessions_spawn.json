@@ -1,0 +1,274 @@
+{
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "spawn"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "task"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "spawn_batch"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "tasks"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "kill"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "run_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "history"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "run_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "steer"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "run_id",
+          "message"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "chat_assign"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "session_id",
+          "task"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "join"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "batch_id"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "default": "spawn",
+      "description": "Action to perform, with the parameter it reads: 'spawn' task; 'spawn_batch' tasks; 'join' batch_id; 'list' none; 'kill' run_id; 'history' run_id; 'steer' run_id + message; 'chat_sessions' none; 'chat_assign' session_id + task. Defaults to 'spawn' when omitted.",
+      "enum": [
+        "spawn",
+        "spawn_batch",
+        "join",
+        "list",
+        "kill",
+        "history",
+        "steer",
+        "chat_sessions",
+        "chat_assign"
+      ],
+      "type": "string"
+    },
+    "agent": {
+      "description": "For 'spawn' and 'spawn_batch': identity agent name. Available: (none configured)",
+      "type": "string"
+    },
+    "allow_delegation": {
+      "default": false,
+      "description": "For 'spawn' and 'spawn_batch': explicitly request a strictly narrower, sealed sessions_spawn grant for this child. Requires operator permission; supports one further level with one child per recursive grant, retaining the selected provider/model pins.",
+      "type": "boolean"
+    },
+    "announce": {
+      "description": "For 'spawn', default true: whether the sub-agent posts its own result to the channel. A 'spawn_batch' member never announces; collect a batch with 'join' and report it once.",
+      "type": "boolean"
+    },
+    "batch_id": {
+      "description": "For 'join': the batch identifier returned by 'spawn_batch'. 'join' blocks until every member has finished, however long that takes.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "disposition": {
+      "default": "queue",
+      "description": "For 'chat_assign': how to handle a turn that session is already running. 'queue' (default) waits, 'steer' feeds the task to the running turn, 'interrupt' stops it first. Prefer 'queue'.",
+      "enum": [
+        "queue",
+        "steer",
+        "interrupt"
+      ],
+      "type": "string"
+    },
+    "last_n": {
+      "description": "For 'history': return the last N entries (default 20, keeping final proof markers visible).",
+      "maximum": 200,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "max_chars_per_entry": {
+      "description": "For 'history': maximum characters per returned entry (default 800).",
+      "maximum": 4000,
+      "minimum": 80,
+      "type": "integer"
+    },
+    "message": {
+      "description": "For 'steer': text injected into an already-running sub-agent to redirect it. Not how work is handed out — 'spawn' and 'chat_assign' take their instructions in `task`.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "mode": {
+      "default": "task",
+      "description": "For 'spawn' and 'spawn_batch': 'task' runs in-process (default), 'process' launches an isolated OS process.",
+      "enum": [
+        "task",
+        "process"
+      ],
+      "type": "string"
+    },
+    "model": {
+      "description": "For 'spawn' and 'spawn_batch': model override. Defaults to the gateway model.",
+      "type": "string"
+    },
+    "provider": {
+      "description": "For 'spawn' and 'spawn_batch': provider override. Must be a provider the operator configured (the gateway provider, a named agent's provider, a fallback provider or a model route); any other provider, including an unconfigured 'custom:<url>', is refused. Defaults to the agent config provider, then the gateway provider.",
+      "type": "string"
+    },
+    "recipient": {
+      "description": "For 'spawn': recipient (phone number, group ID, …) of the result announcement and any kill notice; defaults to the current sender. Under 'spawn_batch' it routes only the kill notice. 'chat_assign' always replies into the assigning conversation.",
+      "type": "string"
+    },
+    "run_id": {
+      "description": "Sub-agent run id returned by 'spawn' and listed by 'list'. Required by 'kill', 'history' and 'steer'. Not a chat session id.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "session_id": {
+      "description": "For 'chat_assign': the live `prx chat` session that gets the task, as listed by 'chat_sessions'. A chat session id, not a sub-agent run_id.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "task": {
+      "description": "The work to be done, as instructions. Required by 'spawn' and by 'chat_assign' ('chat_assign' has no `message`, `prompt` or `text` parameter). Use `tasks` for 'spawn_batch' and `message` for 'steer'.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "tasks": {
+      "description": "For 'spawn_batch': tasks to launch together. Ordinary batches have no fixed member cap; recursive grants permit one child. Each entry is a task string or an object {task, agent?, model?, provider?, allow_delegation?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
+      "items": {
+        "anyOf": [
+          {
+            "minLength": 1,
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "agent": {
+                "type": "string"
+              },
+              "allow_delegation": {
+                "default": false,
+                "description": "For 'spawn' and 'spawn_batch': explicitly request a strictly narrower, sealed sessions_spawn grant for this child. Requires operator permission; supports one further level with one child per recursive grant, retaining the selected provider/model pins.",
+                "type": "boolean"
+              },
+              "mode": {
+                "enum": [
+                  "task",
+                  "process"
+                ],
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "recipient": {
+                "type": "string"
+              },
+              "task": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "task"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [],
+  "type": "object"
+}

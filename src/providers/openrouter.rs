@@ -165,12 +165,12 @@ impl OpenRouterProvider {
 
     /// Lower every published tool schema to what this endpoint was declared to
     /// accept, or refuse the request naming the tool that cannot be offered.
-    fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> anyhow::Result<Option<Vec<NativeToolSpec>>> {
+    fn convert_tools(&self, tools: Option<&[ToolSpec]>, model: &str) -> anyhow::Result<Option<Vec<NativeToolSpec>>> {
         let items = tools.filter(|items| !items.is_empty());
         let Some(items) = items else {
             return Ok(None);
         };
-        let dialect = self.tool_schema_dialect();
+        let dialect = self.tool_schema_dialect_for(model);
         let mut converted = Vec::with_capacity(items.len());
         for tool in items {
             let parameters =
@@ -295,7 +295,7 @@ impl OpenRouterProvider {
             anyhow::anyhow!("OpenRouter API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openrouter`.")
         })?;
 
-        let tools = self.convert_tools(request.tools)?;
+        let tools = self.convert_tools(request.tools, model)?;
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
@@ -351,6 +351,10 @@ impl OpenRouterProvider {
 
 #[async_trait]
 impl Provider for OpenRouterProvider {
+    fn tool_schema_dialect_for(&self, model: &str) -> crate::tools::ToolSchemaDialect {
+        super::catalog::builtin_tool_schema_dialect(&super::ProviderId::of("openrouter"), model)
+    }
+
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: true,
@@ -534,76 +538,33 @@ impl Provider for OpenRouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenRouter API key not set. Set `api_key` in config.toml or run `prx auth paste-token --provider openrouter`.")
-        })?;
-
-        // Convert tool JSON values to NativeToolSpec
-        let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
-            None
-        } else {
-            let specs: Vec<NativeToolSpec> = tools
-                .iter()
-                .filter_map(|t| {
-                    let func = t.get("function")?;
-                    Some(NativeToolSpec {
-                        kind: "function".to_string(),
-                        function: NativeToolFunctionSpec {
-                            name: func.get("name")?.as_str()?.to_string(),
-                            description: func
-                                .get("description")
-                                .and_then(|d| d.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            parameters: func.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({})),
-                        },
-                    })
+        let specs: Vec<ToolSpec> = tools
+            .iter()
+            .filter_map(|tool| {
+                let function = tool.get("function")?;
+                Some(ToolSpec {
+                    name: function.get("name")?.as_str()?.to_owned(),
+                    description: function
+                        .get("description")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    parameters: function
+                        .get("parameters")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
                 })
-                .collect();
-            if specs.is_empty() { None } else { Some(specs) }
-        };
-
-        // Convert ChatMessage to NativeMessage, preserving structured assistant/tool entries
-        // when history contains native tool-call metadata.
-        let native_messages = Self::convert_messages(messages);
-
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            messages: native_messages,
+            })
+            .collect();
+        self.chat(
+            ProviderChatRequest {
+                messages,
+                tools: Some(&specs),
+            },
+            model,
             temperature,
-            stream: false,
-            usage: None,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
-            tools: native_tools,
-        };
-
-        let response = self
-            .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {credential}"))
-            .header("HTTP-Referer", "https://github.com/openprx/prx")
-            .header("X-Title", "OpenPRX")
-            .json(&super::parameter_wire::request(
-                "openrouter",
-                super::parameter_wire::Format::OpenRouter,
-                &native_request.model,
-                &native_request,
-            ))
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
-        }
-
-        let native_response: NativeChatResponse = response.json().await?;
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        Ok(Self::parse_native_response(message))
+        )
+        .await
     }
 
     fn supports_streaming(&self) -> bool {
@@ -631,7 +592,7 @@ impl Provider for OpenRouterProvider {
 
         // Lowered before the connection is opened, so a tool this endpoint
         // cannot be offered ends the turn with the reason, not an upstream 400.
-        let tools = match self.convert_tools(options.tools.as_deref()) {
+        let tools = match self.convert_tools(options.tools.as_deref(), model) {
             Ok(tools) => tools,
             Err(error) => {
                 let message = error.to_string();
@@ -738,6 +699,102 @@ mod tests {
         }
         let response: NativeChatResponse = serde_json::from_str(r#"{"choices":[]}"#).unwrap();
         assert!(response.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_schema_rejection_precedes_streaming_and_chat_transport() {
+        let probe = crate::providers::credential_probe::CredentialProbe::start().await;
+        let mut provider = OpenRouterProvider::new(Some("prx-test-credential"));
+        provider.chat_endpoint = Some(format!("{}/chat/completions", probe.base_url()));
+        let tools = vec![ToolSpec {
+            name: "mcp_fixture".into(),
+            description: "fixture".into(),
+            parameters: serde_json::json!({"type":"object", "anyOf":[{"required":["a"]},{"required":["b"]}]}),
+        }];
+        let messages = vec![ChatMessage::user("fixture")];
+        let error = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "anthropic/fixture",
+                0.0,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<super::super::ProviderCapabilityError>().is_some());
+        for expected in ["mcp_fixture", "anyOf", "no_root_combinators", "tool_tiering"] {
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let result = provider
+            .stream_chat_with_history(
+                &messages,
+                "anthropic/fixture",
+                0.0,
+                StreamOptions {
+                    tools: Some(tools.clone()),
+                    ..StreamOptions::default()
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("no_root_combinators")
+        );
+        let raw = vec![
+            serde_json::json!({"type":"function", "function":{"name":"mcp_fixture", "parameters":tools[0].parameters}}),
+        ];
+        let error = provider
+            .chat_with_tools(&messages, &raw, "anthropic/fixture", 0.0)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<super::super::ProviderCapabilityError>().is_some());
+        assert!(probe.requests().is_empty());
+        assert!(provider.convert_tools(Some(&tools), "openai/fixture").is_ok());
+        let flat = vec![ToolSpec {
+            name: "flat_fixture".into(),
+            description: "fixture".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list"]}},"required":["action"]}),
+        }];
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&flat),
+                },
+                "anthropic/fixture",
+                0.0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.text.as_deref(),
+            Some(crate::providers::credential_probe::PROBE_REPLY)
+        );
+        assert_eq!(probe.requests().len(), 1);
+    }
+
+    #[test]
+    fn catalog_and_transport_agree_on_anthropic_family_dialects() {
+        use crate::tools::ToolSchemaDialect::{NoRootCombinators, Raw};
+        let provider = OpenRouterProvider::new(None);
+        for (model, expected) in [
+            ("anthropic/fixture", NoRootCombinators),
+            ("ANTHROPIC/fixture", NoRootCombinators),
+            ("openai/fixture", Raw),
+            ("anthropic-fixture", Raw),
+        ] {
+            let descriptor = super::super::catalog::CatalogView::default()
+                .describe(&super::super::ProviderId::of("openrouter"), model);
+            assert_eq!(descriptor.dialects.tool_schema, expected);
+            assert_eq!(provider.tool_schema_dialect_for(model), expected);
+        }
     }
 
     #[tokio::test]

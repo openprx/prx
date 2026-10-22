@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod composition;
 mod contracts;
+mod flat_contracts;
 mod idempotency;
 mod pipeline;
 

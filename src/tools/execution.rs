@@ -64,6 +64,9 @@ pub trait ToolBackend: Send + Sync {
     fn process_worker_compatible(&self) -> bool {
         true
     }
+    fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
+        None
+    }
     fn root_name(&self) -> &str;
     fn specs(&self) -> Vec<ToolSpec>;
     fn catalog_specs(&self) -> Vec<ToolSpec> {
@@ -127,6 +130,9 @@ impl SharedRegistryToolAdapter {
 
 #[async_trait]
 impl ToolBackend for SharedRegistryToolAdapter {
+    fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
+        self.tool()?.execution_parameters_schema()
+    }
     fn supports_owner_filesystem(&self) -> bool {
         self.tool().is_some_and(Tool::supports_owner_filesystem)
     }
@@ -231,6 +237,9 @@ impl LegacyToolAdapter {
 
 #[async_trait]
 impl ToolBackend for LegacyToolAdapter {
+    fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
+        self.tool.execution_parameters_schema()
+    }
     fn supports_owner_filesystem(&self) -> bool {
         self.tool.supports_owner_filesystem()
     }
@@ -326,6 +335,14 @@ pub struct ToolDescriptor {
     pub backend_name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    /// Full private built-in contract; None means the public contract is complete.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::tools::schema::serialize_execution_parameters",
+        deserialize_with = "crate::tools::schema::deserialize_execution_parameters"
+    )]
+    pub execution_parameters: Option<Arc<serde_json::Value>>,
     pub tier: ToolTier,
     pub categories: Vec<ToolCategory>,
     pub effect: ToolEffect,
@@ -335,6 +352,16 @@ pub struct ToolDescriptor {
     /// Evidence-backed runtime availability. Registered executable tools are
     /// `Ready`; `Healthy` is reserved for a positive runtime probe.
     pub availability: CapabilityAvailability,
+}
+
+impl ToolDescriptor {
+    fn with_execution_parameters(mut self, schema: Option<Arc<serde_json::Value>>) -> Self {
+        // A dynamic alias owns its own schema, never its backend's root contract.
+        if self.public_name == self.backend_name {
+            self.execution_parameters = schema;
+        }
+        self
+    }
 }
 
 const fn process_worker_compatible_by_default() -> bool {
@@ -1310,6 +1337,7 @@ impl ToolCatalog {
                         backend.availability(),
                         backend.process_worker_compatible(),
                     )
+                    .with_execution_parameters(backend.execution_parameters_schema())
                 })
             })
             .collect();
@@ -1352,6 +1380,7 @@ impl ToolCatalog {
                         tool.availability(),
                         tool.process_worker_compatible(),
                     )
+                    .with_execution_parameters(tool.execution_parameters_schema())
                 })
             })
             .collect();
@@ -1438,6 +1467,7 @@ fn tool_descriptor(
         backend_name: backend_name.to_string(),
         description: spec.description,
         parameters: spec.parameters,
+        execution_parameters: None,
         tier,
         categories,
         effect,
@@ -1621,7 +1651,8 @@ impl ToolExecutionService {
                 |name| backend.adapter_kind(name),
                 backend.availability(),
                 backend.process_worker_compatible(),
-            );
+            )
+            .with_execution_parameters(backend.execution_parameters_schema());
             if resolved.is_some() {
                 // A dynamic name with more than one live owner is ambiguous.
                 return None;
@@ -1703,6 +1734,7 @@ impl ToolExecutionService {
                         backend.availability(),
                         backend.process_worker_compatible(),
                     )
+                    .with_execution_parameters(backend.execution_parameters_schema())
                 })
             })
             .collect()
@@ -2403,6 +2435,30 @@ impl ToolExecutionService {
                 started,
             );
         }
+        // Structural validation runs before approval on purpose: a call that
+        // cannot legally execute must never reach an approval prompt, a
+        // reservation, or a backend. This is the one production gate for the
+        // tool contract, and every entry point funnels through here — including
+        // the gateway MCP server, which ran outside it until 0.8.126. The
+        // contract enforced is the one the caller was shown: see
+        // `ToolExecutionContext::schema_dialect`.
+        let contract = enforce_command_contract(&mut command.arguments, &descriptor, context.schema_dialect);
+        if let Err(error) = contract {
+            return self.finish(
+                &command,
+                &context,
+                input_sha256,
+                Some(descriptor),
+                None,
+                ToolExecutionStatus::InvalidArguments,
+                format!("Error: {error}"),
+                None,
+                Some(error),
+                None,
+                started,
+            );
+        }
+
         let decision = self.policy.decide(&descriptor, &context);
         let decision = if decision != ToolExecutionDecision::Deny
             && context
@@ -2427,30 +2483,6 @@ impl ToolExecutionService {
                 Some(descriptor),
                 Some(decision),
                 ToolExecutionStatus::Denied,
-                format!("Error: {error}"),
-                None,
-                Some(error),
-                None,
-                started,
-            );
-        }
-
-        // Structural validation runs before approval on purpose: a call that
-        // cannot legally execute must never reach an approval prompt, a
-        // reservation, or a backend. This is the one production gate for the
-        // tool contract, and every entry point funnels through here — including
-        // the gateway MCP server, which ran outside it until 0.8.126. The
-        // contract enforced is the one the caller was shown: see
-        // `ToolExecutionContext::schema_dialect`.
-        let contract = enforce_command_contract(&mut command.arguments, &descriptor, context.schema_dialect);
-        if let Err(error) = contract {
-            return self.finish(
-                &command,
-                &context,
-                input_sha256,
-                Some(descriptor),
-                Some(decision),
-                ToolExecutionStatus::InvalidArguments,
                 format!("Error: {error}"),
                 None,
                 Some(error),
@@ -2858,6 +2890,8 @@ impl ToolExecutionService {
         let backend_cancellation = cancellation.clone();
         let exact_call_ref = exact_call.as_ref();
         let public_name = command.name.as_str();
+        let execution_parameters = descriptor.execution_parameters.clone();
+        let schema_dialect = context.schema_dialect;
         let tool_future = crate::runtime::registry::scope_current(
             work.id(),
             crate::runtime::child_source::scope_outgoing_grant(
@@ -2885,7 +2919,11 @@ impl ToolExecutionService {
                                 }
                                 super::owner_filesystem_dispatch::scope(
                                     private_filesystem,
-                                    backend.invoke(public_name, arguments, backend_cancellation),
+                                    crate::tools::schema::with_execution_contract(
+                                        execution_parameters,
+                                        schema_dialect,
+                                        backend.invoke(public_name, arguments, backend_cancellation),
+                                    ),
                                 )
                                 .await
                             },
@@ -3027,6 +3065,14 @@ impl ToolExecutionService {
                 if let Some(trace) = context.execution_trace.as_ref() {
                     trace.note_error_detail(&command.operation_id, format!("{error:#}"));
                 }
+                let status = if error
+                    .downcast_ref::<crate::tools::schema::ToolArgumentError>()
+                    .is_some()
+                {
+                    ToolExecutionStatus::InvalidArguments
+                } else {
+                    ToolExecutionStatus::Failed
+                };
                 let error = error.to_string();
                 let hint = super::error_hints::recovery_hint(&command.name, &error);
                 let model_content = if hint.is_empty() {
@@ -3040,7 +3086,7 @@ impl ToolExecutionService {
                     input_sha256,
                     Some(descriptor),
                     Some(decision),
-                    ToolExecutionStatus::Failed,
+                    status,
                     model_content,
                     None,
                     Some(error),
@@ -3259,14 +3305,13 @@ pub fn strip_runtime_only_args(root: &mut serde_json::Map<String, serde_json::Va
 /// Enforce a tool's published contract on caller-supplied arguments: validate
 /// them, then make the document say what the contract means.
 ///
-/// The descriptor's `parameters` document is the single truth source: native,
-/// skill, MCP alias and WASM plugin tools all reach this with the same schema
-/// the provider was offered, so there is no second, hand-written rule set to
-/// drift. `dialect` says which rewrite of that document the model was actually
-/// shown — Gemini strips `additionalProperties`, `minLength`, `minimum` and a
-/// dozen more keywords before the request goes out — and the same
-/// [`crate::tools::schema::SchemaCleanr`] strategy is replayed here so a
-/// constraint the model never saw is never enforced against it. Runtime-only
+/// The descriptor's full `execution_parameters` (or public `parameters` when
+/// no private contract exists) is the truth source: native,
+/// skill, MCP alias and WASM plugin tools all reach this gate. Migrated built-ins
+/// keep their original conditional rules here while publishing a flat schema.
+/// `dialect` replays the provider's keyword lowering on the full contract:
+/// Gemini strips `additionalProperties` and bounds using the same
+/// [`crate::tools::schema::SchemaCleanr`] strategy as publication. Runtime-only
 /// keys are removed first because the runtime authors them after validation and
 /// they are intentionally absent from public schemas.
 ///
@@ -3281,23 +3326,16 @@ pub(crate) fn enforce_command_contract(
     let compiled = crate::tools::schema::compiled_tool_schema_for_dialect(
         &descriptor.public_name,
         dialect,
-        &descriptor.parameters,
+        descriptor
+            .execution_parameters
+            .as_deref()
+            .unwrap_or(&descriptor.parameters),
     );
-    let issues = {
-        let Some(root) = arguments.as_object() else {
-            return Err("tool arguments must be a JSON object".to_string());
-        };
-        let sanitized;
-        let candidate = if root.keys().any(|key| is_runtime_only_arg(key)) {
-            let mut root = root.clone();
-            strip_runtime_only_args(&mut root);
-            sanitized = serde_json::Value::Object(root);
-            &sanitized
-        } else {
-            &*arguments
-        };
-        compiled.validate_tool_arguments(candidate)
-    };
+    if !arguments.is_object() {
+        return Err("tool arguments must be a JSON object".to_string());
+    }
+    let issues =
+        crate::tools::schema::with_public_arguments(arguments, |public| compiled.validate_tool_arguments(public));
     if !issues.is_empty() {
         return Err(crate::tools::schema::describe_argument_validation_issues(
             &descriptor.public_name,

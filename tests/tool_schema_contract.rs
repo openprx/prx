@@ -75,20 +75,13 @@ fn offers_no_legal_value(schema: &Value) -> bool {
 /// `STATIC_PUBLIC_TOOL_NAMES`, so a new static tool cannot appear without
 /// either being swept here or being listed with a reason.
 const NOT_BUILT_IN_FIXTURE: &[&str] = &[
-    // Needs a live Channel and Provider to spawn against.
-    "sessions_spawn",
-    // Needs a live Provider to issue the vision request.
-    "image",
-    // `prx chat` only: built from the terminal's own session registry.
-    "chat_schedule",
-    "managed_session",
-    // The hook manager and its tool factories are crate-private.
-    "hooks_manage",
-    "hooks_status",
-    // Registered by the WASM plugin runtime from a live plugin generation.
+    #[cfg(not(feature = "wasm-plugins"))]
     "wasm_plugin_call",
+    #[cfg(not(feature = "wasm-plugins"))]
     "wasm_plugin_reload",
+    #[cfg(not(feature = "wasm-plugins"))]
     "wasm_plugins_manage",
+    #[cfg(not(feature = "wasm-plugins"))]
     "wasm_plugins_status",
 ];
 
@@ -129,6 +122,59 @@ fn registry(tmp: &TempDir) -> Vec<Box<dyn Tool>> {
         &config,
     );
     tools.extend(orchestration_tools(&config, &security, &memory));
+    tools.push(Box::new(openprx::tools::SessionsSpawnTool::new(
+        Arc::new(openprx::channels::cli::CliChannel),
+        "fixture",
+        "fixture-model",
+        0.0,
+        Arc::clone(&security),
+        config.workspace_dir.clone(),
+        config.multimodal.clone(),
+        HashMap::new(),
+        None,
+        openprx::providers::ProviderRuntimeOptions::default(),
+        openprx::config::SessionsSpawnConfig::default(),
+    )));
+    tools.push(Box::new(openprx::tools::ImageTool::new(
+        Arc::new(openprx::providers::openrouter::OpenRouterProvider::new(None)),
+        "fixture-model",
+        0.0,
+        Arc::clone(&security),
+        config.multimodal.clone(),
+    )));
+    let hooks = Arc::new(openprx::HookManager::new(config.workspace_dir.clone()));
+    tools.push(hooks.manage_tool(Arc::clone(&security)));
+    tools.push(hooks.status_tool());
+    tools.push(Box::new(openprx::chat::scheduled_input::ScheduledInputTool::new(
+        openprx::chat::scheduled_input::ScheduledInputHandle::default(),
+    )));
+    let (sink, _receiver) = openprx::chat::sessions::event::SessionEventSink::channel();
+    tools.push(Box::new(openprx::chat::managed_session::ManagedSessionTool::new(
+        config.workspace_dir.clone(),
+        Arc::new(parking_lot::Mutex::new(Vec::new())),
+        sink,
+    )));
+    #[cfg(feature = "wasm-plugins")]
+    {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: plugin runtime executor");
+        let policy = openprx::plugins::PluginPolicy::new(true, tmp.path().join("state/plugin-trust.json"));
+        let runtime = executor
+            .block_on(openprx::plugins::init_plugin_runtime_with_policy(
+                &config.workspace_dir,
+                policy,
+                None,
+            ))
+            .expect("test: empty plugin runtime");
+        tools.extend([
+            runtime.tool_router(),
+            runtime.status_tool(),
+            runtime.reload_tool(Arc::clone(&security)),
+            runtime.manage_tool(Arc::clone(&security)),
+        ]);
+    }
     tools
 }
 
@@ -897,36 +943,9 @@ use openprx::tools::schema::{
 };
 use std::borrow::Cow;
 
-/// Published contracts this fixture builds whose root combinator has no
-/// lossless lowering, so a no-root-combinator endpoint is told which tool it
-/// cannot have and why.
-///
-/// Every name here encodes a rule that a single object cannot express: a
-/// requirement conditional on the `action` discriminator, or a choice between
-/// alternative required sets. Merging them would either require every branch's
-/// fields at once or require none of them; both are a different contract from
-/// the published one, and inventing one to obtain an HTTP 200 is what this
-/// refusal exists to prevent.
-///
-/// A name leaving this list means a tool stopped publishing a root combinator.
-/// A name joining it means a tool started publishing one and is now unavailable
-/// on this class of endpoint — a finding either way, never a silent change.
-const REFUSED_UNDER_NO_ROOT_COMBINATORS: &[&str] = &[
-    "chat_profile_update",
-    "composio",
-    "cron",
-    "document_get_chunk",
-    "document_ingest",
-    "gateway",
-    "git_operations",
-    "mcp_call",
-    "memory_get",
-    "nodes",
-    "proxy_config",
-    "skills_manage",
-    "subagents",
-    "xin",
-];
+/// No built-in tool may publish a root combinator. External schemas retain
+/// fail-closed lowering, covered separately below.
+const REFUSED_UNDER_NO_ROOT_COMBINATORS: &[&str] = &[];
 
 /// The root combinator keywords a contract may publish.
 const ROOT_COMBINATORS: [&str; 3] = ["allOf", "anyOf", "oneOf"];
@@ -1036,6 +1055,11 @@ fn every_published_contract_is_lowered_or_refused_for_a_no_root_combinator_endpo
     let mut lowered = Vec::new();
     let mut refused = Vec::new();
     for spec in &specs {
+        assert!(
+            !has_root_combinator(&spec.parameters),
+            "{}: built-in root combinator",
+            spec.public_name
+        );
         match ToolSchemaDialect::NoRootCombinators.wire_schema(&spec.public_name, &spec.parameters) {
             Ok(document) => {
                 assert_lowering_kept_the_contract(&spec.public_name, &spec.parameters, &document);
@@ -1073,14 +1097,23 @@ fn every_published_contract_is_lowered_or_refused_for_a_no_root_combinator_endpo
 /// refusal, so an operator found the fourteen tools one run at a time.
 #[test]
 fn one_request_names_every_refused_tool_at_once() {
-    let tmp = TempDir::new().expect("tempdir");
-    let specs = published_contracts(&tmp);
+    let names: Vec<String> = (0..14).map(|index| format!("mcp_fixture_{index:02}")).collect();
+    let specs: Vec<_> = names
+        .iter()
+        .map(|name| {
+            (
+                name.as_str(),
+                json!({"type":"object","anyOf":[{"required":["a"]},{"required":["b"]}]}),
+            )
+        })
+        .collect();
+    let expected_names: Vec<&str> = names.iter().map(String::as_str).collect();
     let refused = ToolSchemaDialect::NoRootCombinators
-        .lower_all(specs.iter().map(|spec| (spec.public_name.as_str(), &spec.parameters)))
+        .lower_all(specs.iter().map(|(name, schema)| (*name, schema)))
         .expect_err("the published surface holds refused tools");
     let mut names = refused.iter().map(|error| error.tool.clone()).collect::<Vec<_>>();
     names.sort();
-    assert_eq!(names, pinned(REFUSED_UNDER_NO_ROOT_COMBINATORS));
+    assert_eq!(names, pinned(&expected_names));
 
     let rendered = openprx::tools::ToolSchemaRefusals {
         dialect: ToolSchemaDialect::NoRootCombinators,
@@ -1091,7 +1124,7 @@ fn one_request_names_every_refused_tool_at_once() {
             .to_string(),
     }
     .to_string();
-    for name in REFUSED_UNDER_NO_ROOT_COMBINATORS {
+    for name in &expected_names {
         assert!(
             rendered.contains(&format!("\"{name}\"")),
             "{name} missing from the exclusion: {rendered}"
@@ -1104,7 +1137,7 @@ fn one_request_names_every_refused_tool_at_once() {
             names.sort();
             names
         }),
-        Some(pinned(REFUSED_UNDER_NO_ROOT_COMBINATORS)),
+        Some(pinned(&expected_names)),
         "the stable rendering must round-trip the refused names"
     );
     println!("{rendered}");
@@ -1442,10 +1475,9 @@ fn a_verbatim_mcp_alias_schema_is_lowered_or_refused_by_the_same_pass() {
     );
 }
 
-/// The six combinator-bearing tools this fixture cannot construct — they need a
-/// live provider, channel, hook manager or the WASM plugin runtime — authored
-/// through the same public helpers their builders use, so every root-combinator
-/// shape in the tree has a pinned outcome even where the tool itself is absent.
+/// Historical built-in shapes, retained as external-schema regression fixtures.
+/// The actual built-ins above now publish flat schemas; third-party schemas
+/// using the same conditional shapes must still fail closed without weakening.
 fn shapes_the_fixture_cannot_build() -> Vec<(&'static str, Value)> {
     let object = || {
         json!({

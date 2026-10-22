@@ -16,6 +16,21 @@ Browser-based management interface for OpenPRX. Located at `console/` in the rep
 - Provider/channel health overview
 - Session and subagent management
 
+## Where conversations come from
+
+The Console continues an existing persisted conversation. To create one today,
+send a message through a configured messaging channel backed by the same
+persistent memory backend and workspace as the gateway. Accepted channel turns
+create the conversation record that appears in the Console session list.
+Refresh that list and open the conversation before sending a Console message.
+
+`POST /api/sessions/{id}/message` requires that conversation to exist. There is
+no `POST /api/sessions` creation endpoint. A webhook request or a `prx agent`
+invocation does not seed this list; terminal `prx chat` saves its own session
+history separately. An empty list on a fresh installation is therefore expected.
+Creating a session directly in the Console is deferred to a later release.
+Do not insert database rows by hand to create a conversation.
+
 ## Tech Stack
 
 - Svelte SPA (Vite)

@@ -1,0 +1,99 @@
+{
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "set"
+          },
+          "scope": {
+            "enum": [
+              "services",
+              "service"
+            ]
+          }
+        },
+        "required": [
+          "action",
+          "scope"
+        ]
+      },
+      "then": {
+        "required": [
+          "services"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "default": "get",
+      "description": "Action to perform: 'get' reads the effective proxy settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, 'clear_env' removes it. Defaults to 'get'.",
+      "enum": [
+        "get",
+        "set",
+        "list_services",
+        "apply_env",
+        "clear_env"
+      ],
+      "type": "string"
+    },
+    "all_proxy": {
+      "description": "Fallback proxy URL for all protocols",
+      "type": "string"
+    },
+    "http_proxy": {
+      "description": "HTTP proxy URL",
+      "type": "string"
+    },
+    "https_proxy": {
+      "description": "HTTPS proxy URL",
+      "type": "string"
+    },
+    "no_proxy": {
+      "description": "Comma-separated string or array of NO_PROXY entries",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "scope": {
+      "description": "Proxy scope. Canonical values: environment, prx, services.",
+      "enum": [
+        "environment",
+        "env",
+        "prx",
+        "internal",
+        "core",
+        "services",
+        "service"
+      ],
+      "type": "string"
+    },
+    "services": {
+      "description": "Comma-separated string or array of service selectors; required when 'set' targets scope=services",
+      "oneOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      ]
+    }
+  },
+  "type": "object"
+}

@@ -1,0 +1,211 @@
+{
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "enum": [
+              "get",
+              "enable",
+              "disable",
+              "remove",
+              "cron_run",
+              "provider_chat",
+              "storage_health",
+              "storage_store",
+              "storage_recall",
+              "storage_forget",
+              "storage_count"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "enum": [
+              "install",
+              "update"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "source"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "middleware_test"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "stage"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "storage_store"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "key",
+          "content"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "storage_forget"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "key"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "description": "Inspect with 'status'/'get'; reload the workspace with 'refresh'; manage a plugin with 'install'/'update'/'enable'/'disable'/'remove'; exercise an exported adapter with 'middleware_test' (middleware stage), 'cron_run' (cron handler), 'provider_chat' (provider) or the storage actions 'storage_health'/'storage_store'/'storage_recall'/'storage_forget'/'storage_count'.",
+      "enum": [
+        "status",
+        "get",
+        "refresh",
+        "install",
+        "update",
+        "enable",
+        "disable",
+        "remove",
+        "middleware_test",
+        "cron_run",
+        "provider_chat",
+        "storage_health",
+        "storage_store",
+        "storage_recall",
+        "storage_forget",
+        "storage_count"
+      ],
+      "type": "string"
+    },
+    "category": {
+      "description": "Optional storage category for 'storage_store'/'storage_recall'/'storage_count'.",
+      "type": "string"
+    },
+    "content": {
+      "description": "Value to store; required by 'storage_store'.",
+      "type": "string"
+    },
+    "data": {
+      "description": "'middleware_test': the envelope passed to the stage."
+    },
+    "grant_permissions": {
+      "description": "'install'/'update': host permissions the operator grants (must include every required permission of the plugin and only ones it declares). The approval is bound to the plugin name, WASM hash, manifest hash and this list; omitted means none.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "key": {
+      "description": "Storage key; required by 'storage_store' and 'storage_forget'.",
+      "type": "string"
+    },
+    "limit": {
+      "description": "'storage_recall': maximum number of results.",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "message": {
+      "description": "'provider_chat': single user message.",
+      "type": "string"
+    },
+    "messages": {
+      "description": "'provider_chat': full message list; alternative to 'message'.",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "system",
+              "user",
+              "assistant",
+              "tool"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "model": {
+      "description": "'provider_chat': model override.",
+      "type": "string"
+    },
+    "name": {
+      "description": "Plugin name or exported adapter name; required by 'get'/'enable'/'disable'/'remove'/'cron_run'/'provider_chat' and by every storage action ('storage_health'/'storage_store'/'storage_recall'/'storage_forget'/'storage_count').",
+      "minLength": 1,
+      "type": "string"
+    },
+    "query": {
+      "description": "'storage_recall': search query.",
+      "type": "string"
+    },
+    "session_id": {
+      "description": "Optional storage session scope for 'storage_store'/'storage_recall'/'storage_count'.",
+      "type": "string"
+    },
+    "source": {
+      "description": "'install'/'update': plugin source directory in the workspace.",
+      "type": "string"
+    },
+    "stage": {
+      "description": "'middleware_test': pipeline stage to exercise.",
+      "enum": [
+        "inbound",
+        "outbound",
+        "llm_request",
+        "llm_response"
+      ],
+      "type": "string"
+    },
+    "temperature": {
+      "description": "'provider_chat': sampling temperature.",
+      "type": "number"
+    }
+  },
+  "required": [
+    "action"
+  ],
+  "type": "object"
+}

@@ -406,6 +406,96 @@ impl NodesTool {
     }
 }
 
+impl NodesTool {
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_action_requirements(
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["list", "status", "exec", "read", "write", "cancel"],
+                                "description": "Action to perform: 'list' enumerates the configured nodes, 'status' probes one, 'exec' runs a shell command, 'read' fetches a file, 'write' stores a file, 'cancel' aborts a running task."
+                            },
+                            "node": {
+                                "type": "string",
+                                "description": "Node ID; required for 'status', 'exec', 'read', 'write' and 'cancel'"
+                            },
+                            "command": {
+                                "type": "string",
+                                "description": "Shell command; required for 'exec'"
+                            },
+                            "timeout_ms": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Timeout override in milliseconds"
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": "Working directory for 'exec'"
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "File path; required for 'read' and 'write'"
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Byte offset for 'read'"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Byte limit for 'read'"
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "File content; required for 'write'"
+                            },
+                            "create_dirs": {
+                                "type": "boolean",
+                                "description": "Create parent directories for 'write'"
+                            },
+                            "task_id": {
+                                "type": "string",
+                                "description": "Task ID; required for 'cancel'"
+                            }
+                        },
+                        "required": ["action"]
+                    }),
+                    "action",
+                    &[
+                        crate::tools::schema::ActionRequirement {
+                            action: "status",
+                            required: &["node"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "exec",
+                            required: &["node", "command"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "read",
+                            required: &["node", "path"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "write",
+                            required: &["node", "path", "content"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "cancel",
+                            required: &["node", "task_id"],
+                        },
+                    ],
+                )
+            })
+        });
+        &SCHEMA
+    }
+}
+
 #[async_trait]
 impl Tool for NodesTool {
     fn name(&self) -> &str {
@@ -431,89 +521,15 @@ impl Tool for NodesTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_requirements(
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["list", "status", "exec", "read", "write", "cancel"],
-                        "description": "Action to perform: 'list' enumerates the configured nodes, 'status' probes one, 'exec' runs a shell command, 'read' fetches a file, 'write' stores a file, 'cancel' aborts a running task."
-                    },
-                    "node": {
-                        "type": "string",
-                        "description": "Node ID; required for 'status', 'exec', 'read', 'write' and 'cancel'"
-                    },
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command; required for 'exec'"
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Timeout override in milliseconds"
-                    },
-                    "cwd": {
-                        "type": "string",
-                        "description": "Working directory for 'exec'"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "File path; required for 'read' and 'write'"
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Byte offset for 'read'"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Byte limit for 'read'"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "File content; required for 'write'"
-                    },
-                    "create_dirs": {
-                        "type": "boolean",
-                        "description": "Create parent directories for 'write'"
-                    },
-                    "task_id": {
-                        "type": "string",
-                        "description": "Task ID; required for 'cancel'"
-                    }
-                },
-                "required": ["action"]
-            }),
-            "action",
-            &[
-                crate::tools::schema::ActionRequirement {
-                    action: "status",
-                    required: &["node"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "exec",
-                    required: &["node", "command"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "read",
-                    required: &["node", "path"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "write",
-                    required: &["node", "path", "content"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "cancel",
-                    required: &["node", "task_id"],
-                },
-            ],
-        )
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         // A transport error can quote the node URL, userinfo included
         // (`error sending request for url (...)`); the model never sees it.
         self.execute_action(args)
@@ -537,6 +553,75 @@ mod tests {
     use crate::memory::{MemoryPrincipal, SqliteMemory};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
+
+    async fn assert_argument_rejection(tool: &NodesTool, args: Value, path: &str) {
+        let before = tool.config.load_full();
+        let error = tool.execute(args).await.unwrap_err();
+        let typed = error.downcast_ref::<crate::tools::schema::ToolArgumentError>().unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path == path), "{error}");
+        assert!(Arc::ptr_eq(&before, &tool.config.load_full()));
+        assert!(tool.execute(json!({"action":"list"})).await.unwrap().success);
+    }
+
+    async fn assert_corrected_node_call(mut args: Value, field: &str, value: Value, response: Value) {
+        use axum::{Json, Router, routing::post};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut node = test_node("n1");
+        node.endpoint = format!("http://{}", listener.local_addr().unwrap());
+        node.retry_max = Some(0);
+        let tool = make_tool_with_nodes(vec![node], AutonomyLevel::Full);
+        // The same malformed request cannot contact even a configured node.
+        let error = tool.execute(args.clone()).await.unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::tools::schema::ToolArgumentError>()
+                .is_some()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured = observed.clone();
+        let router = Router::new().route(
+            "/rpc",
+            post(move |Json(request): Json<Value>| {
+                let response = response.clone();
+                let captured = captured.clone();
+                async move {
+                    captured.lock().push(request.clone());
+                    Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":response}))
+                }
+            }),
+        );
+        let (shutdown, stop) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = stop.await;
+                })
+                .await
+                .unwrap();
+        });
+        args[field] = value.clone();
+        let result = tool.execute(args.clone()).await;
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+        let result = result.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let requests = observed.lock();
+        assert_eq!(requests.len(), 1);
+        let method = match args["action"].as_str().unwrap() {
+            "exec" => "node.exec_shell",
+            "read" => "node.read_file",
+            "write" => "node.write_file",
+            _ => panic!("unexpected fixture action"),
+        };
+        assert_eq!(requests[0]["method"], method);
+        let wire_field = if field == "command" { "cmd" } else { field };
+        assert_eq!(requests[0]["params"][wire_field], value);
+    }
 
     fn make_tool() -> NodesTool {
         let config = new_shared(Config::default());
@@ -572,13 +657,14 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn nodes_action_tool_contract() {
+    #[tokio::test]
+    async fn nodes_action_tool_contract() {
         let tool = make_tool();
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            tool.execution_schema(),
         );
     }
 
@@ -594,14 +680,14 @@ mod tests {
 
     #[test]
     fn tool_schema_requires_action() {
-        let schema = make_tool().parameters_schema();
+        let schema = make_tool().execution_schema();
         let required = schema["required"].as_array().expect("test: required");
         assert!(required.iter().any(|v| v == "action"));
     }
 
     #[test]
     fn tool_schema_has_six_actions() {
-        let schema = make_tool().parameters_schema();
+        let schema = make_tool().execution_schema();
         let actions = schema["properties"]["action"]["enum"]
             .as_array()
             .expect("test: action enum");
@@ -835,8 +921,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_action_fails() {
         let tool = make_tool();
-        let err = tool.execute(json!({"action": "destroy"})).await.unwrap_err();
-        assert!(err.to_string().contains("Unknown action"));
+        assert_argument_rejection(&tool, json!({"action":"destroy"}), "$.action").await;
     }
 
     // ── Missing action ──────────────────────────────────────────
@@ -875,46 +960,54 @@ mod tests {
     #[tokio::test]
     async fn exec_rejects_non_string_command_param() {
         let tool = make_tool();
-        let error = tool
-            .execute(json!({
-                "action": "exec",
-                "node": "n1",
-                "command": 123
-            }))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("Missing or invalid 'command' parameter"));
+        let invalid = json!({"action":"exec","node":"n1","command":123});
+        assert_argument_rejection(&tool, invalid.clone(), "$.command").await;
+        assert_corrected_node_call(
+            invalid,
+            "command",
+            json!("echo fixture"),
+            json!({
+                "task_id":"fixture-task", "exit_code":0, "stdout":"fixture", "stderr":"",
+                "duration_ms":1, "timed_out":false, "cancelled":false
+            }),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn read_rejects_invalid_offset_param_type() {
         let tool = make_tool();
-        let error = tool
-            .execute(json!({
-                "action": "read",
-                "node": "n1",
-                "path": "file.txt",
-                "offset": "bad"
-            }))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("'offset' must be an unsigned integer"));
+        assert_argument_rejection(
+            &tool,
+            json!({"action":"read","node":"n1","path":"file.txt","offset":"bad"}),
+            "$.offset",
+        )
+        .await;
+        assert_corrected_node_call(
+            json!({"action":"read","node":"n1","path":"file.txt","offset":"bad"}),
+            "offset",
+            json!(0),
+            json!({"path":"file.txt","content":"fixture","bytes_read":7,"offset":0,"eof":true}),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn write_rejects_non_bool_create_dirs() {
         let tool = make_tool_with_nodes(vec![test_node("n1")], AutonomyLevel::Full);
-        let err = tool
-            .execute(json!({
-                "action": "write",
-                "node": "n1",
-                "path": "/f",
-                "content": "x",
-                "create_dirs": "yes"
-            }))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("must be a boolean"));
+        assert_argument_rejection(
+            &tool,
+            json!({"action":"write","node":"n1","path":"/f","content":"x","create_dirs":"yes"}),
+            "$.create_dirs",
+        )
+        .await;
+        assert_corrected_node_call(
+            json!({"action":"write","node":"n1","path":"/f","content":"x","create_dirs":"yes"}),
+            "create_dirs",
+            json!(true),
+            json!({"path":"/f","bytes_written":1,"created_dirs":true}),
+        )
+        .await;
     }
 
     /// R-SECRETS F2, RED before SECRETS-f: `list` returned a node endpoint's

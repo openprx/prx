@@ -1,0 +1,589 @@
+{
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "get"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "runs"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "history"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "events"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "once"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "command"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "remove"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "cancel"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "update"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "job_id",
+          "patch"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "patch"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "job_id",
+          "patch"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "run"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "pause"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "resume"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "add"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "anyOf": [
+          {
+            "required": [
+              "expression",
+              "command"
+            ]
+          },
+          {
+            "required": [
+              "schedule",
+              "command"
+            ]
+          },
+          {
+            "required": [
+              "expression",
+              "prompt"
+            ]
+          },
+          {
+            "required": [
+              "schedule",
+              "prompt"
+            ]
+          },
+          {
+            "required": [
+              "expression",
+              "payload"
+            ]
+          },
+          {
+            "required": [
+              "schedule",
+              "payload"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "schedule"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "anyOf": [
+          {
+            "required": [
+              "expression",
+              "command"
+            ]
+          },
+          {
+            "required": [
+              "schedule",
+              "command"
+            ]
+          },
+          {
+            "required": [
+              "expression",
+              "prompt"
+            ]
+          },
+          {
+            "required": [
+              "schedule",
+              "prompt"
+            ]
+          },
+          {
+            "required": [
+              "expression",
+              "payload"
+            ]
+          },
+          {
+            "required": [
+              "schedule",
+              "payload"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "once"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "oneOf": [
+          {
+            "required": [
+              "delay"
+            ]
+          },
+          {
+            "required": [
+              "run_at"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "description": "Create a job with 'add'/'schedule' (recurring) or 'once' (one-shot); inspect with 'list'/'get'/'runs'/'history'/'events'/'status'; change one with 'update'/'patch'; trigger it now with 'run'; halt or resume it with 'pause'/'resume'; delete it with 'remove'/'cancel'.",
+      "enum": [
+        "add",
+        "schedule",
+        "once",
+        "list",
+        "get",
+        "remove",
+        "cancel",
+        "update",
+        "patch",
+        "run",
+        "runs",
+        "history",
+        "events",
+        "pause",
+        "resume",
+        "status"
+      ],
+      "type": "string"
+    },
+    "command": {
+      "description": "Shell command to run; required by 'once' and one way to give 'add'/'schedule' its work.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "delay": {
+      "description": "One-shot delay for 'once' (e.g. `30m`, `2h`); alternative to 'run_at'.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "delete_after_run": {
+      "description": "Auto-delete one-shot jobs after success (default true for 'at').",
+      "type": "boolean"
+    },
+    "delivery": {
+      "description": "Agent-job result delivery: {mode:'announce',channel,to} or {mode:'none'}.",
+      "properties": {
+        "best_effort": {
+          "default": true,
+          "type": "boolean"
+        },
+        "channel": {
+          "enum": [
+            "signal",
+            "telegram",
+            "discord",
+            "slack",
+            "mattermost"
+          ],
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "none",
+            "announce"
+          ],
+          "type": "string"
+        },
+        "to": {
+          "description": "E.164 phone, UUID, or group:<groupId>",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "expression": {
+      "description": "Cron expression (e.g. `*/5 * * * *`) for 'add'/'schedule'; alternative to 'schedule'.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "job_id": {
+      "description": "Job ID for 'get'/'runs'/'history'/'events'/'update'/'patch'/'run'/'pause'/'resume'/'remove'/'cancel'.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "job_type": {
+      "description": "Legacy alternative to 'payload'. 'agent' runs an LLM turn.",
+      "enum": [
+        "shell",
+        "agent"
+      ],
+      "type": "string"
+    },
+    "limit": {
+      "description": "Max entries for 'runs' (default 10).",
+      "type": "integer"
+    },
+    "model": {
+      "description": "Model override for agent jobs.",
+      "type": "string"
+    },
+    "name": {
+      "description": "Human-readable job name.",
+      "type": "string"
+    },
+    "patch": {
+      "description": "Fields to update for 'update'/'patch'.",
+      "type": "object"
+    },
+    "payload": {
+      "anyOf": [
+        {
+          "required": [
+            "message"
+          ]
+        },
+        {
+          "required": [
+            "text"
+          ]
+        }
+      ],
+      "description": "'add'/'schedule' payload: {kind:agentTurn,message} runs an isolated LLM turn; {kind:systemEvent,text} injects text into the main session.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "agentTurn",
+            "systemEvent"
+          ],
+          "type": "string"
+        },
+        "message": {
+          "description": "agentTurn prompt.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "text": {
+          "description": "systemEvent text.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "prompt": {
+      "description": "LLM prompt for agent jobs on 'add'/'schedule'; overridden by payload.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "run_at": {
+      "description": "One-shot absolute RFC3339 time for 'once'; alternative to 'delay'.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "schedule": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "cron"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "expr"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "at"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "at"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "every"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "every_ms"
+            ]
+          }
+        }
+      ],
+      "description": "'add'/'schedule': {kind:cron,expr,tz?} | {kind:at,at} | {kind:every,every_ms}. Alternative to 'expression'.",
+      "properties": {
+        "at": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "every_ms": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "expr": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "cron",
+            "at",
+            "every"
+          ],
+          "type": "string"
+        },
+        "tz": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "session_target": {
+      "description": "Agent-job target: isolated=new context (default), main=inject into main session.",
+      "enum": [
+        "isolated",
+        "main"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "action"
+  ],
+  "type": "object"
+}

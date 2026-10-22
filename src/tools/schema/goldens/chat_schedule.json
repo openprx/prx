@@ -1,0 +1,76 @@
+{
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "schedule"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "message"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "cancel"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "id"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "action": {
+      "description": "'schedule' creates a future main-session wake-up; 'list' shows pending, delivered and cancelled wake-ups; 'cancel' aborts a pending wake-up.",
+      "enum": [
+        "schedule",
+        "list",
+        "cancel"
+      ],
+      "type": "string"
+    },
+    "delay_seconds": {
+      "default": 60,
+      "description": "Delay before injecting the message for 'schedule'. Defaults to 60 seconds.",
+      "maximum": 86400,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "id": {
+      "description": "Wake-up id; required for 'cancel' and reported by 'list'.",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "message": {
+      "description": "Message to inject into the main chat session when the wake-up fires; required for 'schedule'.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "priority": {
+      "default": false,
+      "description": "When true, 'schedule' injects the wake-up as a priority /now message.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "action"
+  ],
+  "type": "object"
+}

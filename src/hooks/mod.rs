@@ -1024,6 +1024,52 @@ impl HooksManageTool {
     }
 }
 
+impl HooksManageTool {
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                crate::tools::schema::with_action_requirements(
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["status", "refresh", "validate", "replace", "remove", "test"],
+                                "description": "Action to perform: 'status' reports the active hooks configuration, 'refresh' reloads it from disk, 'validate' checks a candidate hooks.json, 'replace' installs one atomically, 'remove' deletes it, 'test' fires a synthetic event"
+                            },
+                            "content": {"type": "string", "description": "Complete hooks.json; required for 'validate' and 'replace'"},
+                            "event": {
+                                "type": "string",
+                                "enum": HookEvent::ALL.map(HookEvent::as_str),
+                                "description": "Lifecycle event to fire; required for 'test'"
+                            },
+                            "payload": {"type": "object", "description": "Synthetic payload for 'test'"}
+                        },
+                        "required": ["action"],
+                        "additionalProperties": false
+                    }),
+                    "action",
+                    &[
+                        crate::tools::schema::ActionRequirement {
+                            action: "validate",
+                            required: &["content"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "replace",
+                            required: &["content"],
+                        },
+                        crate::tools::schema::ActionRequirement {
+                            action: "test",
+                            required: &["event"],
+                        },
+                    ],
+                )
+            })
+        });
+        &SCHEMA
+    }
+}
+
 #[async_trait]
 impl crate::tools::Tool for HooksManageTool {
     fn name(&self) -> &str {
@@ -1035,45 +1081,15 @@ impl crate::tools::Tool for HooksManageTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        crate::tools::schema::with_action_requirements(
-            json!({
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["status", "refresh", "validate", "replace", "remove", "test"],
-                        "description": "Action to perform: 'status' reports the active hooks configuration, 'refresh' reloads it from disk, 'validate' checks a candidate hooks.json, 'replace' installs one atomically, 'remove' deletes it, 'test' fires a synthetic event"
-                    },
-                    "content": {"type": "string", "description": "Complete hooks.json; required for 'validate' and 'replace'"},
-                    "event": {
-                        "type": "string",
-                        "enum": HookEvent::ALL.map(HookEvent::as_str),
-                        "description": "Lifecycle event to fire; required for 'test'"
-                    },
-                    "payload": {"type": "object", "description": "Synthetic payload for 'test'"}
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }),
-            "action",
-            &[
-                crate::tools::schema::ActionRequirement {
-                    action: "validate",
-                    required: &["content"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "replace",
-                    required: &["content"],
-                },
-                crate::tools::schema::ActionRequirement {
-                    action: "test",
-                    required: &["event"],
-                },
-            ],
-        )
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
+    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         use crate::tools::ToolResult;
         let action = Self::required_string(&args, "action")?;
         if let Err(result) = self.authorize(action, &args) {
@@ -1285,6 +1301,7 @@ pub fn payload_error(component: &str, message: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::Tool;
     use tempfile::TempDir;
 
     /// A manager whose workspace hooks run (the operator opted in), with its
@@ -1300,15 +1317,19 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn hooks_manage_action_tool_contract() {
+    #[tokio::test]
+    async fn hooks_manage_action_tool_contract() {
         let temp = TempDir::new().unwrap();
         let manager = std::sync::Arc::new(HookManager::new(temp.path().to_path_buf()));
-        let tool = manager.manage_tool(std::sync::Arc::new(crate::security::SecurityPolicy::default()));
+        let tool = HooksManageTool {
+            manager,
+            security: std::sync::Arc::new(crate::security::SecurityPolicy::default()),
+        };
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            tool.execution_schema(),
         );
     }
 

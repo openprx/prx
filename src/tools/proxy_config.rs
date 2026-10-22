@@ -386,6 +386,69 @@ impl ProxyConfigTool {
     }
 }
 
+impl ProxyConfigTool {
+    fn execution_schema(&self) -> &'static std::sync::Arc<serde_json::Value> {
+        static SCHEMA: std::sync::LazyLock<std::sync::Arc<serde_json::Value>> = std::sync::LazyLock::new(|| {
+            std::sync::Arc::new({
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["get", "set", "list_services", "apply_env", "clear_env"],
+                            "default": "get",
+                            "description": "Action to perform: 'get' reads the effective proxy settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, 'clear_env' removes it. Defaults to 'get'."
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["environment", "env", "prx", "internal", "core", "services", "service"],
+                            "description": "Proxy scope. Canonical values: environment, prx, services."
+                        },
+                        "http_proxy": {
+                            "type": "string",
+                            "description": "HTTP proxy URL"
+                        },
+                        "https_proxy": {
+                            "type": "string",
+                            "description": "HTTPS proxy URL"
+                        },
+                        "all_proxy": {
+                            "type": "string",
+                            "description": "Fallback proxy URL for all protocols"
+                        },
+                        "no_proxy": {
+                            "description": "Comma-separated string or array of NO_PROXY entries",
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}}
+                            ]
+                        },
+                        "services": {
+                            "description": "Comma-separated string or array of service selectors; required when 'set' targets scope=services",
+                            "oneOf": [
+                                {"type": "string", "minLength": 1},
+                                {"type": "array", "items": {"type": "string"}, "minItems": 1}
+                            ]
+                        }
+                    },
+                    "allOf": [{
+                        "if": {
+                            "properties": {
+                                "action": {"const": "set"},
+                                "scope": {"enum": ["services", "service"]}
+                            },
+                            "required": ["action", "scope"]
+                        },
+                        "then": {"required": ["services"]}
+                    }]
+                })
+            })
+        });
+        &SCHEMA
+    }
+}
+
 #[async_trait]
 impl Tool for ProxyConfigTool {
     fn name(&self) -> &str {
@@ -396,63 +459,16 @@ impl Tool for ProxyConfigTool {
         "Manage ZeroClaw proxy settings (scope: environment | prx | services): 'get' reads the effective settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, and 'clear_env' removes it"
     }
 
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["get", "set", "list_services", "apply_env", "clear_env"],
-                    "default": "get",
-                    "description": "Action to perform: 'get' reads the effective proxy settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, 'clear_env' removes it. Defaults to 'get'."
-                },
-                "scope": {
-                    "type": "string",
-                    "enum": ["environment", "env", "prx", "internal", "core", "services", "service"],
-                    "description": "Proxy scope. Canonical values: environment, prx, services."
-                },
-                "http_proxy": {
-                    "type": "string",
-                    "description": "HTTP proxy URL"
-                },
-                "https_proxy": {
-                    "type": "string",
-                    "description": "HTTPS proxy URL"
-                },
-                "all_proxy": {
-                    "type": "string",
-                    "description": "Fallback proxy URL for all protocols"
-                },
-                "no_proxy": {
-                    "description": "Comma-separated string or array of NO_PROXY entries",
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
-                },
-                "services": {
-                    "description": "Comma-separated string or array of service selectors; required when 'set' targets scope=services",
-                    "oneOf": [
-                        {"type": "string", "minLength": 1},
-                        {"type": "array", "items": {"type": "string"}, "minItems": 1}
-                    ]
-                }
-            },
-            "allOf": [{
-                "if": {
-                    "properties": {
-                        "action": {"const": "set"},
-                        "scope": {"enum": ["services", "service"]}
-                    },
-                    "required": ["action", "scope"]
-                },
-                "then": {"required": ["services"]}
-            }]
-        })
+    fn parameters_schema(&self) -> serde_json::Value {
+        crate::tools::schema::publish_flat_schema(self.execution_schema())
     }
 
-    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+    fn execution_parameters_schema(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        Some(std::sync::Arc::clone(self.execution_schema()))
+    }
+
+    async fn execute(&self, mut args: Value) -> anyhow::Result<ToolResult> {
+        crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let action = args
             .get("action")
             .and_then(Value::as_str)
@@ -575,13 +591,14 @@ mod tests {
     /// the tool-list description and the `action` parameter's own description
     /// must each name every enumerated action, and no parameter may ship
     /// undescribed.
-    #[test]
-    fn proxy_config_action_tool_contract() {
+    #[tokio::test]
+    async fn proxy_config_action_tool_contract() {
         let tool = ProxyConfigTool::new(crate::config::new_shared(Config::default()), test_security());
+        crate::tools::schema::assert_flat_execution_contract(&tool, tool.execution_schema()).await;
         crate::tools::schema::action_contract::assert_action_tool_contract(
             tool.name(),
             tool.description(),
-            &tool.parameters_schema(),
+            tool.execution_schema(),
         );
     }
 
@@ -601,6 +618,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
 
+        let before = fs::read(&tool.config.load().config_path).unwrap();
         let result = tool
             .execute(json!({
                 "action": "set",
@@ -610,27 +628,38 @@ mod tests {
                 "services": []
             }))
             .await
+            .unwrap_err();
+        let typed = result
+            .downcast_ref::<crate::tools::schema::ToolArgumentError>()
             .unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("proxy.scope='services'"));
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.services"));
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.enabled"));
+        assert_eq!(fs::read(&tool.config.load().config_path).unwrap(), before);
+        let valid = tool
+            .execute(json!({
+                "action": "set", "scope": "services",
+                "http_proxy": "http://127.0.0.1:7890", "services": ["provider.openai"]
+            }))
+            .await
+            .unwrap();
+        assert!(valid.success, "{:?}", valid.error);
     }
 
     #[tokio::test]
     async fn schema_requires_nonempty_services_for_service_scope_aliases() {
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
-        let schema = tool.parameters_schema();
+        let schema = tool.execution_schema();
 
         for scope in ["services", "service"] {
             assert!(
-                !crate::tools::schema::validate_tool_arguments(&schema, &json!({"action": "set", "scope": scope}))
+                !crate::tools::schema::validate_tool_arguments(schema, &json!({"action": "set", "scope": scope}))
                     .is_empty(),
                 "expected a non-empty value"
             );
             assert!(
                 crate::tools::schema::validate_tool_arguments(
-                    &schema,
+                    schema,
                     &json!({"action": "set", "scope": scope, "services": ["provider.openai"]})
                 )
                 .is_empty(),
@@ -708,7 +737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_null_proxy_url_clears_existing_value() {
+    async fn set_rejects_null_proxy_url_and_empty_string_clears_existing_value() {
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
 
@@ -721,10 +750,24 @@ mod tests {
             .unwrap();
         assert!(set_result.success, "{:?}", set_result.error);
 
+        let before = fs::read(&tool.config.load().config_path).unwrap();
+        let rejected = tool
+            .execute(json!({"action": "set", "http_proxy": null}))
+            .await
+            .unwrap_err();
+        let typed = rejected
+            .downcast_ref::<crate::tools::schema::ToolArgumentError>()
+            .unwrap();
+        assert!(typed.issues.iter().any(|issue| issue.path == "$.http_proxy"));
+        assert_eq!(fs::read(&tool.config.load().config_path).unwrap(), before);
+        assert_eq!(
+            tool.config.desired().config.proxy.http_proxy.as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
         let clear_result = tool
             .execute(json!({
                 "action": "set",
-                "http_proxy": null
+                "http_proxy": ""
             }))
             .await
             .unwrap();

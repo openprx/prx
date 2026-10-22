@@ -142,7 +142,7 @@ impl AdapterFamily {
     const fn tool_schema_dialect(self) -> ToolSchemaDialect {
         match self {
             Self::Gemini => ToolSchemaDialect::Gemini,
-            Self::Anthropic => ToolSchemaDialect::Anthropic,
+            Self::Anthropic => ToolSchemaDialect::NoRootCombinators,
             _ => ToolSchemaDialect::Raw,
         }
     }

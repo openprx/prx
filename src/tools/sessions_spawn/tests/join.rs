@@ -931,7 +931,7 @@ fn batch_entry_cannot_forge_a_trusted_scope_or_an_approval_grant() {
 fn batch_member_overridable_keys_are_derived_from_the_advertised_entry_schema() {
     let (ch, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-    let schema = tool.parameters_schema();
+    let schema = tool.execution_schema();
     let advertised = schema["properties"]["tasks"]["items"]["anyOf"][1].clone();
     assert_eq!(
         advertised,
@@ -996,7 +996,7 @@ async fn the_new_actions_reject_malformed_requests_without_starting_anything() {
 fn schema_advertises_the_fan_out_and_join_actions() {
     let (ch, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
-    let schema = tool.parameters_schema();
+    let schema = tool.execution_schema();
     let actions = schema["properties"]["action"]["enum"]
         .as_array()
         .expect("the action enum")
