@@ -96,6 +96,14 @@ impl ApprovalCollectionLease {
                 operation.as_str().to_owned(),
                 crate::acl::approval_grant::RiskLevel::High,
             )
+        } else if crate::security::approval_operation::collects_exact_generic_call(&call.name) {
+            // The operation is the one the tool itself checks, bound to the
+            // exact target in the arguments. A call that names no grant-bound
+            // target has no exact operation and cannot be reviewed.
+            match crate::security::approval_operation::grant_op_for_call(&call.name, &arguments) {
+                Some(crate::security::approval_operation::GrantOp::ResourceExact(operation, risk)) => (operation, risk),
+                _ => anyhow::bail!("collection call names no exact approval operation"),
+            }
         } else {
             let path = arguments
                 .get("path")

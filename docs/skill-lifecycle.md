@@ -180,6 +180,40 @@ a signed one-shot grant, bound to both `source` and `revision_id`, and `auto`
 mode; see [executable bundles](#executable-bundles). There is no agent
 `force-close`, `propose`, suite-authoring or evaluation action.
 
+### Approving publication, rollback and import
+
+`lifecycle_publish`, `lifecycle_rollback` and `lifecycle_import_executable` are
+always put to the operator, at every autonomy level including `full`, because
+the tool only accepts them with a grant for that exact target. `lifecycle_cancel`
+only closes a proposal and needs no such grant. Naming the tool is enough to
+start: the agent asks the model for the call, records it as a pending decision
+that names the exact operation, and runs nothing until the operator approves it.
+
+1. Ask for the change and name `skills_manage`, for example "use skills_manage
+   to import the reviewed bundle in `/srv/skills/report-runner` with revision
+   `r1-...`". The turn ends as awaiting approval with a decision id. Under
+   `supervised` this is the only form that starts a request; under `full` the
+   model may also call the tool in an ordinary turn and gets the same pending
+   decision.
+2. Inspect the pending call. In chat run `/approval --decision <uuid>`; in the
+   web console open the waiting reply. Check the action and its target: the
+   `proposal_id` for publish, the skill, revision and observed generation for
+   rollback, the `source` directory and complete bundle hash for import.
+3. Approve it. In chat run `/approve --decision <uuid>` (or `/approve <n>` with
+   the displayed number); in the console use the approve button or
+   `POST /api/sessions/{id}/approvals/{decision_id}` with `{"approved":true}`.
+   Approval only records the signed grant; it does not run the operation.
+4. Resume it. In chat run `/resume-decision <uuid>`; in the console use the
+   execute button or `POST /api/sessions/{id}/approvals/{decision_id}/resume`.
+   The saved original call runs once with its one-shot grant. A second resume,
+   or an approval for a different hash, source, proposal or generation, is
+   refused.
+
+An "Always" answer in a terminal prompt never covers these three actions: each
+one needs its own approval. Read-only autonomy still refuses them outright, and
+a model cannot supply grant material: every `_zc_*` argument it sends is
+dropped before the tool runs.
+
 ## Recovery, status and rollback
 
 The publication journal binds the expected predecessor, candidate identity and

@@ -1,6 +1,8 @@
 #![cfg(test)]
 //! Actual recorded Chat write-only initiation, owner review and exact fresh resume.
 use super::*;
+#[path = "skills_manage_grants.rs"]
+mod skills_manage_grants;
 #[path = "collection_usage.rs"]
 mod usage;
 

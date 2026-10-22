@@ -189,6 +189,58 @@ pub(crate) fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Op
     }
 }
 
+/// What `skills_manage` needs for one lifecycle action: the operation it
+/// checks (when the target arguments are present), the risk it checks it at,
+/// and whether `SkillsManageTool::authorize` demands a signed one-shot grant
+/// bound to that operation. This is the single table behind both the grant
+/// minting and `requires_explicit_grant`, so the two cannot drift.
+struct LifecycleAction {
+    operation: Option<String>,
+    risk: crate::acl::approval_grant::RiskLevel,
+    grant_bound: bool,
+}
+
+fn skills_manage_lifecycle_action(args: &serde_json::Value) -> Option<LifecycleAction> {
+    use crate::acl::approval_grant::RiskLevel;
+    let arg = |name: &str| args.get(name).and_then(serde_json::Value::as_str).map(str::trim);
+    match arg("action")? {
+        "lifecycle_publish" => Some(LifecycleAction {
+            operation: arg("proposal_id").map(|proposal| format!("skills_manage:lifecycle_publish:{proposal}")),
+            risk: RiskLevel::High,
+            grant_bound: true,
+        }),
+        // Cancel only withdraws a proposal; `SkillsManageTool::authorize`
+        // gates it through the ordinary side-effect gate without requiring a
+        // signed one-shot grant.
+        "lifecycle_cancel" => Some(LifecycleAction {
+            operation: arg("proposal_id").map(|proposal| format!("skills_manage:lifecycle_cancel:{proposal}")),
+            risk: RiskLevel::Medium,
+            grant_bound: false,
+        }),
+        // Bound to the directory and to the complete bundle hash the operator
+        // reviewed (SL11); the same text `SkillsManageTool::authorize` builds.
+        "lifecycle_import_executable" => Some(LifecycleAction {
+            operation: arg("source")
+                .zip(arg("revision_id"))
+                .map(|(source, revision)| format!("skills_manage:lifecycle_import_executable:{source}:{revision}")),
+            risk: RiskLevel::High,
+            grant_bound: true,
+        }),
+        "lifecycle_rollback" => Some(LifecycleAction {
+            operation: args
+                .get("expected_generation")
+                .and_then(serde_json::Value::as_u64)
+                .zip(arg("skill_id").zip(arg("revision_id")))
+                .map(|(generation, (skill, revision))| {
+                    format!("skills_manage:lifecycle_rollback:{skill}:{revision}:{generation}")
+                }),
+            risk: RiskLevel::High,
+            grant_bound: true,
+        }),
+        _ => None,
+    }
+}
+
 /// The operation `skills_manage` checks for a lifecycle mutation, with the risk
 /// it checks it at. It MUST equal what `SkillsManageTool::authorize` computes:
 /// the target is bound into the operation, trimmed the same way, and a rollback
@@ -197,40 +249,24 @@ pub(crate) fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Op
 fn skills_manage_lifecycle_operation(
     args: &serde_json::Value,
 ) -> Option<(String, crate::acl::approval_grant::RiskLevel)> {
-    use crate::acl::approval_grant::RiskLevel;
-    let arg = |name: &str| args.get(name).and_then(serde_json::Value::as_str).map(str::trim);
-    match arg("action")? {
-        "lifecycle_publish" => Some((
-            format!("skills_manage:lifecycle_publish:{}", arg("proposal_id")?),
-            RiskLevel::High,
-        )),
-        "lifecycle_cancel" => Some((
-            format!("skills_manage:lifecycle_cancel:{}", arg("proposal_id")?),
-            RiskLevel::Medium,
-        )),
-        // Bound to the directory and to the complete bundle hash the operator
-        // reviewed (SL11); the same text `SkillsManageTool::authorize` builds.
-        "lifecycle_import_executable" => Some((
-            format!(
-                "skills_manage:lifecycle_import_executable:{}:{}",
-                arg("source")?,
-                arg("revision_id")?
-            ),
-            RiskLevel::High,
-        )),
-        "lifecycle_rollback" => {
-            let generation = args.get("expected_generation").and_then(serde_json::Value::as_u64)?;
-            Some((
-                format!(
-                    "skills_manage:lifecycle_rollback:{}:{}:{generation}",
-                    arg("skill_id")?,
-                    arg("revision_id")?
-                ),
-                RiskLevel::High,
-            ))
-        }
-        _ => None,
-    }
+    let action = skills_manage_lifecycle_action(args)?;
+    Some((action.operation?, action.risk))
+}
+
+/// Generic tools whose approval operation is fully derived from the call's
+/// arguments by `grant_op_for_call`, so a named call can be collected and
+/// recorded as an exact pending decision before any review.
+pub(crate) fn collects_exact_generic_call(tool: &str) -> bool {
+    tool == "skills_manage"
+}
+
+/// True when the call can only succeed with its own human approval: the tool
+/// itself demands a signed one-shot grant bound to the exact target, at every
+/// autonomy level. Execution upgrades an Allow decision to Ask for these, and
+/// session allowlisting must never mint a grant for them. Derived from the same
+/// table as `skills_manage_lifecycle_operation`.
+pub(crate) fn requires_explicit_grant(tool: &str, args: &serde_json::Value) -> bool {
+    tool == "skills_manage" && skills_manage_lifecycle_action(args).is_some_and(|action| action.grant_bound)
 }
 
 /// Match memory tools' gate identity exactly. The optional principal is the
@@ -333,4 +369,71 @@ pub(crate) fn file_operation(
         launch,
         git,
     )
+}
+
+#[cfg(test)]
+mod grant_requirement_tests {
+    use super::{GrantOp, grant_op_for_call, requires_explicit_grant};
+    use serde_json::json;
+
+    /// The three actions `SkillsManageTool::authorize` refuses without a signed
+    /// one-shot grant bound to the target, with and without their target
+    /// arguments (an incomplete call is still asked, then refused by the tool).
+    #[test]
+    fn exactly_the_grant_bound_lifecycle_actions_require_an_explicit_grant() {
+        let revision = format!("r1-{}", "0".repeat(64));
+        for args in [
+            json!({"action": "lifecycle_publish", "proposal_id": "prop-1"}),
+            json!({"action": "lifecycle_publish"}),
+            json!({"action": "lifecycle_rollback", "skill_id": "a", "revision_id": revision, "expected_generation": 1}),
+            json!({"action": "lifecycle_rollback", "skill_id": "a"}),
+            json!({"action": "lifecycle_import_executable", "source": "/x", "revision_id": revision}),
+            json!({"action": "lifecycle_import_executable"}),
+        ] {
+            assert!(requires_explicit_grant("skills_manage", &args), "{args}");
+        }
+        // Cancel only closes a proposal: the tool grant-binds it under
+        // supervised autonomy through the ordinary gate, not at full.
+        for args in [
+            json!({"action": "lifecycle_cancel", "proposal_id": "prop-1"}),
+            json!({"action": "lifecycle_status"}),
+            json!({"action": "lifecycle_list"}),
+            json!({"action": "lifecycle_inspect", "proposal_id": "prop-1"}),
+            json!({"action": "create", "name": "x"}),
+            json!({"action": "enable", "name": "x"}),
+            json!({"action": "lifecycle_force_close", "proposal_id": "prop-1"}),
+            json!({}),
+        ] {
+            assert!(!requires_explicit_grant("skills_manage", &args), "{args}");
+        }
+        // Only skills_manage: the same arguments on another tool are not it.
+        assert!(!requires_explicit_grant(
+            "shell",
+            &json!({"action": "lifecycle_publish", "proposal_id": "prop-1"})
+        ));
+    }
+
+    /// The predicate and the minted operation come from one table: every call
+    /// that mints a lifecycle operation other than cancel requires the grant.
+    #[test]
+    fn the_predicate_agrees_with_the_minted_operation() {
+        let revision = format!("r1-{}", "0".repeat(64));
+        for args in [
+            json!({"action": "lifecycle_publish", "proposal_id": "prop-1"}),
+            json!({"action": "lifecycle_cancel", "proposal_id": "prop-1"}),
+            json!({"action": "lifecycle_rollback", "skill_id": "a", "revision_id": revision, "expected_generation": 1}),
+            json!({"action": "lifecycle_import_executable", "source": "/x", "revision_id": revision}),
+        ] {
+            let minted = matches!(
+                grant_op_for_call("skills_manage", &args),
+                Some(GrantOp::ResourceExact(..))
+            );
+            assert!(minted, "{args}");
+            assert_eq!(
+                requires_explicit_grant("skills_manage", &args),
+                args.get("action").and_then(serde_json::Value::as_str) != Some("lifecycle_cancel"),
+                "{args}"
+            );
+        }
+    }
 }
