@@ -311,6 +311,7 @@ fn contains_active_shell_substitution(command: &str) -> bool {
 #[serde(rename_all = "lowercase")]
 pub enum AutonomyLevel {
     /// Read-only: can observe but not act
+    #[serde(alias = "read_only")]
     ReadOnly,
     /// Supervised: acts but requires approval for risky operations
     Supervised,
@@ -2304,6 +2305,9 @@ mod tests {
         assert_eq!(parsed, AutonomyLevel::ReadOnly);
         let parsed2: AutonomyLevel = serde_json::from_str("\"supervised\"").unwrap();
         assert_eq!(parsed2, AutonomyLevel::Supervised);
+        let alias: AutonomyLevel = serde_json::from_str("\"read_only\"").unwrap();
+        assert_eq!(alias, AutonomyLevel::ReadOnly);
+        assert_eq!(serde_json::to_string(&alias).unwrap(), "\"readonly\"");
     }
 
     #[test]

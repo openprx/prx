@@ -3217,13 +3217,14 @@ pub const RUNTIME_ONLY_ARG_PREFIXES: [&str; 2] = ["_zc_", "_prx_"];
 /// (V02-R9 / OQ-21).
 ///
 /// An owner-isolated context — today an externally authenticated MCP caller —
-/// may execute only these. Each rebuilds its principal from the service-authored
+/// may execute only these. Stateful tools rebuild their principal from the service-authored
 /// `_zc_scope` and applies [`scope_requires_owner_match`] (or the run registry's
 /// owner scope) to every row it reads or deletes. Every other tool is refused:
 /// autonomy approval is not consulted at `AutonomyLevel::Full`, so the operator's
 /// `mcp_server.exposed_tools` list would otherwise be the only boundary between
 /// an external caller and a mutating tool that does not scope its effect by
-/// owner. A tool joins this list only once it is owner-aware.
+/// owner. A tool joins this list only once it is owner-aware or reads no private
+/// runtime state. Web search is stateless; its provider key and quota are shared.
 ///
 /// `session_status` and `sessions_send` are owner-aware for in-process turns
 /// but the gateway does not register them, so they stay off the list until it

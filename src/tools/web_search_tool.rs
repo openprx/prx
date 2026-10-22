@@ -40,8 +40,11 @@ impl WebSearchTool {
             .build()?;
 
         let response = client.get(&search_url).send().await?;
+        self.parse_duckduckgo_response(response, query).await
+    }
 
-        if !response.status().is_success() {
+    async fn parse_duckduckgo_response(&self, response: reqwest::Response, query: &str) -> anyhow::Result<String> {
+        if response.status() != reqwest::StatusCode::OK {
             anyhow::bail!("DuckDuckGo search failed with status: {}", response.status());
         }
 
@@ -50,6 +53,14 @@ impl WebSearchTool {
     }
 
     fn parse_duckduckgo_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
+        let challenge = Regex::new(
+            r#"(?i)<(?:form|div)[^>]*(?:id=["']challenge-form["']|class=["'][^"']*anomaly-modal|action=["'][^"']*/anomaly\.js)"#,
+        )?;
+        if challenge.is_match(html) {
+            anyhow::bail!(
+                "DuckDuckGo returned a bot challenge; try again later or configure web_search.provider = 'brave'"
+            );
+        }
         // Extract result links: <a class="result__a" href="...">Title</a>
         let link_regex = Regex::new(r#"<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#)?;
 
@@ -61,7 +72,13 @@ impl WebSearchTool {
         let snippet_matches: Vec<_> = snippet_regex.captures_iter(html).take(self.max_results + 2).collect();
 
         if link_matches.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            let no_results = Regex::new(r#"(?i)<div[^>]*class=["'][^"']*\bno-results(?:__message)?\b[^"']*["']"#)?;
+            if no_results.is_match(html) {
+                return Ok(format!("No results found for: {}", query));
+            }
+            anyhow::bail!(
+                "DuckDuckGo returned an unrecognized page without search results; try again later or configure web_search.provider = 'brave'"
+            );
         }
 
         let mut lines = vec![format!("Search results for: {} (via DuckDuckGo)", query)];
@@ -259,9 +276,71 @@ mod tests {
     fn test_parse_duckduckgo_results_empty() {
         let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
         let result = tool
-            .parse_duckduckgo_results("<html>No results here</html>", "test")
+            .parse_duckduckgo_results(r#"<div class="no-results__message">No results found</div>"#, "test")
             .unwrap();
         assert!(result.contains("No results found"));
+    }
+
+    #[test]
+    fn duckduckgo_rejects_challenges_and_unrecognized_pages() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        for html in ["", "<html>No results here</html>", "<html>Service unavailable</html>"] {
+            let error = tool.parse_duckduckgo_results(html, "test").unwrap_err();
+            assert!(error.to_string().contains("unrecognized page"));
+        }
+        for html in [
+            r#"<form id="challenge-form" action="/anomaly.js">challenge</form>"#,
+            r#"<div class="anomaly-modal__modal">challenge</div>"#,
+            r#"<form action="//duckduckgo.com/anomaly.js?fixture=1">challenge</form>"#,
+        ] {
+            // A challenge must win even if the page also carries a result link.
+            let html = format!(r#"{html}<a class="result__a" href="https://example.com">Title</a>"#);
+            let error = tool.parse_duckduckgo_results(&html, "test").unwrap_err();
+            assert!(error.to_string().contains("bot challenge"));
+        }
+    }
+
+    #[tokio::test]
+    async fn duckduckgo_requires_http_200_before_parsing_results() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        for status in [200, 202, 204, 429, 500] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = BufReader::new(&mut socket);
+                loop {
+                    let mut line = String::new();
+                    assert!(request.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = r#"<a class="result__a" href="https://example.com">Title</a>"#;
+                let response = format!(
+                    "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/html/"))
+                .send()
+                .await
+                .unwrap();
+            let result = tool.parse_duckduckgo_response(response, "test").await;
+            server.await.unwrap();
+            if status == 200 {
+                assert!(result.unwrap().contains("https://example.com"));
+            } else {
+                assert!(result.unwrap_err().to_string().contains(&format!("status: {status}")));
+            }
+        }
     }
 
     #[test]

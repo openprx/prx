@@ -86,6 +86,14 @@ fail-closed and are not loaded as configuration. A process that finds an odd
 generation left by an interrupted commit fails closed; restore the last
 known-good configuration and an even generation before restarting.
 
+Raw `prx config plan|apply --file` writes default to `config.toml`. If a later
+managed fragment prevents a changed field from taking effect, planning refuses the write
+and reports `shadowed by config.d/<file>; use --target <file>` instead of a
+misleading no-change plan. Prepare that fragment's complete contents and pass
+its basename, for example `--target tools.toml` for `web_search.provider`.
+Other files remain unchanged; the tool does not redirect or apply the write
+automatically. An unchanged base file is still accepted.
+
 ## Runtime Configuration Generations
 
 The disk transaction barrier above is separate from the process runtime
@@ -485,6 +493,7 @@ warns when all four unrestricted choices are active together.
 
 The shared turn decision service derives runtime effect permission from its
 pinned execution security policy: `readonly` excludes side-effecting tools
+(`read_only` is accepted as a compatibility alias; saved values use `readonly`)
 and delegation, `supervised` requires applicable approval, and `full` permits
 those candidates to be considered. This does not guarantee selection or bypass
 scope ACLs, model support, cost limits, structural restrictions, or inherited

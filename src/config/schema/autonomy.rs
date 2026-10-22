@@ -325,7 +325,7 @@ pub(super) fn validate_acl_pair_entry(path: &str, left_name: &str, right_name: &
 /// risk approval gates, and per-policy budgets.
 ///
 /// Permission-model Phase 1: a single `[autonomy]` section is the sole
-/// permission knob. `level` (read_only / supervised / full) drives the unified
+/// permission knob. `level` (readonly / supervised / full) drives the unified
 /// `SecurityPolicy::decide` decision point. The legacy `[security.tool_policy]`
 /// pipeline and the per-tool `auto_approve` / `always_ask` / `allowed_commands`
 /// lists have been removed; coarse risk presets are governed entirely by
@@ -334,7 +334,7 @@ pub const DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS: u32 = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
-    /// Autonomy level: `read_only`, `supervised`, or `full` (default).
+    /// Autonomy level: `readonly` (alias `read_only`), `supervised`, or `full` (default).
     pub level: AutonomyLevel,
     /// Restrict file writes and command paths to the workspace directory. Default: `true`.
     pub workspace_only: bool,

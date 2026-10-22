@@ -29,6 +29,13 @@ only `mcp_call`. Its schema does not enumerate configured servers or tools.
 | **Infrastructure** | `gateway`, `config_reload`, `proxy_config`, `agents_list` |
 | **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
 
+`web_search_tool` uses DuckDuckGo by default. A non-200 response, bot challenge,
+or unrecognized result page returns an error instead of a successful empty
+search. A recognized no-results page still reports no results. Retry later or
+configure `[web_search] provider = "brave"` with a Brave credential. Public web
+search is available to owner-isolated callers; provider credentials and quota
+remain shared across owners.
+
 Fresh file-write approval in the candidate runtime uses a dedicated argument
 collection path in recorded Chat and Console sessions. Under supervised
 policy, explicitly name `file_write` or `file_edit` in the request. When that
@@ -451,7 +458,8 @@ external MCP caller runs owner-isolated (see "Owner-isolated reads for external
 MCP callers"), and the execution service refuses an owner-isolated caller any
 tool that does not enforce per-owner isolation, before policy and approval are
 evaluated. The list is explicit (`OWNER_ISOLATION_AWARE_TOOLS` in
-`src/tools/execution.rs`): `memory_search`, `memory_recall`, `memory_get`,
+`src/causal_tree/capability_policy.rs`): `capability_search`, `web_search_tool`,
+`memory_search`, `memory_recall`, `memory_get`,
 `document_search`, `document_get_chunk`, `sessions_list`, `sessions_history`,
 `memory_forget`, `memory_store` and `document_ingest`. The name must also be
 served by the tool of that name, so a dynamic MCP, WASM or skill alias that
@@ -464,7 +472,11 @@ owner-isolated caller: it does not enforce per-owner isolation` before any
 idempotency reservation or identity binding is written, and is named by a
 warning when the configuration loads. The entry does not fail config load, so
 a daemon whose configuration exposed such a tool still starts. A tool joins the
-list only after it scopes its own effect by owner. `session_status` and
+list only after it scopes its own effect by owner or reads no private runtime
+state. `web_search_tool` performs stateless public web reads; the configured
+provider credentials and quota are shared across owners, not allocated per owner.
+`skills_manage` remains excluded because its legacy actions mutate the shared
+workspace. `session_status` and
 `sessions_send` scope their effect by owner for in-process turns, but the
 gateway does not register them, so they are kept off the list: exposing them
 over MCP answers the 403 above, before anything is written, rather than a 404

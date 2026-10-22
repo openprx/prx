@@ -31,19 +31,22 @@ pub(crate) fn plan_intercepts_tool(name: &str) -> bool {
 /// (V02-R9 / OQ-21).
 ///
 /// An owner-isolated context — today an externally authenticated MCP caller —
-/// may execute only these. Each rebuilds its principal from the service-authored
+/// may execute only these. Stateful tools rebuild their principal from the service-authored
 /// `_zc_scope` and applies [`crate::tools::execution::scope_requires_owner_match`] (or the run registry's
 /// owner scope) to every row it reads or deletes. Every other tool is refused:
 /// autonomy approval is not consulted at `AutonomyLevel::Full`, so the operator's
 /// `mcp_server.exposed_tools` list would otherwise be the only boundary between
 /// an external caller and a mutating tool that does not scope its effect by
-/// owner. A tool joins this list only once it is owner-aware.
+/// owner. A tool joins this list only once it is owner-aware or reads no private
+/// runtime state. Web search is stateless; its provider key and quota are shared.
 ///
 /// `session_status` and `sessions_send` are owner-aware for in-process turns
 /// but the gateway does not register them, so they stay off the list until it
 /// does: an exposed entry is then refused with 403 before any identity binding
 /// is written, instead of passing this gate and answering 404 afterwards.
 pub const OWNER_ISOLATION_AWARE_TOOLS: &[&str] = &[
+    // Stateless public web reads; no access to another owner's local data.
+    "web_search_tool",
     // Requires the admitted source-bound port; JSON scope cannot authorize it.
     "capability_search",
     "memory_search",
@@ -72,6 +75,14 @@ pub(crate) fn admits_owner_isolated_identity(public_name: &str, backend_name: &s
 mod owner_isolation_tests {
     #[test]
     fn owner_isolation_requires_actual_audited_backend_identity() {
+        assert!(super::admits_owner_isolated_identity(
+            "web_search_tool",
+            "web_search_tool"
+        ));
+        assert!(!super::admits_owner_isolated_identity("web_search_tool", "mcp"));
+        assert!(!super::admits_owner_isolated_identity("web_search", "web_search_tool"));
+        assert!(!super::admits_owner_isolated_identity("skills_manage", "skills_manage"));
+        assert!(!super::admits_owner_isolated_identity("shell", "shell"));
         assert!(super::admits_owner_isolated_identity("memory_search", "memory_search"));
         assert!(!super::admits_owner_isolated_identity("memory_search", "mcp"));
         assert!(!super::admits_owner_isolated_identity(
