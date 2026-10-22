@@ -623,6 +623,15 @@ async fn run_turn_unguarded(
             return Err(ToolLoopCancelled.into());
         }
 
+        // Hits of an earlier `capability_search` become declared tools on this
+        // request, through the same admission as a call by name. The request
+        // that carried the search is already sent and stays as it was.
+        service.admit_offered_discoveries(proof, context, |name, root| {
+            inherited_exclusions
+                .iter()
+                .any(|excluded| excluded == name || excluded == root)
+        });
+
         // Route the turn before refreshing dynamic tools. Refreshing the whole
         // registry here made an unrelated turn wait for every configured MCP
         // server (for example, a PDF-only WhatsApp request paid Playwright's

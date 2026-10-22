@@ -745,7 +745,7 @@ async fn a_new_turn_does_not_inherit_previous_business_publication() {
 }
 
 #[tokio::test]
-async fn discovered_tools_append_only_after_admission_and_do_not_survive_the_turn() {
+async fn discovered_tools_are_offered_after_search_admission_and_do_not_survive_the_turn() {
     let workspace = tempfile::tempdir().unwrap();
     let offers = offered_tools_for(
         workspace.path(),
@@ -760,9 +760,12 @@ async fn discovered_tools_append_only_after_admission_and_do_not_survive_the_tur
         offers.first().expect("test: expected provider offer"),
         MEDIA_TOOL
     ));
+    // FINDING 110.3: a search hit that passes the same admission gates is
+    // declared on the next request (the search request itself is unchanged);
+    // being declared is not an execution grant, which still runs every gate.
     assert!(
-        !contains(offers.get(1).expect("test: expected provider offer"), MEDIA_TOOL),
-        "a search offer alone is not an execution grant"
+        contains(offers.get(1).expect("test: expected provider offer"), MEDIA_TOOL),
+        "an admitted search hit is declared on the request after the search"
     );
     assert!(contains(
         offers.get(2).expect("test: expected provider offer"),

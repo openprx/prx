@@ -165,6 +165,13 @@ pub(crate) fn provider_is_zero_price_exempt(provider: &crate::providers::Provide
             .is_none_or(crate::decision::loopback::is_literal_loopback)
 }
 
+/// One G6 refusal diagnostic per turn, shared with the missing-price warning.
+fn warn_once(warned: &AtomicBool, message: impl FnOnce() -> String) {
+    if !warned.swap(true, Ordering::Relaxed) {
+        tracing::warn!(target: "providers::selection", "{}", message());
+    }
+}
+
 fn estimate_cost_with_validity(
     model: &ResolvedModel,
     pricing: &CostConfig,
@@ -177,6 +184,17 @@ fn estimate_cost_with_validity(
     // zero-cost fallback. Normal config loading rejects these values; this
     // guard also covers direct/in-memory callers.
     if !prices_valid {
+        warn_once(warned_unpriced, || {
+            let key = pricing
+                .prices
+                .iter()
+                .find(|(_, price)| !price.is_finite_nonnegative())
+                .map_or("<unknown>", |(key, _)| key.as_str());
+            format!(
+                "G6 budget admission refuses every priced candidate: [cost.prices.{:?}] has a negative or non-finite component; fix the price (USD per 1M tokens, finite and not negative)",
+                crate::security::redaction::redact_provider_text(key)
+            )
+        });
         return None;
     }
     // V1 token estimate: 64 prompt tokens, at most four schema bytes per
@@ -203,7 +221,16 @@ fn estimate_cost_with_validity(
             }
             return None;
         }
-        crate::llm::route_decision::UsagePrice::Invalid => return None,
+        crate::llm::route_decision::UsagePrice::Invalid => {
+            warn_once(warned_unpriced, || {
+                format!(
+                    "G6 budget admission refuses model '{}/{}': its price or token count is invalid (negative, non-finite or overflowing); fix [cost.prices] for this model",
+                    crate::security::redaction::redact_provider_text(model.provider_label()),
+                    crate::security::redaction::redact_provider_text(model.model())
+                )
+            });
+            return None;
+        }
     };
     let micro = u64::try_from(crate::cost::tracker::ceil_micro_usd(usd).ok()?).ok()?;
     Some(CostEstimate {
@@ -448,6 +475,104 @@ mod tests {
                 );
             }
         });
+    }
+
+    fn capture_warnings(run: impl FnOnce()) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("warnings.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::fs::File::create(&path).unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    fn one_entry_view_tool(name: &'static str) -> CapabilityCatalog {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(SizedSchemaTool {
+            name,
+            payload: "x".into(),
+        })];
+        CapabilityCatalog::build(&tools, &CatalogSources::default(), &SurfacePolicy::default()).unwrap()
+    }
+
+    #[test]
+    fn an_invalid_tariff_elsewhere_in_the_config_warns_once_per_turn() {
+        let mut config = Config::default();
+        config.cost.prices.insert(
+            "openrouter/unrelated".into(),
+            crate::config::schema::ModelPricing {
+                input: -1.0,
+                output: 0.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+        let selected = model(&config, "openrouter", "anthropic/claude-sonnet-5");
+        let catalog = one_entry_view_tool("prx_probe");
+        let view = catalog.view(&Default::default());
+        let log = capture_warnings(|| {
+            let observed = BTreeMap::new();
+            let costs = RuntimeCostModel::new(&selected, &config, &observed);
+            for _ in 0..3 {
+                assert!(costs.estimate_terminal().is_none());
+                for entry in view.entries() {
+                    assert!(costs.estimate_entry(entry).is_none());
+                }
+            }
+        });
+        assert_eq!(
+            log.matches("G6 budget admission refuses every priced candidate")
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("openrouter/unrelated"), "{log}");
+    }
+
+    #[test]
+    fn an_overflowing_tariff_for_the_selected_model_warns_once_per_turn() {
+        let mut config = Config::default();
+        config.cost.prices.insert(
+            "anthropic/claude-sonnet-5".into(),
+            crate::config::schema::ModelPricing {
+                input: f64::MAX,
+                output: f64::MAX,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+        let selected = model(&config, "openrouter", "anthropic/claude-sonnet-5");
+        let log = capture_warnings(|| {
+            let observed = BTreeMap::new();
+            let costs = RuntimeCostModel::new(&selected, &config, &observed);
+            for _ in 0..3 {
+                assert!(costs.estimate_terminal().is_none());
+            }
+        });
+        assert_eq!(log.matches("price or token count is invalid").count(), 1, "{log}");
+        assert!(log.contains("anthropic/claude-sonnet-5"), "{log}");
+    }
+
+    #[test]
+    fn execution_latency_estimates_stay_available_for_scoring() {
+        let config = Config::default();
+        let selected = model(&config, "openrouter", "anthropic/claude-sonnet-5");
+        let catalog = one_entry_view_tool("shell");
+        let view = catalog.view(&Default::default());
+        let entry = view.entries().first().expect("shell fixture entry");
+        assert_eq!(entry.family, CapabilityTarget::Shell);
+        let (cost, latency) = RuntimeCostModel::new(&selected, &config, &BTreeMap::new())
+            .estimate_entry(entry)
+            .expect("a priced model estimates the shell candidate");
+        assert!(cost.micro_usd > 0);
+        assert_eq!(latency, default_latency_ms(CapabilityTarget::Shell));
+        let observed = BTreeMap::from([(entry.id.as_str().to_owned(), 5_000)]);
+        let (_, latency) = RuntimeCostModel::new(&selected, &config, &observed)
+            .estimate_entry(entry)
+            .expect("observed estimate");
+        assert_eq!(latency, 5_000, "the observed p50 replaces the default for scoring");
     }
 
     #[test]

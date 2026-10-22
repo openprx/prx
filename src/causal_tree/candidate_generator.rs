@@ -371,6 +371,7 @@ impl CausalCandidateGenerator {
                             Some(Ns8::of(policy.key, &entry.namespace)),
                         );
                         let admission = HardGates::check_one(state, catalog, &candidate, gates);
+                        trace_rejected(&candidate, &admission);
                         match admission {
                             GateOutcome::Passed => {
                                 selected = Some(candidate);
@@ -728,6 +729,7 @@ fn select_family_candidate<'a>(
         let namespace = bind_namespace.then(|| Ns8::of(policy.key, &entry.namespace));
         let candidate = from_entry(action, family, entry, policy, namespace);
         let outcome = HardGates::check_one(state, catalog, &candidate, gates);
+        trace_rejected(&candidate, &outcome);
         match outcome {
             GateOutcome::Passed => return Ok(Some(candidate)),
             GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() && approval_only.is_none() => {
@@ -780,6 +782,32 @@ fn from_entry(
             estimated_latency_ms: estimate.map(|(_, latency)| latency),
         },
     )
+    // A tool or retrieval candidate adds no extra decision latency, like a
+    // direct Answer; its execution latency stays for scoring only. The
+    // overhead is known exactly when the estimate is, so an unpriced model
+    // still fails G6.
+    .with_decision_overhead_ms(estimate.map(|_| 0))
+}
+
+/// Record why a generator probe left the candidate set. Probes that fail a
+/// gate never reach the stored gate report, so without this trace a refusal
+/// cannot be attributed to a gate.
+fn trace_rejected(candidate: &CausalCandidate, outcome: &GateOutcome) {
+    match outcome {
+        GateOutcome::Passed | GateOutcome::ApprovalOnly { .. } => {}
+        GateOutcome::Blocked { gate, reason_code } => tracing::debug!(
+            target: "causal_tree::candidates",
+            candidate = candidate.candidate_id().as_str(),
+            gate = *gate,
+            reason = *reason_code,
+            "candidate rejected by a hard gate"
+        ),
+        GateOutcome::ApprovalDeferred => tracing::debug!(
+            target: "causal_tree::candidates",
+            candidate = candidate.candidate_id().as_str(),
+            "candidate deferred: approval scope unavailable"
+        ),
+    }
 }
 
 fn terminal(action: CausalActionKind, policy: &CandidatePolicy<'_>) -> CausalCandidate {
@@ -2207,6 +2235,168 @@ mod tests {
         assert_eq!(counting_cost.entries.load(Ordering::Relaxed), 1);
     }
 
+    /// Run `check` against one `shell` capability under full autonomy with the
+    /// given execution estimate and a decision-overhead budget of `budget_ms`.
+    fn with_shell_gate_fixture(
+        estimate: Option<(CostEstimate, u32)>,
+        budget_ms: u64,
+        check: impl FnOnce(&CausalState, &CatalogView<'_>, &CandidatePolicy<'_>, &GateInputs<'_>, &CapabilityEntry),
+    ) {
+        let key = fixtures::key();
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(ProbeTool("shell"))];
+        let catalog =
+            CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let view = catalog.view(&CatalogScope::default());
+        let entry = *view.entries().first().expect("shell capability");
+        assert_eq!(entry.family, CapabilityTarget::Shell);
+        let mut per_capability = BTreeMap::new();
+        if let Some(estimate) = estimate {
+            per_capability.insert(
+                CapabilityRef {
+                    id: entry.id.clone(),
+                    fingerprint: entry.fingerprint,
+                    generation: entry.generation,
+                },
+                estimate,
+            );
+        }
+        let cost = CapabilityCostModel {
+            per_capability,
+            estimates: BTreeMap::new(),
+        };
+        let policy = CandidatePolicy {
+            key: &key,
+            max_candidates: 12,
+            can_deliver_text: true,
+            may_delegate: false,
+            delegation_target: None,
+            cost_model: &cost,
+            discovered_refs: &EMPTY_DISCOVERED_REFS,
+        };
+        let mut security = SecurityPolicy::default();
+        security.autonomy = crate::security::AutonomyLevel::Full;
+        let calls = BTreeMap::new();
+        let history = BTreeSet::new();
+        let gates = GateInputs {
+            policy: &security,
+            owner_id: "owner-1",
+            sender: "owner-1",
+            policy_channel: "terminal",
+            chat_type: "dm",
+            model_ref: "anthropic:claude",
+            model_can_chat: true,
+            model_can_call_tools: true,
+            decision_endpoint_ready: true,
+            child_scope: None,
+            verified_approval_calls: BTreeMap::new(),
+            call_fingerprints: &calls,
+            failed_call_counts: BTreeMap::new(),
+            replayed_non_idempotent: &history,
+            retry_limit: Some(2),
+        };
+        let mut state = fixtures::state(&key, "neutral request");
+        let mut trusted = fixtures::trusted();
+        trusted.catalog_generation = *catalog.generation();
+        trusted.channel = None;
+        trusted.exclusions.clear();
+        trusted.side_effect_mode = SideEffectMode::GuardedWrite;
+        trusted.budgets = crate::causal_tree::state::TurnBudgets {
+            tokens: 1_000,
+            latency_ms: budget_ms,
+            micro_usd: 1_000,
+        };
+        state.trusted = TrustedState::from_runtime(trusted);
+        check(&state, &view, &policy, &gates, entry);
+    }
+
+    #[test]
+    fn a_tool_candidate_passes_g6_after_the_decision_spent_most_of_its_budget() {
+        let priced = CostEstimate {
+            tokens: 10,
+            micro_usd: 1,
+        };
+        // 10 ms of decision budget left and an observed p50 of 5 s.
+        with_shell_gate_fixture(Some((priced, 5_000)), 10, |state, view, policy, gates, entry| {
+            let candidate = from_entry(CausalActionKind::UseTool, entry.family, entry, policy, None);
+            assert_eq!(
+                candidate.estimated_latency_ms(),
+                Some(5_000),
+                "execution latency is kept for scoring"
+            );
+            assert_eq!(candidate.decision_overhead_ms(), Some(0));
+            assert_eq!(
+                HardGates::check_one(state, view, &candidate, gates),
+                GateOutcome::Passed
+            );
+            // Control: a candidate whose overhead is the execution estimate is
+            // still refused, so G6 keeps enforcing the overhead it is given.
+            let slow = CausalCandidate::new(
+                CausalActionKind::UseTool,
+                entry.family,
+                CandidateSpec {
+                    namespace: None,
+                    required_capabilities: candidate.required_capabilities().to_vec(),
+                    side_effect: entry.effect,
+                    approval: entry.approval.clone(),
+                    estimated_cost: Some(priced),
+                    estimated_latency_ms: Some(5_000),
+                },
+            );
+            assert_eq!(
+                HardGates::check_one(state, view, &slow, gates),
+                GateOutcome::Blocked {
+                    gate: 6,
+                    reason_code: "budget"
+                }
+            );
+        });
+        // An unknown estimate (an unpriced model) is still not free.
+        with_shell_gate_fixture(None, 10, |state, view, policy, gates, entry| {
+            let candidate = from_entry(CausalActionKind::UseTool, entry.family, entry, policy, None);
+            assert_eq!(candidate.decision_overhead_ms(), None);
+            assert_eq!(
+                HardGates::check_one(state, view, &candidate, gates),
+                GateOutcome::Blocked {
+                    gate: 6,
+                    reason_code: "budget"
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn a_probe_rejected_by_a_gate_is_traced_with_its_gate_and_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidates.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::fs::File::create(&path).unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            // No estimate: G6 rejects the shell probe, which used to vanish.
+            with_shell_gate_fixture(None, 500, |state, view, policy, gates, entry| {
+                let selected = select_family_candidate(
+                    CausalActionKind::UseTool,
+                    entry.family,
+                    [entry],
+                    false,
+                    state,
+                    view,
+                    policy,
+                    gates,
+                )
+                .unwrap();
+                assert!(selected.is_none());
+            });
+        });
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("candidate rejected by a hard gate"), "{log}");
+        assert!(log.contains("use_tool-shell"), "{log}");
+        assert!(log.contains("gate=6"), "{log}");
+        assert!(log.contains("budget"), "{log}");
+    }
+
     #[test]
     fn exact_cost_binding_cannot_price_another_same_family_capability() {
         let key = fixtures::key();
@@ -2254,6 +2444,7 @@ mod tests {
         let other = from_entry(CausalActionKind::UseTool, second.family, second, &policy, None);
         assert_eq!(priced.estimated_cost(), Some(exact));
         assert_eq!(priced.estimated_latency_ms(), Some(77));
+        assert_eq!(priced.decision_overhead_ms(), Some(0));
         assert_eq!(other.estimated_cost(), None);
         assert_eq!(other.estimated_latency_ms(), None);
         let empty_exact = CapabilityCostModel {

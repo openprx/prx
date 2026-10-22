@@ -1628,6 +1628,149 @@ async fn compiled_request_event_breaks_the_tool_surface_down_by_root_and_adapter
         .await;
 }
 
+#[tokio::test]
+async fn a_capability_search_hit_is_declared_on_the_next_request_and_not_the_current_one() {
+    let tmp = TempDir::new().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let tools_registry: Vec<Box<dyn Tool>> = vec![
+        Box::new(NarrowSchemaTool { name: "plain_probe" }),
+        Box::new(McpAliasFixtureTool),
+    ];
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("Use plain_probe.")];
+
+    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = tmp.path().to_path_buf();
+    let rounds = vec![
+        ChatResponse {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "search-0".to_owned(),
+                name: "capability_search".to_owned(),
+                arguments: serde_json::json!({"query": "mcp_call", "limit": 1}).to_string(),
+            }],
+            reasoning_content: None,
+        },
+        ChatResponse {
+            text: Some("done".to_owned()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        },
+    ];
+    let provider = NativeScriptedProvider::new(rounds);
+    // All targeted fixture tools use native adapters with no filesystem/memory category.
+    // Driver validates an actual use_tool/native_tool candidate in the compiled request.
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
+        .await
+        .expect("owned mechanics decision listener");
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run_factory(true, || async {
+            use futures::FutureExt as _;
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("mechanics cleanup owner");
+            let mut original_panic = None;
+            let drained = cleanup
+                .run(q79_boxed_fixture_work(async {
+                    let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
+                        let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_native_mechanics(
+                            config,
+                            &history.last().expect("source input").content,
+                            Arc::clone(&tools_registry),
+                            Arc::clone(&memory),
+                            &endpoint,
+                            &provider,
+                        )
+                        .await;
+                        let runtime = admission.memory_runtime();
+
+                        let result = run_turn(
+                            &mut history,
+                            crate::agent::turn_request::TurnRequest {
+                                channel_name: "cli",
+                                scope: None,
+                                mode: ChatMode::default(),
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &crate::config::MultimodalConfig::default(),
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 1,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: Vec::new(),
+                                },
+                                compaction: None,
+                                decision: admission.decision(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: &provider,
+                                provider_name: "ollama",
+                                model: "prx-local-model",
+                                temperature: 0.0,
+                                tools_registry,
+                                observer: &NoopObserver,
+                                hooks: &HookManager::new(tmp.path().to_path_buf()),
+                                approval: None,
+                                approval_resolver: None,
+                                runtime_adapter: Some(admission.adapter()),
+                                memory: runtime,
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: None,
+                                on_delta: None,
+                                on_tool_call: None,
+                            },
+                        )
+                        .await
+                        .map(|(outcome, _trace)| outcome.into_text())
+                        .unwrap();
+                        assert_eq!(result, "done");
+
+                        let principal = admission.principal();
+                        let events = memory.list_message_events_since(&principal, 0, 256).await.unwrap();
+                        let mut payloads = events
+                            .iter()
+                            .filter(|event| event.event_type == "llm.request.context.compiled")
+                            .filter_map(|event| event.raw_payload_json.as_deref())
+                            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                            .collect::<Vec<_>>();
+                        payloads.sort_by_key(|payload| payload["iteration"].as_u64().unwrap_or_default());
+                        assert_eq!(payloads.len(), 2, "the search request and the next request");
+                        let tool_names = |payload: &serde_json::Value| {
+                            payload["tool_snapshot"]["tools"]
+                                .as_array()
+                                .expect("test: fingerprinted tool list")
+                                .iter()
+                                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                                .collect::<Vec<_>>()
+                        };
+                        // The request that carried the search is not rewritten.
+                        assert_eq!(payloads[0]["tool_snapshot"]["count"], 2);
+                        assert!(!tool_names(&payloads[0]).iter().any(|name| name == "mcp_call"));
+                        // The hit passed the same admission and is declared next.
+                        assert_eq!(payloads[1]["tool_snapshot"]["count"], 3);
+                        assert!(tool_names(&payloads[1]).iter().any(|name| name == "mcp_call"));
+                        assert_ne!(
+                            payloads[0]["tool_snapshot"]["sha256"], payloads[1]["tool_snapshot"]["sha256"],
+                            "the declared tool set changed, so the snapshot fingerprint must change"
+                        );
+                    }))
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic) = caught {
+                        original_panic = Some(panic);
+                    }
+                    Ok(())
+                }))
+                .await;
+            if let Some(panic) = original_panic {
+                std::panic::resume_unwind(panic);
+            }
+            drained.expect("mechanics services must drain");
+        })
+        .await;
+}
+
 /// The compiled tool snapshot is rebuilt on every iteration so dynamic
 /// backends cannot go stale, but rendering and fingerprinting it is
 /// memoized for the turn. After discovery establishes the appended set,

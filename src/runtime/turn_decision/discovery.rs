@@ -11,7 +11,41 @@ use crate::tools::ToolSpec;
 use crate::tools::capability::search::CatalogSearch;
 use crate::tools::capability::search_tool::{CapabilitySearchPort, MAX_QUERY_BYTES, MAX_SEARCH_HITS};
 pub(super) use append::DiscoveryAdmission;
+#[cfg(test)]
+pub(super) use append::MAX_DISCOVERED_TOOLS_PER_TURN;
 use std::sync::Weak;
+
+/// Offers in the order searches returned them (best rank first), so a bounded
+/// admission keeps the most relevant hits rather than the alphabetical first.
+#[derive(Default)]
+pub(in crate::runtime::turn_decision) struct DiscoveryOffers(Vec<(String, CapabilityRef)>);
+
+impl DiscoveryOffers {
+    pub(in crate::runtime::turn_decision) fn insert(&mut self, name: String, reference: CapabilityRef) {
+        if let Some(slot) = self.0.iter_mut().find(|(existing, _)| *existing == name) {
+            slot.1 = reference;
+        } else {
+            self.0.push((name, reference));
+        }
+    }
+
+    /// An offer by public name, else by exact capability ID.
+    fn find(&self, name_or_id: &str) -> Option<CapabilityRef> {
+        self.0
+            .iter()
+            .find(|(name, _)| name == name_or_id)
+            .or_else(|| self.0.iter().find(|(_, reference)| reference.id.as_str() == name_or_id))
+            .map(|(_, reference)| reference.clone())
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.0.iter().map(|(name, _)| name.clone()).collect()
+    }
+
+    pub(in crate::runtime::turn_decision) fn clear(&mut self) {
+        self.0.clear();
+    }
+}
 
 #[derive(serde::Serialize)]
 pub(crate) struct CapabilitySearchHit {
@@ -256,7 +290,9 @@ impl CapabilitySearchAuthority {
                 !context.execution_closed.load(Ordering::Acquire),
                 "capability search turn expired"
             );
-            offers.extend(issued);
+            for (name, reference) in issued {
+                offers.insert(name, reference);
+            }
         }
         Ok(results)
     }

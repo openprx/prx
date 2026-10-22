@@ -74,7 +74,16 @@ execution-service-issued invocation port and rejects direct calls without it.
 When the model subsequently calls an offered public name or exact capability
 ID, the engine rechecks that specific reference before dispatch. Passed
 definitions are appended after the stable core for later iterations of the
-same turn; the current provider request is not rewritten. A pending-approval
+same turn; the current provider request is not rewritten. A model that calls
+tools natively can only call tools its request declares, so the engine also
+offers the hits of a completed `capability_search` on the next provider
+request: before that request is built, each returned hit that passes the same
+discovery gate as a call by name (`check_capability_publication`: policy,
+capability, owner and exclusion; it does not apply G6) is appended to the
+declared tool specs, in search-rank order, at most five newly admitted per pass
+(the search hit limit) and ten per turn across repeated searches. Excluded,
+denied, ungranted, restricted and approval-pending hits are never declared this
+way; the call-by-name path above still applies to them. A pending-approval
 result is kept separate and forces the actual call through durable approval
 without running the backend. Unknown, blocked and expired references do not
 expand the executable surface. Closing the turn removes discovery offers;

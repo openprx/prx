@@ -347,13 +347,15 @@ impl HardGates {
             return approval_outcome(approval_required || policy_asks, grant_verified, approval_ids);
         }
 
-        // G6: unknown cost or latency is not free for an executable path.
+        // G6: unknown cost or decision overhead is not free for an executable
+        // path. The overhead is the extra latency the decision itself spends;
+        // a tool's execution latency is a scoring input, not a G6 input.
         if candidate.action() != CausalActionKind::Refuse {
             let budget = remaining;
             if candidate.estimated_cost().is_none_or(|estimate| {
                 u64::from(estimate.tokens) > budget.tokens || estimate.micro_usd > budget.micro_usd
             }) || candidate
-                .estimated_latency_ms()
+                .decision_overhead_ms()
                 .is_none_or(|latency| u64::from(latency) > budget.latency_ms)
             {
                 return blocked(6, "budget");

@@ -381,6 +381,7 @@ pub(crate) struct CausalCandidate {
     approval: ApprovalRequirement,
     estimated_cost: Option<CostEstimate>,
     estimated_latency_ms: Option<u32>,
+    decision_overhead_ms: Option<u32>,
 }
 
 /// Everything a candidate is built from besides its action and target.
@@ -408,7 +409,18 @@ impl CausalCandidate {
             approval: spec.approval,
             estimated_cost: spec.estimated_cost,
             estimated_latency_ms: spec.estimated_latency_ms,
+            decision_overhead_ms: spec.estimated_latency_ms,
         }
+    }
+
+    /// Set the extra latency this candidate adds to the decision itself, the
+    /// only latency G6 compares with `extra_latency_budget_ms`. It defaults to
+    /// the execution estimate; a tool or retrieval candidate adds none. `None`
+    /// stays unknown and is rejected by G6.
+    #[must_use]
+    pub(crate) const fn with_decision_overhead_ms(mut self, overhead: Option<u32>) -> Self {
+        self.decision_overhead_ms = overhead;
+        self
     }
 
     /// The stable id.
@@ -451,6 +463,12 @@ impl CausalCandidate {
     /// bucket.
     pub(crate) const fn estimated_latency_ms(&self) -> Option<u32> {
         self.estimated_latency_ms
+    }
+
+    /// The extra latency one decision spends on this candidate, `None` when
+    /// unknown. G6 reads this, never the execution estimate.
+    pub(crate) const fn decision_overhead_ms(&self) -> Option<u32> {
+        self.decision_overhead_ms
     }
 }
 

@@ -400,6 +400,382 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
     }
 }
 
+/// A search hit is only an offer. `admit_offered_discoveries` puts it through
+/// the same admission as a call by name and publishes it for the next request:
+/// excluded, restricted or over-limit hits never become declared tools.
+#[tokio::test]
+async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() {
+    for autonomy in [
+        crate::security::AutonomyLevel::ReadOnly,
+        crate::security::AutonomyLevel::Full,
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        config.causal_tree.enabled = true;
+        config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+        config.autonomy.level = autonomy;
+        config.cost.prices.insert(
+            "prx-local-model".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+            )
+            .unwrap(),
+        );
+        let generation = crate::config::new_shared(config.clone()).pin();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let mut tools: Vec<Box<dyn Tool>> = ["file_read", "skills_list", "skill_read", "shell"]
+            .into_iter()
+            .map(|name| {
+                Box::new(DiscoverySurfaceTool {
+                    name,
+                    dispatches: Arc::clone(&dispatches),
+                }) as Box<dyn Tool>
+            })
+            .collect();
+        tools.push(Box::new(CapabilitySearchTool));
+        let registry = Arc::new(tools);
+        let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
+            Arc::clone(&registry),
+            Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+            Arc::new(DenyApprovalStrategy),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        ));
+        let catalog = ProviderCatalogView::from_config(&config);
+        let transports = CountingTransports(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+        let mut service = build_turn_decision_service(
+            TurnSurfaceKind::AgentLoop,
+            TurnServiceBuild {
+                parent_grant: None,
+                generation: Arc::clone(&generation),
+                registry,
+                execution,
+                catalog_sources: sources(&generation, &config),
+                surface_policy: SurfacePolicy {
+                    direct_names: BTreeSet::from(["file_read".to_owned()]),
+                    ..SurfacePolicy::default()
+                },
+                provider_catalog: &catalog,
+                transports: &transports,
+                events: Arc::new(SilentEvents),
+                memory: Arc::clone(&memory),
+                security,
+            },
+        )
+        .await
+        .unwrap();
+        let predictions = Arc::new(AtomicUsize::new(0));
+        let owning = Arc::get_mut(&mut service).unwrap();
+        owning.factory = DecisionBackendFactory::from_slots(
+            vec![Box::new(ExecuteContextProbeBackend {
+                identity: BackendIdentity {
+                    kind: BackendKind::Mock,
+                    provider: None,
+                    configured_model: Arc::from("prx-local-model"),
+                },
+                calls: Arc::clone(&predictions),
+            })],
+            Arc::clone(&owning.state_key),
+            OutboundSecrets::default(),
+            SlotLimits::default(),
+        );
+        let cli = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
+            &generation,
+            Arc::clone(&memory),
+            "could you make that sound a little friendlier please",
+            "prx_discovery_next_request",
+        )
+        .await;
+        let proof = crate::runtime::turn_source::OwnedTurnSourceProof::capture(&cli);
+        let context = service
+            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
+        let core_before: Vec<_> = service
+            .agent_execution_specs(&proof, &context)
+            .unwrap()
+            .specs
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect();
+        assert_eq!(core_before, ["file_read"]);
+        let original_refs = context.execution_refs().clone();
+        // Nothing has been searched, so there is nothing to admit.
+        assert_eq!(service.admit_offered_discoveries(&proof, &context, |_, _| false), 0);
+
+        let port = service.capability_search_port(&proof, &context).unwrap();
+        for query in ["skills_list", "shell"] {
+            let result = with_search_authority(
+                Some(port.clone()),
+                CapabilitySearchTool.execute(serde_json::json!({"query": query, "limit": 1})),
+            )
+            .await
+            .unwrap();
+            assert!(result.success);
+            let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            // Read-only autonomy does not even make the process-execution
+            // family discoverable.
+            let expected = usize::from(query == "skills_list" || autonomy == crate::security::AutonomyLevel::Full);
+            assert_eq!(
+                output.get("hits").unwrap().as_array().unwrap().len(),
+                expected,
+                "{query}"
+            );
+        }
+        // The search itself declares nothing: the current request is unchanged.
+        assert!(
+            service
+                .agent_appended_execution_specs(&proof, &context)
+                .unwrap()
+                .specs
+                .is_empty()
+        );
+        // An exclusion (here the inherited channel exclusion) blocks the hit.
+        assert_eq!(
+            service.admit_offered_discoveries(&proof, &context, |name, _| name == "skills_list" || name == "shell"),
+            0
+        );
+        assert!(
+            service
+                .agent_appended_execution_specs(&proof, &context)
+                .unwrap()
+                .specs
+                .is_empty()
+        );
+        // Without the exclusion, every hit that passes the gates is declared.
+        let admitted = service.admit_offered_discoveries(&proof, &context, |_, _| false);
+        let appended: Vec<_> = service
+            .agent_appended_execution_specs(&proof, &context)
+            .unwrap()
+            .specs
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        if autonomy == crate::security::AutonomyLevel::ReadOnly {
+            assert_eq!(admitted, 1);
+            assert_eq!(
+                appended,
+                ["skills_list"],
+                "shell must not be admitted at read-only autonomy"
+            );
+        } else {
+            assert_eq!(admitted, 2);
+            assert_eq!(appended, ["shell", "skills_list"]);
+        }
+        // Admission is idempotent, never rewrites the decision's exact refs, and
+        // dispatches nothing.
+        assert_eq!(service.admit_offered_discoveries(&proof, &context, |_, _| false), 0);
+        assert_eq!(context.execution_refs(), &original_refs);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        context.terminal_execution_trace();
+        assert_eq!(service.admit_offered_discoveries(&proof, &context, |_, _| false), 0);
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+}
+
+/// Admission is bounded per turn across repeated searches and follows the
+/// order the searches returned hits, not the alphabet.
+#[tokio::test]
+async fn discovered_tools_are_capped_per_turn_and_admitted_in_search_rank_order() {
+    {
+        let autonomy = crate::security::AutonomyLevel::Full;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        config.causal_tree.enabled = true;
+        config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+        config.autonomy.level = autonomy;
+        config.cost.prices.insert(
+            "prx-local-model".to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+            )
+            .unwrap(),
+        );
+        let generation = crate::config::new_shared(config.clone()).pin();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let mut tools: Vec<Box<dyn Tool>> = ["file_read", "skills_list", "skill_read", "shell"]
+            .into_iter()
+            .map(|name| {
+                Box::new(DiscoverySurfaceTool {
+                    name,
+                    dispatches: Arc::clone(&dispatches),
+                }) as Box<dyn Tool>
+            })
+            .collect();
+        tools.push(Box::new(CapabilitySearchTool));
+        let registry = Arc::new(tools);
+        let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
+            Arc::clone(&registry),
+            Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+            Arc::new(DenyApprovalStrategy),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        ));
+        let catalog = ProviderCatalogView::from_config(&config);
+        let transports = CountingTransports(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+        let mut service = build_turn_decision_service(
+            TurnSurfaceKind::AgentLoop,
+            TurnServiceBuild {
+                parent_grant: None,
+                generation: Arc::clone(&generation),
+                registry,
+                execution,
+                catalog_sources: sources(&generation, &config),
+                surface_policy: SurfacePolicy {
+                    direct_names: BTreeSet::from(["file_read".to_owned()]),
+                    ..SurfacePolicy::default()
+                },
+                provider_catalog: &catalog,
+                transports: &transports,
+                events: Arc::new(SilentEvents),
+                memory: Arc::clone(&memory),
+                security,
+            },
+        )
+        .await
+        .unwrap();
+        let predictions = Arc::new(AtomicUsize::new(0));
+        let owning = Arc::get_mut(&mut service).unwrap();
+        owning.factory = DecisionBackendFactory::from_slots(
+            vec![Box::new(ExecuteContextProbeBackend {
+                identity: BackendIdentity {
+                    kind: BackendKind::Mock,
+                    provider: None,
+                    configured_model: Arc::from("prx-local-model"),
+                },
+                calls: Arc::clone(&predictions),
+            })],
+            Arc::clone(&owning.state_key),
+            OutboundSecrets::default(),
+            SlotLimits::default(),
+        );
+        let cli = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
+            &generation,
+            Arc::clone(&memory),
+            "could you make that sound a little friendlier please",
+            "prx_discovery_cap",
+        )
+        .await;
+        let proof = crate::runtime::turn_source::OwnedTurnSourceProof::capture(&cli);
+        let context = service
+            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
+        let original_refs = context.execution_refs().clone();
+        let port = service.capability_search_port(&proof, &context).unwrap();
+        // `skills_list` ranks first although `shell` sorts first alphabetically.
+        for name in ["skills_list", "shell"] {
+            let result = with_search_authority(
+                Some(port.clone()),
+                CapabilitySearchTool.execute(serde_json::json!({"query": name, "limit": 1})),
+            )
+            .await
+            .unwrap();
+            assert!(result.success);
+            let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            assert_eq!(output.get("hits").unwrap().as_array().unwrap().len(), 1, "{name}");
+        }
+        // A turn cap of one, counted across both searches' offers and every pass.
+        let mut admitted = 0;
+        for _ in 0..3 {
+            admitted += service.admit_offered_discoveries_up_to(&proof, &context, 1, |_, _| false);
+        }
+        assert_eq!(admitted, 1);
+        let appended: Vec<_> = service
+            .agent_appended_execution_specs(&proof, &context)
+            .unwrap()
+            .specs
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(
+            appended,
+            ["skills_list"],
+            "the first hit in search order, not alphabetically"
+        );
+        // The production cap: ten per turn, counted over every admission.
+        let reference_of = |name: &str| {
+            let entry = service.catalog.entry_for_public_name(name).expect("catalog entry");
+            CapabilityRef {
+                id: entry.id.clone(),
+                fingerprint: entry.fingerprint,
+                generation: entry.generation,
+            }
+        };
+        let core = reference_of("file_read");
+        assert!(context.execution_refs().contains(&core));
+        {
+            // A core capability offered again is never counted as newly admitted.
+            context
+                .discovery_offers
+                .get_or_init(Default::default)
+                .lock()
+                .insert("file_read".to_owned(), core.clone());
+            assert_eq!(service.admit_offered_discoveries(&proof, &context, |_, _| false), 1);
+            assert!(context.discovery_admission("file_read").is_none());
+        }
+        assert_eq!(super::super::discovery::MAX_DISCOVERED_TOOLS_PER_TURN, 10);
+        {
+            let mut admissions = context.discovery_admissions.get_or_init(Default::default).lock();
+            let held = admissions.len();
+            for index in held..super::super::discovery::MAX_DISCOVERED_TOOLS_PER_TURN {
+                admissions.insert(
+                    format!("held_{index}"),
+                    super::super::discovery::DiscoveryAdmission {
+                        reference: core.clone(),
+                        requires_approval: true,
+                    },
+                );
+            }
+            assert_eq!(admissions.len(), super::super::discovery::MAX_DISCOVERED_TOOLS_PER_TURN);
+        }
+        context
+            .discovery_offers
+            .get_or_init(Default::default)
+            .lock()
+            .insert("skill_read".to_owned(), reference_of("skill_read"));
+        assert_eq!(
+            service.admit_offered_discoveries(&proof, &context, |_, _| false),
+            0,
+            "the production cap refuses an eleventh admission"
+        );
+        assert!(context.discovery_admission("skill_read").is_none());
+        // Control: the same offer passes once the cap is raised.
+        assert_eq!(
+            service.admit_offered_discoveries_up_to(&proof, &context, 11, |_, _| false),
+            1
+        );
+        assert_eq!(context.execution_refs(), &original_refs);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        context.terminal_execution_trace();
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+}
+
 #[tokio::test]
 async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_execution() {
     const SKILL_NAME: &str = "prx_skill";
