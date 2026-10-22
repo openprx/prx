@@ -825,6 +825,10 @@ struct WebhookToolScriptProvider {
     pending_call: Mutex<Option<String>>,
     /// Every message the turns showed the model, for the history test.
     seen: Mutex<Vec<String>>,
+    /// System-role message contents of every request.
+    system_seen: Mutex<Vec<String>>,
+    /// Tool names published on every request.
+    tools_seen: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -857,6 +861,16 @@ impl Provider for WebhookToolScriptProvider {
             tool_calls: Vec::new(),
             reasoning_content: None,
         };
+        self.system_seen.lock().extend(
+            request
+                .messages
+                .iter()
+                .filter(|message| message.role == "system")
+                .map(|message| message.content.clone()),
+        );
+        self.tools_seen
+            .lock()
+            .extend(request.tools.unwrap_or_default().iter().map(|spec| spec.name.clone()));
         self.seen.lock().push(
             request
                 .messages

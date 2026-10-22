@@ -116,8 +116,20 @@ async fn a_webhook_memory_store_never_reaches_another_surfaces_system_prompt() {
         "test: the webhook must report the withheld write: {withheld}"
     );
     assert!(
-        !withheld.contains("SHARED-PROMPT-STORE"),
-        "the withheld write must not echo the proposed content: {withheld}"
+        !withheld.contains(SHARED_PROMPT_INJECTION),
+        "the withheld write must not echo the proposed payload: {withheld}"
+    );
+    assert!(
+        provider
+            .system_seen
+            .lock()
+            .iter()
+            .all(|system| !system.contains(SHARED_PROMPT_INJECTION)),
+        "no request's system prompt may carry the proposed payload"
+    );
+    assert!(
+        !provider.tools_seen.lock().iter().any(|name| name == "memory_store"),
+        "the approval-required memory_store must not be published on the webhook surface"
     );
     assert!(
         state

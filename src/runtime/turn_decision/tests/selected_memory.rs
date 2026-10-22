@@ -461,13 +461,13 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             decision.state.evidence_fingerprint(&service.state_key),
             "an empty successful read stays no-progress as latency shrinks"
         );
-        let empty_next = empty_observed.state;
+        let empty_next = empty_observed.state.clone();
         assert!(empty_next.observed.artifacts().is_empty(), "expected an empty value");
         assert_eq!(memory.retrieval_calls.load(Ordering::SeqCst), 2);
         let empty_inputs = EngineInputs {
             state: &empty_next,
             decision_id: DecisionId::new_runtime(),
-            allow_terminal_answer: empty_observed.fresh_read || empty_observed.completed_ok,
+            allow_terminal_answer: read_finishes_retrieval(&empty_observed, "Run the shell command: echo hi"),
             ..inputs.clone()
         };
         let empty_terminal = CausalDecisionEngine::decide_terminal_prepared(
@@ -489,6 +489,30 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             empty_terminal.prediction.is_none(),
             "empty recovery makes no backend call"
         );
+
+        // A blank message with the same empty OK read has nothing to answer.
+        assert!(!read_finishes_retrieval(&empty_observed, " \t\n"));
+        let blank_inputs = EngineInputs {
+            state: &empty_next,
+            decision_id: DecisionId::new_runtime(),
+            allow_terminal_answer: read_finishes_retrieval(&empty_observed, " \t\n"),
+            ..inputs.clone()
+        };
+        let blank_terminal = CausalDecisionEngine::decide_terminal_prepared(
+            CausalDecisionEngine::prepare_hop(&blank_inputs).expect("blank terminal preparation"),
+        )
+        .expect("blank terminal selection");
+        assert!(matches!(
+            directive_from_selection(
+                &blank_terminal,
+                &DirectiveContext {
+                    current_generation: view.generation(),
+                    approval_expires_at: chrono::Utc::now(),
+                    discovery_limit: 1,
+                },
+            ),
+            Ok(TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. })
+        ));
 
         memory.return_empty.store(false, Ordering::SeqCst);
         memory.return_stale.store(true, Ordering::SeqCst);
@@ -545,7 +569,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
         let failed_inputs = EngineInputs {
             state: &failed_observation.state,
             decision_id: DecisionId::new_runtime(),
-            allow_terminal_answer: failed_observation.fresh_read || failed_observation.completed_ok,
+            allow_terminal_answer: read_finishes_retrieval(&failed_observation, "Run the shell command: echo hi"),
             ..inputs.clone()
         };
         let failed_terminal = CausalDecisionEngine::decide_terminal_prepared(
@@ -585,7 +609,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
         let cancelled_inputs = EngineInputs {
             state: &cancelled.state,
             decision_id: DecisionId::new_runtime(),
-            allow_terminal_answer: cancelled.fresh_read || cancelled.completed_ok,
+            allow_terminal_answer: read_finishes_retrieval(&cancelled, "Run the shell command: echo hi"),
             deadline: decision.deadline,
             ..inputs.clone()
         };
