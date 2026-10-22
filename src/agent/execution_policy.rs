@@ -210,7 +210,12 @@ impl crate::tools::ApprovalStrategy for AgentToolApprovalStrategy {
             };
         };
         let tool_name = request.descriptor.public_name.as_str();
-        if manager.is_session_allowlisted(tool_name) {
+        // "Always" covers a tool, never a call the tool only accepts with its
+        // own approval: each of those is bound to one target and needs its own
+        // human decision.
+        if !crate::security::approval_operation::requires_explicit_grant(tool_name, &request.command.arguments)
+            && manager.is_session_allowlisted(tool_name)
+        {
             return crate::tools::ToolApprovalDecision::Approved {
                 runtime_approval_granted: true,
                 runtime_grant: self.runtime_grant(&request),

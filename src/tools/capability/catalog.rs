@@ -70,6 +70,28 @@ pub(crate) struct CapabilityEntry {
 }
 
 impl CapabilityEntry {
+    /// The built-in `skills_manage` tool, whose grant-bound lifecycle actions
+    /// derive their approval operation completely from the call's arguments,
+    /// so a named call can be collected and recorded as an exact pending
+    /// decision before any review, like a file mutation. Only the native entry
+    /// qualifies: an MCP, plugin or skill entry of the same name does not.
+    pub(crate) fn collects_exact_call(&self) -> bool {
+        self.public_name == "skills_manage"
+            && self.root == "skills_manage"
+            && self.family == CapabilityTarget::NativeTool
+            && matches!(&self.target, ExecutionTarget::Tool(name) if name == "skills_manage")
+    }
+
+    /// The (lowercased) request names a grant-bound action of a collectable
+    /// tool. Other actions need no approval collection: the model may call them
+    /// in an ordinary turn, and collecting them would end in an error.
+    pub(crate) fn names_collectable_action(&self, folded_text: &str) -> bool {
+        self.collects_exact_call()
+            && crate::security::approval_operation::SKILLS_MANAGE_GRANT_BOUND_ACTIONS
+                .iter()
+                .any(|action| folded_text.contains(action))
+    }
+
     /// Name understood by the execution policy. Synthetic Skill and Node
     /// entries dispatch through their registered root and inherit that root's
     /// read/write classification; public names remain available for search,

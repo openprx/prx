@@ -324,7 +324,7 @@ async fn run_turn_unguarded(
         let spec = lease.proposal_spec();
         let mut proposal_messages = history.clone();
         proposal_messages.insert(0, ChatMessage::system(
-            "Collect exactly one complete argument proposal for the offered file operation. This request cannot execute it. Return the requested tool call; do not claim that the operation has run.",
+            "Collect exactly one complete argument proposal for the offered operation (a file change, an MCP write or a skills_manage lifecycle change). This request cannot execute it. Return the requested tool call; do not claim that the operation has run.",
         ));
         #[cfg(feature = "wasm-plugins")]
         {

@@ -69,6 +69,15 @@ this collection. The decision-stage deadline continues to bound decision work;
 the subsequent main proposal uses the existing main-turn cancellation and idle
 supervision. No decision or Router budget is extended.
 
+A tool call that the tool itself only accepts under a signed one-shot grant
+bound to its exact target is asked at every autonomy level: `skills_manage`
+`lifecycle_publish`, `lifecycle_rollback` and `lifecycle_import_executable`.
+The execution service upgrades an allowed decision to Ask for them, and a deny
+stays a deny. Under supervised autonomy, naming `skills_manage` collects the
+call's arguments through the same Chat or Console owner path as a file
+operation, so the pending record names the exact operation. A session "Always"
+answer never approves such a call; each needs its own review.
+
 Chat and Console review and explicit resume are distinct operations: recording
 approval does not execute the call. Resume runs the exact reviewed operation,
 with a durable claim shared with the revocation resolution path. The backend

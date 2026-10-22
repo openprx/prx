@@ -78,6 +78,14 @@ pub(crate) struct VerifiedPendingDecisionApproval {
     source: MessageEvent,
 }
 
+#[cfg(test)]
+impl VerifiedPendingDecisionApproval {
+    /// The exact operations the pending call asks the owner to approve.
+    pub(crate) fn op_ids(&self) -> &[String] {
+        &self.record.op_ids
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewRecord {
