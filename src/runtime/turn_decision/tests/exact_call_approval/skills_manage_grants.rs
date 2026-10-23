@@ -18,6 +18,24 @@ use futures_util::FutureExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
+struct NoChannel;
+
+#[async_trait::async_trait]
+impl crate::channels::traits::Channel for NoChannel {
+    fn name(&self) -> &str {
+        "prx_grant_fixture"
+    }
+    async fn send(&self, _: &crate::channels::traits::SendMessage) -> anyhow::Result<()> {
+        anyhow::bail!("grant fixture must not announce")
+    }
+    async fn listen(
+        &self,
+        _: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("grant fixture has no listener")
+    }
+}
+
 const SKILL: &str = "report-runner";
 const PROPOSAL: &str = "prop-00000000000000000000000000000000";
 const SCRIPT_TOOL: &str = "[[tools]]\nname = \"run\"\ndescription = \"run it\"\nkind = \"script\"\ncommand = \"scripts/run.sh\"\n\n[tools.args]\nmessage = \"hello\"\nmarks = \"\"\n";
@@ -230,6 +248,13 @@ impl Env {
 }
 
 async fn env(autonomy: AutonomyLevel, case: Case) -> Env {
+    env_with(autonomy, case, false).await
+}
+
+/// `production` builds the service the way `prx chat` does: the shared
+/// publication builder with the interactive surface policy and the session
+/// tools in the registry, instead of a hand-assembled service.
+async fn env_with(autonomy: AutonomyLevel, case: Case, production: bool) -> Env {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().expect("test: workspace");
     let mut config = crate::config::Config::default();
@@ -284,65 +309,105 @@ async fn env(autonomy: AutonomyLevel, case: Case) -> Env {
     tool_config.skills_lifecycle.owner_scope = Some(owner.clone());
     tool_config.skills.open_skills_dir = Some(workspace.path().join("missing-open").to_string_lossy().to_string());
     tool_config.skills.openclaw_skills_dir = Some(workspace.path().join("missing-claw").to_string_lossy().to_string());
-    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(
-        SkillsManageTool::new(workspace.path().to_owned(), tool_config, Arc::clone(&security))
-            .with_lifecycle(Arc::new(lifecycle)),
-    )]);
-    let execution = Arc::new(
-        ToolExecutionService::from_shared_boxed_registry(
-            Arc::clone(&registry),
-            Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
-            Arc::new(DenyApprovalStrategy),
-            Arc::new(AdapterOwnedPreparation),
-            Arc::new(TracingToolExecutionAudit),
+    let registry_slot: Option<Arc<Vec<Box<dyn Tool>>>>;
+    let manage = SkillsManageTool::new(workspace.path().to_owned(), tool_config, Arc::clone(&security))
+        .with_lifecycle(Arc::new(lifecycle));
+    let mut service = if production {
+        let spawn = crate::tools::sessions_spawn::SessionsSpawnTool::new(
+            Arc::new(NoChannel),
+            "ollama",
+            "prx-local-model",
+            0.0,
+            Arc::clone(&security),
+            workspace.path().to_owned(),
+            config.multimodal.clone(),
+            Default::default(),
+            None,
+            Default::default(),
+            config.sessions_spawn.clone(),
         )
-        .with_idempotency_memory(Arc::clone(&memory)),
-    );
-    let catalog = ProviderCatalogView::from_config(&config);
-    let transports = CountingTransports(AtomicUsize::new(0));
-    let mut service = build_turn_decision_service(
-        TurnSurfaceKind::Interactive,
-        TurnServiceBuild {
-            parent_grant: None,
+        .with_shared_memory(Arc::clone(&memory));
+        let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(manage), Box::new(spawn)]);
+        let service = crate::runtime::turn_publication::TurnDecisionPublication {
             generation: Arc::clone(&generation),
             registry: Arc::clone(&registry),
-            execution,
-            catalog_sources: sources(&generation, &config),
-            surface_policy: SurfacePolicy {
-                direct_names: BTreeSet::from(["skills_manage".to_owned()]),
-                excluded_names: config.tool_tiering.always_exclude.iter().cloned().collect(),
-                ..SurfacePolicy::default()
-            },
-            provider_catalog: &catalog,
-            transports: &transports,
-            events: Arc::new(SilentEvents),
+            mcp_tool: None,
+            security: Arc::clone(&security),
+            observer: Arc::new(crate::observability::noop::NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(workspace.path().to_owned())),
             memory: Arc::clone(&memory),
-            security,
-        },
-    )
-    .await
-    .expect("test: decision service");
+            plugin_generation: 0,
+        }
+        .publish(TurnSurfaceKind::Interactive)
+        .await
+        .expect("test: published service");
+        registry_slot = Some(registry);
+        service
+    } else {
+        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(manage)]);
+        let execution = Arc::new(
+            ToolExecutionService::from_shared_boxed_registry(
+                Arc::clone(&registry),
+                Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+                Arc::new(DenyApprovalStrategy),
+                Arc::new(AdapterOwnedPreparation),
+                Arc::new(TracingToolExecutionAudit),
+            )
+            .with_idempotency_memory(Arc::clone(&memory)),
+        );
+        let catalog = ProviderCatalogView::from_config(&config);
+        let transports = CountingTransports(AtomicUsize::new(0));
+        let service = build_turn_decision_service(
+            TurnSurfaceKind::Interactive,
+            TurnServiceBuild {
+                parent_grant: None,
+                generation: Arc::clone(&generation),
+                registry: Arc::clone(&registry),
+                execution,
+                catalog_sources: sources(&generation, &config),
+                surface_policy: SurfacePolicy {
+                    direct_names: BTreeSet::from(["skills_manage".to_owned()]),
+                    excluded_names: config.tool_tiering.always_exclude.iter().cloned().collect(),
+                    ..SurfacePolicy::default()
+                },
+                provider_catalog: &catalog,
+                transports: &transports,
+                events: Arc::new(SilentEvents),
+                memory: Arc::clone(&memory),
+                security,
+            },
+        )
+        .await
+        .expect("test: decision service");
+        registry_slot = Some(registry);
+        service
+    };
+    let registry = registry_slot.expect("test: registry");
     let family = service
         .catalog
         .entry_for_public_name("skills_manage")
         .expect("test: skills_manage is published")
         .family
         .as_str();
-    let owning = Arc::get_mut(&mut service).expect("test: unshared service");
-    owning.factory = DecisionBackendFactory::from_slots(
-        vec![Box::new(FilesystemApprovalBackend {
-            identity: BackendIdentity {
-                kind: BackendKind::Mock,
-                provider: None,
-                configured_model: Arc::from("prx-local-model"),
-            },
-            family,
-            calls: Arc::new(AtomicUsize::new(0)),
-        })],
-        Arc::clone(&owning.state_key),
-        OutboundSecrets::default(),
-        SlotLimits::default(),
-    );
+    // The production service keeps its own decision backend; only the
+    // hand-built fixture steers the family a prediction picks.
+    if !production {
+        let owning = Arc::get_mut(&mut service).expect("test: unshared service");
+        owning.factory = DecisionBackendFactory::from_slots(
+            vec![Box::new(FilesystemApprovalBackend {
+                identity: BackendIdentity {
+                    kind: BackendKind::Mock,
+                    provider: None,
+                    configured_model: Arc::from("prx-local-model"),
+                },
+                family,
+                calls: Arc::new(AtomicUsize::new(0)),
+            })],
+            Arc::clone(&owning.state_key),
+            OutboundSecrets::default(),
+            SlotLimits::default(),
+        );
+    }
     let (mut earlier, mut newer) = (None, None);
     if case == Case::Rollback {
         // Published after the catalog snapshot: an active skill would add
@@ -386,7 +451,11 @@ async fn env(autonomy: AutonomyLevel, case: Case) -> Env {
 }
 
 async fn scenario(autonomy: AutonomyLevel, case: Case) {
-    let env = env(autonomy, case).await;
+    scenario_with(autonomy, case, false).await;
+}
+
+async fn scenario_with(autonomy: AutonomyLevel, case: Case, production: bool) {
+    let env = env_with(autonomy, case, production).await;
     let result = std::panic::AssertUnwindSafe(Box::pin(run(&env, autonomy, case)))
         .catch_unwind()
         .await;
@@ -410,7 +479,7 @@ async fn run(env: &Env, autonomy: AutonomyLevel, case: Case) {
         &env.generation,
         Arc::clone(&env.memory),
         &format!(
-            "Use skills_manage to run {}",
+            "Call the skills_manage tool with action {} for the reviewed bundle in import-src/envprobe",
             spec.arguments
                 .get("action")
                 .and_then(serde_json::Value::as_str)
@@ -958,4 +1027,24 @@ async fn collection_declines_a_plain_action_the_model_proposes() {
         std::panic::resume_unwind(panic);
     }
     assert!(matches!(drained, Ok(true)));
+}
+
+/// Finding 114.1: the service `prx chat` publishes (shared publication builder,
+/// interactive surface policy, session tools in the registry) still reaches the
+/// collection path at supervised autonomy. With `sessions_spawn` direct, every
+/// chat turn carries an outgoing delegation, which once kept the collection
+/// from ever being offered.
+#[tokio::test]
+async fn production_chat_service_supervised_publish_reaches_a_pending_approval() {
+    Box::pin(scenario_with(AutonomyLevel::Supervised, Case::Publish, true)).await;
+}
+
+#[tokio::test]
+async fn production_chat_service_supervised_import_reaches_a_pending_approval() {
+    Box::pin(scenario_with(AutonomyLevel::Supervised, Case::Import, true)).await;
+}
+
+#[tokio::test]
+async fn production_chat_service_supervised_rollback_reaches_a_pending_approval() {
+    Box::pin(scenario_with(AutonomyLevel::Supervised, Case::Rollback, true)).await;
 }
