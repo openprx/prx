@@ -746,7 +746,7 @@ pub async fn post_plan(State(state): State<AppState>, Json(body): Json<ChangeBod
             if let Err(refused) = raw_file_target(&service, &file) {
                 return *refused;
             }
-            match service.plan_file(file, content, ACTOR).await {
+            match service.plan_file(file, content, false, ACTOR).await {
                 Ok(plan) => Json(plan_body(&plan)).into_response(),
                 Err(error) => manage_error_response(error, None, &|message: &str| secrets.scrub(message)),
             }
@@ -789,7 +789,7 @@ pub async fn post_apply(
                 return *refused;
             }
             let scrub = |message: &str| secrets.scrub(message);
-            match service.plan_file(file, content, ACTOR).await {
+            match service.plan_file(file, content, false, ACTOR).await {
                 Ok(plan) => {
                     let around = Commit {
                         operation: OPERATION,
@@ -1213,6 +1213,7 @@ mod tests {
         let plan = cli
             .transactions()
             .plan(ConfigChange::RawFile {
+                allow_secret_clear: false,
                 filename: "config.toml".into(),
                 contents: rotated,
             })

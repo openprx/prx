@@ -971,6 +971,9 @@ enum ConfigCommands {
         /// Which configuration file it replaces (`config.toml` or a `config.d` fragment name)
         #[arg(long, default_value = "config.toml")]
         target: String,
+        /// Permit this raw replacement to omit or empty stored secret slots
+        #[arg(long)]
+        allow_credential_clear: bool,
     },
     /// Write a configuration file through the configuration transaction
     Apply {
@@ -980,6 +983,9 @@ enum ConfigCommands {
         /// Which configuration file it replaces (`config.toml` or a `config.d` fragment name)
         #[arg(long, default_value = "config.toml")]
         target: String,
+        /// Permit this raw replacement to omit or empty stored secret slots
+        #[arg(long)]
+        allow_credential_clear: bool,
         #[command(flatten)]
         apply: ApplyArgs,
     },
