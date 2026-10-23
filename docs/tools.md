@@ -1519,6 +1519,9 @@ A resume that cannot be admitted, including a consumed decision requested from
 a different chat, produces a refusal and leaves chat open after recording the
 failed request. It does not execute the operation or disclose another chat's
 decision details. Failure to persist that terminal record still stops the chat.
+Refused queued requests release their scheduler slot. Recognized infrastructure
+failures instead report that resume failed before execution and can be retried;
+chat does not retry automatically or display private error details.
 Catalog parity checks still apply: after an operation changes the pinned skill
 catalog, start a fresh chat for further model work with the updated catalog.
 

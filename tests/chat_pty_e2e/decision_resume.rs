@@ -123,6 +123,10 @@ fn later_input_and_exit(session: &mut TrackedSession) {
 // This covers the same foreground completion path while allowing the following
 // model turn; successful catalog-changing imports are covered separately below.
 fn approve_and_resume_publish_failure() -> (HarnessGuard, SessionGuard, String) {
+    approve_and_resume_publish_failure_with_delay("")
+}
+
+fn approve_and_resume_publish_failure_with_delay(delay: &str) -> (HarnessGuard, SessionGuard, String) {
     let (guard, _, _) = import_fixture();
     let arguments =
         serde_json::json!({"action": "lifecycle_publish", "proposal_id": format!("prop-{}", "0".repeat(32))});
@@ -133,6 +137,7 @@ fn approve_and_resume_publish_failure() -> (HarnessGuard, SessionGuard, String) 
         &[
             ("OPENPRX_MOCK_TOOL_CALL", &tool_call),
             ("OPENPRX_MOCK_RESPONSE", LATER_REPLY),
+            ("OPENPRX_MOCK_DELAY_MS_BY_PROMPT", delay),
         ],
     );
     let session = sg.session();
@@ -234,6 +239,28 @@ fn chat_resume_consumed_decision_in_same_chat_refuses_and_processes_later_input(
 
 #[test]
 #[serial(prx_chat_pty)]
+fn chat_queued_consumed_resume_releases_queue_and_processes_later_input() {
+    let (guard, mut sg, decision_id) = approve_and_resume_publish_failure_with_delay("prx_busy_resume_turn=5000");
+    let session = sg.session();
+    session.send("hi prx_busy_resume_turn\r").expect("start delayed turn");
+    session.send("/queue\r").expect("inspect running turn");
+    read_until_with_dsr(session, "Main queue: 0 queued (0 priority), 1 running.", TURN_TIMEOUT);
+    session
+        .send(format!("/resume-decision {decision_id}\r"))
+        .expect("queue consumed resume behind running turn");
+    session.send("/queue\r").expect("inspect queued resume");
+    // Prove the resume actually waited behind a running turn, rather than
+    // relying on the fixture delay alone to establish the interleaving.
+    read_until_with_dsr(session, "Main queue: 1 queued (0 priority), 1 running.", TURN_TIMEOUT);
+    read_until_with_dsr(session, REFUSAL, TURN_TIMEOUT);
+    session.send("/queue\r").expect("inspect released queue");
+    read_until_with_dsr(session, "Main queue: 0 queued (0 priority), 0 running.", TURN_TIMEOUT);
+    later_input_and_exit(session);
+    assert_publish_attempts(&guard, 1);
+}
+
+#[test]
+#[serial(prx_chat_pty)]
 fn chat_resume_consumed_decision_from_new_chat_refuses_and_processes_later_input() {
     let (guard, arguments, revision) = import_fixture();
     let (mut original, decision_id) = approve_and_resume_import(&guard, &arguments, &revision);
@@ -256,7 +283,7 @@ fn chat_resume_consumed_decision_from_new_chat_refuses_and_processes_later_input
 
 #[test]
 #[serial(prx_chat_pty)]
-fn chat_import_resume_processes_later_help_and_approval_commands() {
+fn chat_import_resume_processes_later_input_with_current_catalog_parity_limitation() {
     let (guard, arguments, revision) = import_fixture();
     let (mut sg, decision_id) = approve_and_resume_import(&guard, &arguments, &revision);
     let session = sg.session();
@@ -265,8 +292,10 @@ fn chat_import_resume_processes_later_help_and_approval_commands() {
     session
         .send(format!("/approval --decision {decision_id}\r"))
         .expect("inspect after import resume");
-    // Import changes the pinned catalog. Inspection must still run and surface
-    // the existing parity refusal instead of leaving this command queued.
+    // Current documented limitation: import changes the pinned catalog, so a
+    // fresh chat is needed for model work (docs/tools.md). Inspection and the
+    // later message must still run. Update both expectations deliberately when
+    // chat catalog refresh is implemented; these refusals are not the desired UX.
     read_until_with_dsr(
         session,
         "No inspectable pending decision is available for this chat.",
