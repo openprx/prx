@@ -1514,6 +1514,14 @@ Use `/approval --decision <uuid>` to inspect the pending call before review. It 
 
 `/resume-decision <uuid>` explicitly requests execution of the original stored call after approval. Chat records a fresh canonical request and run, rechecks its source and pending approval, and uses the existing one-use direct execution service. Ordinary JSON chat messages do not select resume mode. The resume runs as a foreground ordered turn without a main-provider call; terminal status reflects the tool outcome, and a failed or uncertain attempt is not automatically repeated. A closed decision is rendered without running a tool.
 
+After a resume completes, chat continues accepting messages and slash commands.
+A resume that cannot be admitted, including a consumed decision requested from
+a different chat, produces a refusal and leaves chat open after recording the
+failed request. It does not execute the operation or disclose another chat's
+decision details. Failure to persist that terminal record still stops the chat.
+Catalog parity checks still apply: after an operation changes the pinned skill
+catalog, start a fresh chat for further model work with the updated catalog.
+
 Chat prompt Skill metadata and tool selection no longer accumulate across turns. Each turn uses its current selection in canonical prompt order; decision-owned turns continue through the pinned constrained execution reader. Legacy routing uses its stateless fallback with the existing operator exclusions. Cache stability and performance remain subject to the unchanged centralized budgets.
 
 Pending decisions receive a display number from the same monotonic allocator as child sessions, with separate typed mappings. `/approve <seq>` and `/deny <seq>` can review these decisions through the signed service. Numbers are local to this Chat process, tied to the originating chat identity, never reassigned, and bounded to 1024 decision aliases. Inspecting an authenticated pending UUID registers its alias; UUID commands remain available when an alias cannot be allocated or after restart. Switching chats cannot redirect an old decision number to a child session. Every review still revalidates the durable record and grants.

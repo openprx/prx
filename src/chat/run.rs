@@ -3174,6 +3174,12 @@ Retry with a compatible model: /provider {shown} <model>",
             ).await {
                 return Err(error.context(format!("Chat admission failure persistence is unconfirmed: {record_error}")));
             }
+            if resume_decision {
+                let reply = "Decision resume could not be admitted for this chat. No operation was run by this request.";
+                emit_chat_output(reply);
+                if let Some(guard) = assignment_guard.as_mut() { guard.failed(reply); }
+                continue;
+            }
             return Err(error);
         }
         admission_guard.handoff_terminal()?;
@@ -3636,12 +3642,22 @@ Retry with a compatible model: /provider {shown} <model>",
                     "Chat close draft could not be registered");
             }
             let commit_len = history.len().saturating_add(1);
+            // This awaited execution has no detached driver's lifecycle events.
+            // Its task owns the lease until execution returns; finalization must
+            // observe completion-ready before it can release visible admission.
+            let lease_id = task_id.get();
+            provider_turn_workers.record_execution_started(task_id, lease_id)
+                .map_err(|error| anyhow::anyhow!("Chat close execution start failed: {error:?}"))?;
             let (reply, succeeded) = if let Some(reply) = binding.fixed_reply()? {
                 binding.close(&memory_fabric, commit_len, provider_started_at, &cancellation).await?;
                 (reply, true)
             } else {
                 binding.execute_resume_and_finalize(&memory_fabric, commit_len, provider_started_at, &cancellation).await?
             };
+            provider_turn_workers.record_execution_exited(task_id, lease_id)
+                .map_err(|error| anyhow::anyhow!("Chat close execution exit failed: {error:?}"))?;
+            provider_turn_workers.record_completion_ready(task_id)
+                .map_err(|error| anyhow::anyhow!("Chat close completion failed: {error:?}"))?;
             dispatch_ordered_provider_turn_commit_and_wait(
                 &chat_dispatcher, &turn_signal, task_id, &close_draft_id,
                 &user_input, &reply, "", false, false,
