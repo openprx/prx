@@ -18,24 +18,6 @@ use futures_util::FutureExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
-struct NoChannel;
-
-#[async_trait::async_trait]
-impl crate::channels::traits::Channel for NoChannel {
-    fn name(&self) -> &str {
-        "prx_grant_fixture"
-    }
-    async fn send(&self, _: &crate::channels::traits::SendMessage) -> anyhow::Result<()> {
-        anyhow::bail!("grant fixture must not announce")
-    }
-    async fn listen(
-        &self,
-        _: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("grant fixture has no listener")
-    }
-}
-
 const SKILL: &str = "report-runner";
 const PROPOSAL: &str = "prop-00000000000000000000000000000000";
 const SCRIPT_TOOL: &str = "[[tools]]\nname = \"run\"\ndescription = \"run it\"\nkind = \"script\"\ncommand = \"scripts/run.sh\"\n\n[tools.args]\nmessage = \"hello\"\nmarks = \"\"\n";
@@ -309,12 +291,11 @@ async fn env_with(autonomy: AutonomyLevel, case: Case, production: bool) -> Env 
     tool_config.skills_lifecycle.owner_scope = Some(owner.clone());
     tool_config.skills.open_skills_dir = Some(workspace.path().join("missing-open").to_string_lossy().to_string());
     tool_config.skills.openclaw_skills_dir = Some(workspace.path().join("missing-claw").to_string_lossy().to_string());
-    let registry_slot: Option<Arc<Vec<Box<dyn Tool>>>>;
     let manage = SkillsManageTool::new(workspace.path().to_owned(), tool_config, Arc::clone(&security))
         .with_lifecycle(Arc::new(lifecycle));
-    let mut service = if production {
+    let (mut service, registry) = if production {
         let spawn = crate::tools::sessions_spawn::SessionsSpawnTool::new(
-            Arc::new(NoChannel),
+            Arc::new(crate::runtime::turn_decision::tests::recursive_budget::NoChannel),
             "ollama",
             "prx-local-model",
             0.0,
@@ -341,8 +322,7 @@ async fn env_with(autonomy: AutonomyLevel, case: Case, production: bool) -> Env 
         .publish(TurnSurfaceKind::Interactive)
         .await
         .expect("test: published service");
-        registry_slot = Some(registry);
-        service
+        (service, registry)
     } else {
         let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(manage)]);
         let execution = Arc::new(
@@ -379,18 +359,19 @@ async fn env_with(autonomy: AutonomyLevel, case: Case, production: bool) -> Env 
         )
         .await
         .expect("test: decision service");
-        registry_slot = Some(registry);
-        service
+        (service, registry)
     };
-    let registry = registry_slot.expect("test: registry");
     let family = service
         .catalog
         .entry_for_public_name("skills_manage")
         .expect("test: skills_manage is published")
         .family
         .as_str();
-    // The production service keeps its own decision backend; only the
-    // hand-built fixture steers the family a prediction picks.
+    // The production-built service keeps its real decision backend; only the
+    // hand-built fixture installs the mock `FilesystemApprovalBackend` that
+    // steers the family a prediction picks. The production tests therefore
+    // prove routing to a pending approval (collection is code-issued and needs
+    // no prediction), not backend family prediction.
     if !production {
         let owning = Arc::get_mut(&mut service).expect("test: unshared service");
         owning.factory = DecisionBackendFactory::from_slots(

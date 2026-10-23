@@ -6,7 +6,7 @@ use crate::agent::test_admission::{AdmittedTurn, registry_with_search};
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use crate::tools::sessions_spawn::SessionsSpawnTool;
 
-struct NoChannel;
+pub(super) struct NoChannel;
 #[async_trait::async_trait]
 impl Channel for NoChannel {
     fn name(&self) -> &str {
