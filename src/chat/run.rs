@@ -3820,7 +3820,7 @@ Retry with a compatible model: /provider {shown} <model>",
                         summary: "redux driver dispatch failed".to_string(),
                     },
                 );
-                eprintln!("\nError: redux driver dispatch failed\n");
+                super::output::print_turn_failure(plain_mode, "redux driver dispatch failed");
                 continue;
             }
 
@@ -4200,7 +4200,7 @@ Retry with a compatible model: /provider {shown} <model>",
                         let _ = terminal.cancel_draft("user", id).await;
                     }
                     if !interactive_tui_active {
-                        eprintln!("\nError: {err}\n");
+                        super::output::print_turn_failure(plain_mode, &err);
                     }
                     if plain_mode {
                         plain_mode_turn_failed = true;
@@ -4409,7 +4409,7 @@ Retry with a compatible model: /provider {shown} <model>",
                         let _ = terminal.cancel_draft("user", d_id).await;
                     }
                     let err_text = e.to_string();
-                    eprintln!("\nError: {err_text}\n");
+                    super::output::print_turn_failure(plain_mode, &err_text);
                     if plain_mode {
                         plain_mode_turn_failed = true;
                     }

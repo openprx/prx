@@ -624,7 +624,24 @@ impl Provider for MockEnvProvider {
         true
     }
 
-    async fn chat(&self, _request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
+    /// A non-streaming request that offers exactly the one tool `OPENPRX_MOCK_TOOL_CALL`
+    /// names is an approval-argument collection (a single proposal schema, no
+    /// executable surface): answer it with that call, like a model would. Any
+    /// other request keeps the plain text outcome.
+    async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
+        if let (Some(spec), Some([offered])) = (self.tool_call_spec.as_ref(), request.tools)
+            && offered.name == spec.name
+        {
+            return Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![crate::providers::ToolCall {
+                    id: "mock-collection-call".to_owned(),
+                    name: spec.name.clone(),
+                    arguments: spec.args.clone(),
+                }],
+                reasoning_content: None,
+            });
+        }
         Ok(ChatResponse {
             text: Some(self.non_streaming_outcome()?),
             tool_calls: Vec::new(),

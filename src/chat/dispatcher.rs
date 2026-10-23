@@ -2535,7 +2535,16 @@ async fn drive_start_turn_stream(
             approval_resolver: None,
             runtime_adapter: Some(runtime_adapter),
             // The adapter's ToolExecutionService already carries the resolved ledger.
-            memory: crate::agent::turn_request::ToolLoopMemory::none().with_event_fabric(request_event_fabric),
+            // The scope lets an approval collection record its request event; the
+            // legacy chat loop (chat/run.rs) sets the same scope.
+            memory: crate::agent::turn_request::ToolLoopMemory::none()
+                .with_event_fabric(request_event_fabric)
+                .with_request_event_scope(
+                    binding
+                        .envelope()
+                        .message_scope()
+                        .with_recipient(format!("{}/{model}", binding.provider_name())),
+                ),
         },
         crate::agent::turn_request::TurnDelivery {
             cancellation: Some(cancel.clone()),

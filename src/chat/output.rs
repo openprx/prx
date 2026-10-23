@@ -11,6 +11,17 @@ pub(crate) fn print_fallback_chat_output(text: &str) {
     let _ = std::io::stdout().flush();
 }
 
+/// Show a failed turn where the operator reads the chat. Plain chat prints its
+/// replies on stdout, so the failure goes there too; a stderr-only line is lost
+/// whenever stderr is not the terminal. Other non-TUI modes keep stderr.
+pub(super) fn print_turn_failure(plain_mode: bool, err: &str) {
+    if plain_mode {
+        print_fallback_chat_output(&format!("Error: {err}"));
+    } else {
+        eprintln!("\nError: {err}\n");
+    }
+}
+
 pub(super) fn format_fallback_chat_output_for(text: &str, stdout_is_terminal: bool) -> String {
     if !stdout_is_terminal {
         let mut out = String::with_capacity(text.len() + 1);
