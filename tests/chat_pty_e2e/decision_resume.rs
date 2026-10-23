@@ -16,6 +16,10 @@ fn chat_owner(guard: &HarnessGuard) -> String {
 }
 
 fn import_fixture() -> (HarnessGuard, String, String) {
+    import_fixture_at(openprx::security::AutonomyLevel::Full)
+}
+
+fn import_fixture_at(level: openprx::security::AutonomyLevel) -> (HarnessGuard, String, String) {
     let mut guard = new_harness_guard().expect("isolated resume fixture");
     // CONFIG_DIR takes precedence over WORKSPACE in the real CLI loader.
     guard.workspace_dir = guard.config_dir.join("workspace");
@@ -43,7 +47,7 @@ fn import_fixture() -> (HarnessGuard, String, String) {
         "action": "lifecycle_import_executable", "source": source, "revision_id": revision,
     });
     let mut config = openprx::config::Config::default();
-    config.autonomy.level = openprx::security::AutonomyLevel::Full;
+    config.autonomy.level = level;
     // Publish the lifecycle tool through operator configuration so the mock
     // provider can request it without a separate capability-discovery turn.
     config.tool_tiering.always_include.push("skills_manage".to_owned());
@@ -313,4 +317,79 @@ fn chat_import_resume_processes_later_input_with_current_catalog_parity_limitati
         "chat must exit after import resume"
     );
     assert_import_generation(&guard, &revision, 1);
+}
+
+/// Finalized, succeeded `skills_manage` execution receipts: the approved import.
+fn executed_receipts(guard: &HarnessGuard) -> usize {
+    let db = rusqlite::Connection::open_with_flags(
+        guard.workspace_dir.join("memory/brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("read owned fixture events");
+    let mut query = db
+        .prepare("SELECT raw_payload_json FROM message_events WHERE event_type = 'tool.execution.finalized'")
+        .expect("query tool execution receipts");
+    let receipts = query
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("receipt rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read receipts");
+    receipts
+        .iter()
+        .map(|receipt| serde_json::from_str::<serde_json::Value>(receipt).expect("execution receipt"))
+        .filter(|receipt| {
+            receipt["outcome"]["descriptor"]["public_name"] == "skills_manage"
+                && receipt["outcome"]["status"] == "succeeded"
+        })
+        .count()
+}
+
+// Finding 115.1: at supervised autonomy a named, grant-bound skills_manage call
+// is collected by the plain chat loop (the dispatcher stream path), recorded as
+// a pending approval, approved, and resumed into exactly one execution.
+#[test]
+#[serial(prx_chat_pty)]
+fn chat_supervised_named_import_collects_approves_and_resumes_once() {
+    let (guard, arguments, revision) = import_fixture_at(openprx::security::AutonomyLevel::Supervised);
+    let (mut sg, decision_id) = approve_and_resume_import(&guard, &arguments, &revision);
+    assert_eq!(executed_receipts(&guard), 1, "one approved call is one execution");
+    let session = sg.session();
+    session
+        .send(format!("/resume-decision {decision_id}\r"))
+        .expect("resume the consumed decision");
+    read_until_with_dsr(session, REFUSAL, TURN_TIMEOUT);
+    assert_eq!(executed_receipts(&guard), 1, "a consumed decision does not run again");
+    session.send("/help\r").expect("help after resume");
+    read_until_with_dsr(session, "Available commands:", TURN_TIMEOUT);
+    session.send("/exit\r").expect("exit");
+    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat must exit after resume");
+    assert_import_generation(&guard, &revision, 1);
+}
+
+// Finding 115.2: a turn-engine error on the dispatcher path is shown in chat
+// and the loop keeps accepting input. Here the provider answers a collection
+// request with text instead of the one tool call it asked for.
+#[test]
+#[serial(prx_chat_pty)]
+fn chat_turn_engine_error_is_visible_and_chat_keeps_running() {
+    let (guard, arguments, revision) = import_fixture_at(openprx::security::AutonomyLevel::Supervised);
+    let mut sg = spawn_chat_in(&guard, &["--plain"], &[("OPENPRX_MOCK_RESPONSE", LATER_REPLY)]);
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+    session
+        .send(format!(
+            "Call the skills_manage tool with these arguments: {arguments}\r"
+        ))
+        .expect("request import");
+    read_until_with_dsr(session, "Error: ", TURN_TIMEOUT);
+    session.send("/help\r").expect("help after a failed turn");
+    read_until_with_dsr(session, "Available commands:", TURN_TIMEOUT);
+    session.send("/exit\r").expect("exit");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "chat must exit after a failed turn"
+    );
+    assert_import_generation(&guard, &revision, 0);
+    assert_eq!(executed_receipts(&guard), 0);
 }

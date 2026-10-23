@@ -1311,7 +1311,7 @@ async fn finalize_per_turn_context(
             let interactive_tui_active = redraw_tx_for_main.is_some();
             if !interactive_tui_active {
                 let _ = terminal.cancel_draft("user", &pending.draft_id).await;
-                eprintln!("\nError: {err}\n");
+                super::output::print_turn_failure(plain_mode, &err);
             }
             if plain_mode {
                 *plain_mode_turn_failed = true;
