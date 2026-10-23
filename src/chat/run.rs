@@ -3174,6 +3174,16 @@ Retry with a compatible model: /provider {shown} <model>",
             ).await {
                 return Err(error.context(format!("Chat admission failure persistence is unconfirmed: {record_error}")));
             }
+            if resume_decision {
+                if let Some(id) = provider_queue_task_id {
+                    super::input_queue::cancel_dequeued_input_task(&mut turn_scheduler, id)?;
+                    publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                }
+                let reply = decision_source::resume_admission_failure_reply(&error);
+                emit_chat_output(reply);
+                if let Some(guard) = assignment_guard.as_mut() { guard.failed(reply); }
+                continue;
+            }
             return Err(error);
         }
         admission_guard.handoff_terminal()?;
@@ -3636,12 +3646,24 @@ Retry with a compatible model: /provider {shown} <model>",
                     "Chat close draft could not be registered");
             }
             let commit_len = history.len().saturating_add(1);
+            // This awaited execution has no detached driver's lifecycle events.
+            // Its task owns the lease until execution returns; finalization must
+            // observe completion-ready before it can release visible admission.
+            // Lease comparisons are scoped to this task's worker, not global.
+            // This foreground worker never receives detached-driver lease events.
+            let lease_id = task_id.get();
+            provider_turn_workers.record_execution_started(task_id, lease_id)
+                .map_err(|error| anyhow::anyhow!("Chat close execution start failed: {error:?}"))?;
             let (reply, succeeded) = if let Some(reply) = binding.fixed_reply()? {
                 binding.close(&memory_fabric, commit_len, provider_started_at, &cancellation).await?;
                 (reply, true)
             } else {
                 binding.execute_resume_and_finalize(&memory_fabric, commit_len, provider_started_at, &cancellation).await?
             };
+            provider_turn_workers.record_execution_exited(task_id, lease_id)
+                .map_err(|error| anyhow::anyhow!("Chat close execution exit failed: {error:?}"))?;
+            provider_turn_workers.record_completion_ready(task_id)
+                .map_err(|error| anyhow::anyhow!("Chat close completion failed: {error:?}"))?;
             dispatch_ordered_provider_turn_commit_and_wait(
                 &chat_dispatcher, &turn_signal, task_id, &close_draft_id,
                 &user_input, &reply, "", false, false,

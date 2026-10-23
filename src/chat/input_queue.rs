@@ -218,6 +218,39 @@ pub(super) fn publish_main_queue_status(
     );
 }
 
+/// A refused input never reaches provider start, but must release its scheduler slot.
+pub(super) fn cancel_dequeued_input_task(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    id: crate::chat::turn_scheduler::TurnTaskId,
+) -> anyhow::Result<()> {
+    scheduler
+        .request_cancel(id)
+        .map_err(|error| anyhow::anyhow!("Chat refused input could not release its queue task: {error:?}"))
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use crate::chat::turn_scheduler::{TurnPriority, TurnScheduler, TurnTaskState};
+
+    #[test]
+    fn refused_input_releases_queued_and_dispatched_scheduler_tasks() {
+        for dispatched in [false, true] {
+            let mut scheduler = TurnScheduler::default();
+            let id = scheduler.enqueue("/resume-decision prx_consumed", TurnPriority::Normal, 2);
+            if dispatched {
+                scheduler.mark_dispatched_to_chat_loop(id).unwrap();
+            }
+            cancel_dequeued_input_task(&mut scheduler, id).unwrap();
+            let task = scheduler.task(id).unwrap();
+            assert_eq!(task.state, TurnTaskState::Cancelled);
+            assert_eq!(task.history_commit_len, Some(2));
+            assert_eq!(scheduler.status().terminal, 1);
+            assert_eq!(scheduler.status().queued, 0);
+        }
+    }
+}
+
 pub(super) fn format_input_backlog_report(
     backlog: &std::collections::VecDeque<QueuedInputMessage>,
     scheduler: &crate::chat::turn_scheduler::TurnScheduler,

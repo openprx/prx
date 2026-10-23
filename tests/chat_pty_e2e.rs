@@ -66,6 +66,9 @@ use expectrl::session::Session;
 use serial_test::serial;
 use tempfile::TempDir;
 
+#[path = "chat_pty_e2e/decision_resume.rs"]
+mod decision_resume;
+
 // D-071: every wait below ends on an event (the expected output, the process
 // exiting, the peer recording a call). These limits only turn a hang into a
 // failure: they are far above anything a loaded machine needs, and no test

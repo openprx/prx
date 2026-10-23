@@ -7,6 +7,31 @@ use crate::runtime::envelope::RuntimeEnvelope;
 use anyhow::Context;
 use std::sync::Arc;
 
+/// Only typed infrastructure failures receive retry guidance. Opaque approval
+/// failures include owner/scope/consumption checks and retain the same refusal.
+/// Never render an error's text: its sources may contain private identifiers.
+pub(super) fn resume_admission_failure_reply(error: &anyhow::Error) -> &'static str {
+    use crate::runtime::turn_decision::AgentDecisionError;
+    let infrastructure = error.chain().any(|cause| {
+        cause.is::<std::io::Error>()
+            || cause.is::<rusqlite::Error>()
+            || cause.is::<reqwest::Error>()
+            || matches!(
+                cause.downcast_ref::<AgentDecisionError>(),
+                Some(
+                    AgentDecisionError::RecordWriterUnavailable
+                        | AgentDecisionError::DelegationStorage(_)
+                        | AgentDecisionError::IngressRecovery(_)
+                )
+            )
+    });
+    if infrastructure {
+        "Decision resume failed before execution. You can retry this request."
+    } else {
+        "Decision resume could not be admitted for this chat. No operation was run by this request."
+    }
+}
+
 /// Selection identity paired with the concrete provider instance. Only Chat's
 /// construction/switch path publishes it, before updating either UI slot.
 ///
@@ -1219,6 +1244,36 @@ pub(crate) mod admission_failure_tests {
     use super::*;
     use crate::agent::terminal::TurnTerminalStatus;
     use crate::memory::{MemoryFabric, SqliteMemory};
+
+    #[test]
+    fn resume_admission_infrastructure_failure_offers_retry_without_error_details() {
+        use crate::runtime::turn_decision::AgentDecisionError;
+        for error in [
+            AgentDecisionError::PendingApproval(std::io::Error::other("prx_private_path").into()),
+            AgentDecisionError::PendingApproval(rusqlite::Error::InvalidQuery.into()),
+            AgentDecisionError::RecordWriterUnavailable,
+            AgentDecisionError::IngressRecovery(anyhow::anyhow!("prx_private_owner")),
+        ] {
+            let error = anyhow::Error::new(error).context("prx_private_decision");
+            assert_eq!(
+                resume_admission_failure_reply(&error),
+                "Decision resume failed before execution. You can retry this request."
+            );
+        }
+    }
+
+    #[test]
+    fn resume_admission_authority_failures_share_an_opaque_refusal() {
+        use crate::runtime::turn_decision::AgentDecisionError;
+        for reason in ["owner mismatch", "scope mismatch", "already consumed"] {
+            let error = anyhow::Error::new(AgentDecisionError::PendingApproval(anyhow::anyhow!(reason)))
+                .context("prx_private_decision");
+            assert_eq!(
+                resume_admission_failure_reply(&error),
+                "Decision resume could not be admitted for this chat. No operation was run by this request."
+            );
+        }
+    }
 
     /// Admit only an actual local `/bg` fixture through Chat's private source path.
     pub(crate) async fn recorded_local_operator_spawn(
