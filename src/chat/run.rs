@@ -3820,7 +3820,6 @@ Retry with a compatible model: /provider {shown} <model>",
                         summary: "redux driver dispatch failed".to_string(),
                     },
                 );
-                super::output::print_turn_failure(plain_mode, "redux driver dispatch failed");
                 continue;
             }
 

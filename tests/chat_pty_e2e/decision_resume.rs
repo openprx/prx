@@ -319,20 +319,29 @@ fn chat_import_resume_processes_later_input_with_current_catalog_parity_limitati
     assert_import_generation(&guard, &revision, 1);
 }
 
+/// Finalized, succeeded `skills_manage` execution receipts: the approved import.
 fn executed_receipts(guard: &HarnessGuard) -> usize {
     let db = rusqlite::Connection::open_with_flags(
         guard.workspace_dir.join("memory/brain.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .expect("read owned fixture events");
-    let count = db
-        .query_row(
-            "SELECT count(*) FROM message_events WHERE event_type = 'tool.execution.finalized'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .expect("count execution receipts");
-    usize::try_from(count).expect("receipt count")
+    let mut query = db
+        .prepare("SELECT raw_payload_json FROM message_events WHERE event_type = 'tool.execution.finalized'")
+        .expect("query tool execution receipts");
+    let receipts = query
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("receipt rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read receipts");
+    receipts
+        .iter()
+        .map(|receipt| serde_json::from_str::<serde_json::Value>(receipt).expect("execution receipt"))
+        .filter(|receipt| {
+            receipt["outcome"]["descriptor"]["public_name"] == "skills_manage"
+                && receipt["outcome"]["status"] == "succeeded"
+        })
+        .count()
 }
 
 // Finding 115.1: at supervised autonomy a named, grant-bound skills_manage call
