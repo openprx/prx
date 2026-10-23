@@ -781,8 +781,11 @@ impl CausalDecisionEngine {
         let candidate = adapter
             .filter(|_| {
                 !inputs.terminal_only
-                    && inputs.delegation.is_none()
-                    && prepared.outgoing_child.is_none()
+                    // An interactive chat always publishes `sessions_spawn`, so
+                    // an outgoing delegation (and the child manifest derived
+                    // from it) exists on every turn. Only one that carries
+                    // requested work competes with the collection.
+                    && inputs.delegation.is_none_or(|(_, requested)| requested.is_empty())
                     && Instant::now() < inputs.deadline
                     && trusted.delivery.interactive
                     && trusted.delivery.approval_channel
