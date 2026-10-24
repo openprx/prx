@@ -212,6 +212,25 @@ impl Tool for AllowedToolProxy {
         tool.execute_named(name, self.rewrite_args(args)).await
     }
 
+    async fn execute_named_observed(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<crate::tools::traits::ToolInvocationResult> {
+        anyhow::ensure!(self.supports_name(name), "proxied tool does not expose requested name");
+        let Some(tool) = self.find_source_tool() else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Tool '{}' is not registered.", self.public_name)),
+            }
+            .into());
+        };
+        tool.execute_named_observed(name, self.rewrite_args(args), cancellation)
+            .await
+    }
+
     async fn execute_named_with_cancellation(
         &self,
         name: &str,

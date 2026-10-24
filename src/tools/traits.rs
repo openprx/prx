@@ -19,6 +19,75 @@ pub fn is_tool_cancelled_result(result: &ToolResult) -> bool {
     !result.success && result.error.as_deref() == Some(TOOL_EXECUTION_CANCELLED)
 }
 
+/// Process facts observed by an execution backend, independent of display text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessTermination {
+    Exited,
+    Cancelled,
+    TimedOut,
+    NotStarted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessExecutionDetails {
+    pub termination: ProcessTermination,
+    pub started: bool,
+    pub output_complete: bool,
+    pub diagnostic: Option<String>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+impl ProcessExecutionDetails {
+    pub fn summary(&self) -> String {
+        match self.termination {
+            ProcessTermination::Exited => match (self.exit_code, self.signal) {
+                (Some(code), _) => format!("Process exited with code {code}"),
+                (_, Some(signal)) => format!("Process terminated by signal {signal}"),
+                _ => "Process exited; exit code unavailable".to_string(),
+            },
+            ProcessTermination::Cancelled => "Process execution cancelled".to_string(),
+            ProcessTermination::TimedOut => "Process execution timed out".to_string(),
+            ProcessTermination::NotStarted => "Process was not started".to_string(),
+            ProcessTermination::Failed => "Process execution failed; completion unverified".to_string(),
+        }
+    }
+
+    pub fn render(&self, result: &ToolResult) -> String {
+        let status = self.summary();
+        format!(
+            "{status}\nProcess started: {}\nOutput complete: {}\nstdout{}:\n{}\n\nstderr{}:\n{}\n{}",
+            self.started,
+            self.output_complete,
+            if self.stdout_truncated { " (truncated)" } else { "" },
+            result.output,
+            if self.stderr_truncated { " (truncated)" } else { "" },
+            result.error.as_deref().unwrap_or_default(),
+            self.diagnostic
+                .as_ref()
+                .map(|message| format!("Diagnostics: {message}"))
+                .unwrap_or_default(),
+        )
+    }
+}
+
+/// Compatibility envelope: existing tools keep their result contract while
+/// process tools can supply facts without encoding metadata inside output.
+pub struct ToolInvocationResult {
+    pub result: ToolResult,
+    pub process: Option<Box<ProcessExecutionDetails>>,
+}
+
+impl From<ToolResult> for ToolInvocationResult {
+    fn from(result: ToolResult) -> Self {
+        Self { result, process: None }
+    }
+}
+
 /// Description of a tool for the LLM
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -146,6 +215,18 @@ pub trait Tool: Send + Sync {
             }),
             result = self.execute(args) => result,
         }
+    }
+
+    /// Execute through the same named dispatch while retaining backend facts.
+    async fn execute_named_observed(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<ToolInvocationResult> {
+        self.execute_named_with_cancellation(name, args, cancellation)
+            .await
+            .map(Into::into)
     }
 
     /// Optional pre-turn refresh hook for tools with dynamic capabilities.

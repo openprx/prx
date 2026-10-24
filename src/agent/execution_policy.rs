@@ -340,6 +340,7 @@ pub(super) fn build_agent_tool_runtime_adapter(inputs: AgentToolRuntimeInputs<'_
         service = service.with_idempotency_memory(ledger);
     }
     ToolLoopRuntimeAdapter {
+        verify_unexecuted_reply: false,
         provider_trace: None,
         events: None,
         stream_provider: false,

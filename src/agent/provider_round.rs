@@ -129,6 +129,7 @@ pub(super) async fn run_streaming_provider_turn(
     temperature: f64,
     cancellation: Option<&CancellationToken>,
     adapter: &ToolLoopRuntimeAdapter,
+    relay_text: bool,
 ) -> Result<crate::providers::traits::ChatTrace> {
     use crate::providers::traits::{ChatResponse, StreamChunk, StreamOptions};
     use futures::StreamExt;
@@ -197,7 +198,9 @@ pub(super) async fn run_streaming_provider_turn(
                     }
                     if !delta.is_empty() {
                         text.push_str(&delta);
-                        emit_tool_loop_event(adapter, ToolLoopEvent::TextDelta(delta)).await?;
+                        if relay_text {
+                            emit_tool_loop_event(adapter, ToolLoopEvent::TextDelta(delta)).await?;
+                        }
                     }
                     if let Some(reasoning_delta) = reasoning_delta
                         && !reasoning_delta.is_empty()

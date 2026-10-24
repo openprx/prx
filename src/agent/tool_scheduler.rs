@@ -1,11 +1,12 @@
 use crate::agent::execution_policy::{is_write_tool, preview_tool_arguments};
 use crate::agent::tool_call_parser::{ParsedToolCall, unparseable_native_arguments};
-use crate::agent::tool_result_recording::ToolResultRecorder;
+use crate::agent::tool_result_recording::{ObservedToolResult, ToolResultRecorder};
 use crate::agent::turn_contracts::{
     ChatMode, ToolLoopCancelled, ToolLoopEvent, ToolLoopRuntimeAdapter, emit_tool_loop_event,
 };
 use crate::observability::{Observer, ObserverEvent};
 use crate::providers::ToolCall;
+use crate::tools::ToolExecutionStatus;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -145,7 +146,7 @@ async fn execute_one_with_service(
     cancellation: Option<&CancellationToken>,
     chat_mode: ChatMode,
     recorder: &ToolResultRecorder,
-) -> Result<String> {
+) -> Result<ObservedToolResult> {
     let result = match execute_one_unrecorded(index, call, native_tool_calls, adapter, cancellation, chat_mode).await {
         Ok(result) => result,
         Err(error) => {
@@ -157,7 +158,10 @@ async fn execute_one_with_service(
     };
     // Recorded before returning, so a caller dropped between here and the end
     // of the batch still leaves evidence that this call ran.
-    recorder.record(index, &result);
+    recorder.record(index, &result.content);
+    if result.status == ToolExecutionStatus::Cancelled {
+        return Err(ToolLoopCancelled.into());
+    }
     Ok(result)
 }
 
@@ -168,7 +172,7 @@ async fn execute_one_unrecorded(
     adapter: &ToolLoopRuntimeAdapter,
     cancellation: Option<&CancellationToken>,
     chat_mode: ChatMode,
-) -> Result<String> {
+) -> Result<ObservedToolResult> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return Err(ToolLoopCancelled.into());
     }
@@ -191,7 +195,10 @@ async fn execute_one_unrecorded(
             },
         )
         .await?;
-        return Ok(result);
+        return Ok(ObservedToolResult::not_executed(
+            result,
+            ToolExecutionStatus::InvalidArguments,
+        ));
     }
 
     let command = crate::tools::ToolExecutionCommand::new(&call.name, call.arguments.clone())
@@ -210,7 +217,10 @@ async fn execute_one_unrecorded(
             },
         )
         .await?;
-        return Ok(result);
+        return Ok(ObservedToolResult::not_executed(
+            result,
+            ToolExecutionStatus::Indeterminate,
+        ));
     };
 
     if adapter
@@ -246,7 +256,7 @@ async fn execute_one_unrecorded(
             },
         )
         .await?;
-        return Ok(result);
+        return Ok(ObservedToolResult::not_executed(result, ToolExecutionStatus::Denied));
     }
 
     if chat_mode.intercepts_writes() && is_write_tool(&call.name) {
@@ -272,7 +282,7 @@ async fn execute_one_unrecorded(
             },
         )
         .await?;
-        return Ok(result);
+        return Ok(ObservedToolResult::not_executed(result, ToolExecutionStatus::Succeeded));
     }
 
     let _barrier = match tool_barrier_key(&call.name) {
@@ -291,7 +301,10 @@ async fn execute_one_unrecorded(
                     },
                 )
                 .await?;
-                return Ok(result);
+                return Ok(ObservedToolResult::not_executed(
+                    result,
+                    ToolExecutionStatus::Indeterminate,
+                ));
             }
         },
         None => None,
@@ -305,11 +318,12 @@ async fn execute_one_unrecorded(
     } else {
         service.execute(command, execution_context, cancellation).await
     };
-    if outcome.status == crate::tools::ToolExecutionStatus::Cancelled {
-        return Err(ToolLoopCancelled.into());
-    }
     let awaiting_approval = outcome.status == crate::tools::ToolExecutionStatus::AwaitingApproval;
     let success = outcome.succeeded();
+    // Legacy failures can be backend refusals. Only process facts establish
+    // that an unsuccessful shell command actually started.
+    let executed = outcome.result.is_some() && outcome.process.as_ref().map_or(success, |process| process.started);
+    let status = outcome.status;
     let result = outcome.model_content;
     emit_tool_loop_event(
         adapter,
@@ -325,7 +339,11 @@ async fn execute_one_unrecorded(
     if awaiting_approval {
         return Err(super::turn_contracts::ToolLoopAwaitingApproval { reply: result }.into());
     }
-    Ok(result)
+    Ok(ObservedToolResult {
+        content: result,
+        status,
+        executed,
+    })
 }
 
 /// Delegation backends contain another complete agent loop. Start their fixed
@@ -411,7 +429,7 @@ pub(super) async fn execute_tools_with_service(
     chat_mode: ChatMode,
     observer: &dyn Observer,
     recorder: &ToolResultRecorder,
-) -> Result<Vec<String>> {
+) -> Result<Vec<ObservedToolResult>> {
     use futures::stream::{self, StreamExt};
 
     let mut ordered_indices = (0..tool_calls.len()).collect::<Vec<_>>();
@@ -423,7 +441,8 @@ pub(super) async fn execute_tools_with_service(
             },
         );
     }
-    let mut results = vec![String::new(); tool_calls.len()];
+    let mut results =
+        vec![ObservedToolResult::not_executed(String::new(), ToolExecutionStatus::Indeterminate); tool_calls.len()];
     let mut cursor = 0;
     while cursor < ordered_indices.len() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {

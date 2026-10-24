@@ -542,6 +542,7 @@ async fn run_work(
                 approval: None,
                 approval_resolver: None,
                 runtime_adapter: Some(ToolLoopRuntimeAdapter {
+                    verify_unexecuted_reply: false,
                     provider_trace: Some(Arc::clone(&retained)),
                     events: None,
                     stream_provider: false,

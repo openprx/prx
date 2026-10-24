@@ -13,6 +13,7 @@ pub(crate) mod document_ingest;
 pub(crate) mod embedded_source;
 pub(crate) mod entry;
 pub(crate) mod execution_policy;
+mod execution_requirement;
 pub(crate) mod history;
 pub mod idle;
 pub mod memory_loader;

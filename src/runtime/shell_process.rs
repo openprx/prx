@@ -66,9 +66,25 @@ pub struct ShellProcessOutcome {
     pub stderr_truncated: bool,
 }
 
+/// Captured bytes remain available even when process execution is interrupted.
+#[derive(Debug)]
+pub struct ShellPartialOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub complete: bool,
+}
+
 /// Failures owned by the process adapter rather than caller policy.
 #[derive(Debug, thiserror::Error)]
 pub enum ShellProcessError {
+    #[error("{reason}")]
+    Interrupted {
+        #[source]
+        reason: Box<Self>,
+        output: Box<ShellPartialOutput>,
+    },
     #[error("failed to build runtime command: {0}")]
     Runtime(#[source] anyhow::Error),
     #[error("failed to spawn command: {0}")]
@@ -88,6 +104,15 @@ pub enum ShellProcessError {
          repository's configuration names"
     )]
     GitRefused,
+}
+
+impl ShellProcessError {
+    fn without_output(self) -> Self {
+        match self {
+            Self::Interrupted { reason, .. } => reason.without_output(),
+            error => error,
+        }
+    }
 }
 
 /// Reusable process adapter shared by interactive shell, cron, and Xin.
@@ -123,6 +148,16 @@ impl ShellProcessAdapter {
     }
 
     pub async fn execute(&self, request: ShellProcessRequest<'_>) -> Result<ShellProcessOutcome, ShellProcessError> {
+        self.execute_with(request, false)
+            .await
+            .map_err(ShellProcessError::without_output)
+    }
+
+    /// Retain partial output on interruption for the execution-service result.
+    pub async fn execute_observed(
+        &self,
+        request: ShellProcessRequest<'_>,
+    ) -> Result<ShellProcessOutcome, ShellProcessError> {
         self.execute_with(request, false).await
     }
 
@@ -143,7 +178,9 @@ impl ShellProcessAdapter {
         &self,
         request: ShellProcessRequest<'_>,
     ) -> Result<ShellProcessOutcome, ShellProcessError> {
-        self.execute_with(request, true).await
+        self.execute_with(request, true)
+            .await
+            .map_err(ShellProcessError::without_output)
     }
 
     async fn execute_with(
@@ -226,13 +263,16 @@ impl ShellProcessAdapter {
         }
 
         let mut process = spawn_managed_shell_child(command).map_err(ShellProcessError::Spawn)?;
+        let captures = OutputCaptures::default();
         let stdout_task = spawn_output_drain(
             process.take_stdout(),
+            Arc::clone(&captures.stdout),
             #[cfg(test)]
             Arc::clone(&self.active_output_readers),
         );
         let stderr_task = spawn_output_drain(
             process.take_stderr(),
+            Arc::clone(&captures.stderr),
             #[cfg(test)]
             Arc::clone(&self.active_output_readers),
         );
@@ -247,21 +287,21 @@ impl ShellProcessAdapter {
             biased;
             () = &mut cancellation => {
                 let reaped = process.terminate_and_reap().await;
-                finish_drains_after_kill(&mut drains).await;
+                let complete = finish_drains_after_kill(&mut drains).await;
                 drain_guard.disarm();
                 if reaped {
                     process.mark_complete();
                 }
-                return Err(ShellProcessError::Cancelled);
+                return Err(captures.interrupted(ShellProcessError::Cancelled, complete));
             }
             timeout = &mut deadline => {
                 let reaped = process.terminate_and_reap().await;
-                finish_drains_after_kill(&mut drains).await;
+                let complete = finish_drains_after_kill(&mut drains).await;
                 drain_guard.disarm();
                 if reaped {
                     process.mark_complete();
                 }
-                return Err(ShellProcessError::Timeout(timeout));
+                return Err(captures.interrupted(ShellProcessError::Timeout(timeout), complete));
             }
             status = process.wait() => status.map_err(ShellProcessError::Wait)?,
         };
@@ -277,7 +317,7 @@ impl ShellProcessAdapter {
         }
 
         enum DrainResult {
-            Complete(Result<io::Result<(CapturedOutput, CapturedOutput)>, tokio::task::JoinError>),
+            Complete(Result<io::Result<()>, tokio::task::JoinError>),
             Cancelled,
             TimedOut(Duration),
         }
@@ -287,7 +327,7 @@ impl ShellProcessAdapter {
             timeout = &mut deadline => DrainResult::TimedOut(timeout),
             output = &mut drains => DrainResult::Complete(output),
         };
-        let (stdout, stderr) = match drain_result {
+        match drain_result {
             DrainResult::Complete(output) => {
                 drain_guard.disarm();
                 let output = output.map_err(|error| ShellProcessError::Output(io::Error::other(error)))?;
@@ -295,27 +335,27 @@ impl ShellProcessAdapter {
             }
             DrainResult::Cancelled => {
                 let reaped = process.terminate_and_reap().await;
-                finish_drains_after_kill(&mut drains).await;
+                let complete = finish_drains_after_kill(&mut drains).await;
                 drain_guard.disarm();
                 if reaped {
                     process.mark_complete();
                 }
-                return Err(ShellProcessError::Cancelled);
+                return Err(captures.interrupted(ShellProcessError::Cancelled, complete));
             }
             DrainResult::TimedOut(timeout) => {
                 let reaped = process.terminate_and_reap().await;
-                finish_drains_after_kill(&mut drains).await;
+                let complete = finish_drains_after_kill(&mut drains).await;
                 drain_guard.disarm();
                 if reaped {
                     process.mark_complete();
                 }
-                return Err(ShellProcessError::Timeout(timeout));
+                return Err(captures.interrupted(ShellProcessError::Timeout(timeout), complete));
             }
         };
         process.mark_complete();
 
-        let (stdout, stdout_truncated) = stdout.into_string();
-        let (stderr, stderr_truncated) = stderr.into_string();
+        let (stdout, stdout_truncated) = captures.take_stdout().into_string();
+        let (stderr, stderr_truncated) = captures.take_stderr().into_string();
         Ok(ShellProcessOutcome {
             status,
             stdout,
@@ -394,6 +434,7 @@ async fn wait_for_timeout(timeout: Option<Duration>) -> Duration {
     }
 }
 
+#[derive(Default)]
 struct CapturedOutput {
     bytes: Vec<u8>,
     truncated: bool,
@@ -412,39 +453,67 @@ impl CapturedOutput {
     }
 }
 
+#[derive(Default)]
+struct OutputCaptures {
+    stdout: Arc<parking_lot::Mutex<CapturedOutput>>,
+    stderr: Arc<parking_lot::Mutex<CapturedOutput>>,
+}
+
+impl OutputCaptures {
+    fn take_stdout(&self) -> CapturedOutput {
+        std::mem::take(&mut *self.stdout.lock())
+    }
+    fn take_stderr(&self) -> CapturedOutput {
+        std::mem::take(&mut *self.stderr.lock())
+    }
+
+    fn interrupted(&self, reason: ShellProcessError, complete: bool) -> ShellProcessError {
+        let (stdout, stdout_truncated) = self.take_stdout().into_string();
+        let (stderr, stderr_truncated) = self.take_stderr().into_string();
+        ShellProcessError::Interrupted {
+            reason: Box::new(reason),
+            output: Box::new(ShellPartialOutput {
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+                complete,
+            }),
+        }
+    }
+}
+
 fn spawn_output_drain<R>(
     stream: Option<R>,
+    captured: Arc<parking_lot::Mutex<CapturedOutput>>,
     #[cfg(test)] active_readers: Arc<AtomicUsize>,
-) -> JoinHandle<io::Result<CapturedOutput>>
+) -> JoinHandle<io::Result<()>>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         let Some(mut stream) = stream else {
-            return Ok(CapturedOutput {
-                bytes: Vec::new(),
-                truncated: false,
-            });
+            return Ok(());
         };
         #[cfg(test)]
         let _active_reader = ActiveOutputReaderGuard::new(active_readers);
-        let mut bytes = Vec::with_capacity(MAX_SHELL_OUTPUT_BYTES);
         let mut buffer = [0_u8; 8192];
-        let mut truncated = false;
         loop {
             let count = stream.read(&mut buffer).await?;
             if count == 0 {
                 break;
             }
-            let remaining = MAX_SHELL_OUTPUT_BYTES.saturating_sub(bytes.len());
+            // Only bounded byte copying holds the lock; no await or decoding.
+            let mut captured = captured.lock();
+            let remaining = MAX_SHELL_OUTPUT_BYTES.saturating_sub(captured.bytes.len());
             let retained = remaining.min(count);
-            let retained_bytes = buffer
+            let bytes = buffer
                 .get(..retained)
                 .ok_or_else(|| io::Error::other("captured output slice exceeded read buffer"))?;
-            bytes.extend_from_slice(retained_bytes);
-            truncated |= retained < count;
+            captured.bytes.extend_from_slice(bytes);
+            captured.truncated |= retained < count;
         }
-        Ok(CapturedOutput { bytes, truncated })
+        Ok(())
     })
 }
 
@@ -467,22 +536,19 @@ impl Drop for ActiveOutputReaderGuard {
 }
 
 struct OutputDrainTasks {
-    stdout: Option<JoinHandle<io::Result<CapturedOutput>>>,
-    stderr: Option<JoinHandle<io::Result<CapturedOutput>>>,
+    stdout: Option<JoinHandle<io::Result<()>>>,
+    stderr: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl OutputDrainTasks {
-    const fn new(
-        stdout: JoinHandle<io::Result<CapturedOutput>>,
-        stderr: JoinHandle<io::Result<CapturedOutput>>,
-    ) -> Self {
+    const fn new(stdout: JoinHandle<io::Result<()>>, stderr: JoinHandle<io::Result<()>>) -> Self {
         Self {
             stdout: Some(stdout),
             stderr: Some(stderr),
         }
     }
 
-    async fn join(mut self) -> io::Result<(CapturedOutput, CapturedOutput)> {
+    async fn join(mut self) -> io::Result<()> {
         let stdout = self
             .stdout
             .as_mut()
@@ -496,7 +562,7 @@ impl OutputDrainTasks {
             self.stdout.take();
             self.stderr.take();
         }
-        output
+        output.map(|_| ())
     }
 }
 
@@ -511,17 +577,19 @@ impl Drop for OutputDrainTasks {
     }
 }
 
-async fn join_output_drain(task: &mut JoinHandle<io::Result<CapturedOutput>>) -> io::Result<CapturedOutput> {
+async fn join_output_drain(task: &mut JoinHandle<io::Result<()>>) -> io::Result<()> {
     task.await.map_err(io::Error::other)?
 }
 
-async fn finish_drains_after_kill(drains: &mut JoinHandle<io::Result<(CapturedOutput, CapturedOutput)>>) {
-    if tokio::time::timeout(OUTPUT_DRAIN_KILL_GRACE, &mut *drains)
-        .await
-        .is_err()
-    {
-        drains.abort();
-        let _ = drains.await;
+async fn finish_drains_after_kill(drains: &mut JoinHandle<io::Result<()>>) -> bool {
+    match tokio::time::timeout(OUTPUT_DRAIN_KILL_GRACE, &mut *drains).await {
+        Ok(Ok(Ok(()))) => true,
+        Ok(_) => false,
+        Err(_) => {
+            drains.abort();
+            let _ = drains.await;
+            false
+        }
     }
 }
 
@@ -1302,5 +1370,27 @@ mod tests {
         execution.abort();
         let _ = execution.await;
         wait_until_process_gone(pid).await;
+    }
+    #[tokio::test]
+    async fn observed_timeout_preserves_both_streams_and_marks_process_interruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = adapter()
+            .execute_observed(ShellProcessRequest {
+                command: "printf timeout_stdout; printf timeout_stderr >&2; sleep 30",
+                workspace_dir: temp.path(),
+                timeout: Some(Duration::from_secs(1)),
+                cancellation: None,
+                git: ShellGitPolicy::RefuseGit,
+            })
+            .await;
+        let Err(ShellProcessError::Interrupted { reason, output }) = result else {
+            panic!("expected an observed process interruption");
+        };
+        assert!(matches!(*reason, ShellProcessError::Timeout(_)));
+        assert_eq!(output.stdout, "timeout_stdout");
+        assert_eq!(output.stderr, "timeout_stderr");
+        assert!(output.complete);
+        assert!(!output.stdout_truncated);
+        assert!(!output.stderr_truncated);
     }
 }

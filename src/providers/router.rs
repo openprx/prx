@@ -368,6 +368,9 @@ impl Provider for RouterProvider {
 #[cfg(any(test, feature = "test-mock"))]
 pub(crate) struct MockEnvProvider {
     response: String,
+    /// Scripted verdict for the separate no-result assessment request. This is
+    /// fixture data, not a semantic classifier; it exists only in test/mock builds.
+    execution_assessment: String,
     /// 5a-6: when `OPENPRX_MOCK_TOOL_CALL=name:args_json` is set, the first streaming call
     /// emits a `ToolCallChunk`(name, args) and later calls return the `response` text.
     /// This lets PTY E2E verify the driver's full tool turn loop (call → execute → continue → final).
@@ -572,6 +575,8 @@ impl MockEnvProvider {
             .filter(|value| !value.is_empty());
         Self {
             response,
+            execution_assessment: std::env::var("OPENPRX_MOCK_EXECUTION_ASSESSMENT")
+                .unwrap_or_else(|_| r#"{"requirement":"informational"}"#.to_string()),
             tool_call_spec,
             call_counter: Arc::new(AtomicUsize::new(0)),
             script,
@@ -629,6 +634,25 @@ impl Provider for MockEnvProvider {
     /// executable surface): answer it with that call, like a model would. Any
     /// other request keeps the plain text outcome.
     async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
+        // The assessment is a distinct request, so it must not consume the
+        // reply sentinel or advance the tool/stream script's counter.
+        if request.tools.is_none()
+            && request.messages.first().is_some_and(|message| {
+                message.role == "system"
+                    && message
+                        .content
+                        .starts_with("Classify the execution requirement of the CURRENT user request")
+            })
+        {
+            if let Some(error) = &self.error {
+                anyhow::bail!("{error}");
+            }
+            return Ok(ChatResponse {
+                text: Some(self.execution_assessment.clone()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            });
+        }
         if let (Some(spec), Some([offered])) = (self.tool_call_spec.as_ref(), request.tools)
             && offered.name == spec.name
         {

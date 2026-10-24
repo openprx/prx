@@ -16,14 +16,13 @@ use crate::agent::execution_policy::{
 };
 use crate::agent::tool_call_parser::ParsedToolCall;
 use crate::agent::tool_result_recording::ToolResultRecorder;
-use crate::agent::tool_result_recording::tool_result_is_success;
 use crate::agent::turn_contracts::{ApprovalDecision, ApprovalResolver, ChatMode, ScopeContext};
 use crate::agent::turn_tests::{DelayTool, RecordingTool, scheduler_test_adapter};
 use crate::approval::ApprovalManager;
 #[cfg(test)]
 use crate::approval::ApprovalResponse;
 use crate::observability::{NoopObserver, Observer, ObserverEvent};
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolResult};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -165,7 +164,10 @@ async fn production_scheduler_prioritizes_foreground_tools() {
     )
     .await;
 
-    assert_eq!(results, vec!["sessions_spawn", "file_read"]);
+    assert_eq!(
+        results.iter().map(|result| result.content.as_str()).collect::<Vec<_>>(),
+        vec!["sessions_spawn", "file_read"]
+    );
     let observed_order = execution_order
         .lock()
         .expect("execution order lock should be valid")
@@ -240,9 +242,11 @@ async fn supervised_act_tool_without_approval_manager_is_denied_not_executed() {
     .expect("production scheduler should return a failed tool result, not an execution error");
 
     assert!(
-        results[0].contains("approval required but no approval resolver is available"),
-        "expected fail-closed approval denial, got: {}",
         results[0]
+            .content
+            .contains("approval required but no approval resolver is available"),
+        "expected fail-closed approval denial, got: {}",
+        results[0].content
     );
     assert!(
         execution_order
@@ -279,7 +283,10 @@ async fn default_full_policy_executes_installed_act_tool_without_approval_manage
     let calls = single_call("delegate", serde_json::json!({}));
     let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
 
-    assert_eq!(results, vec!["delegate"]);
+    assert_eq!(
+        results.iter().map(|result| result.content.as_str()).collect::<Vec<_>>(),
+        vec!["delegate"]
+    );
     assert_eq!(
         execution_order
             .lock()
@@ -312,7 +319,10 @@ async fn supervised_read_only_tool_without_approval_manager_still_executes() {
     let calls = single_call("file_read", serde_json::json!({}));
     let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
 
-    assert_eq!(results, vec!["file_read"]);
+    assert_eq!(
+        results.iter().map(|result| result.content.as_str()).collect::<Vec<_>>(),
+        vec!["file_read"]
+    );
     assert_eq!(
         execution_order
             .lock()
@@ -353,7 +363,10 @@ async fn supervised_session_allowlisted_act_tool_executes_without_reprompt() {
     let calls = single_call("delegate", serde_json::json!({}));
     let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
 
-    assert_eq!(results, vec!["delegate"]);
+    assert_eq!(
+        results.iter().map(|result| result.content.as_str()).collect::<Vec<_>>(),
+        vec!["delegate"]
+    );
     assert_eq!(
         execution_order
             .lock()
@@ -412,7 +425,7 @@ async fn run_through_production_scheduler(
     adapter: &ToolLoopRuntimeAdapter,
     schedule: ReadOnlyToolScheduleConfig,
     chat_mode: ChatMode,
-) -> Vec<String> {
+) -> Vec<crate::agent::tool_result_recording::ObservedToolResult> {
     let recorder = ToolResultRecorder::new(calls.len());
     execute_tools_with_service(calls, &[], adapter, schedule, None, chat_mode, &NoopObserver, &recorder)
         .await
@@ -473,7 +486,7 @@ async fn run_supervised_act_call_with_approval(resolver: Option<Arc<dyn Approval
         .lock()
         .expect("execution order lock should be valid")
         .clone();
-    (results.remove(0), executed)
+    (results.remove(0).content, executed)
 }
 
 #[tokio::test]
@@ -569,7 +582,7 @@ async fn run_single_tool_through_scheduler(
     .await
     .expect("scheduler should complete without error");
     assert_eq!(results.len(), 1, "one call in, one result out");
-    results.remove(0)
+    results.remove(0).content
 }
 
 /// Core evidence for the timeout/concurrency decoupling.
@@ -727,8 +740,14 @@ async fn production_scheduler_applies_barrier_for_shared_resource_tools() {
         run_through_production_scheduler(&first_calls, &adapter, unlimited_schedule(1), ChatMode::default()),
         run_through_production_scheduler(&second_calls, &adapter, unlimited_schedule(1), ChatMode::default()),
     );
-    assert_eq!(first, vec!["ok:A"]);
-    assert_eq!(second, vec!["ok:B"]);
+    assert_eq!(
+        first.iter().map(|result| result.content.as_str()).collect::<Vec<_>>(),
+        vec!["ok:A"]
+    );
+    assert_eq!(
+        second.iter().map(|result| result.content.as_str()).collect::<Vec<_>>(),
+        vec!["ok:B"]
+    );
     assert_eq!(
         max_active.load(Ordering::SeqCst),
         1,
@@ -786,9 +805,10 @@ async fn production_scheduler_refuses_a_tool_when_its_shared_resource_barrier_ti
     assert_eq!(results.len(), 1);
     assert!(
         results[0]
+            .content
             .contains("could not acquire shared-resource barrier 'runtime_config' within 60s; tool was not executed"),
         "result: {}",
-        results[0]
+        results[0].content
     );
     assert!(
         execution_order
@@ -810,7 +830,7 @@ async fn production_scheduler_rejects_action_specific_schema_errors_before_side_
     let adapter = scheduler_test_adapter(tools_registry, &ledger_dir);
     let calls = single_call("conditional_schema", serde_json::json!({"action": "write"}));
     let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
-    let result = &results[0];
+    let result = &results[0].content;
 
     assert!(result.contains("$.content is required"), "{result}");
     assert!(result.contains("Read the tool schema and retry"), "{result}");
@@ -849,7 +869,7 @@ async fn production_scheduler_in_plan_mode_intercepts_write_tools() {
     let started = std::time::Instant::now();
     let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::Plan).await;
     let elapsed = started.elapsed();
-    let result = &results[0];
+    let result = &results[0].content;
 
     assert!(
         result.starts_with("[plan mode] would call file_write"),
@@ -884,7 +904,7 @@ async fn production_scheduler_in_plan_mode_allows_read_tools() {
     let adapter = scheduler_test_adapter(tools_registry, &ledger_dir);
     let calls = single_call("file_read", serde_json::json!({"value": "x"}));
     let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::Plan).await;
-    let result = &results[0];
+    let result = &results[0].content;
 
     assert!(
         !result.starts_with("[plan mode]"),
@@ -912,7 +932,7 @@ async fn production_scheduler_in_edit_mode_runs_write_tools_normally() {
     let adapter = scheduler_test_adapter(tools_registry, &ledger_dir);
     let calls = single_call("file_write", serde_json::json!({"value": "y"}));
     let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::Edit).await;
-    let result = &results[0];
+    let result = &results[0].content;
 
     assert!(
         !result.starts_with("[plan mode]"),
@@ -940,7 +960,7 @@ async fn production_scheduler_in_auto_mode_runs_write_tools_normally() {
     let adapter = scheduler_test_adapter(tools_registry, &ledger_dir);
     let calls = single_call("shell", serde_json::json!({"value": "echo hi"}));
     let results = run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::Auto).await;
-    let result = &results[0];
+    let result = &results[0].content;
 
     assert!(
         !result.starts_with("[plan mode]"),
@@ -1015,12 +1035,13 @@ async fn a_failed_tool_with_empty_output_reports_its_reason_to_the_model() {
     .expect("scheduler should complete without error");
 
     assert_eq!(executions.load(Ordering::SeqCst), 1);
-    assert!(results[0].starts_with("Error: "), "{}", results[0]);
-    assert!(results[0].contains("Path not allowed: /etc/shadow"), "{}", results[0]);
+    assert!(results[0].content.starts_with("Error: "), "{}", results[0].content);
     assert!(
-        !tool_result_is_success(&results[0]),
-        "a failure must not read as a success"
+        results[0].content.contains("Path not allowed: /etc/shadow"),
+        "{}",
+        results[0].content
     );
+    assert!(!results[0].succeeded(), "a failure must not read as a success");
 }
 
 /// Live path: under read-only autonomy an act tool is denied by the policy
@@ -1077,6 +1098,7 @@ async fn read_only_autonomy_denies_an_act_tool_before_approval_or_execution() {
     )
     .with_idempotency_memory(ledger);
     let adapter = ToolLoopRuntimeAdapter {
+        verify_unexecuted_reply: false,
         provider_trace: None,
         events: None,
         stream_provider: false,
@@ -1102,7 +1124,11 @@ async fn read_only_autonomy_denies_an_act_tool_before_approval_or_execution() {
     .await
     .expect("scheduler should complete without error");
 
-    assert!(results[0].starts_with("Error: "), "a denial result: {}", results[0]);
+    assert!(
+        results[0].content.starts_with("Error: "),
+        "a denial result: {}",
+        results[0].content
+    );
     assert!(
         execution_order
             .lock()
@@ -1216,9 +1242,9 @@ async fn always_allowlisting_never_approves_a_grant_bound_lifecycle_call() {
         let results =
             run_through_production_scheduler(&calls, &adapter, unlimited_schedule(1), ChatMode::default()).await;
         assert!(
-            results[0].contains("Denied by user"),
+            results[0].content.contains("Denied by user"),
             "the allowlist must not approve the import of {revision}: {}",
-            results[0]
+            results[0].content
         );
     }
     assert_eq!(
@@ -1231,10 +1257,108 @@ async fn always_allowlisting_never_approves_a_grant_bound_lifecycle_call() {
     // A read of the same tool needs no approval at all.
     let status = single_call("skills_manage", serde_json::json!({"action": "lifecycle_status"}));
     let results = run_through_production_scheduler(&status, &adapter, unlimited_schedule(1), ChatMode::default()).await;
-    assert_eq!(results[0], "ran");
+    assert_eq!(results[0].content, "ran");
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
 }
 
 #[path = "tool_scheduler/tracing_context.rs"]
 mod tracing_context;
+
+struct StatusTextTool {
+    process_started: Option<bool>,
+    success: bool,
+    output: &'static str,
+}
+
+#[async_trait]
+impl Tool for StatusTextTool {
+    fn name(&self) -> &str {
+        "file_read"
+    }
+    fn description(&self) -> &str {
+        "Returns arbitrary file content"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object"})
+    }
+    async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+        Ok(ToolResult {
+            success: self.success,
+            output: self.output.to_string(),
+            error: None,
+        })
+    }
+    async fn execute_named_observed(
+        &self,
+        _name: &str,
+        args: serde_json::Value,
+        _cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<crate::tools::traits::ToolInvocationResult> {
+        Ok(crate::tools::traits::ToolInvocationResult {
+            result: self.execute(args).await?,
+            process: self.process_started.map(|started| {
+                Box::new(crate::tools::traits::ProcessExecutionDetails {
+                    termination: if started {
+                        crate::tools::traits::ProcessTermination::Exited
+                    } else {
+                        crate::tools::traits::ProcessTermination::NotStarted
+                    },
+                    started,
+                    output_complete: true,
+                    diagnostic: None,
+                    exit_code: started.then_some(if self.success { 0 } else { 7 }),
+                    signal: None,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                })
+            }),
+        })
+    }
+}
+
+#[tokio::test]
+async fn scheduler_uses_typed_status_and_counts_executed_failures() {
+    let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
+    for (success, output, process_started, expected_executed) in [
+        (true, "Error is a word in this file", None, true),
+        (true, "Denied is another word", None, true),
+        (false, "legacy refusal", None, false),
+        (false, "partial output", Some(true), true),
+        (false, "not started", Some(false), false),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let adapter = scheduler_test_adapter(
+            vec![Box::new(StatusTextTool {
+                process_started,
+                success,
+                output,
+            })],
+            &temp,
+        );
+        let results = run_through_production_scheduler(
+            &single_call("file_read", serde_json::json!({})),
+            &adapter,
+            unlimited_schedule(1),
+            ChatMode::Edit,
+        )
+        .await;
+        assert_eq!(results[0].succeeded(), success);
+        assert_eq!(
+            results[0].executed, expected_executed,
+            "process facts distinguish command failure from refusal"
+        );
+        assert!(results[0].content.contains(output));
+    }
+    let temp = TempDir::new().unwrap();
+    let adapter = scheduler_test_adapter(vec![], &temp);
+    let results = run_through_production_scheduler(
+        &single_call("missing_tool", serde_json::json!({})),
+        &adapter,
+        unlimited_schedule(1),
+        ChatMode::Edit,
+    )
+    .await;
+    assert!(!results[0].executed);
+    assert!(!results[0].succeeded());
+}

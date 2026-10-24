@@ -203,6 +203,7 @@ impl ChildSegmentTurn {
 
     pub(crate) fn adapter(&self) -> ToolLoopRuntimeAdapter {
         ToolLoopRuntimeAdapter {
+            verify_unexecuted_reply: false,
             provider_trace: Some(Arc::clone(&self.provider_trace)),
             events: None,
             stream_provider: false,

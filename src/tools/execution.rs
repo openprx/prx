@@ -104,6 +104,15 @@ pub trait ToolBackend: Send + Sync {
         arguments: serde_json::Value,
         cancellation: Option<CancellationToken>,
     ) -> anyhow::Result<ToolResult>;
+
+    async fn invoke_observed(
+        &self,
+        public_name: &str,
+        arguments: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<super::traits::ToolInvocationResult> {
+        self.invoke(public_name, arguments, cancellation).await.map(Into::into)
+    }
 }
 
 /// Compatibility adapter for the existing native and MCP [`Tool`] registry.
@@ -130,6 +139,18 @@ impl SharedRegistryToolAdapter {
 
 #[async_trait]
 impl ToolBackend for SharedRegistryToolAdapter {
+    async fn invoke_observed(
+        &self,
+        public_name: &str,
+        arguments: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<super::traits::ToolInvocationResult> {
+        self.tool()
+            .ok_or_else(|| anyhow::anyhow!("shared tool is no longer registered"))?
+            .execute_named_observed(public_name, arguments, cancellation)
+            .await
+    }
+
     fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
         self.tool()?.execution_parameters_schema()
     }
@@ -237,6 +258,18 @@ impl LegacyToolAdapter {
 
 #[async_trait]
 impl ToolBackend for LegacyToolAdapter {
+    async fn invoke_observed(
+        &self,
+        public_name: &str,
+        arguments: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<super::traits::ToolInvocationResult> {
+        self.tool
+            .as_ref()
+            .execute_named_observed(public_name, arguments, cancellation)
+            .await
+    }
+
     fn execution_parameters_schema(&self) -> Option<Arc<serde_json::Value>> {
         self.tool.execution_parameters_schema()
     }
@@ -1166,6 +1199,8 @@ pub struct ToolExecutionOutcome {
     pub status: ToolExecutionStatus,
     pub model_content: String,
     pub result: Option<ToolResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<Box<super::traits::ProcessExecutionDetails>>,
     pub error: Option<String>,
     pub preparation: Option<ToolExecutionPermit>,
     pub duration_ms: u64,
@@ -2928,7 +2963,7 @@ impl ToolExecutionService {
                                     crate::tools::schema::with_execution_contract(
                                         execution_parameters,
                                         schema_dialect,
-                                        backend.invoke(public_name, arguments, backend_cancellation),
+                                        backend.invoke_observed(public_name, arguments, backend_cancellation),
                                     ),
                                 )
                                 .await
@@ -2998,7 +3033,12 @@ impl ToolExecutionService {
         } else {
             None
         };
-        let outcome = match (raw_result, abandonment_error) {
+        let (raw_result, process) = match raw_result {
+            Some(Ok(observed)) => (Some(Ok(observed.result)), observed.process),
+            Some(Err(error)) => (Some(Err(error)), None),
+            None => (None, None),
+        };
+        let mut outcome = match (raw_result, abandonment_error) {
             (None, Some(error)) => self.finish(
                 &command,
                 &context,
@@ -3025,19 +3065,26 @@ impl ToolExecutionService {
                 Some(preparation),
                 started,
             ),
-            (Some(Ok(result)), _) if is_tool_cancelled_result(&result) => self.finish(
-                &command,
-                &context,
-                input_sha256,
-                Some(descriptor),
-                Some(decision),
-                ToolExecutionStatus::Cancelled,
-                "Error: tool execution cancelled".to_string(),
-                Some(result),
-                Some("tool execution cancelled".to_string()),
-                Some(preparation),
-                started,
-            ),
+            (Some(Ok(result)), _)
+                if is_tool_cancelled_result(&result)
+                    || process
+                        .as_ref()
+                        .is_some_and(|process| process.termination == super::traits::ProcessTermination::Cancelled) =>
+            {
+                self.finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    Some(descriptor),
+                    Some(decision),
+                    ToolExecutionStatus::Cancelled,
+                    "Error: tool execution cancelled".to_string(),
+                    Some(result),
+                    Some("tool execution cancelled".to_string()),
+                    Some(preparation),
+                    started,
+                )
+            }
             (Some(Ok(result)), _) => {
                 let (status, model_content, error) = if result.success {
                     let model_content = match result.error.as_deref().filter(|error| !error.is_empty()) {
@@ -3046,7 +3093,15 @@ impl ToolExecutionService {
                     };
                     (ToolExecutionStatus::Succeeded, model_content, None)
                 } else {
-                    let error = result.error.clone().unwrap_or_else(|| result.output.clone());
+                    let error = process
+                        .as_ref()
+                        .map(|process| {
+                            process
+                                .diagnostic
+                                .clone()
+                                .unwrap_or_else(|| result.error.clone().unwrap_or_else(|| process.summary()))
+                        })
+                        .unwrap_or_else(|| result.error.clone().unwrap_or_else(|| result.output.clone()));
                     let hint = super::error_hints::recovery_hint(&command.name, &error);
                     let mut model_content = if hint.is_empty() {
                         format!("Error: {error}")
@@ -3112,6 +3167,18 @@ impl ToolExecutionService {
                 )
             }
         };
+        outcome.process = process;
+        if let (Some(process), Some(result)) = (&outcome.process, &outcome.result) {
+            outcome.model_content = process.render(result);
+            if !result.success {
+                let hint =
+                    super::error_hints::recovery_hint(&command.name, outcome.error.as_deref().unwrap_or_default());
+                if !hint.is_empty() {
+                    outcome.model_content.push('\n');
+                    outcome.model_content.push_str(&hint);
+                }
+            }
+        }
         if let Some(observation) = exact_call {
             observation.complete(outcome.status);
         }
@@ -3166,6 +3233,7 @@ impl ToolExecutionService {
             status,
             model_content,
             result,
+            process: None,
             error,
             preparation,
             duration_ms,

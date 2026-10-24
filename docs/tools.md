@@ -65,6 +65,51 @@ stricter environment, and operator cron/Xin jobs keep their existing policy.
 Environment filtering does not restrict which host files native shell commands
 can read, and does not change command authorization or process lifetime.
 
+## Shell execution results
+
+The execution service retains shell process facts separately from model text:
+whether a process started, its exit code or terminating signal, termination
+reason, output-drain completion, and per-stream truncation. Its model result
+labels stdout and stderr and renders the observed exit status. A nonzero exit
+still preserves both streams; stderr from a successful command is not discarded.
+The service keeps its existing succeeded/failed status contract, while downstream
+agent hooks read that typed status instead of interpreting output prefixes.
+For example, a successful file read beginning with `Error` is still successful.
+
+Cancellation retains the bytes already captured from both streams in the
+execution receipt and interrupted tool history. Output is explicitly marked
+incomplete if bounded draining cannot reach EOF. The cancellation remains a
+cancelled outcome, not a successful completion. Idempotent replay returns the
+same recorded process facts and output without rerunning the command.
+
+The process adapter shares output capture and cleanup with its existing
+execution paths. Legacy direct callers retain their error contract. No command
+deadline, interactive shell session, or permission setting is added by this
+result contract. These facts establish what executed; they do not establish
+that the user's whole task succeeded or validate arbitrary assistant prose.
+
+## Chat replies without tool results
+
+Tool-enabled `prx chat` checks a proposed final reply when the current turn has
+no tool results. The configured provider and model classify the current request
+as requiring execution, informational, or uncertain, using a strict JSON
+response. An execution requirement triggers one corrective tool round through
+the existing execution service. A second reply without any tool result, an
+invalid assessment, or an uncertain assessment ends with an explicit unverified
+error. Rejected drafts are not added to conversation history or streamed as
+final answers. Informational replies can finish without tools.
+
+This check adds one model request only to turns that would otherwise finish
+without tool results. Chat text is buffered until accepted; tool progress remains
+visible. Assessment usage is recorded. Plan mode and other hosts retain their
+existing behavior. A refusal remains a refusal and does not grant permission or
+force another attempt. Existing approval and sandbox rules are unchanged.
+
+The classification is a model prediction and can be wrong. A real tool result
+establishes that a tool responded; it does not prove that the correct action was
+chosen or that every completion claim is true. This check complements process
+receipts and task-specific acceptance checks rather than replacing them.
+
 ## Tool behavior
 
 `web_search_tool` uses DuckDuckGo by default. A non-200 response, bot challenge,

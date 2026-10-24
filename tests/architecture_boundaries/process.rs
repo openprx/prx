@@ -112,17 +112,24 @@ fn raw_child_process_spawns_are_explicitly_allowlisted() {
 
 #[test]
 fn shell_entrypoints_delegate_process_execution_to_shared_adapter() {
-    for (relative, entrypoint, execution_helper) in [
-        ("src/tools/shell.rs", "execute_inner", "execute_inner"),
+    for (relative, entrypoint, execution_helper, adapter_method) in [
+        (
+            "src/tools/shell.rs",
+            "execute_inner",
+            "execute_inner",
+            ".execute_observed(",
+        ),
         (
             "src/cron/scheduler.rs",
             "run_job_command",
             "run_job_command_with_adapter",
+            ".execute(",
         ),
         (
             "src/xin/runner.rs",
             "run_shell_with_cancellation",
             "run_shell_with_adapter",
+            ".execute(",
         ),
     ] {
         let source = fs::read_to_string(repository_root().join(relative))
@@ -137,7 +144,7 @@ fn shell_entrypoints_delegate_process_execution_to_shared_adapter() {
             );
         }
         assert!(
-            helper_body.contains(".execute(") && helper_body.contains("ShellProcessRequest"),
+            helper_body.contains(adapter_method) && helper_body.contains("ShellProcessRequest"),
             "{relative}::{execution_helper} must execute a ShellProcessRequest through ShellProcessAdapter"
         );
         let inspected_chain = format!("{entrypoint_body}\n{helper_body}");

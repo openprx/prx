@@ -106,14 +106,15 @@ fn both_gateway_launch_paths_register_their_tools_from_one_body() {
 
 /// Every method that runs a `Tool`.
 ///
-/// `Tool` declares exactly these four: `execute` and `execute_named` plus their
-/// cancellation twins (`src/tools/traits.rs`). The guard below recognises all of
+/// `Tool` declares execution and named execution, their cancellation twins,
+/// and the observed-result entry (`src/tools/traits.rs`). The guard recognises all of
 /// them, in every call form Rust offers, because the string the scanner misses
 /// is the bypass that ships.
 pub(super) const TOOL_EXECUTION_METHODS: &[&str] = &[
     "execute",
     "execute_named",
     "execute_named_with_cancellation",
+    "execute_named_observed",
     "execute_with_cancellation",
 ];
 
@@ -294,6 +295,31 @@ pub(super) const NON_TOOL_CLOSURE_PROVIDERS: &[(&str, &str, &str)] = &[
 /// the deduplicated entry name, which is the same blind spot as exempting a
 /// receiver by its name.
 pub(super) const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
+    (
+        "src/tools/execution.rs::invoke_observed",
+        2,
+        "the service adapters retain process facts after the same execution gates",
+    ),
+    (
+        "src/tools/traits.rs::execute_named_observed",
+        1,
+        "the observed default preserves the existing named cancellation dispatch",
+    ),
+    (
+        "src/tools/mod.rs::execute_named_observed",
+        1,
+        "the shared registry wrapper preserves observed results after service dispatch",
+    ),
+    (
+        "src/tools/delegate.rs::execute_named_observed",
+        1,
+        "the delegated alias preserves its name restriction and observed result",
+    ),
+    (
+        "src/tools/sessions_spawn/tool_proxy.rs::execute_named_observed",
+        1,
+        "the session proxy retains its argument rewrite and name gate while forwarding process facts",
+    ),
     (
         "src/chat/file_mention.rs::enrich_file_mentions_for_prompt",
         1,
@@ -569,15 +595,6 @@ pub(super) const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
         evidence: "fn apply_rls_context_raw<C: GenericClient>",
         reason: "binds the row-level-security context on a generic tokio-postgres client or \
                  transaction; the four calls are the four SET LOCAL statements",
-    },
-    NonToolCallSite {
-        entry: "src/tools/shell.rs::execute_inner",
-        receiver: "self.process",
-        occurrences: 1,
-        evidence_file: "src/tools/shell.rs",
-        evidence: "process: ShellProcessAdapter",
-        reason: "the shell tool's own child-process seam: this is the adapter call the shell \
-                 tool exists to make, not a second tool execution",
     },
     NonToolCallSite {
         entry: "src/tools/skills.rs::execute_resolved",

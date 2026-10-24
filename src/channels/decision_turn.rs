@@ -268,6 +268,7 @@ impl ChannelDecisionTurn {
             crate::tools::ToolExecutionContext::new(self.envelope.clone(), self.proof.policy_chat_type());
         execution.chat_id = self.envelope.recipient.clone().unwrap_or_default();
         crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+            verify_unexecuted_reply: false,
             provider_trace: Some(Arc::clone(&self.trace)),
             events: None,
             stream_provider: false,

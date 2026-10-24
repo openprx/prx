@@ -6,14 +6,26 @@ use crate::providers::{ChatMessage, ToolCall};
 use crate::util::truncate_with_ellipsis;
 use std::fmt::Write;
 
-/// True when a tool result string reports work that actually happened.
-///
-/// The executor renders refusals as `Denied ...` and failures as `Error ...`;
-/// everything else is a result the model may legitimately talk about. Single
-/// source of truth for both the hook payload's `success` flag and the
-/// fabricated-marker guard's "did this turn really run a tool" question.
-pub(crate) fn tool_result_is_success(result: &str) -> bool {
-    !(result.starts_with("Error") || result.starts_with("Denied"))
+/// Facts returned by the execution service, kept separate from model text.
+#[derive(Debug, Clone)]
+pub(super) struct ObservedToolResult {
+    pub content: String,
+    pub status: crate::tools::ToolExecutionStatus,
+    pub executed: bool,
+}
+
+impl ObservedToolResult {
+    pub(super) const fn not_executed(content: String, status: crate::tools::ToolExecutionStatus) -> Self {
+        Self {
+            content,
+            status,
+            executed: false,
+        }
+    }
+
+    pub(super) fn succeeded(&self) -> bool {
+        self.status == crate::tools::ToolExecutionStatus::Succeeded
+    }
 }
 
 /// Maximum inline characters allowed for a single tool result before it is

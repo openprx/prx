@@ -266,6 +266,14 @@ and the migration warnings below before upgrading.
 
 ### Fixed
 
+- Local v0.8.163 shell patch: retain typed process start, exit/signal, output
+  completion and truncation facts through tool wrappers, execution receipts,
+  cancellation and idempotent replay. Agent result handling uses typed status.
+- Tool-enabled Chat assesses final replies with no tool results, using the
+  configured model and one bounded corrective execution round. Invalid or
+  uncertain assessments fail explicitly. This prediction does not establish
+  task completion and does not change permission or sandbox policy.
+
 - Invalid saved model settings are dropped or clamped with diagnostics at
   runtime and remain readable in the Console for repair. Misspelled route keys
   are refused at load. Retired-model migration refuses changes that would

@@ -1,3 +1,4 @@
+use super::traits::{ProcessExecutionDetails, ProcessTermination, ToolInvocationResult};
 use super::traits::{TOOL_EXECUTION_CANCELLED, Tool, ToolCategory, ToolResult, ToolTier};
 use crate::runtime::RuntimeAdapter;
 use crate::runtime::shell_process::{
@@ -42,6 +43,7 @@ impl ShellTool {
 
     fn legacy_process_error_message(error: ShellProcessError) -> String {
         match error {
+            ShellProcessError::Interrupted { reason, .. } => Self::legacy_process_error_message(*reason),
             ShellProcessError::Cancelled => TOOL_EXECUTION_CANCELLED.to_string(),
             ShellProcessError::Timeout(timeout) => format!("Command timed out after {timeout:?} and was killed"),
             ShellProcessError::Runtime(error) => format!("Failed to build runtime command: {error}"),
@@ -52,18 +54,25 @@ impl ShellTool {
         }
     }
 
+    fn legacy_result(mut observed: ToolInvocationResult) -> ToolResult {
+        if let Some(diagnostic) = observed.process.and_then(|process| process.diagnostic) {
+            observed.result.error = Some(diagnostic);
+        }
+        observed.result
+    }
+
     async fn execute_inner(
         &self,
         args: serde_json::Value,
         cancellation: Option<CancellationToken>,
-    ) -> anyhow::Result<ToolResult> {
+    ) -> anyhow::Result<ToolInvocationResult> {
         let command = args
             .get("command")
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
         match self
             .process
-            .execute(ShellProcessRequest {
+            .execute_observed(ShellProcessRequest {
                 command,
                 workspace_dir: &self.workspace_dir,
                 timeout: None,
@@ -83,23 +92,79 @@ impl ShellTool {
                     output.stderr_truncated,
                     "\n... [stderr truncated at 1MB]",
                 );
-                Ok(ToolResult {
-                    success: output.status.success(),
-                    output: stdout,
-                    error: if stderr.is_empty() { None } else { Some(stderr) },
+                #[cfg(unix)]
+                let signal = {
+                    use std::os::unix::process::ExitStatusExt;
+                    output.status.signal()
+                };
+                #[cfg(not(unix))]
+                let signal = None;
+                Ok(ToolInvocationResult {
+                    process: Some(Box::new(ProcessExecutionDetails {
+                        termination: ProcessTermination::Exited,
+                        started: true,
+                        output_complete: true,
+                        diagnostic: None,
+                        exit_code: output.status.code(),
+                        signal,
+                        stdout_truncated: output.stdout_truncated,
+                        stderr_truncated: output.stderr_truncated,
+                    })),
+                    result: ToolResult {
+                        success: output.status.success(),
+                        output: stdout,
+                        error: if stderr.is_empty() { None } else { Some(stderr) },
+                    },
                 })
             }
-            Err(error) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(Self::legacy_process_error_message(error)),
-            }),
+            Err(error) => {
+                let (error, partial) = match error {
+                    ShellProcessError::Interrupted { reason, output } => (*reason, Some(output)),
+                    error => (error, None),
+                };
+                let termination = match &error {
+                    ShellProcessError::Cancelled => ProcessTermination::Cancelled,
+                    ShellProcessError::Timeout(_) => ProcessTermination::TimedOut,
+                    ShellProcessError::Wait(_) | ShellProcessError::Output(_) => ProcessTermination::Failed,
+                    _ => ProcessTermination::NotStarted,
+                };
+                let started =
+                    partial.is_some() || matches!(error, ShellProcessError::Wait(_) | ShellProcessError::Output(_));
+                let diagnostic = Self::legacy_process_error_message(error);
+                Ok(ToolInvocationResult {
+                    process: Some(Box::new(ProcessExecutionDetails {
+                        termination,
+                        started,
+                        output_complete: partial.as_ref().is_some_and(|output| output.complete),
+                        diagnostic: Some(diagnostic),
+                        exit_code: None,
+                        signal: None,
+                        stdout_truncated: partial.as_ref().is_some_and(|output| output.stdout_truncated),
+                        stderr_truncated: partial.as_ref().is_some_and(|output| output.stderr_truncated),
+                    })),
+                    result: ToolResult {
+                        success: false,
+                        output: partial.as_ref().map(|output| output.stdout.clone()).unwrap_or_default(),
+                        error: partial.map(|output| output.stderr).filter(|stderr| !stderr.is_empty()),
+                    },
+                })
+            }
         }
     }
 }
 
 #[async_trait]
 impl Tool for ShellTool {
+    async fn execute_named_observed(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<ToolInvocationResult> {
+        anyhow::ensure!(name == self.name(), "unsupported shell tool name");
+        self.execute_inner(args, cancellation).await
+    }
+
     fn name(&self) -> &str {
         "shell"
     }
@@ -122,7 +187,7 @@ impl Tool for ShellTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        self.execute_inner(args, None).await
+        self.execute_inner(args, None).await.map(Self::legacy_result)
     }
 
     async fn execute_with_cancellation(
@@ -130,7 +195,7 @@ impl Tool for ShellTool {
         args: serde_json::Value,
         cancellation: Option<CancellationToken>,
     ) -> anyhow::Result<ToolResult> {
-        self.execute_inner(args, cancellation).await
+        self.execute_inner(args, cancellation).await.map(Self::legacy_result)
     }
 
     fn tier(&self) -> ToolTier {

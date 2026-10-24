@@ -66,7 +66,7 @@ use crate::agent::tool_call_parser::{
 use crate::agent::tool_result_recording::INTERRUPTED_TOOL_RESULT;
 use crate::agent::tool_result_recording::{
     ExecutedToolRecords, MAX_TOOL_RESULT_INLINE_CHARS, ToolResultRecorder, compact_tool_result_for_history_with_status,
-    tool_result_inline_budget_for_history, tool_result_is_success,
+    tool_result_inline_budget_for_history,
 };
 use crate::agent::tool_scheduler::{
     ReadOnlyToolScheduleConfig, execute_tools_with_service, shared_unrecoverable_tool_error,
@@ -586,6 +586,10 @@ async fn run_turn_unguarded(
     // claims tool use (`[Used tools: ...]`) while this is still false is a
     // fabrication, and the only case worth spending a corrective retry on.
     let mut executed_any_tool_call = false;
+    let assessment_source = runtime_adapter.verify_unexecuted_reply.then(|| history.clone());
+    let mut observed_tool_results = false;
+    let mut execution_requirement = None;
+    let mut inject_execution_retry = false;
     let mut empty_response_retry_attempted = false;
     let mut inject_empty_response_retry_instruction = false;
 
@@ -821,6 +825,26 @@ async fn run_turn_unguarded(
         // wasted provider call. Appending at the tail leaves every cached byte
         // ahead of it untouched, and keeps the "exactly one system message, at
         // index 0" shape that strict chat templates require.
+        let verify_unexecuted_reply = runtime_adapter.verify_unexecuted_reply
+            && !chat_mode.intercepts_writes()
+            && !observed_tool_results
+            && !tool_specs.is_empty();
+        if inject_execution_retry {
+            append_corrective_aside(
+                &mut prepared_messages.messages,
+                super::execution_requirement::RETRY_MESSAGE,
+            );
+            if let Some(config) = compaction_config {
+                anyhow::ensure!(
+                    estimate_request_tokens(
+                        estimate_history_tokens_with_source(&prepared_messages.messages),
+                        tool_surface.native_payload.measurement
+                    ) <= config.max_context_tokens.saturating_sub(config.reserve_tokens),
+                    "execution correction exceeds the request budget; execution is unverified"
+                );
+            }
+            inject_execution_retry = false;
+        }
         if inject_tool_summary_retry_instruction {
             append_corrective_aside(&mut prepared_messages.messages, TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE);
             inject_tool_summary_retry_instruction = false;
@@ -1141,6 +1165,7 @@ async fn run_turn_unguarded(
                     temperature,
                     cancellation_token.as_ref(),
                     &runtime_adapter,
+                    !verify_unexecuted_reply,
                 ))
                 .await
         } else {
@@ -1617,6 +1642,143 @@ async fn run_turn_unguarded(
                     anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
                 }
             }
+            if verify_unexecuted_reply {
+                use super::execution_requirement::{ExecutionRequirement, assessment_messages, parse_assessment};
+                let requirement = if let Some(requirement) = execution_requirement {
+                    requirement
+                } else {
+                    // Keep the assessment and persistence future off the turn's
+                    // already large stack frame, including debug/PTY builds.
+                    let requirement = Box::pin(async {
+                    let budget = compaction_config.map_or(8192, |config| {
+                        config.max_context_tokens.saturating_sub(config.reserve_tokens)
+                    });
+                    let assessment = assessment_messages(assessment_source.as_deref().unwrap_or(history), budget)?;
+                    let observation = execution_adapter
+                        .tool_execution_context
+                        .execution_trace
+                        .as_ref()
+                        .map(|trace| trace.begin_provider())
+                        .transpose()?;
+                    if let Some(retained) = &runtime_adapter.provider_trace {
+                        retained.begin();
+                    }
+                    let assessment_started = Instant::now();
+                    observer.record_event(&ObserverEvent::LlmRequest {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        messages_count: assessment.len(),
+                    });
+                    hooks
+                        .emit(
+                            HookEvent::LlmRequest,
+                            serde_json::json!({
+                                "provider":provider_name, "model":model, "purpose":"execution_requirement",
+                                "messages_count":assessment.len(), "tool_count":0,
+                            }),
+                        )
+                        .await;
+                    let assessment_future = parameter_capture.scope(provider.chat_traced(
+                        ChatRequest {
+                            messages: &assessment,
+                            tools: None,
+                        },
+                        model,
+                        0.0,
+                    ));
+                    let assessment_result = if let Some(token) = cancellation_token.as_ref() {
+                        tokio::select! {
+                            () = token.cancelled() => {
+                                if let Some(observation) = observation { observation.cancelled(); }
+                                if let Some(retained) = &runtime_adapter.provider_trace { retained.failed(); }
+                                return Err(ToolLoopCancelled.into());
+                            }
+                            result = assessment_future => result,
+                        }
+                    } else {
+                        assessment_future.await
+                    };
+                    if let Some(observation) = observation {
+                        observation.finish(assessment_result.as_ref().ok().map(|trace| trace.attempts.as_slice()));
+                    }
+                    crate::agent::idle::beat(crate::agent::idle::ProgressKind::ProviderResponse);
+                    let duration = assessment_started.elapsed();
+                    let error_message = assessment_result.as_ref().err().map(ToString::to_string);
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        duration,
+                        success: assessment_result.is_ok(),
+                        error_message: error_message.clone(),
+                    });
+                    hooks.emit(HookEvent::LlmResponse, serde_json::json!({
+                        "provider":provider_name, "model":model, "purpose":"execution_requirement",
+                        "duration_ms":duration.as_millis(), "success":assessment_result.is_ok(), "error_message":error_message,
+                    })).await;
+                    if assessment_result.is_err()
+                        && let Some(retained) = &runtime_adapter.provider_trace
+                    {
+                        retained.failed();
+                    }
+                    let trace = assessment_result?;
+                    usage_accumulator.record(trace.tokens_used.clone());
+                    any_turn_had_fallback |=
+                        trace.attempts.len() > 1 || trace.final_provider != provider_name || trace.final_model != model;
+                    last_turn_trace
+                        .prepared_parameters
+                        .extend(parameter_capture.snapshot_from(last_turn_trace.prepared_parameters.len()));
+                    if let Some(retained) = &runtime_adapter.provider_trace {
+                        retained.completed(
+                            &last_turn_trace,
+                            usage_accumulator.finish(),
+                            any_turn_had_fallback,
+                            trace.tokens_used.is_reported()
+                                && trace.tokens_used.has_any_tokens()
+                                && !trace
+                                    .attempts
+                                    .iter()
+                                    .any(|attempt| attempt.status == crate::llm::route_decision::AttemptStatus::Failed),
+                        );
+                    }
+                    let requirement = parse_assessment(&trace.response)?;
+                    if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
+                        let payload = serde_json::json!({
+                            "requirement": format!("{requirement:?}"),
+                            "provider": crate::providers::redact_endpoint_userinfo(&trace.final_provider),
+                            "model": trace.final_model,
+                            "tool_results_observed": false,
+                        });
+                        if let Err(error) = fabric
+                            .record_runtime_event(
+                                scope.clone(),
+                                "turn.execution_requirement.assessed",
+                                "Execution requirement assessed".to_string(),
+                                Some(payload.to_string()),
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error, "Failed to record execution requirement assessment");
+                        }
+                    }
+                        Ok::<_, anyhow::Error>(requirement)
+                    }).await?;
+                    if requirement == ExecutionRequirement::ExecutionRequired {
+                        execution_requirement = Some(requirement);
+                        inject_execution_retry = true;
+                        continue;
+                    }
+                    requirement
+                };
+                match requirement {
+                    ExecutionRequirement::ExecutionRequired => anyhow::bail!(
+                        "request requires execution but no tool result was produced after one corrective retry; execution is unverified"
+                    ),
+                    ExecutionRequirement::Uncertain => {
+                        anyhow::bail!("execution requirement is uncertain; execution is unverified")
+                    }
+                    ExecutionRequirement::Informational => {}
+                }
+            }
             // One outbound middleware pass per accepted, delivered turn. Every
             // retry, repair and marker guard above has accepted this response,
             // and nothing below can replace it: the next statements stream it,
@@ -1654,6 +1816,9 @@ async fn run_turn_unguarded(
             }
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
+            if runtime_adapter.stream_provider && verify_unexecuted_reply {
+                emit_tool_loop_event(&runtime_adapter, ToolLoopEvent::TextDelta(display_text.clone())).await?;
+            }
             if let Some(ref tx) = on_delta {
                 // Semantic-boundary chunking: only flush after closed XML tags
                 // (`<...>`) or closed JSON objects/arrays. See
@@ -1865,6 +2030,7 @@ async fn run_turn_unguarded(
                 return Err(error);
             }
         };
+        observed_tool_results |= !individual_results.is_empty();
         let tools_elapsed_ms = tools_started_at.elapsed().as_millis() as u64;
 
         // Only a batch that actually produced a result counts as real tool use.
@@ -1872,7 +2038,7 @@ async fn run_turn_unguarded(
         // permission layer or the idempotency ledger did no work, so a later
         // `[Used tools: ...]` line is still provably fabricated and still worth
         // the one corrective retry.
-        if individual_results.iter().any(|result| tool_result_is_success(result)) {
+        if individual_results.iter().any(|result| result.executed) {
             executed_any_tool_call = true;
         }
 
@@ -1888,8 +2054,9 @@ async fn run_turn_unguarded(
         // tool result does. Built once per tool round and shared by the inline
         // caps and the mid-turn trim.
         let reserved_config = compaction_config.map(|config| reserve_request_tool_surface(config, tool_surface));
-        for (call, result) in tool_calls.iter().zip(individual_results.iter()) {
-            let success = tool_result_is_success(result);
+        for (call, outcome) in tool_calls.iter().zip(individual_results.iter()) {
+            let success = outcome.succeeded();
+            let result = &outcome.content;
             hooks
                 .emit(
                     HookEvent::ToolCall,
@@ -2001,7 +2168,7 @@ async fn run_turn_unguarded(
                 );
                 let truncated_result = compact_tool_result_for_history_with_status(
                     &native_call.name,
-                    result,
+                    &result.content,
                     max_inline_chars,
                     document_status,
                 );

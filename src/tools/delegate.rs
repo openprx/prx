@@ -1637,6 +1637,18 @@ impl ToolArcRef {
 
 #[async_trait]
 impl Tool for ToolArcRef {
+    async fn execute_named_observed(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<crate::tools::traits::ToolInvocationResult> {
+        if !self.supports_name(name) {
+            anyhow::bail!("Tool '{}' does not handle name '{name}'", self.name());
+        }
+        self.inner.execute_named_observed(name, args, cancellation).await
+    }
+
     fn live_hook_manager(&self) -> Option<Arc<HookManager>> {
         self.inner.live_hook_manager()
     }

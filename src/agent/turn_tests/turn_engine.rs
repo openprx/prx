@@ -3660,3 +3660,6 @@ fn q79_boxed_fixture_work<'a, F: std::future::Future + 'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + 'a>> {
     Box::pin(work)
 }
+
+#[path = "execution_grounding.rs"]
+mod execution_grounding;

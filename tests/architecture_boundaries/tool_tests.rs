@@ -698,6 +698,14 @@ fn the_scanner_reports_every_supported_tool_execution_form() {
     let forms: &[(&str, &str)] = &[
         ("method", "let result = tool.execute(args).await;"),
         (
+            "observed",
+            "let result = tool.execute_named_observed(name, args, None).await;",
+        ),
+        (
+            "observed UFCS",
+            "let result = Tool::execute_named_observed(&tool, name, args, None).await;",
+        ),
+        (
             "cancellation twin",
             "let result = tool.execute_with_cancellation(args, None).await;",
         ),

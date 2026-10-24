@@ -43,6 +43,7 @@ async fn delegation_task_retains_the_source_subscriber_after_its_scope_ends() ->
         DelegationExecutionTask::spawn(Box::pin(async {
             emit_task_marker();
             ToolExecutionOutcome {
+                process: None,
                 operation_id: "prx_observed_delegation".to_owned(),
                 descriptor: None,
                 decision: None,

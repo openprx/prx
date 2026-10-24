@@ -241,6 +241,15 @@ impl ArcDelegatingTool {
 
 #[async_trait]
 impl Tool for ArcDelegatingTool {
+    async fn execute_named_observed(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<crate::tools::traits::ToolInvocationResult> {
+        self.inner.execute_named_observed(name, args, cancellation).await
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }

@@ -2258,7 +2258,7 @@ fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
 #[serial(prx_chat_pty)]
 fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
     // 10 chunks * 100ms = 1s total, long enough for Ctrl+C to land mid-stream.
-    let script = r#"{"chunks":[{"delta":"g1 "},{"delta":"g2 "},{"delta":"g3 "},{"delta":"g4 "},{"delta":"g5 "},{"delta":"g6 "},{"delta":"g7 "},{"delta":"g8 "},{"delta":"g9 "},{"delta":"g10"},{"is_final":true}]}"#;
+    let script = r#"{"chunks":[{"reasoning":"CANCEL_STREAM_READY"},{"delta":"g2 "},{"delta":"g3 "},{"delta":"g4 "},{"delta":"g5 "},{"delta":"g6 "},{"delta":"g7 "},{"delta":"g8 "},{"delta":"g9 "},{"delta":"g10"},{"is_final":true}]}"#;
     let (mut sg, _guard) = spawn_chat(
         &[],
         &[
@@ -2272,7 +2272,9 @@ fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
     read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
     drain_with_dsr(session, Duration::from_millis(200));
     session.send("hi\r").expect("send hi");
-    read_until_with_dsr(session, "g1", TURN_TIMEOUT);
+    // Reasoning progress proves the stream started. Final-answer text is
+    // buffered until the no-result check accepts it, so it is not a cancel signal.
+    read_until_with_dsr(session, "CANCEL_STREAM_READY", TURN_TIMEOUT);
     session
         .send(expectrl::ControlCode::EndOfText)
         .expect("mid-stream Ctrl+C");
@@ -2771,4 +2773,39 @@ fn test_chat_re_enrols_by_itself_after_the_daemon_forgets_its_session() {
 
     session.send("/exit\r").expect("send /exit");
     assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat should exit cleanly");
+}
+
+/// A fabricated completion must not leak through either terminal delivery path.
+/// The fixture supplies a structured execution-required verdict and repeats the
+/// same final draft; the production loop must exhaust one correction and fail.
+#[test]
+#[serial(prx_chat_pty)]
+fn unexecuted_completion_is_not_delivered_in_plain_or_fullscreen_chat() {
+    for tui in ["0", "1"] {
+        let sentinel = "UNEXECUTED_COMPLETION_MUST_NOT_APPEAR";
+        let (mut sg, _guard) = spawn_chat(
+            &[],
+            &[
+                ("PRX_TUI", tui),
+                ("OPENPRX_MOCK_RESPONSE", sentinel),
+                (
+                    "OPENPRX_MOCK_EXECUTION_ASSESSMENT",
+                    r#"{"requirement":"execution_required"}"#,
+                ),
+            ],
+        );
+        let session = sg.session();
+        read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+        drain_with_dsr(session, Duration::from_millis(200));
+        session
+            .send("Use shell to run exactly printf ACTUAL_EXECUTION_REQUIRED and report its output.\r")
+            .expect("send actual execution request");
+        let captured = read_until_with_dsr(session, "unverified", TURN_TIMEOUT);
+        assert!(
+            !captured.contains(sentinel),
+            "rejected draft reached the terminal: {captured}"
+        );
+        session.send("/exit\r").expect("send /exit");
+        assert!(wait_for_exit(session, EXIT_TIMEOUT), "rejected turn must exit cleanly");
+    }
 }
