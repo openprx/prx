@@ -83,8 +83,14 @@ impl TurnDecisionPublication {
         let mcp = mcp_tool.as_ref();
         let mcp_snapshot = match mcp {
             Some(mcp) => {
-                // Synchronize local metadata without invoking a remote tool.
+                // Discover configured servers before pinning the catalog. The
+                // turn engine refreshes selected tools before exposing their
+                // schemas; deferring initial discovery until then would add
+                // aliases to the executor after this publication was sealed.
+                // Discovery only initializes servers and lists tools; it never
+                // invokes a remote tool.
                 mcp.refresh_catalog_config();
+                tools::Tool::refresh(mcp.as_ref()).await?;
                 mcp.capability_snapshot()
             }
             None => {

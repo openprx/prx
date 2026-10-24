@@ -11,6 +11,14 @@ can add Skill, MCP, and WASM aliases. MCP aliases remain in the discovery
 catalog and are resolved by exact name; the default MCP tool surface contains
 only `mcp_call`. Its schema does not enumerate configured servers or tools.
 
+Before publishing a root runtime's decision catalog, PRX completes initial MCP
+discovery for its configured servers. Startup can therefore wait for their
+initialization and tool-list timeouts; no remote tool is invoked by discovery.
+This pins discovered aliases and their bindings before the first selected-tool
+refresh. Unchanged servers reuse that discovery state. A later configuration or
+forced-discovery change still invalidates the old catalog; parity, policy, and
+approval checks remain enforced.
+
 | Category | Tools |
 |----------|-------|
 | **Capability discovery** | `capability_search` (source-authorized AnswerDirectly and Execute turns) |

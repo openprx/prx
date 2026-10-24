@@ -689,6 +689,9 @@ pub fn all_tools_with_runtime_ext_and_extensions(
 }
 
 #[cfg(test)]
+mod mcp_publication_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::indexing_slicing,
