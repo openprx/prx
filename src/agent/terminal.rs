@@ -2013,8 +2013,20 @@ mod tests {
             async move { finalize_turn(&fabric, commit, &cost_config, &workspace_dir).await }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+        // Wait for the actual durable event, not an assumed scheduler/SQLite
+        // latency. The ledger lock remains held throughout this observation.
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+                if events.iter().any(|event| event.event_type == "usage.settled") {
+                    break events;
+                }
+                assert!(!task.is_finished(), "finalization ended before usage was settled");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("usage must settle while the cost ledger is locked");
         assert_eq!(
             events
                 .iter()
@@ -2022,6 +2034,9 @@ mod tests {
                 .count(),
             1
         );
+        // A timer must still run on this single-thread runtime while the cost
+        // projection waits for the lock in the blocking pool.
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!cost_path.exists());
         assert!(!task.is_finished());
 
