@@ -159,7 +159,7 @@ async fn exercise_owned(f: &Fixture<'_>) {
             approval: None,
             approval_resolver: None,
             runtime_adapter: Some(ToolLoopRuntimeAdapter {
-                verify_unexecuted_reply: false,
+                verify_chat_completion: false,
                 provider_trace: Some(retained),
                 events: None,
                 stream_provider: false,

@@ -166,7 +166,7 @@ fn render_folded_tool_card_done_shows_hook_summary() {
     assert_eq!(lines.len(), 5, "done folded card renders header + summary + preview");
     assert!(
         line_to_plain(lines.first().expect("test: header")).starts_with("\u{25CF} Ran "),
-        "completed tool uses the same filled neutral marker as assistant output"
+        "completed tool keeps a textual success label and a filled marker"
     );
     let summary: String = lines
         .get(1)
@@ -182,7 +182,8 @@ fn render_folded_tool_card_done_shows_hook_summary() {
     assert_eq!(line_to_plain(lines.get(2).expect("test: preview line")), "    │ a");
     assert_eq!(line_to_plain(lines.get(3).expect("test: preview line")), "    │ b");
     assert_eq!(line_to_plain(lines.get(4).expect("test: preview line")), "    │ c");
-    assert_eq!(span_fg(&lines, 0, 0), Some(Color::DarkGray));
+    assert_eq!(span_fg(&lines, 0, 0), Some(Color::Green));
+    assert_eq!(span_fg(&lines, 0, 1), Some(Color::Green));
     assert_eq!(span_fg(&lines, 1, 0), Some(Color::DarkGray));
 }
 
@@ -370,7 +371,7 @@ fn render_tool_card_status_glyphs_and_colors() {
     assert_eq!(hook, "\u{2514}", "unicode branch └");
     assert_eq!(
         tool_status_marker(ToolStatus::Running, false),
-        ("\u{25CF}", Color::White)
+        ("\u{25CF}", Color::Cyan)
     );
     assert_eq!(tool_status_marker(ToolStatus::Done, false), ("\u{2713}", Color::Green));
     assert_eq!(tool_status_marker(ToolStatus::Error, false), ("\u{2717}", Color::Red));
@@ -575,4 +576,63 @@ fn total_content_lines_counts_folded_vs_expanded() {
         expanded_total > folded_total,
         "expanded card takes more rows: {expanded_total} vs {folded_total}"
     );
+}
+
+#[test]
+fn execution_status_colors_match_in_folded_expanded_and_ascii_cards() {
+    for ascii in [false, true] {
+        for folded in [false, true] {
+            for (status, label, color) in [
+                (ToolStatus::Running, "Running ", Color::Cyan),
+                (ToolStatus::Done, "Ran ", Color::Green),
+                (ToolStatus::Error, "Failed ", Color::Red),
+                (ToolStatus::Cancelled, "Cancelled ", Color::Yellow),
+            ] {
+                let mut lines = Vec::new();
+                render_tool_result(
+                    &mut lines,
+                    "shell",
+                    "",
+                    "{}",
+                    Some("result"),
+                    status,
+                    Some(4),
+                    folded,
+                    ascii,
+                );
+                assert_eq!(span_fg_for_content(&lines, label), Some(color));
+                assert_eq!(span_fg(&lines, 0, 0), Some(color));
+                if !folded && status != ToolStatus::Running {
+                    let result_label = match status {
+                        ToolStatus::Error => "error",
+                        ToolStatus::Cancelled => "cancelled",
+                        _ => "output",
+                    };
+                    assert_eq!(span_fg_for_content(&lines, result_label), Some(color));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn typed_status_notices_are_colored_but_ordinary_prose_is_not_classified() {
+    let cancelled = ConversationLine::system_notice("(cancelled)".into());
+    let mut lines = Vec::new();
+    render_conversation_line(&mut lines, &cancelled, false);
+    assert_eq!(span_fg(&lines, 0, 0), Some(Color::Yellow));
+    assert!(matches!(
+        ConversationLine::system_notice("Error: quoted fixture prose".into()),
+        ConversationLine::System { .. }
+    ));
+    for (label, color) in [
+        ("running", Color::Cyan),
+        ("completed", Color::Green),
+        ("failed", Color::Red),
+        ("cancelled", Color::Yellow),
+        ("needs-input", Color::Yellow),
+        ("awaiting-commit", Color::Yellow),
+    ] {
+        assert_eq!(super::super::status_style::session_color(label), color);
+    }
 }

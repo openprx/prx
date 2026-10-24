@@ -1,6 +1,7 @@
 use super::keys::{bottom_chrome_session_entries_with_workers, bottom_list_selection_index};
 use super::layout::{BOTTOM_CHROME_MIN_HEIGHT, BottomChromeView, fullscreen_bottom_chrome_height};
 use super::slash_menu::{SlashMenuEntry, SlashMenuState};
+use super::status_style;
 use super::views::{focus_active_entry_seq, switcher_entry_display_id};
 use super::{ConversationLine, ToolStatus};
 use crate::agent::turn_contracts::ChatMode;
@@ -200,13 +201,10 @@ pub(super) fn render_sessions_list_entry_line(
         text.push_str(&entry.title);
     }
     let text = truncate_chars_with_ellipsis(&text, width, ascii);
-    let style = if active {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else if entry.is_terminal() {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default().fg(Color::Cyan)
-    };
+    let mut style = Style::default().fg(status_style::session_color(entry.status));
+    if active {
+        style = style.add_modifier(Modifier::BOLD);
+    }
     Line::from(Span::styled(text, style))
 }
 
@@ -351,7 +349,18 @@ pub(super) fn render_active_session_view(
     for line in active_session_visible_lines(view, body_rows) {
         lines.push(Line::from(Span::styled(
             truncate_chars_with_ellipsis(&line, max_width, ascii),
-            Style::default().fg(Color::White),
+            Style::default().fg(
+                if view.kind == crate::chat::sessions::model::ManagedKind::Worker.as_str() {
+                    if matches!(line.as_str(), "completion: ready" | "completion: pending") {
+                        status_style::ATTENTION
+                    } else {
+                        line.strip_prefix("state: ")
+                            .map_or(Color::White, status_style::session_color)
+                    }
+                } else {
+                    Color::White
+                },
+            ),
         )));
     }
     let widget = Paragraph::new(Text::from(lines)).style(Style::default().bg(Color::Black));
@@ -766,16 +775,13 @@ pub(super) fn render_switcher(
         let glyph = session_status_glyph(entry, ascii);
         let narrow = inner.width < 48;
         let body = render_switcher_row(entry, glyph, narrow, inner.width.saturating_sub(2));
-        let style = if selected {
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD)
-        } else if entry.is_terminal() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        };
+        let mut style = Style::default().fg(status_style::session_color(entry.status));
+        if selected {
+            style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+            if status_style::session_color(entry.status) == status_style::CONTEXT {
+                style = style.fg(Color::White);
+            }
+        }
         lines.push(Line::from(Span::styled(format!("{head}{body}"), style)));
     }
 
@@ -798,9 +804,46 @@ pub(super) fn render_switcher(
 }
 
 pub(super) fn render_status_bar<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
-    let status_text = render_status_bar_text(state, area.width);
-    let status = Paragraph::new(status_text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
+    let status = Paragraph::new(render_status_bar_line(state, area.width))
+        .style(Style::default().fg(Color::White).bg(Color::DarkGray));
     frame.render_widget(status, area);
+}
+
+pub(super) fn render_status_bar_line<V: BottomChromeView + ?Sized>(state: &V, width: u16) -> Line<'static> {
+    let text = render_status_bar_text(state, width);
+    let mut labels = Vec::new();
+    if let Some(queue) = render_main_queue_status(state.main_queue_status()) {
+        labels.extend(
+            queue
+                .split_whitespace()
+                .map(|label| (label.to_owned(), status_style::ATTENTION)),
+        );
+    }
+    let workers = state.provider_worker_status();
+    labels.push((format!("workers:{}", workers.running), status_style::ACTIVE));
+    labels.push((format!("cancelling:{}", workers.cancelling), status_style::ATTENTION));
+    labels.push((format!("commit:{}", workers.awaiting_commit), status_style::ATTENTION));
+    for row in &workers.rows {
+        labels.push((
+            render_provider_worker_row(row),
+            if row.completion_ready && row.is_active() {
+                status_style::ATTENTION
+            } else {
+                status_style::worker_color(row.state)
+            },
+        ));
+    }
+    Line::from(
+        text.split_inclusive(' ')
+            .map(|token| {
+                let color = labels
+                    .iter()
+                    .find(|(label, _)| label == token.trim_end())
+                    .map_or(Color::White, |(_, color)| *color);
+                Span::styled(token.to_owned(), Style::default().fg(color))
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[allow(clippy::option_if_let_else)]

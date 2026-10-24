@@ -194,7 +194,18 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
                 .iter()
                 .filter(|(_, body)| body.contains("PRX_CHAT_PARENT"))
                 .count();
-            let message = if body.contains("PRX_CHAT_PARENT") && parent_count == 1 {
+            let request: serde_json::Value = serde_json::from_str(&body).expect("JSON request");
+            let completion_review = request["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "system"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.starts_with("Review the proposed final reply against"))
+                })
+            });
+            let message = if completion_review {
+                serde_json::json!({"role":"assistant","content":r#"{"decision":"accept","reason":"Observed spawn and join results"}"#})
+            } else if body.contains("PRX_CHAT_PARENT") && parent_count == 1 {
                 serde_json::json!({"role":"assistant","content":null,"tool_calls":[{
                     "id":"call-prx-chat-spawn","type":"function","function":{
                         "name":"sessions_spawn","arguments":serde_json::json!({

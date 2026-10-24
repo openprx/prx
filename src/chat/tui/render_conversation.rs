@@ -10,6 +10,7 @@ use super::render_chrome::{
 use super::render_input::{
     input_visual_rows_for_width, render_approval, render_fullscreen_footer, render_input, wrap_line_ranges,
 };
+use super::status_style;
 use super::tool_card::{estimate_reasoning_tokens, render_reasoning_card, render_tool_result, tool_card_glyphs};
 use super::{
     ASSISTANT_MARKDOWN_CACHE_CAPACITY, ConversationLine, INPUT_MAX_VISIBLE_ROWS,
@@ -195,7 +196,10 @@ pub(super) fn render_turn_activity_line<'a, V: BottomChromeView + ?Sized>(
     let label = if thinking.is_some() { "Thinking" } else { "Working" };
     lines.push(Line::from(vec![
         Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
-        Span::styled(label, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            label,
+            Style::default().fg(status_style::ACTIVE).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!(" ({detail})"), Style::default().fg(Color::DarkGray)),
     ]));
     if let Some(preview) = thinking.and_then(StreamingDraft::reasoning_preview) {
@@ -531,6 +535,15 @@ pub(super) fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line:
             // `Assistant` and the cursor disappears.
             push_blank_line_if_needed(lines);
             push_assistant_rendered_lines(lines, render_streaming_assistant_markdown_lines(content, ascii), ascii);
+            lines.push(Line::from(""));
+        }
+        ConversationLine::Status { content, status } => {
+            for text in content.lines() {
+                lines.push(Line::from(Span::styled(
+                    text,
+                    Style::default().fg(status_style::tool_color(*status)),
+                )));
+            }
             lines.push(Line::from(""));
         }
         ConversationLine::System { content } => {

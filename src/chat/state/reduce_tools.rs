@@ -39,7 +39,7 @@ impl ChatState {
     pub(super) fn finalize_pending_tool_cards(
         &mut self,
         key: ToolTaskKey,
-        success: bool,
+        cancelled: bool,
         fallback_result: Option<&'static str>,
     ) {
         use crate::chat::tui::{ConversationLine, ToolStatus};
@@ -60,7 +60,11 @@ impl ChatState {
             if *status != ToolStatus::Running {
                 continue;
             }
-            *status = if success { ToolStatus::Done } else { ToolStatus::Error };
+            *status = if cancelled {
+                ToolStatus::Cancelled
+            } else {
+                ToolStatus::Error
+            };
             if result.is_none()
                 && let Some(fallback_result) = fallback_result
             {
@@ -76,7 +80,7 @@ impl ChatState {
     pub(super) fn finalize_pending_tool_cards(
         &mut self,
         key: ToolTaskKey,
-        _success: bool,
+        _cancelled: bool,
         _fallback_result: Option<&'static str>,
     ) {
         if let Some(buffer) = self.control.tool_buffers.get_mut(&key) {
@@ -420,7 +424,7 @@ impl ChatState {
     pub(super) fn cancel_task(&mut self, tool_key: ToolTaskKey, draft_id: String, reason: &'static str) -> Vec<Effect> {
         let cancel_opt = self.control.take_turn_cancel(tool_key);
         let _ = self.stream.remove_visible_draft(&draft_id);
-        self.finalize_pending_tool_cards(tool_key, false, Some(reason));
+        self.finalize_pending_tool_cards(tool_key, true, Some(reason));
         self.control.clear_tool_buffer(tool_key);
         let target_pending_approval = self.clear_target_pending_approval(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();

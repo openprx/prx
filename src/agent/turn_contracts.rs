@@ -389,7 +389,7 @@ pub(crate) trait ToolLoopEventSink: Send + Sync {
 #[derive(Clone)]
 pub(crate) struct ToolLoopRuntimeAdapter {
     /// Opt-in for interactive chat; other hosts retain their completion contract.
-    pub verify_unexecuted_reply: bool,
+    pub verify_chat_completion: bool,
     pub provider_trace: Option<Arc<RetainedProviderTrace>>,
     pub events: Option<Arc<dyn ToolLoopEventSink>>,
     pub stream_provider: bool,

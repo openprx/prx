@@ -22,8 +22,8 @@ struct Assessment {
     requirement: ExecutionRequirement,
 }
 
-pub(super) fn assessment_messages(history: &[ChatMessage], input_budget: usize) -> anyhow::Result<Vec<ChatMessage>> {
-    let context = history
+pub(super) fn request_context(history: &[ChatMessage]) -> Vec<serde_json::Value> {
+    history
         .iter()
         .filter(|message| {
             matches!(message.role.as_str(), "user" | "assistant")
@@ -35,7 +35,11 @@ pub(super) fn assessment_messages(history: &[ChatMessage], input_budget: usize) 
         .into_iter()
         .rev()
         .map(|message| serde_json::json!({"role":message.role,"content":message.content}))
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+}
+
+pub(super) fn assessment_messages(history: &[ChatMessage], input_budget: usize) -> anyhow::Result<Vec<ChatMessage>> {
+    let context = request_context(history);
     anyhow::ensure!(
         !context.is_empty(),
         "execution requirement assessment has no current request"

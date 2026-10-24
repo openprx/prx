@@ -133,6 +133,7 @@ pub(super) const fn tool_status_name(status: ToolStatus) -> &'static str {
         ToolStatus::Running => "running",
         ToolStatus::Done => "done",
         ToolStatus::Error => "error",
+        ToolStatus::Cancelled => "cancelled",
     }
 }
 
@@ -157,7 +158,9 @@ pub(super) fn transcript_lines_from_conversation(conversation: &[ConversationLin
             ConversationLine::StreamingAssistant { content } => {
                 push_transcript_text(&mut lines, "assistant (streaming)", content);
             }
-            ConversationLine::System { content } => push_transcript_text(&mut lines, "system", content),
+            ConversationLine::System { content } | ConversationLine::Status { content, .. } => {
+                push_transcript_text(&mut lines, "system", content)
+            }
             ConversationLine::Tool { name, success } => {
                 let status = if *success { "done" } else { "error" };
                 lines.push(format!("tool {name}: {status}"));
@@ -244,6 +247,7 @@ pub fn latest_provider_worker_tool_summary_from_conversation(
             | ConversationLine::Assistant { .. }
             | ConversationLine::StreamingAssistant { .. }
             | ConversationLine::System { .. }
+            | ConversationLine::Status { .. }
             | ConversationLine::Reasoning { .. } => None,
         })
 }
@@ -319,7 +323,7 @@ pub fn provider_worker_io_lines_from_conversation(
             ConversationLine::Reasoning { char_count, .. } => {
                 lines.push(format!("thinking: {char_count} chars"));
             }
-            ConversationLine::User { .. } | ConversationLine::System { .. } => {}
+            ConversationLine::User { .. } | ConversationLine::System { .. } | ConversationLine::Status { .. } => {}
         }
     }
     if let Some(streaming) = streaming

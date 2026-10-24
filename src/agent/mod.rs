@@ -3,6 +3,7 @@ pub mod agent;
 pub(crate) mod approval_collection;
 pub mod classifier;
 pub(crate) mod compaction;
+mod completion_review;
 pub(crate) mod context_budget;
 pub(crate) mod context_paging;
 pub(crate) mod context_preflight;

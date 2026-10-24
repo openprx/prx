@@ -586,8 +586,10 @@ async fn run_turn_unguarded(
     // claims tool use (`[Used tools: ...]`) while this is still false is a
     // fabrication, and the only case worth spending a corrective retry on.
     let mut executed_any_tool_call = false;
-    let assessment_source = runtime_adapter.verify_unexecuted_reply.then(|| history.clone());
+    let assessment_source = runtime_adapter.verify_chat_completion.then(|| history.clone());
     let mut observed_tool_results = false;
+    let mut completion_evidence = super::completion_review::CompletionEvidence::default();
+    let mut completion_correction: Option<String> = None;
     let mut execution_requirement = None;
     let mut inject_execution_retry = false;
     let mut empty_response_retry_attempted = false;
@@ -825,10 +827,17 @@ async fn run_turn_unguarded(
         // wasted provider call. Appending at the tail leaves every cached byte
         // ahead of it untouched, and keeps the "exactly one system message, at
         // index 0" shape that strict chat templates require.
-        let verify_unexecuted_reply = runtime_adapter.verify_unexecuted_reply
-            && !chat_mode.intercepts_writes()
-            && !observed_tool_results
-            && !tool_specs.is_empty();
+        let verify_chat_completion =
+            runtime_adapter.verify_chat_completion && !chat_mode.intercepts_writes() && !tool_specs.is_empty();
+        if verify_chat_completion {
+            append_corrective_aside(
+                &mut prepared_messages.messages,
+                super::completion_review::COMPLETION_INSTRUCTIONS,
+            );
+            if let Some(correction) = &completion_correction {
+                append_corrective_aside(&mut prepared_messages.messages, correction);
+            }
+        }
         if inject_execution_retry {
             append_corrective_aside(
                 &mut prepared_messages.messages,
@@ -1165,7 +1174,7 @@ async fn run_turn_unguarded(
                     temperature,
                     cancellation_token.as_ref(),
                     &runtime_adapter,
-                    !verify_unexecuted_reply,
+                    !verify_chat_completion,
                 ))
                 .await
         } else {
@@ -1642,18 +1651,25 @@ async fn run_turn_unguarded(
                     anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
                 }
             }
-            if verify_unexecuted_reply {
+            if verify_chat_completion {
+                use super::completion_review::{CompletionDecision, ReplyAssessment};
                 use super::execution_requirement::{ExecutionRequirement, assessment_messages, parse_assessment};
-                let requirement = if let Some(requirement) = execution_requirement {
-                    requirement
+                let assessment = if !observed_tool_results && let Some(requirement) = execution_requirement {
+                    ReplyAssessment::Execution(requirement)
                 } else {
                     // Keep the assessment and persistence future off the turn's
                     // already large stack frame, including debug/PTY builds.
-                    let requirement = Box::pin(async {
+                    Box::pin(async {
                     let budget = compaction_config.map_or(8192, |config| {
                         config.max_context_tokens.saturating_sub(config.reserve_tokens)
                     });
-                    let assessment = assessment_messages(assessment_source.as_deref().unwrap_or(history), budget)?;
+                    let source = assessment_source.as_deref().unwrap_or(history);
+                    let assessment = if observed_tool_results {
+                        completion_evidence.messages(source, &display_text, budget)?
+                    } else {
+                        assessment_messages(source, budget)?
+                    };
+                    let purpose = if observed_tool_results { "completion_review" } else { "execution_requirement" };
                     let observation = execution_adapter
                         .tool_execution_context
                         .execution_trace
@@ -1673,7 +1689,7 @@ async fn run_turn_unguarded(
                         .emit(
                             HookEvent::LlmRequest,
                             serde_json::json!({
-                                "provider":provider_name, "model":model, "purpose":"execution_requirement",
+                                "provider":provider_name, "model":model, "purpose":purpose,
                                 "messages_count":assessment.len(), "tool_count":0,
                             }),
                         )
@@ -1712,7 +1728,7 @@ async fn run_turn_unguarded(
                         error_message: error_message.clone(),
                     });
                     hooks.emit(HookEvent::LlmResponse, serde_json::json!({
-                        "provider":provider_name, "model":model, "purpose":"execution_requirement",
+                        "provider":provider_name, "model":model, "purpose":purpose,
                         "duration_ms":duration.as_millis(), "success":assessment_result.is_ok(), "error_message":error_message,
                     })).await;
                     if assessment_result.is_err()
@@ -1740,19 +1756,27 @@ async fn run_turn_unguarded(
                                     .any(|attempt| attempt.status == crate::llm::route_decision::AttemptStatus::Failed),
                         );
                     }
-                    let requirement = parse_assessment(&trace.response)?;
+                    let assessment = if observed_tool_results {
+                        ReplyAssessment::Completion(super::completion_review::parse_review(&trace.response)?)
+                    } else {
+                        ReplyAssessment::Execution(parse_assessment(&trace.response)?)
+                    };
                     if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
                         let payload = serde_json::json!({
-                            "requirement": format!("{requirement:?}"),
+                            "assessment": format!("{assessment:?}"),
+                            "requirement": match &assessment {
+                                ReplyAssessment::Execution(requirement) => Some(format!("{requirement:?}")),
+                                ReplyAssessment::Completion(_) => None,
+                            },
                             "provider": crate::providers::redact_endpoint_userinfo(&trace.final_provider),
                             "model": trace.final_model,
-                            "tool_results_observed": false,
+                            "tool_results_observed": observed_tool_results,
                         });
                         if let Err(error) = fabric
                             .record_runtime_event(
                                 scope.clone(),
-                                "turn.execution_requirement.assessed",
-                                "Execution requirement assessed".to_string(),
+                                if observed_tool_results { "turn.completion_review.assessed" } else { "turn.execution_requirement.assessed" },
+                                "Chat reply assessed".to_string(),
                                 Some(payload.to_string()),
                             )
                             .await
@@ -1760,23 +1784,39 @@ async fn run_turn_unguarded(
                             tracing::warn!(%error, "Failed to record execution requirement assessment");
                         }
                     }
-                        Ok::<_, anyhow::Error>(requirement)
-                    }).await?;
-                    if requirement == ExecutionRequirement::ExecutionRequired {
-                        execution_requirement = Some(requirement);
+                        Ok::<_, anyhow::Error>(assessment)
+                    }).await?
+                };
+                match assessment {
+                    ReplyAssessment::Execution(ExecutionRequirement::ExecutionRequired) => {
+                        anyhow::ensure!(
+                            execution_requirement.is_none(),
+                            "request requires execution but no tool result was produced after one corrective retry; execution is unverified"
+                        );
+                        execution_requirement = Some(ExecutionRequirement::ExecutionRequired);
                         inject_execution_retry = true;
                         continue;
                     }
-                    requirement
-                };
-                match requirement {
-                    ExecutionRequirement::ExecutionRequired => anyhow::bail!(
-                        "request requires execution but no tool result was produced after one corrective retry; execution is unverified"
-                    ),
-                    ExecutionRequirement::Uncertain => {
+                    ReplyAssessment::Execution(ExecutionRequirement::Uncertain) => {
                         anyhow::bail!("execution requirement is uncertain; execution is unverified")
                     }
-                    ExecutionRequirement::Informational => {}
+                    ReplyAssessment::Execution(ExecutionRequirement::Informational) => {}
+                    ReplyAssessment::Completion(review) => match review.decision {
+                        CompletionDecision::Accept => {}
+                        CompletionDecision::Revise => {
+                            anyhow::ensure!(
+                                completion_correction.is_none(),
+                                "completion remains unverified after one corrective attempt: {}",
+                                review.reason
+                            );
+                            completion_correction = Some(super::completion_review::corrective_message(&review.reason));
+                            continue;
+                        }
+                        CompletionDecision::Uncertain => anyhow::bail!(
+                            "completion evidence is uncertain; completion is unverified: {}",
+                            review.reason
+                        ),
+                    },
                 }
             }
             // One outbound middleware pass per accepted, delivered turn. Every
@@ -1816,7 +1856,7 @@ async fn run_turn_unguarded(
             }
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
-            if runtime_adapter.stream_provider && verify_unexecuted_reply {
+            if runtime_adapter.stream_provider && verify_chat_completion {
                 emit_tool_loop_event(&runtime_adapter, ToolLoopEvent::TextDelta(display_text.clone())).await?;
             }
             if let Some(ref tx) = on_delta {
@@ -2031,6 +2071,11 @@ async fn run_turn_unguarded(
             }
         };
         observed_tool_results |= !individual_results.is_empty();
+        if runtime_adapter.verify_chat_completion {
+            for (call, result) in tool_calls.iter().zip(&individual_results) {
+                completion_evidence.record(call, result);
+            }
+        }
         let tools_elapsed_ms = tools_started_at.elapsed().as_millis() as u64;
 
         // Only a batch that actually produced a result counts as real tool use.

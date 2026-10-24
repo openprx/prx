@@ -266,6 +266,13 @@ and the migration warnings below before upgrading.
 
 ### Fixed
 
+- Local v0.8.164: review tool-backed chat completion drafts against the request
+  and observed results, with one corrective attempt for unsupported delivery
+  claims. Preserve metric definitions and expose uncertain completion explicitly.
+- Align execution-state colors across tool cards, activity, sessions and worker
+  status: active cyan, success green, failure red, waiting/cancellation yellow.
+  Cancelled pending tool cards now retain a distinct cancellation label.
+
 - Local v0.8.163 shell patch: retain typed process start, exit/signal, output
   completion and truncation facts through tool wrappers, execution receipts,
   cancellation and idempotent replay. Agent result handling uses typed status.

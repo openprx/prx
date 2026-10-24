@@ -2496,7 +2496,7 @@ async fn drive_start_turn_stream(
         reasoning_progress: Arc::clone(&reasoning_progress),
     });
     let runtime_adapter = crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
-        verify_unexecuted_reply: true,
+        verify_chat_completion: true,
         provider_trace: binding.retained_provider_trace(),
         events: Some(events),
         stream_provider: true,

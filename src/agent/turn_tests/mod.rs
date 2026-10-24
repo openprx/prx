@@ -372,7 +372,7 @@ pub(super) fn scheduler_test_adapter(tools: Vec<Box<dyn Tool>>, ledger_dir: &Tem
     )
     .with_idempotency_memory(ledger);
     ToolLoopRuntimeAdapter {
-        verify_unexecuted_reply: false,
+        verify_chat_completion: false,
         provider_trace: None,
         events: None,
         stream_provider: false,

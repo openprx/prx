@@ -18,7 +18,7 @@ impl ChatState {
     pub(super) fn reduce_system_message_added(&mut self, text: String) -> Vec<Effect> {
         self.ui
             .conversation_lines
-            .push(crate::chat::tui::ConversationLine::System { content: text });
+            .push(crate::chat::tui::ConversationLine::system_notice(text));
         vec![Effect::RequestRedraw]
     }
 

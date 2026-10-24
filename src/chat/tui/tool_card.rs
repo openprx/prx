@@ -1,5 +1,6 @@
 use super::render_chrome::{current_animation_tick, spinner_frame_for_tick, truncate_chars_with_ellipsis};
 use super::render_conversation::ansi_sgr_to_lines;
+use super::status_style;
 use super::{
     ARGS_PREVIEW_ELLIPSIS, ARGS_PREVIEW_ELLIPSIS_ASCII, ARGS_PREVIEW_MAX_CHARS, TOOL_ARG_VALUE_MAX_CHARS,
     TOOL_ERROR_REASON_MAX_CHARS, TOOL_EXPANDED_OUTPUT_LINE_MAX_CHARS, TOOL_EXPANDED_OUTPUT_MAX_LINES,
@@ -49,11 +50,12 @@ pub(super) fn render_tool_result<'a>(
     let (status_glyph, status_color, action) = match status {
         ToolStatus::Running => (
             spinner_frame_for_tick(ascii, current_animation_tick()),
-            Color::Cyan,
+            status_style::ACTIVE,
             "Running ",
         ),
-        ToolStatus::Done => (if ascii { "*" } else { "\u{25CF}" }, Color::DarkGray, "Ran "),
-        ToolStatus::Error => (if ascii { "x" } else { "\u{00D7}" }, Color::Red, "Failed "),
+        ToolStatus::Done => (if ascii { "*" } else { "\u{25CF}" }, status_style::SUCCESS, "Ran "),
+        ToolStatus::Cancelled => ("-", status_style::ATTENTION, "Cancelled "),
+        ToolStatus::Error => (if ascii { "x" } else { "\u{00D7}" }, status_style::FAILURE, "Failed "),
     };
     let preview_ellipsis = if ascii {
         ARGS_PREVIEW_ELLIPSIS_ASCII
@@ -73,14 +75,7 @@ pub(super) fn render_tool_result<'a>(
     };
     lines.push(Line::from(vec![
         Span::styled(format!("{status_glyph} "), Style::default().fg(status_color)),
-        Span::styled(
-            action,
-            Style::default().fg(if matches!(status, ToolStatus::Error) {
-                Color::Red
-            } else {
-                Color::DarkGray
-            }),
-        ),
+        Span::styled(action, Style::default().fg(status_style::tool_color(status))),
         Span::raw(header),
     ]));
 
@@ -119,15 +114,15 @@ pub(super) fn push_folded_tool_summary<'a>(
     let metrics_style = Style::default().fg(Color::DarkGray);
     let result_text = result.unwrap_or("");
     let metrics = tool_card_metrics(status, elapsed_ms, result_text, ascii);
-    let prefix = if matches!(status, ToolStatus::Error) {
-        "error · "
-    } else {
-        ""
+    let prefix = match status {
+        ToolStatus::Error => "error · ",
+        ToolStatus::Cancelled => "cancelled · ",
+        _ => "",
     };
     lines.push(Line::from(Span::styled(
         format!("  {hook} {prefix}{metrics}"),
-        if matches!(status, ToolStatus::Error) {
-            Style::default().fg(Color::Red)
+        if matches!(status, ToolStatus::Error | ToolStatus::Cancelled) {
+            Style::default().fg(status_style::tool_color(status))
         } else {
             metrics_style
         },
@@ -213,20 +208,19 @@ pub(super) fn push_expanded_tool_io<'a>(
     let body_style = Style::default().fg(Color::DarkGray);
     lines.push(Line::from(vec![
         Span::styled(format!("  {hook} "), body_style),
-        Span::styled("input", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "input",
+            Style::default().fg(status_style::INPUT).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("  {input}"), body_style),
     ]));
 
-    let label = if matches!(status, ToolStatus::Error) {
-        "error"
-    } else {
-        "output"
+    let label = match status {
+        ToolStatus::Error => "error",
+        ToolStatus::Cancelled => "cancelled",
+        _ => "output",
     };
-    let label_color = if matches!(status, ToolStatus::Error) {
-        Color::Red
-    } else {
-        Color::Green
-    };
+    let label_color = status_style::tool_color(status);
     let result_text = result.unwrap_or("");
     let metrics = tool_card_metrics(status, None, result_text, ascii);
     let (status_glyph, status_color) = tool_status_marker(status, ascii);
@@ -370,7 +364,7 @@ pub(super) fn tool_card_metrics(status: ToolStatus, elapsed_ms: Option<u64>, res
             parts.push(format_bytes(byte_count));
             parts.join(" \u{00B7} ")
         }
-        ToolStatus::Error => {
+        ToolStatus::Error | ToolStatus::Cancelled => {
             let mut parts = Vec::new();
             if let Some(ms) = elapsed_ms {
                 parts.push(format!("{ms}ms"));
@@ -703,11 +697,12 @@ pub(super) const fn tool_card_glyphs(ascii: bool) -> (&'static str, &'static str
 /// Status → header/result marker + marker color.
 pub(super) const fn tool_status_marker(status: ToolStatus, ascii: bool) -> (&'static str, Color) {
     match status {
+        ToolStatus::Cancelled => ("-", status_style::ATTENTION),
         ToolStatus::Running => {
             if ascii {
-                ("*", Color::White)
+                ("*", status_style::ACTIVE)
             } else {
-                ("\u{25CF}", Color::White)
+                ("\u{25CF}", status_style::ACTIVE)
             }
         }
         ToolStatus::Done => {

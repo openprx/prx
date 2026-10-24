@@ -143,7 +143,7 @@ async fn exercise_grounding_on_stream(
                     let events = Arc::new(GroundingEvents::default());
                     let mut adapter = admission.adapter();
                     adapter.stream_provider = streaming;
-                    adapter.verify_unexecuted_reply = true;
+                    adapter.verify_chat_completion = true;
                     adapter.events = Some(events.clone());
                     let result = run_turn(
                         &mut history,
@@ -190,7 +190,10 @@ async fn exercise_grounding_on_stream(
                         "the assessment must count as a real provider request"
                     );
                     assert_eq!(trace.provider_pending, 0);
-                    let expected_calls = usize::from(texts.iter().any(|text| text.contains(r#""name":"file_read""#)));
+                    let expected_calls = texts
+                        .iter()
+                        .filter(|text| text.contains(r#""name":"file_read""#))
+                        .count();
                     assert_eq!(execution_order.lock().unwrap().len(), expected_calls);
 
                     let mut streamed = events.0.lock().clone();
@@ -247,20 +250,85 @@ async fn required_execution_can_recover_with_one_actual_call() {
             r#"{"requirement":"execution_required"}"#,
             call,
             "The requested read returned file_read.",
+            r#"{"decision":"accept","reason":"read result supports reply"}"#,
         ],
     )
     .await;
     assert!(result.unwrap().contains("returned file_read"));
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert!(!history.iter().any(|message| message.content == fake));
 }
 
 #[tokio::test]
-async fn actual_tool_result_skips_semantic_assessment() {
+async fn actual_tool_result_is_reviewed_against_current_request() {
     let call = r#"<tool_call>{"name":"file_read","arguments":{"path":"report.txt"}}</tool_call>"#;
-    let (result, requests, _, _) = exercise_grounding(true, &[call, "The read completed."]).await;
+    let (result, requests, _, _) = exercise_grounding(
+        true,
+        &[
+            call,
+            "The read completed.",
+            r#"{"decision":"accept","reason":"supported"}"#,
+        ],
+    )
+    .await;
     assert_eq!(result.unwrap(), "The read completed.");
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
+    let review = requests.last().unwrap().last().unwrap();
+    assert!(review.content.contains("observed_tools"));
+    assert!(review.content.contains("report.txt"));
+    assert!(review.content.contains("succeeded"));
+}
+
+#[tokio::test]
+async fn completion_review_rejects_missing_deliverable_draft_and_allows_verified_correction() {
+    for streaming in [false, true] {
+        let call = r#"<tool_call>{"name":"file_read","arguments":{"path":"report.txt"}}</tool_call>"#;
+        let fake = "Every requested deliverable has been saved and verified.";
+        let answer = "The requested report was inspected; no implementation was requested.";
+        let (result, requests, history, streamed) = exercise_grounding_on_stream(true, &[
+            call, fake,
+            r#"{"decision":"revise","reason":"The draft claims saved deliverables without evidence; inspect the requested report and answer only that request."}"#,
+            call, answer,
+            r#"{"decision":"accept","reason":"The corrected reply matches the actual requested read."}"#,
+        ], streaming).await;
+        assert_eq!(result.unwrap(), answer);
+        assert_eq!(requests.len(), 6);
+        assert!(!history.iter().any(|m| m.content == fake));
+        assert!(!streamed.contains(fake));
+        assert!(streamed.contains(answer));
+        assert!(
+            requests
+                .iter()
+                .flatten()
+                .any(|m| m.content.contains("Preserve the user's scope"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn completion_review_does_not_loop_or_deliver_a_rejected_draft() {
+    let call = r#"<tool_call>{"name":"file_read","arguments":{"path":"report.txt"}}</tool_call>"#;
+    let fake = "The implementation file is ready.";
+    let verdict = r#"{"decision":"revise","reason":"The requested implementation is not evidenced."}"#;
+    let (result, requests, history, streamed) = exercise_grounding(true, &[call, fake, verdict, fake, verdict]).await;
+    assert!(result.unwrap_err().to_string().contains("after one corrective attempt"));
+    assert_eq!(requests.len(), 5);
+    assert!(!history.iter().any(|m| m.content == fake));
+    assert!(!streamed.contains(fake));
+}
+
+#[tokio::test]
+async fn completion_review_rejects_invalid_or_uncertain_evidence() {
+    let call = r#"<tool_call>{"name":"file_read","arguments":{"path":"report.txt"}}</tool_call>"#;
+    for verdict in [
+        "invalid",
+        r#"{"decision":"uncertain","reason":"Required evidence was omitted."}"#,
+    ] {
+        let (result, _, history, streamed) = exercise_grounding(true, &[call, "All done.", verdict]).await;
+        assert!(result.is_err());
+        assert!(!history.iter().any(|m| m.content == "All done."));
+        assert!(!streamed.contains("All done."));
+    }
 }
 
 #[tokio::test]

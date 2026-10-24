@@ -22,6 +22,7 @@ mod render_conversation;
 mod render_input;
 mod sinks;
 mod slash_menu;
+mod status_style;
 mod tool_card;
 mod views;
 
@@ -289,6 +290,7 @@ pub enum ToolStatus {
     Running,
     Done,
     Error,
+    Cancelled,
 }
 
 /// A single line in the conversation display.
@@ -317,6 +319,8 @@ pub enum ConversationLine {
     },
     /// System / status message (dimmed in render).
     System { content: String },
+    /// A typed turn-status notice, separate from ordinary system prose.
+    Status { content: String, status: ToolStatus },
     /// Legacy single-line tool indicator (kept for back-compat with
     /// [`TuiState::push_tool_call`]; new code should prefer `ToolResult`).
     Tool { name: String, success: bool },
@@ -399,6 +403,21 @@ const PROVIDER_WORKER_SWITCHER_KIND: &str = "worker";
 pub const TRANSCRIPT_MAX_LINES: usize = 400;
 const ASSISTANT_MARKDOWN_CACHE_CAPACITY: usize = 512;
 const STREAMING_MARKDOWN_HIGHLIGHT_MAX_BYTES: usize = 32 * 1024;
+
+impl ConversationLine {
+    pub(crate) fn system_notice(content: String) -> Self {
+        // Exact notice emitted by the terminal bridge; never inspect tool/model
+        // output to infer execution success or failure.
+        if content == "(cancelled)" {
+            Self::Status {
+                content,
+                status: ToolStatus::Cancelled,
+            }
+        } else {
+            Self::System { content }
+        }
+    }
+}
 
 impl TuiState {
     pub fn new(provider: &str, model: &str) -> Self {
@@ -591,9 +610,8 @@ impl TuiState {
 
     /// Add a system / status message.
     pub fn push_system_message(&mut self, content: &str) {
-        self.conversation_lines.push(ConversationLine::System {
-            content: content.to_string(),
-        });
+        self.conversation_lines
+            .push(ConversationLine::system_notice(content.to_string()));
     }
 
     #[must_use]

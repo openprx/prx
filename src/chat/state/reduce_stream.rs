@@ -434,7 +434,8 @@ impl ChatState {
         #[cfg(feature = "terminal-tui")]
         self.ui
             .conversation_lines
-            .push(crate::chat::tui::ConversationLine::System {
+            .push(crate::chat::tui::ConversationLine::Status {
+                status: crate::chat::tui::ToolStatus::Error,
                 content: format!("Error: {err}"),
             });
         vec![
@@ -474,7 +475,7 @@ impl ChatState {
                 u64::try_from(elapsed).unwrap_or(u64::MAX)
             });
         }
-        self.finalize_pending_tool_cards(tool_key, false, Some("turn cancelled before tool finish event"));
+        self.finalize_pending_tool_cards(tool_key, true, Some("turn cancelled before tool finish event"));
         if no_visible_drafts {
             self.rollback_trailing_answerless_user_turn();
         }

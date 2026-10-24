@@ -99,16 +99,40 @@ invalid assessment, or an uncertain assessment ends with an explicit unverified
 error. Rejected drafts are not added to conversation history or streamed as
 final answers. Informational replies can finish without tools.
 
-This check adds one model request only to turns that would otherwise finish
-without tool results. Chat text is buffered until accepted; tool progress remains
-visible. Assessment usage is recorded. Plan mode and other hosts retain their
-existing behavior. A refusal remains a refusal and does not grant permission or
-force another attempt. Existing approval and sandbox rules are unchanged.
+Tool-backed final replies also receive a bounded review against the original
+request, proposed answer and observed tool results. The review checks support for
+completion claims, including requested reusable source files, validation evidence
+and established metric definitions. An unsupported draft gets one corrective
+attempt through the normal tool path, followed by another review. A second
+rejection, invalid JSON or uncertain evidence ends with an explicit unverified
+error. Honest failures, partial results and refusals can be reported without
+claiming completion; the review does not grant permission or require repeating
+completed side effects. Explicit command/call limits remain binding.
 
-The classification is a model prediction and can be wrong. A real tool result
-establishes that a tool responded; it does not prove that the correct action was
-chosen or that every completion claim is true. This check complements process
-receipts and task-specific acceptance checks rather than replacing them.
+The configured provider/model performs the review. Evidence retains at most 24
+tool records, with bounded argument/result excerpts and explicit truncation and
+omission markers. Reviews are input-budget checked, cancellable and accounted
+for in provider usage. Chat final text is buffered until accepted; tool progress
+remains visible. Expect one extra model request for an eligible final reply,
+plus one further review if a tool-backed draft needs correction. Plan mode and
+other hosts retain their existing behavior. Approval and sandbox rules are
+unchanged.
+
+Both classification and review are model predictions and can be wrong. A review
+acceptance is not an independent artifact verifier or a guarantee that the whole
+task succeeded. Keep task-specific external checks for file delivery, numeric
+contracts, replay and other acceptance criteria.
+
+## Chat execution colors
+
+Fullscreen chat uses the same execution colors across tool cards, live activity,
+child sessions and provider-worker status: cyan for active work, green for
+success, red for failure, and yellow for waiting, cancellation or required input.
+A pending tool interrupted by a cancellation event is labeled `Cancelled`, not
+`Failed`. Input labels remain blue; timings, byte counts, historical reasoning
+and other passive context remain gray. Text and glyphs remain present in ASCII
+mode; color is never the only status signal. A green `Ran` means that tool call
+succeeded, not that the user's entire task has passed acceptance.
 
 ## Tool behavior
 

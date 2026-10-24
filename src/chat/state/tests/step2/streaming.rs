@@ -564,11 +564,11 @@ fn stream_cancelled_finalizes_pending_running_tool_cards() {
             line,
             crate::chat::tui::ConversationLine::ToolResult {
                 tool_name,
-                status: crate::chat::tui::ToolStatus::Error,
+                status: crate::chat::tui::ToolStatus::Cancelled,
                 ..
             } if tool_name == "shell"
         )),
-        "pending shell tool card should be finalized as an error/cancelled card"
+        "pending shell tool card should be finalized as a distinct cancelled card"
     );
 }
 
@@ -600,7 +600,7 @@ fn cancel_requested_finalizes_pending_running_tool_cards() {
             line,
             crate::chat::tui::ConversationLine::ToolResult {
                 tool_name,
-                status: crate::chat::tui::ToolStatus::Error,
+                status: crate::chat::tui::ToolStatus::Cancelled,
                 result: Some(result),
                 ..
             } if tool_name == "shell" && result.contains("cancel request")

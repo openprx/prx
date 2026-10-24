@@ -371,6 +371,7 @@ pub(crate) struct MockEnvProvider {
     /// Scripted verdict for the separate no-result assessment request. This is
     /// fixture data, not a semantic classifier; it exists only in test/mock builds.
     execution_assessment: String,
+    completion_assessment: String,
     /// 5a-6: when `OPENPRX_MOCK_TOOL_CALL=name:args_json` is set, the first streaming call
     /// emits a `ToolCallChunk`(name, args) and later calls return the `response` text.
     /// This lets PTY E2E verify the driver's full tool turn loop (call → execute → continue → final).
@@ -577,6 +578,8 @@ impl MockEnvProvider {
             response,
             execution_assessment: std::env::var("OPENPRX_MOCK_EXECUTION_ASSESSMENT")
                 .unwrap_or_else(|_| r#"{"requirement":"informational"}"#.to_string()),
+            completion_assessment: std::env::var("OPENPRX_MOCK_COMPLETION_ASSESSMENT")
+                .unwrap_or_else(|_| r#"{"decision":"accept","reason":"fixture result"}"#.to_string()),
             tool_call_spec,
             call_counter: Arc::new(AtomicUsize::new(0)),
             script,
@@ -639,16 +642,29 @@ impl Provider for MockEnvProvider {
         if request.tools.is_none()
             && request.messages.first().is_some_and(|message| {
                 message.role == "system"
-                    && message
+                    && (message
                         .content
                         .starts_with("Classify the execution requirement of the CURRENT user request")
+                        || message
+                            .content
+                            .starts_with("Review the proposed final reply against the CURRENT request"))
             })
         {
             if let Some(error) = &self.error {
                 anyhow::bail!("{error}");
             }
             return Ok(ChatResponse {
-                text: Some(self.execution_assessment.clone()),
+                text: Some(
+                    if request
+                        .messages
+                        .first()
+                        .is_some_and(|message| message.content.starts_with("Review the proposed final reply"))
+                    {
+                        self.completion_assessment.clone()
+                    } else {
+                        self.execution_assessment.clone()
+                    },
+                ),
                 tool_calls: Vec::new(),
                 reasoning_content: None,
             });
