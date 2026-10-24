@@ -1638,7 +1638,9 @@ or reused by this publication.
 An exactly named read-only capability can obtain its own missing evidence without
 a preliminary generic retrieval. Naming a Skill together with its registered
 read-only loader counts as one operation; naming distinct skills or tools does
-not. Fresh-state requirements and all execution gates still apply.
+not. When that same capability backs a selected scoped retrieval, the runtime
+keeps the retrieval path so its evidence and ownership checks still run.
+Fresh-state requirements and all execution gates still apply.
 
 Decision records expose `gates.rejected_by_gate` for the current decision hop
 and `gates.turn_rejected_by_gate` for the cumulative turn prefix. The counters

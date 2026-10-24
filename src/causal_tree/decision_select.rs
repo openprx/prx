@@ -361,7 +361,15 @@ impl CausalSelector {
         let exact_read = exact_selected_action
             && context.single_exact_capability
             && top.action() == CausalActionKind::UseTool
-            && top.side_effect() == SideEffectClass::ReadOnly;
+            && top.side_effect() == SideEffectClass::ReadOnly
+            // A selected retrieval backed by this same capability is not
+            // redundant. It invokes the scoped runtime read port and supplies
+            // evidence; publishing the tool instead would skip that read.
+            && !retrieve.is_some_and(|source| {
+                top.required_capabilities()
+                    .iter()
+                    .any(|reference| source.required_capabilities().contains(reference))
+            });
         if (insufficient && !exact_read || stale)
             && let Some(candidate) = retrieve
         {
@@ -1111,22 +1119,34 @@ mod tests {
 
     #[test]
     fn exact_read_discovers_or_executes_without_a_redundant_retrieval() {
-        for (exact, effect, stale, direct, single) in [
-            (true, SideEffectClass::ReadOnly, false, false, true),
-            (true, SideEffectClass::ReadOnly, false, true, false),
-            (true, SideEffectClass::ReadOnly, false, true, true),
-            (false, SideEffectClass::ReadOnly, false, false, true),
-            (true, SideEffectClass::LocalWrite, false, false, true),
-            (true, SideEffectClass::ReadOnly, true, false, true),
-            (true, SideEffectClass::ReadOnly, true, true, true),
+        for (exact, effect, stale, direct, single, same_source) in [
+            (true, SideEffectClass::ReadOnly, false, false, true, false),
+            (true, SideEffectClass::ReadOnly, false, true, false, false),
+            (true, SideEffectClass::ReadOnly, false, true, true, false),
+            (false, SideEffectClass::ReadOnly, false, false, true, false),
+            (true, SideEffectClass::LocalWrite, false, false, true, false),
+            (true, SideEffectClass::ReadOnly, true, false, true, false),
+            (true, SideEffectClass::ReadOnly, true, true, true, false),
+            (true, SideEffectClass::ReadOnly, false, false, true, true),
+            (true, SideEffectClass::ReadOnly, false, true, true, true),
         ] {
             let (mut set, mut scores, mut evidence, mut report, policy, mut context) = fixture(0.5);
+            use crate::causal_tree::branch::{CapabilityId, CapabilityRef, CatalogGeneration, SchemaFingerprint};
+            let shared_ref = CapabilityRef {
+                id: CapabilityId::new(CapabilityTarget::Memory, "native", "memory_search").unwrap(),
+                fingerprint: SchemaFingerprint([1; 32]),
+                generation: CatalogGeneration([2; 32]),
+            };
             let tool = CausalCandidate::new(
                 CausalActionKind::UseTool,
                 CapabilityTarget::Memory,
                 CandidateSpec {
                     namespace: None,
-                    required_capabilities: Vec::new(),
+                    required_capabilities: if same_source {
+                        vec![shared_ref.clone()]
+                    } else {
+                        Vec::new()
+                    },
                     side_effect: effect,
                     approval: ApprovalRequirement::None,
                     estimated_cost: Some(CostEstimate {
@@ -1171,6 +1191,27 @@ mod tests {
             else {
                 panic!("expected legal candidates");
             };
+            if same_source {
+                let source = candidates
+                    .iter_mut()
+                    .find(|item| item.action() == CausalActionKind::Retrieve)
+                    .unwrap();
+                *source = CausalCandidate::new(
+                    CausalActionKind::Retrieve,
+                    CapabilityTarget::Memory,
+                    CandidateSpec {
+                        namespace: None,
+                        required_capabilities: vec![shared_ref],
+                        side_effect: SideEffectClass::ReadOnly,
+                        approval: ApprovalRequirement::None,
+                        estimated_cost: Some(CostEstimate {
+                            tokens: 1,
+                            micro_usd: 1,
+                        }),
+                        estimated_latency_ms: Some(1),
+                    },
+                );
+            }
             let retrieval_id = candidates
                 .iter()
                 .find(|item| item.action() == CausalActionKind::Retrieve)
@@ -1182,7 +1223,7 @@ mod tests {
                 exact_mentions.insert(tool.candidate_id().clone());
             }
             let selection = CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap();
-            let expected = if exact && single && effect == SideEffectClass::ReadOnly && !stale {
+            let expected = if exact && single && effect == SideEffectClass::ReadOnly && !stale && !same_source {
                 if direct {
                     Selection::Commit {
                         candidate_id: tool.candidate_id().clone(),
@@ -1202,7 +1243,7 @@ mod tests {
             };
             assert_eq!(
                 selection, expected,
-                "exact={exact} effect={effect:?} stale={stale} direct={direct}"
+                "exact={exact} effect={effect:?} stale={stale} direct={direct} same_source={same_source}"
             );
 
             report.outcomes.insert(
