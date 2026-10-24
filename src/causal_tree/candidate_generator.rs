@@ -2395,6 +2395,27 @@ mod tests {
 
     #[test]
     fn a_probe_rejected_by_a_gate_is_traced_with_its_gate_and_reason() {
+        // tracing callsite interest is process-global. Keep this log assertion
+        // isolated from concurrent tests that install or rebuild subscribers.
+        const PROBE: &str = "PRX_CANDIDATE_GATE_TRACE_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "causal_tree::candidate_generator::tests::a_probe_rejected_by_a_gate_is_traced_with_its_gate_and_reason",
+                    "--nocapture",
+                ])
+                .env(PROBE, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated trace probe failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("candidates.log");
         let subscriber = tracing_subscriber::fmt()
