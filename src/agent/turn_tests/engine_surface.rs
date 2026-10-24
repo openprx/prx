@@ -1323,6 +1323,10 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
                         })
                         .await
                         .expect_err("a turn silent for longer than the whole window must be terminated");
+                        // The watchdog assertion above uses virtual time. Queue
+                        // shutdown below awaits real SQLite / blocking work; do
+                        // not let an idle virtual clock skip its drain deadline.
+                        tokio::time::resume();
 
                         assert!(
                             crate::agent::idle::is_hang_termination(&error),
