@@ -1670,6 +1670,11 @@ async fn run_turn_unguarded(
                         assessment_messages(source, budget)?
                     };
                     let purpose = if observed_tool_results { "completion_review" } else { "execution_requirement" };
+                    if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
+                        record_assessment_request(
+                            fabric, scope.clone(), provider_name, model, purpose, &assessment,
+                        ).await?;
+                    }
                     let observation = execution_adapter
                         .tool_execution_context
                         .execution_trace
@@ -2263,6 +2268,53 @@ async fn run_turn_unguarded(
             );
         }
     }
+}
+
+/// Account for the separate, tool-free assessment request as well as task
+/// requests. Persist only measurements and purpose, never the supplied evidence.
+async fn record_assessment_request(
+    fabric: &crate::memory::MemoryFabric,
+    scope: crate::memory::MessageEventScope,
+    provider: &str,
+    model: &str,
+    purpose: &str,
+    messages: &[ChatMessage],
+) -> anyhow::Result<()> {
+    use super::context_budget::{budgeted_tokens, estimate_history_tokens_with_source, token_source_label};
+    let measurement = estimate_history_tokens_with_source(messages);
+    let tokens = budgeted_tokens(measurement);
+    let bytes = messages.iter().fold(0usize, |total, message| {
+        total
+            .saturating_add(message.role.len())
+            .saturating_add(message.content.len())
+    });
+    fabric
+        .record_runtime_event(
+            scope.with_recipient(format!("{provider}/{model}")),
+            "llm.request.context.compiled",
+            format!("{purpose}; no executable capabilities"),
+            Some(
+                serde_json::json!({
+                    "schema_version": 1,
+                    "purpose": purpose,
+                    "provider": crate::providers::redact_endpoint_userinfo(provider),
+                    "model": model,
+                    "messages_count": messages.len(),
+                    "tool_snapshot": {"count": 0, "native_tools": false, "tools": []},
+                    "request_estimate": {
+                        "messages_bytes": bytes,
+                        "messages_tokens": tokens,
+                        "native_tool_bytes": 0,
+                        "native_tool_tokens": 0,
+                        "total_tokens": tokens,
+                        "token_source": token_source_label(measurement.source),
+                    },
+                })
+                .to_string(),
+            ),
+        )
+        .await?;
+    Ok(())
 }
 
 #[path = "turn_tests/turn_engine.rs"]

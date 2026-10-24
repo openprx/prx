@@ -3114,6 +3114,9 @@ mod tool_tiering_tests;
 #[cfg(test)]
 mod stream_native_tools_tests;
 
+#[cfg(test)]
+mod assessment_fixture;
+
 // ─── S4-A Commit 3: dispatcher snapshot push ────────────────────────────────
 
 #[cfg(test)]

@@ -459,9 +459,9 @@ async fn int_ts_07_http_request_readonly_is_not_a_gate() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test(flavor = "current_thread")]
-async fn int_ts_10_direct_shell_inherits_complete_environment() {
+async fn int_ts_10_direct_shell_does_not_inherit_provider_credentials() {
     // SAFETY: test-only, single-threaded (current_thread flavor).
-    // Direct host execution inherits the parent environment exactly.
+    // Host commands inherit only the explicit safe-variable allowlist.
     struct EnvGuard {
         key: &'static str,
         original: Option<String>,
@@ -512,9 +512,20 @@ async fn int_ts_10_direct_shell_inherits_complete_environment() {
         result.error
     );
 
-    assert!(result.output.contains("sk-test-openai-secret-999"));
-    assert!(result.output.contains("sk-test-anthropic-secret-888"));
-    assert!(result.output.contains("aws-test-secret-777"));
+    for secret in [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "sk-test-openai-secret-999",
+        "sk-test-anthropic-secret-888",
+        "aws-test-secret-777",
+    ] {
+        assert!(
+            !result.output.contains(secret),
+            "credential names and values stay outside shell environment"
+        );
+    }
+    assert!(result.output.lines().any(|line| line.starts_with("PATH=")));
 }
 
 #[tokio::test(flavor = "current_thread")]

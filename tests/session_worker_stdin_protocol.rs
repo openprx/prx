@@ -172,47 +172,60 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         });
                         requests.iter().filter(|request| request.marker == marker).count()
                     };
-                    let assistant = match (marker, request_index) {
-                        ("PRX-ROUTE-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
-                            "action": "spawn_batch", "mode": "process", "tasks": ["PRX-ROUTE-CHILD"]
-                        })),
-                        ("PRX-AGENT-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
-                            "action": "spawn_batch", "mode": "process", "tasks": [
-                                {"task": "PRX-AGENT-CHILD", "agent": "prx_agent"}
-                            ]
-                        })),
-                        ("PRX-DENIED-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
-                            "action": "spawn_batch", "mode": "process", "allow_delegation": true,
-                            "tasks": ["PRX-DENIED-CHILD"]
-                        })),
-                        ("PRX-NESTED-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
-                            "action": "spawn_batch", "mode": "process", "tasks": [
-                                {"task": RECURSIVE_CHILD_TASK, "allow_delegation": true}
-                            ]
-                        })),
-                        ("PRX-NESTED-CHILD", 1) => scripted_spawn_call(&serde_json::json!({
-                            "action": "spawn_batch", "mode": "process", "tasks": ["PRX-NESTED-LEAF"]
-                        })),
-                        ("PRX-FANOUT-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
-                            "action": "spawn_batch", "mode": "process", "tasks": [
-                                {"task": FANOUT_CHILD_TASK, "allow_delegation": true}
-                            ]
-                        })),
-                        ("PRX-FANOUT-CHILD", 1) => scripted_spawn_call(&serde_json::json!({
-                            "action": "spawn_batch", "mode": "process",
-                            "tasks": ["PRX-FANOUT-DENIED-A", "PRX-FANOUT-DENIED-B"]
-                        })),
-                        ("PRX-FANOUT-CHILD", 2) => scripted_spawn_call(&serde_json::json!({
-                            "action": "spawn_batch", "mode": "process", "tasks": ["PRX-FANOUT-LEAF"]
-                        })),
-                        ("PRX-FANOUT-CHILD", 3) | ("PRX-FANOUT-PARENT", 2) => scripted_join_call(&request_body),
-                        ("PRX-FANOUT-CHILD", 4) => scripted_spawn_call(&serde_json::json!({
-                            "action": "spawn_batch", "mode": "process", "tasks": ["PRX-FANOUT-SECOND"]
-                        })),
-                        ("PRX-ROUTE-PARENT" | "PRX-AGENT-PARENT" | "PRX-NESTED-PARENT" | "PRX-NESTED-CHILD", 2) => {
-                            scripted_join_call(&request_body)
+                    let assistant = if request_body
+                        .contains("Review the proposed final reply against the CURRENT request")
+                    {
+                        let request: serde_json::Value = serde_json::from_str(&request_body).expect("review request");
+                        assert!(request["tools"].as_array().is_none_or(Vec::is_empty));
+                        assert!(
+                            request_body.contains("observed_tools") && request_body.contains("proposed_final_reply")
+                        );
+                        serde_json::json!({"role":"assistant", "content": r#"{"decision":"accept","reason":"fixture evidence accepted"}"#})
+                    } else if request_body.contains("Classify the execution requirement of the CURRENT user request") {
+                        serde_json::json!({"role":"assistant", "content": r#"{"requirement":"informational"}"#})
+                    } else {
+                        match (marker, request_index) {
+                            ("PRX-ROUTE-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+                                "action": "spawn_batch", "mode": "process", "tasks": ["PRX-ROUTE-CHILD"]
+                            })),
+                            ("PRX-AGENT-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+                                "action": "spawn_batch", "mode": "process", "tasks": [
+                                    {"task": "PRX-AGENT-CHILD", "agent": "prx_agent"}
+                                ]
+                            })),
+                            ("PRX-DENIED-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+                                "action": "spawn_batch", "mode": "process", "allow_delegation": true,
+                                "tasks": ["PRX-DENIED-CHILD"]
+                            })),
+                            ("PRX-NESTED-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+                                "action": "spawn_batch", "mode": "process", "tasks": [
+                                    {"task": RECURSIVE_CHILD_TASK, "allow_delegation": true}
+                                ]
+                            })),
+                            ("PRX-NESTED-CHILD", 1) => scripted_spawn_call(&serde_json::json!({
+                                "action": "spawn_batch", "mode": "process", "tasks": ["PRX-NESTED-LEAF"]
+                            })),
+                            ("PRX-FANOUT-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+                                "action": "spawn_batch", "mode": "process", "tasks": [
+                                    {"task": FANOUT_CHILD_TASK, "allow_delegation": true}
+                                ]
+                            })),
+                            ("PRX-FANOUT-CHILD", 1) => scripted_spawn_call(&serde_json::json!({
+                                "action": "spawn_batch", "mode": "process",
+                                "tasks": ["PRX-FANOUT-DENIED-A", "PRX-FANOUT-DENIED-B"]
+                            })),
+                            ("PRX-FANOUT-CHILD", 2) => scripted_spawn_call(&serde_json::json!({
+                                "action": "spawn_batch", "mode": "process", "tasks": ["PRX-FANOUT-LEAF"]
+                            })),
+                            ("PRX-FANOUT-CHILD", 3) | ("PRX-FANOUT-PARENT", 2) => scripted_join_call(&request_body),
+                            ("PRX-FANOUT-CHILD", 4) => scripted_spawn_call(&serde_json::json!({
+                                "action": "spawn_batch", "mode": "process", "tasks": ["PRX-FANOUT-SECOND"]
+                            })),
+                            ("PRX-ROUTE-PARENT" | "PRX-AGENT-PARENT" | "PRX-NESTED-PARENT" | "PRX-NESTED-CHILD", 2) => {
+                                scripted_join_call(&request_body)
+                            }
+                            _ => serde_json::json!({"role": "assistant", "content": "PRX-WORKER-OK"}),
                         }
-                        _ => serde_json::json!({"role": "assistant", "content": "PRX-WORKER-OK"}),
                     };
                     let body = serde_json::json!({
                         "id": "chatcmpl-prx-worker",
@@ -397,9 +410,22 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request.marker == "PRX-DENIED-PARENT")
+                .filter(|request| request.marker == "PRX-DENIED-PARENT"
+                    && !request
+                        .body
+                        .contains("Review the proposed final reply against the CURRENT request"))
                 .count(),
             2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.marker == "PRX-DENIED-PARENT"
+                    && request
+                        .body
+                        .contains("Review the proposed final reply against the CURRENT request"))
+                .count(),
+            1
         );
         assert!(requests.iter().any(|request| {
             request.marker == "PRX-DENIED-PARENT"

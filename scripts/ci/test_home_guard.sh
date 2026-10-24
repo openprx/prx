@@ -254,7 +254,9 @@ Darwin)
     write_profile 0 "$guard_token-build" >"$build_profile"
     write_profile 1 "$guard_token-canary" >"$canary_profile"
     write_profile 1 "$guard_token-run" >"$profile"
+    echo "test_home_guard: phase=build started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     HOME="$guard_home" sandbox-exec -f "$build_profile" cargo test --no-run "$@" || status=$?
+    echo "test_home_guard: phase=build finished exit=$status $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if [ "$status" -eq 0 ]; then
         # The kernel reports every denial with the rule's message: this run's
         # token. A denial by a child process the test tolerated is reported
@@ -292,6 +294,7 @@ Darwin)
         runner_script="$guard_home.runner.sh"
         printf '#!/bin/sh\necho "$$" >>"$PRX_GUARD_RUN_PIDS"\nexec ${PRX_GUARD_INNER_RUNNER:-} "$@"\n' >"$runner_script"
         chmod +x "$runner_script"
+        echo "test_home_guard: phase=test started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         HOME="$guard_home" CARGO_NET_OFFLINE=true PRX_GUARD_RUN_PIDS="$run_tree" \
             PRX_GUARD_INNER_RUNNER="${!runner_var:-}" env "$runner_var=$runner_script" \
             sandbox-exec -f "$profile" cargo test "$@" &
@@ -299,6 +302,7 @@ Darwin)
         track_tree "$run_pid" "$run_tree" &
         tracker_pid=$!
         wait "$run_pid" || status=$?
+        echo "test_home_guard: phase=test finished exit=$status $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         wait "$tracker_pid" 2>/dev/null || true
         # Reports are delivered asynchronously.
         sleep 3
@@ -345,7 +349,9 @@ Darwin)
     fi
     ;;
 Linux)
+    echo "test_home_guard: phase=build started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     HOME="$guard_home" cargo test --no-run "$@" || status=$?
+    echo "test_home_guard: phase=build finished exit=$status $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if [ "$status" -eq 0 ]; then
         if sudo -n true 2>/dev/null && sudo -n unshare --net true 2>/dev/null; then
             sudo -n modprobe dummy 2>/dev/null || true
@@ -379,8 +385,10 @@ Linux)
         # namespace-root writer truncates this file, then the outer guard must
         # read it without broadening its permissions.
         : >"$attempts_file"
+        echo "test_home_guard: phase=test started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         "${runner[@]}" "${guard_env[@]}" "${namespace[@]}" bash "$linux_inner" "$(command -v cargo)" test "$@" ||
             status=$?
+        echo "test_home_guard: phase=test finished exit=$status $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         if [ ! -s "$attempts_file" ]; then
             echo "test_home_guard: the network guard did not complete (is the dummy module available? try 'sudo modprobe dummy')." >&2
             exit "$((status == 0 ? 2 : status))"

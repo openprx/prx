@@ -391,12 +391,9 @@ async fn driver_executes_tool_call_chunk_and_continues_to_completion() {
         ) -> anyhow::Result<String> {
             Ok(String::new())
         }
-        async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
-            Ok(ChatResponse {
-                text: None,
-                tool_calls: Vec::new(),
-                reasoning_content: None,
-            })
+        async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+            super::super::assessment_fixture::response(&request)
+                .ok_or_else(|| anyhow::anyhow!("expected reply assessment"))
         }
         fn supports_streaming(&self) -> bool {
             true

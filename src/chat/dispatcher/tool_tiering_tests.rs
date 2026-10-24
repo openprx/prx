@@ -61,13 +61,9 @@ impl Provider for CatalogRecordingProvider {
         Ok(String::new())
     }
 
-    async fn chat_traced(
-        &self,
-        _request: ChatRequest<'_>,
-        _model: &str,
-        _temperature: f64,
-    ) -> anyhow::Result<ChatTrace> {
-        anyhow::bail!("tiering fixture drives the streaming path only")
+    async fn chat_traced(&self, request: ChatRequest<'_>, model: &str, _temperature: f64) -> anyhow::Result<ChatTrace> {
+        super::assessment_fixture::trace(&request, model)
+            .ok_or_else(|| anyhow::anyhow!("unexpected non-assessment request in streaming fixture"))
     }
 
     fn supports_streaming(&self) -> bool {

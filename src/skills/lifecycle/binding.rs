@@ -155,6 +155,15 @@ pub(super) struct PinTable {
 }
 
 impl PinTable {
+    #[cfg(test)]
+    pub(super) fn age_pins_for_test(&self, age: Duration) {
+        for (_, _, accessed) in self.entries.lock().iter_mut() {
+            *accessed = accessed
+                .checked_sub(age)
+                .expect("test pin age fits the monotonic clock");
+        }
+    }
+
     pub(super) const fn new(cap: usize, orphan_age: Duration) -> Self {
         Self {
             cap,

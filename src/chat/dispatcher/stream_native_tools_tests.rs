@@ -392,6 +392,24 @@ mod tests {
             post(move |Json(request): Json<serde_json::Value>| {
                 let sink = Arc::clone(&sink);
                 async move {
+                    if request["stream"] != true {
+                        let text = super::super::assessment_fixture::reply(&wire.system_text(&request))
+                            .expect("non-streaming request is a reply assessment");
+                        assert!(request["tools"].as_array().is_none_or(Vec::is_empty));
+                        sink.lock().push(request);
+                        let body = match wire {
+                            Wire::OpenAi => serde_json::json!({
+                                "choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}],
+                                "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
+                            }),
+                            Wire::Anthropic => serde_json::json!({
+                                "id":"assessment", "type":"message", "role":"assistant", "model":FIXTURE_MODEL,
+                                "content":[{"type":"text","text":text}], "stop_reason":"end_turn",
+                                "usage":{"input_tokens":3,"output_tokens":2}
+                            }),
+                        };
+                        return ([(header::CONTENT_TYPE, "application/json")], body.to_string());
+                    }
                     let reply = {
                         let mut requests = sink.lock();
                         let reply = if !requests.is_empty() {
@@ -661,8 +679,8 @@ mod tests {
             Some("x")
         );
 
-        // 3. Exactly one follow-up request, 4. carrying the tool result.
-        assert_eq!(run.requests.len(), 2, "tool round trip = exactly two provider requests");
+        // 3. One result follow-up and one bounded completion assessment.
+        assert_completion_assessment(wire, run);
         let second = run.requests.get(1).expect("test: second request");
         assert!(
             result_carried(second),
@@ -678,7 +696,7 @@ mod tests {
 
         // 6. Prompt pin (D-020 Q5): native mode is unchanged, so the system text
         //    never carries the prompt-guided tool protocol or its grammar.
-        for request in &run.requests {
+        for request in run.requests.iter().take(2) {
             let system = wire.system_text(request);
             assert!(system.contains(FIXTURE_SYSTEM), "system prompt kept: {system}");
             assert!(
@@ -706,7 +724,7 @@ mod tests {
                 .expect("test: native_tool_bytes");
             let counted_tools = event["tool_snapshot"]["count"].as_u64().expect("test: tool count");
             let wire_tools = request["tools"].as_array().map_or(0, Vec::len);
-            assert!(counted_bytes > 0, "a native tool payload was measured: {event}");
+            assert_eq!(counted_bytes > 0, wire_tools > 0, "tool payload accounting: {event}");
             assert_eq!(
                 usize::try_from(counted_tools).ok(),
                 Some(wire_tools),
@@ -763,6 +781,19 @@ mod tests {
     // -----------------------------------------------------------------
     // STREAM-f: a half-received tool call never executes
     // -----------------------------------------------------------------
+
+    fn assert_completion_assessment(wire: Wire, run: &ChatRun) {
+        assert_eq!(run.requests.len(), 3, "two task requests plus one assessment");
+        let review = run.requests.get(2).expect("completion assessment request");
+        assert_ne!(review["stream"], true);
+        assert!(review["tools"].as_array().is_none_or(Vec::is_empty));
+        assert_eq!(
+            super::super::assessment_fixture::reply(&wire.system_text(review)),
+            Some(super::super::assessment_fixture::ACCEPT),
+        );
+        let body = review.to_string();
+        assert!(body.contains("observed_tools") && body.contains("proposed_final_reply"));
+    }
 
     fn stream_failures(run: &ChatRun) -> Vec<&str> {
         run.actions
@@ -895,6 +926,16 @@ mod tests {
             _temperature: f64,
         ) -> anyhow::Result<String> {
             Ok(String::new())
+        }
+
+        async fn chat(
+            &self,
+            request: crate::providers::traits::ChatRequest<'_>,
+            _: &str,
+            _: f64,
+        ) -> anyhow::Result<crate::providers::traits::ChatResponse> {
+            super::super::assessment_fixture::response(&request)
+                .ok_or_else(|| anyhow::anyhow!("expected reply assessment"))
         }
 
         fn supports_streaming(&self) -> bool {
@@ -1146,7 +1187,7 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("x")
         );
-        assert_eq!(run.requests.len(), 2);
+        assert_completion_assessment(Wire::OpenAi, &run);
         assert_eq!(stream_completions(&run), ["done"]);
     }
 
@@ -1198,7 +1239,7 @@ mod tests {
             server.abort();
 
             assert_eq!(run.tool_calls, 0, "the refused call never runs");
-            assert_eq!(run.requests.len(), 2, "the refusal goes back to the model");
+            assert_completion_assessment(wire, &run);
             let second = run.requests.get(1).expect("test: second request");
             let replayed: Vec<serde_json::Value> = second["messages"]
                 .as_array()
@@ -1265,7 +1306,7 @@ mod tests {
                 server.abort();
 
                 assert_eq!(run.tool_calls, 0, "{arguments}: the call never runs");
-                assert_eq!(run.requests.len(), 2, "{arguments}: the refusal goes back to the model");
+                assert_completion_assessment(wire, &run);
                 let second = run.requests.get(1).expect("test: second request");
                 let replayed: Vec<serde_json::Value> = second["messages"]
                     .as_array()

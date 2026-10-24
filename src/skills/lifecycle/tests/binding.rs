@@ -450,7 +450,9 @@ fn orphaned_pins_are_reclaimed_only_when_the_table_is_full_and_only_if_old() {
     let who = owner(OWNER_A);
     let issue = || store.pin_active(&skill());
 
-    let short = PinTable::new(1, std::time::Duration::from_millis(5));
+    // A parallel suite can deschedule this thread for longer than 5 ms.
+    // Age the stored timestamp explicitly instead of assuming a quick disk read.
+    let short = PinTable::new(1, std::time::Duration::from_secs(3600));
     short
         .pin(&who, "old", &skill(), issue)
         .expect("test: pin")
@@ -460,7 +462,7 @@ fn orphaned_pins_are_reclaimed_only_when_the_table_is_full_and_only_if_old() {
         short.pin(&who, "new", &skill(), issue).expect_err("test: full"),
         LifecycleError::PinTableFull(1)
     ));
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    short.age_pins_for_test(std::time::Duration::from_secs(7200));
     assert!(
         short
             .pin(&who, "new", &skill(), issue)
@@ -476,7 +478,6 @@ fn orphaned_pins_are_reclaimed_only_when_the_table_is_full_and_only_if_old() {
     long.pin(&who, "a", &skill(), issue)
         .expect("test: pin")
         .expect("test: pinned");
-    std::thread::sleep(std::time::Duration::from_millis(20));
     assert!(long.pin(&who, "b", &skill(), issue).is_err());
 }
 
