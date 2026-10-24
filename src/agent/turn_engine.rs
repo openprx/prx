@@ -322,10 +322,7 @@ async fn run_turn_unguarded(
             apply_middleware_messages(history, &transformed);
         }
         let spec = lease.proposal_spec();
-        let mut proposal_messages = history.clone();
-        proposal_messages.insert(0, ChatMessage::system(
-            "Collect exactly one complete argument proposal for the offered operation (a file change, an MCP write or a skills_manage lifecycle change). This request cannot execute it. Return the requested tool call; do not claim that the operation has run.",
-        ));
+        let mut proposal_messages = super::approval_collection::proposal_messages(history, proof.routing_input());
         #[cfg(feature = "wasm-plugins")]
         {
             let transformed = hooks
@@ -1671,9 +1668,9 @@ async fn run_turn_unguarded(
                     };
                     let purpose = if observed_tool_results { "completion_review" } else { "execution_requirement" };
                     if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
-                        record_assessment_request(
+                        Box::pin(record_assessment_request(
                             fabric, scope.clone(), provider_name, model, purpose, &assessment,
-                        ).await?;
+                        )).await?;
                     }
                     let observation = execution_adapter
                         .tool_execution_context
