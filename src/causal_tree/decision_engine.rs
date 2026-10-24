@@ -1552,6 +1552,31 @@ fn selector_context(
     }
 }
 
+/// A named Skill and its registered read-only loader describe one operation.
+/// Distinct skills remain distinct even when they share that loader.
+fn single_exact_capability(catalog: &CatalogView<'_>, routing_input: &str) -> bool {
+    use crate::causal_tree::branch::SideEffectClass;
+    use crate::tools::capability::catalog::ExecutionTarget;
+
+    let folded = routing_input.to_lowercase();
+    let mentioned: Vec<_> = catalog
+        .iter_entries()
+        .filter(|entry| super::candidate_generator::exact_mention(&folded, entry))
+        .collect();
+    mentioned
+        .iter()
+        .filter(|entry| {
+            !matches!(&entry.target, ExecutionTarget::Tool(name)
+            if entry.effect == SideEffectClass::ReadOnly && mentioned.iter().any(|skill| {
+                skill.effect == SideEffectClass::ReadOnly
+                    && matches!(&skill.target, ExecutionTarget::Skill { root, .. } if root == name)
+            }))
+        })
+        .take(2)
+        .count()
+        == 1
+}
+
 fn selector_context_for_config(
     set: &CandidateSet,
     catalog: &CatalogView<'_>,
@@ -1562,13 +1587,7 @@ fn selector_context_for_config(
     routing_input: &str,
 ) -> SelectorContext {
     let mut context = selector_context(set, catalog, interactive, resume_target, discovered_refs);
-    let folded = routing_input.to_lowercase();
-    context.single_exact_capability = catalog
-        .iter_entries()
-        .filter(|entry| super::candidate_generator::exact_mention(&folded, entry))
-        .take(2)
-        .count()
-        == 1;
+    context.single_exact_capability = single_exact_capability(catalog, routing_input);
     if decision_enabled {
         return context;
     }
@@ -1668,6 +1687,36 @@ mod tests {
     use crate::tools::capability::child::AuthorityEnvelope;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn exact_skill_and_loader_are_one_operation_but_distinct_skills_are_not() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::default();
+        let tools: Vec<Box<dyn crate::tools::traits::Tool>> = vec![Box::new(crate::tools::SkillReadTool::new(
+            workspace.path().to_owned(),
+            config,
+        ))];
+        let sources = CatalogSources {
+            skills: ["prx_report", "prx_sheet"]
+                .into_iter()
+                .map(|name| crate::skills::SkillMetadata {
+                    name: name.to_owned(),
+                    description: "Read PRX fixture guidance".to_owned(),
+                    location: workspace.path().join(name).join("SKILL.md"),
+                    frontmatter_sha: [1; 32],
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let catalog = CapabilityCatalog::build(&tools, &sources, &SurfacePolicy::default()).unwrap();
+        let view = catalog.view(&CatalogScope::default());
+        for input in ["skill_read", "prx_report", "Use skill_read to read prx_report"] {
+            assert!(single_exact_capability(&view, input), "{input}");
+        }
+        for input in ["unrelated", "prx_report prx_sheet", "skill_read prx_report prx_sheet"] {
+            assert!(!single_exact_capability(&view, input), "{input}");
+        }
+    }
 
     struct DelayedBackend {
         calls: Arc<AtomicUsize>,

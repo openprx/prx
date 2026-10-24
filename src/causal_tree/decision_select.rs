@@ -61,7 +61,8 @@ pub(crate) struct SelectorContext {
     /// candidate direct or bypasses its gates.
     pub discovery_completed: bool,
     /// Count raw catalog mentions before the per-family candidate collapse.
-    /// A multi-tool task must not be narrowed to its first read-only candidate.
+    /// A Skill and its read-only loader count once; distinct skills and tools
+    /// must not be narrowed to their first read-only candidate.
     pub single_exact_capability: bool,
 }
 

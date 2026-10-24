@@ -1635,6 +1635,11 @@ before admitting the next model turn. A fresh chat is not required. Existing
 turns retain their sealed catalog; consumed or stale approvals are not refreshed
 or reused by this publication.
 
+An exactly named read-only capability can obtain its own missing evidence without
+a preliminary generic retrieval. Naming a Skill together with its registered
+read-only loader counts as one operation; naming distinct skills or tools does
+not. Fresh-state requirements and all execution gates still apply.
+
 Decision records expose `gates.rejected_by_gate` for the current decision hop
 and `gates.turn_rejected_by_gate` for the cumulative turn prefix. The counters
 include totals and counts by gate and reason. A candidate is counted once at
