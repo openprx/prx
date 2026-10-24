@@ -287,7 +287,7 @@ fn chat_resume_consumed_decision_from_new_chat_refuses_and_processes_later_input
 
 #[test]
 #[serial(prx_chat_pty)]
-fn chat_import_resume_processes_later_input_with_current_catalog_parity_limitation() {
+fn chat_import_resume_refreshes_catalog_for_later_input_in_the_same_chat() {
     let (guard, arguments, revision) = import_fixture();
     let (mut sg, decision_id) = approve_and_resume_import(&guard, &arguments, &revision);
     let session = sg.session();
@@ -296,21 +296,15 @@ fn chat_import_resume_processes_later_input_with_current_catalog_parity_limitati
     session
         .send(format!("/approval --decision {decision_id}\r"))
         .expect("inspect after import resume");
-    // Current documented limitation: import changes the pinned catalog, so a
-    // fresh chat is needed for model work (docs/tools.md). Inspection and the
-    // later message must still run. Update both expectations deliberately when
-    // chat catalog refresh is implemented; these refusals are not the desired UX.
+    // The consumed decision stays consumed. A later source turn gets a new
+    // catalog publication without restarting this chat or reusing the grant.
     read_until_with_dsr(
         session,
         "No inspectable pending decision is available for this chat.",
         TURN_TIMEOUT,
     );
     session.send("hi\r").expect("message after catalog-changing resume");
-    read_until_with_dsr(
-        session,
-        "What specific information should I use to answer your request?",
-        TURN_TIMEOUT,
-    );
+    read_until_with_dsr(session, LATER_REPLY, TURN_TIMEOUT);
     session.send("/exit\r").expect("exit after import resume");
     assert!(
         wait_for_exit(session, EXIT_TIMEOUT),

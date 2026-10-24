@@ -177,7 +177,7 @@ fn candidate_score(state: &StateFeatures<'_>, candidate: &CandidateFeatures<'_>)
     if text.path && matches!(candidate.target, "filesystem" | "document") {
         score += weights::PATH_TO_FILES;
     }
-    if text.code && candidate.target == "shell" {
+    if text.code && (candidate.target == "shell" || (candidate.target == "filesystem" && candidate.executes_process)) {
         score += weights::CODE_TO_SHELL;
     }
     if candidate.failed_before {
@@ -970,6 +970,37 @@ mod tests {
     use super::*;
     use crate::decision::protocol::{CandidateKey, RequestLimits, RequestParts};
     use crate::decision::{DecisionKey, DecisionResponseValidator, ModelVersionPolicy, ValidationContext};
+
+    #[test]
+    fn code_bonus_uses_the_real_filesystem_process_class_without_biasing_file_reads() {
+        use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, SurfacePolicy};
+        let workspace = tempfile::tempdir().unwrap();
+        let security = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![
+            Box::new(crate::tools::shell::ShellTool::new(
+                std::sync::Arc::new(crate::runtime::NativeRuntime::new()),
+                workspace.path().to_owned(),
+            )),
+            Box::new(crate::tools::file_read::FileReadTool::new(security, false)),
+        ];
+        let catalog = CapabilityCatalog::build(&tools, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let view = catalog.view(&CatalogScope::default());
+        for name in ["shell", "file_read"] {
+            let entry = view.entries().iter().find(|entry| entry.public_name == name).unwrap();
+            assert_eq!(entry.id.as_str(), format!("filesystem:native:{name}"));
+            let value = json!({"latest_user_turn":"`value`", "candidates":[{
+                "id":"use_tool-filesystem", "action":"use_tool", "target":entry.family.as_str(),
+                "side_effect":entry.effect.as_str(), "available":true,
+            }]});
+            let coded = features::extract(&value);
+            let mut plain = coded.clone();
+            plain.text.code = false;
+            let candidate = coded.candidates.first().unwrap();
+            let difference = candidate_score(&coded, candidate) - candidate_score(&plain, candidate);
+            let expected = if name == "shell" { weights::CODE_TO_SHELL } else { 0.0 };
+            assert!((difference - expected).abs() < 1e-10, "{name}: {difference}");
+        }
+    }
 
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),

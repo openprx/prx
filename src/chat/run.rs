@@ -295,7 +295,7 @@ pub async fn run(
         base_tools_vec,
     )?;
 
-    let turn_decisions = ctx
+    let mut turn_decisions = ctx
         .publish_turn_decisions(
             Arc::clone(&tools_registry),
             crate::causal_tree::state::TurnSurfaceKind::Interactive,
@@ -3110,7 +3110,8 @@ Retry with a compatible model: /provider {shown} <model>",
         };
         let provider_admission =
             provider_turn_visible_admission(&provider_turn_workers, provider_worker_kind, provider_admission_max);
-        if !provider_admission.can_start_visible {
+        let catalog_changed = turn_decisions.check_live_parity().is_err();
+        if !provider_admission.can_start_visible || (catalog_changed && provider_admission.active_workers > 0) {
             tracing::warn!(
                 active_workers = provider_admission.active_workers,
                 foreground_active = provider_admission.foreground_active,
@@ -3135,6 +3136,22 @@ Retry with a compatible model: /provider {shown} <model>",
             );
             publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
             continue;
+        }
+        if catalog_changed {
+            // Publish only at a new source boundary after existing model turns
+            // have finished. Their sealed catalog/grants are never rewritten.
+            // Keep publication's large builder future off the chat task's
+            // stack, including unoptimized binaries used by PTY regression.
+            let replacement = Box::pin(ctx.publish_turn_decisions(
+                Arc::clone(&tools_registry),
+                crate::causal_tree::state::TurnSurfaceKind::Interactive,
+            )).await?;
+            child_cleanup.retain_service(Arc::clone(&replacement));
+            let retired = std::mem::replace(&mut turn_decisions, replacement);
+            let retirement = child_cleanup.retire(&retired)?;
+            let drained = retired.drain_writes(std::time::Instant::now() + Duration::from_secs(2)).await;
+            retirement.finish(drained);
+            anyhow::ensure!(drained, "previous chat catalog writes were not confirmed");
         }
         fabric_turn_seq += 1;
         // D8-2: one run_id per turn, generated at the turn entry and reused by

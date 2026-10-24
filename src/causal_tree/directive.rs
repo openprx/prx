@@ -64,7 +64,10 @@ pub(crate) fn render_terminal_directive(
     match directive {
         TurnExecutionDirective::Clarify { reason_code } => Ok(std::borrow::Cow::Borrowed(match reason_code.as_str() {
             "deadline_exceeded" => "Could you narrow your request so I can finish it in time?",
-            "retrieve_evidence" | "hop_stopped" => "What specific information should I use to answer your request?",
+            "retrieve_evidence" => "I could not obtain enough supporting information. What source should I use?",
+            "hop_stopped" => {
+                "Capability selection stopped without a usable next step. Please specify the action or tool you need."
+            }
             "discover_capability" => "Which action would you like me to take?",
             "approval_requires_call" => APPROVAL_UNAVAILABLE_REPLY,
             _ => "Could you clarify the result you want?",

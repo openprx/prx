@@ -464,6 +464,8 @@ pub struct CandidateFeatures<'s> {
     pub target: &'s str,
     /// The risk floor of the side-effect class, in `[0, 1]`.
     pub side_effect_risk: f64,
+    /// The trusted side-effect class permits process execution.
+    pub executes_process: bool,
     /// An approval is required and not yet satisfied.
     pub approval_required: bool,
     /// The capability is available.
@@ -571,6 +573,7 @@ pub fn extract(state: &Value) -> StateFeatures<'_> {
             action: Action::from_code(str_at(candidate, "action")),
             target: str_at(candidate, "target"),
             side_effect_risk: super::weights::side_effect_risk(str_at(candidate, "side_effect")),
+            executes_process: str_at(candidate, "side_effect") == "process_exec",
             approval_required: str_at(candidate, "approval") == "required",
             available: candidate.get("available").and_then(Value::as_bool).unwrap_or(true),
             exact_mention: candidate.get("exact_mention").and_then(Value::as_bool).unwrap_or(false),

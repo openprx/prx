@@ -320,6 +320,7 @@ impl CausalCandidateGenerator {
             return Err(GateError::InvalidCandidateLimit);
         }
         let mut discoverable_families = DiscoveryFamilies::default();
+        let mut generation_rejections = BTreeMap::new();
         let mut exact_mentions = BTreeSet::new();
         // Approval-only exact mentions with no bound call that must not turn
         // into a plain Answer (full-name mentions of collectable entries).
@@ -343,6 +344,7 @@ impl CausalCandidateGenerator {
                 catalog,
                 policy,
                 gates,
+                &mut generation_rejections,
             )? {
                 proposed.push(candidate);
             }
@@ -374,7 +376,7 @@ impl CausalCandidateGenerator {
                             Some(Ns8::of(policy.key, &entry.namespace)),
                         );
                         let admission = HardGates::check_one(state, catalog, &candidate, gates);
-                        trace_rejected(&candidate, &admission);
+                        trace_rejected(&candidate, &admission, &mut generation_rejections);
                         match admission {
                             GateOutcome::Passed => {
                                 selected = Some(candidate);
@@ -428,6 +430,7 @@ impl CausalCandidateGenerator {
                             catalog,
                             policy,
                             gates,
+                            &mut generation_rejections,
                         )? {
                             // An admitted exact mention already represents this entry.
                             // Preserve family fallback for other entries and unmatched input.
@@ -471,6 +474,7 @@ impl CausalCandidateGenerator {
                             catalog,
                             policy,
                             gates,
+                            &mut generation_rejections,
                         )? {
                             proposed.push(candidate);
                         }
@@ -500,6 +504,7 @@ impl CausalCandidateGenerator {
                             catalog,
                             policy,
                             gates,
+                            &mut generation_rejections,
                         )? {
                             let outcome = HardGates::check_one(state, catalog, &candidate, gates);
                             *eligible = outcome == GateOutcome::Passed;
@@ -551,6 +556,7 @@ impl CausalCandidateGenerator {
                     catalog,
                     policy,
                     gates,
+                    &mut generation_rejections,
                 )? {
                     if policy.delegation_target.is_some() || exact_delegator.is_some() {
                         exact_mentions.insert(candidate.candidate_id().clone());
@@ -609,7 +615,12 @@ impl CausalCandidateGenerator {
             }
             proposed.push(refusal);
         }
-        let report = HardGates::apply(state, catalog, &proposed, gates)?;
+        let mut report = HardGates::apply(state, catalog, &proposed, gates)?;
+        // Preserve refusals that removed a probe before final candidate
+        // construction. Never override the final admission of a retained ID.
+        for (id, outcome) in generation_rejections {
+            report.outcomes.entry(id).or_insert(outcome);
+        }
         let mut legal = Vec::new();
         for candidate in proposed {
             if matches!(report.outcomes.get(candidate.candidate_id()), Some(GateOutcome::Passed)) {
@@ -701,6 +712,7 @@ fn select_family_candidate<'a>(
     catalog: &CatalogView<'_>,
     policy: &CandidatePolicy<'_>,
     gates: &GateInputs<'_>,
+    generation_rejections: &mut BTreeMap<CandidateId, GateOutcome>,
 ) -> Result<Option<CausalCandidate>, GateError> {
     let mut approval_only = None;
     for entry in entries {
@@ -732,7 +744,7 @@ fn select_family_candidate<'a>(
         let namespace = bind_namespace.then(|| Ns8::of(policy.key, &entry.namespace));
         let candidate = from_entry(action, family, entry, policy, namespace);
         let outcome = HardGates::check_one(state, catalog, &candidate, gates);
-        trace_rejected(&candidate, &outcome);
+        trace_rejected(&candidate, &outcome, generation_rejections);
         match outcome {
             GateOutcome::Passed => return Ok(Some(candidate)),
             GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() && approval_only.is_none() => {
@@ -793,9 +805,18 @@ fn from_entry(
 }
 
 /// Record why a generator probe left the candidate set. Probes that fail a
-/// gate never reach the stored gate report, so without this trace a refusal
-/// cannot be attributed to a gate.
-fn trace_rejected(candidate: &CausalCandidate, outcome: &GateOutcome) {
+/// gate are retained as diagnostic outcomes when the final candidate set
+/// does not contain their ID. They never supply executable candidate bodies.
+fn trace_rejected(
+    candidate: &CausalCandidate,
+    outcome: &GateOutcome,
+    rejections: &mut BTreeMap<CandidateId, GateOutcome>,
+) {
+    if matches!(outcome, GateOutcome::Blocked { .. }) {
+        rejections
+            .entry(candidate.candidate_id().clone())
+            .or_insert_with(|| outcome.clone());
+    }
     match outcome {
         GateOutcome::Passed | GateOutcome::ApprovalOnly { .. } => {}
         GateOutcome::Blocked { gate, reason_code } => tracing::debug!(
@@ -896,7 +917,7 @@ fn available_for_fallback(entry: &CapabilityEntry, policy: &CandidatePolicy<'_>)
         })
 }
 
-fn exact_mention(folded_text: &str, entry: &CapabilityEntry) -> bool {
+pub(super) fn exact_mention(folded_text: &str, entry: &CapabilityEntry) -> bool {
     entry
         .exact_mention_terms
         .iter()
@@ -2219,6 +2240,7 @@ mod tests {
             &view,
             &policy,
             &gates,
+            &mut BTreeMap::new(),
         )
         .unwrap();
         assert!(skipped.is_none());
@@ -2235,6 +2257,7 @@ mod tests {
             &view,
             &policy,
             &gates,
+            &mut BTreeMap::new(),
         )
         .unwrap();
         assert!(considered.is_some());
@@ -2391,6 +2414,7 @@ mod tests {
                     view,
                     policy,
                     gates,
+                    &mut BTreeMap::new(),
                 )
                 .unwrap();
                 assert!(selected.is_none());
@@ -2588,6 +2612,7 @@ mod tests {
             let CandidateSet::Legal {
                 candidates,
                 exact_mentions,
+                report,
                 ..
             } = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).expect("legal fixture")
             else {
@@ -2612,6 +2637,16 @@ mod tests {
                 assert!(count <= 1, "exact and family cannot duplicate an entry");
             }
             if blocked {
+                assert!(
+                    report.outcomes.values().any(|outcome| matches!(
+                        outcome,
+                        GateOutcome::Blocked {
+                            gate: 2,
+                            reason_code: "excluded"
+                        }
+                    )),
+                    "the discarded exact candidate keeps its refusal evidence"
+                );
                 assert!(
                     tools.iter().all(|candidate| candidate
                         .required_capabilities()
@@ -3192,6 +3227,7 @@ mod tests {
                 &view,
                 &policy,
                 &gates,
+                &mut BTreeMap::new(),
             )
             .unwrap();
             let actual_pricing = counting_cost.entries.load(Ordering::Relaxed);
@@ -3359,6 +3395,7 @@ mod tests {
                 &view,
                 &policy,
                 &gates,
+                &mut BTreeMap::new(),
             )
             .unwrap()
             .expect("optimized selection");

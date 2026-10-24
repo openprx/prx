@@ -1101,6 +1101,7 @@ impl CausalDecisionEngine {
                         resume_target,
                         inputs.discovered_refs,
                         inputs.config.enabled,
+                        state.routing_input.as_str(),
                     ),
                     &inputs.config.evaluation,
                     inputs.key,
@@ -1121,6 +1122,7 @@ impl CausalDecisionEngine {
                             resume_target,
                             inputs.discovered_refs,
                             inputs.config.enabled,
+                            state.routing_input.as_str(),
                         ),
                     )?,
                     BTreeMap::new(),
@@ -1141,6 +1143,7 @@ impl CausalDecisionEngine {
                         resume_target,
                         inputs.discovered_refs,
                         inputs.config.enabled,
+                        state.routing_input.as_str(),
                     ),
                 )?,
                 BTreeMap::new(),
@@ -1163,6 +1166,7 @@ impl CausalDecisionEngine {
                     resume_target,
                     inputs.discovered_refs,
                     inputs.config.enabled,
+                    state.routing_input.as_str(),
                 ),
             )?;
             exploration_propensities.clear();
@@ -1470,9 +1474,7 @@ fn candidate_is_direct(
                     && reference.generation == catalog.generation()
                     && reference.generation == entry.generation
                     && reference.fingerprint == entry.fingerprint
-                    && matches!(entry.family, super::branch::CapabilityTarget::Skill
-                        | super::branch::CapabilityTarget::Mcp | super::branch::CapabilityTarget::NativeTool
-                        | super::branch::CapabilityTarget::Wasm | super::branch::CapabilityTarget::Hook)
+                    && super::candidate_generator::DiscoveryFamilies::supports(entry.family)
                     && discovered_refs.contains(reference))
                 // A freshly authenticated exact resume already owns
                 // this concrete capability. It need not rediscover
@@ -1546,6 +1548,7 @@ fn selector_context(
         interactive,
         direct_candidates,
         discovery_completed: discovered_refs.iter().next().is_some(),
+        single_exact_capability: false,
     }
 }
 
@@ -1556,8 +1559,16 @@ fn selector_context_for_config(
     resume_target: Option<&CapabilityRef>,
     discovered_refs: &DiscoveredRefs,
     decision_enabled: bool,
+    routing_input: &str,
 ) -> SelectorContext {
     let mut context = selector_context(set, catalog, interactive, resume_target, discovered_refs);
+    let folded = routing_input.to_lowercase();
+    context.single_exact_capability = catalog
+        .iter_entries()
+        .filter(|entry| super::candidate_generator::exact_mention(&folded, entry))
+        .take(2)
+        .count()
+        == 1;
     if decision_enabled {
         return context;
     }
@@ -2727,13 +2738,43 @@ mod tests {
             exact_mentions.insert(use_id.clone());
         }
         assert!(
-            selector_context_for_config(&available_set, &view, true, None, &DiscoveredRefs::empty(), true,)
+            selector_context_for_config(
+                &available_set,
+                &view,
+                true,
+                None,
+                &DiscoveredRefs::empty(),
+                true,
+                &entry.public_name,
+            )
+            .single_exact_capability
+        );
+        let peer = view
+            .entries()
+            .iter()
+            .find(|peer| peer.id != entry.id)
+            .expect("catalog peer");
+        assert!(
+            !selector_context_for_config(
+                &available_set,
+                &view,
+                true,
+                None,
+                &DiscoveredRefs::empty(),
+                true,
+                &format!("Use {} then {}", entry.public_name, peer.public_name),
+            )
+            .single_exact_capability,
+            "per-family candidate collapse must not hide another named capability"
+        );
+        assert!(
+            selector_context_for_config(&available_set, &view, true, None, &DiscoveredRefs::empty(), true, "",)
                 .direct_candidates
                 .is_empty(),
             "an enabled decision plane must discover an exact discoverable-family tool"
         );
         assert_eq!(
-            selector_context_for_config(&available_set, &view, true, None, &DiscoveredRefs::empty(), false,)
+            selector_context_for_config(&available_set, &view, true, None, &DiscoveredRefs::empty(), false, "",)
                 .direct_candidates,
             BTreeSet::from([use_id.clone()]),
             "disabled mode preserves legacy exact-name publication without widening peers"

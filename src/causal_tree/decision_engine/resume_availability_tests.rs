@@ -82,7 +82,7 @@ fn resume_availability_is_single_current_reference_and_never_catalog_exposure() 
             .is_empty()
     );
     let selected = selector_context(&set, &view, true, Some(target), &DiscoveredRefs::empty());
-    assert_eq!(selected.direct_candidates, BTreeSet::from([first]));
+    assert_eq!(selected.direct_candidates, BTreeSet::from([first.clone()]));
     assert!(!selected.direct_candidates.contains(&second));
     for stale_schema in [true, false] {
         let mut stale = target.clone();
@@ -143,10 +143,15 @@ fn resume_availability_is_single_current_reference_and_never_catalog_exposure() 
             .direct_candidates
             .is_empty()
     );
-    // Filesystem remains unsupported for the selected-discovery path.
-    let unsupported = DiscoveredRefs::from_refs_for_test(BTreeSet::from([target.clone()]));
+    // Discovery supports Filesystem too, but publishes only the exact ref;
+    // neither its peer nor a compound candidate becomes ready.
+    let discovered = DiscoveredRefs::from_refs_for_test(BTreeSet::from([target.clone()]));
+    assert_eq!(
+        selector_context(&set, &view, true, None, &discovered).direct_candidates,
+        BTreeSet::from([first]),
+    );
     assert!(
-        selector_context(&set, &view, true, None, &unsupported)
+        selector_context(&compound, &view, true, None, &discovered)
             .direct_candidates
             .is_empty()
     );

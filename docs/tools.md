@@ -1629,8 +1629,18 @@ decision details. Failure to persist that terminal record still stops the chat.
 Refused queued requests release their scheduler slot. Recognized infrastructure
 failures instead report that resume failed before execution and can be retried;
 chat does not retry automatically or display private error details.
-Catalog parity checks still apply: after an operation changes the pinned skill
-catalog, start a fresh chat for further model work with the updated catalog.
+Catalog parity checks still apply. After an operation changes the skill catalog,
+chat waits for existing model turns to finish, then publishes the current catalog
+before admitting the next model turn. A fresh chat is not required. Existing
+turns retain their sealed catalog; consumed or stale approvals are not refreshed
+or reused by this publication.
+
+Decision records expose `gates.rejected_by_gate` for the current decision hop
+and `gates.turn_rejected_by_gate` for the cumulative turn prefix. The counters
+include totals and counts by gate and reason. A candidate is counted once at
+its first blocking gate within a hop, even when later gate passes repeat the
+same refusal. Approval waits are excluded. A candidate rejected again in a
+later hop is another observation; these totals are not independent bug counts.
 
 Chat prompt Skill metadata and tool selection no longer accumulate across turns. Each turn uses its current selection in canonical prompt order; decision-owned turns continue through the pinned constrained execution reader. Legacy routing uses its stateless fallback with the existing operator exclusions. Cache stability and performance remain subject to the unchanged centralized budgets.
 

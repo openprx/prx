@@ -10,6 +10,129 @@ struct DiscoverySurfaceTool {
     dispatches: Arc<AtomicUsize>,
 }
 
+#[tokio::test]
+async fn named_memory_recall_becomes_ready_after_selected_discovery_without_publishing_peers() {
+    for excluded in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        config.causal_tree.enabled = true;
+        config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+            )
+            .unwrap(),
+        );
+        let generation = crate::config::new_shared(config.clone()).pin();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+        memory
+            .store(
+                "prx_recall_probe",
+                "durable fixture value",
+                crate::memory::MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            // Production publishes this retrieval source alongside recall.
+            // Omitting it hides the Retrieve -> Discover -> hop-limit failure.
+            Box::new(crate::tools::memory_search::MemorySearchTool::new(
+                workspace.path().to_owned(),
+                Arc::clone(&memory),
+                false,
+            )),
+            Box::new(crate::tools::memory_recall::MemoryRecallTool::new(
+                Arc::clone(&memory),
+                false,
+            )),
+            Box::new(crate::tools::memory_get::MemoryGetTool::new(
+                workspace.path().to_owned(),
+                Arc::clone(&memory),
+                false,
+            )),
+            Box::new(CapabilitySearchTool),
+        ]);
+        let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
+            Arc::clone(&registry),
+            Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+            Arc::new(DenyApprovalStrategy),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        ));
+        let provider_catalog = ProviderCatalogView::from_config(&config);
+        let transports = CountingTransports(AtomicUsize::new(0));
+        let service = build_turn_decision_service(
+            TurnSurfaceKind::AgentLoop,
+            TurnServiceBuild {
+                parent_grant: None,
+                generation: Arc::clone(&generation),
+                registry,
+                execution,
+                catalog_sources: sources(&generation, &config),
+                surface_policy: SurfacePolicy {
+                    excluded_names: if excluded {
+                        BTreeSet::from(["memory_recall".to_owned()])
+                    } else {
+                        BTreeSet::new()
+                    },
+                    ..SurfacePolicy::default()
+                },
+                provider_catalog: &provider_catalog,
+                transports: &transports,
+                events: Arc::new(SilentEvents),
+                memory: Arc::clone(&memory),
+                security,
+            },
+        )
+        .await
+        .unwrap();
+        let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+            &generation,
+            Arc::clone(&memory),
+            "Use memory_recall to search durable memory for prx_recall_probe and quote its stored content. Do not use workspace files or guess.",
+            "prx_named_memory_discovery",
+            ("ollama", "prx-local-model"),
+        ).await;
+        let context = service
+            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .await
+            .unwrap();
+        let published = service.agent_execution_specs(&proof, &context);
+        if excluded {
+            assert!(published.is_err() || published.unwrap().specs.iter().all(|spec| spec.name != "memory_recall"));
+        } else {
+            assert!(
+                matches!(context.directive(), TurnExecutionDirective::Execute { .. }),
+                "{:?}",
+                context.directive()
+            );
+            let specs = published.unwrap();
+            assert!(specs.specs.iter().any(|spec| spec.name == "memory_recall"));
+            assert!(
+                specs.specs.iter().all(|spec| spec.name != "memory_get"),
+                "discovery is one exact ref, not a family grant"
+            );
+            assert!(specs.specs.iter().all(|spec| spec.name != "memory_search"));
+            assert!(
+                context
+                    .engine()
+                    .state
+                    .observed
+                    .completed_steps()
+                    .iter()
+                    .any(|step| step.kind() == ObservedStepKind::Discover && step.status() == ObservedStepStatus::Ok)
+            );
+            assert_eq!(context.hop_ids().len(), 2, "discover, then execute the exact ref");
+        }
+        assert_eq!(transports.0.load(Ordering::SeqCst), 0);
+        context.terminal_execution_trace();
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for DiscoverySurfaceTool {
     fn name(&self) -> &str {

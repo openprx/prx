@@ -1,7 +1,7 @@
 //! Pure construction of bounded decision records. A successful turn queues
 //! the complete chain separately; this module performs no I/O.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -39,6 +39,50 @@ pub(crate) enum RecordBuildError {
 
 pub(crate) struct DecisionRecordBuilder;
 
+/// Count a candidate once per hop at its first blocking gate, not once per
+/// repeated gate pass. Approval deferral is not a rejection. Turn totals sum
+/// these hop observations; they are not a count of independent defects.
+#[derive(Default, Clone, serde::Serialize)]
+struct GateRejections {
+    total: usize,
+    by_gate: BTreeMap<u8, usize>,
+    by_reason: BTreeMap<&'static str, usize>,
+}
+
+impl GateRejections {
+    fn add(&mut self, other: &Self) {
+        self.total += other.total;
+        for (gate, count) in &other.by_gate {
+            *self.by_gate.entry(*gate).or_default() += count;
+        }
+        for (reason, count) in &other.by_reason {
+            *self.by_reason.entry(reason).or_default() += count;
+        }
+    }
+
+    fn from_reports<'a>(reports: impl IntoIterator<Item = &'a GateReport>) -> Self {
+        let mut result = Self::default();
+        let mut seen = BTreeSet::new();
+        for report in reports {
+            for (candidate, outcome) in &report.outcomes {
+                if let GateOutcome::Blocked { gate, reason_code } = outcome
+                    && seen.insert(candidate)
+                {
+                    result.total += 1;
+                    *result.by_gate.entry(*gate).or_default() += 1;
+                    *result.by_reason.entry(reason_code).or_default() += 1;
+                }
+            }
+        }
+        result
+    }
+
+    fn for_hop(hop: &EngineDecision) -> Self {
+        let (CandidateSet::Legal { report, .. } | CandidateSet::NoLegalPath { report, .. }) = &hop.candidates;
+        Self::from_reports([report, &hop.post_rehearsal, &hop.pre_commit])
+    }
+}
+
 impl DecisionRecordBuilder {
     /// Build every hop before any queue admission. A failed or cancelled
     /// service call has no context and cannot reach this method.
@@ -56,6 +100,7 @@ impl DecisionRecordBuilder {
             return Err(RecordBuildError::Chain);
         }
         let mut records = Vec::with_capacity(hops.len());
+        let mut turn_rejections = GateRejections::default();
         for (index, (hop, expected_id)) in hops.iter().zip(context.hop_ids()).enumerate() {
             if hop.decision_id != *expected_id {
                 return Err(RecordBuildError::Chain);
@@ -72,13 +117,14 @@ impl DecisionRecordBuilder {
                 }
                 _ => return Err(RecordBuildError::Chain),
             };
-            records.push(Self::build_hop(
-                hop,
-                key,
-                prior,
-                enabled_and_recordable,
-                record_redacted_projection,
-            )?);
+            let mut record = Self::build_hop(hop, key, prior, enabled_and_recordable, record_redacted_projection)?;
+            turn_rejections.add(&GateRejections::for_hop(hop));
+            record
+                .gates
+                .as_object_mut()
+                .ok_or(RecordBuildError::Binding)?
+                .insert("turn_rejected_by_gate".to_owned(), json!(turn_rejections));
+            records.push(record);
         }
         if !same_turn_chain(&records) {
             return Err(RecordBuildError::Chain);
@@ -204,6 +250,9 @@ impl DecisionRecordBuilder {
         gate_values.insert("pre_prediction".to_owned(), gate_fields(first_gates, key));
         gate_values.insert("post_rehearsal".to_owned(), gate_fields(&hop.post_rehearsal, key));
         gate_values.insert("pre_commit".to_owned(), gate_fields(&hop.pre_commit, key));
+        let rejected = json!(GateRejections::for_hop(hop));
+        gate_values.insert("rejected_by_gate".to_owned(), rejected.clone());
+        gate_values.insert("turn_rejected_by_gate".to_owned(), rejected);
         let mut gates = Value::Object(gate_values);
         if let Selection::CollectApprovalArguments(proof) = &hop.selection {
             if proof.state_fingerprint() != state_fingerprint
@@ -1129,6 +1178,53 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn rejection_counts_deduplicate_passes_and_keep_approval_waits_separate() {
+        let key = fixtures::key();
+        let id = |action| {
+            fixtures::candidate(&key, action, CapabilityTarget::None, None)
+                .candidate
+                .candidate_id()
+                .clone()
+        };
+        let first = GateReport {
+            outcomes: BTreeMap::from([
+                (
+                    id(CausalActionKind::Answer),
+                    GateOutcome::Blocked {
+                        gate: 3,
+                        reason_code: "model_unavailable",
+                    },
+                ),
+                (id(CausalActionKind::Clarify), GateOutcome::ApprovalDeferred),
+                (id(CausalActionKind::Refuse), GateOutcome::Passed),
+            ]),
+            gate_set_hash: [0; 32],
+        };
+        let mut later = first.clone();
+        later.outcomes.insert(
+            id(CausalActionKind::Clarify),
+            GateOutcome::Blocked {
+                gate: 9,
+                reason_code: "approval_missing",
+            },
+        );
+        let counts = GateRejections::from_reports([&first, &later, &later]);
+        assert_eq!(counts.total, 2);
+        assert_eq!(counts.by_gate, BTreeMap::from([(3, 1), (9, 1)]));
+        assert_eq!(
+            counts.by_reason,
+            BTreeMap::from([("model_unavailable", 1), ("approval_missing", 1)])
+        );
+        let mut turn = GateRejections::default();
+        turn.add(&counts);
+        turn.add(&counts);
+        assert_eq!(
+            turn.total, 4,
+            "turn totals count hop observations, not distinct defects"
+        );
+    }
+
     fn priced_usage(id: &str, cost: f64) -> MeteredTokenUsageRecord {
         MeteredTokenUsageRecord {
             settlement_id: Some(id.to_owned()),
@@ -1419,8 +1515,23 @@ mod tests {
             };
             let record = DecisionRecordBuilder::build_hop(&decision, &key, None, true, false)
                 .expect("actual record builder accepts fixture binding");
+            let mut original_phases = record.gates.clone();
+            let fields = original_phases.as_object_mut().expect("gate object");
+            let counts = fields.remove("rejected_by_gate").expect("hop rejection counts");
+            assert_eq!(fields.remove("turn_rejected_by_gate"), Some(counts.clone()));
+            let blocked = usize::from(
+                report
+                    .outcomes
+                    .values()
+                    .any(|outcome| matches!(outcome, GateOutcome::Blocked { .. })),
+            );
             assert_eq!(
-                serde_json::to_vec(&record.gates).expect("actual gate JSON"),
+                counts.get("total"),
+                Some(&json!(blocked)),
+                "repeated gate passes count once"
+            );
+            assert_eq!(
+                serde_json::to_vec(&original_phases).expect("actual gate phases JSON"),
                 serde_json::to_vec(&legacy).expect("legacy gate JSON"),
                 "persisted gate bytes must remain exact, including empty/null/string distinctions"
             );

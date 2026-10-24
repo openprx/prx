@@ -60,6 +60,9 @@ pub(crate) struct SelectorContext {
     /// this turn. This can settle a targetless Answer; it never makes a tool
     /// candidate direct or bypasses its gates.
     pub discovery_completed: bool,
+    /// Count raw catalog mentions before the per-family candidate collapse.
+    /// A multi-tool task must not be narrowed to its first read-only candidate.
+    pub single_exact_capability: bool,
 }
 
 pub(crate) struct CausalSelector;
@@ -350,7 +353,15 @@ impl CausalSelector {
         if no_choice_mass || other_action || other_target {
             return terminal_abstain(candidates, pre_commit, context, "choice_outside_legal_set");
         }
-        if (insufficient || stale)
+        // An explicitly selected read-only tool can obtain the missing
+        // evidence itself. Retrieving generic context first can consume the
+        // bounded recovery budget before its exact ref is discovered. Keep
+        // freshness recovery, write/delegation behavior and every hard gate.
+        let exact_read = exact_selected_action
+            && context.single_exact_capability
+            && top.action() == CausalActionKind::UseTool
+            && top.side_effect() == SideEffectClass::ReadOnly;
+        if (insufficient && !exact_read || stale)
             && let Some(candidate) = retrieve
         {
             return Ok(Selection::Recover {
@@ -678,6 +689,7 @@ mod tests {
             interactive: true,
             direct_candidates,
             discovery_completed: false,
+            single_exact_capability: false,
         };
         (
             set,
@@ -1094,6 +1106,116 @@ mod tests {
         let selection = CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context)
             .unwrap_or_else(|error| panic!("{error}"));
         assert!(matches!(selection, Selection::Abstain { .. }));
+    }
+
+    #[test]
+    fn exact_read_discovers_or_executes_without_a_redundant_retrieval() {
+        for (exact, effect, stale, direct, single) in [
+            (true, SideEffectClass::ReadOnly, false, false, true),
+            (true, SideEffectClass::ReadOnly, false, true, false),
+            (true, SideEffectClass::ReadOnly, false, true, true),
+            (false, SideEffectClass::ReadOnly, false, false, true),
+            (true, SideEffectClass::LocalWrite, false, false, true),
+            (true, SideEffectClass::ReadOnly, true, false, true),
+            (true, SideEffectClass::ReadOnly, true, true, true),
+        ] {
+            let (mut set, mut scores, mut evidence, mut report, policy, mut context) = fixture(0.5);
+            let tool = CausalCandidate::new(
+                CausalActionKind::UseTool,
+                CapabilityTarget::Memory,
+                CandidateSpec {
+                    namespace: None,
+                    required_capabilities: Vec::new(),
+                    side_effect: effect,
+                    approval: ApprovalRequirement::None,
+                    estimated_cost: Some(CostEstimate {
+                        tokens: 1,
+                        micro_usd: 1,
+                    }),
+                    estimated_latency_ms: Some(1),
+                },
+            );
+            let discover = candidate(CausalActionKind::Discover, CapabilityTarget::Memory);
+            let prediction = evidence.candidates.values().next().unwrap().clone();
+            for score in scores.values_mut() {
+                score.execution_utility = 0.1;
+            }
+            for (item, utility) in [(&tool, 0.95), (&discover, 0.7)] {
+                scores.insert(
+                    item.candidate_id().clone(),
+                    CandidateScore {
+                        semantic_utility: utility,
+                        execution_utility: utility,
+                    },
+                );
+                evidence
+                    .candidates
+                    .insert(item.candidate_id().clone(), prediction.clone());
+                report.outcomes.insert(item.candidate_id().clone(), GateOutcome::Passed);
+            }
+            evidence.chosen_action = "use_tool".to_owned();
+            evidence.chosen_target = "memory".to_owned();
+            evidence.target_probabilities.insert(CapabilityTarget::Memory, 0.9);
+            context.single_exact_capability = single;
+            evidence.evidence_sufficient = 0.0;
+            evidence.needs_fresh_state = if stale { 0.9 } else { 0.0 };
+            if direct {
+                context.direct_candidates.insert(tool.candidate_id().clone());
+            }
+            let CandidateSet::Legal {
+                candidates,
+                exact_mentions,
+                ..
+            } = &mut set
+            else {
+                panic!("expected legal candidates");
+            };
+            let retrieval_id = candidates
+                .iter()
+                .find(|item| item.action() == CausalActionKind::Retrieve)
+                .unwrap()
+                .candidate_id()
+                .clone();
+            candidates.extend([tool.clone(), discover.clone()]);
+            if exact {
+                exact_mentions.insert(tool.candidate_id().clone());
+            }
+            let selection = CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap();
+            let expected = if exact && single && effect == SideEffectClass::ReadOnly && !stale {
+                if direct {
+                    Selection::Commit {
+                        candidate_id: tool.candidate_id().clone(),
+                        propensity: 1.0,
+                    }
+                } else {
+                    Selection::Recover {
+                        candidate_id: discover.candidate_id().clone(),
+                        reason_code: "discover_capability",
+                    }
+                }
+            } else {
+                Selection::Recover {
+                    candidate_id: retrieval_id,
+                    reason_code: "retrieve_evidence",
+                }
+            };
+            assert_eq!(
+                selection, expected,
+                "exact={exact} effect={effect:?} stale={stale} direct={direct}"
+            );
+
+            report.outcomes.insert(
+                tool.candidate_id().clone(),
+                GateOutcome::Blocked {
+                    gate: 9,
+                    reason_code: "explicit_restriction",
+                },
+            );
+            assert!(!matches!(
+                CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap(),
+                Selection::Commit { candidate_id, .. } if candidate_id == *tool.candidate_id()
+            ));
+        }
     }
 
     #[test]
