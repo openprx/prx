@@ -361,7 +361,7 @@ impl CausalCandidateGenerator {
                     for entry in catalog.iter_entries().filter(|entry| {
                         entry.family == family
                             && !matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
-                            && (exact_mention(&folded_input, entry)
+                            && (exact_operation_mention(&folded_input, entry, catalog)
                                 || resume_target.is_some_and(|reference| {
                                     reference.id == entry.id
                                         && reference.fingerprint == entry.fingerprint
@@ -922,6 +922,22 @@ pub(super) fn exact_mention(folded_text: &str, entry: &CapabilityEntry) -> bool 
         .exact_mention_terms
         .iter()
         .any(|name| contains_bounded(folded_text, name))
+}
+
+/// Naming a Skill and its registered read-only loader names one operation.
+/// Keep the concrete Skill as the exact candidate so generic target-choice
+/// ties cannot disagree with the cheaper, more specific candidate's score.
+/// This changes intent ranking only; every Skill reference still passes gates.
+pub(super) fn exact_operation_mention(folded_text: &str, entry: &CapabilityEntry, catalog: &CatalogView<'_>) -> bool {
+    use crate::tools::capability::catalog::ExecutionTarget;
+
+    exact_mention(folded_text, entry)
+        && !matches!(&entry.target, ExecutionTarget::Tool(name)
+        if entry.effect == SideEffectClass::ReadOnly && catalog.iter_entries().any(|skill| {
+            skill.effect == SideEffectClass::ReadOnly
+                && exact_mention(folded_text, skill)
+                && matches!(&skill.target, ExecutionTarget::Skill { root, .. } if root == name)
+        }))
 }
 
 fn contains_bounded(text: &str, name: &str) -> bool {

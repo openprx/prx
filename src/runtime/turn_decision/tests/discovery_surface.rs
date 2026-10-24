@@ -133,6 +133,119 @@ async fn named_memory_recall_becomes_ready_after_selected_discovery_without_publ
     }
 }
 
+#[tokio::test]
+async fn named_skill_and_loader_select_the_skill_without_competing_targets() {
+    for excluded in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        config.causal_tree.enabled = true;
+        config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+            )
+            .unwrap(),
+        );
+        let skill_dir = workspace.path().join("skills/docx");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: docx\ndescription: Create Word documents\n---\nUse the installed Node document package.\n",
+        )
+        .unwrap();
+        config.skills.open_skills_dir = Some(workspace.path().join("missing-open-skills").display().to_string());
+        config.skills.openclaw_skills_dir =
+            Some(workspace.path().join("missing-openclaw-skills").display().to_string());
+        let generation = crate::config::new_shared(config.clone()).pin();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            // Keep the real retrieval source that exposed the bounded-hop failure.
+            // Omitting it hides the Retrieve -> Discover -> hop-limit failure.
+            Box::new(crate::tools::memory_search::MemorySearchTool::new(
+                workspace.path().to_owned(),
+                Arc::clone(&memory),
+                false,
+            )),
+            Box::new(crate::tools::SkillReadTool::new(
+                workspace.path().to_owned(),
+                config.clone(),
+            )),
+            Box::new(CapabilitySearchTool),
+        ]);
+        let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
+            Arc::clone(&registry),
+            Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+            Arc::new(DenyApprovalStrategy),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        ));
+        let provider_catalog = ProviderCatalogView::from_config(&config);
+        let transports = CountingTransports(AtomicUsize::new(0));
+        let service = build_turn_decision_service(
+            TurnSurfaceKind::AgentLoop,
+            TurnServiceBuild {
+                parent_grant: None,
+                generation: Arc::clone(&generation),
+                registry,
+                execution,
+                catalog_sources: sources(&generation, &config),
+                surface_policy: SurfacePolicy {
+                    excluded_names: if excluded {
+                        BTreeSet::from(["docx".to_owned()])
+                    } else {
+                        BTreeSet::new()
+                    },
+                    ..SurfacePolicy::default()
+                },
+                provider_catalog: &provider_catalog,
+                transports: &transports,
+                events: Arc::new(SilentEvents),
+                memory: Arc::clone(&memory),
+                security,
+            },
+        )
+        .await
+        .unwrap();
+        let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+            &generation,
+            Arc::clone(&memory),
+            "Use skill_read to read the installed docx skill, then follow it. Create named.docx with title Capability regression. Save a reusable implementation as named.js, generate the document, and verify the actual document text.",
+            "prx_named_skill_loader",
+            ("ollama", "prx-local-model"),
+        ).await;
+        let context = service
+            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .await
+            .unwrap();
+        let published = service.agent_execution_specs(&proof, &context);
+        if excluded {
+            assert!(published.is_err() || published.unwrap().specs.iter().all(|spec| spec.name != "docx"));
+        } else {
+            assert!(
+                matches!(context.directive(), TurnExecutionDirective::Execute { .. }),
+                "{:?}",
+                context.directive()
+            );
+            let specs = published.unwrap();
+            assert!(specs.specs.iter().any(|spec| spec.name == "docx"));
+            assert!(
+                specs.specs.iter().all(|spec| spec.name != "skill_read"),
+                "publish the selected skill, not its generic loader"
+            );
+            assert!(specs.specs.iter().all(|spec| spec.name != "memory_search"));
+            assert!(
+                context.hop_ids().len() <= 2,
+                "selection stays within the existing hop budget"
+            );
+        }
+        assert_eq!(transports.0.load(Ordering::SeqCst), 0);
+        context.terminal_execution_trace();
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for DiscoverySurfaceTool {
     fn name(&self) -> &str {

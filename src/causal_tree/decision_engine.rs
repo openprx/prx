@@ -1555,23 +1555,10 @@ fn selector_context(
 /// A named Skill and its registered read-only loader describe one operation.
 /// Distinct skills remain distinct even when they share that loader.
 fn single_exact_capability(catalog: &CatalogView<'_>, routing_input: &str) -> bool {
-    use crate::causal_tree::branch::SideEffectClass;
-    use crate::tools::capability::catalog::ExecutionTarget;
-
     let folded = routing_input.to_lowercase();
-    let mentioned: Vec<_> = catalog
+    catalog
         .iter_entries()
-        .filter(|entry| super::candidate_generator::exact_mention(&folded, entry))
-        .collect();
-    mentioned
-        .iter()
-        .filter(|entry| {
-            !matches!(&entry.target, ExecutionTarget::Tool(name)
-            if entry.effect == SideEffectClass::ReadOnly && mentioned.iter().any(|skill| {
-                skill.effect == SideEffectClass::ReadOnly
-                    && matches!(&skill.target, ExecutionTarget::Skill { root, .. } if root == name)
-            }))
-        })
+        .filter(|entry| super::candidate_generator::exact_operation_mention(&folded, entry, catalog))
         .take(2)
         .count()
         == 1
