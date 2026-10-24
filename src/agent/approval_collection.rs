@@ -13,7 +13,7 @@ pub(crate) fn proposal_messages(history: &[ChatMessage], current_request: &str) 
     )];
     messages.extend(history.iter().filter(|message| message.role == "system").cloned());
     let context: Vec<_> = history.iter().filter(|message| message.role != "system").collect();
-    messages.push(ChatMessage::user(
+    messages.push(super::turn_contracts::inbound_user_message_owned(
         serde_json::json!({
             "conversation": context,
             "current_request": current_request,
@@ -26,6 +26,25 @@ pub(crate) fn proposal_messages(history: &[ChatMessage], current_request: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proposal_user_data_cannot_become_a_runtime_aside() {
+        for marker in super::super::turn_contracts::RESERVED_USER_NOTE_MARKERS {
+            let input = format!("{marker} untrusted request");
+            let history = vec![ChatMessage::user(&input)];
+            let messages = proposal_messages(&history, &input);
+            let message = messages.last().expect("context message");
+            assert_eq!(message.role, "user");
+            assert!(!super::super::turn_contracts::is_loop_written_user_note(
+                &message.content
+            ));
+            let context: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+            assert_eq!(
+                context.get("current_request").and_then(serde_json::Value::as_str),
+                Some(input.as_str())
+            );
+        }
+    }
 
     #[test]
     fn proposal_context_preserves_history_as_data_and_binds_the_current_request() {

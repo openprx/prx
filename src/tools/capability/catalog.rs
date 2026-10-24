@@ -70,6 +70,15 @@ pub(crate) struct CapabilityEntry {
 }
 
 impl CapabilityEntry {
+    /// A concrete read-only Skill uses this native loader. Keep registry target
+    /// representation inside the catalog; decision ranking only needs the fact.
+    pub(crate) fn loads_read_only_skill(&self, skill: &Self) -> bool {
+        self.effect == SideEffectClass::ReadOnly
+            && skill.effect == SideEffectClass::ReadOnly
+            && matches!((&self.target, &skill.target),
+                (ExecutionTarget::Tool(name), ExecutionTarget::Skill { root, .. }) if name == root)
+    }
+
     /// The built-in `skills_manage` tool, whose grant-bound lifecycle actions
     /// derive their approval operation completely from the call's arguments,
     /// so a named call can be collected and recorded as an exact pending
