@@ -235,6 +235,12 @@ async fn exercise(
     assert_eq!(foreign.status(), StatusCode::CONFLICT);
     // A separately pinned ReadOnly generation must refuse before publication,
     // pending mutation, input recording or job dispatch, even for the true owner.
+    let runtime = state.pin_turn_runtime();
+    let service = runtime.decision_slot.publish(&runtime, &state).await?;
+    anyhow::ensure!(
+        service.drain_writes(Instant::now() + Duration::from_secs(5)).await,
+        "pending collection events must settle before checking readonly mutation"
+    );
     let before_readonly = state.mem.list_message_events_since(&scope, 0, 64).await?;
     let mut readonly = state.clone();
     let mut readonly_config = (*state.config.pin().effective).clone();

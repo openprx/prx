@@ -408,6 +408,19 @@ async fn cli_readonly_shell_request_is_refused_by_policy_before_the_model() {
         other => panic!("read-only shell request must refuse with no_legal_path: {other:?}"),
     }
 
+    // End the independent admission probe before opening the real CLI owner
+    // against the same durable workspace. Keep both policy assertions intact.
+    admission.decision().context.terminal_execution_trace();
+    assert!(
+        admission
+            .decision()
+            .service
+            .drain_writes(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await,
+        "admission probe queues must drain before the CLI turn"
+    );
+    drop(admission);
+
     let reply = run_with_runtime_envelope(
         config.clone(),
         Some("Run the shell command: echo hi".to_string()),

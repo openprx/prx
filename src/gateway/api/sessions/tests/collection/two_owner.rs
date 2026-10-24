@@ -35,6 +35,14 @@ impl Provider for OwnerCollectionProvider {
             .find(|message| message.role == "user")
             .context("actual collection input")?
             .content;
+        // Proposal-only requests encode prior messages as context data. Owner
+        // intent must come from the explicit current request, not old probes.
+        let proposal_context = serde_json::from_str::<serde_json::Value>(input).ok();
+        let input = proposal_context
+            .as_ref()
+            .and_then(|value| value.get("current_request"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(input);
         let matching = OWNERS
             .iter()
             .filter(|owner| input.contains(owner.2))
