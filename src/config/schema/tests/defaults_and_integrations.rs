@@ -4,6 +4,23 @@ use super::*;
 use tokio::test;
 
 #[test]
+async fn shell_env_allowlist_defaults_round_trips_and_rejects_patterns() {
+    let default: RuntimeConfig = toml::from_str("").unwrap();
+    assert_eq!(default.shell_env_allowlist, Vec::<String>::new());
+    let mut config = Config::default();
+    config.runtime.shell_env_allowlist = vec!["PRX_BUILD_CACHE".into()];
+    config.validate().unwrap();
+    let round_trip: RuntimeConfig = toml::from_str(&toml::to_string(&config.runtime).unwrap()).unwrap();
+    assert_eq!(round_trip.shell_env_allowlist, config.runtime.shell_env_allowlist);
+    for invalid in ["", "*", "PRX_*", "TOKEN=value", "1TOKEN", " TOKEN", "token", "TOKEN\0"] {
+        config.runtime.shell_env_allowlist = vec![invalid.into()];
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("runtime.shell_env_allowlist"));
+        assert!(!error.contains("TOKEN=value"));
+    }
+}
+
+#[test]
 async fn invalid_cost_tariff_is_rejected_without_disclosing_key() {
     for (field, invalid) in [
         ("input", -1.0),

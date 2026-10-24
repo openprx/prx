@@ -37,6 +37,36 @@ approval checks remain enforced.
 | **Infrastructure** | `gateway`, `config_reload`, `proxy_config`, `agents_list` |
 | **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
 
+## Shell environment
+
+The generic `shell` tool clears the child environment before launch. It keeps
+only `PATH`, `HOME`, `TERM`, `LANG`, `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`,
+`LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, `LC_TIME`, `TZ`, `USER`, `SHELL`
+and `TMPDIR` when present. Without a parent `PATH`, it uses
+`/usr/local/bin:/usr/bin:/bin`. Other host variables, including provider keys,
+tokens and interpreter startup variables, are absent by default. Locale names
+are matched exactly; an arbitrary name beginning with `LC_` is not admitted.
+
+Operators can set `[runtime] shell_env_allowlist = ["PRX_BUILD_CACHE"]` to
+inherit additional variables by exact uppercase ASCII name. There is no
+wildcard or inherit-all option, and tool-call arguments cannot alter this list.
+Missing variables remain absent. Adding names is classified as a high-risk
+configuration change. Restart PRX after editing the list; remove a name and
+restart to revoke its inheritance. This changes the previous full-inheritance
+behavior: explicitly list variables needed by local build tools or clients.
+Allowing a credential or loader/startup variable gives shell commands access
+to it, so review each addition.
+
+For Docker, the client gets the cleared host environment, while only explicitly
+listed additions are forwarded into the container. Image defaults such as
+`PATH` and `HOME` remain intact unless explicitly overridden. This policy
+applies to the generic shell tool; managed skill execution keeps its separate,
+stricter environment, and operator cron/Xin jobs keep their existing policy.
+Environment filtering does not restrict which host files native shell commands
+can read, and does not change command authorization or process lifetime.
+
+## Tool behavior
+
 `web_search_tool` uses DuckDuckGo by default. A non-200 response, bot challenge,
 or unrecognized result page returns an error instead of a successful empty
 search. A recognized no-results page still reports no results. Retry later or

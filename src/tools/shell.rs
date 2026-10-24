@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Authorization belongs to the orchestration boundary. This executor passes
 /// command text unchanged to the configured runtime and applies no ACL, path
-/// parser, environment filtering, or OS sandbox.
+/// parser or OS sandbox. The child environment is cleared and allowlisted.
 pub struct ShellTool {
     process: ShellProcessAdapter,
     workspace_dir: std::path::PathBuf,
@@ -21,9 +21,15 @@ pub struct ShellTool {
 impl ShellTool {
     pub fn new(runtime: Arc<dyn RuntimeAdapter>, workspace_dir: std::path::PathBuf) -> Self {
         Self {
-            process: ShellProcessAdapter::new(runtime),
+            process: ShellProcessAdapter::new(runtime).with_environment_allowlist(Vec::new()),
             workspace_dir,
         }
+    }
+
+    /// Inherit additional exact environment names configured by the operator.
+    pub fn with_env_allowlist(mut self, names: Vec<String>) -> Self {
+        self.process = self.process.with_environment_allowlist(names);
+        self
     }
 
     fn legacy_truncation_marker(mut output: String, truncated: bool, marker: &str) -> String {
@@ -178,7 +184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_shell_inherits_parent_path_and_environment() {
+    async fn direct_shell_inherits_parent_path() {
         let tmp = TempDir::new().unwrap();
         let expected_path = std::env::var("PATH").unwrap_or_default();
         let result = tool(tmp.path())
@@ -187,6 +193,62 @@ mod tests {
             .unwrap();
         assert!(result.success, "{:?}", result.error);
         assert_eq!(result.output, expected_path);
+    }
+
+    #[test]
+    fn direct_shell_filters_parent_environment() {
+        const PROBE: &str = "PRX_SHELL_ENV_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            // Give the probe its own environment without mutating the parallel
+            // test process or reading any real credential value.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tools::shell::tests::direct_shell_filters_parent_environment",
+                    "--nocapture",
+                ])
+                .env(PROBE, "1")
+                .env("PRX_SHELL_TEST_TOKEN", "synthetic-secret")
+                .env("PRX_SHELL_TEST_ALLOWED", "synthetic-allowed")
+                .env("LC_PRX_TEST_TOKEN", "synthetic-locale-secret")
+                .env("BASH_ENV", "/nonexistent/prx-shell-startup")
+                .env("ENV", "/nonexistent/prx-shell-startup")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated environment probe failed");
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let result = tool(tmp.path()).execute(json!({"command":
+                "test -n \"$PATH\" && test -n \"$HOME\" && test -z \"${PRX_SHELL_TEST_TOKEN+x}\" && test -z \"${PRX_SHELL_TEST_ALLOWED+x}\" && test -z \"${PRX_SHELL_ENV_PROBE+x}\" && printf ENV_FILTERED"
+            })).await.unwrap();
+            assert!(result.success, "unlisted host variables reached the shell");
+            assert_eq!(result.output, "ENV_FILTERED");
+            // Exercise the production registry as well as the default
+            // constructor: the operator override must actually be wired.
+            let mut config = crate::config::Config::default();
+            config.workspace_dir = tmp.path().to_path_buf();
+            config.config_path = tmp.path().join("config.toml");
+            config.runtime.shell_env_allowlist = vec!["PRX_SHELL_TEST_ALLOWED".into()];
+            let security = Arc::new(crate::security::SecurityPolicy::from_config(&config.autonomy, tmp.path()));
+            let memory = Arc::new(crate::memory::SqliteMemory::new(tmp.path()).unwrap());
+            let tools = crate::tools::all_tools(
+                Arc::new(config.clone()), &security, memory, None, None,
+                &config.browser, &config.http_request, tmp.path(), &config.agents, None, &config,
+            );
+            let shell = tools.iter().find(|tool| tool.name() == "shell").unwrap();
+            let result = shell.execute(json!({"command":
+                "test \"$PRX_SHELL_TEST_ALLOWED\" = synthetic-allowed && test -z \"${PRX_SHELL_TEST_TOKEN+x}\" && test -z \"${LC_PRX_TEST_TOKEN+x}\" && test -z \"${BASH_ENV+x}\" && test -z \"${ENV+x}\" && printf OVERRIDE_FILTERED"
+            })).await.unwrap();
+            assert!(result.success, "override must only admit the named variable");
+            assert_eq!(result.output, "OVERRIDE_FILTERED");
+            let invalid = tool(tmp.path()).with_env_allowlist(vec!["*".into()])
+                .execute(json!({"command": "printf MUST_NOT_RUN"})).await.unwrap();
+            assert!(!invalid.success);
+            assert_eq!(invalid.output, "");
+            assert!(invalid.error.unwrap().contains("shell_env_allowlist"));
+        });
     }
 
     #[tokio::test]

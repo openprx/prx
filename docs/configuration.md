@@ -246,6 +246,12 @@ max_history = 200
 # channel_webhook_dedup_ttl_secs = 86400
 
 [runtime]
+# Extra host environment variable names available to the generic shell tool.
+# Default: []; exact uppercase ASCII names only, no wildcards or values.
+# Adding a name grants access to its value and is a high-risk config change.
+# Takes effect on process restart. See tools.md, "Shell environment".
+# shell_env_allowlist = ["PRX_BUILD_CACHE"]
+
 # Hard cap on the tokio blocking-thread pool (optional).
 #
 # PRX places no ceiling on concurrent turns, sub-agents, or sessions, which

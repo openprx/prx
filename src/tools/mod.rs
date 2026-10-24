@@ -503,7 +503,10 @@ pub fn all_tools_with_runtime_ext_and_extensions(
 ) -> ToolsRegistryResult {
     // Core tools — always registered regardless of module flags.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(runtime.clone(), workspace_dir.to_path_buf())),
+        Arc::new(
+            ShellTool::new(runtime.clone(), workspace_dir.to_path_buf())
+                .with_env_allowlist(config.runtime.shell_env_allowlist.clone()),
+        ),
         Arc::new(FileReadTool::new(security.clone(), config.memory.acl_enabled)),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),

@@ -1,7 +1,7 @@
 //! Shared, policy-free direct shell process execution.
 //!
 //! Authorization and action accounting deliberately stay at each caller. This
-//! adapter owns only runtime construction, inherited-environment process setup,
+//! adapter owns only runtime construction, caller-selected environment setup,
 //! bounded output capture, and process-tree lifecycle management. It deliberately
 //! does not inspect command text or apply filesystem/OS isolation.
 
@@ -19,9 +19,9 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Environment keys retained by the remote-node execution boundary. Direct
-/// host-shell execution inherits the complete parent environment and does not
-/// consult this list.
+/// Baseline environment keys retained by the remote-node boundary and the
+/// filtered generic shell tool. Other adapter callers retain their existing
+/// inheritance policy unless they explicitly select an allowlist.
 pub(crate) const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
@@ -93,6 +93,7 @@ pub enum ShellProcessError {
 /// Reusable process adapter shared by interactive shell, cron, and Xin.
 pub struct ShellProcessAdapter {
     runtime: Arc<dyn RuntimeAdapter>,
+    environment_allowlist: Option<Vec<String>>,
     #[cfg(test)]
     active_output_readers: Arc<AtomicUsize>,
 }
@@ -101,9 +102,18 @@ impl ShellProcessAdapter {
     pub fn new(runtime: Arc<dyn RuntimeAdapter>) -> Self {
         Self {
             runtime,
+            environment_allowlist: None,
             #[cfg(test)]
             active_output_readers: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Clear the shell's inherited environment, keeping the baseline and these
+    /// exact operator-configured names. Joined skill runs keep their stricter
+    /// environment independently of this setting.
+    pub fn with_environment_allowlist(mut self, names: Vec<String>) -> Self {
+        self.environment_allowlist = Some(names);
+        self
     }
 
     /// Construct a direct host-shell adapter from the configured runtime.
@@ -162,10 +172,42 @@ impl ShellProcessAdapter {
         {
             return Err(ShellProcessError::Cancelled);
         }
+        let filtered_environment = self
+            .environment_allowlist
+            .as_deref()
+            .filter(|_| !end_group_on_exit)
+            .map(filtered_shell_environment)
+            .transpose()
+            .map_err(ShellProcessError::Runtime)?;
+        let mut shell_environment = Vec::new();
+        if let Some(environment) = &filtered_environment {
+            // A container keeps its image's PATH/HOME and other defaults.
+            // Only explicit operator additions cross into it; the Docker
+            // client itself still gets the cleared host baseline below.
+            shell_environment.extend(
+                environment
+                    .iter()
+                    .filter(|(key, _)| {
+                        self.runtime.name() != "docker"
+                            || self
+                                .environment_allowlist
+                                .as_ref()
+                                .is_some_and(|names| names.iter().any(|name| key == std::ffi::OsStr::new(name)))
+                    })
+                    .cloned(),
+            );
+        }
+        // Hardened Git settings win even over an explicitly inherited name.
+        shell_environment.extend(git_environment.iter().cloned());
         let mut command = self
             .runtime
-            .build_shell_command_with_env(request.command, request.workspace_dir, &git_environment)
+            .build_shell_command_with_env(request.command, request.workspace_dir, &shell_environment)
             .map_err(ShellProcessError::Runtime)?;
+        if let Some(environment) = filtered_environment {
+            command.env_clear();
+            command.envs(environment);
+            command.envs(git_environment.iter().cloned());
+        }
         if end_group_on_exit && self.runtime.name() == "native" {
             command.env_clear();
             command.envs(contained_environment(request.workspace_dir).map_err(ShellProcessError::Runtime)?);
@@ -287,6 +329,29 @@ impl ShellProcessAdapter {
     fn active_output_reader_count(&self) -> usize {
         self.active_output_readers.load(Ordering::SeqCst)
     }
+}
+
+/// Baseline needed by local command-line tools, without credential, loader or
+/// interpreter-startup variables. Locale names are exact: `LC_*_TOKEN` is not
+/// a locale setting. Extra names are an explicit operator grant.
+fn filtered_shell_environment(extra: &[String]) -> anyhow::Result<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+    crate::config::RuntimeConfig::validate_shell_env_allowlist(extra)?;
+    let mut environment: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| {
+            key.to_str().is_some_and(|key| {
+                SAFE_ENV_VARS.contains(&key)
+                    || matches!(
+                        key,
+                        "TZ" | "LC_COLLATE" | "LC_MESSAGES" | "LC_MONETARY" | "LC_NUMERIC" | "LC_TIME"
+                    )
+                    || extra.iter().any(|name| name == key)
+            })
+        })
+        .collect();
+    if !environment.iter().any(|(key, _)| key == "PATH") {
+        environment.push(("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()));
+    }
+    Ok(environment)
 }
 
 /// The only environment a contained run gets (see
@@ -705,6 +770,62 @@ mod tests {
 
     fn adapter() -> ShellProcessAdapter {
         ShellProcessAdapter::new(Arc::new(NativeRuntime::new()))
+    }
+
+    #[tokio::test]
+    async fn filtered_docker_launch_clears_client_and_forwards_only_explicit_names() {
+        struct InspectDocker {
+            forwarded: parking_lot::Mutex<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+        }
+        impl RuntimeAdapter for InspectDocker {
+            fn name(&self) -> &str {
+                "docker"
+            }
+            fn has_shell_access(&self) -> bool {
+                true
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::path::PathBuf::new()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn build_shell_command(&self, command: &str, dir: &Path) -> anyhow::Result<tokio::process::Command> {
+                let mut command = NativeRuntime::new().build_shell_command(command, dir)?;
+                command.env("PRX_RUNTIME_INTERNAL_TOKEN", "synthetic-secret");
+                Ok(command)
+            }
+            fn build_shell_command_with_env(
+                &self,
+                command: &str,
+                dir: &Path,
+                env: &[(std::ffi::OsString, std::ffi::OsString)],
+            ) -> anyhow::Result<tokio::process::Command> {
+                *self.forwarded.lock() = env.to_vec();
+                self.build_shell_command(command, dir)
+            }
+        }
+        let temp = TempDir::new().unwrap();
+        for names in [Vec::new(), vec!["PATH".to_string()]] {
+            let runtime = Arc::new(InspectDocker {
+                forwarded: parking_lot::Mutex::new(Vec::new()),
+            });
+            let outcome = ShellProcessAdapter::new(runtime.clone()).with_environment_allowlist(names.clone())
+                .execute(ShellProcessRequest {
+                    command: "test -n \"$PATH\" && test -z \"${PRX_RUNTIME_INTERNAL_TOKEN+x}\" && printf CLIENT_FILTERED",
+                    workspace_dir: temp.path(), timeout: None, cancellation: None, git: ShellGitPolicy::RefuseGit,
+                }).await.unwrap();
+            assert!(outcome.status.success());
+            assert_eq!(outcome.stdout, "CLIENT_FILTERED");
+            let forwarded = runtime.forwarded.lock();
+            assert_eq!(forwarded.len(), names.len());
+            for (key, _) in forwarded.iter() {
+                assert_eq!(key, "PATH", "only the explicitly allowed PATH is forwarded");
+            }
+        }
     }
 
     /// D-107: a model-driven surface's command string that runs git is

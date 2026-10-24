@@ -705,6 +705,8 @@ impl Config {
             }
         }
 
+        super::RuntimeConfig::validate_shell_env_allowlist(&self.runtime.shell_env_allowlist)?;
+
         // Runtime. A zero-sized blocking pool cannot run any blocking work, so
         // every `spawn_blocking` would queue forever instead of failing fast.
         if let Some(max_blocking_threads) = self.runtime.max_blocking_threads {

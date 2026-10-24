@@ -9,6 +9,12 @@ pub struct RuntimeConfig {
     #[serde(default = "default_runtime_kind")]
     pub kind: String,
 
+    /// Extra parent environment names inherited by the generic `shell` tool.
+    /// Empty by default. Exact uppercase ASCII names only; no wildcards.
+    /// This grants the shell access to their values and takes effect on restart.
+    #[serde(default)]
+    pub shell_env_allowlist: Vec<String>,
+
     /// Docker runtime settings (used when `kind = "docker"`).
     #[serde(default)]
     pub docker: DockerRuntimeConfig,
@@ -149,6 +155,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             kind: default_runtime_kind(),
+            shell_env_allowlist: Vec::new(),
             docker: DockerRuntimeConfig::default(),
             reasoning_enabled: None,
             codex_stream_idle_timeout_secs: None,
@@ -157,6 +164,24 @@ impl Default for RuntimeConfig {
             long_task_warn_secs: None,
             idle_hang_secs: None,
         }
+    }
+}
+
+impl RuntimeConfig {
+    pub(crate) fn validate_shell_env_allowlist(names: &[String]) -> anyhow::Result<()> {
+        for name in names {
+            let valid_first = name.bytes().next().is_some_and(|b| b.is_ascii_uppercase() || b == b'_');
+            if !valid_first
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            {
+                anyhow::bail!(
+                    "runtime.shell_env_allowlist requires exact uppercase ASCII variable names (no wildcards or values)"
+                );
+            }
+        }
+        Ok(())
     }
 }
 

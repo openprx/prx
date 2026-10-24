@@ -1106,6 +1106,14 @@ fn containment_widenings(before: &Config, after: &Config, reasons: &mut Vec<Risk
         }
     };
     push(
+        after
+            .runtime
+            .shell_env_allowlist
+            .iter()
+            .any(|name| !before.runtime.shell_env_allowlist.contains(name)),
+        "runtime.shell_env_allowlist",
+    );
+    push(
         before.runtime.kind == "docker" && after.runtime.kind != "docker",
         "runtime.kind",
     );
@@ -3106,6 +3114,18 @@ mod tests {
                 None,
             ),
             // ── D-051: containment ──
+            (
+                "shell gains a host environment variable",
+                |_| {},
+                |c| c.runtime.shell_env_allowlist = strings(&["PRX_TEST_TOKEN"]),
+                Some("runtime.shell_env_allowlist"),
+            ),
+            (
+                "shell loses a host environment variable (narrows)",
+                |c| c.runtime.shell_env_allowlist = strings(&["PRX_TEST_TOKEN"]),
+                |c| c.runtime.shell_env_allowlist.clear(),
+                None,
+            ),
             (
                 "sandbox removed: runtime.kind docker to native (R-SECRETSfg P27)",
                 |c| c.runtime.kind = "docker".into(),
