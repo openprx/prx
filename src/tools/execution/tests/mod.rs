@@ -11,6 +11,7 @@ mod composition;
 mod contracts;
 mod flat_contracts;
 mod idempotency;
+mod output_channels;
 mod pipeline;
 
 #[derive(Clone)]

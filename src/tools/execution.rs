@@ -3040,15 +3040,26 @@ impl ToolExecutionService {
             ),
             (Some(Ok(result)), _) => {
                 let (status, model_content, error) = if result.success {
-                    (ToolExecutionStatus::Succeeded, result.output.clone(), None)
+                    let model_content = match result.error.as_deref().filter(|error| !error.is_empty()) {
+                        Some(diagnostics) => format!("Output:\n{}\n\nDiagnostics:\n{diagnostics}", result.output),
+                        None => result.output.clone(),
+                    };
+                    (ToolExecutionStatus::Succeeded, model_content, None)
                 } else {
                     let error = result.error.clone().unwrap_or_else(|| result.output.clone());
                     let hint = super::error_hints::recovery_hint(&command.name, &error);
-                    let model_content = if hint.is_empty() {
+                    let mut model_content = if hint.is_empty() {
                         format!("Error: {error}")
                     } else {
                         format!("Error: {error}\n{hint}")
                     };
+                    // `error` is a separate diagnostic channel, not a replacement
+                    // for output produced before failure. Keep the Error prefix
+                    // used by existing history consumers and avoid duplicating
+                    // output when it was the fallback error above.
+                    if result.error.is_some() && !result.output.is_empty() {
+                        model_content.push_str(&format!("\n\nOutput:\n{}", result.output));
+                    }
                     (ToolExecutionStatus::Failed, model_content, Some(error))
                 };
                 self.finish(
