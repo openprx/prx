@@ -266,6 +266,16 @@ and the migration warnings below before upgrading.
 
 ### Fixed
 
+- Local v0.8.165: retain authenticated discovered capabilities, canonicalize
+  named skills and their loaders, preserve scoped memory retrieval, and refresh
+  chat capability catalogs after quiescent lifecycle changes. Record gate
+  rejection counts and classify shell execution using its actual catalog class.
+- Separate approval proposal history from the current request without changing
+  permission policy. Repair assessment protocol fixtures and asynchronous test
+  ownership, and synchronize the cost-lock test on its durable usage event.
+- Observe CI test resource usage and termination while preserving the existing
+  guarded test command, exit status, network restrictions and assertions.
+
 - Local v0.8.164: review tool-backed chat completion drafts against the request
   and observed results, with one corrective attempt for unsupported delivery
   claims. Preserve metric definitions and expose uncertain completion explicitly.
