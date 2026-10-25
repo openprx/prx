@@ -416,7 +416,7 @@ fn swap_in(stage: &Path, target: &Path, staging_root: &Path, skill: &SkillId) ->
         }
         Ok(_) => {}
     }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     {
         use rustix::fs::{CWD, RenameFlags, renameat_with};
         use rustix::io::Errno;
@@ -429,7 +429,7 @@ fn swap_in(stage: &Path, target: &Path, staging_root: &Path, skill: &SkillId) ->
                 }
                 Err(Errno::INVAL | Errno::NOSYS | Errno::NOTSUP) => {
                     tracing::warn!(
-                        "renameat2 exchange is unsupported here; replacing the skill projection in two steps"
+                        "atomic directory exchange is unsupported here; replacing the skill projection in two steps"
                     );
                 }
                 Err(errno) => return Err(LifecycleError::io(target, std::io::Error::from(errno))),
@@ -450,13 +450,13 @@ fn swap_in(stage: &Path, target: &Path, staging_root: &Path, skill: &SkillId) ->
     Ok(())
 }
 
-/// Test seam: forces the two-rename fallback so it runs on Linux too.
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+/// Test seam: forces the two-rename fallback on platforms supporting atomic exchange.
+#[cfg(all(test, any(target_os = "linux", target_os = "android", target_os = "macos")))]
 fn two_step_forced() -> bool {
     super::publish::crash_hooks::two_step_forced()
 }
 
-#[cfg(all(not(test), any(target_os = "linux", target_os = "android")))]
+#[cfg(all(not(test), any(target_os = "linux", target_os = "android", target_os = "macos")))]
 const fn two_step_forced() -> bool {
     false
 }

@@ -695,3 +695,20 @@ fn recovery_resets_the_disabled_marker_of_a_bound_skill_to_the_binding() {
     assert!(!marker.exists(), "the binding is enabled, so the marker is cleared");
     assert_eq!(discovered(tmp.path()), [(NAME.to_string(), "alpha-desc".to_string())]);
 }
+
+/// On supported filesystems the second publish must bypass the crash seam in
+/// the two-rename gap. This exercises the real OS exchange, not a mock.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[test]
+fn atomic_exchange_keeps_the_projection_present_during_replacement() {
+    let (tmp, store) = setup();
+    let a = write(&store, &skill(), "alpha-desc");
+    let b = write(&store, &skill(), "beta-desc");
+    store.publish(&publish_req("atomic-a", &skill(), &a, 0, true)).unwrap();
+    crash_hooks::arm("projection_swapped_out");
+    let result = store.publish(&publish_req("atomic-b", &skill(), &b, 1, true));
+    crash_hooks::disarm();
+    result.expect("the native atomic exchange must not enter the two-rename gap");
+    assert_eq!(on_disk(&projection(tmp.path())), b.0);
+    no_leftovers(tmp.path());
+}

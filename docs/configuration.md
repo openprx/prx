@@ -2950,8 +2950,9 @@ recovery and are never aged out solely because they were idle.
 Publication and rollback refresh the compatibility projection after commit;
 `CommittedRepairRequired` leaves the binding live for recovery to repair.
 Recovery resets the disabled marker to the binding's enabled state. First
-publication refuses different unmanaged content; macOS uses a non-atomic
-two-rename replacement. Legacy executables are marked `ExecutableNeedsReview`
+publication refuses different unmanaged content. Linux and macOS use native
+atomic directory exchange where supported; unsupported filesystems retain the
+recoverable two-rename fallback. Legacy executables are marked `ExecutableNeedsReview`
 and need operator re-import to run managed. Managed native execution clears
 the environment down to an allowlist and joins process cleanup; deliberate
 `setsid` escape requires docker runtime containment today. See the

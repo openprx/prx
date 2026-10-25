@@ -250,10 +250,13 @@ For a lifecycle-managed skill, `active/<skill-id>.json` is the authority and
 `skills/<dir>/` is a plain directory copy of the active revision, kept for
 existing consumers such as discovery. Publish and rollback replace the copy
 after the binding commits, using a staged write under
-`skills/.openprx-projection/`. Linux uses an atomic exchange where supported.
-macOS, and Linux filesystems without exchange support, use two renames: the
-skill may be briefly absent, but the replacement tree is never half-written.
-An atomic macOS projection swap remains unimplemented.
+`skills/.openprx-projection/`. Linux and macOS use a native atomic directory exchange where supported
+(`renameat2` with `RENAME_EXCHANGE`, or `renameatx_np` with `RENAME_SWAP`).
+Filesystems without exchange support fall back to two renames and emit a
+warning: the skill may then be briefly absent, but the replacement tree is
+never half-written. Other errors are returned without entering the fallback.
+The existing recovery protocol also covers this fallback. Reverting this
+change restores the previous macOS two-rename behavior; store formats do not change.
 
 Refresh invalidates the catalog snapshots containing metadata and embeddings.
 The separate process embedding cache is keyed by description text, so a changed

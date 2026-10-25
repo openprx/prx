@@ -109,7 +109,7 @@ pub(super) mod crash_hooks {
         TWO_STEP.with(|f| f.set(on));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     pub(in crate::skills::lifecycle) fn two_step_forced() -> bool {
         TWO_STEP.with(std::cell::Cell::get)
     }
