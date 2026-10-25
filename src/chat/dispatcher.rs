@@ -1236,7 +1236,10 @@ impl EffectExecutor {
                 // Task locals do not cross spawn; carry the chat owner's tracker.
                 let cleanup_owner = self.cleanup_owner.clone();
                 let provider_task_handle = tokio::spawn(async move {
-                    let work = async move {
+                    // Task-local wrappers otherwise carry copies of the large
+                    // driver future through nested debug poll frames. Keep both
+                    // ownership scopes on the heap without detaching their work.
+                    let work = Box::pin(async move {
                         if let (Some(task_id), Some(lease_id), Some(tx)) = (
                             provider_turn_task_id,
                             provider_turn_execution_lease_id,
@@ -1271,7 +1274,7 @@ impl EffectExecutor {
                             return;
                         }
                         let compaction_guard_history = compaction_guard_history.unwrap_or_else(|| history.clone());
-                        let driver = drive_start_turn_stream(
+                        let driver = Box::pin(drive_start_turn_stream(
                             turn_binding.clone(),
                             provider_turn_task_id,
                             provider,
@@ -1291,7 +1294,7 @@ impl EffectExecutor {
                             chat_mode,
                             observer,
                             hooks,
-                        );
+                        ));
                         // D8-4 (redux path real fix): mirror the scope wrapper around
                         // the legacy tool-loop path's `run_turn` call in `chat::run` — seed the
                         // turn-root spawn execution context so any `sessions_spawn`
@@ -1341,7 +1344,7 @@ impl EffectExecutor {
                         ) {
                             let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id }).await;
                         }
-                    };
+                    });
                     if let Some(owner) = cleanup_owner {
                         owner.scope(work).await;
                     } else {
