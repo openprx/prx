@@ -17,15 +17,6 @@ unsound = "workspace"
 ignore = [
     # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete
     { id = "RUSTSEC-2025-0141", reason = "bincode: probe-rs transitive dep, project considered complete" },
-    # Proposed 2026-10-21; manually review/remove by 2026-11-21.
-    # cargo-deny 0.20.2 has no per-advisory expiry. Only the 0.26.11 bridge is
-    # reached through tokio-tungstenite 0.28.0 (directly and through Axum).
-    # Its only exported roots are parent::TLS_SERVER_ROOTS, resolved to the
-    # patched webpki-roots 1.0.10; it contains no independent certificate set.
-    # Released tokio-tungstenite 0.29/0.30 still require the 0.26 bridge, so
-    # upgrading cannot remove it. Keep the existing Mozilla-root TLS behavior.
-    # Bans below reject every other affected version despite this exception.
-    { id = "RUSTSEC-2026-0381", reason = "2026-10-21: webpki-roots 0.26.11 only re-exports the patched 1.0.10 root bundle; no distrusted emSign roots remain on this path. Review by 2026-11-21 or when upstream drops the bridge." },
 ]
 
 # ===== 许可证合规 =====

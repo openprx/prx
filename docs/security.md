@@ -168,14 +168,16 @@ and zero catalog-growth tolerance still apply.
 
 ## Dependency advisory exception
 
-The current dependency policy retains `RUSTSEC-2026-0381` for the
-`webpki-roots` 0.26.11 compatibility bridge. On the locked dependency graph this
-bridge re-exports the patched 1.0.10 root set; it has no separate certificate
-bundle. `deny.toml` bans other affected versions while the exception remains.
-The dated review deadline is 2026-11-21, or earlier if upstream removes the
-bridge. The policy files are [deny.toml](../deny.toml) and
-[the audit configuration](../.cargo/audit.toml).
+The 2026-10-25 review removed the `RUSTSEC-2026-0381` exception from both
+[deny.toml](../deny.toml) and [the audit configuration](../.cargo/audit.toml),
+closing its 2026-11-21 review deadline. The updated
+[RustSec advisory](https://rustsec.org/advisories/RUSTSEC-2026-0381.html)
+explicitly lists the `webpki-roots` 0.26.11 compatibility bridge as unaffected
+when its separately resolved 1.x dependency is at least 1.0.10.
 
-A policy-filtered pass is distinct from a raw advisory scan: the unfiltered
-scan still reports this bridge advisory. These notes make no additional
-advisory or global dependency-acceptance claim.
+The locked graph resolves that parent to 1.0.10. The bridge exports only
+`parent::TLS_SERVER_ROOTS` and has no independent certificate bundle.
+The version bans still reject older root bundles. A fresh raw scan with no
+ignored advisories reports zero vulnerabilities on this graph. It still
+reports informational warnings; the existing bincode and derivative policy
+exceptions are separate and were not closed by this review.

@@ -1,7 +1,5 @@
 [advisories]
 ignore = [
-    # 2026-10-21: webpki-roots 0.26.11 only re-exports the patched 1.0.10 root bundle; no distrusted emSign roots remain on this path. Review by 2026-11-21 or when upstream drops the bridge.
-    "RUSTSEC-2026-0381",
     # bincode v2.0.1 via probe-rs — project considered complete
     "RUSTSEC-2025-0141",
     # derivative unmaintained — matrix-sdk-indexeddb transitive，仅 wasm 路径 (cargo-audit denies unmaintained; cargo-deny does not match this, so deny.toml omits it)
