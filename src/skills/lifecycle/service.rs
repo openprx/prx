@@ -483,6 +483,16 @@ impl SkillsLifecycleService {
         self.settings.mode
     }
 
+    /// Maintenance never changes a proposal, review, revision or binding.
+    pub fn prune_experiences(
+        &self,
+        retention: &super::capture::ExperienceRetention,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, ServiceError> {
+        self.require_enabled()?;
+        Ok(self.store.prune_unreferenced_experiences(retention, now)?)
+    }
+
     const fn require_enabled(&self) -> Result<(), ServiceError> {
         if self.settings.enabled {
             Ok(())

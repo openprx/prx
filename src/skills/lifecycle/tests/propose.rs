@@ -326,6 +326,52 @@ fn proposal_dir(f: &Fixture, id: &str) -> std::path::PathBuf {
 }
 
 #[tokio::test]
+async fn production_retention_keeps_proposal_and_pattern_lineage() {
+    let f = fixture();
+    let pattern = usable_pattern(&f);
+    let model = ScriptedModel::replying(&good_patch());
+    let ProposeOutcome::Staged(proposal) = run(&f, &model, request("retention", &[&pattern])).await else {
+        panic!("expected staged proposal");
+    };
+    failing(&f, "unreferenced-task");
+    let retention = crate::skills::lifecycle::ExperienceRetention {
+        terminal_max_age: chrono::Duration::days(30),
+        incomplete_max_age: chrono::Duration::days(7),
+    };
+    let later = chrono::Utc::now() + chrono::Duration::days(40);
+    assert_eq!(
+        f.store
+            .prune_unreferenced_experiences(&retention, later)
+            .expect("prune"),
+        1
+    );
+    for id in &proposal.evidence_ids {
+        assert!(f.store.read_experience_by_id(id).expect("read").is_some());
+    }
+    assert!(
+        f.store
+            .read_proposal(&proposal.proposal_id)
+            .expect("proposal")
+            .is_some()
+    );
+    // A proposal independently retains its evidence if the derived pattern
+    // listing and file are unavailable; retention does not erase review facts.
+    fs::remove_file(
+        f.store
+            .root()
+            .join("patterns")
+            .join(format!("{}.json", pattern.pattern_id)),
+    )
+    .expect("remove pattern");
+    assert_eq!(
+        f.store
+            .prune_unreferenced_experiences(&retention, later)
+            .expect("prune"),
+        0
+    );
+}
+
+#[tokio::test]
 async fn a_bounded_candidate_is_staged_and_nothing_is_activated() {
     let f = fixture();
     let pattern = usable_pattern(&f);

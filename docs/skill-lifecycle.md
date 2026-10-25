@@ -74,7 +74,11 @@ A skill can also be created from repeated work that no managed skill covered.
   `missing_skill` needs at least two distinct root tasks. New uncovered-task
   recording stops at the 4096-experience threshold; this is not a hard cap on
   the whole store, since managed-skill experiences can still be recorded.
-  Automatic experience retention is not wired.
+  With both the evolution scheduler and lifecycle enabled, each evolution tick
+  removes at most 128 unreferenced terminal records past the evolution config's
+  `runtime.retention.cold_days`. Open tasks, pins, parent lineage and evidence
+  cited by retained patterns or proposals stay protected. Unreadable evidence
+  defers deletion; the sweep never treats an idle task as finished.
 - **Proposal.** `propose_new_skill` writes a fixed skeleton from the request
   (name, description, required tools) and the model may only append text, within
   the same 300-token cap. The bundle is `SKILL.md` alone: no scripts and no

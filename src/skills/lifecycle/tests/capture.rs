@@ -487,6 +487,109 @@ fn dropped_evidence_is_marked_even_when_the_capture_locks_cannot_be_taken() {
 }
 
 #[test]
+fn production_retention_preserves_open_pinned_and_parent_experiences() {
+    let (_tmp, store, pin) = setup();
+    for task in [
+        "retention-old",
+        "retention-open",
+        "retention-pinned",
+        "retention-parent",
+    ] {
+        let correlation = if task == "retention-parent" {
+            Correlation {
+                run_id: Some("parent-run".to_string()),
+                ..Correlation::default()
+            }
+        } else {
+            Correlation::default()
+        };
+        store
+            .record_hydration(task, &pin, "SKILL.md", b"x", &correlation)
+            .expect("hydrate");
+        if task != "retention-open" {
+            store
+                .join_terminal(task, "term", ExperienceOutcome::Success)
+                .expect("terminal");
+        }
+    }
+    store
+        .record_hydration(
+            "retention-child",
+            &pin,
+            "SKILL.md",
+            b"x",
+            &Correlation {
+                parent_run_id: Some("parent-run".to_string()),
+                ..Correlation::default()
+            },
+        )
+        .expect("child");
+    task_pin(store.owner_scope(), "retention-pinned", &skill(), || {
+        Ok(Some(pin.clone()))
+    })
+    .expect("pin");
+    let retention = ExperienceRetention {
+        terminal_max_age: chrono::Duration::days(30),
+        incomplete_max_age: chrono::Duration::days(7),
+    };
+    let later = chrono::Utc::now() + chrono::Duration::days(40);
+    assert_eq!(
+        store.prune_unreferenced_experiences(&retention, later).expect("prune"),
+        1
+    );
+    assert!(store.read_experience("retention-old").expect("read").is_none());
+    for task in [
+        "retention-open",
+        "retention-child",
+        "retention-parent",
+        "retention-pinned",
+    ] {
+        assert!(store.read_experience(task).expect("read").is_some(), "{task}");
+    }
+    crate::skills::lifecycle::release_task_pins(store.owner_scope(), "retention-pinned");
+    assert_eq!(
+        store.prune_unreferenced_experiences(&retention, later).expect("prune"),
+        1
+    );
+}
+
+#[test]
+fn production_retention_limits_deletions_and_refuses_unreadable_evidence() {
+    let (_tmp, store, pin) = setup();
+    for n in 0..130 {
+        let task = format!("retention-{n}");
+        store
+            .record_hydration(&task, &pin, "SKILL.md", b"x", &Correlation::default())
+            .expect("hydrate");
+        store
+            .join_terminal(&task, "term", ExperienceOutcome::Success)
+            .expect("terminal");
+    }
+    let retention = ExperienceRetention {
+        terminal_max_age: chrono::Duration::days(30),
+        incomplete_max_age: chrono::Duration::days(7),
+    };
+    let later = chrono::Utc::now() + chrono::Duration::days(40);
+    let path = store
+        .root()
+        .join("experiences")
+        .join(format!("{}.json", experience_id(store.owner_scope(), "retention-0")));
+    let original = fs::read(&path).expect("read");
+    fs::write(&path, b"invalid").expect("damage");
+    assert!(store.prune_unreferenced_experiences(&retention, later).is_err());
+    assert!(store.read_experience("retention-1").expect("read").is_some());
+    fs::write(path, original).expect("restore");
+    assert_eq!(
+        store.prune_unreferenced_experiences(&retention, later).expect("prune"),
+        128
+    );
+    assert_eq!(
+        store.prune_unreferenced_experiences(&retention, later).expect("prune"),
+        2
+    );
+}
+
+#[test]
 fn pruning_removes_old_experiences_with_their_markers_and_locks() {
     let (_tmp, store, pin) = setup();
     let keep_me = |record: &crate::skills::lifecycle::SkillExperience| record.task_id == "task-kept";

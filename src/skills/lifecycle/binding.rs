@@ -257,6 +257,14 @@ impl PinTable {
 
 static TASK_PINS: PinTable = PinTable::new(MAX_TASK_PINS, ORPHAN_PIN_AGE);
 
+pub(super) fn task_has_pins(owner: &OwnerScope, task: &str) -> bool {
+    TASK_PINS
+        .entries
+        .lock()
+        .iter()
+        .any(|(key, _, _)| key.owner == *owner && key.task_id == task)
+}
+
 /// Returns the pin of `task_id` for `skill`, issuing it with `issue` on first
 /// use. Later calls return the same pin even if the active binding moved.
 pub fn task_pin(

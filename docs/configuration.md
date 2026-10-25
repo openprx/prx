@@ -2913,8 +2913,14 @@ See [Skill lifecycle](skill-lifecycle.md) for new instruction skills from
 uncovered completed root tasks, frozen no-skill baselines, reviewed executable
 imports, publication gates and recovery. Completed turns are not verified task
 success, and local acceptance is not evidence of learning. Uncovered-task
-recording stops at the 4096-experience threshold; automatic retention is not
-wired and this is not a hard cap on managed-skill experiences.
+recording stops at the 4096-experience threshold; this is not a hard cap on
+managed-skill experiences. When the evolution scheduler and skill lifecycle
+are enabled, each evolution tick removes at most 128 unreferenced terminal
+experiences older than `runtime.retention.cold_days` in the evolution config.
+Open tasks, task pins, parent-task lineage, and references from retained
+patterns (including history) and proposals remain protected. Unreadable
+evidence defers the sweep before deletion; incomplete tasks require terminal
+recovery and are never aged out solely because they were idle.
 
 Publication and rollback refresh the compatibility projection after commit;
 `CommittedRepairRequired` leaves the binding live for recovery to repair.

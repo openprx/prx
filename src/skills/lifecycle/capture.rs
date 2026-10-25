@@ -629,8 +629,8 @@ pub fn on_task_terminal(
 }
 
 /// Experience records after which tasks that used no managed skill stop
-/// leaving one. Nothing prunes experiences by itself yet, so recording the work
-/// of every task must not grow a store without bound.
+/// leaving one. Retention only removes expired, unreferenced terminal records,
+/// so recording every task still needs an independent admission bound.
 pub const UNCOVERED_RECORDING_LIMIT: usize = 4096;
 
 /// Records created since the last directory count of a store, per store root.
@@ -801,15 +801,102 @@ impl SkillLifecycleStore {
         now: DateTime<Utc>,
         keep: impl Fn(&SkillExperience) -> bool,
     ) -> Result<usize, LifecycleError> {
+        let _store_lock = self.lock_store(false, CAPTURE_LOCK_TIMEOUT)?;
+        self.prune_experiences_locked(retention, now, keep, usize::MAX, true)
+    }
+
+    /// Remove at most 128 expired, terminal, unreferenced experiences per
+    /// maintenance pass. Unknown/live tasks and retained evidence fail closed.
+    /// Reference discovery and deletion share the exclusive store lock, so a
+    /// concurrent proposal or consolidation cannot lose its evidence.
+    pub fn prune_unreferenced_experiences(
+        &self,
+        retention: &ExperienceRetention,
+        now: DateTime<Utc>,
+    ) -> Result<usize, LifecycleError> {
+        let _store_lock = self.lock_store(false, CAPTURE_LOCK_TIMEOUT)?;
+        let mut keep = self.retained_pattern_experiences()?;
+        for proposal in self.list_proposals()? {
+            keep.extend(proposal.evidence_ids);
+        }
         let dir = self.root().join(EXPERIENCES_DIR);
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(LifecycleError::io(&dir, e)),
         };
-        let _store_lock = self.lock_store(false, CAPTURE_LOCK_TIMEOUT)?;
+        let mut records = Vec::new();
+        let mut parents = std::collections::BTreeSet::new();
+        for (count, entry) in entries.enumerate() {
+            if count >= 65_536 {
+                return Err(LifecycleError::KnowledgeLimit {
+                    what: "experience retention entries",
+                    limit: 65_536,
+                });
+            }
+            let entry = entry.map_err(|e| LifecycleError::io(&dir, e))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".json").filter(|id| is_experience_id(id)) else {
+                continue;
+            };
+            if let Some(record) = self.read_experience_by_id(id)? {
+                // Parent records establish distinct root-task lineage. Keeping
+                // every retained child's parent also handles multi-hop chains.
+                if let Some(parent) = record.correlation.parent_run_id.as_deref() {
+                    keep.insert(experience_id(self.owner_scope(), parent));
+                    parents.insert(parent.to_owned());
+                }
+                records.push(record);
+            }
+        }
+        for record in records {
+            if parents.contains(&record.task_id)
+                || record
+                    .correlation
+                    .run_id
+                    .as_ref()
+                    .is_some_and(|id| parents.contains(id))
+                || record
+                    .correlation
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|id| parents.contains(id))
+            {
+                keep.insert(record.record_id);
+            }
+        }
+        self.prune_experiences_locked(
+            retention,
+            now,
+            |record| {
+                record.terminal.is_none()
+                    || keep.contains(&record.record_id)
+                    || super::binding::task_has_pins(self.owner_scope(), &record.task_id)
+            },
+            128,
+            false,
+        )
+    }
+
+    fn prune_experiences_locked(
+        &self,
+        retention: &ExperienceRetention,
+        now: DateTime<Utc>,
+        keep: impl Fn(&SkillExperience) -> bool,
+        max_removed: usize,
+        prune_orphan_markers: bool,
+    ) -> Result<usize, LifecycleError> {
+        let dir = self.root().join(EXPERIENCES_DIR);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(LifecycleError::io(&dir, e)),
+        };
         let mut removed = 0;
         for entry in entries {
+            if removed >= max_removed {
+                break;
+            }
             let entry = entry.map_err(|e| LifecycleError::io(&dir, e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if let Some(id) = name
@@ -817,7 +904,8 @@ impl SkillLifecycleStore {
                 .filter(|id| id.starts_with("exp-"))
             {
                 // A marker whose record never got written (or was removed).
-                if !dir.join(format!("{id}.json")).exists()
+                if prune_orphan_markers
+                    && !dir.join(format!("{id}.json")).exists()
                     && marker_age(&entry.path(), now) >= retention.incomplete_max_age
                 {
                     for path in [entry.path(), self.root().join("locks").join(format!("{id}.lock"))] {

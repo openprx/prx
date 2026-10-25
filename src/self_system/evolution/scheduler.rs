@@ -79,6 +79,11 @@ impl EvolutionScheduler {
         }
     }
 
+    /// The active generation's existing retention policy for skill experiences.
+    pub fn experience_retention(&self) -> super::config::EvolutionRetentionConfig {
+        self.shared_config.load_full().runtime.retention.clone()
+    }
+
     /// Run daily digest and/or three-layer evolution cycle when schedules are due.
     pub async fn run_scheduled(&mut self, now: DateTime<Utc>) -> Result<SchedulerRunSummary> {
         let mut state = match self.load_state().await {

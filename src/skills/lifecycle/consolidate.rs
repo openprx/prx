@@ -405,6 +405,25 @@ fn verify_content(pattern: &KnowledgePattern) -> Result<(), LifecycleError> {
 }
 
 impl SkillLifecycleStore {
+    /// Called under the exclusive store lock by retention. Include history:
+    /// an older pattern can still be cited by a retained proposal or review.
+    pub(super) fn retained_pattern_experiences(&self) -> Result<BTreeSet<String>, LifecycleError> {
+        let mut keep = BTreeSet::new();
+        for (dir, limit) in [
+            (self.patterns_dir(), MAX_ACTIVE_PATTERN_FILES),
+            (self.history_dir(), MAX_REBUILD_FILES),
+        ] {
+            for id in Self::list_pattern_ids(&dir, limit, "retained pattern files")? {
+                if let Some(pattern) = self.read_pattern_file(&dir.join(format!("{id}.json")), &id)? {
+                    keep.extend(pattern.evidence_ids);
+                    keep.extend(pattern.counterevidence_ids);
+                    keep.extend(pattern.withdrawn_evidence);
+                }
+            }
+        }
+        Ok(keep)
+    }
+
     fn patterns_dir(&self) -> PathBuf {
         self.root().join(PATTERNS_DIR)
     }

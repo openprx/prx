@@ -1402,6 +1402,13 @@ async fn run_evolution_scheduler_worker(
                 crate::health::touch_component(EVOLUTION_JUDGE_COMPONENT);
             }
             _ = interval.tick() => {
+                match crate::skills::lifecycle_runtime::run_experience_retention(
+                    &config,
+                    scheduler.experience_retention(),
+                ).await {
+                    Ok(removed) => tracing::info!(removed, "skill experience retention finished"),
+                    Err(error) => tracing::warn!(%error, "skill experience retention deferred"),
+                }
                 match scheduler.run_scheduled(Utc::now()).await {
                     Ok(summary) => {
                         if summary.digest_ran || summary.cycle_ran {

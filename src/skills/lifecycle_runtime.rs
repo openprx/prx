@@ -1,9 +1,9 @@
 //! Wires the skill lifecycle service into the process (SL09 part B): building
 //! it from `[skills_lifecycle]`, and the recovery sweep at daemon start.
 //!
-//! A disabled lifecycle builds nothing and opens no store. Startup recovery is
-//! the only lifecycle work that runs by itself; it repairs and never starts a
-//! proposal, an evaluation or a publication.
+//! A disabled lifecycle builds nothing and opens no store. Startup recovery
+//! repairs records; evolution ticks prune expired, unreferenced terminal
+//! experiences. Neither starts a proposal, evaluation or publication.
 
 use crate::config::Config;
 use crate::config::skills_lifecycle::{SkillsLifecycleConfig, SkillsLifecycleConfigError};
@@ -85,6 +85,25 @@ pub fn lifecycle_enabled_for(workspace_dir: &Path) -> bool {
     SERVICES.lock().keys().any(|(workspace, _)| workspace == workspace_dir)
 }
 
+/// Run one bounded retention pass at the evolution scheduler's cadence.
+/// Terminal records expire at the existing cold-retention horizon. Records
+/// without a terminal remain protected until recovery establishes their end.
+pub async fn run_experience_retention(
+    config: &Config,
+    retention: crate::self_system::evolution::config::EvolutionRetentionConfig,
+) -> anyhow::Result<usize> {
+    let Some(service) = open_service(&config.workspace_dir, &config.skills_lifecycle)? else {
+        return Ok(0);
+    };
+    let retention = crate::skills::lifecycle::ExperienceRetention {
+        terminal_max_age: chrono::Duration::days(i64::from(retention.cold_days)),
+        incomplete_max_age: chrono::Duration::days(i64::from(retention.hot_days)),
+    };
+    crate::runtime::blocking::spawn_blocking(move || service.prune_experiences(&retention, chrono::Utc::now()))
+        .await?
+        .map_err(Into::into)
+}
+
 /// Runs `call` again while it reports a store locked by another process
 /// ([`ServiceError::Busy`]), up to `retry.attempts` calls with a doubling wait.
 /// Any other result, and the last `Busy`, is returned.
@@ -163,6 +182,56 @@ pub fn spawn_startup_recovery(config: &Config) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[tokio::test]
+    async fn scheduled_retention_uses_the_configured_owner_and_skips_disabled_stores() {
+        use crate::skills::lifecycle::{ExperienceOutcome, TaskTerminal, on_task_terminal};
+        let tmp = tempfile::TempDir::new().expect("workspace");
+        let mut config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let retention = crate::self_system::evolution::config::EvolutionRetentionConfig {
+            cold_days: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            run_experience_retention(&config, retention.clone())
+                .await
+                .expect("disabled"),
+            0
+        );
+        assert!(!tmp.path().join("self/skill-lifecycle").exists());
+        config.skills_lifecycle = SkillsLifecycleConfig {
+            enabled: true,
+            owner_scope: Some("owner:ws:cli:prx_user".to_string()),
+            ..Default::default()
+        };
+        let service = open_service(tmp.path(), &config.skills_lifecycle)
+            .expect("service")
+            .expect("enabled");
+        on_task_terminal(
+            tmp.path(),
+            service.owner_scope(),
+            &TaskTerminal {
+                task_id: "retention-task",
+                terminal_receipt_id: "retention-terminal",
+                outcome: ExperienceOutcome::Success,
+                observations: None,
+                root_task: true,
+            },
+        )
+        .expect("terminal")
+        .expect("recorded");
+        assert_eq!(
+            run_experience_retention(&config, retention).await.expect("retention"),
+            1
+        );
+        let store = SkillLifecycleStore::open_existing(tmp.path(), service.owner_scope().clone())
+            .expect("store")
+            .expect("exists");
+        assert!(store.read_experience("retention-task").expect("read").is_none());
+    }
 
     fn enabled_config() -> SkillsLifecycleConfig {
         SkillsLifecycleConfig {
