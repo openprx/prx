@@ -183,6 +183,7 @@ mod tests {
     fn zero_priced_dispatched_calls_remain_visible_until_settled() {
         use crate::cost::reservation::{ReservationRequest, Reservations};
         let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("state")).unwrap();
         let mut journal = Reservations::default();
         let receipt = journal
             .reserve(
