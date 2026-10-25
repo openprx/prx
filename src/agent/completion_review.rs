@@ -474,8 +474,16 @@ mod tests {
         assert_eq!(evidence.executed_count("docx"), 1);
         let messages = evidence.messages(&history, "done", 50000).unwrap();
         let data: serde_json::Value = serde_json::from_str(&messages.last().unwrap().content).unwrap();
-        assert_eq!(data["observed_tools"][0]["backend_tool"], "skill_read");
-        assert_eq!(data["executed_backend_tool_counts"]["skill_read"], 2);
+        assert_eq!(
+            data.pointer("/observed_tools/0/backend_tool")
+                .and_then(serde_json::Value::as_str),
+            Some("skill_read")
+        );
+        assert_eq!(
+            data.pointer("/executed_backend_tool_counts/skill_read")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
     }
 
     #[test]
