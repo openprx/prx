@@ -267,6 +267,7 @@ impl EvolutionEngine for StrategyEvolutionEngine {
         };
 
         Ok(CycleResult {
+            review_data: None,
             layer: EvolutionLayer::Policy,
             proposal: Some(proposal),
             cycle,

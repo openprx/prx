@@ -318,6 +318,7 @@ impl EvolutionEngine for MemoryEvolutionEngine {
         };
 
         Ok(CycleResult {
+            review_data: None,
             layer: EvolutionLayer::Memory,
             proposal: Some(proposal),
             cycle,

@@ -273,6 +273,12 @@ async fn handle_config(as_json: bool, config: &Config) -> Result<()> {
 }
 
 async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionLayerArg>) -> Result<()> {
+    crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())?
+        .run(handle_trigger_owned(as_json, config, layer))
+        .await
+}
+
+async fn handle_trigger_owned(as_json: bool, config: &Config, layer: Option<EvolutionLayerArg>) -> Result<()> {
     let (cfg, cfg_path, _exists) = load_evolution_config(config).await?;
     let shared = new_shared_evolution_config(cfg.clone());
 
@@ -299,7 +305,15 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
     // `security.audit`, FIX-P1-31) and install it on the pipeline so the engine is
     // never reached on a deny decision.
     let security_policy = crate::runtime::bootstrap::build_security_policy(config);
-    let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer, &config.workspace_dir)
+    let judge: Arc<dyn crate::self_system::evolution::judge::JudgeScoringModel> =
+        match crate::runtime::evolution_model::EvolutionModel::from_config(
+            config,
+            crate::runtime::evolution_model::EvolutionPurpose::Judge,
+        ) {
+            Ok(model) => Arc::new(crate::self_system::evolution::judge::ManagedJudge(model)),
+            Err(_) => Arc::new(crate::self_system::evolution::judge::MockJudgeModel),
+        };
+    let pipeline = EvolutionPipeline::with_judge_model(shared.clone(), analyzer, writer, &config.workspace_dir, judge)
         .with_security_policy(security_policy)
         .with_judge_timeout(std::time::Duration::from_secs(
             config.self_system.evolution_judge_timeout_secs,
@@ -330,6 +344,12 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
         EvolutionLayer::Prompt => {
             let mut engine = PromptEvolutionEngine::new(shared, &config.workspace_dir, Some(writer_for_engine.clone()))
                 .with_debug_raw(config.self_system.evolution_debug_raw);
+            if let Ok(model) = crate::runtime::evolution_model::EvolutionModel::from_config(
+                config,
+                crate::runtime::evolution_model::EvolutionPurpose::Proposer,
+            ) {
+                engine = engine.with_proposer(model);
+            }
             pipeline
                 .run_for_layer(
                     EvolutionTrigger::Manual,

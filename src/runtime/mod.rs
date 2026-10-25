@@ -9,6 +9,7 @@ pub mod control_ladder;
 pub(crate) mod decision_accounting;
 pub mod docker;
 pub mod envelope;
+pub(crate) mod evolution_model;
 pub mod native;
 pub mod registry;
 pub mod shell_process;

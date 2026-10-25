@@ -608,6 +608,11 @@ impl Config {
             "self_system.fitness.min_samples must be greater than zero"
         );
         anyhow::ensure!(
+            self.self_system.evolution_model_max_tokens <= 1_048_576
+                && i64::try_from(self.self_system.evolution_model_max_micro_usd).is_ok(),
+            "self_system evolution model allowance exceeds the supported range"
+        );
+        anyhow::ensure!(
             self.self_system.fitness.retention_days > 0,
             "self_system.fitness.retention_days must be greater than zero"
         );

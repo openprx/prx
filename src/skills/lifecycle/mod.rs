@@ -120,7 +120,7 @@ pub use propose::{
 };
 pub use propose_new::{NEW_SKILL_PROMPT_VERSION, NewSkillRequest, propose_new_skill};
 pub use proposer_model::{
-    ManagedProviderModel, ModelBinding, ModelCallError, ModelReply, ProposerModel, ReportedUsage,
+    ManagedProviderModel, ModelBinding, ModelCallError, ModelReply, ProposerModel, ReportedUsage, TallyCounters,
 };
 pub use publish::{PUBLICATION_LOCK_TIMEOUT, PublishRequest, RecoveryReport, RollbackRequest, TransactionOutcome};
 #[cfg(test)]

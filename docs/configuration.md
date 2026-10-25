@@ -159,6 +159,31 @@ watcher and cannot publish the process `Config`. The evolution pipeline may
 atomically update its in-memory adaptive policy during a run, but a disk policy
 change is adopted only through the owning supervisor lifecycle.
 
+Evolution prompt generation and judging use the resolved default model through
+the managed provider and physical-attempt accounting path. Configure their
+per-call allowance under `[self_system]`:
+
+```toml
+[self_system]
+evolution_model_max_tokens = 16384
+evolution_model_max_micro_usd = 0
+evolution_judge_timeout_secs = 180
+```
+
+The token allowance includes input, output and retries; zero disables model
+calls. Its maximum is 1,048,576. The monetary allowance defaults to zero, so
+paid models need an explicit allowance; local models still need valid price
+metadata. Workspace daily/monthly cost limits remain effective. These amounts
+are reservation estimates, not vendor billing caps. Missing usage retains an
+unknown liability rather than becoming free. The timeout bounds both proposal
+and judge calls. A provider without physical-attempt accounting is refused.
+
+Prompt generation has no canned-text fallback. A complete model rewrite is
+classified at severity 4 and follows the configured human-review threshold,
+immutable-section checks, autonomy gate and judge verdict. Default review
+settings therefore do not automatically apply a generated rewrite. These
+settings do not enable generated executable skill proposals.
+
 ## Daily Fitness Snapshots
 
 Fitness v2 scores the most recently closed calendar day from durable runtime

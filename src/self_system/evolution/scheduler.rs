@@ -344,6 +344,7 @@ mod tests {
 
         async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
             Ok(CycleResult {
+                review_data: None,
                 layer: self.0.clone(),
                 proposal: Some(EvolutionProposal {
                     id: input.cycle_id.clone(),

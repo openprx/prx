@@ -154,6 +154,7 @@ impl ProposerModel for Scripted {
             || Err(ModelCallError::failed("script exhausted")),
             |text| {
                 Ok(ModelReply {
+                    accounting_scope_id: None,
                     text,
                     usage: ReportedUsage::default(),
                 })

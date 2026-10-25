@@ -808,6 +808,7 @@ impl ProposerModel for ScriptedModel {
         let scripted = self.reply.lock().take();
         match scripted {
             Some(Ok(text)) => Ok(ModelReply {
+                accounting_scope_id: None,
                 text,
                 usage: tally.snapshot(),
             }),

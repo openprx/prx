@@ -263,17 +263,29 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         Arc::new(|_| true),
         {
             let shared = Arc::clone(&shared_config);
+            let cleanup_owner = Arc::clone(&runtime_cleanup);
+            let retirement_gate = Arc::new(tokio::sync::Mutex::new(()));
             Arc::new(move |generation, shutdown| {
                 let shared = Arc::clone(&shared);
+                let cleanup_owner = Arc::clone(&cleanup_owner);
+                let retirement_gate = Arc::clone(&retirement_gate);
                 Box::pin(async move {
-                    tokio::select! {
-                        result = run_evolution_scheduler_worker(
-                            (*generation.effective).clone(),
-                            shared,
-                            generation.id,
-                        ) => result,
-                        () = shutdown.cancelled() => Ok(()),
-                    }
+                    let retirement = retirement_gate.lock_owned().await;
+                    let cleanup =
+                        crate::runtime::turn_cleanup::CleanupScope::new(Some(&cleanup_owner), shutdown.clone())?
+                            .with_retirement_guard(retirement);
+                    cleanup
+                        .run(async move {
+                            tokio::select! {
+                                result = run_evolution_scheduler_worker(
+                                    (*generation.effective).clone(),
+                                    shared,
+                                    generation.id,
+                                ) => result,
+                                () = shutdown.cancelled() => Ok(()),
+                            }
+                        })
+                        .await
                 })
             })
         },
@@ -1487,7 +1499,7 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
     let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
 
     // FIX-P1-10: the production scheduler judges evolution cycles with a real
-    // LLM-backed `ModelJudge` (falling back to the deterministic mock only when
+    // LLM-backed `ManagedJudge` (falling back to the deterministic mock only when
     // no provider can be initialized) instead of always using `MockJudgeModel`.
     let judge_model = build_evolution_judge_model(config);
     // FIX-P0-40: the autonomous evolution pipeline must pass every commit through
@@ -1528,10 +1540,20 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
             .with_context(|| format!("failed to initialize memory evolution engine: {}", cfg_path.display()))?
             .with_memory(evolution_memory),
     );
-    let prompt_engine = Box::new(
-        PromptEvolutionEngine::new(shared.clone(), &config.workspace_dir, Some(writer.clone()))
-            .with_debug_raw(config.self_system.evolution_debug_raw),
-    );
+    let mut prompt_engine = PromptEvolutionEngine::new(shared.clone(), &config.workspace_dir, Some(writer.clone()))
+        .with_debug_raw(config.self_system.evolution_debug_raw);
+    match crate::runtime::evolution_model::EvolutionModel::from_config(
+        config,
+        crate::runtime::evolution_model::EvolutionPurpose::Proposer,
+    ) {
+        Ok(model) => {
+            prompt_engine = prompt_engine.with_proposer(model);
+        }
+        Err(_) => {
+            tracing::warn!(target: "self_system", "managed evolution proposer unavailable; prompt generation will be refused")
+        }
+    }
+    let prompt_engine = Box::new(prompt_engine);
     let strategy_engine = Box::new(StrategyEvolutionEngine::new(
         shared.clone(),
         &config.workspace_dir,
@@ -1610,7 +1632,7 @@ fn record_evolution_judge_health<'a>(
 
 /// FIX-P1-10: build the scoring model used to judge evolution cycles.
 ///
-/// The production path prefers a real LLM-backed [`ModelJudge`] driven by the
+/// The production path prefers a real LLM-backed [`crate::self_system::evolution::judge::ManagedJudge`] driven by the
 /// configured default provider. Constructing a provider can fail (missing
 /// credentials, unavailable backend); in that case we fall back to the
 /// deterministic [`MockJudgeModel`] so a credential gap degrades judging quality
@@ -1621,34 +1643,16 @@ fn record_evolution_judge_health<'a>(
 /// [`EVOLUTION_JUDGE_COMPONENT`] health component (error when degraded, ok when a
 /// real judge is wired) so the daemon health surface reflects it.
 fn build_evolution_judge_model(config: &Config) -> Arc<dyn crate::self_system::evolution::judge::JudgeScoringModel> {
-    use crate::self_system::evolution::judge::{MockJudgeModel, ModelJudge};
-
+    use crate::self_system::evolution::judge::{ManagedJudge, MockJudgeModel};
     let provider_name = crate::providers::selection::default_provider(config).to_string();
-    let provider_runtime_options = crate::providers::provider_runtime_options_from_config(config);
-
-    // D-034: the judge asks the resolved default model (the route's
-    // destination for a `hint:` default), with the credential the resolver
-    // released for it. A default that cannot be resolved means no model
-    // judge: judging degrades to the deterministic mock, which sends nothing.
-    let built =
-        crate::providers::selection::check_default(config, crate::providers::catalog::UnknownPolicy::Invocation)
-            .map_err(anyhow::Error::from)
-            .and_then(|resolved| {
-                let catalog = crate::providers::selection::catalog_for(config);
-                crate::providers::create_provider_for(
-                    &resolved,
-                    &catalog,
-                    &config.reliability,
-                    &config.cost,
-                    &provider_runtime_options,
-                )
-                .map(|provider| (provider, resolved.model().to_string()))
-            });
+    let built = crate::runtime::evolution_model::EvolutionModel::from_config(
+        config,
+        crate::runtime::evolution_model::EvolutionPurpose::Judge,
+    );
     match built {
-        Ok((provider, model)) => {
-            let provider: Arc<dyn crate::providers::traits::Provider> = Arc::from(provider);
+        Ok(model) => {
             crate::health::mark_component_ok(EVOLUTION_JUDGE_COMPONENT);
-            Arc::new(ModelJudge::new(provider, model))
+            Arc::new(ManagedJudge(model))
         }
         Err(error) => {
             // The default provider may be a `custom:` URL carrying
@@ -3078,6 +3082,7 @@ mod tests {
                 let content = "{\"task_completion\":0.7,\"correctness\":0.7,\"efficiency\":0.7,\"safety_compliance\":0.7,\"reasoning\":\"r\"}";
                 let payload = serde_json::json!({
                     "id": "x", "object": "chat.completion",
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]
                 })
                 .to_string();
@@ -3097,16 +3102,50 @@ mod tests {
     async fn the_judge_sends_the_resolved_default_model_never_the_placeholder() {
         use crate::self_system::evolution::judge::JudgeConfig;
         let (label, models, server) = judge_stub().await;
-        let config = Config {
-            default_provider: Some(label),
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            workspace_dir: workspace.path().to_path_buf(),
+            default_provider: Some(label.clone()),
             default_model: Some("judge-model".to_string()),
             ..Config::default()
         };
+        config.providers.models.push(
+            serde_json::from_value(serde_json::json!({
+                "provider": label, "model": "judge-model", "operations": ["chat"], "native_tools": false
+            }))
+            .unwrap(),
+        );
+        config.cost.prices.insert(
+            format!("{label}/judge-model"),
+            crate::config::schema::ModelPricing {
+                input: 0.0,
+                output: 0.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
         let judge = {
             let _serial = JUDGE_HEALTH_SERIAL.lock();
             build_evolution_judge_model(&config)
         };
-        let _ = judge.score("task", "done", &JudgeConfig::default()).await;
+        assert!(judge.score("task", "done", &JudgeConfig::default()).await.is_err());
+        assert!(
+            models.lock().is_empty(),
+            "missing cleanup ownership must prevent transport"
+        );
+        let engine = crate::self_system::evolution::judge::JudgeEngine::new(JudgeConfig::default(), judge);
+        let verdict = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+            .unwrap()
+            .run(async { engine.judge_task("experiment", "task", "task", "done").await })
+            .await
+            .unwrap();
+        let journal = std::fs::read_to_string(workspace.path().join("state/costs.reservations.jsonl")).unwrap();
+        let provenance = verdict.model_provenance.unwrap();
+        assert_eq!(provenance.model.model, "judge-model");
+        assert!(provenance.usage.reported);
+        assert!(journal.contains(&provenance.accounting_scope_id.unwrap()));
+        assert!(journal.contains("evolution_judge"));
+        assert!(journal.contains("estimated_settled_v1"));
         let seen = models.lock().clone();
         server.abort();
         assert!(

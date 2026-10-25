@@ -75,6 +75,8 @@ pub struct ReportedUsage {
 
 #[derive(Clone, Debug)]
 pub struct ModelReply {
+    /// Opaque runtime scope joining this reply to the physical cost journal.
+    pub accounting_scope_id: Option<String>,
     pub text: String,
     pub usage: ReportedUsage,
 }
@@ -147,12 +149,10 @@ impl TallyCounters {
 
 /// The production model: the managed provider path with attempt accounting.
 ///
-/// Fields are crate-visible and there is deliberately no constructor: a
-/// `pub(crate)` one would be dead code until the proposal-purpose accounting
-/// owner exists, and a public one would expose a crate-private type. The
-/// runtime wires it with the objects its own
-/// provider construction and decision service already issued; the proposer
-/// owns no provider registry and reads no credential.
+/// Fields remain crate-visible: only runtime owners construct this adapter
+/// from the managed provider factory and a sealed physical accounting owner.
+/// Evolution creates a fresh bounded owner per call; the proposer itself owns
+/// no provider registry and reads no credential.
 pub struct ManagedProviderModel {
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) binding: ModelBinding,
@@ -299,6 +299,10 @@ impl ProposerModel for ManagedProviderModel {
                 usage,
             });
         }
-        Ok(ModelReply { text, usage })
+        Ok(ModelReply {
+            accounting_scope_id: None,
+            text,
+            usage,
+        })
     }
 }

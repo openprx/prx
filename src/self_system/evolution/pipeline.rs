@@ -390,9 +390,15 @@ impl EvolutionPipeline {
         // for the task before it returns.
         let cancel = self.commits.task_token();
         let _cancel_when_dropped = cancel.clone().drop_guard();
+        let cleanup = crate::runtime::turn_cleanup::current_tracker();
         let verdict = self
             .commits
-            .spawn(stage.run(cancel))
+            .spawn(async move {
+                match cleanup {
+                    Some(owner) => owner.scope(stage.run(cancel)).await,
+                    None => stage.run(cancel).await,
+                }
+            })
             .await
             .map_err(|err| anyhow::anyhow!("evolution verdict task failed: {err}"))??;
         errors.extend(verdict.errors);
@@ -742,7 +748,7 @@ impl VerdictStage {
             }
             result = tokio::time::timeout(
                 judge_timeout,
-                judge_engine.judge_task(&experiment_id, &cycle_result.cycle.id, task, &cycle_result.cycle.validation.notes),
+                judge_engine.judge_task(&experiment_id, &cycle_result.cycle.id, task, cycle_result.review_data.as_ref().map(|data| data.as_str()).unwrap_or(&cycle_result.cycle.validation.notes)),
             ) => {
                 cancelled_before_verdict = false;
                 result.unwrap_or_else(|_| {
@@ -1115,6 +1121,7 @@ mod tests {
 
         async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
             Ok(CycleResult {
+                review_data: None,
                 layer: EvolutionLayer::Memory,
                 proposal: Some(EvolutionProposal {
                     id: input.cycle_id.clone(),
@@ -1796,7 +1803,14 @@ mod tests {
 
     #[async_trait]
     impl JudgeScoringModel for SnapshotJudge {
-        async fn score(&self, _task: &str, _result: &str, _config: &JudgeConfig) -> Result<String> {
+        async fn score(&self, _task: &str, result: &str, _config: &JudgeConfig) -> Result<String> {
+            if self.target.file_name().is_some_and(|name| name == "p.md") {
+                let projection: serde_json::Value = serde_json::from_str(result)
+                    .expect("the prompt judge must receive the actual bounded proposal projection");
+                assert_eq!(projection["before"], PROMPT_ORIGINAL);
+                assert!(projection["after"].as_str().unwrap().contains("Verify the result"));
+                assert!(projection["provenance"].as_str().unwrap().contains("input_sha256"));
+            }
             *self.seen.lock() = Some(std::fs::read_to_string(&self.target).unwrap_or_default());
             match self.reply {
                 Some(score) => Ok(format!(
@@ -1821,6 +1835,7 @@ mod tests {
         cfg.prompt.human_approval_severity = 4;
         pipeline.shared_config.store(Arc::new(cfg));
         crate::self_system::evolution::PromptEvolutionEngine::new(Arc::clone(&pipeline.shared_config), dir, None)
+            .with_proposer(crate::self_system::evolution::prompt_evolution::test_proposer())
     }
 
     /// Point the pipeline's strategy layer at `decision_policy.toml`.

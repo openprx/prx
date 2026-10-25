@@ -288,6 +288,7 @@ impl EvolutionEngine for ProposingEngine {
         };
 
         Ok(openprx::self_system::evolution::CycleResult {
+            review_data: None,
             layer: EvolutionLayer::Memory,
             proposal: Some(proposal),
             cycle: EvolutionCycle {

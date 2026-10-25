@@ -722,6 +722,7 @@ impl ProposerModel for ScriptedProposer {
             || Err(ModelCallError::failed("the scripted proposer has no reply left")),
             |text| {
                 Ok(ModelReply {
+                    accounting_scope_id: None,
                     text,
                     usage: crate::skills::lifecycle::ReportedUsage::default(),
                 })

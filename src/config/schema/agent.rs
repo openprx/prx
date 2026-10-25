@@ -236,11 +236,20 @@ pub struct SelfSystemConfig {
     #[serde(default)]
     pub evolution_debug_raw: bool,
 
-    /// Seconds one evolution judge call may take (1 to 3600, default 180).
-    /// A judge that has not answered by then gives no verdict, so an applied
-    /// change is rolled back.
+    /// Seconds one evolution model call may take (1 to 3600, default 180).
+    /// Shared by the proposer and judge. A missing verdict cannot apply a change.
     #[serde(default = "default_self_system_evolution_judge_timeout_secs")]
     pub evolution_judge_timeout_secs: u64,
+
+    /// Total input/output token allowance for one evolution model call,
+    /// including physical retries. Zero disables evolution model calls.
+    #[serde(default = "default_evolution_model_max_tokens")]
+    pub evolution_model_max_tokens: u64,
+    /// Monetary allowance per evolution model call, in micro USD. The default
+    /// zero allows explicitly priced free/local models only. Global cost limits
+    /// still apply; this is a reservation estimate, not a vendor billing cap.
+    #[serde(default)]
+    pub evolution_model_max_micro_usd: u64,
 }
 
 /// Calendar schedule, evidence thresholds, and retention for fitness v2.
@@ -322,6 +331,10 @@ pub(super) const fn default_self_system_evolution_judge_timeout_secs() -> u64 {
 /// Upper bound on `self_system.evolution_judge_timeout_secs`: one hour.
 pub(super) const MAX_EVOLUTION_JUDGE_TIMEOUT_SECS: u64 = 3600;
 
+pub(super) const fn default_evolution_model_max_tokens() -> u64 {
+    16_384
+}
+
 impl Default for SelfSystemConfig {
     fn default() -> Self {
         Self {
@@ -331,6 +344,8 @@ impl Default for SelfSystemConfig {
             evolution_config_path: None,
             evolution_debug_raw: false,
             evolution_judge_timeout_secs: default_self_system_evolution_judge_timeout_secs(),
+            evolution_model_max_tokens: default_evolution_model_max_tokens(),
+            evolution_model_max_micro_usd: 0,
         }
     }
 }

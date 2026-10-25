@@ -72,9 +72,29 @@ pub struct EngineCycleInput {
     pub fitness_trend: Option<FitnessTrend>,
 }
 
+/// Ephemeral review projection. Debug output exposes only its size.
+#[derive(Clone)]
+pub struct ReviewData(String);
+impl ReviewData {
+    pub const fn new(content: String) -> Self {
+        Self(content)
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl std::fmt::Debug for ReviewData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReviewData").field("bytes", &self.0.len()).finish()
+    }
+}
+
 /// Normalized output from a single evolution engine cycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CycleResult {
+    /// Ephemeral bounded input for model review; never persisted in cycle JSON.
+    #[serde(skip)]
+    pub review_data: Option<ReviewData>,
     pub layer: EvolutionLayer,
     pub proposal: Option<EvolutionProposal>,
     pub cycle: EvolutionCycle,

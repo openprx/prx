@@ -268,6 +268,7 @@ impl ProposerModel for ScriptedModel {
         let next = self.script.lock().pop_front();
         match next {
             Some(Script::Reply(text)) => Ok(ModelReply {
+                accounting_scope_id: None,
                 text,
                 usage: ReportedUsage {
                     reported: true,
@@ -293,6 +294,7 @@ impl ProposerModel for ScriptedModel {
             Some(Script::Gated(gate, text)) => {
                 gate.notified().await;
                 Ok(ModelReply {
+                    accounting_scope_id: None,
                     text,
                     usage: ReportedUsage {
                         reported: true,
@@ -809,6 +811,7 @@ async fn a_cancel_during_the_call_stands_and_keeps_the_real_usage() {
         .expect("test: cancel");
     assert_eq!(cancelled.attempts[0].outcome, AttemptOutcome::Abandoned);
     let reply = ModelReply {
+        accounting_scope_id: None,
         text: good_patch(),
         usage: ReportedUsage {
             reported: true,
