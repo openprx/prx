@@ -7,6 +7,22 @@ Example PRX tool plugin built with the Rust PDK. Demonstrates:
 - Pure-Rust logic with no external crate dependencies
 - Unit tests runnable on the host (no WASM required)
 
+## Build the component
+
+The WIT contract is committed under `wit/`; the Rust macro generates bindings
+during compilation. From the repository root:
+
+```bash
+rustup target add wasm32-wasip2
+cargo build --release --locked --target wasm32-wasip2 \
+  --manifest-path pdk/rust/examples/base64-tool/Cargo.toml
+```
+
+Stage `target/wasm32-wasip2/release/base64_tool.wasm` from this example's
+directory together with `plugin.toml` under the PRX workspace. Install it
+through `wasm_plugins_manage` with the declared `log`, `config` and `kv`
+permissions. Host-only unit tests do not validate the component exports.
+
 ## Usage
 
 The `base64` tool accepts:

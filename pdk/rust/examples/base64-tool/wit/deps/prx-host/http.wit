@@ -1,0 +1,16 @@
+package prx:host@0.1.0;
+
+interface http-outbound {
+    record http-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    request: func(
+        method: string,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    ) -> result<http-response, string>;
+}

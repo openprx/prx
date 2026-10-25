@@ -1,7 +1,7 @@
 # PRX WASM Plugin Developer Guide
 
 > **Version:** 0.1  
-> **Stack:** wasmtime + Component Model + WIT  
+> **Stack:** Wasmtime 50.0.0 + Component Model + WIT
 > **Status:** Stable
 
 ---

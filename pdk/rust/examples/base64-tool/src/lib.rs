@@ -162,33 +162,39 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 
 // ── WIT guest trait implementation (cargo-component / wasm32 only) ────────────
 //
-// When building with `cargo component build`, cargo-component invokes wit-bindgen
-// to generate a `Guest` trait for the `prx:plugin/tool` world. The generated code
-// is placed in a `bindings` module. We implement that trait here.
+// Generate bindings from the committed WIT contract for direct WASIp2 builds.
 //
 // On non-wasm32 hosts this block is excluded so `cargo build` succeeds.
+
+#[cfg(target_arch = "wasm32")]
+mod bindings {
+    wit_bindgen::generate!({
+        world: "tool",
+        path: "wit",
+        generate_all,
+    });
+}
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_exports {
     use super::Base64Tool;
 
-    // cargo-component generates `bindings::Guest`, `bindings::ToolSpec`,
-    // `bindings::PluginResult` for the `tool` world.
-    use bindings::Guest;
+    use super::bindings;
+    use bindings::exports::prx::plugin::tool_exports::{Guest, PluginResult, ToolSpec};
 
     impl Guest for Base64Tool {
-        fn get_spec() -> bindings::ToolSpec {
+        fn get_spec() -> ToolSpec {
             let s = Base64Tool::get_spec_impl();
-            bindings::ToolSpec {
+            ToolSpec {
                 name: s.name,
                 description: s.description,
                 parameters_schema: s.parameters_schema,
             }
         }
 
-        fn execute(args: String) -> bindings::PluginResult {
+        fn execute(args: String) -> PluginResult {
             let r = Base64Tool::execute_impl(&args);
-            bindings::PluginResult {
+            PluginResult {
                 success: r.success,
                 output: r.output,
                 error: r.error,
