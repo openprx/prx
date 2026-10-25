@@ -671,6 +671,16 @@ request registered — a request that registered no tools has no such name, so
 every block is rejected — and that the body parses as JSON. A rejected block is
 never executed.
 
+## Managing a model fallback
+
+`prx providers add openai --fallback --model MODEL` plans an addition to
+`reliability.model_fallbacks` for the current explicit default model. Apply it
+with `--yes` and the revision confirmation printed by the plan. The model list
+is shared by the provider chain; it is not a provider-specific binding. Adding
+the default provider does not duplicate it in `fallback_providers`. Each affected
+provider/model pair must pass the normal capability and credential validation.
+Remove the entry through the configuration transaction to roll back.
+
 ## Routing, fallback, and cost truth
 
 Provider construction and availability checks use the same credential

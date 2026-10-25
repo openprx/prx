@@ -197,7 +197,7 @@ impl Write {
 /// The operation name a change is authorized under.
 const fn operation_name(change: &ManagedChange) -> &'static str {
     match change {
-        ManagedChange::AddProvider { .. } => "gateway_api:providers:add",
+        ManagedChange::AddProvider { .. } | ManagedChange::AddProviderWithModel { .. } => "gateway_api:providers:add",
         ManagedChange::SetProviderEndpoint { .. } => "gateway_api:providers:update",
         ManagedChange::RemoveProvider { .. } => "gateway_api:providers:remove",
         ManagedChange::AddModel(_) | ManagedChange::UpdateModel(_) | ManagedChange::RemoveModel { .. } => {

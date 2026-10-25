@@ -79,6 +79,8 @@ pub enum ManagedChange {
     /// `reliability.fallback_providers` (the default is chosen with
     /// [`ManagedChange::SetDefault`]).
     AddProvider { provider: String },
+    /// Add a fallback model for the default selection and ensure provider membership.
+    AddProviderWithModel { provider: String, model: String },
     /// Set (`Some`) or clear (`None`) the endpoint of the default provider
     /// (`api_url`, which only the default provider uses).
     SetProviderEndpoint { provider: String, api_url: Option<String> },
@@ -271,6 +273,27 @@ impl ManagementService {
         let candidate = candidate(&desired.config, change)?;
         let revision = ConfigTransactions::base_revision(&desired);
         self.plan_candidate(candidate, revision, actor).await
+    }
+
+    /// Write-only Brave credential planning through the same slot validation,
+    /// encryption and revision-checked transaction used by the gateway.
+    pub async fn plan_brave_credential(
+        &self,
+        secret: &super::credentials::SecretString,
+        actor: ConfigActor,
+    ) -> Result<ManagedPlan, ManageError> {
+        let desired = self.shared.desired();
+        let mut candidate = desired.config.as_ref().clone();
+        let value = crate::config::credential_slots::validate_credential(secret.expose())
+            .map_err(|error| ManageError::Invalid(error.to_string()))?;
+        crate::config::credential_slots::CredentialSlot::BraveSearch
+            .apply(
+                &mut candidate,
+                crate::config::credential_slots::CredentialValue::One(value),
+            )
+            .map_err(|error| ManageError::Invalid(error.to_string()))?;
+        self.plan_candidate(candidate, ConfigTransactions::base_revision(&desired), actor)
+            .await
     }
 
     /// Plan a raw file write (`config.toml` or a `config.d` fragment), as the
@@ -1349,6 +1372,30 @@ fn candidate(current: &Config, change: &ManagedChange) -> Result<Config, ManageE
                 return Err(ManageError::AlreadyExists(format!("provider '{}'", shown(&provider))));
             }
             next.reliability.fallback_providers.push(provider);
+        }
+        ManagedChange::AddProviderWithModel { provider, model } => {
+            let (provider, _) = provider_arg(provider)?;
+            if !is_configured_provider(current, &provider) {
+                next = candidate(current, &ManagedChange::AddProvider { provider })?;
+            }
+            let source = current
+                .default_model
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+                .ok_or_else(|| {
+                    ManageError::Invalid("select an explicit default model before adding model fallbacks".into())
+                })?;
+            let model = model.trim();
+            if model.is_empty() || model == source || model.chars().any(char::is_control) {
+                return Err(ManageError::Invalid(
+                    "a fallback model must be nonempty, distinct from the default and contain no control characters"
+                        .into(),
+                ));
+            }
+            let models = next.reliability.model_fallbacks.entry(source.to_string()).or_default();
+            if !models.iter().any(|existing| existing == model) {
+                models.push(model.to_string());
+            }
         }
         ManagedChange::SetProviderEndpoint { provider, api_url } => {
             let (provider, id) = provider_arg(provider)?;

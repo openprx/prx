@@ -954,6 +954,13 @@ enum TasksCommands {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
+    /// Set the Brave Search credential from stdin without an argument or echo
+    BraveKey {
+        #[arg(long, required = true)]
+        from_stdin: bool,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
     /// Print the effective merged configuration
     Show {
         /// Output format
@@ -1099,6 +1106,9 @@ enum ProvidersCommands {
         /// role cannot change what an existing script does
         #[arg(long, required = true)]
         fallback: bool,
+        /// Append a model fallback for the current default model (shared by the provider chain)
+        #[arg(long)]
+        model: Option<String>,
         #[command(flatten)]
         apply: ApplyArgs,
     },

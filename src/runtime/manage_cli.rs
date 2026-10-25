@@ -280,8 +280,15 @@ async fn run_providers(command: ProvidersCommands, config: Config, io: &mut Io<'
         ProvidersCommands::Add {
             provider,
             fallback: _,
+            model,
             apply,
-        } => change(&service(config), ManagedChange::AddProvider { provider }, &apply, io).await,
+        } => {
+            let mutation = match model {
+                Some(model) => ManagedChange::AddProviderWithModel { provider, model },
+                None => ManagedChange::AddProvider { provider },
+            };
+            change(&service(config), mutation, &apply, io).await
+        }
         ProvidersCommands::Update {
             provider,
             api_url,
@@ -1018,6 +1025,33 @@ fn read_posted_file(path: &std::path::Path) -> Result<(String, config::secret_pa
 
 pub(crate) async fn run_config(command: ConfigCommands, config: Config, io: &mut Io<'_>) -> Result<()> {
     match command {
+        ConfigCommands::BraveKey { from_stdin: _, apply } => {
+            let service = service(config);
+            let revision = service.revision().unwrap_or_else(|| "none".to_owned());
+            if !apply.yes || apply.confirm_high_risk.is_none() {
+                writeln!(
+                    io.out,
+                    "Dry run: stdin was not read. Set web_search.brave_api_key with --from-stdin --yes --confirm-high-risk {revision}"
+                )?;
+                return Ok(());
+            }
+            if apply.confirm_high_risk.as_deref() != Some(revision.as_str()) {
+                bail!("the configuration revision changed; rerun the dry run before supplying a credential");
+            }
+            let mut value = String::new();
+            (&mut *io.stdin)
+                .take(16_385)
+                .read_to_string(&mut value)
+                .context("failed to read the Brave credential")?;
+            if value.len() > 16_384 {
+                bail!("the Brave credential exceeds 16384 bytes; nothing was stored");
+            }
+            let secret = openprx::config::manage::credentials::SecretString::new(
+                value.trim_end_matches(['\r', '\n']).to_owned(),
+            );
+            let plan = service.plan_brave_credential(&secret, ConfigActor::Cli).await?;
+            finish(&service, plan, &apply, io).await
+        }
         ConfigCommands::Plan {
             file,
             target,
@@ -1386,6 +1420,93 @@ mod tests {
             self.read.set(true);
             self.bytes.read(buf)
         }
+    }
+
+    #[tokio::test]
+    async fn brave_stdin_intake_waits_for_confirmation_and_never_echoes_the_value() {
+        let (dir, config) = fixture(|_| {}).await;
+        let original = stored(&dir);
+        let read = std::cell::Cell::new(false);
+        let mut stdin = Watched {
+            bytes: SECRET.as_bytes(),
+            read: &read,
+        };
+        let mut out = Vec::new();
+        let mut io = Io {
+            out: &mut out,
+            stdin: &mut stdin,
+            env: &|_| None,
+            prompt: &|_| bail!("no prompt"),
+        };
+        run(
+            manage_command(&["config", "brave-key", "--from-stdin"]),
+            config.clone(),
+            &mut io,
+        )
+        .await
+        .unwrap();
+        assert!(!read.get());
+        assert_eq!(stored(&dir), original);
+        let revision = service(config.clone()).revision().unwrap();
+        let (result, output) = run_cli(
+            &[
+                "config",
+                "brave-key",
+                "--from-stdin",
+                "--yes",
+                "--confirm-high-risk",
+                &revision,
+            ],
+            config,
+            &format!("{SECRET}\n"),
+            &[],
+        )
+        .await;
+        result.unwrap();
+        assert!(!output.contains(SECRET));
+        assert!(!String::from_utf8(stored(&dir)).unwrap().contains(SECRET));
+        assert_eq!(reload(&dir).await.web_search.brave_api_key.as_deref(), Some(SECRET));
+    }
+
+    #[tokio::test]
+    async fn fallback_model_flag_updates_the_default_chain_without_duplicate_provider_membership() {
+        let (dir, config) = fixture(|_| {}).await;
+        let revision = service(config.clone()).revision().unwrap();
+        let original = stored(&dir);
+        let (result, plan) = run_cli(
+            &["providers", "add", "openai", "--fallback", "--model", "gpt-5.6"],
+            config.clone(),
+            "",
+            &[],
+        )
+        .await;
+        result.unwrap();
+        assert!(plan.contains("model_fallbacks"));
+        assert_eq!(stored(&dir), original);
+        let (result, _) = run_cli(
+            &[
+                "providers",
+                "add",
+                "openai",
+                "--fallback",
+                "--model",
+                "gpt-5.6",
+                "--yes",
+                "--confirm-high-risk",
+                &revision,
+            ],
+            config,
+            "",
+            &[],
+        )
+        .await;
+        result.unwrap();
+        let config = reload(&dir).await;
+        assert_eq!(
+            config.reliability.model_fallbacks.get("gpt-4o").unwrap(),
+            &vec!["gpt-5.6".to_owned()]
+        );
+        assert!(config.reliability.fallback_providers.is_empty());
     }
 
     /// CDP-14: `prx causal config set secret` reads the credential only once

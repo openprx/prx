@@ -3004,3 +3004,13 @@ ceiling below the catalog recommendation. An explicit current-schema
 `causal_tree.policy.extra_latency_budget_ms` is operator-owned and does not
 emit that upgrade warning at load, status or doctor. Both paths preserve the
 configured ceiling.
+
+### Brave credential intake
+
+Run `prx config brave-key --from-stdin` to inspect the current revision without
+reading stdin. Then pipe the key to the same command with `--yes
+--confirm-high-risk REVISION`. The confirmed transaction accepts at most 16 KiB,
+validates the credential, and stores it through the existing secret encryption
+policy. The key is never a CLI argument or part of plan output. A stale revision
+is refused before stdin is consumed. Replacing or clearing it uses the same
+managed configuration history and secret rules as other credentials.
