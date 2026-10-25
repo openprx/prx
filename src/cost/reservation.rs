@@ -593,6 +593,21 @@ impl Reservations {
         Ok(())
     }
 
+    /// Requests still held, separated from sent requests awaiting settlement.
+    pub(super) fn active_request_counts(&self) -> (usize, usize) {
+        let reserved = self
+            .entries
+            .values()
+            .filter(|(_, state)| *state == State::Reserved)
+            .count();
+        let dispatched = self
+            .entries
+            .values()
+            .filter(|(_, state)| *state == State::Dispatched)
+            .count();
+        (reserved, dispatched)
+    }
+
     pub(super) fn active_micro_usd(&self) -> Result<u128> {
         ensure!(
             !self.unreconciled_over_bound,

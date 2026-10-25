@@ -382,6 +382,35 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
         // process: it is an HTTP client of whichever process owns the work.
         Commands::Tasks { tasks_command } => handle_tasks_command(tasks_command, &config).await,
 
+        Commands::Cost { json } => {
+            let report = openprx::cost::tracker::workspace_cost_report(&config.workspace_dir)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Workspace costs (UTC; advisory snapshot {})", report.as_of_utc);
+                for (label, totals) in [
+                    ("Today", &report.today),
+                    ("Month", &report.month),
+                    ("All time", &report.all_time),
+                ] {
+                    println!(
+                        "{label}: ${:.6}; {} tokens; {} requests ({} with reported usage)",
+                        totals.cost_usd, totals.total_tokens, totals.requests, totals.reported_requests
+                    );
+                }
+                println!(
+                    "Outstanding reservations: {} micro-USD; {} reserved requests; {} dispatched requests awaiting settlement",
+                    report.outstanding_reservation_micro_usd,
+                    report.reserved_requests,
+                    report.unsettled_dispatched_requests
+                );
+                println!(
+                    "Reservation amounts include estimates and are not additional settled charges or vendor billing caps."
+                );
+            }
+            Ok(())
+        }
+
         Commands::Status => {
             println!("🦀 OpenPRX Status");
             println!();

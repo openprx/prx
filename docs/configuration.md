@@ -2824,6 +2824,27 @@ For an issued child grant, delegation retains original backend roots so dynamic 
 
 Delegate input receipts bind the complete user input sent to the child, including the optional context block and task separators. Decision routing and the provider history use that same text; a granted child rejects a mismatched execution input before entering its tool loop.
 
+### Workspace cost report
+
+`prx cost` reads the existing workspace ledger without initializing configuration,
+creating a database, migrating legacy state, or changing reservations. Use
+`prx cost --json` for machine-readable output. Logging goes to stderr; the same
+rule now applies to `prx evolution --json`.
+
+The report shows settled ledger totals for today, the current month (both UTC),
+and all time, plus an all-time breakdown by redacted model label. Request counts
+separate provider-reported usage from estimated or legacy records. Outstanding
+reservations are shown separately from settled charges, including dispatched
+requests awaiting settlement even when their monetary reservation is zero.
+Reservation amounts include estimates and are not vendor billing caps.
+
+This is an advisory snapshot, not a billing export or a budget authorization.
+Concurrent writes may require retrying it. Each ledger read is bounded to 8 MiB;
+unsafe paths, incomplete or malformed rows, duplicate settlements and legacy
+state requiring migration produce errors instead of an empty report. It uses
+the existing Unix file-handle safety checks. There is no new persisted format;
+rolling back removes the command without changing the ledger.
+
 ### Cost settlement replay
 
 A terminal usage settlement is recorded once under its stable settlement ID.

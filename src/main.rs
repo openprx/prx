@@ -675,6 +675,13 @@ Examples:
         evolution_command: EvolutionCommands,
     },
 
+    /// Read workspace costs and outstanding reservations without creating state.
+    Cost {
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Inspect, run, and migrate daily self-system fitness snapshots.
     Fitness {
         /// Output machine-readable JSON.
@@ -1690,6 +1697,8 @@ async fn async_main() -> Result<()> {
             | Commands::Integrations { .. }
             | Commands::Audit { .. }
             | Commands::Causal { .. }
+            | Commands::Cost { .. }
+            | Commands::Evolution { .. }
     );
     if use_stderr {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -1951,7 +1960,7 @@ async fn async_main() -> Result<()> {
         }
     ) || matches!(
         &cli.command,
-        Commands::Doctor { .. } | Commands::Tasks { .. } | Commands::Causal { .. }
+        Commands::Doctor { .. } | Commands::Tasks { .. } | Commands::Causal { .. } | Commands::Cost { .. }
     );
     let config = if read_only_config_command {
         Config::load_existing_read_only_with_config_dir(cli.config_dir.as_deref()).await?

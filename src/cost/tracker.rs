@@ -11,7 +11,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+mod report;
 mod settlement;
+pub use report::{CostTotals, WorkspaceCostReport, workspace_cost_report};
 
 const COST_LEDGER_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const COST_LEDGER_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
