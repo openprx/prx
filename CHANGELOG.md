@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Raise Tokio to 1.53.3 to address RUSTSEC-2026-0386 without adding an advisory exception.
 - Check model-extracted completion constraints against full-turn tool counts and
   exact command hashes, preserving violations after detailed evidence eviction.
   Preserve runtime backend identities behind public aliases and repair invalid
