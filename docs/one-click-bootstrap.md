@@ -126,6 +126,9 @@ curl -fsSL https://github.com/openprx/prx/releases/latest/download/install.sh |
 
 ## Daemon Service
 
+For a pinned local-model and Office test environment, see
+[the isolated acceptance profile](local-model-office-profile.md).
+
 Installing the binary does not create or start a background service. After
 onboarding, service setup remains explicit:
 

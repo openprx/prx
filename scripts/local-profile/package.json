@@ -1,0 +1,9 @@
+{
+  "name": "prx-local-office-profile",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "docx": "9.14.0",
+    "pptxgenjs": "4.0.1"
+  }
+}
