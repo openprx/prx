@@ -148,7 +148,24 @@ async fn spawn_agent_uses_identity_prompt() {
         .unwrap();
     assert!(result.success);
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Admission, accounting and notification delivery need not finish within
+    // one scheduler delay. Observe both terminal state and the announcement.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let announced = !sent.lock().await.is_empty();
+            let terminal = tool
+                .active_runs_snapshot()
+                .await
+                .iter()
+                .any(|run| matches!(&run.status, SubAgentStatus::Completed(_) | SubAgentStatus::Failed(_)));
+            if announced && terminal {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("admitted identity child should terminate and announce");
     let messages = sent.lock().await;
     assert_eq!(messages.len(), 1);
     assert!(messages[0].contains("completed:"), "{}", messages[0]);
