@@ -21,8 +21,12 @@ tokio::task_local! {
     static EVIDENCE_SUFFICIENT: ();
 }
 
-pub(crate) async fn with_evidence_sufficient<F: Future>(work: F) -> F::Output {
-    EVIDENCE_SUFFICIENT.scope((), work).await
+#[inline(never)]
+pub(crate) fn with_evidence_sufficient<F: Future>(work: F) -> impl Future<Output = F::Output> {
+    // Keep the complete admission/turn fixture on the heap instead of copying
+    // it through another async state machine on the default test-thread stack.
+    // The same runtime path and assertions still run under the task-local scope.
+    EVIDENCE_SUFFICIENT.scope((), Box::pin(work))
 }
 
 pub(super) fn wrap_factory(
