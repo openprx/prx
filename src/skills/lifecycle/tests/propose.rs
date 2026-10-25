@@ -189,6 +189,48 @@ fn good_patch() -> String {
     }]))
 }
 
+#[tokio::test]
+async fn evolution_prompt_bridge_uses_verified_evidence_and_keeps_publication_separate() {
+    use crate::skills::lifecycle::{SkillsLifecycleService, SkillsLifecycleSettings};
+    let f = fixture();
+    usable_pattern(&f);
+    let service = SkillsLifecycleService::new(
+        Arc::clone(&f.store),
+        SkillsLifecycleSettings {
+            enabled: true,
+            ..SkillsLifecycleSettings::default()
+        },
+    )
+    .expect("service");
+    let model = ScriptedModel::replying(&good_patch());
+    let before = skill_md_with(20);
+    let (draft, after) = service
+        .propose_prompt_revision("Deploy helper", &before, "evolution-cycle".into(), budget(), &model)
+        .await
+        .expect("managed proposal");
+    assert_eq!(draft.status, Status::Draft);
+    assert!(!draft.evidence_ids.is_empty());
+    assert_ne!(after, before);
+    assert_eq!(
+        f.store.active_binding(&skill()).unwrap().unwrap().revision_id,
+        f.pin.revision_id
+    );
+    assert!(service.publish(&draft.proposal_id).is_err());
+    assert_eq!(model.calls(), 1);
+    let error = service
+        .propose_prompt_revision(
+            "Deploy helper",
+            "stale projection",
+            "different-cycle".into(),
+            budget(),
+            &model,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("projection differs"));
+    assert_eq!(model.calls(), 1, "stale projection must fail before another model call");
+}
+
 fn append_patch(words: u64) -> String {
     let text = vec!["word"; usize::try_from(words).expect("test: words")].join(" ");
     patch(&json!([{"file": "SKILL.md", "op": "append", "new": text}]))

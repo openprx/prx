@@ -1541,7 +1541,11 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
             .with_memory(evolution_memory),
     );
     let mut prompt_engine = PromptEvolutionEngine::new(shared.clone(), &config.workspace_dir, Some(writer.clone()))
-        .with_debug_raw(config.self_system.evolution_debug_raw);
+        .with_debug_raw(config.self_system.evolution_debug_raw)
+        .with_lifecycle(crate::skills::lifecycle_runtime::open_service(
+            &config.workspace_dir,
+            &config.skills_lifecycle,
+        )?);
     match crate::runtime::evolution_model::EvolutionModel::from_config(
         config,
         crate::runtime::evolution_model::EvolutionPurpose::Proposer,

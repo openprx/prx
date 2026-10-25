@@ -388,6 +388,7 @@ impl SkillLifecycleStore {
                 finished_at: None,
                 outcome: AttemptOutcome::InFlight,
                 usage: None,
+                accounting_scope_id: None,
                 prompt_sha256,
                 detail: None,
             }],

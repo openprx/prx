@@ -629,6 +629,7 @@ impl SkillLifecycleStore {
                 finished_at: None,
                 outcome: AttemptOutcome::InFlight,
                 usage: None,
+                accounting_scope_id: None,
                 prompt_sha256,
                 detail: None,
             }],
@@ -706,6 +707,9 @@ impl SkillLifecycleStore {
                 attempt.outcome = outcome;
                 attempt.usage = usage;
                 attempt.detail = detail;
+                if let CallResult::Reply(reply) = &call {
+                    attempt.accounting_scope_id = reply.accounting_scope_id.clone();
+                }
             }
             current.updated_at = now;
             self.write_proposal(&lock, &current)?;
@@ -717,6 +721,11 @@ impl SkillLifecycleStore {
         }
         let (outcome, usage, detail) = attempt_result(&call);
         close_attempt(&mut proposal, outcome, usage, detail, now);
+        if let CallResult::Reply(reply) = &call
+            && let Some(attempt) = proposal.attempts.last_mut()
+        {
+            attempt.accounting_scope_id = reply.accounting_scope_id.clone();
+        }
         proposal.updated_at = now;
 
         let failure = match call {

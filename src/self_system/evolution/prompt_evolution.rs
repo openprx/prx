@@ -51,6 +51,7 @@ pub struct PromptEvolutionEngine {
     workspace_root: PathBuf,
     debug_raw: bool,
     proposer: Option<Arc<dyn ProposerModel>>,
+    lifecycle: Option<Arc<crate::skills::lifecycle::SkillsLifecycleService>>,
 }
 
 impl PromptEvolutionEngine {
@@ -69,6 +70,7 @@ impl PromptEvolutionEngine {
             workspace_root: workspace_root.as_ref().to_path_buf(),
             debug_raw: false,
             proposer: None,
+            lifecycle: None,
         }
     }
 
@@ -93,6 +95,11 @@ impl PromptEvolutionEngine {
     /// refuses generation; deterministic text is never a production fallback.
     pub fn with_proposer(mut self, proposer: Arc<dyn ProposerModel>) -> Self {
         self.proposer = Some(proposer);
+        self
+    }
+
+    pub fn with_lifecycle(mut self, lifecycle: Option<Arc<crate::skills::lifecycle::SkillsLifecycleService>>) -> Self {
+        self.lifecycle = lifecycle;
         self
     }
 
@@ -186,7 +193,6 @@ impl PromptEvolutionEngine {
         }
         Ok(())
     }
-
     /// Per-layer rollback directory shared with the pipeline rollback path.
     ///
     /// Where an applied prompt change snapshots the previous version
@@ -243,33 +249,72 @@ impl EvolutionEngine for PromptEvolutionEngine {
             .proposer
             .as_ref()
             .context("no managed evolution proposer is available")?;
-        let user = serde_json::to_string(&serde_json::json!({
-            "original": before, "candidate": candidate, "mutation_type": mutation_type,
-        }))?;
-        anyhow::ensure!(
-            user.len() <= MAX_PROMPT_BYTES,
-            "proposal context exceeds the bounded generation input"
-        );
-        let reply = proposer
-            .complete(MUTATION_SYSTEM, &user, Arc::new(TallyCounters::default()))
-            .await?;
-        anyhow::ensure!(
-            reply.text.len() <= MAX_PROMPT_BYTES,
-            "proposal exceeds the bounded generation output"
-        );
-        let after = serde_json::from_str::<MutationReply>(&reply.text)
-            .context("evolution proposer did not return the required JSON object")?
-            .content;
-        anyhow::ensure!(
-            !after.trim().is_empty() && after != before,
-            "evolution proposer returned no change"
-        );
-        let provenance = serde_json::to_string(&serde_json::json!({
-            "model": proposer.binding(), "usage": reply.usage,
-            "accounting_scope_id": reply.accounting_scope_id,
-            "input_sha256": sha256_hex(&user), "output_sha256": sha256_hex(&after),
-            "evidence_ids": candidate.as_ref().map(|item| &item.evidence_ids),
-        }))?;
+        let managed_name = relative_target
+            .strip_prefix("skills/")
+            .and_then(|path| path.strip_suffix("/SKILL.md"))
+            .filter(|name| !name.is_empty() && !name.contains('/'));
+        let (after, provenance, managed_target) = if let Some(name) = managed_name {
+            let service = self
+                .lifecycle
+                .as_ref()
+                .context("managed prompt evolution requires the enabled skill lifecycle")?;
+            let budget = crate::skills::lifecycle::ProposerBudget::new(
+                MAX_PROMPT_BYTES,
+                MAX_PROMPT_BYTES,
+                std::time::Duration::from_secs(180),
+            )?;
+            let (draft, content) = service
+                .propose_prompt_revision(name, &before, cycle_id.clone(), budget, proposer.as_ref())
+                .await?;
+            let attempt = draft
+                .attempts
+                .last()
+                .context("lifecycle proposal has no model attempt")?;
+            let provenance = serde_json::to_string(&serde_json::json!({
+                "model": draft.author.model, "usage": attempt.usage,
+                "accounting_scope_id": attempt.accounting_scope_id,
+                "input_sha256": attempt.prompt_sha256, "output_sha256": sha256_hex(&content),
+                "evidence_ids": draft.evidence_ids, "lifecycle_proposal_id": draft.proposal_id,
+            }))?;
+            let target = ChangeTarget::SkillRevision {
+                proposal_id: draft.proposal_id,
+                skill_id: draft.skill_id.to_string(),
+                revision_id: draft
+                    .candidate_revision
+                    .context("lifecycle proposal has no candidate")?
+                    .to_string(),
+            };
+            (content, provenance, Some(target))
+        } else {
+            let user = serde_json::to_string(&serde_json::json!({
+                "original": before, "candidate": candidate, "mutation_type": mutation_type,
+            }))?;
+            anyhow::ensure!(
+                user.len() <= MAX_PROMPT_BYTES,
+                "proposal context exceeds the bounded generation input"
+            );
+            let reply = proposer
+                .complete(MUTATION_SYSTEM, &user, Arc::new(TallyCounters::default()))
+                .await?;
+            anyhow::ensure!(
+                reply.text.len() <= MAX_PROMPT_BYTES,
+                "proposal exceeds the bounded generation output"
+            );
+            let after = serde_json::from_str::<MutationReply>(&reply.text)
+                .context("evolution proposer did not return the required JSON object")?
+                .content;
+            anyhow::ensure!(
+                !after.trim().is_empty() && after != before,
+                "evolution proposer returned no change"
+            );
+            let provenance = serde_json::to_string(&serde_json::json!({
+                "model": proposer.binding(), "usage": reply.usage,
+                "accounting_scope_id": reply.accounting_scope_id,
+                "input_sha256": sha256_hex(&user), "output_sha256": sha256_hex(&after),
+                "evidence_ids": candidate.as_ref().map(|item| &item.evidence_ids),
+            }))?;
+            (after, provenance, None)
+        };
         Self::validate_safety(&before, &after, &prompt_cfg.blocked_keywords)?;
 
         // A whole-document model reply is a rewrite, regardless of the requested category.
@@ -281,14 +326,14 @@ impl EvolutionEngine for PromptEvolutionEngine {
         // cross-owner JSONL/store without an owner scope. Persisting the full mutated prompt
         // there would leak prompt contents across owners. Store a summary + sha256 digest
         // instead; the full content is only materialized when a mutation is actually applied.
-        let operation = if matches!(mode, crate::self_system::evolution::EvolutionMode::DraftOnly) {
+        let managed = managed_target.is_some();
+        let operation = if managed || matches!(mode, crate::self_system::evolution::EvolutionMode::DraftOnly) {
             ChangeOperation::Write {
                 content: Self::draft_content_summary(&after),
             }
         } else {
             ChangeOperation::Write { content: after.clone() }
         };
-
         let proposal = EvolutionProposal {
             id: Uuid::now_v7().to_string(),
             summary: format!("Prompt mutation for {relative_target}"),
@@ -301,9 +346,9 @@ impl EvolutionEngine for PromptEvolutionEngine {
             } else {
                 RiskLevel::Medium
             },
-            target: ChangeTarget::WorkspaceFile {
+            target: managed_target.unwrap_or_else(|| ChangeTarget::WorkspaceFile {
                 path: relative_target.clone(),
-            },
+            }),
             operation,
         };
 
@@ -311,7 +356,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
         let mut notes = "shadow mode: prompt mutation recorded only".to_string();
         let mut pending: Option<Arc<dyn PendingChange>> = None;
 
-        if mode.allows_target_mutation() {
+        if mode.allows_target_mutation() && !managed {
             if needs_human_approval {
                 outcome = CycleOutcome::ApprovalRequired;
                 notes = "severity exceeded threshold".to_string();
@@ -331,6 +376,9 @@ impl EvolutionEngine for PromptEvolutionEngine {
                 )));
                 notes = "prompt mutation proposed; written only after an accepted verdict".to_string();
             }
+        }
+        if managed {
+            notes = "candidate staged in the skill lifecycle; source review, paired evaluation and publication authorization are required".to_string();
         }
         let (log_before, log_after, log_diff) = Self::redact_evolution_content(&before, &after, &diff, self.debug_raw);
 

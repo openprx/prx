@@ -11,9 +11,21 @@ pub enum RiskLevel {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ChangeTarget {
-    ConfigFile { path: String },
-    CronFile { path: String },
-    WorkspaceFile { path: String },
+    ConfigFile {
+        path: String,
+    },
+    CronFile {
+        path: String,
+    },
+    WorkspaceFile {
+        path: String,
+    },
+    /// Publication is owned by the skill lifecycle, never the generic file writer.
+    SkillRevision {
+        proposal_id: String,
+        skill_id: String,
+        revision_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

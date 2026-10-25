@@ -121,3 +121,9 @@ enabled = false
   [agent turn engine migration](agent-turn-engine-migration.md).
 - Decision-plane rollback and downgrade limits:
   [candidate notes](release-notes-decision-plane-candidate-2026-10-04.md).
+- Evolution targets shaped as `skills/<name>/SKILL.md` now require an enabled
+  owner-scoped lifecycle and an existing managed binding. They stage lifecycle
+  proposals instead of directly rewriting the compatibility projection. Existing
+  unmanaged prompt targets retain their workflow. Proposal attempt records add
+  an optional accounting scope ID; older records remain readable. See
+  [managed skill prompts](evolution.md#managed-skill-prompts).

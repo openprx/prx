@@ -174,6 +174,9 @@ pub struct AttemptRecord {
     pub outcome: AttemptOutcome,
     /// Usage the provider reported; `None` when no call was made or finished.
     pub usage: Option<ReportedUsage>,
+    /// Opaque join to the runtime-owned physical reservation journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting_scope_id: Option<String>,
     /// SHA-256 over the system and user prompt actually sent.
     pub prompt_sha256: String,
     pub detail: Option<String>,

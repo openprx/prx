@@ -20,6 +20,8 @@
 //! `DraftOnly`-like for publication (spec 8.2): [`SkillsLifecycleSettings::
 //! publication_block`] says why.
 
+mod proposals;
+
 use super::authorize::{Finalization, ForceClose, PublicationOutcome};
 use super::evaluate::{CaseExecutor, EvaluationError};
 use super::evaluator::{EvaluationRequest, RecordedEvaluation};
