@@ -279,6 +279,7 @@ async fn exercise_accounted_classifier(content: &str, verdict: Verdict) {
         );
         let channel_impl = Arc::new(RecordingChannel::default());
         let mut ctx = gate_test_ctx(
+            &workspace,
             crate::security::AutonomyLevel::Supervised,
             Arc::new(CountingMemory::default()),
             channel_impl.clone(),

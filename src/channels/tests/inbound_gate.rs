@@ -43,10 +43,16 @@ impl Channel for SignalRecordingChannel {
 /// is sent. This is the "mock-gate-rejects-all" check.
 #[tokio::test]
 async fn process_channel_message_inbound_gate_blocks_under_readonly() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let memory = Arc::new(CountingMemory::default());
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
-    let ctx = gate_test_ctx(crate::security::AutonomyLevel::ReadOnly, Arc::clone(&memory), channel);
+    let ctx = gate_test_ctx(
+        &workspace,
+        crate::security::AutonomyLevel::ReadOnly,
+        Arc::clone(&memory),
+        channel,
+    );
 
     run_owned_channel_probe(ctx, gate_test_message(), CancellationToken::new()).await;
 
@@ -67,10 +73,16 @@ async fn process_channel_message_inbound_gate_blocks_under_readonly() {
 /// does not falsely reject low-risk inbound messages.
 #[tokio::test]
 async fn process_channel_message_inbound_gate_allows_under_supervised() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let memory = Arc::new(CountingMemory::default());
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
-    let ctx = gate_test_ctx(crate::security::AutonomyLevel::Supervised, Arc::clone(&memory), channel);
+    let ctx = gate_test_ctx(
+        &workspace,
+        crate::security::AutonomyLevel::Supervised,
+        Arc::clone(&memory),
+        channel,
+    );
 
     run_owned_channel_probe(ctx, gate_test_message(), CancellationToken::new()).await;
 
@@ -181,12 +193,13 @@ fn signal_vision_fallback_message() -> traits::ChannelMessage {
 /// under the `signal` name) instead of the default `RecordingChannel`, so the
 /// Signal vision-fallback path can resolve its `target_channel`.
 fn signal_gate_ctx_with(
+    workspace: &TempDir,
     opts: GateTestOpts,
     memory: Arc<CountingMemory>,
     channel: Arc<SignalRecordingChannel>,
 ) -> Arc<ChannelRuntimeContext> {
     let channel_dyn: Arc<dyn Channel> = channel;
-    gate_test_ctx_with(opts, memory, channel_dyn)
+    gate_test_ctx_with(workspace, opts, memory, channel_dyn)
 }
 
 /// DEV-05 (vision-fallback outbound deny): the Signal vision fallback emits an
@@ -197,11 +210,12 @@ fn signal_gate_ctx_with(
 /// fallback short-circuited a reply ahead of the outbound gate.
 #[tokio::test]
 async fn process_channel_message_vision_fallback_outbound_denied() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let memory = Arc::new(CountingMemory::default());
     let channel_impl = Arc::new(SignalRecordingChannel::default());
     let mut opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
     opts.test_inbound_authorizer = Some(Arc::new(OutboundOnlyDeny));
-    let ctx = signal_gate_ctx_with(opts, Arc::clone(&memory), Arc::clone(&channel_impl));
+    let ctx = signal_gate_ctx_with(&workspace, opts, Arc::clone(&memory), Arc::clone(&channel_impl));
 
     run_owned_channel_probe(ctx, signal_vision_fallback_message(), CancellationToken::new()).await;
 
@@ -221,10 +235,11 @@ async fn process_channel_message_vision_fallback_outbound_denied() {
 /// actually reachable for this message and only the gate suppresses it.
 #[tokio::test]
 async fn process_channel_message_vision_fallback_outbound_allowed_sends() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let memory = Arc::new(CountingMemory::default());
     let channel_impl = Arc::new(SignalRecordingChannel::default());
     let opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
-    let ctx = signal_gate_ctx_with(opts, Arc::clone(&memory), Arc::clone(&channel_impl));
+    let ctx = signal_gate_ctx_with(&workspace, opts, Arc::clone(&memory), Arc::clone(&channel_impl));
 
     run_owned_channel_probe(ctx, signal_vision_fallback_message(), CancellationToken::new()).await;
 
@@ -248,13 +263,14 @@ async fn process_channel_message_vision_fallback_outbound_allowed_sends() {
 /// outbound, which the real policy cannot do per-operation.
 #[tokio::test]
 async fn process_channel_message_autosave_gate_denied_by_mock() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let memory = Arc::new(CountingMemory::default());
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
     let mut opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
     opts.auto_save_memory = true;
     opts.test_inbound_authorizer = Some(Arc::new(AutosaveOnlyDeny));
-    let ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
+    let ctx = gate_test_ctx_with(&workspace, opts, Arc::clone(&memory), channel);
 
     run_owned_channel_probe(ctx, gate_test_dm_message(), CancellationToken::new()).await;
 
@@ -285,7 +301,7 @@ async fn process_channel_message_autosave_gate_allowed_writes_memory() {
     let channel: Arc<dyn Channel> = channel_impl.clone();
     let mut opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
     opts.auto_save_memory = true;
-    let mut ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
+    let mut ctx = gate_test_ctx_with(&workspace, opts, Arc::clone(&memory), channel);
 
     let recorded = super::recording_fixture::attach(
         Arc::get_mut(&mut ctx).expect("unique channel fixture context"),
@@ -307,12 +323,13 @@ async fn process_channel_message_autosave_gate_allowed_writes_memory() {
 
 #[tokio::test]
 async fn process_channel_message_telegram_group_does_not_autosave() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let memory = Arc::new(CountingMemory::default());
     let channel_impl = Arc::new(TelegramRecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
     let mut opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
     opts.auto_save_memory = true;
-    let ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
+    let ctx = gate_test_ctx_with(&workspace, opts, Arc::clone(&memory), channel);
 
     run_owned_channel_probe(ctx, gate_test_telegram_group_message(), CancellationToken::new()).await;
 

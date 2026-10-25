@@ -4907,9 +4907,10 @@ mod tests {
 
     #[test]
     fn absolute_path_blocking_works_on_workspace_only() {
+        let workspace = tempfile::tempdir().expect("test: private workspace");
         let policy = SecurityPolicy {
             workspace_only: true,
-            workspace_dir: std::env::temp_dir(),
+            workspace_dir: workspace.path().to_path_buf(),
             ..SecurityPolicy::default()
         };
         // Unix absolute

@@ -488,6 +488,7 @@ async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> Option<T> {
 }
 
 fn registry_probe_ctx(
+    workspace: &TempDir,
     channel: Arc<dyn Channel>,
     provider: Arc<dyn Provider>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
@@ -506,7 +507,7 @@ fn registry_probe_ctx(
         memory: Arc::new(NoopMemory),
         tools_registry,
         observer: Arc::new(NoopObserver),
-        hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+        hooks: Arc::new(HookManager::new(workspace.path().to_path_buf())),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
         auto_save_memory: false,
@@ -522,7 +523,7 @@ fn registry_probe_ctx(
         api_url: None,
         reliability: Arc::new(crate::config::ReliabilityConfig::default()),
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-        workspace_dir: Arc::new(std::env::temp_dir()),
+        workspace_dir: Arc::new(workspace.path().to_path_buf()),
 
         tool_tiering,
         signal_inbound_policy: None,
@@ -642,9 +643,15 @@ impl Provider for NeverAnsweringProvider {
 /// After: aborting the turn stops the refresher, which sends its stop.
 #[tokio::test]
 async fn an_aborted_turn_stops_its_typing_refresher() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
-    let runtime_ctx = registry_probe_ctx(channel, Arc::new(NeverAnsweringProvider), Arc::new(Vec::new()));
+    let runtime_ctx = registry_probe_ctx(
+        &workspace,
+        channel,
+        Arc::new(NeverAnsweringProvider),
+        Arc::new(Vec::new()),
+    );
     let turn = tokio::spawn(run_owned_channel_probe(
         runtime_ctx,
         traits::ChannelMessage {
@@ -679,9 +686,12 @@ async fn an_aborted_turn_stops_its_typing_refresher() {
 async fn channel_turn_is_registered_and_cascade_kill_reaches_its_tool_and_child_process() {
     use crate::runtime::registry;
 
+    let workspace = TempDir::new().expect("test: private channel workspace");
+
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
     let runtime_ctx = registry_probe_ctx(
+        &workspace,
         channel,
         Arc::new(TurnProbeProvider),
         Arc::new(vec![Box::new(TurnProbeBlockingTool) as Box<dyn Tool>]),
@@ -819,9 +829,11 @@ impl Provider for StuckUnlessPingProvider {
 async fn dispatch_keeps_answering_while_more_turns_are_stuck_than_the_old_gate_allowed() {
     use crate::runtime::registry;
 
+    let workspace = TempDir::new().expect("test: private channel workspace");
+
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
-    let runtime_ctx = registry_probe_ctx(channel, Arc::new(StuckUnlessPingProvider), Arc::new(vec![]));
+    let runtime_ctx = registry_probe_ctx(&workspace, channel, Arc::new(StuckUnlessPingProvider), Arc::new(vec![]));
 
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(DISPATCH_GATE_STUCK_TURNS.saturating_add(4));
     for index in 0..DISPATCH_GATE_STUCK_TURNS {

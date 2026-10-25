@@ -91,6 +91,7 @@ impl Provider for DelayedHistoryCaptureProvider {
 
 #[tokio::test]
 async fn message_dispatch_processes_messages_in_parallel() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -107,7 +108,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+        hooks: Arc::new(HookManager::new(workspace.path().to_path_buf())),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
         auto_save_memory: false,
@@ -123,7 +124,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
         api_url: None,
         reliability: Arc::new(crate::config::ReliabilityConfig::default()),
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-        workspace_dir: Arc::new(std::env::temp_dir()),
+        workspace_dir: Arc::new(workspace.path().to_path_buf()),
 
         tool_tiering: crate::config::ToolTieringConfig::default(),
         signal_inbound_policy: None,
@@ -200,6 +201,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
 
 #[tokio::test]
 async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_context() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let channel_impl = Arc::new(TelegramRecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -227,7 +229,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
+        hooks: Arc::new(crate::hooks::HookManager::new(workspace.path().to_path_buf())),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
         auto_save_memory: false,
@@ -243,7 +245,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
         api_url: None,
         reliability: Arc::new(crate::config::ReliabilityConfig::default()),
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-        workspace_dir: Arc::new(std::env::temp_dir()),
+        workspace_dir: Arc::new(workspace.path().to_path_buf()),
 
         tool_tiering: crate::config::ToolTieringConfig::default(),
         signal_inbound_policy: None,
@@ -344,6 +346,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
 
 #[tokio::test]
 async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let channel_impl = Arc::new(TelegramRecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -362,7 +365,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
+        hooks: Arc::new(crate::hooks::HookManager::new(workspace.path().to_path_buf())),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
         auto_save_memory: false,
@@ -378,7 +381,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
         api_url: None,
         reliability: Arc::new(crate::config::ReliabilityConfig::default()),
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-        workspace_dir: Arc::new(std::env::temp_dir()),
+        workspace_dir: Arc::new(workspace.path().to_path_buf()),
 
         tool_tiering: crate::config::ToolTieringConfig::default(),
         signal_inbound_policy: None,

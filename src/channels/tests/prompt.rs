@@ -626,6 +626,7 @@ async fn autosave_keys_preserve_multiple_conversation_facts() {
 
 #[tokio::test]
 async fn channel_plain_greeting_and_follow_up_reach_provider_with_default_causal_config() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -652,7 +653,7 @@ async fn channel_plain_greeting_and_follow_up_reach_provider_with_default_causal
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
+        hooks: Arc::new(crate::hooks::HookManager::new(workspace.path().to_path_buf())),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
         auto_save_memory: false,
@@ -668,7 +669,7 @@ async fn channel_plain_greeting_and_follow_up_reach_provider_with_default_causal
         api_url: None,
         reliability: Arc::new(crate::config::ReliabilityConfig::default()),
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-        workspace_dir: Arc::new(std::env::temp_dir()),
+        workspace_dir: Arc::new(workspace.path().to_path_buf()),
 
         tool_tiering: crate::config::ToolTieringConfig::default(),
         signal_inbound_policy: None,
@@ -747,6 +748,7 @@ async fn channel_plain_greeting_and_follow_up_reach_provider_with_default_causal
 
 #[tokio::test]
 async fn process_channel_message_answers_plain_turn_without_retrieval_or_persisted_context() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -765,7 +767,7 @@ async fn process_channel_message_answers_plain_turn_without_retrieval_or_persist
         memory: memory.clone(),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
+        hooks: Arc::new(crate::hooks::HookManager::new(workspace.path().to_path_buf())),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
         auto_save_memory: false,
@@ -781,7 +783,7 @@ async fn process_channel_message_answers_plain_turn_without_retrieval_or_persist
         api_url: None,
         reliability: Arc::new(crate::config::ReliabilityConfig::default()),
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-        workspace_dir: Arc::new(std::env::temp_dir()),
+        workspace_dir: Arc::new(workspace.path().to_path_buf()),
 
         tool_tiering: crate::config::ToolTieringConfig::default(),
         signal_inbound_policy: None,
@@ -845,6 +847,7 @@ async fn process_channel_message_answers_plain_turn_without_retrieval_or_persist
 
 #[tokio::test]
 async fn process_channel_message_telegram_keeps_system_instruction_at_top_only() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
     let channel_impl = Arc::new(TelegramRecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -872,7 +875,7 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
         memory: Arc::new(NoopMemory),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
+        hooks: Arc::new(crate::hooks::HookManager::new(workspace.path().to_path_buf())),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
         auto_save_memory: false,
@@ -888,7 +891,7 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
         api_url: None,
         reliability: Arc::new(crate::config::ReliabilityConfig::default()),
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-        workspace_dir: Arc::new(std::env::temp_dir()),
+        workspace_dir: Arc::new(workspace.path().to_path_buf()),
 
         tool_tiering: crate::config::ToolTieringConfig::default(),
         signal_inbound_policy: None,

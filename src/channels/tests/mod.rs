@@ -584,6 +584,7 @@ impl GateTestOpts {
 /// wired to the provided counting memory and channel, for the inbound-gate
 /// tests below.
 fn gate_test_ctx_with(
+    workspace: &TempDir,
     opts: GateTestOpts,
     memory: Arc<CountingMemory>,
     channel: Arc<dyn Channel>,
@@ -600,7 +601,7 @@ fn gate_test_ctx_with(
         memory,
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
-        hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+        hooks: Arc::new(HookManager::new(workspace.path().to_path_buf())),
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
         auto_save_memory: opts.auto_save_memory,
@@ -616,7 +617,7 @@ fn gate_test_ctx_with(
         api_url: None,
         reliability: Arc::new(crate::config::ReliabilityConfig::default()),
         provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-        workspace_dir: Arc::new(std::env::temp_dir()),
+        workspace_dir: Arc::new(workspace.path().to_path_buf()),
 
         tool_tiering: crate::config::ToolTieringConfig::default(),
         signal_inbound_policy: None,
@@ -642,11 +643,12 @@ fn gate_test_ctx_with(
 /// level, the provided counting memory, and a `RecordingChannel`, for the
 /// inbound-gate tests below.
 fn gate_test_ctx(
+    workspace: &TempDir,
     autonomy: crate::security::AutonomyLevel,
     memory: Arc<CountingMemory>,
     channel: Arc<dyn Channel>,
 ) -> Arc<ChannelRuntimeContext> {
-    gate_test_ctx_with(GateTestOpts::new(autonomy), memory, channel)
+    gate_test_ctx_with(workspace, GateTestOpts::new(autonomy), memory, channel)
 }
 
 fn gate_test_message() -> traits::ChannelMessage {

@@ -199,6 +199,7 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         }
         let channel_impl = Arc::new(RecordingChannel::default());
         let mut ctx = gate_test_ctx(
+            &workspace,
             crate::security::AutonomyLevel::Supervised,
             Arc::new(CountingMemory::default()),
             channel_impl.clone(),
