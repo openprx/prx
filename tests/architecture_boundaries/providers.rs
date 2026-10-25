@@ -428,10 +428,11 @@ pub(super) fn provider_construction_outside_the_provider_module_is_pinned() {
         "src/channels/runtime_commands.rs:build_channel_hint_provider:create_provider_for",
         "src/channels/runtime_commands.rs:build_channel_startup_provider:create_routed_provider_for",
         "src/chat/bootstrap.rs:chat_provider_chain:create_routed_provider_for",
-        "src/daemon/mod.rs:build_evolution_judge_model:create_provider_for",
         "src/doctor/mod.rs:provider_validation_error:create_provider_for",
         "src/gateway/mod.rs:build_gateway_provider_selection:create_routed_provider_for",
         "src/runtime/child_source.rs:from_selection:create_provider_for",
+        // Proposal and judge calls share the resolved, credential-scoped factory.
+        "src/runtime/evolution_model.rs:from_config:create_provider_for",
         "src/runtime/turn_decision/auxiliary.rs:auxiliary_accounting:create_provider_for",
         "src/runtime/turn_decision/auxiliary.rs:smart_group_accounting:create_provider_for",
         "src/session_worker/runner/provider.rs:build_worker_provider_selection:create_provider_for",
