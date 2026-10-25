@@ -27,6 +27,8 @@ jobs:
               run: ./scripts/ci/rust_toolchain_sync_gate.sh
             - name: Verify one-click installer contract
               run: ./scripts/ci/installer_contract_gate.sh
+            - name: Verify CI gate contracts
+              run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 
     windows-installer:
         name: Windows Installer Contract
@@ -98,12 +100,22 @@ jobs:
         if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
         runs-on: ubuntu-latest
         timeout-minutes: 30
+        # Full-debug test compilation exhausted 16 GiB RAM and 3 GiB swap
+        # before tests started. Reduce build memory, not test coverage.
+        env:
+            CARGO_BUILD_JOBS: "1"
+            CARGO_INCREMENTAL: "0"
+            CARGO_PROFILE_TEST_DEBUG: "0"
+            CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
+            CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.99.0
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+              with:
+                  key: serial-tests-no-debuginfo
             - name: Run tests (HOME is a guard home, the network is denied except loopback; no test may touch ~/.openprx, a credential store or another host)
               run: python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh --locked --all-features
 

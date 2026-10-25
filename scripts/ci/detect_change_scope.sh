@@ -78,7 +78,9 @@ while IFS= read -r file; do
     || [[ "$file" == tests/* ]] \
     || [[ "$file" == "Cargo.toml" ]] \
     || [[ "$file" == "Cargo.lock" ]] \
-    || [[ "$file" == "deny.toml" ]]; then
+    || [[ "$file" == "deny.toml" ]] \
+    || [[ "$file" == ".github/workflows/ci-run.yml" ]] \
+    || [[ "$file" == scripts/ci/* ]]; then
     rust_changed=true
   fi
 done <<< "$CHANGED"
@@ -90,6 +92,8 @@ done <<< "$CHANGED"
   echo "workflow_changed=$workflow_changed"
   echo "base_sha=$BASE"
   echo "docs_files<<EOF"
-  printf '%s\n' "${docs_files[@]}"
+  if [ "${#docs_files[@]}" -gt 0 ]; then
+    printf '%s\n' "${docs_files[@]}"
+  fi
   echo "EOF"
 } >> "$GITHUB_OUTPUT"

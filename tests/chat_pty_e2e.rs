@@ -204,7 +204,7 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
                 })
             });
             let message = if completion_review {
-                serde_json::json!({"role":"assistant","content":r#"{"decision":"accept","reason":"Observed spawn and join results"}"#})
+                serde_json::json!({"role":"assistant","content":r#"{"decision":"accept","reason":"Observed spawn and join results","constraints":[]}"#})
             } else if body.contains("PRX_CHAT_PARENT") && parent_count == 1 {
                 serde_json::json!({"role":"assistant","content":null,"tool_calls":[{
                     "id":"call-prx-chat-spawn","type":"function","function":{

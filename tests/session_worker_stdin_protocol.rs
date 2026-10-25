@@ -180,7 +180,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         assert!(
                             request_body.contains("observed_tools") && request_body.contains("proposed_final_reply")
                         );
-                        serde_json::json!({"role":"assistant", "content": r#"{"decision":"accept","reason":"fixture evidence accepted"}"#})
+                        serde_json::json!({"role":"assistant", "content": r#"{"decision":"accept","reason":"fixture evidence accepted","constraints":[]}"#})
                     } else if request_body.contains("Classify the execution requirement of the CURRENT user request") {
                         serde_json::json!({"role":"assistant", "content": r#"{"requirement":"informational"}"#})
                     } else {

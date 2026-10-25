@@ -579,7 +579,7 @@ impl MockEnvProvider {
             execution_assessment: std::env::var("OPENPRX_MOCK_EXECUTION_ASSESSMENT")
                 .unwrap_or_else(|_| r#"{"requirement":"informational"}"#.to_string()),
             completion_assessment: std::env::var("OPENPRX_MOCK_COMPLETION_ASSESSMENT")
-                .unwrap_or_else(|_| r#"{"decision":"accept","reason":"fixture result"}"#.to_string()),
+                .unwrap_or_else(|_| r#"{"decision":"accept","reason":"fixture result","constraints":[]}"#.to_string()),
             tool_call_spec,
             call_counter: Arc::new(AtomicUsize::new(0)),
             script,
