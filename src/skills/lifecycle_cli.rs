@@ -20,6 +20,14 @@ use std::sync::Arc;
 
 /// Runs a lifecycle command and prints its result.
 pub async fn handle(command: SkillLifecycleCommands, config: &Config) -> Result<()> {
+    if let SkillLifecycleCommands::SuiteDigest { source } = &command {
+        let suite = read_suite(source).await?;
+        println!(
+            "{}",
+            serde_json::json!({"skill_id":suite.suite().skill_id,"digest":suite.digest()})
+        );
+        return Ok(());
+    }
     let service =
         open_service(&config.workspace_dir, &config.skills_lifecycle).context("the skill lifecycle could not start")?;
     let text = execute(command, service, config).await?;
@@ -34,6 +42,10 @@ pub(crate) async fn execute(
     service: Option<Arc<SkillsLifecycleService>>,
     config: &Config,
 ) -> Result<String> {
+    if let SkillLifecycleCommands::SuiteDigest { source } = &command {
+        let suite = read_suite(source).await?;
+        return Ok(serde_json::json!({"skill_id":suite.suite().skill_id,"digest":suite.digest()}).to_string());
+    }
     let Some(service) = service else {
         // Disabled: nothing was opened. Status says so; the rest refuses.
         if matches!(command, SkillLifecycleCommands::Status) {
@@ -46,6 +58,70 @@ pub(crate) async fn execute(
         bail!("the skill lifecycle is disabled; set [skills_lifecycle] enabled = true");
     };
     match command {
+        SkillLifecycleCommands::SuiteDigest { source } => {
+            let suite = read_suite(&source).await?;
+            Ok(serde_json::json!({"skill_id":suite.suite().skill_id,"digest":suite.digest()}).to_string())
+        }
+        SkillLifecycleCommands::InstallSuite { source } => {
+            let suite = read_suite(&source).await?;
+            let digest = suite.digest().to_owned();
+            blocking(&service, move |service| service.install_operator_suite(&suite)).await?;
+            Ok(serde_json::json!({"installed_suite":digest}).to_string())
+        }
+        SkillLifecycleCommands::Review { proposal_id } => {
+            let review = blocking(&service, move |service| {
+                service.review_source(&proposal_id, "PRXOperator")
+            })
+            .await?;
+            Ok(serde_json::to_string_pretty(
+                &serde_json::json!({"review":review.record,"proposal":review.proposal}),
+            )?)
+        }
+        SkillLifecycleCommands::Evaluate { proposal_id } => {
+            use crate::skills::lifecycle::{AccountingOwner, AgentCaseExecutor, EvalSplit, EvaluationPin};
+            let id = proposal_id.clone();
+            blocking(&service, move |service| {
+                service.begin_evaluation(&id, "operator paired validation and holdout")
+            })
+            .await?;
+            let scratch = tempfile::Builder::new()
+                .prefix("prx-skill-eval-")
+                .tempdir_in(&config.workspace_dir)?;
+            let executor = AgentCaseExecutor::new(
+                config.clone(),
+                scratch.path().to_path_buf(),
+                0.0,
+                AccountingOwner::new(config.workspace_dir.clone()),
+            );
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, cancel.clone())?;
+            let mut evaluations = Vec::new();
+            let outcome = cleanup
+                .run(async {
+                    let mut pins = Vec::new();
+                    for split in [EvalSplit::Validation, EvalSplit::Holdout] {
+                        let recorded = service.evaluate(&proposal_id, split, &executor, &cancel).await?;
+                        pins.push(EvaluationPin {
+                            evaluation_id: recorded.receipt.record_id.clone(),
+                            receipt_digest: recorded.receipt_digest.clone(),
+                        });
+                        evaluations.push(
+                            serde_json::json!({"receipt":recorded.receipt,"receipt_digest":recorded.receipt_digest}),
+                        );
+                    }
+                    let id = proposal_id.clone();
+                    blocking(&service, move |service| {
+                        service.finish_evaluation(&id, "paired validation and holdout recorded")
+                    })
+                    .await?;
+                    Ok::<_, anyhow::Error>(service.gate(&proposal_id, &pins, None, &cancel).await?)
+                })
+                .await?;
+            Ok(serde_json::to_string_pretty(
+                &serde_json::json!({"evaluations":evaluations,
+                "gate":outcome.gate.decision,"gate_digest":outcome.gate.digest,"proposal":outcome.proposal,"published":false}),
+            )?)
+        }
         SkillLifecycleCommands::ProposeScript {
             source,
             script,
@@ -255,4 +331,18 @@ fn render_list(proposals: &[ProposalSummary]) -> String {
         out.push('\n');
     }
     out.trim_end().to_string()
+}
+
+async fn read_suite(source: &str) -> Result<crate::skills::lifecycle::FrozenSuite> {
+    let source = source.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<_> {
+        use std::io::Read;
+        let file = std::fs::File::open(source)?;
+        let mut bytes = Vec::new();
+        file.take(204_801).read_to_end(&mut bytes)?;
+        anyhow::ensure!(bytes.len() <= 204_800, "suite exceeds 200 KiB");
+        let suite: crate::skills::lifecycle::EvalSuite = serde_json::from_slice(&bytes)?;
+        Ok(suite.freeze()?)
+    })
+    .await?
 }

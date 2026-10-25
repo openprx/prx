@@ -111,6 +111,7 @@ pub(crate) enum CapabilityKind {
     Cron,
     Provider,
     Storage,
+    Channel,
 }
 
 impl CapabilityKind {
@@ -122,6 +123,7 @@ impl CapabilityKind {
             Self::Cron => "cron",
             Self::Provider => "provider",
             Self::Storage => "storage",
+            Self::Channel => "channel",
         }
     }
 
@@ -138,6 +140,7 @@ impl CapabilityKind {
             Self::Cron => "prx.plugin.cron_quarantined",
             Self::Provider => "prx.plugin.provider_quarantined",
             Self::Storage => "prx.plugin.storage_quarantined",
+            Self::Channel => "prx.plugin.channel_quarantined",
         }
     }
 
@@ -151,6 +154,7 @@ impl CapabilityKind {
             Self::Cron => "cron",
             Self::Provider => "provider",
             Self::Storage => "storage plugin",
+            Self::Channel => "channel plugin",
         }
     }
 }

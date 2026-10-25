@@ -140,7 +140,11 @@ impl OrdinaryProcessLaunch {
             &worker.run_id,
             &worker.config_generation,
         )?;
-        let scope = publication.scope().rebind_process_key(key)?;
+        let (cents, _) = publication.allocate_child_budget()?;
+        let (issued, original_parent) = publication.scope().gate_inputs();
+        let narrowed = issued.clone().with_cost_ceiling(original_parent, cents)?;
+        let scope = crate::tools::capability::child::VerifiedChildScope::new(narrowed, original_parent)?
+            .rebind_process_key(key)?;
         let (child, parent) = scope.gate_inputs();
         let input = receipt
             .map(|receipt| -> anyhow::Result<_> {
@@ -243,6 +247,9 @@ impl TurnDecisionService {
             loop_runtime: Some(runtime),
             publication_policy: build.surface_policy,
             ordinary_parent: None,
+            ordinary_money: Some(Arc::new(std::sync::atomic::AtomicU64::new(
+                u64::from(child.authority.max_cost_cents) * 10_000,
+            ))),
             operator_task: None,
             operator_process: None,
             ordinary_task: None,

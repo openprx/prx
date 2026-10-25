@@ -1680,3 +1680,35 @@ KV storage is backed by PRX's persistent store. If PRX is configured in ephemera
 - [Python PDK](../pdk/python/README.md) — Python plugin development
 - [JavaScript PDK](../pdk/javascript/README.md) — TypeScript/JavaScript plugin development
 - [Go PDK](../pdk/go/README.md) — Go/TinyGo plugin development
+
+## Channel capability and operator CLI
+
+The `channel` world exports `send(message: string) -> result<string,string>` and
+`poll(request: string) -> result<string,string>`. Send receives JSON with content,
+recipient and optional subject/thread/quote fields. Poll receives `{}` every
+250 ms and returns at most 32 JSON records with `id`, `sender`, `reply_target`,
+`content`, optional `is_group` and `thread_ts`. IDs/senders/targets are bounded to
+256 bytes and content to 64 KiB; the manifest payload cap also applies. Unknown
+fields are rejected. Return an empty array when idle. Do not replay acknowledged
+inbound messages after a guest restart. The host filters `config.allowed_users`
+and assigns the channel/timestamp. HTTP permissions and allowlists remain
+operator-trusted; declaring a channel does not grant transport access.
+
+Each adapter uses the shared fuel/deadline supervisor, bounded lock waits,
+trap recovery and quarantine. Sends and polls retain their store during an
+in-flight call; reload publishes a complete new generation. Channel diagnostics
+are included in plugin status. `pdk/rust/examples/echo-channel` is a deterministic
+fixture with one allowed and one refused sender, an intentional trap probe and
+no network permissions. Build it with `cargo build --locked --release --target
+wasm32-wasip2 --manifest-path pdk/rust/examples/echo-channel/Cargo.toml`.
+
+`prx plugin list` and `prx plugin inspect SOURCE` read artifact identities and
+trust without executing guests. `prx plugin trust SOURCE --sha256 HASH
+--manifest-sha256 HASH --permission PERMISSION` previews an exact permission
+record; add `--yes` after reviewing both hashes to write it. Required permissions
+must all be named; undeclared permissions are refused. `prx plugin revoke NAME`
+also previews, and `--yes` removes standing trust. Read-only autonomy refuses
+these writes. These local commands neither download nor install bundles and do
+not silently mutate a running daemon: reload via its existing plugin API or
+restart the owning runtime to apply a trust change. Trust records remain outside
+the workspace; the CLI cannot make a workspace-controlled trust file valid.

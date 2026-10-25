@@ -3014,3 +3014,32 @@ validates the credential, and stores it through the existing secret encryption
 policy. The key is never a CLI argument or part of plan output. A stale revision
 is refused before stdin is consumed. Replacing or clearing it uses the same
 managed configuration history and secret rules as other credentials.
+
+### Managed script process containment
+
+`[runtime] managed_cgroup_root = "/sys/fs/cgroup/prx-skills"` optionally selects
+an operator-delegated Linux cgroup v2 subtree for managed native skill scripts.
+PRX creates a unique child cgroup, joins it before exec, and writes `cgroup.kill`
+on success, timeout, cancellation or abort. Normal completion waits up to five
+seconds for the empty cgroup directory to be removed. Nested cgroups are disabled.
+An unavailable root, missing kill interface, invalid filesystem or unsupported
+platform refuses the script before execution. The setting is unset by default.
+
+On macOS, or without this setting, cleanup uses process groups: a descendant
+that calls `setsid` can escape. This is not a filesystem sandbox, nor protection
+against a same-UID process explicitly migrating itself through a writable cgroup
+hierarchy. Use OS/container access controls for hostile code. See the
+[Linux cgroup v2 contract](https://docs.kernel.org/admin-guide/cgroup-v2.html).
+The setting applies to lifecycle-managed native scripts; it does not claim to
+change generic shell or Docker-container cleanup. Unset it to restore the
+previous process-group behavior.
+
+The Linux containment regression requires an empty, delegated cgroup v2 root:
+
+```sh
+PRX_TEST_CGROUP_ROOT=/sys/fs/cgroup/prx-test cargo test --lib setsid_descendant_is_killed_and_the_managed_group_is_removed -- --ignored
+```
+
+It starts a descendant in a new session, verifies its cgroup membership, kills the
+managed group, joins the shell, and checks removal. This test is opt-in because an
+ordinary developer shell does not necessarily own a delegated cgroup.

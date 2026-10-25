@@ -1659,6 +1659,16 @@ pub trait Memory: Send + Sync {
         Ok(None)
     }
 
+    /// Create an empty Console session without inventing a conversation turn.
+    /// Keys are server-generated; an existing key must fail without mutation.
+    async fn create_conversation_session(&self, session_key: &str, owner_id: &str) -> anyhow::Result<()> {
+        let _ = (session_key, owner_id);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "create_conversation_session",
+        ))
+    }
+
     /// Append a persisted channel conversation turn.
     ///
     /// Backends without conversation persistence can no-op.

@@ -1317,6 +1317,7 @@ fn register_gateway_turn_tools(
     config: &Config,
     shared_config: &crate::config::SharedConfig,
     security: &Arc<crate::security::SecurityPolicy>,
+    hooks: &Arc<HookManager>,
     _model: &str,
     memory: &Arc<dyn Memory>,
     provider_runtime_options: &providers::ProviderRuntimeOptions,
@@ -1380,6 +1381,7 @@ fn register_gateway_turn_tools(
         .with_configured_providers(&crate::providers::ConfiguredProviders::from_config(config))
         .with_model_catalog(providers::selection::catalog_for(config))
         .with_hint_config(config)
+        .with_parent_hooks(Arc::clone(hooks))
         .with_channels(Arc::clone(&channels_registry))
         .with_shared_memory(Arc::clone(memory))
         .with_event_recording(config.memory.event_recording_config())
@@ -1469,6 +1471,7 @@ fn build_gateway_turn_runtime(
         config.api_key.as_deref(),
         config,
         extensions,
+        Some(Arc::clone(&hooks)),
     );
     let mut tools_list = tools_result.tools;
     let mcp_tool = tools_result.mcp_tool;
@@ -1478,6 +1481,7 @@ fn build_gateway_turn_runtime(
         config,
         &shared_config,
         &security,
+        &hooks,
         &model,
         &memory,
         &provider_runtime_options,
@@ -1672,6 +1676,7 @@ pub async fn run_gateway(
         config.api_key.as_deref(),
         &config,
         extensions,
+        Some(Arc::clone(&hooks)),
     );
     let mut tools_list = tools_result.tools;
     let mcp_tool = tools_result.mcp_tool;
@@ -1746,6 +1751,7 @@ pub async fn run_gateway(
         &config,
         &shared_config_for_reload,
         &security,
+        &hooks,
         &model,
         &mem,
         &provider_runtime_options,

@@ -201,6 +201,7 @@ fn both_gateway_launch_paths_publish_the_same_tool_surface() {
         config.api_key.as_deref(),
         &config,
         extensions,
+        Some(Arc::clone(&hooks)),
     )
     .tools;
     let (_channels_registry, spawn_tools_handle) = register_gateway_turn_tools(
@@ -208,6 +209,7 @@ fn both_gateway_launch_paths_publish_the_same_tool_surface() {
         &config,
         &manager,
         &security,
+        &hooks,
         &model,
         &memory,
         &provider_runtime_options,

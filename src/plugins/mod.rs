@@ -35,6 +35,7 @@
 //! confer trust.
 
 pub mod capabilities;
+pub mod cli;
 pub mod error;
 pub mod event_bus;
 pub mod host;
@@ -762,10 +763,82 @@ impl PluginManager {
         PluginAdapterBuild { value: manager, errors }
     }
 
-    /// Create provider adapters for all plugins with provider capabilities.
+    /// Create channel adapters for all plugins with channel capabilities.
     ///
-    /// Returns a list of `WasmProvider` instances, each implementing the
-    /// `Provider` trait and ready to handle LLM routing requests.
+    /// Returns a list of `WasmChannel` instances, each implementing the
+    /// bounded polling and sending for the channel runtime.
+    pub async fn create_channel_adapters(
+        &self,
+        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
+    ) -> PluginAdapterBuild<Vec<capabilities::channel::WasmChannel>> {
+        let plugins = self.registry.list().await;
+        let mut channels = Vec::new();
+        let mut errors = Vec::new();
+
+        for info in &plugins {
+            if !matches!(info.status, registry::PluginStatus::Active) {
+                continue;
+            }
+            if !info.capabilities.iter().any(|c| c.starts_with("channel")) {
+                continue;
+            }
+
+            let manifest = match self.registry.get_manifest(&info.name).await {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let component = match self.registry.get_component(&info.name).await {
+                Some(c) => c,
+                None => {
+                    errors.push(format!(
+                        "plugin '{}' declares channel but has no WASM component",
+                        info.name
+                    ));
+                    continue;
+                }
+            };
+
+            let granted_permissions: std::collections::HashSet<String> = self
+                .registry
+                .get_granted_permissions(&info.name)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+
+            self.metrics.record_instantiation();
+
+            match capabilities::channel::WasmChannel::new(
+                &self.engine,
+                &component,
+                &manifest,
+                granted_permissions,
+                event_bus.clone(),
+            )
+            .await
+            {
+                Ok(channel) => {
+                    tracing::info!(
+                        plugin = %info.name,
+                        channel = %channel.name(),
+                        "WASM channel adapter created"
+                    );
+                    channels.push(channel);
+                }
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to create channel adapter");
+                    errors.push(format!("plugin '{}' channel adapter failed: {e}", info.name));
+                }
+            }
+        }
+
+        PluginAdapterBuild {
+            value: channels,
+            errors,
+        }
+    }
+
     pub async fn create_provider_adapters(
         &self,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,

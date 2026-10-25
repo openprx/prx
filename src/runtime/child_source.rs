@@ -658,15 +658,11 @@ impl IssuedChildGrant {
             "child grant differs from admitted parent source"
         );
         Ok(Self(Arc::new(ChildGrantData {
-            recursive_child_claimed: recursive_child_claimed.or_else(|| {
-                (generation.effective.sessions_spawn.allow_recursive_delegation
-                    || manifest.authority.delegation.is_some())
-                .then(|| {
-                    Arc::new(super::turn_decision::recursive_allowance::RecursiveAllowance::new(
-                        u64::from(manifest.authority.max_cost_cents) * 10_000,
-                    ))
-                })
-            }),
+            recursive_child_claimed: Some(recursive_child_claimed.unwrap_or_else(|| {
+                Arc::new(super::turn_decision::recursive_allowance::RecursiveAllowance::new(
+                    u64::from(manifest.authority.max_cost_cents) * 10_000,
+                ))
+            })),
             parent_model,
             source_fabric,
             security,

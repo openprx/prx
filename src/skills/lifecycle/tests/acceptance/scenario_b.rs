@@ -164,3 +164,55 @@ async fn a_bounded_revision_replaces_the_active_one_while_a_running_task_keeps_i
     // A stays retained for rollback.
     assert!(world.store.read_revision(&skill(), &a, None).is_ok());
 }
+
+#[tokio::test]
+async fn operator_cli_evaluates_both_frozen_splits_without_publishing() {
+    use crate::SkillLifecycleCommands as Command;
+    let world = World::new().await;
+    let baseline = world.onboard(&skill_text(&[
+        ("hotfix", "hotfix-v1"),
+        ("legacy", "legacy-v1"),
+        ("release", "changelog-v1"),
+    ]));
+    let suite = notes_suite(&world.owner, "changelog-v2", "hotfix-v1");
+    let config = world.production_config(SkillsLifecycleModeConfig::Auto, &[(&skill(), &suite)]);
+    let service = world.service(&config);
+    let evidence = capture_failed_tasks(&world, &config, "cli-wrong-rule", 2).await;
+    let pattern = consolidate(&world, "The release rule names the wrong token.", &evidence);
+    let proposer = ScriptedProposer::new(vec![replace_patch("fix release rule", OLD_RULE, NEW_RULE)]);
+    let proposal = staged(propose(&world, "cli-paired", &pattern, &proposer).await);
+    let source = world.ws.join("suite.json");
+    std::fs::write(&source, serde_json::to_vec(suite.suite()).unwrap()).unwrap();
+    for command in [
+        Command::InstallSuite {
+            source: source.to_string_lossy().into_owned(),
+        },
+        Command::Review {
+            proposal_id: proposal.proposal_id.clone(),
+        },
+    ] {
+        crate::skills::lifecycle_cli::execute(command, Some(Arc::clone(&service)), &config)
+            .await
+            .unwrap();
+    }
+    let output = crate::skills::lifecycle_cli::execute(
+        Command::Evaluate {
+            proposal_id: proposal.proposal_id,
+        },
+        Some(service),
+        &config,
+    )
+    .await
+    .unwrap();
+    let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(result.get("published"), Some(&serde_json::json!(false)));
+    assert_eq!(result.get("evaluations").and_then(|v| v.as_array()).unwrap().len(), 2);
+    assert_eq!(
+        result.pointer("/proposal/status").and_then(|v| v.as_str()),
+        Some("eligible")
+    );
+    assert_eq!(
+        world.store.active_binding(&skill()).unwrap().unwrap().revision_id,
+        baseline
+    );
+}

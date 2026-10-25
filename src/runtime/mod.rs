@@ -12,6 +12,7 @@ pub mod envelope;
 pub(crate) mod evolution_model;
 pub mod native;
 pub mod registry;
+mod shell_cgroup;
 pub mod shell_process;
 pub mod shutdown;
 pub mod sqlite_pool;

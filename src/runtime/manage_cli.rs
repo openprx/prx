@@ -1506,7 +1506,7 @@ mod tests {
             config.reliability.model_fallbacks.get("gpt-4o").unwrap(),
             &vec!["gpt-5.6".to_owned()]
         );
-        assert!(config.reliability.fallback_providers.is_empty());
+        assert_eq!(config.reliability.fallback_providers, Vec::<String>::new());
     }
 
     /// CDP-14: `prx causal config set secret` reads the credential only once

@@ -15,6 +15,11 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub shell_env_allowlist: Vec<String>,
 
+    /// Optional delegated Linux cgroup v2 root for managed native skill scripts.
+    /// A configured but unavailable root refuses execution; macOS is unsupported.
+    #[serde(default)]
+    pub managed_cgroup_root: Option<std::path::PathBuf>,
+
     /// Docker runtime settings (used when `kind = "docker"`).
     #[serde(default)]
     pub docker: DockerRuntimeConfig,
@@ -156,6 +161,7 @@ impl Default for RuntimeConfig {
         Self {
             kind: default_runtime_kind(),
             shell_env_allowlist: Vec::new(),
+            managed_cgroup_root: None,
             docker: DockerRuntimeConfig::default(),
             reasoning_enabled: None,
             codex_stream_idle_timeout_secs: None,

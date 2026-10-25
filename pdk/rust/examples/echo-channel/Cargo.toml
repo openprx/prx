@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "echo-channel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.51", default-features = false, features = ["macros"] }
+
+[package.metadata.component]
+package = "prx:plugin"

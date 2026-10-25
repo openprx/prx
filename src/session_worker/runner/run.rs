@@ -733,6 +733,7 @@ async fn run_owned_manifest(
         credentials.root_api_key,
         &config,
         extensions,
+        Some(Arc::clone(&hooks)),
     )
     .tools;
 
@@ -760,6 +761,7 @@ async fn run_owned_manifest(
         Arc::clone(&active_runs),
     )
     .with_shared_memory(Arc::clone(&memory))
+    .with_parent_hooks(Arc::clone(&hooks))
     .with_source_fabric(session_fabric.clone())
     .with_event_recording(config.memory.event_recording_config());
     let spawn_tools_handle = spawn_tool.tools_handle();

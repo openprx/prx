@@ -1746,7 +1746,7 @@ fn channels_prepares_for_field(field: &str) -> bool {
     field == "channels_config" || crate::config::generation::is_rebuild_and_swap(field)
 }
 
-const fn has_supervised_channels(config: &Config) -> bool {
+fn has_supervised_channels(config: &Config) -> bool {
     let crate::config::ChannelsConfig {
         cli: _,     // `cli` is used only when running the CLI manually
         webhook: _, // Managed by the gateway
@@ -1769,7 +1769,21 @@ const fn has_supervised_channels(config: &Config) -> bool {
         ..
     } = &config.channels_config;
 
-    telegram.is_some()
+    #[cfg(feature = "wasm-plugins")]
+    let plugin_channel = config.plugins.enabled
+        && std::fs::read_dir(config.workspace_dir.join("plugins")).is_ok_and(|entries| {
+            entries.filter_map(|entry| entry.ok()).any(|entry| {
+                if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    return false;
+                }
+                crate::plugins::manifest::PluginManifest::from_file(&entry.path().join("plugin.toml"))
+                    .is_ok_and(|manifest| manifest.has_capability("channel"))
+            })
+        });
+    #[cfg(not(feature = "wasm-plugins"))]
+    let plugin_channel = false;
+    plugin_channel
+        || telegram.is_some()
         || discord.is_some()
         || slack.is_some()
         || mattermost.is_some()

@@ -354,3 +354,26 @@ SL11 adds reviewed executable revisions: a bundle with scripts or declared
 - **Evaluation.** Executable revisions use the same frozen-suite evaluator.
   Trials can only be offered read tools and workspace file writes, so scripts,
   mail, payments and other external effects are never run in a trial.
+
+## Operator paired evaluation
+
+`prx skills lifecycle suite-digest suite.json` validates an `EvalSuite` and prints
+its canonical digest without opening the lifecycle store. Register that digest
+under `skills_lifecycle.suites` and select `shadow` mode (evaluation without
+publication) or `auto` mode. `draft_only` refuses evaluation. Then run:
+
+```text
+prx skills lifecycle install-suite suite.json
+prx skills lifecycle review PROPOSAL_ID
+prx skills lifecycle evaluate PROPOSAL_ID
+```
+
+Evaluation uses `AgentCaseExecutor` with the configured provider/model, fresh
+scratch workspaces, pinned baseline/candidate bundles, the suite's budgets and
+the owner's cost ledger. It runs validation and holdout once each and records
+the deterministic gate; it never publishes. Existing split attempt limits still
+apply to retries. Inspect the durable proposal/receipts if interrupted. The
+separate `publish` command still requires an eligible gate and Auto mode.
+A passing fixture suite demonstrates that task population only. Sustained
+production improvement requires later observed tasks and cannot be inferred
+from a judge score, a synthetic fixture, or one paired run.

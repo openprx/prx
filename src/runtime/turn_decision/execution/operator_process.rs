@@ -102,6 +102,7 @@ impl TurnDecisionService {
             operator_process: Some(Arc::clone(&authority)),
             operator_task: None,
             ordinary_parent: None,
+            ordinary_money: None,
             ordinary_task: None,
             ordinary_process: None,
             parent_grant: None,

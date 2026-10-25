@@ -602,7 +602,7 @@ evaluated. The list is explicit (`OWNER_ISOLATION_AWARE_TOOLS` in
 `src/causal_tree/capability_policy.rs`): `capability_search`, `web_search_tool`,
 `memory_search`, `memory_recall`, `memory_get`,
 `document_search`, `document_get_chunk`, `sessions_list`, `sessions_history`,
-`memory_forget`, `memory_store` and `document_ingest`. The name must also be
+`memory_forget`, `memory_store`, `document_ingest` and `skills_manage`. The name must also be
 served by the tool of that name, so a dynamic MCP, WASM or skill alias that
 publishes a listed name from another backend is refused too. Any other name in
 `mcp_server.exposed_tools` — `document_sync`, `shell`, `cron`, `message_send`, `sessions_spawn`, any dynamic
@@ -616,8 +616,12 @@ a daemon whose configuration exposed such a tool still starts. A tool joins the
 list only after it scopes its own effect by owner or reads no private runtime
 state. `web_search_tool` performs stateless public web reads; the configured
 provider credentials and quota are shared across owners, not allocated per owner.
-`skills_manage` remains excluded because its legacy actions mutate the shared
-workspace. `session_status` and
+`skills_manage` admits only `lifecycle_status`, `lifecycle_list`,
+`lifecycle_inspect` and `lifecycle_cancel` for isolated callers. All four require
+an authenticated owner matching the configured lifecycle store, including reads.
+Cancellation retains its exact approval checks. Legacy actions, publication,
+rollback and executable import remain refused for isolated callers, even with
+a grant: they can change the shared workspace. `session_status` and
 `sessions_send` scope their effect by owner for in-process turns, but the
 gateway does not register them, so they are kept off the list: exposing them
 over MCP answers the 403 above, before anything is written, rather than a 404
@@ -1764,3 +1768,20 @@ lowered losslessly are rejected locally before transport, with the tool name,
 keyword and `[tool_tiering]` remediation. Republish such a tool without the root
 combinator while retaining its strict execution validation, or exclude it from
 the affected model's tool set. See [upgrade actions](migration-unreleased.md).
+
+### Child ownership and budgets
+
+Entrypoints explicitly inject their live HookManager into delegates and spawned
+tasks. A child's tool allowlist may omit hook controls without losing event
+routing or the parent's shutdown drain.
+
+Ordinary `delegate` and `sessions_spawn` launches now reserve a strict whole-cent
+share from the parent's remaining monetary allowance, just as recursive launches
+do. Each ordinary sibling atomically takes half of the smaller current balance
+and manifest ceiling, rounded down to cents. A failed launch keeps its reservation;
+no speculative refund can finance another child. Recursive ancestry still has its
+single-child rule. Cloned/reissued grants use the same parent balance. Disabled
+causal-plane publications also share the parent accounting owner, and process
+workers carry the narrowed ceiling in their authenticated manifest. A parent
+unable to fund one cent refuses the launch. This is monetary admission; it does
+not merge the distinct per-turn token/context windows or claim a vendor billing cap.

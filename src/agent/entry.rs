@@ -29,7 +29,26 @@ use uuid::Uuid;
 // interactive REPL mode. The interactive loop manages history compaction
 // and hard trimming to keep the context window bounded.
 
-#[allow(clippy::too_many_lines)]
+tokio::task_local! {
+    static QUIET_SINGLE_SHOT: bool;
+}
+
+/// Internal evaluations return their answer to the caller without mixing it
+/// into the operator command's machine-readable stdout.
+pub(crate) async fn run_quiet(
+    config: Config,
+    message: String,
+    temperature: f64,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<String> {
+    QUIET_SINGLE_SHOT
+        .scope(
+            true,
+            Box::pin(run(config, Some(message), None, None, temperature, shutdown)),
+        )
+        .await
+}
+
 pub async fn run(
     config: Config,
     message: Option<String>,
@@ -1862,7 +1881,9 @@ pub(crate) async fn run_with_runtime_envelope(
                             .close_agent_directive_turn(proof, Arc::clone(&decision), &ports, shutdown)
                             .await?;
                         final_output = reply.to_string();
-                        println!("{reply}");
+                        if !QUIET_SINGLE_SHOT.try_with(|quiet| *quiet).unwrap_or(false) {
+                            println!("{reply}");
+                        }
                         return Ok::<(), anyhow::Error>(());
                     }
                     (service, proof, decision, route_decision)
@@ -2077,7 +2098,9 @@ pub(crate) async fn run_with_runtime_envelope(
                 }
                 increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
                 final_output = response.clone();
-                println!("{response}");
+                if !QUIET_SINGLE_SHOT.try_with(|quiet| *quiet).unwrap_or(false) {
+                    println!("{response}");
+                }
                 observer.record_event(&ObserverEvent::TurnComplete);
                 hooks
                     .emit(

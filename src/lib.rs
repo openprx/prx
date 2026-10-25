@@ -253,6 +253,16 @@ pub enum SkillCommands {
 /// service under the `[skills_lifecycle]` settings.
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillLifecycleCommands {
+    /// Validate a frozen evaluation suite and print its canonical digest.
+    SuiteDigest { source: String },
+    /// Install a suite whose digest is already registered by operator configuration.
+    InstallSuite { source: String },
+    /// Review candidate source deterministically without publishing it.
+    Review { proposal_id: String },
+    /// Run paired validation and holdout through the real agent, then record the gate.
+    /// Publication remains a separate command.
+    Evaluate { proposal_id: String },
+
     /// Generate a private script draft from an operator-supplied skill template
     ProposeScript {
         /// Template directory with a declared script tool

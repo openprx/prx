@@ -170,6 +170,7 @@ impl OperatorChildPublication {
             operator_task: Some(Arc::clone(&task)),
             operator_process: None,
             ordinary_parent: None,
+            ordinary_money: None,
             ordinary_task: None,
             ordinary_process: None,
             parent_grant: None,

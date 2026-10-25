@@ -92,6 +92,7 @@ fn production_gateway_registries(
         config.api_key.as_deref(),
         config,
         extensions,
+        Some(Arc::clone(&hooks)),
     );
     let direct_mcp = direct_registry.mcp_tool;
     let mut direct_tools = direct_registry.tools;
@@ -100,6 +101,7 @@ fn production_gateway_registries(
         config,
         &manager,
         &security,
+        &hooks,
         &model,
         &memory,
         &provider_runtime_options,

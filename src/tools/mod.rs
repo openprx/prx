@@ -488,6 +488,7 @@ pub fn all_tools_with_runtime_ext(
         fallback_api_key,
         root_config,
         Vec::new(),
+        None,
     )
 }
 
@@ -509,6 +510,7 @@ pub fn all_tools_with_runtime_ext_and_extensions(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
     extensions: Vec<Arc<dyn Tool>>,
+    parent_hooks: Option<Arc<crate::hooks::HookManager>>,
 ) -> ToolsRegistryResult {
     // Core tools — always registered regardless of module flags.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
@@ -691,6 +693,11 @@ pub fn all_tools_with_runtime_ext_and_extensions(
             .with_multimodal_config(root_config.multimodal.clone())
             .with_shared_memory(Arc::clone(&memory))
             .with_event_recording(root_config.memory.event_recording_config());
+        let delegate_tool = if let Some(hooks) = parent_hooks {
+            delegate_tool.with_parent_hooks(hooks)
+        } else {
+            delegate_tool
+        };
         tool_arcs.push(Arc::new(delegate_tool));
     }
 

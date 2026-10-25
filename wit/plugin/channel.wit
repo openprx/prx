@@ -1,0 +1,9 @@
+package prx:plugin@0.1.0;
+
+/// A bounded, host-polled channel. Both exports use result<string, string>.
+/// poll receives {} and returns a JSON array of at most 32 inbound messages.
+/// send receives the host's JSON SendMessage and returns an acknowledgement.
+interface channel-exports {
+    send: func(message: string) -> result<string, string>;
+    poll: func(request: string) -> result<string, string>;
+}

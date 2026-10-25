@@ -1,19 +1,15 @@
-//! The hook manager a sub-agent shares with its parent (finding 96b).
-//!
-//! The parent's registry carries the live manager through its hook control
-//! tools ([`Tool::live_hook_manager`]). A child that runs without an Ordinary
-//! parent runtime uses that same manager, so its events join the parent's
-//! queue (per-manager order holds and the parent owner's shutdown drain covers
-//! them) and reach the parent's plugin runtime. A parent that has none leaves
-//! the child with an inert manager, as before.
+//! Child hook ownership is injected by the entrypoint, independent of tool exposure.
 
 use crate::hooks::HookManager;
+#[cfg(test)]
 use crate::tools::Tool;
+#[cfg(test)]
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 
 /// The live manager of the parent registry, when it carries one.
+#[cfg(test)]
 pub(crate) fn parent_hook_manager<T>(parent_tools: &[T]) -> Option<Arc<HookManager>>
 where
     T: Deref<Target = dyn Tool>,

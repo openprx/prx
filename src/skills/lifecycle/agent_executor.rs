@@ -501,11 +501,9 @@ impl CaseExecutor for AgentCaseExecutor {
         };
 
         let token = cancel.child_token();
-        let mut run = Box::pin(crate::agent::run(
+        let mut run = Box::pin(crate::agent::entry::run_quiet(
             run_config.clone(),
-            Some(request.prompt.to_string()),
-            None,
-            None,
+            request.prompt.to_string(),
             self.temperature,
             token.clone(),
         ));

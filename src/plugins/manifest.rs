@@ -324,7 +324,7 @@ impl PluginManifest {
             }
             if !matches!(
                 capability.capability_type.as_str(),
-                "tool" | "hook" | "middleware" | "cron" | "provider" | "storage"
+                "tool" | "hook" | "middleware" | "cron" | "provider" | "storage" | "channel"
             ) {
                 return Err(PluginError::Manifest(format!(
                     "unsupported plugin capability type '{}'",

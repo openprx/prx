@@ -256,3 +256,15 @@ existing uncertainty fallback. Non-image messages retain their normal path.
 The terminal owner retains auxiliary observations and their physical accounting
 scope. Aggregate vision traces do not create a second cost charge. This candidate
 still requires real scoped validation and fixed-budget acceptance.
+
+## WASM channels
+
+With `wasm-plugins` compiled and `[plugins] enabled = true`, trusted plugins with
+one `type = "channel"` capability join the channel supervisor as `wasm:NAME`.
+They use `prx:plugin/channel-exports@0.1.0` `send` and `poll`, described in the
+[plugin developer guide](plugin-developer-guide.md). Inbound senders require an
+exact entry in the trusted manifest's comma-separated `config.allowed_users`;
+an empty list admits nobody, and `*` is an explicit wildcard. The host supplies
+channel identity and timestamps. Standard inbound processing and outbound policy
+still apply. Existing channel proxies follow atomic plugin reloads; adding a
+new channel name requires restarting the channel supervisor.

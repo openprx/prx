@@ -63,13 +63,27 @@ impl RecursiveAllowance {
                 .is_ok(),
             "recursive grant already allocated its one child allowance"
         );
+        let allocation = self.carve_ordinary_child(ceiling_cents)?;
+        anyhow::ensure!(
+            allocation.0 > 0,
+            "recursive parent allowance cannot fund a strict whole-cent child share"
+        );
+        Ok(allocation)
+    }
+
+    /// Each ordinary launch atomically reserves a strict share of the balance.
+    /// Failed launches retain their reservation; siblings cannot reuse it.
+    pub(crate) fn carve_ordinary_child(&self, ceiling_cents: u32) -> anyhow::Result<(u32, Arc<Self>)> {
+        anyhow::ensure!(self.funded, "parent child allowance is unavailable");
         let mut available = self.money.load(Ordering::Acquire);
         loop {
             let cents = u32::try_from(available.min(u64::from(ceiling_cents) * 10_000) / 20_000)?;
-            anyhow::ensure!(
-                cents > 0,
-                "recursive parent allowance cannot fund a strict whole-cent child share"
-            );
+            // A zero-price child can still run with a zero money ceiling.
+            // Paid requests remain denied by its accounting owner. Never give
+            // it the parent's sub-cent remainder or manufacture a fresh budget.
+            if cents == 0 {
+                return Ok((0, Arc::new(Self::new(0))));
+            }
             let share = u64::from(cents) * 10_000;
             match self
                 .money
@@ -180,13 +194,11 @@ impl TurnDecisionService {
     pub(super) fn recursive_money(&self, proof: &dyn TurnSourceProof) -> Option<Arc<AtomicU64>> {
         if let Some(incoming) = &self.parent_grant {
             return incoming
-                .has_recursive_ancestry()
-                .then(|| incoming.recursive_child_allowance())
-                .flatten()
+                .recursive_child_allowance()
                 .and_then(|owner| owner.funded_money());
         }
-        if !self.generation.effective.sessions_spawn.allow_recursive_delegation {
-            return None;
+        if let Some(money) = &self.ordinary_money {
+            return Some(Arc::clone(money));
         }
         self.recursive_allowances
             .lookup(proof)
@@ -201,12 +213,13 @@ impl TurnDecisionService {
         if let Some(incoming) = &self.parent_grant {
             return incoming.recursive_child_allowance();
         }
-        if !self.generation.effective.sessions_spawn.allow_recursive_delegation {
-            return None;
-        }
         Some(Arc::clone(context.recursive_allowance.get_or_init(|| {
             let money = context.accounting.as_ref().map_or_else(
-                || Arc::new(AtomicU64::new(context.engine.state.trusted.parts().budgets.micro_usd)),
+                || {
+                    self.recursive_money(proof).unwrap_or_else(|| {
+                        Arc::new(AtomicU64::new(context.engine.state.trusted.parts().budgets.micro_usd))
+                    })
+                },
                 |scope| scope.money_owner(),
             );
             self.recursive_allowances.issue(proof, money)
@@ -295,3 +308,34 @@ impl RunAllowances {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod ordinary_concurrency_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_ordinary_reservations_conserve_the_original_envelope() {
+        let initial = 10_000_000;
+        let parent = Arc::new(RecursiveAllowance::new(initial));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        // Every barrier participant must start before any thread is joined.
+        #[allow(clippy::needless_collect)]
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let parent = Arc::clone(&parent);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    parent.carve_ordinary_child(1000).map_or(0, |(cents, child)| {
+                        let share = u64::from(cents) * 10_000;
+                        assert_eq!(child.money().load(Ordering::Acquire), share);
+                        share
+                    })
+                })
+            })
+            .collect();
+        let reserved: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(reserved > 0);
+        assert_eq!(reserved + parent.money().load(Ordering::Acquire), initial);
+    }
+}

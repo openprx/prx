@@ -3,7 +3,7 @@
 //! Two things live here, both for skills whose bundle carries scripts or
 //! declared `[[tools]]`:
 //!
-//! * [`review_executable_bundle`] is the stronger review an operator-authored
+//! * [`review_executable_bundle`] is the stronger review an operator-reviewed
 //!   executable revision gets before it can be published (migration import or
 //!   an operator import through the lifecycle service). Executable revisions
 //!   never come from the proposer: a proposal may change `SKILL.md` text only,
@@ -76,7 +76,7 @@ pub enum ExecutableError {
     #[error("executable file {path:?} is not referenced by any declared tool")]
     UnreferencedExecutable { path: String },
     #[error(
-        "the bundle carries an untrusted-origin marker; only operator-authored bundles can be reviewed as executable"
+        "the bundle carries an untrusted-origin marker; only operator-reviewed bundles can be reviewed as executable"
     )]
     UntrustedOrigin,
     #[error("the bundle hashes to {found}, not to the revision {reviewed} the operator reviewed")]

@@ -22,12 +22,21 @@ impl Channel for NoChannel {
 
 #[tokio::test]
 async fn recursive_publication_cannot_multiply_the_parent_allowance_by_reissue_or_clone() -> anyhow::Result<()> {
+    allowance_fixture(true).await
+}
+
+#[tokio::test]
+async fn ordinary_child_publications_carve_the_parent_balance_even_without_recursion() -> anyhow::Result<()> {
+    allowance_fixture(false).await
+}
+
+async fn allowance_fixture(recursive_enabled: bool) -> anyhow::Result<()> {
     let workspace = tempfile::tempdir()?;
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
     config.autonomy.level = crate::security::AutonomyLevel::Full;
-    config.sessions_spawn.allow_recursive_delegation = true;
+    config.sessions_spawn.allow_recursive_delegation = recursive_enabled;
     let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
     let spawn = SessionsSpawnTool::new(
@@ -56,34 +65,56 @@ async fn recursive_publication_cannot_multiply_the_parent_allowance_by_reissue_o
                 ("ollama", "prx-local-model"),
             )
             .await;
-            let batch = admitted
-                .execute_tool(
-                    "sessions_spawn",
-                    serde_json::json!({
-                        "action": "spawn_batch", "allow_delegation": true,
-                        "tasks": ["Explain the first integer.", "Explain the second integer."]
-                    }),
-                )
-                .await;
-            let refusal = match batch {
-                Ok(result) => {
-                    assert!(!result.success);
-                    result.error.unwrap_or_default()
-                }
-                Err(error) => format!("{error:#}"),
-            };
-            assert!(refusal.contains("at most one child"), "{refusal}");
-            let rows = memory.list_message_events_since(&admitted.principal(), 0, 100).await?;
-            assert!(
-                !rows.iter().any(|row| row.event_type == "task.spawned"),
-                "refused fanout must not launch a member"
-            );
+            if recursive_enabled {
+                let batch = admitted
+                    .execute_tool(
+                        "sessions_spawn",
+                        serde_json::json!({
+                            "action": "spawn_batch", "allow_delegation": true,
+                            "tasks": ["Explain the first integer.", "Explain the second integer."]
+                        }),
+                    )
+                    .await;
+                let refusal = match batch {
+                    Ok(result) => {
+                        assert!(!result.success);
+                        result.error.unwrap_or_default()
+                    }
+                    Err(error) => format!("{error:#}"),
+                };
+                assert!(refusal.contains("at most one child"), "{refusal}");
+                let rows = memory.list_message_events_since(&admitted.principal(), 0, 100).await?;
+                assert!(
+                    !rows.iter().any(|row| row.event_type == "task.spawned"),
+                    "refused fanout must not launch a member"
+                );
+            }
             let decision = admitted.decision();
             let issue = || decision.service.issue_child_grant(decision.proof, decision.context);
             let root = issue()?;
-            let ordinary = root.for_spawn_request(false, "ollama", "prx-local-model")?;
-            assert!(ordinary.scope().gate_inputs().0.allowed.is_empty());
-            assert!(ordinary.scope().gate_inputs().0.authority.delegation.is_none());
+            if !recursive_enabled {
+                let balance = root
+                    .recursive_child_allowance()
+                    .context("ordinary parent owner")?
+                    .money();
+                let initial = balance.load(Ordering::Acquire);
+                let first = root.for_spawn_request(false, "ollama", "prx-local-model")?;
+                let second = issue()?.for_spawn_request(false, "ollama", "prx-local-model")?;
+                let first_money = u64::from(first.scope().gate_inputs().0.authority.max_cost_cents) * 10_000;
+                let second_money = u64::from(second.scope().gate_inputs().0.authority.max_cost_cents) * 10_000;
+                assert!(first_money > 0 && second_money > 0 && second_money < first_money);
+                assert_eq!(balance.load(Ordering::Acquire) + first_money + second_money, initial);
+                assert!(first.scope().gate_inputs().0.authority.delegation.is_none());
+                assert!(issue()?.for_spawn_request(true, "ollama", "prx-local-model").is_err());
+                assert!(
+                    decision
+                        .service
+                        .drain_writes(Instant::now() + Duration::from_secs(5))
+                        .await
+                );
+                return Ok(());
+            }
+
             let recursive = root.for_spawn_request(true, "ollama", "prx-local-model")?;
             let (manifest, parent) = recursive.scope().gate_inputs();
             manifest.verify(parent)?;

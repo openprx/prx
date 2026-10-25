@@ -756,12 +756,15 @@ impl AdmittedTurn {
         };
         let (proof, envelope): (Box<dyn TurnSourceProof>, _) = match origin {
             FixtureOrigin::Channel(message) | FixtureOrigin::OrdinaryControlledChannel(message) => {
+                // A new admission is a distinct run, including fixtures that
+                // share /tmp or one channel session while children stay live.
+                let run_id = format!("prx_channel_parent_{}", uuid::Uuid::new_v4());
                 let source = if generation.effective.causal_tree.enabled {
                     crate::channels::decision_source::recorded_enabled_fixture_source(
                         &generation,
                         Arc::clone(&memory),
                         &message,
-                        "prx_channel_parent",
+                        &run_id,
                         selection,
                     )
                     .await
@@ -770,7 +773,7 @@ impl AdmittedTurn {
                         &generation,
                         Arc::clone(&memory),
                         &message,
-                        "prx_channel_parent",
+                        &run_id,
                         selection,
                     )
                     .await

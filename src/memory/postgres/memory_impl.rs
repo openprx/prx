@@ -1227,6 +1227,26 @@ impl Memory for PostgresMemory {
     // (legacy NULL / `legacy:<session_key>` rows remain visible during the
     // phased rollout, matching SQLite's `legacy_visible = 1` default).
     #[allow(clippy::too_many_arguments)]
+    async fn create_conversation_session(&self, session_key: &str, owner_id: &str) -> Result<()> {
+        anyhow::ensure!(
+            !session_key.is_empty() && !owner_id.is_empty(),
+            "session identity is empty"
+        );
+        let client = self.client.clone();
+        let table = self.qualified_sessions_table();
+        let session_key = session_key.to_owned();
+        let owner_id = owner_id.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            client.with_client(|client| {
+                let now = Utc::now().to_rfc3339();
+                client.execute(&format!("INSERT INTO {table}
+                    (session_key, channel, sender, owner_id, created_at, updated_at, message_count, last_message_preview)
+                    VALUES ($1, 'console', $2, $2, $3, $3, 0, '')"), &[&session_key, &owner_id, &now])?;
+                Ok(())
+            })
+        }).await?
+    }
+
     async fn append_conversation_turn(
         &self,
         session_key: &str,

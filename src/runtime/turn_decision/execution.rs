@@ -119,6 +119,11 @@ impl OrdinaryChildPublication {
             !service.generation.effective.causal_tree.enabled,
             "ordinary publication requires disabled plane"
         );
+        // Bind the parent monetary owner before its main model call can spend.
+        // Later child launches carve from that same balance, including builtin admission.
+        service
+            .issue_recursive_allowance(source, context)
+            .context("ordinary parent budget owner missing")?;
         Ok(Self(Arc::new(OrdinaryChildPublicationInner {
             context: Arc::clone(context),
             scope: Arc::new(service.verified_delegation_scope(context)?),
@@ -181,6 +186,15 @@ impl OrdinaryChildPublication {
         )?;
         self.0.service.check_live_parity()?;
         Ok(())
+    }
+
+    fn allocate_child_budget(&self) -> anyhow::Result<(u32, Arc<super::recursive_allowance::RecursiveAllowance>)> {
+        let owner = self
+            .0
+            .service
+            .issue_recursive_allowance(&self.0.source, &self.0.context)
+            .context("ordinary parent budget owner missing")?;
+        owner.carve_ordinary_child(self.scope().gate_inputs().0.authority.max_cost_cents)
     }
 
     /// Derive an in-process worker from the actual parent publication. It
@@ -270,6 +284,7 @@ impl OrdinaryChildPublication {
             loop_runtime: Some(runtime),
             publication_policy: policy,
             ordinary_parent: task.is_none().then(|| self.clone()),
+            ordinary_money: Some(self.allocate_child_budget()?.1.money()),
             operator_task: None,
             operator_process: None,
             ordinary_task: task,

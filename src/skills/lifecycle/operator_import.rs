@@ -1,4 +1,4 @@
-//! Publication of an operator-authored executable bundle (SL11).
+//! Publication of an operator-reviewed executable bundle (SL11).
 //!
 //! The only way a revision with scripts or executable tools enters the store.
 //! Migration only plans a legacy executable directory
@@ -7,7 +7,8 @@
 //! lineage has no such review. The caller names the complete bundle hash the
 //! operator reviewed; the directory must hash to exactly that, pass
 //! [`review_executable_bundle`], and the revision is written with `Operator`
-//! provenance and published through the ordinary generation-checked
+//! publication provenance (model authorship remains in the hashed proposal record)
+//! and published through the ordinary generation-checked
 //! transaction, so a concurrent writer is rejected and rollback, pinning and
 //! the compatibility projection behave as for any other revision.
 

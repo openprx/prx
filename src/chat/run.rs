@@ -288,6 +288,7 @@ pub async fn run(
         model_name,
         temperature,
         &security,
+        &hooks,
         &terminal,
         &mem,
         startup_connection,

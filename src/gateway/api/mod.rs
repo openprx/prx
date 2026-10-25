@@ -119,7 +119,7 @@ pub fn router(state: AppState) -> Router<AppState> {
 
     let protected_routes = Router::new()
         .route("/status", get(status::get_status))
-        .route("/sessions", get(sessions::get_sessions))
+        .route("/sessions", get(sessions::get_sessions).post(sessions::post_session))
         .route(
             "/sessions/{id}/messages",
             get(sessions::get_session_messages),

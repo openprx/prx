@@ -675,6 +675,13 @@ Examples:
         evolution_command: EvolutionCommands,
     },
 
+    /// Inspect and authorize local WASM plugin artifacts.
+    #[cfg(feature = "wasm-plugins")]
+    Plugin {
+        #[command(subcommand)]
+        command: openprx::plugins::cli::PluginCommand,
+    },
+
     /// Read workspace costs and outstanding reservations without creating state.
     Cost {
         /// Output machine-readable JSON.
@@ -1711,6 +1718,8 @@ async fn async_main() -> Result<()> {
             | Commands::Evolution { .. }
             | Commands::Skills { .. }
     );
+    #[cfg(feature = "wasm-plugins")]
+    let use_stderr = use_stderr || matches!(&cli.command, Commands::Plugin { .. });
     if use_stderr {
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
@@ -1973,6 +1982,8 @@ async fn async_main() -> Result<()> {
         &cli.command,
         Commands::Doctor { .. } | Commands::Tasks { .. } | Commands::Causal { .. } | Commands::Cost { .. }
     );
+    #[cfg(feature = "wasm-plugins")]
+    let read_only_config_command = read_only_config_command || matches!(&cli.command, Commands::Plugin { .. });
     let config = if read_only_config_command {
         Config::load_existing_read_only_with_config_dir(cli.config_dir.as_deref()).await?
     } else if read_only_management_command(&cli.command) {

@@ -64,6 +64,9 @@ pub const OWNER_ISOLATION_AWARE_TOOLS: &[&str] = &[
     // stores under an owner-namespaced document id (document_ingest.rs).
     // `document_sync` always takes a host path, so it is never admitted.
     "document_ingest",
+    // The tool restricts isolated callers to owner-bound proposal reads/cancellation.
+    // Shared projection, executable import and legacy workspace actions are refused.
+    "skills_manage",
 ];
 
 /// Both public identity and actual backend must name the audited implementation.
@@ -81,7 +84,8 @@ mod owner_isolation_tests {
         ));
         assert!(!super::admits_owner_isolated_identity("web_search_tool", "mcp"));
         assert!(!super::admits_owner_isolated_identity("web_search", "web_search_tool"));
-        assert!(!super::admits_owner_isolated_identity("skills_manage", "skills_manage"));
+        assert!(super::admits_owner_isolated_identity("skills_manage", "skills_manage"));
+        assert!(!super::admits_owner_isolated_identity("skills_manage", "mcp"));
         assert!(!super::admits_owner_isolated_identity("shell", "shell"));
         assert!(super::admits_owner_isolated_identity("memory_search", "memory_search"));
         assert!(!super::admits_owner_isolated_identity("memory_search", "mcp"));

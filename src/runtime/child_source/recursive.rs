@@ -44,11 +44,7 @@ impl IssuedChildGrant {
         let (issued, parent) = self.scope().gate_inputs();
         self.verify_child_model(provider, model)?;
         if !requested {
-            return if issued.authority.delegation.is_some() {
-                self.with_budgeted_scope(issued.clone())
-            } else {
-                Ok(Arc::clone(self))
-            };
+            return self.with_budgeted_scope(issued.clone());
         }
         let config = &self.generation().effective.sessions_spawn;
         anyhow::ensure!(
@@ -90,12 +86,16 @@ impl IssuedChildGrant {
         manifest: crate::tools::capability::child::ChildCapabilityManifest,
     ) -> anyhow::Result<Arc<Self>> {
         let (_, parent) = self.scope().gate_inputs();
-        let (cents, recursive_child_claimed) = self
+        let owner = self
             .0
             .recursive_child_claimed
             .as_ref()
-            .context("recursive grant has no budget owner")?
-            .carve_child(manifest.authority.max_cost_cents)?;
+            .context("child grant has no budget owner")?;
+        let (cents, recursive_child_claimed) = if manifest.authority.delegation.is_some() {
+            owner.carve_child(manifest.authority.max_cost_cents)?
+        } else {
+            owner.carve_ordinary_child(manifest.authority.max_cost_cents)?
+        };
         let manifest = manifest.with_cost_ceiling(parent, cents)?;
         let scope = Arc::new(crate::tools::capability::child::VerifiedChildScope::new(
             manifest, parent,

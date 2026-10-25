@@ -118,6 +118,7 @@ impl SessionsSpawnTool {
             default_recipient: Arc::new(RwLock::new(None)),
             active_runs,
             tools: Arc::new(ParentToolRegistry::default()),
+            parent_hooks: None,
             workspace_dir,
             configured_providers,
             model_catalog: Arc::default(),
@@ -135,6 +136,12 @@ impl SessionsSpawnTool {
             batch_rosters: Arc::new(RwLock::new(Vec::new())),
             restart_recovery: None,
         }
+    }
+
+    /// Share hooks even when hook management tools are not exposed to this child.
+    pub fn with_parent_hooks(mut self, hooks: Arc<crate::hooks::HookManager>) -> Self {
+        self.parent_hooks = Some(hooks);
+        self
     }
 
     /// One actual bounded recovery page, retaining every per-launch error.

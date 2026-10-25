@@ -756,6 +756,36 @@ async fn parse_message_from_request(state: &AppState, request: Request) -> Resul
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CreateSessionRequest {}
+
+pub async fn post_session(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
+    Json(_body): Json<CreateSessionRequest>,
+) -> Response {
+    if let Err(error) =
+        super::authorize_resource_mutation(&state, "gateway_api:sessions:create", ResourceRiskLevel::Low)
+    {
+        return error.into_response();
+    }
+    let session_id = format!("console-{}", uuid::Uuid::new_v4());
+    if let Err(error) = state
+        .mem
+        .create_conversation_session(&session_id, &principal.owner_id)
+        .await
+    {
+        tracing::error!(%error, "Failed to create Console session");
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create session");
+    }
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({"session_id": session_id, "status":"empty", "message_count":0})),
+    )
+        .into_response()
+}
+
 pub async fn get_sessions(State(state): State<AppState>, Query(query): Query<SessionsQuery>) -> impl IntoResponse {
     let limit = normalize_limit(query.limit);
     let offset = normalize_offset(query.offset);
@@ -2250,6 +2280,60 @@ mod tests {
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime: None,
         }
+    }
+
+    #[tokio::test]
+    async fn session_creation_route_binds_owner_and_creates_no_message() {
+        use tower::ServiceExt;
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_owned();
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        let mut state = test_app_state(config.clone(), Arc::new(CapturingProvider::default()));
+        let memory = Arc::new(crate::memory::SqliteMemory::new(temp.path()).unwrap());
+        state.mem = memory.clone();
+        let router = super::super::router(state.clone()).with_state(state.clone());
+        let request = |body: &'static str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let response = router.clone().oneshot(request("{}")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        let id = body.get("session_id").unwrap().as_str().unwrap();
+        let stored = memory.get_conversation_session(id).await.unwrap().unwrap();
+        assert_eq!(stored.message_count, 0);
+        assert_eq!(stored.channel, "console");
+        assert_eq!(stored.sender, "api:local");
+        assert_eq!(stored.last_message_preview, "");
+        assert!(memory.create_conversation_session(id, "api:other").await.is_err());
+        assert_eq!(
+            memory.get_conversation_session(id).await.unwrap().unwrap().sender,
+            "api:local"
+        );
+        assert_eq!(
+            router
+                .oneshot(request(r#"{"owner_id":"api:other"}"#))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        let mut denied = test_app_state(config, Arc::new(CapturingProvider::default()));
+        denied.mem = memory.clone();
+        let response = super::super::router(denied.clone())
+            .with_state(denied)
+            .oneshot(request("{}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(memory.list_conversation_sessions(100, 0, None).await.unwrap().len(), 1);
     }
 
     fn console_provider_fixture_config(config: &mut Config, workspace: &std::path::Path, model: &str, endpoint: &str) {

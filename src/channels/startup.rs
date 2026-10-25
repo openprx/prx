@@ -146,6 +146,7 @@ pub async fn start_channels_with_config(
         config.api_key.as_deref(),
         &config,
         extensions,
+        Some(Arc::clone(&hooks)),
     );
     let mcp_tool = tool_build.mcp_tool;
     let mut tools_list = tool_build.tools;
@@ -399,6 +400,11 @@ pub async fn start_channels_with_config(
         )));
     }
 
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(runtime) = &wasm_plugin_runtime {
+        channels.extend(runtime.channels());
+    }
+
     if channels.is_empty() {
         println!("No channels configured. Run `prx onboard` to set up channels.");
         return Ok(());
@@ -496,6 +502,7 @@ pub async fn start_channels_with_config(
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
+        .with_parent_hooks(Arc::clone(&hooks))
         .with_configured_providers(&providers::ConfiguredProviders::from_config(&config))
         .with_model_catalog(providers::selection::catalog_for(&config))
         .with_hint_config(&config)

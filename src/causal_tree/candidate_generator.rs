@@ -106,6 +106,9 @@ pub(crate) struct CapabilityCostModel {
 pub(crate) trait CostEstimateSource: Send + Sync {
     fn estimate_entry(&self, entry: &CapabilityEntry) -> Option<(CostEstimate, u32)>;
     fn estimate_terminal(&self) -> Option<(CostEstimate, u32)>;
+    fn decision_overhead_ms(&self, _action: CausalActionKind, _entry: &CapabilityEntry) -> u32 {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -797,11 +800,9 @@ fn from_entry(
             estimated_latency_ms: estimate.map(|(_, latency)| latency),
         },
     )
-    // A tool or retrieval candidate adds no extra decision latency, like a
-    // direct Answer; its execution latency stays for scoring only. The
-    // overhead is known exactly when the estimate is, so an unpriced model
-    // still fails G6.
-    .with_decision_overhead_ms(estimate.map(|_| 0))
+    // Charge only work performed during this control hop. A later tool's
+    // whole-turn latency remains a scoring estimate, not decision overhead.
+    .with_decision_overhead_ms(estimate.map(|_| policy.cost_model.decision_overhead_ms(action, entry)))
 }
 
 /// Record why a generator probe left the candidate set. Probes that fail a

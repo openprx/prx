@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
 use crate::causal_tree::branch::CapabilityRef;
-use crate::causal_tree::branch::{CapabilityTarget, CostEstimate};
+use crate::causal_tree::branch::{CapabilityTarget, CausalActionKind, CostEstimate};
 #[cfg(test)]
 use crate::causal_tree::candidate_generator::CapabilityCostModel;
 use crate::causal_tree::candidate_generator::CostEstimateSource;
@@ -30,6 +30,7 @@ pub(super) struct RuntimeCostModel<'a> {
     prices_valid: bool,
     zero_price_exempt: bool,
     warned_unpriced: AtomicBool,
+    model_backed_retrieval: bool,
 }
 
 impl<'a> RuntimeCostModel<'a> {
@@ -40,6 +41,13 @@ impl<'a> RuntimeCostModel<'a> {
     ) -> Self {
         Self {
             model,
+            model_backed_retrieval: {
+                let (provider, _) = crate::memory::configured_embedder(config);
+                !matches!(
+                    provider.trim().to_ascii_lowercase().as_str(),
+                    "none" | "" | "local" | "local_hash" | "local-hash"
+                )
+            },
             pricing: &config.cost,
             observed_latency_ms,
             prices_valid: config.cost.prices.values().all(|price| price.is_finite_nonnegative()),
@@ -50,6 +58,20 @@ impl<'a> RuntimeCostModel<'a> {
 }
 
 impl CostEstimateSource for RuntimeCostModel<'_> {
+    fn decision_overhead_ms(&self, action: CausalActionKind, entry: &CapabilityEntry) -> u32 {
+        // Versioned admission estimate for one model-backed retrieval hop.
+        // Local catalog discovery has no model call. Paid transports still
+        // reserve/settle their actual usage through AccountingScope.
+        if self.model_backed_retrieval
+            && action == CausalActionKind::Retrieve
+            && matches!(entry.family, CapabilityTarget::Memory | CapabilityTarget::Document)
+        {
+            100
+        } else {
+            0
+        }
+    }
+
     fn estimate_entry(&self, entry: &CapabilityEntry) -> Option<(CostEstimate, u32)> {
         let cost = estimate_cost_with_validity(
             self.model,
@@ -361,6 +383,31 @@ mod tests {
         let small = by_name.get("prx_small").expect("small fixture estimate");
         assert!(large.tokens > small.tokens);
         assert_eq!(cost.estimates.len(), 1, "only the terminal has a family estimate");
+    }
+
+    #[test]
+    fn model_backed_retrieval_has_overhead_but_local_discovery_does_not() {
+        let mut config = Config::default();
+        let selected = model(&config, "openai", "gpt-5.6");
+        let latencies = BTreeMap::new();
+        let workspace = tempfile::tempdir().unwrap();
+        let memory = std::sync::Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::memory_recall::MemoryRecallTool::new(
+            memory, false,
+        ))];
+        let catalog = CapabilityCatalog::build(&tools, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let view = catalog.view(&Default::default());
+        let entry = view.entries().first().copied().unwrap();
+        config.memory.embedding_provider = "openai".into();
+        let paid = RuntimeCostModel::new(&selected, &config, &latencies);
+        assert_eq!(paid.decision_overhead_ms(CausalActionKind::Retrieve, entry), 100);
+        assert_eq!(paid.decision_overhead_ms(CausalActionKind::Discover, entry), 0);
+        config.memory.embedding_provider = "none".into();
+        assert_eq!(
+            RuntimeCostModel::new(&selected, &config, &latencies)
+                .decision_overhead_ms(CausalActionKind::Retrieve, entry),
+            0
+        );
     }
 
     #[test]

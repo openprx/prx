@@ -696,6 +696,7 @@ fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
         default_recipient: Arc::clone(&tool.default_recipient),
         active_runs: Arc::clone(&tool.active_runs),
         tools: Arc::clone(&tool.tools),
+        parent_hooks: tool.parent_hooks.clone(),
         workspace_dir: tool.workspace_dir.clone(),
         agents: Arc::clone(&tool.agents),
         fallback_api_key: tool.fallback_api_key.clone(),
@@ -882,9 +883,12 @@ async fn execute_admitted_spawn_with_plane(
         _ => crate::channels::traits::ChatKind::Dm,
     };
     let message = ChannelMessage {
-        id: field("source_message_event_id")
-            .unwrap_or("prx-sessions-spawn-parent")
-            .to_owned(),
+        // Each helper call is a distinct parent request. Reusing one event id
+        // would correctly share its monetary owner with unrelated fixtures.
+        id: field("source_message_event_id").map_or_else(
+            || format!("prx-sessions-spawn-parent-{}", Uuid::new_v4()),
+            str::to_owned,
+        ),
         sender: field("sender").unwrap_or("prx_user").to_owned(),
         reply_target: field("chat_id").unwrap_or_default().to_owned(),
         content: if decision_enabled {

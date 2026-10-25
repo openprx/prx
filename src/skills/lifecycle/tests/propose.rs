@@ -209,7 +209,7 @@ async fn evolution_prompt_bridge_uses_verified_evidence_and_keeps_publication_se
         .await
         .expect("managed proposal");
     assert_eq!(draft.status, Status::Draft);
-    assert!(!draft.evidence_ids.is_empty());
+    assert_ne!(draft.evidence_ids, Vec::<String>::new());
     assert_ne!(after, before);
     assert_eq!(
         f.store.active_binding(&skill()).unwrap().unwrap().revision_id,

@@ -547,6 +547,7 @@ impl RuntimeBootstrap {
                 config.api_key.as_deref(),
                 &config,
                 extensions,
+                Some(Arc::clone(&hooks)),
             );
             mcp_tool = registry_result.mcp_tool;
             let registry = registry_result.tools;

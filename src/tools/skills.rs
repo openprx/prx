@@ -912,6 +912,18 @@ impl Tool for SkillsManageTool {
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
         crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let action = Self::required_string(&args, "action")?;
+        if crate::tools::execution::scope_requires_owner_match(&args)
+            && !matches!(
+                action,
+                "lifecycle_status" | "lifecycle_list" | "lifecycle_inspect" | "lifecycle_cancel"
+            )
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("owner-isolated callers may inspect or cancel their own lifecycle proposals; shared-workspace actions require the local operator".to_owned()),
+            });
+        }
         if action.starts_with("lifecycle_") {
             if !self.lifecycle_actions().contains(&action) {
                 anyhow::bail!("Unsupported skills_manage action: {action}");
@@ -1036,10 +1048,11 @@ impl SkillExecuteTool {
         http_config: &crate::config::HttpRequestConfig,
     ) -> Self {
         let runtime_name = runtime.name().to_string();
+        let shell = ShellProcessAdapter::new(runtime).with_cgroup_root(config.runtime.managed_cgroup_root.clone());
         Self {
             workspace_dir,
             config,
-            shell: ShellProcessAdapter::new(runtime),
+            shell,
             http: super::HttpRequestTool::new(
                 Arc::clone(&security),
                 browser_config.allowed_domains.clone(),
@@ -2509,6 +2522,43 @@ mod tests {
             .await
             .unwrap();
         assert!(isolated.success, "{:?}", isolated.error);
+    }
+
+    #[tokio::test]
+    async fn isolated_lifecycle_callers_cannot_write_the_shared_workspace() {
+        let workspace = TempDir::new().unwrap();
+        let tool = supervised_tool(workspace.path(), crate::security::AutonomyLevel::Full);
+        for action in [
+            "create",
+            "install",
+            "update",
+            "enable",
+            "disable",
+            "validate",
+            "sync",
+            "remove",
+            "lifecycle_publish",
+            "lifecycle_rollback",
+            "lifecycle_import_executable",
+        ] {
+            let result = tool
+                .execute(json!({"action": action, "name":"prx-fixture", "description":"Fixture", "instructions":"Fixture instructions", "source":"fixture", "proposal_id":"prop-fixture", "skill_id":"prx-fixture", "revision_id":"0".repeat(64), "expected_generation":1,
+                    "_zc_scope_trusted": true,
+                    "_zc_scope": {"owner_isolated": true, "owner_id": "owner:ws:cli:alice"}
+                }))
+                .await
+                .unwrap();
+            assert!(!result.success, "{action}");
+            assert!(result.error.unwrap_or_default().contains("local operator"), "{action}");
+        }
+        let foreign = tool
+            .execute(json!({"action":"lifecycle_list", "_zc_scope_trusted":true,
+            "_zc_scope":{"owner_isolated":true,"owner_id":"owner:ws:cli:prx_other"}}))
+            .await
+            .unwrap();
+        assert!(!foreign.success);
+        assert!(foreign.error.unwrap_or_default().contains("another owner"));
+        assert!(!workspace.path().join("skills").exists());
     }
 
     /// A call the gate refuses does not burn the approval.

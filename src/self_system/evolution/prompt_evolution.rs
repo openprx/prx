@@ -266,6 +266,13 @@ impl EvolutionEngine for PromptEvolutionEngine {
             let (draft, content) = service
                 .propose_prompt_revision(name, &before, cycle_id.clone(), budget, proposer.as_ref())
                 .await?;
+            if let Err(error) = Self::validate_safety(&before, &content, &prompt_cfg.blocked_keywords) {
+                let service = Arc::clone(service);
+                let proposal_id = draft.proposal_id.clone();
+                tokio::task::spawn_blocking(move || service.cancel(&proposal_id, "prompt safety validation failed"))
+                    .await??;
+                return Err(error);
+            }
             let attempt = draft
                 .attempts
                 .last()

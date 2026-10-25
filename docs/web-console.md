@@ -18,18 +18,19 @@ Browser-based management interface for OpenPRX. Located at `console/` in the rep
 
 ## Where conversations come from
 
-The Console continues an existing persisted conversation. To create one today,
-send a message through a configured messaging channel backed by the same
-persistent memory backend and workspace as the gateway. Accepted channel turns
-create the conversation record that appears in the Console session list.
-Refresh that list and open the conversation before sending a Console message.
+Create an empty persisted conversation with authenticated `POST /api/sessions`
+and JSON `{}`. The server creates its UUID, binds the authenticated token's
+owner, and returns HTTP 201 with `session_id`, `status: "empty"` and
+`message_count: 0`. No model call or synthetic message is created. Owner, channel
+and ID overrides are rejected. Read-only autonomy refuses creation. SQLite and
+PostgreSQL support the operation; other backends must implement the explicit
+creation contract or return an error.
 
-`POST /api/sessions/{id}/message` requires that conversation to exist. There is
-no `POST /api/sessions` creation endpoint. A webhook request or a `prx agent`
-invocation does not seed this list; terminal `prx chat` saves its own session
-history separately. An empty list on a fresh installation is therefore expected.
-Creating a session directly in the Console is deferred to a later release.
-Do not insert database rows by hand to create a conversation.
+Use the returned ID with `POST /api/sessions/{id}/message`. Accepted messaging
+channel turns also create records in this list. Webhook requests, `prx agent`
+and terminal `prx chat` have separate histories and do not implicitly create
+Console sessions. The existing Console list continues to show these persisted
+records; the API is available to clients without manually inserting database rows.
 
 ## Tech Stack
 

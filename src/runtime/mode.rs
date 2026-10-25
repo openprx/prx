@@ -382,6 +382,8 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
         // process: it is an HTTP client of whichever process owns the work.
         Commands::Tasks { tasks_command } => handle_tasks_command(tasks_command, &config).await,
 
+        #[cfg(feature = "wasm-plugins")]
+        Commands::Plugin { command } => openprx::plugins::cli::handle(&config, command),
         Commands::Cost { json } => {
             let report = openprx::cost::tracker::workspace_cost_report(&config.workspace_dir)?;
             if json {

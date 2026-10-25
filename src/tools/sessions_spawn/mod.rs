@@ -411,6 +411,7 @@ pub struct SessionsSpawnTool {
     /// Set post-construction via `tools_handle().set(...)` to resolve the chicken-and-egg
     /// problem (sessions_spawn is part of tools_registry, but needs it to run sub-agents).
     tools: Arc<ParentToolRegistry>,
+    parent_hooks: Option<Arc<crate::hooks::HookManager>>,
     /// Workspace dir for HookManager inside sub-agent loops.
     workspace_dir: PathBuf,
     /// Configured named agents for identity/model/tool scoping in spawn.

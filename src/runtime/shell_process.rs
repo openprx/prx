@@ -119,6 +119,7 @@ impl ShellProcessError {
 pub struct ShellProcessAdapter {
     runtime: Arc<dyn RuntimeAdapter>,
     environment_allowlist: Option<Vec<String>>,
+    cgroup_root: Option<std::path::PathBuf>,
     #[cfg(test)]
     active_output_readers: Arc<AtomicUsize>,
 }
@@ -128,9 +129,15 @@ impl ShellProcessAdapter {
         Self {
             runtime,
             environment_allowlist: None,
+            cgroup_root: None,
             #[cfg(test)]
             active_output_readers: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn with_cgroup_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.cgroup_root = root;
+        self
     }
 
     /// Clear the shell's inherited environment, keeping the baseline and these
@@ -148,7 +155,7 @@ impl ShellProcessAdapter {
     }
 
     pub async fn execute(&self, request: ShellProcessRequest<'_>) -> Result<ShellProcessOutcome, ShellProcessError> {
-        self.execute_with(request, false)
+        self.execute_with(request, false, None)
             .await
             .map_err(ShellProcessError::without_output)
     }
@@ -158,14 +165,15 @@ impl ShellProcessAdapter {
         &self,
         request: ShellProcessRequest<'_>,
     ) -> Result<ShellProcessOutcome, ShellProcessError> {
-        self.execute_with(request, false).await
+        self.execute_with(request, false, None).await
     }
 
-    /// Like [`Self::execute`], for a run that must be fully contained:
+    /// Like [`Self::execute`], with joined process-group cleanup:
     ///
     /// * the whole process group ends the moment the command's leader exits,
-    ///   so nothing the command started outlives the call (and a child holding
-    ///   the output pipes open cannot keep the call waiting). Cancellation and
+    ///   including ordinary descendants. A configured Linux cgroup also ends
+    ///   descendants that call setsid; without one, detached descendants may
+    ///   escape the group. Cancellation and
     ///   timeout already tear the group down in both forms;
     /// * on the native runtime the command does not inherit the PRX
     ///   environment: it gets `PATH`, `LANG`, `LC_*` and `TZ` from the parent,
@@ -178,15 +186,32 @@ impl ShellProcessAdapter {
         &self,
         request: ShellProcessRequest<'_>,
     ) -> Result<ShellProcessOutcome, ShellProcessError> {
-        self.execute_with(request, true)
-            .await
-            .map_err(ShellProcessError::without_output)
+        let group = self
+            .cgroup_root
+            .as_ref()
+            .map(|root| {
+                if self.runtime.name() != "native" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "managed_cgroup_root requires the native runtime",
+                    ));
+                }
+                super::shell_cgroup::ShellCgroup::create(root).map(Arc::new)
+            })
+            .transpose()
+            .map_err(ShellProcessError::Spawn)?;
+        let result = self.execute_with(request, true, group.clone()).await;
+        if let Some(group) = group {
+            group.finish().await.map_err(ShellProcessError::Wait)?;
+        }
+        result.map_err(ShellProcessError::without_output)
     }
 
     async fn execute_with(
         &self,
         request: ShellProcessRequest<'_>,
         end_group_on_exit: bool,
+        cgroup: Option<Arc<super::shell_cgroup::ShellCgroup>>,
     ) -> Result<ShellProcessOutcome, ShellProcessError> {
         if request.git == ShellGitPolicy::RefuseGit
             && crate::security::git_launch::shell_command_runs_git(request.command)
@@ -262,7 +287,11 @@ impl ShellProcessAdapter {
             return Err(ShellProcessError::Cancelled);
         }
 
+        if let Some(group) = &cgroup {
+            group.attach(&mut command).map_err(ShellProcessError::Spawn)?;
+        }
         let mut process = spawn_managed_shell_child(command).map_err(ShellProcessError::Spawn)?;
+        process.cgroup = cgroup;
         let captures = OutputCaptures::default();
         let stdout_task = spawn_output_drain(
             process.take_stdout(),
@@ -618,6 +647,7 @@ impl Drop for DrainAbortGuard {
 
 pub(crate) struct ManagedShellChild {
     child: Option<Child>,
+    cgroup: Option<Arc<super::shell_cgroup::ShellCgroup>>,
     #[cfg(unix)]
     pgid: Option<i32>,
     leader_reaped: bool,
@@ -666,6 +696,11 @@ impl ManagedShellChild {
 
     #[allow(unsafe_code)]
     fn kill_process_tree(&mut self) {
+        if let Some(group) = &self.cgroup {
+            if let Err(error) = group.kill() {
+                tracing::error!(%error, "failed to kill managed skill cgroup");
+            }
+        }
         #[cfg(unix)]
         if let Some(pgid) = self.pgid {
             // SAFETY: `pgid` is the positive group id created for this child.
@@ -752,6 +787,7 @@ pub(crate) fn spawn_managed_shell_child(mut cmd: tokio::process::Command) -> io:
 
     Ok(ManagedShellChild {
         child: Some(child),
+        cgroup: None,
         #[cfg(unix)]
         pgid,
         leader_reaped: false,
@@ -894,6 +930,24 @@ mod tests {
                 assert_eq!(key, "PATH", "only the explicitly allowed PATH is forwarded");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_cgroup_root_refuses_joined_execution_before_spawn() {
+        let temp = TempDir::new().unwrap();
+        let adapter =
+            ShellProcessAdapter::new(Arc::new(NativeRuntime::new())).with_cgroup_root(Some(temp.path().to_owned()));
+        let result = adapter
+            .execute_joined(ShellProcessRequest {
+                command: "touch should-not-exist",
+                workspace_dir: temp.path(),
+                timeout: None,
+                cancellation: None,
+                git: ShellGitPolicy::RefuseGit,
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(!temp.path().join("should-not-exist").exists());
     }
 
     /// D-107: a model-driven surface's command string that runs git is

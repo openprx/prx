@@ -44,6 +44,7 @@ struct PluginGeneration {
     cron: Arc<WasmCronManager>,
     providers: HashMap<String, Arc<WasmProvider>>,
     storages: HashMap<String, Arc<WasmStorage>>,
+    channels: HashMap<String, Arc<super::capabilities::channel::WasmChannel>>,
     errors: Vec<String>,
 }
 
@@ -71,6 +72,7 @@ impl PluginGeneration {
             .create_cron_manager_with_memory(memory, Some(Arc::clone(&event_bus)))
             .await;
         let provider_build = manager.create_provider_adapters(Some(Arc::clone(&event_bus))).await;
+        let channel_build = manager.create_channel_adapters(Some(Arc::clone(&event_bus))).await;
         let storage_build = manager.create_storage_adapters(Some(event_bus)).await;
         let wasm_tools: Vec<Arc<WasmToolAdapter>> = tools_build.value.into_iter().map(Arc::new).collect();
         let tools = wasm_tools
@@ -88,6 +90,7 @@ impl PluginGeneration {
             .chain(cron_build.errors)
             .chain(provider_build.errors)
             .chain(storage_build.errors)
+            .chain(channel_build.errors)
             .collect::<Vec<_>>();
         let mut providers = HashMap::new();
         for provider in provider_build.value {
@@ -104,6 +107,11 @@ impl PluginGeneration {
             }
         }
 
+        let channels = channel_build
+            .value
+            .into_iter()
+            .map(|channel| (channel.name().to_owned(), Arc::new(channel)))
+            .collect();
         Ok(Self {
             id,
             manager,
@@ -114,6 +122,7 @@ impl PluginGeneration {
             cron,
             providers,
             storages,
+            channels,
             errors,
         })
     }
@@ -288,6 +297,13 @@ impl PluginRuntime {
             .chain(cron)
             .chain(providers)
             .chain(storages)
+            .chain(
+                generation
+                    .channels
+                    .values()
+                    .filter(|channel| channel.is_quarantined())
+                    .map(|channel| format!("channel:{}", channel.name())),
+            )
             .collect()
     }
 
@@ -306,6 +322,28 @@ impl PluginRuntime {
     }
 
     /// Names exported by provider adapters in the current generation.
+    pub fn channel_diagnostics(&self) -> Vec<serde_json::Value> {
+        let generation = self.generation.load();
+        let mut entries = generation.channels.iter().collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        entries.into_iter().map(|(_, channel)| channel.diagnostics()).collect()
+    }
+
+    /// Stable proxies resolve the active generation on every send and poll.
+    pub fn channels(self: &Arc<Self>) -> Vec<Arc<dyn crate::channels::traits::Channel>> {
+        let mut names = self.generation.load().channels.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                Arc::new(RuntimeWasmChannel {
+                    runtime: Arc::clone(self),
+                    name,
+                }) as Arc<dyn crate::channels::traits::Channel>
+            })
+            .collect()
+    }
+
     pub fn provider_names(&self) -> Vec<String> {
         let mut names = self.generation.load().providers.keys().cloned().collect::<Vec<_>>();
         names.sort();
@@ -473,6 +511,49 @@ impl PluginRuntime {
 
 fn strip_wasm_prefix(name: &str) -> &str {
     name.strip_prefix("wasm:").unwrap_or(name)
+}
+
+struct RuntimeWasmChannel {
+    runtime: Arc<PluginRuntime>,
+    name: String,
+}
+impl RuntimeWasmChannel {
+    fn current(&self) -> anyhow::Result<Arc<super::capabilities::channel::WasmChannel>> {
+        self.runtime
+            .generation
+            .load()
+            .channels
+            .get(&self.name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("WASM channel is no longer active"))
+    }
+}
+#[async_trait]
+impl crate::channels::traits::Channel for RuntimeWasmChannel {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    async fn send(&self, message: &crate::channels::traits::SendMessage) -> anyhow::Result<()> {
+        self.current()?.send(message).await
+    }
+    async fn listen(
+        &self,
+        tx: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! { () = tx.closed() => return Ok(()), _ = tick.tick() => {} }
+            for message in self.current()?.poll().await? {
+                if tx.send(message).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    async fn health_check(&self) -> bool {
+        self.current().is_ok_and(|channel| !channel.is_quarantined())
+    }
 }
 
 struct RuntimeWasmProvider {
@@ -673,6 +754,7 @@ impl Tool for PluginStatusTool {
                 "middleware_adapters": self.runtime.middleware_diagnostics(),
                 "cron_adapters": self.runtime.cron_diagnostics(),
                 "provider_adapters": self.runtime.provider_names(),
+                "channel_diagnostics": self.runtime.channel_diagnostics(),
                 "provider_adapter_status": self.runtime.provider_diagnostics(),
                 "storage_adapters": self.runtime.storage_names(),
                 "storage_adapter_status": self.runtime.storage_diagnostics(),
@@ -1457,6 +1539,7 @@ impl Tool for PluginManageTool {
                 "middleware_adapters": self.runtime.middleware_diagnostics(),
                 "cron_adapters": self.runtime.cron_diagnostics(),
                 "provider_adapters": self.runtime.provider_names(),
+                "channel_diagnostics": self.runtime.channel_diagnostics(),
                 "provider_adapter_status": self.runtime.provider_diagnostics(),
                 "storage_adapters": self.runtime.storage_names(),
                 "storage_adapter_status": self.runtime.storage_diagnostics(),
@@ -1893,6 +1976,53 @@ optional = []
             .join(example);
         std::fs::copy(fixture.join("plugin.toml"), plugin_dir.join("plugin.toml")).unwrap();
         std::fs::copy(fixture.join("plugin.wasm"), plugin_dir.join("plugin.wasm")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wasm_channel_polls_filters_recovers_and_follows_generation_reload() {
+        use crate::channels::traits::SendMessage;
+        let temp = TempDir::new().unwrap();
+        install_example_fixture(temp.path(), "echo-channel");
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        assert!(runtime.adapter_errors().is_empty(), "{:?}", runtime.adapter_errors());
+        let proxy = runtime.channels().pop().unwrap();
+        assert_eq!(proxy.name(), "wasm:echo-channel");
+        let adapter = runtime.generation.load().channels.get(proxy.name()).unwrap().clone();
+        let messages = adapter.poll().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages.first().unwrap().sender, "prx_user");
+        assert_eq!(messages.first().unwrap().channel, "wasm:echo-channel");
+        assert!(adapter.poll().await.unwrap().is_empty());
+        proxy.send(&SendMessage::new("normal", "prx_chat")).await.unwrap();
+        assert!(
+            proxy
+                .send(&SendMessage::new("PRX_TRAP_PROBE", "prx_chat"))
+                .await
+                .is_err()
+        );
+        proxy.send(&SendMessage::new("recovered", "prx_chat")).await.unwrap();
+        assert!(proxy.health_check().await);
+        let path = temp.path().join("plugins/echo-channel/plugin.toml");
+        let manifest = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("allowed_users = \"prx_user\"", "allowed_users = \"prx_other\"");
+        std::fs::write(path, manifest).unwrap();
+        trust_workspace_plugins(temp.path());
+        runtime.reload_plugin("echo-channel").await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listener = tokio::spawn(async move { proxy.listen(tx).await });
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.sender, "prx_other");
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(runtime.channel_diagnostics().len(), 1);
     }
 
     #[tokio::test]

@@ -4,6 +4,9 @@ use super::helpers::{
 };
 use std::fs;
 const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
+    // Linux-only opt-in regression: a real setsid descendant proves the cgroup
+    // contains session escape. The test joins the shell and removes its group.
+    "src/runtime/shell_cgroup.rs::setsid_descendant_is_killed_and_the_managed_group_is_removed::let mut child = command.spawn().unwrap();",
     // Fresh-process fixture: exact current test executable, owned acknowledgement and reap.
     "src/runtime/ingress_recovery/tests.rs::start::.spawn()",
     "src/channels/signal_native.rs::health_check::let Ok(_child) = cmd.spawn() else {",

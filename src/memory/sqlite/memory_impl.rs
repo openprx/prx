@@ -344,6 +344,28 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn create_conversation_session(&self, session_key: &str, owner_id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !session_key.is_empty() && !owner_id.is_empty(),
+            "session identity is empty"
+        );
+        let pool = self.pool.clone();
+        let session_key = session_key.to_owned();
+        let owner_id = owner_id.to_owned();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
+            let now = Utc::now().to_rfc3339();
+            let conn = pool.write();
+            conn.execute(
+                "INSERT INTO sessions
+                (session_key, channel, sender, owner_id, created_at, updated_at, message_count, last_message_preview)
+                VALUES (?1, 'console', ?2, ?2, ?3, ?3, 0, '')",
+                params![session_key, owner_id, now],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn append_conversation_turn(
         &self,

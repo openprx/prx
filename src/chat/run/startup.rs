@@ -39,6 +39,7 @@ pub(super) fn session_tools(
     model_name: &str,
     temperature: f64,
     security: &Arc<crate::security::SecurityPolicy>,
+    hooks: &Arc<crate::hooks::HookManager>,
     terminal: &Arc<TerminalChannel>,
     mem: &Arc<dyn Memory>,
     startup_connection: providers::ProviderConnection<'_>,
@@ -111,6 +112,7 @@ pub(super) fn session_tools(
         config.sessions_spawn.clone(),
         Arc::clone(&active_runs),
     )
+    .with_parent_hooks(Arc::clone(hooks))
     .with_cost_config(config.cost.clone())
     .with_configured_providers(&providers::ConfiguredProviders::from_config(config))
     .with_model_catalog(providers::selection::catalog_for(config))

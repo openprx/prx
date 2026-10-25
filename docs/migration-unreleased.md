@@ -130,3 +130,19 @@ enabled = false
   unmanaged prompt targets retain their workflow. Proposal attempt records add
   an optional accounting scope ID; older records remain readable. See
   [managed skill prompts](evolution.md#managed-skill-prompts).
+
+## Remaining lifecycle and runtime interfaces
+
+Ordinary child monetary budgets now carve from their parent instead of each
+receiving the full allowance. Small balances narrow a child to a zero monetary ceiling, so it can run
+zero-price work while paid requests remain refused. No fresh money is created. Hook managers are explicitly inherited
+independently of child tool exposure. Isolated `skills_manage` callers can read
+and cancel only their own lifecycle proposals; shared-workspace writes stay
+local-operator-only. `POST /api/sessions` creates an authenticated empty Console
+conversation. Trusted WASM channels and the operator `prx plugin` artifact/trust
+CLI are available behind the existing feature and opt-in setting. Optional Linux
+`runtime.managed_cgroup_root` adds cgroup v2 cleanup for managed native scripts;
+macOS keeps the documented process-group limitation. Model-backed memory and
+document retrieval reserve a versioned 100 ms decision-overhead estimate; local
+catalog discovery keeps zero model overhead. Actual paid requests still use the
+physical accounting ledger. No database schema migration is introduced.

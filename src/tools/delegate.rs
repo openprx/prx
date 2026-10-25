@@ -89,6 +89,7 @@ pub struct DelegateTool {
     depth: u32,
     /// Parent tool registry for agentic sub-agents.
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
+    parent_hooks: Option<Arc<HookManager>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
     /// Shared memory fabric backend for normalized delegation events.
@@ -258,6 +259,7 @@ impl DelegateTool {
             reliability: crate::config::ReliabilityConfig::default(),
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
+            parent_hooks: None,
             multimodal_config: crate::config::MultimodalConfig::default(),
             memory: None,
             event_recording: MemoryEventRecording::default(),
@@ -287,10 +289,17 @@ impl DelegateTool {
             reliability: crate::config::ReliabilityConfig::default(),
             depth,
             parent_tools: Arc::new(Vec::new()),
+            parent_hooks: None,
             multimodal_config: crate::config::MultimodalConfig::default(),
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
+    }
+
+    /// Share the owning runtime manager independently of exposed control tools.
+    pub fn with_parent_hooks(mut self, hooks: Arc<HookManager>) -> Self {
+        self.parent_hooks = Some(hooks);
+        self
     }
 
     /// Attach parent tools used to build sub-agent allowlist registries.
@@ -645,6 +654,11 @@ impl Tool for DelegateTool {
             .unwrap_or_else(|| agent_config.provider.clone());
         let mut effective_model = model_override.clone().unwrap_or_else(|| agent_config.model.clone());
 
+        let child_grant = child_grant
+            .as_ref()
+            .map(|grant| grant.for_spawn_request(false, &effective_provider, &effective_model))
+            .transpose()?;
+
         let child_binding_result = {
             let config = child_config;
 
@@ -978,6 +992,7 @@ struct DelegateLoopRequest<'a> {
 struct DelegateLoopResources {
     security: Arc<SecurityPolicy>,
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
+    parent_hooks: Option<Arc<HookManager>>,
 }
 
 struct DelegateTaskContext {
@@ -1036,6 +1051,7 @@ impl DelegateTool {
         DelegateLoopResources {
             security: Arc::clone(&self.security),
             parent_tools: Arc::clone(&self.parent_tools),
+            parent_hooks: self.parent_hooks.clone(),
         }
     }
 
@@ -1384,10 +1400,7 @@ impl DelegateLoopResources {
                     (Arc::clone(&runtime.hooks), Arc::clone(&runtime.observer))
                 }
                 _ => (
-                    super::child_hooks::child_hooks(
-                        super::child_hooks::parent_hook_manager(self.parent_tools.as_slice()),
-                        &security.workspace_dir,
-                    ),
+                    super::child_hooks::child_hooks(self.parent_hooks.clone(), &security.workspace_dir),
                     Arc::new(NoopObserver),
                 ),
             };
@@ -3022,7 +3035,12 @@ mod tests {
             config.agents.clone(),
             Arc::new(SecurityPolicy::from_config(&config.autonomy, &workspace)),
         )
-        .with_parent_tools(Arc::new(parent_tools));
+        .with_parent_tools(Arc::new(parent_tools.clone()));
+        let delegate = if let Some(hooks) = crate::tools::child_hooks::parent_hook_manager(&parent_tools) {
+            delegate.with_parent_hooks(hooks)
+        } else {
+            delegate
+        };
         use futures::FutureExt as _;
         let mut arguments = json!({"agent":"tester", "prompt":tool_name});
         if let Some(context) = context {
