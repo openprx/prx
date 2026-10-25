@@ -1699,6 +1699,7 @@ async fn async_main() -> Result<()> {
             | Commands::Causal { .. }
             | Commands::Cost { .. }
             | Commands::Evolution { .. }
+            | Commands::Skills { .. }
     );
     if use_stderr {
         use tracing_subscriber::layer::SubscriberExt as _;

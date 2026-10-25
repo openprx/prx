@@ -92,11 +92,14 @@ enabled = false
 
 - The [skill lifecycle](skill-lifecycle.md) is opt-in and defaults
   to disabled / `draft_only`. Its CLI and approval-bound agent actions manage
-  proposals and revisions, including reviewed executable imports. Automatic
-  proposal scheduling and script generation remain unsupported. New instruction
+  proposals and revisions, including reviewed executable imports. Managed prompt
+  targets use lifecycle evidence through the evolution scheduler. Explicit script
+  drafts are opt-in and require a separate review of their complete hash before
+  import; enabling generation does not enable publication or execution. New instruction
   skills can be staged from repeated uncovered completed root tasks and tested
   against a frozen no-skill baseline; this is not a learning claim. Uncovered
-  recording stops at the 4096-experience threshold, with no automatic retention.
+  recording stops at the 4096-experience threshold; evolution ticks prune expired
+  unreferenced terminal experience under the configured retention policy.
   Unmanaged directories are not rewritten merely by enabling the lifecycle;
   managed bindings use the projection and migration rules above. Managed native
   scripts receive a cleared, allowlisted environment and joined cleanup, but

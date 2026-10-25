@@ -5,9 +5,8 @@
 //! and publication policy apply here too: `draft_only` and `shadow` never
 //! publish. `force-close` exists only here; no agent tool action reaches it.
 //!
-//! There is deliberately no `propose` command: proposing needs the adherence
-//! and permission-refusal facts on the experience record (SL05 hard gate) and
-//! is not wired yet.
+//! Script generation creates private, unreviewed artifacts. Publication uses
+//! a separate explicit import bound to the complete bundle the operator reviewed.
 
 use crate::config::Config;
 use crate::skills::lifecycle::{
@@ -47,6 +46,36 @@ pub(crate) async fn execute(
         bail!("the skill lifecycle is disabled; set [skills_lifecycle] enabled = true");
     };
     match command {
+        SkillLifecycleCommands::ProposeScript {
+            source,
+            script,
+            instructions,
+        } => {
+            anyhow::ensure!(
+                config.skills_lifecycle.allow_executable_proposals,
+                "script proposals require skills_lifecycle.allow_executable_proposals = true"
+            );
+            let model = crate::runtime::evolution_model::EvolutionModel::from_config(
+                config,
+                crate::runtime::evolution_model::EvolutionPurpose::ScriptProposer,
+            )?;
+            let proposal =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())?
+                    .run(service.propose_script(source.into(), script, instructions, model.as_ref()))
+                    .await?;
+            Ok(serde_json::to_string_pretty(&proposal)?)
+        }
+        SkillLifecycleCommands::ImportExecutable { source, reviewed } => {
+            let reviewed = RevisionId::parse(&reviewed).context("invalid --reviewed bundle hash")?;
+            let outcome = blocking(&service, move |s| {
+                s.import_executable(std::path::Path::new(&source), &reviewed)
+            })
+            .await?;
+            Ok(format!(
+                "Imported reviewed executable skill {} as revision {} at generation {}.",
+                outcome.skill_id, outcome.revision_id, outcome.generation
+            ))
+        }
         SkillLifecycleCommands::Status => {
             let status = blocking(&service, |s| s.status()).await?;
             Ok(render_status(&status))

@@ -15,12 +15,14 @@ use async_trait::async_trait;
 pub(crate) enum EvolutionPurpose {
     Proposer,
     Judge,
+    ScriptProposer,
 }
 impl EvolutionPurpose {
     const fn label(self) -> &'static str {
         match self {
             Self::Proposer => "evolution_proposer",
             Self::Judge => "evolution_judge",
+            Self::ScriptProposer => "evolution_script_proposer",
         }
     }
 }

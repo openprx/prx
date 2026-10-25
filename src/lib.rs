@@ -253,6 +253,23 @@ pub enum SkillCommands {
 /// service under the `[skills_lifecycle]` settings.
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillLifecycleCommands {
+    /// Generate a private script draft from an operator-supplied skill template
+    ProposeScript {
+        /// Template directory with a declared script tool
+        source: String,
+        /// Exact bundle-relative script path already declared by the template
+        #[arg(long)]
+        script: String,
+        /// Desired behavior, treated as untrusted generation input
+        #[arg(long)]
+        instructions: String,
+    },
+    /// Import a complete executable bundle after reviewing its exact hash
+    ImportExecutable {
+        source: String,
+        #[arg(long)]
+        reviewed: String,
+    },
     /// Show the lifecycle mode, policy, proposal counts and startup recovery
     Status,
     /// List proposals, oldest first

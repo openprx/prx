@@ -21,6 +21,7 @@
 //! publication_block`] says why.
 
 mod proposals;
+mod script_proposals;
 
 use super::authorize::{Finalization, ForceClose, PublicationOutcome};
 use super::evaluate::{CaseExecutor, EvaluationError};
@@ -101,6 +102,7 @@ pub const fn default_gate_policy() -> GatePolicy {
 /// proposal path will take them from here once it is wired (SL05 gate).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct LifecycleLimits {
+    pub allow_executable_proposals: bool,
     pub max_concurrent_evaluations: u32,
     pub max_proposals_per_cycle: u32,
     pub max_edit_tokens: u64,
@@ -110,6 +112,7 @@ pub struct LifecycleLimits {
 impl Default for LifecycleLimits {
     fn default() -> Self {
         Self {
+            allow_executable_proposals: false,
             max_concurrent_evaluations: 1,
             max_proposals_per_cycle: 1,
             max_edit_tokens: 300,
@@ -880,10 +883,10 @@ impl SkillsLifecycleService {
         })?)
     }
 
-    /// Publishes an operator-authored executable bundle the operator reviewed
+    /// Publishes an executable bundle the operator explicitly reviewed
     /// (SL11): `source` is a real directory, `reviewed` the complete bundle hash
-    /// the operator approved. It never goes through a proposal; the proposer
-    /// cannot produce an executable revision. Same gate as publication: `Auto`
+    /// the operator approved. Generated drafts retain their model provenance
+    /// inside the reviewed bundle. Same gate as publication: `Auto`
     /// mode under a valid publication policy, and the tool boundary asks for a
     /// signed one-shot grant bound to `reviewed` before it calls this.
     ///

@@ -5,15 +5,40 @@ executable bundles: immutable revisions, task receipts, evidence-linked
 knowledge, bounded proposal staging,
 frozen-suite evaluation, publication gates, journaled promotion and rollback.
 It is disabled by default. Enabling it does not start automatic learning:
-proposal scheduling is not wired in this candidate, and there is no CLI
-`propose` command. Reviewed executable bundles ship as SL11 (see
-[Executable bundles](#executable-bundles)); the proposer never creates or edits
-a script, and `allow_executable_proposals = true` is refused when configuration
-loads. Unmanaged manifest shell/script/HTTP skills are a separate execution
+managed prompt proposals use the configured evolution scheduler and verified
+lifecycle evidence. Reviewed executable bundles ship as SL11 (see
+[Executable bundles](#executable-bundles)). Explicit script drafts require
+`allow_executable_proposals = true` and a separate operator review before import.
+Unmanaged manifest shell/script/HTTP skills are a separate execution
 surface that SL11 leaves unchanged; see
 [skill catalog trust and execution](skills-catalog-security.md).
 
 ## Content and evidence
+
+### Script drafts
+
+`prx skills lifecycle propose-script <template> --script scripts/report.sh
+--instructions "Write the requested report"` generates one script through the
+managed, accounted evolution model. The template must already declare that
+exact `kind = "script"` tool. The model can create or replace only the named
+script; it cannot change either manifest, capability requirements or tool
+arguments. Other files stay unchanged except the reserved provenance document
+`references/prx-script-proposal.json`, which records the template hash, model,
+usage and accounting scope. Input/output and call time are bounded.
+
+The result is an owner-private artifact under `self/skill-lifecycle/script-proposals`.
+It is not an active revision, is not exposed through the skill catalog and is
+not executed. A request with no result is incomplete; the physical accounting
+journal remains authoritative for cancelled or failed model requests.
+
+After inspecting the entire generated bundle, the operator may run
+`prx skills lifecycle import-executable <candidate-dir> --reviewed <bundle-hash>`.
+This is an explicit adoption under the existing Auto-mode publication policy,
+not evidence-based automatic promotion. The exact complete hash must match;
+the model provenance remains inside the published bundle. Runtime execution
+still requires its independent tool grant, pinned hashes, cleared environment
+and joined cleanup. Generated scripts and model scores do not establish learned
+improvement or replace paired validation and holdout evidence.
 
 A **bundle** is the complete validated content of a revision, including its
 manifests and resources. A revision has immutable content identity and

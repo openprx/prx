@@ -453,9 +453,10 @@ enabled = false
 #   mode = "shadow"      adds bounded evaluation and gating, never publishes
 #   mode = "auto"        publishes an eligible proposal after every gate
 # A weaker publication policy is refused at load, not downgraded:
-# `require_holdout = false` and `min_cases_floor` below 3 do not load, and
-# neither does `allow_executable_proposals = true`. Reviewed executable bundles
-# enter through an operator import; proposals change SKILL.md only, never scripts.
+# `require_holdout = false` and `min_cases_floor` below 3 do not load.
+# `allow_executable_proposals = true` enables explicit private script drafts
+# from operator templates, never automatic publication. Executable bundles
+# still enter through a separate import of the exact operator-reviewed hash.
 # `storage_dir` only accepts the default, the location
 # `skill_read` and recovery use. `owner_scope` names the owner whose store this
 # installation manages and is required when enabled; an agent run from another

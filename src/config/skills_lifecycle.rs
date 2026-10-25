@@ -71,10 +71,6 @@ pub enum SkillsLifecycleConfigError {
     HoldoutRequired,
     #[error("skills_lifecycle.min_cases_floor = {0} is refused: it must be 3..=128")]
     CasesFloorOutOfRange(u32),
-    #[error(
-        "skills_lifecycle.allow_executable_proposals = true is refused: the proposer never creates or edits scripts (script generation is a next-phase package); reviewed executable revisions enter only through an operator import"
-    )]
-    ExecutableProposalsUnsupported,
     #[error("skills_lifecycle.{field} is out of range: {detail}")]
     LimitOutOfRange { field: &'static str, detail: String },
     #[error("skills_lifecycle.suites names skill \"{0}\" twice")]
@@ -122,11 +118,9 @@ pub struct SkillsLifecycleConfig {
     /// Edit budget of a proposal as a fraction of the skill body, in (0, 1].
     #[serde(default = "default_max_edit_fraction")]
     pub max_edit_fraction: f64,
-    /// Allow proposals that touch executable files. `true` is refused: a
-    /// proposal changes `SKILL.md` text only, also for a skill that has
-    /// scripts. Reviewed executable revisions (SL11) come from an operator
-    /// import, never from the proposer; script generation is a next-phase
-    /// package.
+    /// Allow explicit script drafts from operator-supplied templates. Drafts
+    /// never publish or execute. Import still requires review of the exact
+    /// complete bundle hash and execution requires an independent tool grant.
     #[serde(default)]
     pub allow_executable_proposals: bool,
     /// The frozen suite per skill. Operator-owned: it is the only source of
@@ -209,9 +203,6 @@ impl SkillsLifecycleConfig {
         if !(MIN_PUBLICATION_CASES_FLOOR..=MAX_MIN_CASES_FLOOR).contains(&self.min_cases_floor) {
             return Err(E::CasesFloorOutOfRange(self.min_cases_floor));
         }
-        if self.allow_executable_proposals {
-            return Err(E::ExecutableProposalsUnsupported);
-        }
         let out_of_range = |field: &'static str, detail: String| E::LimitOutOfRange { field, detail };
         if !(1..=MAX_CONCURRENT_EVALUATIONS).contains(&self.max_concurrent_evaluations) {
             return Err(out_of_range(
@@ -267,6 +258,7 @@ impl SkillsLifecycleConfig {
             gate_policy,
             suites,
             limits: LifecycleLimits {
+                allow_executable_proposals: self.allow_executable_proposals,
                 max_concurrent_evaluations: self.max_concurrent_evaluations,
                 max_proposals_per_cycle: self.max_proposals_per_cycle,
                 max_edit_tokens: self.max_edit_tokens,
@@ -364,10 +356,7 @@ mod tests {
     fn refuses_what_the_lifecycle_cannot_honour() {
         let mut config = enabled();
         config.allow_executable_proposals = true;
-        assert_eq!(
-            config.validate(),
-            Err(SkillsLifecycleConfigError::ExecutableProposalsUnsupported)
-        );
+        assert!(config.to_settings().unwrap().limits.allow_executable_proposals);
         let mut config = enabled();
         config.storage_dir = "elsewhere/store".to_string();
         assert!(matches!(
