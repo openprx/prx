@@ -106,6 +106,26 @@ through `prx causal config`; see the
 An expired-key response is a failed remote preflight, not a successful
 decision or a reason to report builtin fallback as Jev acceptance.
 
+For a bounded Jev acceptance run, use four candidates:
+
+```bash
+prx --config-dir /path/to/prx-profile/config causal config set policy \
+  --max-candidates 4 --yes
+prx --config-dir /path/to/prx-profile/config causal test --live --yes --json
+```
+
+The live test sends a small neutral fixture and may incur a provider charge.
+Follow it with a real chat turn and inspect the durable decision and execution
+records. In the verified profile, a 12-candidate request consumed 4,714 reported
+tokens, exhausted the 4,096-token decision allowance, and correctly blocked
+execution. Four candidates consumed 2,243 tokens and allowed the selected
+local-model/tool path to complete. These are observations from one run, not
+upper bounds or permission to disable budget checks. A snapshot mismatch must
+be recorded as a failed remote attempt and an explicit fallback. Physical
+usage can still be reported and charged even when the decision is rejected;
+verify the spend journal separately. Missing usage must remain unknown and
+must not become a fabricated zero-cost successful Jev result.
+
 To roll back, exit the profile's chat and restore the previously selected
 binary. The existing PRX profile is untouched. Stop only model processes
 started for this run, after checking their identity.
