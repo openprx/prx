@@ -2306,8 +2306,35 @@ command = "echo hello"
         assert_eq!(runtime.first().unwrap().name, "prx_filename");
     }
 
-    #[test]
-    fn catalog_snapshot_changes_only_after_explicit_invalidation() {
+    #[tokio::test]
+    async fn catalog_snapshot_changes_only_after_explicit_invalidation() {
+        // Other parallel fixtures can fill the bounded process-wide cache and
+        // evict this snapshot. Exercise invalidation with a private process cache.
+        const ISOLATED: &str = "PRX_TEST_SKILL_CATALOG_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "skills::tests::catalog_snapshot_changes_only_after_explicit_invalidation",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1");
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                crate::runtime::shell_process::run_managed_output(command),
+            )
+            .await
+            .expect("isolated catalog test completes")
+            .expect("isolated catalog test runs");
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let workspace_dir = dir.path().join("workspace");
         let alpha = workspace_dir.join("skills").join("alpha");

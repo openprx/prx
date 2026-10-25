@@ -2048,7 +2048,8 @@ mod tests {
     #[test]
     fn append_after_period_rollover_counts_new_record_once() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("costs.jsonl");
+        // CostStorage accepts a physical path; the public tracker resolves aliases.
+        let path = tmp.path().canonicalize().unwrap().join("costs.jsonl");
         let mut storage = CostStorage::new(&path).unwrap();
         let mut usage = TokenUsage::new("test/model", 1000, 0, 1.0, 1.0);
         usage.cost_usd = 0.25;

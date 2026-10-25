@@ -232,7 +232,7 @@ async fn selected_skill_turn(lifecycle: bool) -> SelectedSkillTurn {
         &generation,
         Arc::clone(&memory),
         "inspect the available release metadata capability",
-        "prx_skill_receipts",
+        &format!("prx_skill_receipts_{}", uuid::Uuid::new_v4()),
     )
     .await;
     let context = service

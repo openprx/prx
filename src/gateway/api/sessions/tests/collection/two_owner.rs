@@ -148,6 +148,40 @@ async fn routed(
     .await
 }
 
+/// A response may precede its queued terminal events. Wait for the last input's
+/// durable outcome before asserting that a refused request adds no events.
+async fn settled_owner_events(
+    state: &AppState,
+    scope: &crate::memory::MemoryPrincipal,
+) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = state.mem.list_message_events_since(scope, 0, 128).await?;
+            let last_run = events
+                .iter()
+                .rev()
+                .find(|event| event.role == "user" && event.event_type == "message.created")
+                .and_then(|event| event.run_id.as_deref())
+                .context("owner input run")?;
+            if events
+                .iter()
+                .any(|event| event.run_id.as_deref() == Some(last_run) && event.event_type == "causal.outcome.recorded")
+            {
+                let runtime = state.pin_turn_runtime();
+                let service = runtime.decision_slot.publish(&runtime, state).await?;
+                anyhow::ensure!(
+                    service.drain_writes(Instant::now() + Duration::from_secs(5)).await,
+                    "owner event queues did not drain"
+                );
+                return state.mem.list_message_events_since(scope, 0, 128).await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("owner terminal events did not settle")?
+}
+
 async fn exercise_owners(
     state: &AppState,
     provider: &OwnerCollectionProvider,
@@ -195,7 +229,7 @@ async fn exercise_owners(
         );
         assert_eq!(provider.context_calls.load(Ordering::SeqCst), index + 1);
         let input = serde_json::json!({"message":format!("file_write: Create {TARGET} containing {content}.")});
-        let before = state.mem.list_message_events_since(&scope, 0, 128).await?;
+        let before = settled_owner_events(state, &scope).await?;
         for unauthorized in [None, Some("prx-unknown-token")] {
             let (status, _) = routed(&app, Method::POST, &uri, unauthorized, input.clone()).await?;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -240,7 +274,7 @@ async fn exercise_owners(
             );
         }
         assert_eq!(writes.load(Ordering::SeqCst), index);
-        let before_unreviewed = state.mem.list_message_events_since(&scope, 0, 128).await?;
+        let before_unreviewed = settled_owner_events(state, &scope).await?;
         let (status, _) = routed(&app, Method::POST, &resume, Some(token), serde_json::json!({})).await?;
         assert_eq!(
             status,
@@ -273,7 +307,7 @@ async fn exercise_owners(
         assert_eq!(writes.load(Ordering::SeqCst), index + 1);
         assert_eq!(std::fs::read_to_string(&target)?, *content);
         assert!(!workspace.join(TARGET).exists());
-        let before_repeat = state.mem.list_message_events_since(&scope, 0, 128).await?;
+        let before_repeat = settled_owner_events(state, &scope).await?;
         let (status, _) = routed(&app, Method::POST, &resume, Some(token), serde_json::json!({})).await?;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(writes.load(Ordering::SeqCst), index + 1);
