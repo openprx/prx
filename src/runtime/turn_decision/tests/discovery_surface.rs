@@ -135,7 +135,7 @@ async fn named_memory_recall_becomes_ready_after_selected_discovery_without_publ
 
 #[tokio::test]
 async fn named_skill_and_loader_select_the_skill_without_competing_targets() {
-    for excluded in [false, true] {
+    for (excluded, shell_excluded) in [(false, false), (true, false), (false, true)] {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
@@ -172,6 +172,10 @@ async fn named_skill_and_loader_select_the_skill_without_competing_targets() {
                 workspace.path().to_owned(),
                 config.clone(),
             )),
+            Box::new(DiscoverySurfaceTool {
+                name: "shell",
+                dispatches: Arc::new(AtomicUsize::new(0)),
+            }),
             Box::new(CapabilitySearchTool),
         ]);
         let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
@@ -192,8 +196,11 @@ async fn named_skill_and_loader_select_the_skill_without_competing_targets() {
                 execution,
                 catalog_sources: sources(&generation, &config),
                 surface_policy: SurfacePolicy {
+                    direct_names: BTreeSet::from(["shell".to_owned()]),
                     excluded_names: if excluded {
                         BTreeSet::from(["docx".to_owned()])
+                    } else if shell_excluded {
+                        BTreeSet::from(["shell".to_owned()])
                     } else {
                         BTreeSet::new()
                     },
@@ -229,6 +236,34 @@ async fn named_skill_and_loader_select_the_skill_without_competing_targets() {
                 context.directive()
             );
             let specs = published.unwrap();
+            assert!(
+                specs.specs.iter().all(|spec| spec.name != "shell"),
+                "a skill selection is not a shell grant"
+            );
+            let port = service.capability_search_port(&proof, &context).unwrap();
+            let result = with_search_authority(
+                Some(port),
+                CapabilitySearchTool.execute(serde_json::json!({"query":"shell","limit":1})),
+            )
+            .await
+            .unwrap();
+            let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            let hits = output.get("hits").unwrap().as_array().unwrap();
+            assert_eq!(
+                hits.len(),
+                usize::from(!shell_excluded),
+                "Skill discovery must preserve exclusions"
+            );
+            if !shell_excluded {
+                assert_eq!(
+                    hits.first()
+                        .unwrap()
+                        .pointer("/schema/name")
+                        .and_then(serde_json::Value::as_str),
+                    Some("shell")
+                );
+            }
+
             assert!(specs.specs.iter().any(|spec| spec.name == "docx"));
             assert!(
                 specs.specs.iter().all(|spec| spec.name != "skill_read"),
@@ -641,9 +676,11 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
 /// excluded, restricted or over-limit hits never become declared tools.
 #[tokio::test]
 async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() {
-    for autonomy in [
-        crate::security::AutonomyLevel::ReadOnly,
-        crate::security::AutonomyLevel::Full,
+    for (autonomy, direct_shell) in [
+        (crate::security::AutonomyLevel::ReadOnly, false),
+        (crate::security::AutonomyLevel::Full, false),
+        (crate::security::AutonomyLevel::ReadOnly, true),
+        (crate::security::AutonomyLevel::Full, true),
     ] {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
@@ -699,7 +736,11 @@ async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() 
                 execution,
                 catalog_sources: sources(&generation, &config),
                 surface_policy: SurfacePolicy {
-                    direct_names: BTreeSet::from(["file_read".to_owned()]),
+                    direct_names: if direct_shell {
+                        BTreeSet::from(["file_read".to_owned(), "shell".to_owned()])
+                    } else {
+                        BTreeSet::from(["file_read".to_owned()])
+                    },
                     ..SurfacePolicy::default()
                 },
                 provider_catalog: &catalog,
@@ -729,7 +770,11 @@ async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() 
         let cli = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
             &generation,
             Arc::clone(&memory),
-            "could you make that sound a little friendlier please",
+            if direct_shell {
+                "Use file_read and shell."
+            } else {
+                "could you make that sound a little friendlier please"
+            },
             "prx_discovery_next_request",
         )
         .await;
@@ -752,7 +797,12 @@ async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() 
         assert_eq!(service.admit_offered_discoveries(&proof, &context, |_, _| false), 0);
 
         let port = service.capability_search_port(&proof, &context).unwrap();
-        for query in ["skills_list", "shell"] {
+        let queries = if direct_shell {
+            vec!["shell"]
+        } else {
+            vec!["skills_list", "shell"]
+        };
+        for query in queries {
             let result = with_search_authority(
                 Some(port.clone()),
                 CapabilitySearchTool.execute(serde_json::json!({"query": query, "limit": 1})),
@@ -799,7 +849,15 @@ async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() 
             .into_iter()
             .map(|spec| spec.name)
             .collect();
-        if autonomy == crate::security::AutonomyLevel::ReadOnly {
+        if direct_shell {
+            let expected = if autonomy == crate::security::AutonomyLevel::ReadOnly {
+                Vec::new()
+            } else {
+                vec!["shell"]
+            };
+            assert_eq!(admitted, expected.len());
+            assert_eq!(appended, expected);
+        } else if autonomy == crate::security::AutonomyLevel::ReadOnly {
             assert_eq!(admitted, 1);
             assert_eq!(
                 appended,

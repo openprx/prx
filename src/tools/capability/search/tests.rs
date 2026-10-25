@@ -364,3 +364,39 @@ fn ranked_search_preserves_mixed_alias_and_tokenizer_contracts() {
         );
     }
 }
+
+#[test]
+fn durable_content_queries_discover_a_reader_with_real_memory_descriptions() {
+    use std::sync::Arc;
+    let workspace = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let security = Arc::new(crate::security::SecurityPolicy::default());
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(crate::tools::memory_get::MemoryGetTool::new(
+            workspace.path().to_owned(),
+            Arc::clone(&memory),
+            false,
+        )),
+        Box::new(crate::tools::memory_recall::MemoryRecallTool::new(
+            Arc::clone(&memory),
+            false,
+        )),
+        Box::new(crate::tools::memory_store::MemoryStoreTool::new(memory, security)),
+    ];
+    let catalog = CapabilityCatalog::build(&tools, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+    let view = catalog.view(&CatalogScope::default());
+    for query in [
+        "What content is stored under prx_probe in durable long-term memory? Retrieve the actual stored value; do not use workspace files or guess.",
+        "Retrieve saved preferences from long-term memory",
+        "Read durable memory by key",
+    ] {
+        let hits = CatalogSearch::find(&view, query, &[CapabilityTarget::Memory], 1);
+        assert!(
+            matches!(
+                hits.first().map(|hit| hit.entry.public_name.as_str()),
+                Some("memory_get" | "memory_recall")
+            ),
+            "{query}"
+        );
+    }
+}

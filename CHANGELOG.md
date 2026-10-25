@@ -5,6 +5,24 @@ All notable changes to OpenPRX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.166] - 2026-10-25
+
+### Fixed
+
+- Check model-extracted completion constraints against full-turn tool counts and
+  exact command hashes, preserving violations after detailed evidence eviction.
+  Preserve runtime backend identities behind public aliases and repair invalid
+  quoted constraint extraction once without dispatching additional tools.
+- Let the only explicitly named read acquire its own evidence even when the
+  request also names a tool with side effects; retain all admission gates.
+- Keep historical approval notices as context data on the single text-only
+  execution retry, without changing approval policy.
+- Guide missing capabilities through discovery, durable recall through memory,
+  and immediate work through execution rather than scheduling.
+- Keep configured direct tools discoverable after a narrowed selection, and
+  describe durable memory readers so catalog search can distinguish retrieval
+  from storage.
+
 ## [Unreleased]
 
 Unreleased changes merged during local closeout. Deployment, real messaging,

@@ -68,12 +68,21 @@ async fn exercise_grounding_on_stream(
     texts: &[&str],
     streaming: bool,
 ) -> (anyhow::Result<String>, Vec<Vec<ChatMessage>>, Vec<ChatMessage>, String) {
-    let temp = TempDir::new().unwrap();
     let input = if explicit_execution {
         "Use file_read to inspect the requested report."
     } else {
         "Explain what shell and file_read do without running anything."
     };
+    exercise_grounding_request(explicit_execution, texts, streaming, input).await
+}
+
+async fn exercise_grounding_request(
+    explicit_execution: bool,
+    texts: &[&str],
+    streaming: bool,
+    input: &str,
+) -> (anyhow::Result<String>, Vec<Vec<ChatMessage>>, Vec<ChatMessage>, String) {
+    let temp = TempDir::new().unwrap();
     let execution_order = Arc::new(Mutex::new(Vec::new()));
     let registry = crate::agent::turn_tests::admission::registry_with_search(vec![
         Box::new(RecordingTool {
@@ -250,7 +259,7 @@ async fn required_execution_can_recover_with_one_actual_call() {
             r#"{"requirement":"execution_required"}"#,
             call,
             "The requested read returned file_read.",
-            r#"{"decision":"accept","reason":"read result supports reply"}"#,
+            r#"{"decision":"accept","reason":"read result supports reply","constraints":[]}"#,
         ],
     )
     .await;
@@ -267,7 +276,7 @@ async fn actual_tool_result_is_reviewed_against_current_request() {
         &[
             call,
             "The read completed.",
-            r#"{"decision":"accept","reason":"supported"}"#,
+            r#"{"decision":"accept","reason":"supported","constraints":[]}"#,
         ],
     )
     .await;
@@ -287,9 +296,9 @@ async fn completion_review_rejects_missing_deliverable_draft_and_allows_verified
         let answer = "The requested report was inspected; no implementation was requested.";
         let (result, requests, history, streamed) = exercise_grounding_on_stream(true, &[
             call, fake,
-            r#"{"decision":"revise","reason":"The draft claims saved deliverables without evidence; inspect the requested report and answer only that request."}"#,
+            r#"{"decision":"revise","reason":"The draft claims saved deliverables without evidence; inspect the requested report and answer only that request.","constraints":[]}"#,
             call, answer,
-            r#"{"decision":"accept","reason":"The corrected reply matches the actual requested read."}"#,
+            r#"{"decision":"accept","reason":"The corrected reply matches the actual requested read.","constraints":[]}"#,
         ], streaming).await;
         assert_eq!(result.unwrap(), answer);
         assert_eq!(requests.len(), 6);
@@ -309,7 +318,7 @@ async fn completion_review_rejects_missing_deliverable_draft_and_allows_verified
 async fn completion_review_does_not_loop_or_deliver_a_rejected_draft() {
     let call = r#"<tool_call>{"name":"file_read","arguments":{"path":"report.txt"}}</tool_call>"#;
     let fake = "The implementation file is ready.";
-    let verdict = r#"{"decision":"revise","reason":"The requested implementation is not evidenced."}"#;
+    let verdict = r#"{"decision":"revise","reason":"The requested implementation is not evidenced.","constraints":[]}"#;
     let (result, requests, history, streamed) = exercise_grounding(true, &[call, fake, verdict, fake, verdict]).await;
     assert!(result.unwrap_err().to_string().contains("after one corrective attempt"));
     assert_eq!(requests.len(), 5);
@@ -322,7 +331,7 @@ async fn completion_review_rejects_invalid_or_uncertain_evidence() {
     let call = r#"<tool_call>{"name":"file_read","arguments":{"path":"report.txt"}}</tool_call>"#;
     for verdict in [
         "invalid",
-        r#"{"decision":"uncertain","reason":"Required evidence was omitted."}"#,
+        r#"{"decision":"uncertain","reason":"Required evidence was omitted.","constraints":[]}"#,
     ] {
         let (result, _, history, streamed) = exercise_grounding(true, &[call, "All done.", verdict]).await;
         assert!(result.is_err());
@@ -340,5 +349,74 @@ async fn uncertain_or_invalid_assessment_never_delivers_a_completion_claim() {
         assert_eq!(requests.len(), 2);
         assert_eq!(streamed, "");
         assert!(!history.iter().any(|message| message.content == fake));
+    }
+}
+
+#[tokio::test]
+async fn completion_review_cannot_accept_an_exceeded_call_limit_or_stream_its_draft() {
+    for streaming in [false, true] {
+        let call = r#"<tool_call>{"name":"file_read","arguments":{"path":"report.txt"}}</tool_call>"#;
+        let fake = "I read the report exactly once.";
+        let (result, requests, history, streamed) = exercise_grounding_request(true, &[
+            call, call, fake,
+            r#"{"decision":"accept","reason":"The requested read succeeded.","constraints":[{"kind":"max_calls","request_quote":"file_read exactly once","tool":"file_read","limit":1}]}"#,
+        ], streaming, "Use file_read exactly once to inspect report.txt.").await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("violated an explicit request constraint")
+        );
+        assert_eq!(
+            requests.len(),
+            4,
+            "a violation must not cause another execution attempt"
+        );
+        assert!(!history.iter().any(|message| message.content == fake));
+        assert!(!streamed.contains(fake));
+    }
+}
+
+#[tokio::test]
+async fn completion_review_repairs_extraction_once_without_repeating_execution() {
+    let call = r#"<tool_call>{"name":"file_read","arguments":{"path":"report.txt"}}</tool_call>"#;
+    let invalid = r#"{"decision":"accept","reason":"Read succeeded.","constraints":[{"kind":"max_calls","request_quote":"read the file only once","tool":"file_read","limit":1}]}"#;
+    let valid = r#"{"decision":"accept","reason":"Read succeeded.","constraints":[{"kind":"max_calls","request_quote":"file_read exactly once","tool":"file_read","limit":1}]}"#;
+    for streaming in [false, true] {
+        for repaired in [true, false] {
+            let answer = "The report was inspected once.";
+            let (result, requests, history, streamed) = exercise_grounding_request(
+                true,
+                &[call, answer, invalid, if repaired { valid } else { invalid }],
+                streaming,
+                "Use file_read exactly once to inspect report.txt.",
+            )
+            .await;
+            assert_eq!(requests.len(), 4, "one execution and two auxiliary reviews only");
+            assert!(
+                requests
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.content.contains("invalid_review"))
+            );
+            let repaired_request = requests.last().unwrap();
+            assert_eq!(
+                repaired_request
+                    .iter()
+                    .filter(|message| message.role == "system")
+                    .count(),
+                1
+            );
+            assert_eq!(repaired_request.first().unwrap().role, "system");
+            if repaired {
+                assert_eq!(result.unwrap(), answer);
+                assert!(streamed.contains(answer));
+            } else {
+                assert!(result.unwrap_err().to_string().contains("not quoted"));
+                assert!(!streamed.contains(answer));
+                assert!(!history.iter().any(|m| m.content == answer));
+            }
+        }
     }
 }

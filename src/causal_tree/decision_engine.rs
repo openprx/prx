@@ -1549,6 +1549,7 @@ fn selector_context(
         direct_candidates,
         discovery_completed: discovered_refs.iter().next().is_some(),
         single_exact_capability: false,
+        single_exact_read_capability: false,
     }
 }
 
@@ -1575,6 +1576,16 @@ fn selector_context_for_config(
 ) -> SelectorContext {
     let mut context = selector_context(set, catalog, interactive, resume_target, discovered_refs);
     context.single_exact_capability = single_exact_capability(catalog, routing_input);
+    let folded = routing_input.to_lowercase();
+    context.single_exact_read_capability = catalog
+        .iter_entries()
+        .filter(|entry| {
+            entry.effect == super::branch::SideEffectClass::ReadOnly
+                && super::candidate_generator::exact_operation_mention(&folded, entry, catalog)
+        })
+        .take(2)
+        .count()
+        == 1;
     if decision_enabled {
         return context;
     }
@@ -1703,6 +1714,61 @@ mod tests {
         for input in ["unrelated", "prx_report prx_sheet", "skill_read prx_report prx_sheet"] {
             assert!(!single_exact_capability(&view, input), "{input}");
         }
+    }
+
+    #[test]
+    fn another_named_effect_does_not_force_context_retrieval_before_the_only_named_read() {
+        struct NamedTool(&'static str);
+        #[async_trait]
+        impl crate::tools::Tool for NamedTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "PRX catalog fixture"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{}})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                anyhow::bail!("catalog-only fixture must not execute")
+            }
+        }
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![
+            Box::new(NamedTool("memory_recall")),
+            Box::new(NamedTool("shell")),
+            Box::new(NamedTool("file_read")),
+        ];
+        let catalog = CapabilityCatalog::build(&tools, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let view = catalog.view(&CatalogScope::default());
+        let set = CandidateSet::NoLegalPath {
+            reason: super::super::candidate_generator::NoLegalReason::NoLegalCandidate,
+            terminals: vec![],
+            approval_only: vec![],
+            report: report(BTreeMap::new()),
+        };
+        for input in [
+            "Use memory_recall; do not use shell.",
+            "Use memory_recall, then run shell.",
+        ] {
+            let context = selector_context_for_config(&set, &view, true, None, &DiscoveredRefs::empty(), true, input);
+            assert!(!context.single_exact_capability);
+            assert!(context.single_exact_read_capability, "{input}");
+            assert!(
+                context.direct_candidates.is_empty(),
+                "naming does not grant direct execution"
+            );
+        }
+        let context = selector_context_for_config(
+            &set,
+            &view,
+            true,
+            None,
+            &DiscoveredRefs::empty(),
+            true,
+            "Use memory_recall and file_read",
+        );
+        assert!(!context.single_exact_read_capability, "distinct reads remain distinct");
     }
 
     struct DelayedBackend {

@@ -66,7 +66,7 @@ impl Tool for MemoryRecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance."
+        "Retrieve saved facts, preferences, or context from durable long-term memory by search query. Returns stored content ranked by relevance; use memory_get for a known exact key."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

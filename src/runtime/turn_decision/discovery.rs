@@ -4,7 +4,7 @@ use super::{
     Arc, BTreeMap, BTreeSet, CapabilityAvailabilityLevel, CapabilityRef, CatalogScope, Context, Exposure, GateInputs,
     Ordering, TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnSourceProof,
 };
-use crate::causal_tree::branch::{CapabilityTarget, CausalActionKind};
+use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, CausalActionKind};
 use crate::causal_tree::candidate_generator::CandidateSet;
 use crate::runtime::turn_source::OwnedTurnSourceProof;
 use crate::tools::ToolSpec;
@@ -188,7 +188,48 @@ impl TurnDecisionService {
                 }
             }
         }
+        let view = self.catalog_view();
+        for id in self.direct_discovery_ids(context) {
+            if let Some(entry) = view.entry_any(&id)
+                && crate::causal_tree::candidate_generator::DiscoveryFamilies::supports(entry.family)
+                && !families.contains(&entry.family)
+            {
+                families.push(entry.family);
+            }
+        }
         Ok(families)
+    }
+
+    /// A selected Skill needs a way to discover its execution tools after its
+    /// loader narrows the serving slice. Otherwise only source-named direct
+    /// peers are offered. These IDs are search eligibility, never grants;
+    /// exclusions, read-only mode, child scope and publication gates still apply.
+    fn direct_discovery_ids(&self, context: &TurnDecisionContext) -> BTreeSet<CapabilityId> {
+        let view = self.catalog_view();
+        let selected_skill = context.execution_refs.iter().any(|reference| {
+            view.entry_any(&reference.id).is_some_and(|entry| {
+                matches!(
+                    &entry.target,
+                    crate::tools::capability::catalog::ExecutionTarget::Skill { .. }
+                )
+            })
+        });
+        let mut entries =
+            CatalogSearch::exact_mentions(&view, context.engine.state.routing_input.as_str(), 64).unwrap_or_default();
+        if selected_skill {
+            entries.extend(
+                view.iter_entries()
+                    .filter(|entry| matches!(entry.exposure, Exposure::Direct)),
+            );
+        }
+        entries
+            .into_iter()
+            .filter(|entry| {
+                matches!(entry.exposure, Exposure::Direct)
+                    && !context.execution_refs.iter().any(|reference| reference.id == entry.id)
+            })
+            .map(|entry| entry.id.clone())
+            .collect()
     }
 }
 
@@ -210,15 +251,19 @@ impl CapabilitySearchAuthority {
             .view(&CatalogScope::default())
             .with_surface(&service.publication_policy);
         let trusted = context.engine.state.trusted.parts();
+        let offered_direct = service.direct_discovery_ids(&context);
         let mut results = Vec::new();
         let mut issued = Vec::new();
         let hits = CatalogSearch::find_filtered(&view, query, &families, limit, |entry| {
             !matches!(
                 entry.public_name.as_str(),
                 "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate" | "sessions_spawn"
-            ) && matches!(entry.exposure, Exposure::Searchable)
+            ) && (matches!(entry.exposure, Exposure::Searchable)
+                || matches!(entry.exposure, Exposure::Direct) && offered_direct.contains(&entry.id))
                 && entry.availability.level >= CapabilityAvailabilityLevel::Configured
                 && !trusted.excludes_entry(view.model_admission_entry(entry))
+                && !(trusted.side_effect_mode == crate::causal_tree::state::SideEffectMode::ReadOnly
+                    && entry.effect > crate::causal_tree::branch::SideEffectClass::ReadOnly)
                 && (trusted.channel.is_none() || entry.channel_eligible)
                 && self.proof.child_scope().is_none_or(|scope| {
                     scope.gate_inputs().0.allowed.iter().any(|reference| {

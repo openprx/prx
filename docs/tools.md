@@ -94,7 +94,10 @@ Tool-enabled `prx chat` checks a proposed final reply when the current turn has
 no tool results. The configured provider and model classify the current request
 as requiring execution, informational, or uncertain, using a strict JSON
 response. An execution requirement triggers one corrective tool round through
-the existing execution service. A second reply without any tool result, an
+the existing execution service. For text-only retries, earlier conversation is
+serialized as context data so historical approval notices are not imitated as
+new assistant replies; current system policy and the request are preserved.
+A second reply without any tool result, an
 invalid assessment, or an uncertain assessment ends with an explicit unverified
 error. Rejected drafts are not added to conversation history or streamed as
 final answers. Informational replies can finish without tools.
@@ -109,12 +112,43 @@ error. Honest failures, partial results and refusals can be reported without
 claiming completion; the review does not grant permission or require repeating
 completed side effects. Explicit command/call limits remain binding.
 
+The review must also return structured execution restrictions quoted from the
+current request: whole-tool bans, maximum call counts, exact shell commands, and
+other semantic restrictions. An action-specific restriction such as not installing
+dependencies must not become a ban on every shell command; semantic restrictions
+inform the model's verdict, while the other shapes have mechanical checks.
+PRX checks those extracted restrictions against complete per-tool execution counts
+and command hashes, even when detailed evidence has been evicted. Runtime backend
+identities accompany public aliases, so a skill alias backed by `skill_read` is
+recognized as that execution. Alias and backend counts overlap and are not added
+together when counting all calls. A detected
+violation ends the turn as unverified without another execution retry; later
+successful calls cannot erase it. The extraction is still model-based and may
+miss a restriction; it is an acceptance check, not a new permission boundary.
+Missing or malformed restriction data fails closed. A structurally valid review
+with an invalid quoted extraction gets at most one auxiliary repair, using the
+same execution evidence and no tools. A valid detected violation takes precedence
+over invalid extractions and cannot enter that repair path. A second invalid
+extraction ends the turn without delivering the draft.
+
+A uniquely named read-only operation can acquire its own evidence before generic
+context retrieval, even if the request also mentions a tool with side effects.
+This only orders recovery: discovery, freshness checks, explicit restrictions
+and execution admission still apply, and distinct named reads remain distinct.
+Capability search can also offer an explicitly named configured direct tool
+omitted from a narrowed execution slice; unmentioned direct peers remain outside
+that offer. A selected Skill can discover configured direct tools for its workflow
+after the loader narrows the slice. Neither path grants execution: the same
+publication, exclusion, read-only, child-scope and execution checks apply.
+The request snapshot identifies discovery as the way to obtain a missing schema.
+
 The configured provider/model performs the review. Evidence retains at most 24
 tool records, with bounded argument/result excerpts and explicit truncation and
 omission markers. Reviews are input-budget checked, cancellable and accounted
 for in provider usage. Chat final text is buffered until accepted; tool progress
 remains visible. Expect one extra model request for an eligible final reply,
-plus one further review if a tool-backed draft needs correction. Plan mode and
+plus one further review if a tool-backed draft needs correction. Each review can
+make one additional request to repair invalid constraint extraction. Plan mode and
 other hosts retain their existing behavior. Approval and sandbox rules are
 unchanged.
 

@@ -816,16 +816,20 @@ async fn run_turn_unguarded(
         let media_artifacts = hooks.media_artifacts();
         let mut prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config, media_artifacts.as_ref()).await?;
-        // Corrective retries are appended at the tail, not as request-local
+        // Corrective instructions are appended at the tail, not as request-local
         // `system` context. A system message here is folded into the leading
         // one by `coalesce_system_messages_at_front` below, which appends bytes
         // to the system prefix and misses the provider-side prefix cache for
         // the whole conversation — on the one turn that is already paying for a
-        // wasted provider call. Appending at the tail leaves every cached byte
-        // ahead of it untouched, and keeps the "exactly one system message, at
-        // index 0" shape that strict chat templates require.
+        // wasted provider call. The execution retry separately serializes text
+        // history as data to prevent imitation of earlier runtime notices. Both
+        // paths keep the leading system policy unchanged and the "exactly one
+        // system message, at index 0" shape that strict chat templates require.
         let verify_chat_completion =
             runtime_adapter.verify_chat_completion && !chat_mode.intercepts_writes() && !tool_specs.is_empty();
+        if inject_execution_retry && image_marker_count == 0 {
+            prepared_messages.messages = super::execution_requirement::retry_messages(&prepared_messages.messages);
+        }
         if verify_chat_completion {
             append_corrective_aside(
                 &mut prepared_messages.messages,
@@ -1661,15 +1665,17 @@ async fn run_turn_unguarded(
                         config.max_context_tokens.saturating_sub(config.reserve_tokens)
                     });
                     let source = assessment_source.as_deref().unwrap_or(history);
-                    let assessment = if observed_tool_results {
+                    let mut assessment_messages = if observed_tool_results {
                         completion_evidence.messages(source, &display_text, budget)?
                     } else {
                         assessment_messages(source, budget)?
                     };
                     let purpose = if observed_tool_results { "completion_review" } else { "execution_requirement" };
+                    let mut review_repair_attempted = false;
+                    loop {
                     if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
                         Box::pin(record_assessment_request(
-                            fabric, scope.clone(), provider_name, model, purpose, &assessment,
+                            fabric, scope.clone(), provider_name, model, purpose, &assessment_messages,
                         )).await?;
                     }
                     let observation = execution_adapter
@@ -1685,20 +1691,20 @@ async fn run_turn_unguarded(
                     observer.record_event(&ObserverEvent::LlmRequest {
                         provider: provider_name.to_string(),
                         model: model.to_string(),
-                        messages_count: assessment.len(),
+                        messages_count: assessment_messages.len(),
                     });
                     hooks
                         .emit(
                             HookEvent::LlmRequest,
                             serde_json::json!({
                                 "provider":provider_name, "model":model, "purpose":purpose,
-                                "messages_count":assessment.len(), "tool_count":0,
+                                "messages_count":assessment_messages.len(), "tool_count":0,
                             }),
                         )
                         .await;
                     let assessment_future = parameter_capture.scope(provider.chat_traced(
                         ChatRequest {
-                            messages: &assessment,
+                            messages: &assessment_messages,
                             tools: None,
                         },
                         model,
@@ -1759,7 +1765,27 @@ async fn run_turn_unguarded(
                         );
                     }
                     let assessment = if observed_tool_results {
-                        ReplyAssessment::Completion(super::completion_review::parse_review(&trace.response)?)
+                        let review = super::completion_review::parse_review(&trace.response)?;
+                        if let Err(error) = completion_evidence.validate_review(&review, source) {
+                            use super::completion_review::ReviewValidationError;
+                            if review_repair_attempted || matches!(error, ReviewValidationError::Violation(_)) {
+                                return Err(error.into());
+                            }
+                            super::completion_review::repair_messages(
+                                &mut assessment_messages, &trace.response, &error, budget,
+                            )?;
+                            review_repair_attempted = true;
+                            tracing::warn!(%error, "Repairing invalid completion review once without executing tools");
+                            if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
+                                fabric.record_runtime_event(
+                                    scope.clone(), "turn.completion_review.repair_requested",
+                                    "Invalid completion review requires one auxiliary repair".to_string(),
+                                    Some(serde_json::json!({"error":error.to_string()}).to_string()),
+                                ).await?;
+                            }
+                            continue;
+                        }
+                        ReplyAssessment::Completion(review)
                     } else {
                         ReplyAssessment::Execution(parse_assessment(&trace.response)?)
                     };
@@ -1786,7 +1812,8 @@ async fn run_turn_unguarded(
                             tracing::warn!(%error, "Failed to record execution requirement assessment");
                         }
                     }
-                        Ok::<_, anyhow::Error>(assessment)
+                        break Ok::<_, anyhow::Error>(assessment);
+                    }
                     }).await?
                 };
                 match assessment {

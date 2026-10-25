@@ -64,6 +64,9 @@ pub(crate) struct SelectorContext {
     /// A Skill and its read-only loader count once; distinct skills and tools
     /// must not be narrowed to their first read-only candidate.
     pub single_exact_capability: bool,
+    /// One named read can acquire its own evidence even when another named
+    /// operation has side effects. This never grants either operation.
+    pub single_exact_read_capability: bool,
 }
 
 pub(crate) struct CausalSelector;
@@ -359,7 +362,7 @@ impl CausalSelector {
         // bounded recovery budget before its exact ref is discovered. Keep
         // freshness recovery, write/delegation behavior and every hard gate.
         let exact_read = exact_selected_action
-            && context.single_exact_capability
+            && (context.single_exact_capability || context.single_exact_read_capability)
             && top.action() == CausalActionKind::UseTool
             && top.side_effect() == SideEffectClass::ReadOnly
             // A selected retrieval backed by this same capability is not
@@ -699,6 +702,7 @@ mod tests {
             direct_candidates,
             discovery_completed: false,
             single_exact_capability: false,
+            single_exact_read_capability: false,
         };
         (
             set,
@@ -1119,16 +1123,18 @@ mod tests {
 
     #[test]
     fn exact_read_discovers_or_executes_without_a_redundant_retrieval() {
-        for (exact, effect, stale, direct, single, same_source) in [
-            (true, SideEffectClass::ReadOnly, false, false, true, false),
-            (true, SideEffectClass::ReadOnly, false, true, false, false),
-            (true, SideEffectClass::ReadOnly, false, true, true, false),
-            (false, SideEffectClass::ReadOnly, false, false, true, false),
-            (true, SideEffectClass::LocalWrite, false, false, true, false),
-            (true, SideEffectClass::ReadOnly, true, false, true, false),
-            (true, SideEffectClass::ReadOnly, true, true, true, false),
-            (true, SideEffectClass::ReadOnly, false, false, true, true),
-            (true, SideEffectClass::ReadOnly, false, true, true, true),
+        for (exact, effect, stale, direct, single, same_source, only_read) in [
+            (true, SideEffectClass::ReadOnly, false, false, true, false, false),
+            (true, SideEffectClass::ReadOnly, false, true, false, false, false),
+            (true, SideEffectClass::ReadOnly, false, true, true, false, false),
+            (false, SideEffectClass::ReadOnly, false, false, true, false, false),
+            (true, SideEffectClass::LocalWrite, false, false, true, false, false),
+            (true, SideEffectClass::ReadOnly, true, false, true, false, false),
+            (true, SideEffectClass::ReadOnly, true, true, true, false, false),
+            (true, SideEffectClass::ReadOnly, false, false, true, true, false),
+            (true, SideEffectClass::ReadOnly, false, true, true, true, false),
+            (true, SideEffectClass::ReadOnly, false, false, false, false, true),
+            (true, SideEffectClass::ReadOnly, false, true, false, false, true),
         ] {
             let (mut set, mut scores, mut evidence, mut report, policy, mut context) = fixture(0.5);
             use crate::causal_tree::branch::{CapabilityId, CapabilityRef, CatalogGeneration, SchemaFingerprint};
@@ -1178,6 +1184,7 @@ mod tests {
             evidence.chosen_target = "memory".to_owned();
             evidence.target_probabilities.insert(CapabilityTarget::Memory, 0.9);
             context.single_exact_capability = single;
+            context.single_exact_read_capability = only_read;
             evidence.evidence_sufficient = 0.0;
             evidence.needs_fresh_state = if stale { 0.9 } else { 0.0 };
             if direct {
@@ -1223,24 +1230,25 @@ mod tests {
                 exact_mentions.insert(tool.candidate_id().clone());
             }
             let selection = CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap();
-            let expected = if exact && single && effect == SideEffectClass::ReadOnly && !stale && !same_source {
-                if direct {
-                    Selection::Commit {
-                        candidate_id: tool.candidate_id().clone(),
-                        propensity: 1.0,
+            let expected =
+                if exact && (single || only_read) && effect == SideEffectClass::ReadOnly && !stale && !same_source {
+                    if direct {
+                        Selection::Commit {
+                            candidate_id: tool.candidate_id().clone(),
+                            propensity: 1.0,
+                        }
+                    } else {
+                        Selection::Recover {
+                            candidate_id: discover.candidate_id().clone(),
+                            reason_code: "discover_capability",
+                        }
                     }
                 } else {
                     Selection::Recover {
-                        candidate_id: discover.candidate_id().clone(),
-                        reason_code: "discover_capability",
+                        candidate_id: retrieval_id,
+                        reason_code: "retrieve_evidence",
                     }
-                }
-            } else {
-                Selection::Recover {
-                    candidate_id: retrieval_id,
-                    reason_code: "retrieve_evidence",
-                }
-            };
+                };
             assert_eq!(
                 selection, expected,
                 "exact={exact} effect={effect:?} stale={stale} direct={direct} same_source={same_source}"

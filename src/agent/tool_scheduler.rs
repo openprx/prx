@@ -323,6 +323,10 @@ async fn execute_one_unrecorded(
     // Legacy failures can be backend refusals. Only process facts establish
     // that an unsuccessful shell command actually started.
     let executed = outcome.result.is_some() && outcome.process.as_ref().map_or(success, |process| process.started);
+    let backend_name = outcome
+        .descriptor
+        .as_ref()
+        .map(|descriptor| descriptor.backend_name.clone());
     let status = outcome.status;
     let result = outcome.model_content;
     emit_tool_loop_event(
@@ -343,6 +347,7 @@ async fn execute_one_unrecorded(
         content: result,
         status,
         executed,
+        backend_name,
     })
 }
 

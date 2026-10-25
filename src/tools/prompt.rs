@@ -128,14 +128,23 @@ pub(crate) fn render_ordered_capability_snapshot<'a>(tools: impl ExactSizeIterat
     if count == 0 {
         return String::new();
     }
+    let mut has_search = false;
     let names = tools
-        .map(|tool| format!("`{}`", tool.name))
+        .map(|tool| {
+            has_search |= tool.name == "capability_search";
+            format!("`{}`", tool.name)
+        })
         .collect::<Vec<_>>()
         .join(", ");
+    let discovery = if has_search {
+        "\nThis is the current slice, not the full capability catalog. If the requested operation is missing, call capability_search with its name or purpose, then use the returned schema through normal admission. For durable memory, discover a memory reader; shell or workspace search is not a substitute. A discovery hit needs no warm-up call."
+    } else {
+        ""
+    };
     format!(
         "## Runtime Capabilities\n\n\
          The following {} tools are exposed and executable for this request: {names}.\n\
-         This request-local list is authoritative; use the supplied tool schemas for arguments.",
+         This request-local list is authoritative; use the supplied tool schemas for arguments.{discovery}",
         count
     )
 }

@@ -4,7 +4,7 @@
 
 use crate::providers::traits::{ChatRequest, ChatResponse, ChatTrace};
 
-pub(super) const ACCEPT: &str = r#"{"decision":"accept","reason":"fixture evidence accepted"}"#;
+pub(super) const ACCEPT: &str = r#"{"decision":"accept","reason":"fixture evidence accepted","constraints":[]}"#;
 pub(super) const INFORMATIONAL: &str = r#"{"requirement":"informational"}"#;
 
 pub(super) fn reply(system: &str) -> Option<&'static str> {

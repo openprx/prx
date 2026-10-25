@@ -201,7 +201,7 @@ impl Tool for MemoryGetTool {
     }
 
     fn description(&self) -> &str {
-        "Read memory by key from the configured backend with ACL observe/enforce mode. Provide at least one of path or key."
+        "Retrieve stored content from durable long-term memory by key. Reads the configured memory backend, not workspace files. Provide at least one of path or key; ACL observe/enforce mode applies."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
