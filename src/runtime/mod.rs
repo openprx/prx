@@ -13,6 +13,7 @@ pub(crate) mod evolution_model;
 pub mod native;
 pub mod registry;
 mod shell_cgroup;
+mod shell_container;
 pub mod shell_process;
 pub mod shutdown;
 pub mod sqlite_pool;

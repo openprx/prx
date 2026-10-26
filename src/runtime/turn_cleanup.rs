@@ -425,8 +425,11 @@ impl CleanupScope {
         if let Some(completion) = &mut self.diagnostic_completion {
             completion.mark_finished();
         }
-        cleanup.map_err(|error| error.context(CleanupIncomplete))?;
-        result
+        match (cleanup, result) {
+            (Err(cleanup), Err(work)) => Err(work.context(cleanup).context(CleanupIncomplete)),
+            (Err(cleanup), Ok(_)) => Err(cleanup.context(CleanupIncomplete)),
+            (Ok(()), result) => result,
+        }
     }
 }
 

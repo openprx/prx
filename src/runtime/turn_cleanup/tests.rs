@@ -321,3 +321,20 @@ async fn cancelled_admission_retains_failed_ticket_until_owner_drop_ack() {
     );
     assert!(current_tracker().is_none());
 }
+
+#[tokio::test]
+async fn incomplete_cleanup_keeps_the_original_work_failure() {
+    let scope = CleanupScope::new(None, CancellationToken::new()).unwrap();
+    let error = scope
+        .run::<()>(async {
+            let ticket = current_tracker().unwrap().register(CancellationToken::new()).unwrap();
+            ticket.finish(false);
+            anyhow::bail!("specific ingress failure")
+        })
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<super::CleanupIncomplete>().is_some());
+    let chain = format!("{error:#}");
+    assert!(chain.contains("specific ingress failure"));
+    assert!(chain.contains("runtime terminal cleanup has unconfirmed failures"));
+}

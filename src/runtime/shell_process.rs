@@ -265,6 +265,7 @@ impl ShellProcessAdapter {
             .runtime
             .build_shell_command_with_env(request.command, request.workspace_dir, &shell_environment)
             .map_err(ShellProcessError::Runtime)?;
+        let client_env_cleared = filtered_environment.is_some();
         if let Some(environment) = filtered_environment {
             command.env_clear();
             command.envs(environment);
@@ -274,124 +275,139 @@ impl ShellProcessAdapter {
             command.env_clear();
             command.envs(contained_environment(request.workspace_dir).map_err(ShellProcessError::Runtime)?);
         }
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if request
-            .cancellation
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return Err(ShellProcessError::Cancelled);
-        }
-
-        if let Some(group) = &cgroup {
-            group.attach(&mut command).map_err(ShellProcessError::Spawn)?;
-        }
-        let mut process = spawn_managed_shell_child(command).map_err(ShellProcessError::Spawn)?;
-        process.cgroup = cgroup;
-        let captures = OutputCaptures::default();
-        let stdout_task = spawn_output_drain(
-            process.take_stdout(),
-            Arc::clone(&captures.stdout),
-            #[cfg(test)]
-            Arc::clone(&self.active_output_readers),
-        );
-        let stderr_task = spawn_output_drain(
-            process.take_stderr(),
-            Arc::clone(&captures.stderr),
-            #[cfg(test)]
-            Arc::clone(&self.active_output_readers),
-        );
-        let mut drains = tokio::spawn(OutputDrainTasks::new(stdout_task, stderr_task).join());
-        let mut drain_guard = DrainAbortGuard::new(drains.abort_handle());
-        let deadline = wait_for_timeout(request.timeout);
-        tokio::pin!(deadline);
-        let cancellation = wait_for_cancellation(request.cancellation.as_ref());
-        tokio::pin!(cancellation);
-
-        let status = tokio::select! {
-            biased;
-            () = &mut cancellation => {
-                let reaped = process.terminate_and_reap().await;
-                let complete = finish_drains_after_kill(&mut drains).await;
-                drain_guard.disarm();
-                if reaped {
-                    process.mark_complete();
-                }
-                return Err(captures.interrupted(ShellProcessError::Cancelled, complete));
-            }
-            timeout = &mut deadline => {
-                let reaped = process.terminate_and_reap().await;
-                let complete = finish_drains_after_kill(&mut drains).await;
-                drain_guard.disarm();
-                if reaped {
-                    process.mark_complete();
-                }
-                return Err(captures.interrupted(ShellProcessError::Timeout(timeout), complete));
-            }
-            status = process.wait() => status.map_err(ShellProcessError::Wait)?,
+        let mut container = if self.runtime.name() == "docker" && command.as_std().get_program() == "docker" {
+            Some(
+                super::shell_container::ShellContainer::from_command(&command, client_env_cleared)
+                    .map_err(ShellProcessError::Spawn)?,
+            )
+        } else {
+            None
         };
-        if end_group_on_exit {
-            // The leader was reaped by `wait`; the signal reaches whatever it
-            // left running in its group. Known window: once the leader is
-            // reaped and every member has exited, the group id could in
-            // principle be reused by an unrelated process before this
-            // `killpg`. The same window exists in the timeout and cancel
-            // paths; it is a few microseconds after `wait` returns, and the
-            // signal goes to the group id this adapter created.
-            process.kill_process_tree();
-        }
+        let result = async {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            if request
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(ShellProcessError::Cancelled);
+            }
 
-        enum DrainResult {
-            Complete(Result<io::Result<()>, tokio::task::JoinError>),
-            Cancelled,
-            TimedOut(Duration),
-        }
-        let drain_result = tokio::select! {
-            biased;
-            () = &mut cancellation => DrainResult::Cancelled,
-            timeout = &mut deadline => DrainResult::TimedOut(timeout),
-            output = &mut drains => DrainResult::Complete(output),
-        };
-        match drain_result {
-            DrainResult::Complete(output) => {
-                drain_guard.disarm();
-                let output = output.map_err(|error| ShellProcessError::Output(io::Error::other(error)))?;
-                output.map_err(ShellProcessError::Output)?
+            if let Some(group) = &cgroup {
+                group.attach(&mut command).map_err(ShellProcessError::Spawn)?;
             }
-            DrainResult::Cancelled => {
-                let reaped = process.terminate_and_reap().await;
-                let complete = finish_drains_after_kill(&mut drains).await;
-                drain_guard.disarm();
-                if reaped {
-                    process.mark_complete();
-                }
-                return Err(captures.interrupted(ShellProcessError::Cancelled, complete));
-            }
-            DrainResult::TimedOut(timeout) => {
-                let reaped = process.terminate_and_reap().await;
-                let complete = finish_drains_after_kill(&mut drains).await;
-                drain_guard.disarm();
-                if reaped {
-                    process.mark_complete();
-                }
-                return Err(captures.interrupted(ShellProcessError::Timeout(timeout), complete));
-            }
-        };
-        process.mark_complete();
+            let mut process = spawn_managed_shell_child(command).map_err(ShellProcessError::Spawn)?;
+            process.cgroup = cgroup;
+            let captures = OutputCaptures::default();
+            let stdout_task = spawn_output_drain(
+                process.take_stdout(),
+                Arc::clone(&captures.stdout),
+                #[cfg(test)]
+                Arc::clone(&self.active_output_readers),
+            );
+            let stderr_task = spawn_output_drain(
+                process.take_stderr(),
+                Arc::clone(&captures.stderr),
+                #[cfg(test)]
+                Arc::clone(&self.active_output_readers),
+            );
+            let mut drains = tokio::spawn(OutputDrainTasks::new(stdout_task, stderr_task).join());
+            let mut drain_guard = DrainAbortGuard::new(drains.abort_handle());
+            let deadline = wait_for_timeout(request.timeout);
+            tokio::pin!(deadline);
+            let cancellation = wait_for_cancellation(request.cancellation.as_ref());
+            tokio::pin!(cancellation);
 
-        let (stdout, stdout_truncated) = captures.take_stdout().into_string();
-        let (stderr, stderr_truncated) = captures.take_stderr().into_string();
-        Ok(ShellProcessOutcome {
-            status,
-            stdout,
-            stderr,
-            stdout_truncated,
-            stderr_truncated,
-        })
+            let status = tokio::select! {
+                biased;
+                () = &mut cancellation => {
+                    let reaped = process.terminate_and_reap().await;
+                    let complete = finish_drains_after_kill(&mut drains).await;
+                    drain_guard.disarm();
+                    if reaped {
+                        process.mark_complete();
+                    }
+                    return Err(captures.interrupted(ShellProcessError::Cancelled, complete));
+                }
+                timeout = &mut deadline => {
+                    let reaped = process.terminate_and_reap().await;
+                    let complete = finish_drains_after_kill(&mut drains).await;
+                    drain_guard.disarm();
+                    if reaped {
+                        process.mark_complete();
+                    }
+                    return Err(captures.interrupted(ShellProcessError::Timeout(timeout), complete));
+                }
+                status = process.wait() => status.map_err(ShellProcessError::Wait)?,
+            };
+            if end_group_on_exit {
+                // The leader was reaped by `wait`; the signal reaches whatever it
+                // left running in its group. Known window: once the leader is
+                // reaped and every member has exited, the group id could in
+                // principle be reused by an unrelated process before this
+                // `killpg`. The same window exists in the timeout and cancel
+                // paths; it is a few microseconds after `wait` returns, and the
+                // signal goes to the group id this adapter created.
+                process.kill_process_tree();
+            }
+
+            enum DrainResult {
+                Complete(Result<io::Result<()>, tokio::task::JoinError>),
+                Cancelled,
+                TimedOut(Duration),
+            }
+            let drain_result = tokio::select! {
+                biased;
+                () = &mut cancellation => DrainResult::Cancelled,
+                timeout = &mut deadline => DrainResult::TimedOut(timeout),
+                output = &mut drains => DrainResult::Complete(output),
+            };
+            match drain_result {
+                DrainResult::Complete(output) => {
+                    drain_guard.disarm();
+                    let output = output.map_err(|error| ShellProcessError::Output(io::Error::other(error)))?;
+                    output.map_err(ShellProcessError::Output)?
+                }
+                DrainResult::Cancelled => {
+                    let reaped = process.terminate_and_reap().await;
+                    let complete = finish_drains_after_kill(&mut drains).await;
+                    drain_guard.disarm();
+                    if reaped {
+                        process.mark_complete();
+                    }
+                    return Err(captures.interrupted(ShellProcessError::Cancelled, complete));
+                }
+                DrainResult::TimedOut(timeout) => {
+                    let reaped = process.terminate_and_reap().await;
+                    let complete = finish_drains_after_kill(&mut drains).await;
+                    drain_guard.disarm();
+                    if reaped {
+                        process.mark_complete();
+                    }
+                    return Err(captures.interrupted(ShellProcessError::Timeout(timeout), complete));
+                }
+            };
+            process.mark_complete();
+
+            let (stdout, stdout_truncated) = captures.take_stdout().into_string();
+            let (stderr, stderr_truncated) = captures.take_stderr().into_string();
+            Ok(ShellProcessOutcome {
+                status,
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+            })
+        }
+        .await;
+        if let Some(container) = &mut container {
+            container.finish().await.map_err(ShellProcessError::Wait)?;
+        }
+        result
     }
 
     #[cfg(test)]
@@ -1255,6 +1271,86 @@ mod tests {
         // setsid leader; killpg does not dereference pointers.
         unsafe {
             let _ = libc::killpg(pid, libc::SIGKILL);
+        }
+    }
+
+    /// Opt-in integration with an actual Docker-compatible daemon. The
+    /// image must provide sh, setsid, hostname and sleep; no image is pulled.
+    #[tokio::test]
+    #[ignore = "requires a Docker-compatible daemon and PRX_TEST_DOCKER_IMAGE"]
+    async fn docker_joined_execution_removes_detached_descendants_on_exit_cancel_timeout_and_drop() {
+        let image = std::env::var("PRX_TEST_DOCKER_IMAGE").expect("explicit local test image");
+        for mode in ["exit", "cancel", "timeout", "drop"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = crate::config::DockerRuntimeConfig::default();
+            config.image = image.clone();
+            config.network = "none".into();
+            config.mount_workspace = true;
+            let process = ShellProcessAdapter::new(Arc::new(crate::runtime::DockerRuntime::new(config)));
+            let cancellation = CancellationToken::new();
+            let ready = temp.path().join("ready");
+            let watched = ready.clone();
+            let stop = cancellation.clone();
+            let watcher = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    while !watched.exists() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("detached child started");
+                if matches!(mode, "cancel" | "drop") {
+                    stop.cancel();
+                }
+            });
+            let suffix = if mode == "exit" { "exit 0" } else { "wait" };
+            let command = format!(
+                "hostname > container-id; setsid sh -c 'echo ready > ready; exec sleep 120' >/dev/null 2>&1 & while [ ! -s ready ]; do :; done; {suffix}"
+            );
+            let tracker = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+            let result = tracker
+                .scope(async {
+                    let work = process.execute_joined(ShellProcessRequest {
+                        command: &command,
+                        workspace_dir: temp.path(),
+                        timeout: Some(Duration::from_secs(10)),
+                        cancellation: Some(cancellation.clone()),
+                        git: ShellGitPolicy::RefuseGit,
+                    });
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled(), if mode == "drop" => Err(ShellProcessError::Cancelled),
+                        result = work => result,
+                    }
+                })
+                .await;
+            tracker
+                .drain(tokio::time::Instant::now() + Duration::from_secs(15))
+                .await
+                .expect("container cleanup belongs to the turn, including a dropped future");
+            watcher.await.unwrap();
+            match mode {
+                "exit" => assert!(result.unwrap().status.success()),
+                "cancel" | "drop" => assert!(matches!(result, Err(ShellProcessError::Cancelled))),
+                _ => assert!(matches!(result, Err(ShellProcessError::Timeout(_)))),
+            }
+            let id = std::fs::read_to_string(temp.path().join("container-id")).unwrap();
+            assert!(id.trim().bytes().all(|byte| byte.is_ascii_hexdigit()));
+            let output = tokio::process::Command::new("docker")
+                .args([
+                    "container",
+                    "ls",
+                    "--all",
+                    "--filter",
+                    &format!("id={}", id.trim()),
+                    "--format",
+                    "{{.ID}}",
+                ])
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success());
+            assert!(output.stdout.is_empty(), "owned container must be absent after {mode}");
         }
     }
 

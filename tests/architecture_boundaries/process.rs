@@ -267,6 +267,9 @@ const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
     "src/nodes/server.rs::execute_shell_command::let mut cmd = Command::new(&parsed_command.program);",
     "src/runtime/docker.rs::build_command::let mut process = tokio::process::Command::new(\"docker\");",
     "src/runtime/native.rs::build_shell_command::let mut process = tokio::process::Command::new(\"sh\");",
+    // Runtime-owned, bounded ls/rm of UUID-labelled containers. The cleanup
+    // command preserves the original client transport and uses managed spawn.
+    "src/runtime/shell_container.rs::run::let mut command = tokio::process::Command::new(\"docker\");",
     "src/security/git_launch.rs::git_command_with_parent::let mut command = tokio::process::Command::new(\"git\");",
     "src/security/git_launch.rs::read_git::let mut command = tokio::process::Command::new(\"git\");",
     "src/security/secrets.rs::load_or_create_key::match std::process::Command::new(\"icacls\")",

@@ -58,6 +58,9 @@ impl DockerRuntime {
     ) -> Result<tokio::process::Command> {
         let mut process = tokio::process::Command::new("docker");
         process.arg("run").arg("--rm").arg("--init").arg("--interactive");
+        process
+            .arg("--label")
+            .arg(format!("org.openprx.shell={}", uuid::Uuid::new_v4()));
 
         let network = self.config.network.trim();
         if !network.is_empty() {
