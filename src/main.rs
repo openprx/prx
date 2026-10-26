@@ -675,7 +675,7 @@ Examples:
         evolution_command: EvolutionCommands,
     },
 
-    /// Inspect and authorize local WASM plugin artifacts.
+    /// Inspect, authorize, and reload trusted WASM plugin artifacts.
     #[cfg(feature = "wasm-plugins")]
     Plugin {
         #[command(subcommand)]

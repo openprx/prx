@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add authenticated `prx plugins reload` with stdin-token input and a dry-run
+- Add authenticated `prx plugin reload` with stdin-token input and a dry-run
   mode for reloading trusted WASM plugins through the gateway.
 
 ### Fixed
