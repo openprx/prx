@@ -110,9 +110,28 @@ impl ApprovalCollectionLease {
             // operation needs no collected approval: decline before anything
             // is persisted so the owner gets an explanation, not a failure of
             // the collection itself.
+            if call.name == "skills_manage"
+                && !crate::security::approval_operation::requires_explicit_grant(&call.name, &arguments)
+            {
+                let action = arguments
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                return Err(CollectionDeclined(format!("skills_manage {action} needs no collected approval; nothing was recorded or run. Request the read-only lifecycle capability for a query.")).into());
+            }
             match crate::security::approval_operation::grant_op_for_call(&call.name, &arguments) {
+                Some(crate::security::approval_operation::GrantOp::Command(command)) => {
+                    (command, crate::acl::approval_grant::RiskLevel::High)
+                }
                 Some(crate::security::approval_operation::GrantOp::ResourceExact(operation, risk)) => (operation, risk),
                 _ => {
+                    if call.name != "skills_manage" {
+                        return Err(CollectionDeclined(
+                            "The proposed call has no valid exact approval operation; nothing was recorded or run."
+                                .into(),
+                        )
+                        .into());
+                    }
                     let action = arguments
                         .get("action")
                         .and_then(serde_json::Value::as_str)

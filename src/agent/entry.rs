@@ -1864,7 +1864,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             decision.disposition()?,
                             crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
                         ),
-                        "ingress has no approval collection adapter"
+                        "Supervised approval collection requires prx chat or Console; this CLI ingress has no review adapter"
                     );
                     if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = decision.disposition()? {
                         let ports = CliDecisionClose {
@@ -2343,7 +2343,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             decision.disposition()?,
                             crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
                         ),
-                        "ingress has no approval collection adapter"
+                        "Supervised approval collection requires prx chat or Console; this CLI ingress has no review adapter"
                     );
                     if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = decision.disposition()? {
                         if history.is_empty() {

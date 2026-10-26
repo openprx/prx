@@ -2723,7 +2723,11 @@ impl TurnDecisionService {
                 Some(prepared.candidate_count()),
             );
             let decision = if terminal_only {
-                CausalDecisionEngine::decide_terminal_prepared(prepared)?
+                if hop == max_hops && !stop_hops && Instant::now() < deadline {
+                    CausalDecisionEngine::decide_terminal_with_collection(prepared, proof.approval_review_adapter())?
+                } else {
+                    CausalDecisionEngine::decide_terminal_prepared(prepared)?
+                }
             } else {
                 tokio::select! {
                     biased;
@@ -3106,26 +3110,29 @@ impl TurnDecisionService {
                 if cancellation.is_cancelled() {
                     return Err(AgentDecisionError::Cancelled);
                 }
-                stop_hops = crate::causal_tree::decision_engine::discovery_has_no_progress(
-                    || {
-                        progress_operand!(
-                            "same_evidence",
-                            next_prepared.evidence_fingerprint() == previous_prepared.evidence_fingerprint()
-                        )
-                    },
-                    || {
-                        progress_operand!(
-                            "same_candidate_bodies",
-                            !next_prepared.candidate_bodies_changed_from_prepared(&previous_prepared)
-                        )
-                    },
-                    || {
-                        !progress_operand!(
-                            "same_direct_readiness",
-                            !next_prepared.gained_direct_candidate_from_prepared(&previous_prepared)
-                        )
-                    },
-                );
+                let gained_collection =
+                    next_prepared.gained_collection_from_prepared(&previous_prepared, proof.approval_review_adapter());
+                stop_hops = !gained_collection
+                    && crate::causal_tree::decision_engine::discovery_has_no_progress(
+                        || {
+                            progress_operand!(
+                                "same_evidence",
+                                next_prepared.evidence_fingerprint() == previous_prepared.evidence_fingerprint()
+                            )
+                        },
+                        || {
+                            progress_operand!(
+                                "same_candidate_bodies",
+                                !next_prepared.candidate_bodies_changed_from_prepared(&previous_prepared)
+                            )
+                        },
+                        || {
+                            !progress_operand!(
+                                "same_direct_readiness",
+                                !next_prepared.gained_direct_candidate_from_prepared(&previous_prepared)
+                            )
+                        },
+                    );
             }
             #[cfg(test)]
             progress_diagnostic::record("stop_hops", u64::from(stop_hops));

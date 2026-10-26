@@ -207,6 +207,24 @@ pub(crate) struct PendingApproval {
 
 pub(crate) struct CausalCandidateGenerator;
 
+/// Resolve all discovery identities against the current catalog. Ambiguous,
+/// stale or read-only discoveries cannot be promoted to a lifecycle proposal.
+fn discovered_lifecycle_entry<'a>(catalog: &CatalogView<'a>, refs: &DiscoveredRefs) -> Option<&'a CapabilityEntry> {
+    let mut selected = catalog.iter_entries().filter(|entry| {
+        entry.effect != SideEffectClass::ReadOnly
+            && refs.contains(&CapabilityRef {
+                id: entry.id.clone(),
+                fingerprint: entry.fingerprint,
+                generation: entry.generation,
+            })
+    });
+    let entry = selected.next()?;
+    if selected.next().is_some() || entry.public_name != "skills_manage" || !entry.collects_exact_call() {
+        return None;
+    }
+    Some(entry)
+}
+
 impl CausalCandidateGenerator {
     /// Exact one-capability proposal; never inserts it into the legal executable set.
     pub(super) fn exact_deferred_mutation(
@@ -233,10 +251,28 @@ impl CausalCandidateGenerator {
                                 .any(|part| part.eq_ignore_ascii_case(term.as_bytes())))
                 })
             });
-        if !possible {
-            return None;
-        }
         let folded = state.routing_input.as_str().to_lowercase();
+        if !possible {
+            // Only a unique, current, turn-scoped discovery can identify an
+            // unnamed lifecycle proposal. Discovery grants no execution; the
+            // model must still supply a grant-bound action and exact arguments.
+            if catalog.iter_entries().any(|entry| exact_mention(&folded, entry)) {
+                return None;
+            }
+            let entry = discovered_lifecycle_entry(catalog, policy.discovered_refs)?;
+            let candidate = from_entry(
+                CausalActionKind::UseTool,
+                entry.family,
+                entry,
+                policy,
+                Some(Ns8::of(policy.key, &entry.namespace)),
+            );
+            return matches!(
+                HardGates::check_one(state, catalog, &candidate, gates),
+                GateOutcome::ApprovalDeferred | GateOutcome::ApprovalOnly { .. }
+            )
+            .then_some(candidate);
+        }
         let mut exact = catalog.iter_entries().filter(|entry| exact_mention(&folded, entry));
         let entry = exact.next()?;
         let others = exact.next().is_some();
@@ -893,7 +929,9 @@ fn approval_candidate(target: CapabilityTarget) -> CausalCandidate {
 /// as nodes do not.
 pub(crate) fn collectable_approval_entry(entry: &CapabilityEntry) -> bool {
     match entry.family {
-        CapabilityTarget::Filesystem => matches!(entry.public_name.as_str(), "file_write" | "file_edit"),
+        CapabilityTarget::Filesystem => {
+            matches!(entry.public_name.as_str(), "file_write" | "file_edit") || entry.collects_exact_call()
+        }
         CapabilityTarget::Mcp => entry.effect > SideEffectClass::ReadOnly && entry.op_ids.len() == 1,
         // A generic tool whose lifecycle actions need a grant bound to their
         // exact target derives that operation from the arguments, like a file
@@ -904,7 +942,7 @@ pub(crate) fn collectable_approval_entry(entry: &CapabilityEntry) -> bool {
 
 /// The text names the capability itself (public name or id), not one of its
 /// bare aliases, which are ordinary words such as `write` or `search`.
-fn names_entry(folded_text: &str, entry: &CapabilityEntry) -> bool {
+pub(super) fn names_entry(folded_text: &str, entry: &CapabilityEntry) -> bool {
     contains_bounded(folded_text, &entry.id.as_str().to_lowercase())
         || contains_bounded(folded_text, &entry.public_name.to_lowercase())
 }
@@ -930,6 +968,23 @@ pub(super) fn exact_mention(folded_text: &str, entry: &CapabilityEntry) -> bool 
 /// ties cannot disagree with the cheaper, more specific candidate's score.
 /// This changes intent ranking only; every Skill reference still passes gates.
 pub(super) fn exact_operation_mention(folded_text: &str, entry: &CapabilityEntry, catalog: &CatalogView<'_>) -> bool {
+    // A concrete read alias supersedes its mixed-effect management root.
+    // Its schema admits only that read; naming a write still keeps the root.
+    if entry.public_name == "skills_manage"
+        && entry.root == "skills_manage"
+        && !entry.names_collectable_action(folded_text)
+        && catalog.iter_entries().any(|read| {
+            read.root == "skills_manage"
+                && read.effect == SideEffectClass::ReadOnly
+                && matches!(
+                    read.public_name.as_str(),
+                    "lifecycle_status" | "lifecycle_list" | "lifecycle_inspect"
+                )
+                && exact_mention(folded_text, read)
+        })
+    {
+        return false;
+    }
     exact_mention(folded_text, entry)
         && !catalog
             .iter_entries()
@@ -3493,6 +3548,44 @@ mod tests {
         assert!(!names_entry("write a poem about spring", write));
         assert!(!names_entry("search the docs for write", write));
         assert!(names_entry("please call mcp__prx_server__write now", write));
+    }
+
+    #[test]
+    fn unnamed_lifecycle_collection_requires_unique_current_discovery() {
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(ProbeTool("skills_manage")), Box::new(ProbeTool("shell"))];
+        let catalog =
+            CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let view = catalog.view(&CatalogScope::default());
+        let manage = view
+            .iter_entries()
+            .find(|entry| entry.public_name == "skills_manage")
+            .unwrap();
+        let shell = view.iter_entries().find(|entry| entry.public_name == "shell").unwrap();
+        let reference = |entry: &CapabilityEntry| CapabilityRef {
+            id: entry.id.clone(),
+            fingerprint: entry.fingerprint,
+            generation: entry.generation,
+        };
+        assert!(discovered_lifecycle_entry(&view, &DiscoveredRefs::empty()).is_none());
+        let discovered = DiscoveredRefs::from_refs_for_test(BTreeSet::from([reference(manage)]));
+        assert_eq!(
+            discovered_lifecycle_entry(&view, &discovered).unwrap().public_name,
+            "skills_manage"
+        );
+        let ambiguous = DiscoveredRefs::from_refs_for_test(BTreeSet::from([reference(manage), reference(shell)]));
+        assert!(discovered_lifecycle_entry(&view, &ambiguous).is_none());
+        for schema in [true, false] {
+            let mut stale = reference(manage);
+            if schema {
+                *stale.fingerprint.0.first_mut().unwrap() ^= 1;
+            } else {
+                *stale.generation.0.first_mut().unwrap() ^= 1;
+            }
+            assert!(
+                discovered_lifecycle_entry(&view, &DiscoveredRefs::from_refs_for_test(BTreeSet::from([stale])))
+                    .is_none()
+            );
+        }
     }
 
     /// Only the built-in native `skills_manage` is collectable by name; an

@@ -7,8 +7,8 @@ mod ordinary_process;
 pub(crate) use ordinary_process::OrdinaryProcessLaunch;
 
 use super::{
-    Arc, BTreeMap, BTreeSet, CancellationToken, CapabilityAvailabilityLevel, CapabilityRef, CapabilityTarget,
-    CatalogScope, CausalDecisionStore, CausalEventSink, ConfigGeneration, Context, DecisionBackendFactory, DecisionKey,
+    Arc, BTreeMap, BTreeSet, CancellationToken, CapabilityAvailabilityLevel, CapabilityRef, CatalogScope,
+    CausalDecisionStore, CausalEventSink, ConfigGeneration, Context, DecisionBackendFactory, DecisionKey,
     DirectiveContext, Exposure, FactoryDeps, GateInputs, Memory, Ordering, SecurityPolicy, StoreMode, Tool,
     ToolExecutionService, TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnLoopRuntime,
     TurnServiceBuild, TurnServiceBuildError, TurnSourceProof, TurnSurfaceKind, directive_from_selection,
@@ -723,7 +723,13 @@ impl TurnDecisionService {
         let entries = self.catalog.resolve(&refs)?;
         let mut skills: Vec<crate::skills::Skill> = Vec::new();
         for entry in entries {
-            if entry.family != CapabilityTarget::Skill {
+            // Skill adapters (including skill_execute) are execution tools,
+            // not installed skill documents. Only concrete skill targets carry
+            // prompt metadata and may emit a selection receipt here.
+            if !matches!(
+                entry.target,
+                crate::tools::capability::catalog::ExecutionTarget::Skill { .. }
+            ) {
                 continue;
             }
             let metadata = entry

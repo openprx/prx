@@ -167,10 +167,18 @@ pub(crate) fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Op
         // Decision approval resolves this discriminator to a canonical exact
         // file operation; the legacy callback must not issue this glob.
         "file_edit" => Some(GrantOp::ResourceGlob("file_edit:edit:*".to_string(), RiskLevel::Medium)),
-        "http_request" => Some(GrantOp::ResourceGlob(
-            "http_request:request:*".to_string(),
-            RiskLevel::Medium,
-        )),
+        "http_request" => {
+            let url = reqwest::Url::parse(string_arg("url")?.trim()).ok()?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return None;
+            }
+            // The origin names the operation; the signed call digest also
+            // binds the complete URL, method, headers and body. No glob grant.
+            Some(GrantOp::ResourceExact(
+                format!("http_request:request:{}", url.origin().ascii_serialization()),
+                RiskLevel::Medium,
+            ))
+        }
         "message_send" => Some(GrantOp::ResourceGlob(
             "message_send:send:*".to_string(),
             RiskLevel::Medium,
@@ -373,6 +381,17 @@ pub(crate) fn file_operation(
 mod grant_requirement_tests {
     use super::{GrantOp, grant_op_for_call, requires_explicit_grant};
     use serde_json::json;
+
+    #[test]
+    fn http_approval_is_origin_scoped_and_rejects_invalid_urls() {
+        for raw in ["file:///tmp/test", "not a URL", "https://"] {
+            assert!(grant_op_for_call("http_request", &json!({"url":raw})).is_none());
+        }
+        assert!(
+            matches!(grant_op_for_call("http_request", &json!({"url":"https://example.com:443/path?q=value"})),
+            Some(GrantOp::ResourceExact(operation, _)) if operation == "http_request:request:https://example.com")
+        );
+    }
 
     /// The three actions `SkillsManageTool::authorize` refuses without a signed
     /// one-shot grant bound to the target, with and without their target

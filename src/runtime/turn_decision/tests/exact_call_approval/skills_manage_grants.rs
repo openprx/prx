@@ -237,12 +237,19 @@ async fn env(autonomy: AutonomyLevel, case: Case) -> Env {
 /// publication builder with the interactive surface policy and the session
 /// tools in the registry, instead of a hand-assembled service.
 async fn env_with(autonomy: AutonomyLevel, case: Case, production: bool) -> Env {
+    env_with_hops(autonomy, case, production, None).await
+}
+
+async fn env_with_hops(autonomy: AutonomyLevel, case: Case, production: bool, hops: Option<u8>) -> Env {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().expect("test: workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
     config.causal_tree.enabled = true;
+    if let Some(hops) = hops {
+        config.causal_tree.policy.max_decision_hops = hops;
+    }
     config.autonomy.level = autonomy;
     config.cost.prices.insert(
         "prx-local-model".to_owned(),
@@ -897,7 +904,7 @@ async fn read_only_autonomy_denies_the_import_in_the_execution_service() {
 /// in a turn error. It takes the ordinary path, which opens no approval, runs
 /// nothing and fails no turn.
 #[tokio::test]
-async fn supervised_named_non_grant_bound_action_is_not_collected() {
+async fn supervised_named_reads_execute_without_collecting_mutation_approval() {
     let env = env(AutonomyLevel::Supervised, Case::Import).await;
     let result = std::panic::AssertUnwindSafe(Box::pin(async {
         let cancel = CancellationToken::new();
@@ -927,7 +934,49 @@ async fn supervised_named_non_grant_bound_action_is_not_collected() {
                 ),
                 "{action}"
             );
-            assert!(context.execution_refs().is_empty(), "{action}");
+            if action.starts_with("lifecycle_") {
+                let selected = env
+                    .service
+                    .agent_execution_specs(proof.as_ref(), &context)
+                    .expect("read capability");
+                assert_eq!(
+                    selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+                    [action]
+                );
+                let tool = env
+                    .registry
+                    .iter()
+                    .find(|tool| tool.supports_name(action))
+                    .expect("read tool");
+                let result = tool
+                    .execute_named(
+                        action,
+                        serde_json::json!({"action":action,
+                    "_zc_scope_trusted":true,"_zc_scope":{"owner_id":env.owner}}),
+                    )
+                    .await
+                    .expect("read");
+                assert!(result.success, "{:?}", result.error);
+                assert!(
+                    tool.execute_named(
+                        action,
+                        serde_json::json!({"action":"lifecycle_publish", "proposal_id":PROPOSAL})
+                    )
+                    .await
+                    .is_err()
+                );
+                let other = tool
+                    .execute_named(
+                        action,
+                        serde_json::json!({"action":action,
+                    "_zc_scope_trusted":true,"_zc_scope":{"owner_id":"prx_other_owner"}}),
+                    )
+                    .await
+                    .expect("owner denial");
+                assert!(!other.success);
+            } else {
+                assert!(context.execution_refs().is_empty(), "{action}");
+            }
             assert!(
                 env.service
                     .load_pending_decision_approval(proof.owner_id(), proof.session_key(), context.decision_id())
@@ -1028,4 +1077,119 @@ async fn production_chat_service_supervised_import_reaches_a_pending_approval() 
 #[tokio::test]
 async fn production_chat_service_supervised_rollback_reaches_a_pending_approval() {
     Box::pin(scenario_with(AutonomyLevel::Supervised, Case::Rollback, true)).await;
+}
+
+#[tokio::test]
+async fn production_unnamed_lifecycle_import_collects_only_after_verified_discovery() {
+    for hops in [1, 2] {
+        let env = env_with_hops(AutonomyLevel::Supervised, Case::Import, true, Some(hops)).await;
+        // Search uses bounded public summaries. The mutation must remain
+        // discoverable ahead of read aliases for an executable-import request.
+        let view = env.service.catalog.view(&CatalogScope::default());
+        let hits = crate::tools::capability::search::CatalogSearch::find_filtered(
+            &view,
+            "skill lifecycle import executable bundle",
+            &[crate::causal_tree::branch::CapabilityTarget::NativeTool],
+            1,
+            |_| true,
+        );
+        assert_eq!(
+            hits.first().map(|hit| hit.entry.public_name.as_str()),
+            Some("skills_manage")
+        );
+
+        let cancel = CancellationToken::new();
+        let request = format!(
+            "Import the reviewed executable skill bundle from {} at revision {}. Discover the skill lifecycle management capability and ask for approval before changing anything.",
+            env.source.display(),
+            env.revision
+        );
+        let (proof, envelope) = recorded_approval_source(
+            &env.generation,
+            Arc::clone(&env.memory),
+            &request,
+            ChatMode::Edit,
+            "prx_unnamed_import",
+            70,
+        )
+        .await;
+        let context = env
+            .service
+            .decide_agent_initial(proof.as_ref(), AgentTurnKind::Repl, &cancel)
+            .await
+            .unwrap();
+        assert!(
+            context.approval_collection_proof().is_some(),
+            "unnamed import should collect after discovery: {:?}; prior hops={:?}; exposure={:?}; search={:?}",
+            context.directive(),
+            context.prior_hops.iter().map(|hop| &hop.selection).collect::<Vec<_>>(),
+            env.service
+                .catalog
+                .entry_for_public_name("skills_manage")
+                .unwrap()
+                .exposure,
+            crate::tools::capability::search::CatalogSearch::find_filtered(
+                &env.service.catalog.view(&CatalogScope::default()),
+                &request,
+                &[crate::causal_tree::branch::CapabilityTarget::NativeTool],
+                64,
+                |_| true
+            )
+            .iter()
+            .map(|hit| (hit.entry.public_name.as_str(), hit.entry.effect, hit.score))
+            .collect::<Vec<_>>()
+        );
+        assert!(context.execution_refs().is_empty());
+        env.assert_untouched(Case::Import);
+        let cleanup = AtomicBool::new(true);
+        let arguments = env.spec(Case::Import).arguments;
+        Box::pin(super::usage::exercise(super::usage::Fixture {
+            service: &env.service,
+            context: &context,
+            proof: proof.as_ref(),
+            envelope: &envelope,
+            config: &env.config,
+            memory: &env.memory,
+            registry: &env.registry,
+            tool_name: "skills_manage",
+            arguments: &arguments,
+            cleanup_confirmed: &cleanup,
+        }))
+        .await;
+        assert!(cleanup.load(Ordering::SeqCst));
+        assert!(
+            env.service
+                .load_pending_decision_approval(proof.owner_id(), proof.session_key(), context.decision_id())
+                .await
+                .is_ok()
+        );
+        env.assert_untouched(Case::Import);
+        assert!(env.service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
+    }
+}
+
+#[tokio::test]
+async fn explicit_spawn_intent_is_not_replaced_by_local_approval_collection() {
+    let env = env_with(AutonomyLevel::Supervised, Case::Import, true).await;
+    let request = "Use sessions_spawn to delegate the skills_manage lifecycle_import_executable task to a child.";
+    let (proof, _) = recorded_approval_source(
+        &env.generation,
+        Arc::clone(&env.memory),
+        request,
+        ChatMode::Edit,
+        "prx_delegate_import",
+        71,
+    )
+    .await;
+    let context = env
+        .service
+        .decide_agent_initial(proof.as_ref(), AgentTurnKind::Repl, &CancellationToken::new())
+        .await
+        .expect("delegation decision");
+    assert!(
+        context.approval_collection_proof().is_none(),
+        "explicit delegation cannot be intercepted as a local call"
+    );
+    env.assert_untouched(Case::Import);
+    assert!(env.service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
 }

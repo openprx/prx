@@ -895,7 +895,7 @@ impl Tool for SkillsManageTool {
 
     fn description(&self) -> &str {
         if self.lifecycle.is_some() {
-            "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Lifecycle proposals of learned revisions: 'lifecycle_status', 'lifecycle_list' and 'lifecycle_inspect' only read; 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes one and 'lifecycle_rollback' re-activates an earlier revision and 'lifecycle_import_executable' publishes an operator-authored executable bundle from a directory, bound to the complete bundle hash the operator reviewed, all under the operator's lifecycle mode and policy. Mutating actions are approval-gated."
+            "Manage skill lifecycle: import reviewed executable bundles, publish proposals, and roll back revisions. Lifecycle writes require exact operator approval. Also 'create', 'install', 'update', 'enable', 'disable', 'validate', 'sync' and 'remove' instruction skills. Lifecycle actions: 'lifecycle_status', 'lifecycle_list' and 'lifecycle_inspect' only read and must use their same-named read-only capabilities instead of this mixed-effect root; 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes one and 'lifecycle_rollback' re-activates an earlier revision and 'lifecycle_import_executable' publishes an operator-reviewed executable bundle from a directory, bound to the complete bundle hash the operator reviewed, all under the operator's lifecycle mode and policy. Mutating actions are approval-gated."
         } else {
             "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Mutating actions are approval-gated."
         }
@@ -909,7 +909,61 @@ impl Tool for SkillsManageTool {
         Some(std::sync::Arc::clone(self.execution_schema()))
     }
 
-    async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs = vec![self.spec()];
+        if self.lifecycle.is_some() {
+            specs.extend(LIFECYCLE_READ_ACTIONS.into_iter().map(|action| {
+                let mut properties = serde_json::Map::from_iter([("action".into(), json!({"type":"string","enum":[action]}))]);
+                let mut required = vec!["action"];
+                if action == "lifecycle_inspect" {
+                    properties.insert("proposal_id".into(), json!({"type":"string"}));
+                    required.push("proposal_id");
+                } else if action == "lifecycle_list" {
+                    properties.insert("skill_id".into(), json!({"type":"string"}));
+                }
+                ToolSpec {
+                    name: action.into(),
+                    description: format!("Read-only execution of skills_manage with action {action} for the current owner. This alias completes that skills_manage operation; do not rediscover or call the mixed-effect root to repeat the read. No publication or workspace mutation."),
+                    parameters: json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
+                }
+            }));
+        }
+        specs
+    }
+
+    fn supports_name(&self, name: &str) -> bool {
+        name == self.name() || (self.lifecycle.is_some() && LIFECYCLE_READ_ACTIONS.contains(&name))
+    }
+
+    async fn execute_named(&self, name: &str, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if name != self.name() {
+            let spec = self
+                .spec_for_name(name)
+                .ok_or_else(|| anyhow::anyhow!("unknown lifecycle read capability"))?;
+            crate::tools::schema::validate_execution_contract(name, &spec.parameters, &mut args)?;
+            anyhow::ensure!(
+                args.get("action").and_then(serde_json::Value::as_str) == Some(name),
+                "lifecycle read action changed"
+            );
+        }
+        self.execute_request(args).await
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_request(args).await
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::System, ToolCategory::Automation]
+    }
+}
+
+impl SkillsManageTool {
+    async fn execute_request(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
         crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let action = Self::required_string(&args, "action")?;
         if crate::tools::execution::scope_requires_owner_match(&args)
@@ -1015,14 +1069,6 @@ impl Tool for SkillsManageTool {
                 error: Some(error.to_string()),
             },
         })
-    }
-
-    fn tier(&self) -> ToolTier {
-        ToolTier::Extended
-    }
-
-    fn categories(&self) -> &'static [ToolCategory] {
-        &[ToolCategory::System, ToolCategory::Automation]
     }
 }
 

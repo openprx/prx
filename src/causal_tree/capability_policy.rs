@@ -71,7 +71,9 @@ pub const OWNER_ISOLATION_AWARE_TOOLS: &[&str] = &[
 
 /// Both public identity and actual backend must name the audited implementation.
 pub(crate) fn admits_owner_isolated_identity(public_name: &str, backend_name: &str) -> bool {
-    backend_name == public_name && OWNER_ISOLATION_AWARE_TOOLS.contains(&public_name)
+    (backend_name == public_name && OWNER_ISOLATION_AWARE_TOOLS.contains(&public_name))
+        || (backend_name == "skills_manage"
+            && matches!(public_name, "lifecycle_status" | "lifecycle_list" | "lifecycle_inspect"))
 }
 
 #[cfg(test)]

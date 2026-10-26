@@ -163,6 +163,10 @@ struct SelectedSkillTurn {
 
 /// A real turn whose discovery selects and admits the workspace skill `prx_skill`.
 async fn selected_skill_turn(lifecycle: bool) -> SelectedSkillTurn {
+    selected_skill_target_turn(lifecycle, false).await
+}
+
+async fn selected_skill_target_turn(lifecycle: bool, execute: bool) -> SelectedSkillTurn {
     let workspace = tempfile::tempdir().expect("test: workspace");
     let skill_dir = workspace.path().join("skills").join(SKILL_NAME);
     std::fs::create_dir_all(&skill_dir).expect("test: skill dir");
@@ -171,19 +175,39 @@ async fn selected_skill_turn(lifecycle: bool) -> SelectedSkillTurn {
         format!("---\nname: {SKILL_NAME}\ndescription: Inspect release metadata\n---\nlegacy body\n"),
     )
     .expect("test: skill file");
+    if execute {
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            "[skill]\nname='prx_skill'\ndescription='Inspect release metadata'\n[[tools]]\nname='run'\ndescription='Print a fixture marker'\nkind='shell'\ncommand='printf PRX_FIXTURE'\n",
+        ).expect("executable skill declaration");
+    }
     let mut config = base_config(workspace.path());
+    if execute {
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+    }
     config.skills_lifecycle.enabled = lifecycle;
     config.skills_lifecycle.owner_scope = Some("owner".to_owned());
     let generation = crate::config::new_shared(config.clone()).pin();
     let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
-    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(NoopTool),
         Box::new(crate::tools::SkillReadTool::new(
             workspace.path().to_owned(),
             config.clone(),
         )),
         Box::new(CapabilitySearchTool),
-    ]);
+    ];
+    if execute {
+        tools.push(Box::new(crate::tools::SkillExecuteTool::new(
+            workspace.path().to_owned(),
+            config.clone(),
+            Arc::new(crate::runtime::NativeRuntime::new()),
+            Arc::clone(&security),
+            &crate::config::BrowserConfig::default(),
+            &crate::config::HttpRequestConfig::default(),
+        )));
+    }
+    let registry = Arc::new(tools);
     let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
         Arc::clone(&registry),
         Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
@@ -203,7 +227,7 @@ async fn selected_skill_turn(lifecycle: bool) -> SelectedSkillTurn {
             execution,
             catalog_sources: sources(&generation, &config),
             surface_policy: SurfacePolicy {
-                direct_names: BTreeSet::from([SKILL_NAME.to_owned()]),
+                direct_names: BTreeSet::from([if execute { "skill_execute" } else { SKILL_NAME }.to_owned()]),
                 ..SurfacePolicy::default()
             },
             provider_catalog: &provider_catalog,
@@ -231,7 +255,11 @@ async fn selected_skill_turn(lifecycle: bool) -> SelectedSkillTurn {
     let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
         &generation,
         Arc::clone(&memory),
-        "inspect the available release metadata capability",
+        if execute {
+            "Call skill_execute exactly once using the reviewed skill and tool arguments"
+        } else {
+            "inspect the available release metadata capability"
+        },
         &format!("prx_skill_receipts_{}", uuid::Uuid::new_v4()),
     )
     .await;
@@ -527,5 +555,22 @@ fn an_admission_waiting_for_approval_is_not_an_executable_capability_id() {
     assert_eq!(
         unprompted_admission_ids(&admissions).collect::<Vec<_>>(),
         vec!["native_tool:native:free_tool".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn skill_execution_adapter_does_not_require_concrete_prompt_metadata() {
+    let turn = selected_skill_target_turn(false, true).await;
+    assert!(
+        turn.service
+            .agent_execution_specs(&turn.proof, &turn.context)
+            .expect("execution specs")
+            .specs
+            .iter()
+            .any(|spec| spec.name == "skill_execute")
+    );
+    assert_eq!(
+        selected_names(&turn).expect("native skill adapter has no prompt document"),
+        Vec::<String>::new()
     );
 }

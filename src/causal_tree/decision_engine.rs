@@ -276,6 +276,17 @@ impl<P: PredictionPort> PreparedHop<'_, '_, P> {
         self.candidate_bodies_changed_from(&prior.state)
     }
 
+    /// A newly discovered, gated proposal is progress even though it adds
+    /// no executable capability. This probe never issues a collection proof.
+    pub(crate) fn gained_collection_from_prepared(
+        &self,
+        prior: &PreparedHop<'_, '_, P>,
+        adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
+    ) -> bool {
+        CausalDecisionEngine::collection_candidate(self, adapter).is_some()
+            && CausalDecisionEngine::collection_candidate(prior, adapter).is_none()
+    }
+
     /// Selected discovery can authenticate an unchanged exact candidate.
     /// Compare borrowed readiness proofs, without creating new candidate sets.
     pub(crate) fn gained_direct_candidate_from_prepared(&self, prior: &PreparedHop<'_, '_, P>) -> bool {
@@ -769,23 +780,32 @@ impl CausalDecisionEngine {
         }
     }
 
+    /// At the read-hop limit, an already discovered operation may terminate
+    /// in argument collection. It cannot start another read or executable hop.
+    pub(crate) fn decide_terminal_with_collection<P: PredictionPort>(
+        mut prepared: PreparedHop<'_, '_, P>,
+        adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
+    ) -> Result<EngineDecision, EngineError> {
+        prepared.inputs.terminal_only = false;
+        if let Some(ready) = Self::prepare_collection_routing(&mut prepared, adapter)? {
+            return Ok(Self::finish_collection_decision(prepared, ready));
+        }
+        prepared.inputs.terminal_only = true;
+        Self::decide_terminal_prepared(prepared)
+    }
+
     /// Source eligibility is supplied by the verified service's sealed ingress proof.
     /// No backend sees this result and no executable capability is selected.
     #[inline(never)]
-    fn prepare_collection_routing<'a, 'catalog, P: PredictionPort>(
-        prepared: &mut PreparedHop<'a, 'catalog, P>,
+    fn collection_candidate<'a, 'catalog, P: PredictionPort>(
+        prepared: &PreparedHop<'a, 'catalog, P>,
         adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
-    ) -> Result<Option<CollectionReadyRecord>, EngineError> {
+    ) -> Option<(super::approval_collection::ApprovalReviewAdapter, CausalCandidate)> {
         let inputs = &prepared.inputs;
         let trusted = prepared.state.trusted.parts();
-        let candidate = adapter
+        adapter
             .filter(|_| {
                 !inputs.terminal_only
-                    // An interactive chat always publishes `sessions_spawn`, so
-                    // an outgoing delegation (and the child manifest derived
-                    // from it) exists on every turn. Only one that carries
-                    // requested work competes with the collection.
-                    && inputs.delegation.is_none_or(|(_, requested)| requested.is_empty())
                     && Instant::now() < inputs.deadline
                     && trusted.delivery.interactive
                     && trusted.delivery.approval_channel
@@ -806,8 +826,31 @@ impl CausalDecisionEngine {
                     &policy,
                     inputs.gates,
                 )
+                .filter(|candidate| {
+                    // Discovery also populates an optional outgoing child
+                    // manifest. That is not a request to delegate this call.
+                    inputs.delegation.is_none_or(|(_, requested)| {
+                        requested
+                            .iter()
+                            .all(|reference| candidate.required_capabilities().contains(reference))
+                    }) && !inputs.catalog.iter_entries().any(|entry| {
+                        matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
+                            && super::candidate_generator::names_entry(
+                                &prepared.state.routing_input.as_str().to_lowercase(),
+                                entry,
+                            )
+                    })
+                })
                 .map(|candidate| (adapter, candidate))
-            });
+            })
+    }
+
+    fn prepare_collection_routing<'a, 'catalog, P: PredictionPort>(
+        prepared: &mut PreparedHop<'a, 'catalog, P>,
+        adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
+    ) -> Result<Option<CollectionReadyRecord>, EngineError> {
+        let inputs = &prepared.inputs;
+        let candidate = Self::collection_candidate(prepared, adapter);
         let Some((adapter, candidate)) = candidate else {
             return Ok(None);
         };
