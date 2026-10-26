@@ -5,6 +5,30 @@ All notable changes to OpenPRX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.167] - 2026-10-26
+
+### Added
+
+- Add authenticated `prx plugins reload` with stdin-token input and a dry-run
+  mode for reloading trusted WASM plugins through the gateway.
+
+### Fixed
+
+- Anchor relative configuration and runtime directories before deriving paths.
+- Expose owner-scoped skill lifecycle reads in Supervised mode and discover
+  lifecycle mutations before collecting exact-call approval proposals.
+- Bind Shell and HTTP approvals to their complete arguments, preserve one-shot
+  execution on resume, and reject replay or altered calls.
+- Require skill metadata only for concrete skill targets, preserving execution
+  through capability adapters.
+- Join owned container cleanup after cancellation and dropped executions while
+  preserving the original work failure when cleanup also fails.
+
+### Documentation
+
+- Document approval review and resume, plugin reload authentication, and native,
+  container, and opt-in Linux cgroup containment boundaries.
+
 ## [0.8.166] - 2026-10-25
 
 ### Fixed
