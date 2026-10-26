@@ -1785,3 +1785,39 @@ causal-plane publications also share the parent accounting owner, and process
 workers carry the narrowed ceiling in their authenticated manifest. A parent
 unable to fund one cent refuses the launch. This is monetary admission; it does
 not merge the distinct per-turn token/context windows or claim a vendor billing cap.
+
+### Supervised exact-call collection
+
+Interactive Chat and authenticated Console can collect one proposed call for
+`file_write`, `file_edit`, an MCP tool with one fixed approval operation,
+`shell`, `http_request`, or a grant-bound `skills_manage` lifecycle action.
+Collection exposes only the selected schema and never dispatches the tool.
+Review approves the normalized complete arguments; changing a command, URL,
+method, header, body, artifact hash or target invalidates the approval. Resume
+uses the original call once, through the ordinary tool policy. HTTP private-host
+and allowlist checks still apply after approval.
+
+The plain `prx agent` CLI has no approval-review adapter. Use `prx chat` or the
+Console for Supervised collection, review and explicit resume; the CLI does not
+silently approve an operation or create an unreviewable pending request.
+
+Lifecycle reads have separate capabilities: `lifecycle_status`, `lifecycle_list`
+and `lifecycle_inspect`. Each requires its matching `action`; inspection also
+requires `proposal_id`. They retain owner checks and cannot accept a write
+action. The mixed-effect `skills_manage` capability remains approval-gated.
+An unnamed lifecycle request can enter proposal collection after a unique,
+current, source-bound discovery identifies that capability. Stale, ambiguous or
+absent discovery provides no authority. The proposed action must still be a
+grant-bound lifecycle mutation, and the operator must inspect and approve it.
+
+### Reload a trusted plugin in a running gateway
+
+`prx plugin reload NAME --gateway-url https://gateway.example.com` previews a
+reload without reading a token or contacting the gateway. Add
+`--token-from-stdin --yes` and pipe an already-paired token to apply it. Tokens
+are never accepted as command arguments or printed. HTTP is accepted only for
+numeric loopback addresses; redirects and ambient proxies are disabled. Both
+local ReadOnly mode and the gateway's authorization policy can refuse the
+request. Success reports the gateway's new plugin generation. Trust/revoke
+alone does not reload a running owner; this command calls its existing reload
+endpoint and does not restart it or change configuration.

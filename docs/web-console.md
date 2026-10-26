@@ -447,3 +447,17 @@ the level's value. Review the settings change before applying it through the
 existing transaction flow; revision checks and history rollback still apply.
 The backend refuses invalid durable values before any write. See
 [model settings and API examples](model-catalog.md#saving-a-model-level).
+
+### Exact-call review coverage
+
+Supervised exact-call collection includes named Shell and HTTP operations in
+addition to file, fixed-operation MCP and lifecycle mutations. Approval binds
+all normalized arguments; explicit resume executes the stored call once and
+retains tool-specific policy. A Console owner's existing isolation restrictions
+still apply, so this does not grant Console access to host Shell. The plain
+agent CLI has no review adapter; use Chat or Console for this workflow.
+
+An operator can call the authenticated plugin reload route through
+`prx plugin reload NAME --gateway-url URL --token-from-stdin --yes`. The command
+uses an existing paired token supplied on stdin and reports the returned plugin
+generation. It does not start or restart the gateway.

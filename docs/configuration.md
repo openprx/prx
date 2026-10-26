@@ -3043,3 +3043,26 @@ PRX_TEST_CGROUP_ROOT=/sys/fs/cgroup/prx-test cargo test --lib setsid_descendant_
 It starts a descendant in a new session, verifies its cgroup membership, kills the
 managed group, joins the shell, and checks removal. This test is opt-in because an
 ordinary developer shell does not necessarily own a delegated cgroup.
+
+### Relative configuration directories and managed container cleanup
+
+`--config-dir`, `OPENPRX_CONFIG_DIR` and `OPENPRX_WORKSPACE` are anchored to the
+process working directory before subsystems derive paths. A relative directory
+need not exist yet. Evolution analysis and other workspace paths therefore do
+not append the configuration directory a second time.
+
+Docker shell calls carry a fresh ownership label. After normal completion,
+cancellation or timeout, PRX force-removes matching owned containers and checks
+that none remain, within a ten-second cleanup deadline. A daemon failure or
+unconfirmed removal is reported as a cleanup failure, never successful joined
+cleanup. This supplements host process-group termination. Abrupt host/runtime
+shutdown and an unreachable container daemon cannot provide synchronous cleanup
+confirmation. Native macOS still has no cgroup boundary: use the Docker runtime
+for managed scripts that can detach with `setsid`; a native process group alone
+cannot contain them. Linux native containment requires the explicitly delegated
+`managed_cgroup_root` described above.
+
+Dropping an in-flight Docker call schedules bounded removal under the turn's
+cleanup owner, so the turn cannot acknowledge cleanup before that task settles.
+If work and terminal cleanup both fail, the error chain retains the original
+work failure as well as the unconfirmed-cleanup marker.
