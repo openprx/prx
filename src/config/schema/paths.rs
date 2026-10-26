@@ -378,7 +378,7 @@ pub(super) async fn resolve_runtime_config_dirs(
     if let Some(dir) = explicit_config_dir {
         let dir = dir.trim();
         if !dir.is_empty() {
-            let openprx_dir = PathBuf::from(dir);
+            let openprx_dir = std::path::absolute(dir).context("resolve --config-dir against the process directory")?;
             return Ok((
                 openprx_dir.clone(),
                 openprx_dir.join("workspace"),
@@ -390,7 +390,7 @@ pub(super) async fn resolve_runtime_config_dirs(
     if let Ok(custom_config_dir) = env_openprx("CONFIG_DIR") {
         let custom_config_dir = custom_config_dir.trim();
         if !custom_config_dir.is_empty() {
-            let openprx_dir = PathBuf::from(custom_config_dir);
+            let openprx_dir = std::path::absolute(custom_config_dir).context("resolve OPENPRX_CONFIG_DIR")?;
             return Ok((
                 openprx_dir.clone(),
                 openprx_dir.join("workspace"),
@@ -401,7 +401,8 @@ pub(super) async fn resolve_runtime_config_dirs(
 
     if let Ok(custom_workspace) = env_openprx("WORKSPACE") {
         if !custom_workspace.is_empty() {
-            let (openprx_dir, workspace_dir) = resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
+            let absolute = std::path::absolute(custom_workspace).context("resolve OPENPRX_WORKSPACE")?;
+            let (openprx_dir, workspace_dir) = resolve_config_dir_for_workspace(&absolute);
             return Ok((openprx_dir, workspace_dir, ConfigResolutionSource::EnvWorkspace));
         }
     }

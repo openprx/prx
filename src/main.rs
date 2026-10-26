@@ -1640,7 +1640,7 @@ async fn async_main() -> Result<()> {
         // Publish the explicit directory before anything can lazily create
         // process-global state (witness key, session-worker secret) that has no
         // `Config` in hand and would otherwise anchor on `$HOME/.openprx`.
-        config::set_process_config_dir(std::path::PathBuf::from(config_dir.trim()));
+        config::set_process_config_dir(std::path::absolute(config_dir.trim()).context("resolve --config-dir")?);
     }
 
     // session-worker must stay stdout-clean for IPC JSON.

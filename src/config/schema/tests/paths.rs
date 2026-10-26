@@ -269,6 +269,32 @@ async fn resolve_runtime_config_dirs_uses_env_config_dir_first() {
 }
 
 #[test]
+async fn relative_runtime_overrides_are_anchored_before_subsystems_join_paths() {
+    let _env_guard = env_override_lock().await;
+    let defaults = std::env::temp_dir().join("prx-path-defaults");
+    let relative = "prx-nonexistent-profile/config";
+    let expected = std::env::current_dir().unwrap().join(relative);
+    for source in ["flag", "OPENPRX_CONFIG_DIR", "OPENPRX_WORKSPACE"] {
+        test_remove_env("OPENPRX_CONFIG_DIR");
+        test_remove_env("OPENPRX_WORKSPACE");
+        let flag = if source == "flag" {
+            Some(relative)
+        } else {
+            test_set_env(source, relative);
+            None
+        };
+        let (config, workspace, _) = resolve_runtime_config_dirs(&defaults, &defaults.join("workspace"), flag)
+            .await
+            .unwrap();
+        assert_eq!(config, expected);
+        assert_eq!(workspace, expected.join("workspace"));
+        assert!(workspace.join("self/evolution/analysis").is_absolute());
+    }
+    test_remove_env("OPENPRX_CONFIG_DIR");
+    test_remove_env("OPENPRX_WORKSPACE");
+}
+
+#[test]
 async fn resolve_runtime_config_dirs_uses_active_workspace_marker() {
     let _env_guard = env_override_lock().await;
     let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
