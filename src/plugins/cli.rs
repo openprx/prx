@@ -5,6 +5,16 @@ use std::path::PathBuf;
 
 #[derive(Debug, Subcommand)]
 pub enum PluginCommand {
+    /// Reload one trusted plugin in an authenticated, already-running gateway.
+    Reload {
+        name: String,
+        #[arg(long)]
+        gateway_url: String,
+        #[arg(long)]
+        token_from_stdin: bool,
+        #[arg(long)]
+        yes: bool,
+    },
     /// List installed artifact identities and their current trust records (no guest execution).
     List,
     /// Inspect a local bundle without executing it or granting permissions.
@@ -30,14 +40,24 @@ pub enum PluginCommand {
 }
 
 #[allow(clippy::print_stdout)] // This is the operator CLI output boundary.
-pub fn handle(config: &crate::config::Config, command: PluginCommand) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(&run(config, command)?)?);
+pub async fn handle(config: &crate::config::Config, command: PluginCommand) -> anyhow::Result<()> {
+    let result = match command {
+        PluginCommand::Reload {
+            name,
+            gateway_url,
+            token_from_stdin,
+            yes,
+        } => super::cli_reload::reload(config, &name, &gateway_url, token_from_stdin, yes).await?,
+        other => run(config, other)?,
+    };
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 
 fn run(config: &crate::config::Config, command: PluginCommand) -> anyhow::Result<serde_json::Value> {
     let policy = PluginPolicy::from_config(config)?;
     match command {
+        PluginCommand::Reload { .. } => anyhow::bail!("reload requires the asynchronous gateway handler"),
         PluginCommand::Inspect { source } => inspect(&source, &policy),
         PluginCommand::List => {
             let root = config.workspace_dir.join("plugins");

@@ -36,6 +36,7 @@
 
 pub mod capabilities;
 pub mod cli;
+mod cli_reload;
 pub mod error;
 pub mod event_bus;
 pub mod host;
