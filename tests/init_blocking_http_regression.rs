@@ -4,30 +4,42 @@
 //! `reqwest::blocking` enters and drops a temporary Tokio runtime on the calling
 //! thread, which panics with "Cannot drop a runtime in a context where blocking
 //! is not allowed" when that thread belongs to the async runtime. Every blocking
-//! client in `src/onboard/wizard.rs` must therefore be created inside a
+//! client in `src/initialization/wizard.rs` must therefore be created inside a
 //! `std::thread::spawn` closure or a `runtime::blocking::spawn_blocking` closure.
 
 #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::unwrap_used)]
 
 const WIZARD_SOURCES: &[(&str, &str)] = &[
-    ("wizard.rs", include_str!("../src/onboard/wizard.rs")),
-    ("wizard/quick.rs", include_str!("../src/onboard/wizard/quick.rs")),
-    ("wizard/models.rs", include_str!("../src/onboard/wizard/models.rs")),
+    ("wizard.rs", include_str!("../src/initialization/wizard.rs")),
+    ("wizard/quick.rs", include_str!("../src/initialization/wizard/quick.rs")),
+    ("wizard/models.rs", include_str!("../src/providers/model_discovery.rs")),
     (
         "wizard/workspace.rs",
-        include_str!("../src/onboard/wizard/workspace.rs"),
+        include_str!("../src/initialization/wizard/workspace.rs"),
     ),
-    ("wizard/provider.rs", include_str!("../src/onboard/wizard/provider.rs")),
+    (
+        "wizard/provider.rs",
+        include_str!("../src/initialization/wizard/provider.rs"),
+    ),
     (
         "wizard/preferences.rs",
-        include_str!("../src/onboard/wizard/preferences.rs"),
+        include_str!("../src/initialization/wizard/preferences.rs"),
     ),
-    ("wizard/channels.rs", include_str!("../src/onboard/wizard/channels.rs")),
-    ("wizard/tunnel.rs", include_str!("../src/onboard/wizard/tunnel.rs")),
-    ("wizard/summary.rs", include_str!("../src/onboard/wizard/summary.rs")),
+    (
+        "wizard/channels.rs",
+        include_str!("../src/initialization/wizard/channels.rs"),
+    ),
+    (
+        "wizard/tunnel.rs",
+        include_str!("../src/initialization/wizard/tunnel.rs"),
+    ),
+    (
+        "wizard/summary.rs",
+        include_str!("../src/initialization/wizard/summary.rs"),
+    ),
     (
         "wizard/persistence.rs",
-        include_str!("../src/onboard/wizard/persistence.rs"),
+        include_str!("../src/initialization/wizard/persistence.rs"),
     ),
 ];
 
@@ -72,7 +84,7 @@ fn enclosing_top_level_function(lines: &[&str], index: usize) -> String {
 fn onboard_wizard_never_builds_a_blocking_client_on_the_async_worker() {
     assert!(WIZARD_SOURCES.len() > 1, "scan the root and production children");
     assert!(WIZARD_SOURCES.iter().all(|(_, source)| !source.trim().is_empty()));
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/onboard/wizard");
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/initialization/wizard");
     for entry in std::fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
         if path.is_file() && path.extension().and_then(|extension| extension.to_str()) == Some("rs") {

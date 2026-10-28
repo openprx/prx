@@ -94,7 +94,7 @@
 "onboard":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/onboard/**"
+          - "src/initialization/**"
 
 "provider":
   - changed-files:

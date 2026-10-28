@@ -406,7 +406,7 @@ pub async fn start_channels_with_config(
     }
 
     if channels.is_empty() {
-        println!("No channels configured. Run `prx onboard` to set up channels.");
+        println!("No channels configured. Run `prx init` to set up channels.");
         return Ok(());
     }
 

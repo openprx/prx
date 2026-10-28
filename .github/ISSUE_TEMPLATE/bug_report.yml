@@ -72,7 +72,7 @@ body:
       label: Steps to reproduce
       description: Please provide exact commands/config.
       placeholder: |
-        1. prx onboard --interactive
+        1. prx init --interactive
         2. prx daemon
         3. Observe crash in logs
       render: bash

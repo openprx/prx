@@ -289,7 +289,6 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
     }
     match command {
         Commands::Init { .. } => anyhow::bail!("BUG: Init command should have been handled earlier"),
-        Commands::Onboard { .. } => anyhow::bail!("BUG: Onboard command should have been handled earlier"),
         Commands::Completions { .. } => anyhow::bail!("BUG: Completions command should have been handled earlier"),
         Commands::SessionWorker { .. } => anyhow::bail!("BUG: SessionWorker command should have been handled earlier"),
         Commands::Go { .. } => anyhow::bail!("BUG: Go command should have been handled earlier"),

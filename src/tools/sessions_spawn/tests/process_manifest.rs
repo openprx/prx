@@ -121,10 +121,9 @@ async fn spawn_agent_uses_identity_prompt() {
     std::fs::write(identity_dir.join("SOUL.md"), "Identity Soul").unwrap();
 
     let mut agents = HashMap::new();
-    agents.insert(
-        "alpha".to_string(),
-        make_agent_config(Some("identities/alpha".to_string())),
-    );
+    let mut agent = make_agent_config(Some("identities/alpha".to_string()));
+    agent.system_prompt = Some("Explicit role instruction sentinel".to_string());
+    agents.insert("alpha".to_string(), agent);
 
     let (ch, sent) = RecordingChannel::new();
     let tool = SessionsSpawnTool::new(
@@ -179,6 +178,7 @@ async fn spawn_agent_uses_identity_prompt() {
     };
     assert!(full_output.contains("### SOUL.md"));
     assert!(full_output.contains("Identity Soul"));
+    assert!(full_output.contains("Explicit role instruction sentinel"));
 }
 
 #[test]

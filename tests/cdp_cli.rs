@@ -708,14 +708,14 @@ fn init_refuses_a_hosted_kind() {
 #[test]
 fn quick_setup_decision_flags_use_the_shared_service() {
     let temp = TempDir::new().expect("test: temp");
-    let dir = temp.path().join("onboard");
+    let dir = temp.path().join("init");
     let dir_text = dir.to_string_lossy().to_string();
     let output = prx(
         temp.path(),
         &[
             "--config-dir",
             &dir_text,
-            "onboard",
+            "init",
             "--provider",
             "ollama",
             "--model",
@@ -734,7 +734,9 @@ fn quick_setup_decision_flags_use_the_shared_service() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let written = std::fs::read_to_string(dir.join("config.toml")).expect("test: config");
+    let written = openprx::config::files::read_merged_toml_with_gate(&dir.join("config.toml"))
+        .expect("test: config")
+        .to_string();
     assert!(
         written.contains("compatible_http") && written.contains("decision_endpoint"),
         "{written}"
@@ -747,7 +749,7 @@ fn quick_setup_decision_flags_use_the_shared_service() {
         &[
             "--config-dir",
             &hosted_text,
-            "onboard",
+            "init",
             "--provider",
             "ollama",
             "--decision-backend",

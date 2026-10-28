@@ -1273,7 +1273,7 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
             crate::security::redaction::redact_provider_text(provider_name)
         );
 
-        match crate::onboard::run_models_probe_read_only(config, Some(provider_name), use_cache) {
+        match crate::providers::model_discovery::run_models_probe_read_only(config, Some(provider_name), use_cache) {
             Ok(()) => {
                 ok_count += 1;
                 println!("    ✅ model catalog check passed");
@@ -1756,7 +1756,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     } else {
         items.push(DiagItem::warn(
             cat,
-            "no channels configured — run `prx onboard` to set one up",
+            "no channels configured — run `prx init` to set one up",
         ));
     }
 
@@ -1994,8 +1994,15 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Key workspace files
-    check_file_exists(ws, "SOUL.md", false, cat, items);
-    check_file_exists(ws, "AGENTS.md", false, cat, items);
+    for name in ["SOUL.md", "AGENTS.md"] {
+        check_file_exists(
+            &crate::identity::root::file_directory(ws, name),
+            name,
+            false,
+            cat,
+            items,
+        );
+    }
 }
 
 fn check_file_exists(base: &Path, name: &str, required: bool, cat: &'static str, items: &mut Vec<DiagItem>) {

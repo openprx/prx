@@ -343,6 +343,9 @@ fn worker_system_prompt_keeps_agent_instructions_without_a_static_tool_catalog()
     let mut manifest = base_manifest(workspace.path(), "capability");
     manifest.model = "k3".to_string();
     manifest.system_prompt = Some("Use file tools and verify every artifact.".to_string());
+    let identity = workspace.path().join("identity/worker");
+    std::fs::create_dir_all(&identity).unwrap();
+    std::fs::write(identity.join("SOUL.md"), "Worker role identity sentinel").unwrap();
 
     let prompt = build_worker_system_prompt(&manifest, &config, true);
 
@@ -351,5 +354,7 @@ fn worker_system_prompt_keeps_agent_instructions_without_a_static_tool_catalog()
     assert!(prompt.contains("Use tools when the request requires action"));
     assert!(prompt.contains("## Delegated Agent Instructions"));
     assert!(prompt.contains("Use file tools and verify every artifact."));
+    assert!(prompt.contains("Worker role identity sentinel"));
+    assert!(prompt.contains("## Additional Role Instructions"));
     assert!(prompt.contains("Never claim that a file, command, or check succeeded"));
 }

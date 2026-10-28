@@ -30,7 +30,7 @@ Options:
 
 The default binary path does not require Rust, Cargo, Git, or sudo.
 After installation, configure PRX with:
-  prx onboard --interactive
+  prx init --interactive
 EOF
 }
 
@@ -271,7 +271,7 @@ esac
 cat <<'EOF'
 
 Next:
-  prx onboard --interactive
+  prx init --interactive
 
 Optional daemon service:
   prx service install

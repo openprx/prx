@@ -388,7 +388,7 @@ impl DecisionSetup {
             anyhow::bail!(
                 "the decision backend `{}` is a hosted service, which needs a credential: choose it with \
                  `prx causal config set backend` (with a `cred-` reference from `prx providers credential set`) \
-                 or `prx onboard --interactive`",
+                 or `prx init --interactive`",
                 self.kind.as_str()
             );
         }

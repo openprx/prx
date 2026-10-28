@@ -4,7 +4,7 @@ use super::{
     canonical_provider_name, catalog_models_for_provider, default_model_for_provider,
     fetch_live_models_for_provider_off_runtime, humanize_age, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
     is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_zai_alias, is_zai_cn_alias, load_cached_models_for_provider,
-    print_bullet, prioritize_default_model, style, supports_live_model_fetch,
+    print_bullet, prioritize_default_model, provider_credential_env_var, style, supports_live_model_fetch,
 };
 
 // ── Step 2: Provider & API Key ───────────────────────────────────
@@ -538,6 +538,7 @@ pub(super) async fn setup_provider(workspace_dir: &Path) -> Result<(String, Stri
 ///
 /// Each provider line below prints the label through the one redaction helper:
 /// a `custom:` URL may carry `user:password@`.
+#[cfg(test)]
 pub(super) fn setup_provider_line(provider_name: &str) -> String {
     format!(
         "  {} Provider:   {}",
@@ -563,48 +564,6 @@ pub(super) fn quick_summary_provider_line(config: &Config) -> String {
         style("🤖").cyan(),
         crate::providers::redact_endpoint_userinfo(crate::providers::selection::default_provider(config))
     )
-}
-
-/// Map provider name to its conventional env var
-/// The environment variable that holds `name`'s own credential, if the
-/// provider has one. Model discovery reads only this.
-pub(super) fn provider_credential_env_var(name: &str) -> Option<&'static str> {
-    if canonical_provider_name(name) == "qwen-code" {
-        return Some("QWEN_OAUTH_TOKEN");
-    }
-
-    Some(match canonical_provider_name(name) {
-        "openrouter" => "OPENROUTER_API_KEY",
-        "anthropic" => "ANTHROPIC_API_KEY",
-        "openai" => "OPENAI_API_KEY",
-        "ollama" => "OLLAMA_API_KEY",
-        "llamacpp" => "LLAMACPP_API_KEY",
-        "venice" => "VENICE_API_KEY",
-        "groq" => "GROQ_API_KEY",
-        "mistral" => "MISTRAL_API_KEY",
-        "deepseek" => "DEEPSEEK_API_KEY",
-        "xai" => "XAI_API_KEY",
-        "together-ai" => "TOGETHER_API_KEY",
-        "fireworks" | "fireworks-ai" => "FIREWORKS_API_KEY",
-        "perplexity" => "PERPLEXITY_API_KEY",
-        "cohere" => "COHERE_API_KEY",
-        "kimi-code" => "KIMI_CODE_API_KEY",
-        "moonshot" => "MOONSHOT_API_KEY",
-        "glm" => "GLM_API_KEY",
-        "minimax" => "MINIMAX_API_KEY",
-        "qwen" => "DASHSCOPE_API_KEY",
-        "qianfan" => "QIANFAN_API_KEY",
-        "zai" => "ZAI_API_KEY",
-        "synthetic" => "SYNTHETIC_API_KEY",
-        "opencode" | "opencode-zen" => "OPENCODE_API_KEY",
-        "vercel" | "vercel-ai" => "VERCEL_API_KEY",
-        "cloudflare" | "cloudflare-ai" => "CLOUDFLARE_API_KEY",
-        "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
-        "gemini" => "GEMINI_API_KEY",
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
-        "astrai" => "ASTRAI_API_KEY",
-        _ => return None,
-    })
 }
 
 /// The environment variable the daemon itself reads for `name`'s credential,
@@ -668,4 +627,36 @@ pub(super) fn shell_quoted(value: &str) -> String {
 
 pub(super) fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
     matches!(canonical_provider_name(provider_name), "ollama" | "llamacpp")
+}
+
+pub(super) fn choose_model_level(
+    provider: &str,
+    model: &str,
+) -> Result<std::collections::BTreeMap<String, crate::config::model_settings::ModelSettings>> {
+    let release = crate::providers::catalog::ReleaseCatalog::embedded_ref()?;
+    let Some(row) = release.model(&crate::providers::ProviderId::of(provider), model) else {
+        return Ok(Default::default());
+    };
+    if row.levels.is_empty() {
+        return Ok(Default::default());
+    }
+    let levels = ["low", "medium", "high"];
+    let default = levels
+        .iter()
+        .position(|level| row.default_level.as_deref() == Some(*level))
+        .unwrap_or(1);
+    let choice = Select::new()
+        .with_prompt("Model level")
+        .items(levels)
+        .default(default)
+        .interact()?;
+    let level = levels
+        .get(choice)
+        .ok_or_else(|| anyhow::anyhow!("invalid model level selection"))?;
+    let settings = crate::config::model_settings::ModelSettings {
+        level: Some((*level).to_owned()),
+        ..Default::default()
+    };
+    settings.validate(&row.id)?;
+    Ok([(row.id.clone(), settings)].into())
 }

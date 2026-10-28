@@ -277,7 +277,23 @@ fn load_openclaw_bootstrap_files(prompt: &mut String, workspace_dir: &Path, max_
     prompt.push_str(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
     );
-    prompt.push_str(&build_identity_prompt_with_limit(workspace_dir, max_chars_per_file));
+    if crate::identity::root::file_directory(workspace_dir, "SOUL.md") != workspace_dir {
+        prompt.push_str(
+            "Active role files SOUL.md, AGENTS.md, IDENTITY.md and THINKING.md live under `identities/main/` relative to the workspace. Read or update them there, including when older instructions name only the file. Any root copies are inactive migration backups. Other context files and bootstrap state remain at the workspace root.\n\n",
+        );
+    }
+    for filename in [
+        "SOUL.md",
+        "AGENTS.md",
+        "IDENTITY.md",
+        "USER.md",
+        "TOOLS.md",
+        "MEMORY.md",
+        "THINKING.md",
+    ] {
+        let directory = crate::identity::root::file_directory(workspace_dir, filename);
+        inject_workspace_file(prompt, &directory, filename, max_chars_per_file);
+    }
 
     let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
     let bootstrap_completed = workspace_dir.join("state/bootstrap.completed");
@@ -335,6 +351,31 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_main_identity_is_loaded_with_workspace_user_context() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("SOUL.md"), "Legacy identity sentinel").unwrap();
+        crate::identity::root::initialize(workspace.path(), &Default::default()).unwrap();
+        std::fs::write(
+            workspace.path().join("identities/main/SOUL.md"),
+            "Managed identity sentinel",
+        )
+        .unwrap();
+        std::fs::write(workspace.path().join("USER.md"), "Workspace user sentinel").unwrap();
+        let ctx = PromptContext {
+            workspace_dir: workspace.path(),
+            model_name: "test-model",
+            skills: &[],
+            identity_config: None,
+            bootstrap_max_chars: None,
+            native_tools: true,
+        };
+        let prompt = IdentitySection.build(&ctx).unwrap();
+        assert!(prompt.contains("Managed identity sentinel"));
+        assert!(prompt.contains("Workspace user sentinel"));
+        assert!(!prompt.contains("Legacy identity sentinel"));
+    }
 
     #[test]
     fn identity_section_with_aieos_replaces_workspace_files() {

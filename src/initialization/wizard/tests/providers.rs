@@ -75,7 +75,7 @@ fn onboarding_credential_hints_name_only_what_the_daemon_reads() {
     let sources = [
         include_str!("../../wizard.rs"),
         include_str!("../quick.rs"),
-        include_str!("../models.rs"),
+        include_str!("../../../providers/model_discovery.rs"),
         include_str!("../workspace.rs"),
         include_str!("../provider.rs"),
         include_str!("../preferences.rs"),
@@ -86,7 +86,7 @@ fn onboarding_credential_hints_name_only_what_the_daemon_reads() {
     ];
     assert!(sources.len() > 1);
     assert!(sources.iter().all(|source| !source.trim().is_empty()));
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/onboard/wizard");
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/initialization/wizard");
     for entry in std::fs::read_dir(directory).expect("read wizard sources") {
         let path = entry.expect("wizard source entry").path();
         if path.is_file() && path.extension().and_then(|extension| extension.to_str()) == Some("rs") {

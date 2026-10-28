@@ -748,7 +748,7 @@ impl GeminiProvider {
                  2. Set GEMINI_API_KEY or GOOGLE_API_KEY env var\n\
                  3. Run `gemini` CLI to authenticate (tokens will be reused)\n\
                  4. Get an API key from https://aistudio.google.com/app/apikey\n\
-                 5. Run `prx onboard` to configure"
+                 5. Run `prx init` to configure"
             )
         })?;
 

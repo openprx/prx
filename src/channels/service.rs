@@ -17,7 +17,7 @@ pub(super) async fn bind_telegram_identity(config: &Config, identity: &str) -> R
 
     let mut updated = config.clone();
     let Some(telegram) = updated.channels_config.telegram.as_mut() else {
-        anyhow::bail!("Telegram channel is not configured. Run `prx onboard --channels-only` first");
+        anyhow::bail!("Telegram channel is not configured. Run `prx init --channels-only` first");
     };
 
     if telegram.allowed_users.iter().any(|u| u == "*") {

@@ -5,6 +5,22 @@ All notable changes to OpenPRX will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.8.168] - 2026-10-28
+
+### Changed
+
+- Consolidate persistent setup under `prx init`, including interactive setup,
+  explicit model/credential options and channel-only repair. Remove `onboard`
+  and update bootstrap scripts to `--init` and `--interactive-init`.
+- Share identity templates and delegated prompt composition across execution
+  modes. Publish main role files under `workspace/identities/main`, preserving
+  legacy root files as migration backups and keeping user/memory files scoped
+  to the workspace.
+- Add `prx config agents new` with automatic identity directory allocation,
+  configuration preview/apply and compensation of failed creation.
+
 ## [0.8.167] - 2026-10-26
 
 ### Added

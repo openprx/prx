@@ -387,7 +387,7 @@ fn list_request(
                         shape: ListShape::Ollama,
                     });
                 }
-                return crate::onboard::wizard::resolve_live_models_endpoint(label, api_url).map(bearer);
+                return crate::providers::model_discovery::resolve_live_models_endpoint(label, api_url).map(bearer);
             }
             match name {
                 "openrouter" => Some(bearer("https://openrouter.ai/api/v1/models".to_string())),
@@ -408,7 +408,7 @@ fn list_request(
                     headers: Vec::new(),
                     shape: ListShape::Ollama,
                 }),
-                _ => crate::onboard::wizard::resolve_live_models_endpoint(label, api_url).map(bearer),
+                _ => crate::providers::model_discovery::resolve_live_models_endpoint(label, api_url).map(bearer),
             }
         }
         _ => None,
@@ -420,7 +420,7 @@ fn list_request(
 fn anthropic_headers(credential: Option<&str>) -> Vec<(&'static str, String)> {
     let mut headers = vec![("anthropic-version", "2023-06-01".to_string())];
     match credential {
-        Some(token) if crate::onboard::auto_detect::is_claude_code_oauth_setup_token(token) => {
+        Some(token) if crate::auth::discovery::is_claude_code_oauth_setup_token(token) => {
             headers.push(("authorization", format!("Bearer {token}")));
             headers.push(("anthropic-beta", "oauth-2025-04-20".to_string()));
         }

@@ -1,35 +1,14 @@
-use crate::channels::build_identity_prompt;
 use crate::config::Config;
 use crate::session_worker::protocol::WorkerManifest;
 
-const DEFAULT_SUB_AGENT_SYSTEM_PROMPT: &str = "\
-You are a sub-agent handling a specific delegated task. \
-Complete the task thoroughly and report results concisely. \
-Focus only on the assigned task; do not ask clarifying questions.";
-
 fn resolve_system_prompt(manifest: &WorkerManifest) -> String {
-    if let Some(prompt) = manifest
-        .system_prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return prompt.to_string();
-    }
-
-    if let Some(identity_dir) = manifest
+    let directory = manifest
         .identity_dir
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        let prompt = build_identity_prompt(&manifest.workspace_dir.join(identity_dir));
-        if !prompt.trim().is_empty() {
-            return prompt;
-        }
-    }
-
-    DEFAULT_SUB_AGENT_SYSTEM_PROMPT.to_string()
+        .map(|directory| manifest.workspace_dir.join(directory));
+    crate::identity::delegated::compose(directory.as_deref(), manifest.system_prompt.as_deref())
 }
 
 /// Build the worker's leading system message from the same runtime prompt

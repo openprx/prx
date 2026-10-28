@@ -49,7 +49,7 @@ Linux and macOS:
 ```bash
 curl -fsSL https://github.com/openprx/prx/releases/latest/download/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
-prx onboard --interactive
+prx init --interactive
 prx daemon
 ```
 
@@ -57,7 +57,7 @@ Windows PowerShell:
 
 ```powershell
 irm https://github.com/openprx/prx/releases/latest/download/install.ps1 | iex
-prx onboard --interactive
+prx init --interactive
 prx daemon
 ```
 
@@ -73,7 +73,7 @@ To build from a checkout with the pinned Rust 1.99.0 toolchain:
 git clone https://github.com/openprx/prx.git
 cd prx
 cargo build --release --locked --bin prx
-./target/release/prx onboard --interactive
+./target/release/prx init --interactive
 ```
 
 Release binaries and normal source builds leave Matrix support out. To build

@@ -19,13 +19,71 @@ model support from the endpoint URL. These changes do not write configuration.
 
 ```bash
 # Interactive setup wizard
-prx onboard --interactive
+prx init --interactive
 
 # Inspect the effective configuration
 prx config show
 ```
 
 ## Choosing the Configuration Directory
+
+`init` is the sole persistent setup entry point. The former `onboard` command
+has been removed; replace it with `init` in scripts. Bare `prx init` remains
+noninteractive and uses the release catalog's default provider/model.
+
+```bash
+prx init --spec full --dir /path/to/config
+prx init --interactive
+prx init --provider openrouter --model openai/gpt-5-mini --from-env PRX_SETUP_KEY
+prx init --channels-only
+```
+
+Full setup over existing configuration requires `--force`. This repairs the
+configuration and retains explicit settings; supplied selections replace only
+their fields. `--interactive` rejects quick-setup value flags. `--channels-only`
+requires existing configuration and accepts only target selection, leaving
+models, agents and other sections intact. Interactive setup retains channel,
+tunnel, integration, memory, persona and decision setup, plus optional channel
+launch after configuration is saved. Noninteractive setup does not launch a
+service. Hosted decision credentials still use `--decision-credential-stdin`;
+remote decision processing remains separately opt-in.
+
+Configuration generation is journaled. Identity publication and decision
+credential/configuration setup have separate completion steps: an error after
+the base configuration commits explicitly reports that fact. Do not interpret
+every nonzero setup exit as "nothing was written."
+
+### Managed identities
+
+New initialization puts the main role's `SOUL.md`, `AGENTS.md`, `IDENTITY.md`
+and `THINKING.md` under `workspace/identities/main/`. Existing root role files
+are copied verbatim and retained as migration backups. Once the managed main
+identity is published, edit its files; root backup copies are no longer the
+active persona. Workspaces not yet migrated continue to load the legacy root
+layout. `USER.md`, `TOOLS.md`, `MEMORY.md`, `BOOTSTRAP.md`, `HEARTBEAT.md` and
+bootstrap completion state remain workspace-scoped.
+
+```bash
+# Preview creation, then apply the same operation.
+prx config agents new reviewer --provider openrouter --model openai/gpt-5-mini
+prx config agents new reviewer --provider openrouter --model openai/gpt-5-mini --yes
+```
+
+Creation automatically writes `identity_dir = "identities/reviewer"` and
+creates compact `AGENTS.md` and `SOUL.md` files. If the configuration plan
+requires a revision-bound high-risk confirmation, use the revision printed by
+the preview. Role IDs are stable lowercase identifiers; `main` is reserved.
+Existing roles or directories are never overwritten. A failed transaction
+compensates unchanged new files; a crash or indeterminate commit can leave a
+`.creation-pending` marker for inspection, and a retry refuses to overwrite it.
+Model rebinding with `config agents set` leaves the identity path unchanged.
+
+All three delegation paths now compose identity files followed by nonempty
+`system_prompt` instructions. An explicit prompt no longer suppresses the
+identity directory in process mode, and task mode honors it as well. Directory
+selection does not imply inheritance of the main persona, separate memory or
+additional permissions. Process workers copy the selected role into their
+temporary worker directory; those copies are not persistent identity sources.
 
 Every command accepts the global `--config-dir <DIR>`. It selects the whole
 configuration tree the run reads and writes: `config.toml`, `config.d/`,
@@ -2407,9 +2465,9 @@ The `[[providers.tool_dialects]]` table still loads, with a deprecation
 warning; `prx providers migrate --apply` moves it into `[[providers.models]]`.
 
 A secret on the command line is visible to other local users in the process
-list and stays in the shell history. `prx onboard --api-key`, `prx go -k`
+list and stays in the shell history. `prx init --api-key`, `prx go -k`
 and `prx auth paste-token --token` still accept one, and print a
-deprecation warning on stderr; use `prx onboard --from-stdin` or
+deprecation warning on stderr; use `prx init --from-stdin` or
 `--from-env VAR`, `prx go --from-stdin` or `--from-env VAR`, and
 `prx auth paste-token --from-stdin` (or its hidden prompt) instead.
 

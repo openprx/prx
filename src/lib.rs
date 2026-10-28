@@ -109,6 +109,7 @@ pub(crate) mod health;
 pub mod heartbeat;
 pub(crate) mod hooks;
 pub mod identity;
+pub mod initialization;
 pub mod integrations;
 pub mod llm;
 pub(crate) mod markdown;
@@ -118,7 +119,6 @@ pub mod migration;
 pub(crate) mod multimodal;
 pub mod nodes;
 pub mod observability;
-pub mod onboard;
 #[cfg(feature = "wasm-plugins")]
 pub mod plugins;
 pub mod providers;
@@ -626,7 +626,7 @@ mod module_ownership_tests {
             "mod multimodal;",
             "mod nodes;",
             "mod observability;",
-            "mod onboard;",
+            "mod initialization;",
             "mod plugins;",
             "mod providers;",
             "mod recovery;",

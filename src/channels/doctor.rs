@@ -59,14 +59,14 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             }
             println!("\nTo start channels: prx channel start");
             println!("To check health:    prx channel doctor");
-            println!("To configure:      prx onboard");
+            println!("To configure:      prx init");
             Ok(())
         }
         crate::ChannelCommands::Add {
             channel_type,
             config: _,
         } => {
-            anyhow::bail!("Channel type '{channel_type}' — use `prx onboard` to configure channels");
+            anyhow::bail!("Channel type '{channel_type}' — use `prx init` to configure channels");
         }
         crate::ChannelCommands::Remove { name } => {
             anyhow::bail!("Remove channel '{name}' — edit ~/.openprx/config.toml directly");
@@ -355,7 +355,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
-        println!("No real-time channels configured. Run `prx onboard` first.");
+        println!("No real-time channels configured. Run `prx init` first.");
         return Ok(());
     }
 

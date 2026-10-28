@@ -20,7 +20,7 @@ export PATH="$HOME/.local/bin:$PATH"
 Then configure PRX:
 
 ```bash
-prx onboard --interactive
+prx init --interactive
 ```
 
 The installer does not collect provider credentials. Onboarding is separate so
@@ -32,7 +32,7 @@ Run in PowerShell:
 
 ```powershell
 irm https://github.com/openprx/prx/releases/latest/download/install.ps1 | iex
-prx onboard --interactive
+prx init --interactive
 ```
 
 The PowerShell installer adds its per-user installation directory to the user
@@ -113,7 +113,7 @@ opt in to the Matrix channel explicitly:
 cargo build --release --locked --bin prx --features channel-matrix
 ```
 
-After installing that binary, `prx onboard --interactive` offers Matrix. A
+After installing that binary, `prx init --interactive` offers Matrix. A
 default binary reports an existing `[channels_config.matrix]` configuration as
 unavailable through `prx doctor` and at channel startup.
 

@@ -12,7 +12,6 @@ use super::{
     spawn_event_scope, spawn_lineage, spawn_session_scope_key, sub_agent_reported_failure, task_failure_reason,
     task_terminal, termination_cause, watch_process_mode_monitor, watch_task_mode_monitor,
 };
-use crate::channels::build_identity_prompt;
 use crate::providers;
 use crate::security::SideEffectGate;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
@@ -1487,18 +1486,13 @@ impl SessionsSpawnTool {
         let task_lineage = run_lineage.clone();
         let agent_label_for_registry = selected_agent.as_ref().map(|(name, _)| name.clone());
         let (system_prompt, filtered_tools) = if let Some((agent, cfg)) = selected_agent {
-            let identity_prompt = cfg
+            let identity_path = cfg
                 .identity_dir
                 .as_deref()
                 .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(|identity_dir| build_identity_prompt(&identity_workspace.join(identity_dir)))
-                .unwrap_or_default();
-            let prompt = if identity_prompt.trim().is_empty() {
-                DEFAULT_SUB_AGENT_SYSTEM_PROMPT.to_string()
-            } else {
-                identity_prompt
-            };
+                .filter(|value| !value.is_empty())
+                .map(|directory| identity_workspace.join(directory));
+            let prompt = crate::identity::delegated::compose(identity_path.as_deref(), cfg.system_prompt.as_deref());
             let memory_scope = parse_memory_scope(cfg.memory_scope.as_deref())?;
             let tools = tools.map(|registry| {
                 if ordinary_publication.is_some() {

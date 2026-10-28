@@ -331,7 +331,7 @@ numeric alternate IP forms, mapped IPv6, `localhost.` and subdomains are not
 loopback exemptions. Other endpoints require HTTPS. URL user information,
 query strings and fragments are refused.
 
-`prx onboard --decision-backend typesafe|openrouter --decision-model <id>
+`prx init --decision-backend typesafe|openrouter --decision-model <id>
 --decision-credential-stdin` (and the interactive wizard) store the hosted
 credential as `cred-decision-<kind>`, reference it and leave remote processing
 off; setup refuses when that reference already exists and never replaces it.

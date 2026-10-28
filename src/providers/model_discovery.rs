@@ -1,15 +1,23 @@
-use super::{
-    AuthProfilesStore, Config, Context, DiscoveredModel, Duration, Path, PathBuf, Result, Select, Value, bail,
-    canonical_china_provider_name, discovery, is_claude_code_oauth_setup_token, is_huggingface_alias, is_litellm_alias,
-    is_qwen_oauth_alias, is_vllm_alias, provider_credential_env_var, select_profile_id, style,
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+use crate::auth::discovery::is_claude_code_oauth_setup_token;
+use crate::auth::{profiles::AuthProfilesStore, select_profile_id};
+use crate::config::Config;
+use crate::providers::catalog::discovery::{self, DiscoveredModel};
+use crate::providers::{
+    canonical_china_provider_name, is_huggingface_alias, is_litellm_alias, is_qwen_oauth_alias, is_vllm_alias,
 };
+use anyhow::{Context, Result, bail};
+use console::style;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-pub(super) const LIVE_MODEL_MAX_OPTIONS: usize = 120;
-pub(super) const MODEL_PREVIEW_LIMIT: usize = 20;
-pub(super) const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
-pub(super) const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
+pub(crate) const LIVE_MODEL_MAX_OPTIONS: usize = 120;
+pub(crate) const MODEL_PREVIEW_LIMIT: usize = 20;
+pub(crate) const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
+pub(crate) const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
-pub(super) fn canonical_provider_name(provider_name: &str) -> &str {
+pub(crate) fn canonical_provider_name(provider_name: &str) -> &str {
     if is_qwen_oauth_alias(provider_name) {
         return "qwen-code";
     }
@@ -39,7 +47,7 @@ pub(super) fn canonical_provider_name(provider_name: &str) -> &str {
     }
 }
 
-pub(super) fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
+pub(crate) fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
         "openrouter" | "ollama" | "llamacpp" | "litellm" | "vllm" | "compatible" | "venice" | "astrai" | "nvidia"
@@ -54,7 +62,7 @@ pub(super) fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
 /// ([`crate::providers::selection::catalog_for`], D-078 T-8), so a default
 /// onboarding accepts is judged the same way by the configuration API and
 /// `config.patch` afterwards.
-pub(super) fn check_onboarding_selection(config: &Config, provider: &str, model: &str) -> Result<()> {
+pub(crate) fn check_onboarding_selection(config: &Config, provider: &str, model: &str) -> Result<()> {
     let catalog = crate::providers::selection::catalog_for(config);
     let credential = crate::providers::selection::credential_for(config, provider);
     match crate::providers::selection::check_with(
@@ -95,7 +103,7 @@ pub(super) fn check_onboarding_selection(config: &Config, provider: &str, model:
     }
 }
 
-pub(super) fn model_has_no_billing_tariff(
+pub(crate) fn model_has_no_billing_tariff(
     provider: &str,
     model: &crate::providers::catalog::ReleaseModel,
     cost: &crate::config::schema::CostConfig,
@@ -106,7 +114,7 @@ pub(super) fn model_has_no_billing_tariff(
     )
 }
 
-pub(super) fn onboarding_model_warning(
+pub(crate) fn onboarding_model_warning(
     provider: &str,
     model: &crate::providers::catalog::ReleaseModel,
 ) -> Option<String> {
@@ -121,7 +129,7 @@ pub(super) fn onboarding_model_warning(
 }
 
 /// Pick a sensible default model for the given provider.
-pub(super) fn default_model_for_provider(provider: &str) -> String {
+pub(crate) fn default_model_for_provider(provider: &str) -> String {
     let provider = canonical_provider_name(provider);
     match crate::providers::catalog::ReleaseCatalog::embedded() {
         Ok(catalog) => catalog
@@ -142,7 +150,7 @@ pub(super) fn default_model_for_provider(provider: &str) -> String {
     }
 }
 
-pub(super) fn catalog_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
+pub(crate) fn catalog_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
     let provider = canonical_provider_name(provider_name);
     match crate::providers::catalog::ReleaseCatalog::embedded() {
         Ok(catalog) => catalog
@@ -163,7 +171,7 @@ pub(super) fn catalog_models_for_provider(provider_name: &str) -> Vec<(String, S
     }
 }
 
-pub(super) fn prioritize_default_model(provider_name: &str, models: &mut Vec<(String, String)>) {
+pub(crate) fn prioritize_default_model(provider_name: &str, models: &mut Vec<(String, String)>) {
     let default = default_model_for_provider(provider_name);
     if let Some(index) = models.iter().position(|(model, _)| model == &default)
         && index != 0
@@ -173,7 +181,7 @@ pub(super) fn prioritize_default_model(provider_name: &str, models: &mut Vec<(St
     }
 }
 
-pub(super) fn supports_live_model_fetch(provider_name: &str) -> bool {
+pub(crate) fn supports_live_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
         "openrouter"
@@ -204,7 +212,7 @@ pub(super) fn supports_live_model_fetch(provider_name: &str) -> bool {
     )
 }
 
-pub(super) fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
+pub(crate) fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
     match provider_name {
         "qwen-intl" => Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models"),
         "dashscope-us" => Some("https://dashscope-us.aliyuncs.com/compatible-mode/v1/models"),
@@ -237,7 +245,7 @@ pub(super) fn models_endpoint_for_provider(provider_name: &str) -> Option<&'stat
     }
 }
 
-pub(super) fn build_model_fetch_client() -> Result<reqwest::blocking::Client> {
+pub(crate) fn build_model_fetch_client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(8))
         .connect_timeout(Duration::from_secs(4))
@@ -245,7 +253,7 @@ pub(super) fn build_model_fetch_client() -> Result<reqwest::blocking::Client> {
         .context("failed to build model-fetch HTTP client")
 }
 
-pub(super) fn fetch_openai_compatible_models(
+pub(crate) fn fetch_openai_compatible_models(
     endpoint: &str,
     api_key: Option<&str>,
     allow_unauthenticated: bool,
@@ -272,7 +280,7 @@ pub(super) fn fetch_openai_compatible_models(
     Ok(discovery::parse_openai_compatible_models(&payload))
 }
 
-pub(super) fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<DiscoveredModel>> {
+pub(crate) fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<DiscoveredModel>> {
     let client = build_model_fetch_client()?;
     let mut request = client.get("https://openrouter.ai/api/v1/models");
     if let Some(api_key) = api_key {
@@ -289,7 +297,7 @@ pub(super) fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<Disco
     Ok(discovery::parse_openai_compatible_models(&payload))
 }
 
-pub(super) fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<DiscoveredModel>> {
+pub(crate) fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<DiscoveredModel>> {
     let Some(api_key) = api_key else {
         bail!("Anthropic model fetch requires API key or OAuth token");
     };
@@ -324,7 +332,7 @@ pub(super) fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<Discov
     Ok(discovery::parse_openai_compatible_models(&payload))
 }
 
-pub(super) fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<DiscoveredModel>> {
+pub(crate) fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<DiscoveredModel>> {
     let Some(api_key) = api_key else {
         bail!("Gemini model fetch requires API key");
     };
@@ -342,7 +350,7 @@ pub(super) fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<Discovere
     Ok(discovery::parse_gemini_models(&payload))
 }
 
-pub(super) fn fetch_ollama_models() -> Result<Vec<DiscoveredModel>> {
+pub(crate) fn fetch_ollama_models() -> Result<Vec<DiscoveredModel>> {
     let client = build_model_fetch_client()?;
     let payload: Value = client
         .get("http://localhost:11434/api/tags")
@@ -382,7 +390,7 @@ pub(crate) fn resolve_live_models_endpoint(provider_name: &str, provider_api_url
     models_endpoint_for_provider(provider_name).map(str::to_string)
 }
 
-pub(super) fn fetch_live_models_for_provider(
+pub(crate) fn fetch_live_models_for_provider(
     provider_name: &str,
     api_key: &str,
     provider_api_url: Option<&str>,
@@ -455,7 +463,7 @@ pub(super) fn fetch_live_models_for_provider(
 /// interactive wizard uses the same boundary.
 ///
 /// Arguments are owned because the blocking closure must be `'static`.
-pub(super) async fn fetch_live_models_for_provider_off_runtime(
+pub(crate) async fn fetch_live_models_for_provider_off_runtime(
     provider_name: String,
     api_key: String,
     provider_api_url: Option<String>,
@@ -468,10 +476,10 @@ pub(super) async fn fetch_live_models_for_provider_off_runtime(
 }
 
 /// The credential and base URL model discovery may present to a provider.
-pub(super) struct DiscoveryConnection<'a> {
+pub(crate) struct DiscoveryConnection<'a> {
     /// Empty when the provider has no credential of its own.
-    pub(super) api_key: String,
-    pub(super) api_url: Option<&'a str>,
+    pub(crate) api_key: String,
+    pub(crate) api_url: Option<&'a str>,
 }
 
 /// What `prx models refresh`, the read-only probe and `prx doctor models`
@@ -481,7 +489,7 @@ pub(super) struct DiscoveryConnection<'a> {
 /// and are released only on a provider-identity match; any other provider is
 /// probed with its own auth profile (or its own environment variable, read by
 /// the fetcher), or without a credential.
-pub(super) fn model_discovery_connection<'a>(config: &'a Config, provider_name: &str) -> DiscoveryConnection<'a> {
+pub(crate) fn model_discovery_connection<'a>(config: &'a Config, provider_name: &str) -> DiscoveryConnection<'a> {
     let configured_provider = crate::providers::selection::default_provider(config);
     let root = crate::providers::configured_connection_for(
         provider_name,
@@ -501,7 +509,7 @@ pub(super) fn model_discovery_connection<'a>(config: &'a Config, provider_name: 
 }
 
 /// The selected provider's own auth-profile credential, or empty.
-pub(super) fn model_discovery_api_key(config: &Config, provider_name: &str) -> String {
+pub(crate) fn model_discovery_api_key(config: &Config, provider_name: &str) -> String {
     let state_dir = config
         .config_path
         .parent()
@@ -530,19 +538,19 @@ pub(super) fn model_discovery_api_key(config: &Config, provider_name: &str) -> S
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct CachedModels {
-    pub(super) models: Vec<String>,
-    pub(super) age_secs: u64,
+pub(crate) struct CachedModels {
+    pub(crate) models: Vec<String>,
+    pub(crate) age_secs: u64,
 }
 
-pub(super) fn now_unix_secs() -> u64 {
+pub(crate) fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
 }
 
 /// Record a fetched catalog, with every model's metadata, in the model cache.
-pub(super) fn cache_live_models_for_provider(
+pub(crate) fn cache_live_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
     models: &[DiscoveredModel],
@@ -550,7 +558,7 @@ pub(super) fn cache_live_models_for_provider(
     discovery::record_discovered(workspace_dir, provider_name, models, now_unix_secs())
 }
 
-pub(super) fn load_cached_models_for_provider_internal(
+pub(crate) fn load_cached_models_for_provider_internal(
     workspace_dir: &Path,
     provider_name: &str,
     ttl_secs: Option<u64>,
@@ -577,7 +585,7 @@ pub(super) fn load_cached_models_for_provider_internal(
     }))
 }
 
-pub(super) fn load_cached_models_for_provider(
+pub(crate) fn load_cached_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
     ttl_secs: u64,
@@ -585,14 +593,14 @@ pub(super) fn load_cached_models_for_provider(
     load_cached_models_for_provider_internal(workspace_dir, provider_name, Some(ttl_secs))
 }
 
-pub(super) fn load_any_cached_models_for_provider(
+pub(crate) fn load_any_cached_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
 ) -> Result<Option<CachedModels>> {
     load_cached_models_for_provider_internal(workspace_dir, provider_name, None)
 }
 
-pub(super) fn humanize_age(age_secs: u64) -> String {
+pub(crate) fn humanize_age(age_secs: u64) -> String {
     if age_secs < 60 {
         format!("{age_secs}s")
     } else if age_secs < 60 * 60 {
@@ -602,7 +610,7 @@ pub(super) fn humanize_age(age_secs: u64) -> String {
     }
 }
 
-pub(super) fn build_model_options(provider_name: &str, model_ids: Vec<String>, source: &str) -> Vec<(String, String)> {
+pub(crate) fn build_model_options(provider_name: &str, model_ids: Vec<String>, source: &str) -> Vec<(String, String)> {
     let provider_name = canonical_provider_name(provider_name);
     let provider = crate::providers::ProviderId::of(provider_name);
     let release = crate::providers::catalog::ReleaseCatalog::embedded().ok();
@@ -614,7 +622,7 @@ pub(super) fn build_model_options(provider_name: &str, model_ids: Vec<String>, s
     })
 }
 
-pub(super) fn build_model_options_with_warnings(
+pub(crate) fn build_model_options_with_warnings(
     model_ids: Vec<String>,
     source: &str,
     mut warning_for: impl FnMut(&str) -> Option<String>,
@@ -633,13 +641,13 @@ pub(super) fn build_model_options_with_warnings(
 }
 
 #[derive(Debug)]
-pub(super) enum WizardModelFetchStatus {
+pub(crate) enum WizardModelFetchStatus {
     Fetched { fetched_count: usize, shown_count: usize },
     Empty,
     Failed { error: String, stale_age_secs: Option<u64> },
 }
 
-pub(super) fn apply_wizard_model_fetch(
+pub(crate) fn apply_wizard_model_fetch(
     workspace_dir: &Path,
     provider_name: &str,
     live_options: &mut Option<Vec<(String, String)>>,
@@ -682,7 +690,7 @@ pub(super) fn apply_wizard_model_fetch(
     }
 }
 
-pub(super) fn print_model_preview(models: &[String]) {
+pub(crate) fn print_model_preview(models: &[String]) {
     for model in models.iter().take(MODEL_PREVIEW_LIMIT) {
         println!("  {} {model}", style("-"));
     }
@@ -880,34 +888,44 @@ pub fn run_models_probe_read_only(config: &Config, provider_override: Option<&st
     }
 }
 
-pub(super) fn choose_model_level(
-    provider: &str,
-    model: &str,
-) -> Result<std::collections::BTreeMap<String, crate::config::model_settings::ModelSettings>> {
-    let release = crate::providers::catalog::ReleaseCatalog::embedded_ref()?;
-    let Some(row) = release.model(&crate::providers::ProviderId::of(provider), model) else {
-        return Ok(Default::default());
-    };
-    if row.levels.is_empty() {
-        return Ok(Default::default());
+/// Map provider name to its conventional env var
+/// The environment variable that holds `name`'s own credential, if the
+/// provider has one. Model discovery reads only this.
+pub(crate) fn provider_credential_env_var(name: &str) -> Option<&'static str> {
+    if canonical_provider_name(name) == "qwen-code" {
+        return Some("QWEN_OAUTH_TOKEN");
     }
-    let levels = ["low", "medium", "high"];
-    let default = levels
-        .iter()
-        .position(|level| row.default_level.as_deref() == Some(*level))
-        .unwrap_or(1);
-    let choice = Select::new()
-        .with_prompt("Model level")
-        .items(levels)
-        .default(default)
-        .interact()?;
-    let level = levels
-        .get(choice)
-        .ok_or_else(|| anyhow::anyhow!("invalid model level selection"))?;
-    let settings = crate::config::model_settings::ModelSettings {
-        level: Some((*level).to_owned()),
-        ..Default::default()
-    };
-    settings.validate(&row.id)?;
-    Ok([(row.id.clone(), settings)].into())
+
+    Some(match canonical_provider_name(name) {
+        "openrouter" => "OPENROUTER_API_KEY",
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "ollama" => "OLLAMA_API_KEY",
+        "llamacpp" => "LLAMACPP_API_KEY",
+        "venice" => "VENICE_API_KEY",
+        "groq" => "GROQ_API_KEY",
+        "mistral" => "MISTRAL_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "xai" => "XAI_API_KEY",
+        "together-ai" => "TOGETHER_API_KEY",
+        "fireworks" | "fireworks-ai" => "FIREWORKS_API_KEY",
+        "perplexity" => "PERPLEXITY_API_KEY",
+        "cohere" => "COHERE_API_KEY",
+        "kimi-code" => "KIMI_CODE_API_KEY",
+        "moonshot" => "MOONSHOT_API_KEY",
+        "glm" => "GLM_API_KEY",
+        "minimax" => "MINIMAX_API_KEY",
+        "qwen" => "DASHSCOPE_API_KEY",
+        "qianfan" => "QIANFAN_API_KEY",
+        "zai" => "ZAI_API_KEY",
+        "synthetic" => "SYNTHETIC_API_KEY",
+        "opencode" | "opencode-zen" => "OPENCODE_API_KEY",
+        "vercel" | "vercel-ai" => "VERCEL_API_KEY",
+        "cloudflare" | "cloudflare-ai" => "CLOUDFLARE_API_KEY",
+        "bedrock" | "aws-bedrock" => "AWS_ACCESS_KEY_ID",
+        "gemini" => "GEMINI_API_KEY",
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
+        "astrai" => "ASTRAI_API_KEY",
+        _ => return None,
+    })
 }

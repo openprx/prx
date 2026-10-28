@@ -285,12 +285,6 @@ pub(super) fn config_writes_route_through_the_transaction_layer() {
             "the file watcher (reload only)",
         ),
         (
-            "src/config/init.rs",
-            "commit_mutation_atomically(",
-            1,
-            "first-run initialization",
-        ),
-        (
             "src/tools/config_reload.rs",
             "reload_from_disk(",
             1,
@@ -321,25 +315,13 @@ pub(super) fn config_writes_route_through_the_transaction_layer() {
             "not yet migrated: Telegram in-channel bind (one in a doc comment)",
         ),
         (
-            "src/onboard/wizard.rs",
-            ".save()",
-            2,
-            "offline channel repair (one occurrence is in a comment)",
-        ),
-        (
-            "src/onboard/wizard/persistence.rs",
+            "src/initialization/wizard/persistence.rs",
             ".save()",
             1,
             "offline first-run defaults",
         ),
         (
-            "src/onboard/wizard.rs",
-            "write_split_config(",
-            1,
-            "offline channel repair",
-        ),
-        (
-            "src/onboard/wizard/persistence.rs",
+            "src/initialization/wizard/persistence.rs",
             "write_split_config(",
             1,
             "safe first-run defaults",

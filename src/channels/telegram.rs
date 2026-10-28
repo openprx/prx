@@ -535,7 +535,7 @@ impl TelegramChannel {
             anyhow::bail!(
                 "Missing [channels.telegram] section in config.toml. \
                 Add bot_token and allowed_users under [channels.telegram], \
-                or run `prx onboard --channels-only` to configure interactively"
+                or run `prx init --channels-only` to configure interactively"
             );
         };
 

@@ -1488,10 +1488,15 @@ impl DelegateLoopResources {
             let turn = admitted.with_child_cleanup(cleanup_confirmed);
             (turn, config)
         };
-        let mut history = Vec::new();
-        if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
-            history.push(ChatMessage::system(system_prompt.clone()));
-        }
+        let identity_path = agent_config
+            .identity_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|directory| security.workspace_dir.join(directory));
+        let role_prompt =
+            crate::identity::delegated::compose(identity_path.as_deref(), agent_config.system_prompt.as_deref());
+        let mut history = vec![ChatMessage::system(role_prompt.clone())];
         history.push(crate::agent::turn_contracts::inbound_user_message(full_prompt));
 
         {
@@ -1513,7 +1518,7 @@ impl DelegateLoopResources {
                     trace: None,
                 });
             }
-            let prompt = turn.prompt_with_skills(agent_config.system_prompt.as_deref().unwrap_or_default())?;
+            let prompt = turn.prompt_with_skills(&role_prompt)?;
             if let Some(system) = history.first_mut().filter(|message| message.role == "system") {
                 *system = ChatMessage::system(prompt);
             } else if !prompt.is_empty() {

@@ -92,7 +92,7 @@ use openprx::{
     CHAT_TRACING_RELOAD, ChannelCommands, ChatFmtLayer, Config, CronCommands, EvolutionCommands, FitnessCommands,
     IntegrationCommands, MigrateCommands, ServiceCommands, SkillCommands, XinCommands, acl, agent, auth, channels,
     chat, config, cron, daemon, doctor, evolution_cli, fitness_cli, gateway, handle_xin_command, integrations, memory,
-    migration, onboard, providers, runtime, security, service, session_worker, skills,
+    migration, providers, runtime, security, service, session_worker, skills,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,8 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
 
 // CLI dispatch remains binary-owned; every runtime subsystem it calls is owned
 // and compiled once by the openprx library.
+#[path = "runtime/init_cli.rs"]
+mod init_cli;
 #[path = "runtime/mode.rs"]
 mod mode;
 
@@ -340,34 +342,18 @@ enum CompletionShell {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Initialize PRX workspace with preset configuration
+    /// Initialize or repair configuration, channels and agent identity
     Init {
-        /// Configuration preset
-        #[arg(long, value_enum, default_value = "minimal")]
-        spec: crate::config::init::Spec,
-        /// Target directory (default: ~/.openprx)
+        /// Configuration preset (default: minimal)
+        #[arg(long, value_enum)]
+        spec: Option<crate::config::init::Spec>,
+        /// Target configuration directory
         #[arg(long)]
         dir: Option<String>,
-        /// Overwrite existing configuration
+        /// Repair existing configuration while preserving explicit operator settings
         #[arg(long)]
         force: bool,
-        /// The decision backend: builtin or compatible_http (a hosted service
-        /// needs a credential: use `prx causal config` or `prx onboard`)
-        #[arg(long, value_enum)]
-        decision_backend: Option<openprx::causal_cli::BackendKindArg>,
-        /// The decision endpoint (compatible_http)
-        #[arg(long, requires = "decision_backend")]
-        decision_endpoint: Option<String>,
-        /// The decision model, one exact version
-        #[arg(long, requires = "decision_backend")]
-        decision_model: Option<String>,
-        /// Also turn the decision plane on
-        #[arg(long, requires = "decision_backend")]
-        decision_enable: bool,
-    },
 
-    /// Initialize your workspace and configuration
-    Onboard {
         /// Run the full interactive wizard (default is quick setup)
         #[arg(long)]
         interactive: bool,
@@ -376,7 +362,7 @@ enum Commands {
         #[arg(long)]
         channels_only: bool,
 
-        /// API key (used in quick mode, ignored with --interactive). Deprecated: an
+        /// API key (quick mode only). Deprecated: an
         /// argument is visible in the process list; use --from-stdin or --from-env
         #[arg(long)]
         api_key: Option<String>,
@@ -389,7 +375,7 @@ enum Commands {
         #[arg(long, value_name = "VAR", conflicts_with = "api_key")]
         from_env: Option<String>,
 
-        /// Provider name (used in quick mode, default: openrouter)
+        /// Provider name (quick mode; otherwise preserve the preset or existing selection)
         #[arg(long)]
         provider: Option<String>,
         /// Model ID override (used in quick mode)
@@ -1080,6 +1066,16 @@ enum HistoryCommands {
 
 #[derive(Subcommand, Debug)]
 enum AgentsCommands {
+    /// Create a role with a system-managed identity directory
+    New {
+        agent: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: String,
+        #[command(flatten)]
+        apply: ApplyArgs,
+    },
     /// List the delegate agents and their model bindings
     List,
     /// Bind an existing agent to a provider and model
@@ -1669,34 +1665,8 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
-    // Init generates a fresh workspace — no existing config needed. The target
-    // is resolved through the shared precedence (`--dir` > `--config-dir` >
-    // environment / active workspace > `~/.openprx`) so that a run scoped with
-    // `--config-dir` cannot rewrite the default configuration instead.
-    if let Commands::Init {
-        spec,
-        dir,
-        force,
-        decision_backend,
-        decision_endpoint,
-        decision_model,
-        decision_enable,
-    } = &cli.command
-    {
-        let target = config::resolve_init_target_dir(dir.as_deref(), cli.config_dir.as_deref()).await?;
-        if *force && daemon::live_daemon_uses_config_dir(&target) {
-            println!(
-                "NOTE: a live daemon is running out of {}; it will hot-reload the regenerated configuration.",
-                target.display()
-            );
-        }
-        let decision = decision_backend.map(|kind| openprx::causal_cli::DecisionSetup {
-            kind: kind.into(),
-            endpoint: decision_endpoint.clone(),
-            model: decision_model.clone(),
-            enable: *decision_enable,
-        });
-        return spec.generate_with_decision(&target, *force, decision.as_ref()).await;
+    if matches!(&cli.command, Commands::Init { .. }) {
+        return init_cli::run(&cli).await;
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
@@ -1762,133 +1732,6 @@ async fn async_main() -> Result<()> {
         None
     };
 
-    // Onboard runs quick setup by default, or the interactive wizard with --interactive.
-    // These entry points are awaited directly on this runtime, and that is deliberate: the
-    // wizard is human-paced and awaits internally, so it must not occupy a blocking-pool slot
-    // for the whole session. The wizard owns its own blocking boundary instead — model
-    // discovery goes through runtime::blocking::spawn_blocking and every channel connection
-    // probe runs on a dedicated thread, so no reqwest::blocking runtime is dropped on a
-    // Tokio worker.
-    if let Commands::Onboard {
-        interactive,
-        channels_only,
-        api_key,
-        from_stdin,
-        from_env,
-        provider,
-        model,
-        memory,
-        decision_backend,
-        decision_endpoint,
-        decision_model,
-        decision_enable,
-        decision_credential_stdin,
-    } = &cli.command
-    {
-        let interactive = *interactive;
-        // The decision flags use the one setup service (CDP-14); they are
-        // quick-mode flags, like --provider.
-        let decision = decision_backend.map(|kind| openprx::causal_cli::DecisionSetup {
-            kind: kind.into(),
-            endpoint: decision_endpoint.clone(),
-            model: decision_model.clone(),
-            enable: *decision_enable,
-        });
-        if decision.is_some() && (interactive || *channels_only) {
-            bail!("--decision-backend is a quick-setup flag; the interactive wizard asks for the decision backend");
-        }
-        let hosted = decision
-            .as_ref()
-            .is_some_and(|decision| openprx::causal_cli::hosted_owner(decision.kind).is_some());
-        if hosted && !*decision_credential_stdin {
-            bail!(
-                "a hosted decision backend needs its credential: add --decision-credential-stdin (the value is read \
-                 from standard input and stored as a credential reference), or use `prx causal config`"
-            );
-        }
-        if *decision_credential_stdin && !hosted {
-            bail!("--decision-credential-stdin applies only to the hosted backends typesafe and openrouter");
-        }
-        let decision_secret = if *decision_credential_stdin {
-            manage_cli::secret_from(true, None, &mut std::io::stdin(), &|name: &str| {
-                std::env::var(name).ok()
-            })?
-            .map(openprx::config::manage::credentials::SecretString::new)
-        } else {
-            None
-        };
-        let channels_only = *channels_only;
-        if channels_only && (*from_stdin || from_env.is_some()) {
-            bail!("--channels-only does not accept --from-stdin or --from-env");
-        }
-        let api_key = manage_cli::secret_from(
-            *from_stdin,
-            from_env.as_deref(),
-            &mut std::io::stdin(),
-            &|name: &str| std::env::var(name).ok(),
-        )?
-        .or_else(|| api_key.clone());
-        let provider = provider.clone();
-        let model = model.clone();
-        let memory = memory.clone();
-
-        if interactive && channels_only {
-            bail!("Use either --interactive or --channels-only, not both");
-        }
-        if channels_only && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some()) {
-            bail!("--channels-only does not accept --api-key, --provider, --model, or --memory");
-        }
-        let config_dir = cli.config_dir.as_deref();
-        let autostart_config = if channels_only {
-            let (config, autostart) = onboard::wizard::run_channels_repair_wizard(config_dir).await?;
-            if autostart { Some(config) } else { None }
-        } else if interactive {
-            let (config, autostart) = onboard::wizard::run_wizard(config_dir).await?;
-            if autostart { Some(config) } else { None }
-        } else {
-            // Checked before anything is written; applied to the written
-            // configuration as its own transaction.
-            if let Some(decision) = &decision {
-                if hosted {
-                    decision.check_hosted()?;
-                    decision.ensure_hosted_credential_free(&onboard::wizard::quick_setup_config_path(config_dir)?)?;
-                    anyhow::ensure!(
-                        decision_secret
-                            .as_ref()
-                            .is_some_and(|secret| !secret.expose().trim().is_empty()),
-                        "the decision credential read from standard input is empty; nothing was written"
-                    );
-                } else {
-                    decision.check()?;
-                }
-            }
-            let config = onboard::wizard::run_quick_setup(
-                api_key.as_deref(),
-                provider.as_deref(),
-                model.as_deref(),
-                memory.as_deref(),
-                config_dir,
-            )
-            .await?;
-            if let Some(decision) = &decision {
-                let text = match decision_secret {
-                    Some(secret) => decision.apply_hosted(config, secret).await?,
-                    None => decision.apply(config).await?,
-                };
-                print!("{text}");
-                println!("Decision backend configured ({}).", decision.kind.as_str());
-            }
-            None
-        };
-        if let Some(config) = autostart_config {
-            // Non-dispatch direct call (onboard autostart): no dispatch-level
-            // signal task is wired here, so use the explicitly-named
-            // never-cancelled token. Termination is via the process default.
-            channels::start_channels(config, crate::runtime::shutdown::never_cancelled_shutdown()).await?;
-        }
-        return Ok(());
-    }
-
     // `prx go` — zero-config instant start. No permanent files written.
     if let Commands::Go {
         api_key,
@@ -1906,14 +1749,10 @@ async fn async_main() -> Result<()> {
             &|name: &str| std::env::var(name).ok(),
         )?
         .or_else(|| api_key.clone());
-        let (detected_provider, detected_key, detected_model) = onboard::auto_detect::detect_credentials(
-            api_key.as_deref(),
-            provider.as_deref(),
-            model.as_deref(),
-        )
-        .context(
-            "No API key found. Run `prx auth paste-token --provider anthropic`, or use: prx go -k <your-api-key>",
-        )?;
+        let (detected_provider, detected_key, detected_model) =
+            auth::discovery::detect_credentials(api_key.as_deref(), provider.as_deref(), model.as_deref()).context(
+                "No API key found. Run `prx auth paste-token --provider anthropic`, or use: prx go -k <your-api-key>",
+            )?;
 
         let tmpdir = tempfile::tempdir().context("failed to create temporary workspace for `prx go`")?;
 
@@ -2027,9 +1866,9 @@ async fn async_main() -> Result<()> {
 /// history. Never contains the secret.
 fn argv_secret_warning(command: &Commands) -> Option<String> {
     let (flag, alternative) = match command {
-        Commands::Onboard { api_key: Some(_), .. } => (
+        Commands::Init { api_key: Some(_), .. } => (
             "--api-key",
-            "--from-stdin (pipe the key in: `printf %s \"$KEY\" | prx onboard --from-stdin`) or --from-env VAR",
+            "--from-stdin (pipe the key in: `printf %s \"$KEY\" | prx init --from-stdin`) or --from-env VAR",
         ),
         Commands::Go { api_key: Some(_), .. } => ("-k/--key", "--from-stdin or --from-env VAR"),
         Commands::Auth {
@@ -3598,11 +3437,7 @@ mod tests {
     fn a_secret_argument_draws_a_warning_naming_the_alternative() {
         const SENTINEL: &str = "sk-pmme-warning-sentinel";
         for (args, flag, alternative) in [
-            (
-                vec!["prx", "onboard", "--api-key", SENTINEL],
-                "--api-key",
-                "--from-stdin",
-            ),
+            (vec!["prx", "init", "--api-key", SENTINEL], "--api-key", "--from-stdin"),
             (vec!["prx", "go", "-k", SENTINEL], "-k/--key", "--from-stdin"),
             (
                 vec![
@@ -3624,8 +3459,8 @@ mod tests {
             assert!(!warning.contains(SENTINEL), "{warning}");
         }
         for args in [
-            vec!["prx", "onboard", "--from-stdin"],
-            vec!["prx", "onboard", "--from-env", "OPENROUTER_API_KEY"],
+            vec!["prx", "init", "--from-stdin"],
+            vec!["prx", "init", "--from-env", "OPENROUTER_API_KEY"],
             vec!["prx", "go", "--from-env", "ANTHROPIC_API_KEY"],
             vec!["prx", "go", "--from-stdin", "--message", "hi"],
             vec!["prx", "auth", "paste-token", "--provider", "anthropic", "--from-stdin"],
@@ -3635,7 +3470,7 @@ mod tests {
             assert_eq!(argv_secret_warning(&cli.command), None, "{args:?}");
         }
         // The argument and its alternative are exclusive.
-        assert!(Cli::try_parse_from(["prx", "onboard", "--api-key", SENTINEL, "--from-stdin"]).is_err());
+        assert!(Cli::try_parse_from(["prx", "init", "--api-key", SENTINEL, "--from-stdin"]).is_err());
         assert!(Cli::try_parse_from(["prx", "go", "-k", SENTINEL, "--from-env", "X"]).is_err());
     }
 
@@ -3745,28 +3580,28 @@ mod tests {
     }
 
     #[test]
-    fn onboard_help_includes_model_flag() {
+    fn init_help_includes_model_flag() {
         let cmd = Cli::command();
-        let onboard = cmd
+        let init = cmd
             .get_subcommands()
-            .find(|subcommand| subcommand.get_name() == "onboard")
-            .expect("onboard subcommand must exist");
+            .find(|subcommand| subcommand.get_name() == "init")
+            .expect("init subcommand must exist");
 
-        let has_model_flag = onboard
+        let has_model_flag = init
             .get_arguments()
             .any(|arg| arg.get_id().as_str() == "model" && arg.get_long() == Some("model"));
 
         assert!(
             has_model_flag,
-            "onboard help should include --model for quick setup overrides"
+            "init help should include --model for quick setup overrides"
         );
     }
 
     #[test]
-    fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
+    fn init_cli_accepts_model_provider_and_api_key_in_quick_mode() {
         let cli = Cli::try_parse_from([
             "prx",
-            "onboard",
+            "init",
             "--provider",
             "openrouter",
             "--model",
@@ -3774,10 +3609,10 @@ mod tests {
             "--api-key",
             "sk-issue946",
         ])
-        .expect("quick onboard invocation should parse");
+        .expect("quick init invocation should parse");
 
         match cli.command {
-            Commands::Onboard {
+            Commands::Init {
                 interactive,
                 channels_only,
                 api_key,
@@ -3791,7 +3626,7 @@ mod tests {
                 assert_eq!(model.as_deref(), Some("custom-model-946"));
                 assert_eq!(api_key.as_deref(), Some("sk-issue946"));
             }
-            other => panic!("expected onboard command, got {other:?}"),
+            other => panic!("expected init command, got {other:?}"),
         }
     }
 

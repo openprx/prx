@@ -28,17 +28,17 @@ Modes:
 Options:
   --guided                   Run interactive guided installer
   --no-guided                Disable guided installer
-  --docker                   Run bootstrap in Docker and launch onboarding inside the container
+  --docker                   Run bootstrap in Docker and launch initialization inside the container
   --install-system-deps      Install build dependencies (Linux/macOS)
   --install-rust             Install Rust via rustup if missing
   --prefer-prebuilt          Try latest release binary first; fallback to source build on miss
   --prebuilt-only            Install only from latest release binary (no source build fallback)
   --force-source-build       Disable prebuilt flow and always build from source
-  --onboard                  Run onboarding after install
-  --interactive-onboard      Run interactive onboarding (implies --onboard)
-  --api-key <key>            API key for non-interactive onboarding
-  --provider <id>            Provider for non-interactive onboarding (default: openrouter)
-  --model <id>               Model for non-interactive onboarding (optional)
+  --init                  Run initialization after install
+  --interactive-init      Run interactive initialization (implies --init)
+  --api-key <key>            API key for non-interactive initialization
+  --provider <id>            Provider for non-interactive initialization (default: openrouter)
+  --model <id>               Model for non-interactive initialization (optional)
   --build-first              Alias for explicitly enabling separate `cargo build --release --locked`
   --skip-build               Skip `cargo build --release --locked`
   --skip-install             Skip `cargo install --path . --force --locked`
@@ -50,8 +50,8 @@ Examples:
   ./scripts/bootstrap.sh --install-system-deps --install-rust
   ./scripts/bootstrap.sh --prefer-prebuilt
   ./scripts/bootstrap.sh --prebuilt-only
-  ./scripts/bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
-  ./scripts/bootstrap.sh --interactive-onboard
+  ./scripts/bootstrap.sh --init --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+  ./scripts/bootstrap.sh --interactive-init
 
   # User-facing pre-built installer:
   curl -fsSL https://github.com/openprx/prx/releases/latest/download/install.sh | sh
@@ -583,12 +583,12 @@ run_guided_installer() {
     SKIP_INSTALL=true
   fi
 
-  if prompt_yes_no "Run onboarding after install?" "no"; then
-    RUN_ONBOARD=true
-    if prompt_yes_no "Use interactive onboarding?" "yes"; then
-      INTERACTIVE_ONBOARD=true
+  if prompt_yes_no "Run initialization after install?" "no"; then
+    RUN_INIT=true
+    if prompt_yes_no "Use interactive initialization?" "yes"; then
+      INTERACTIVE_INIT=true
     else
-      INTERACTIVE_ONBOARD=false
+      INTERACTIVE_INIT=false
       if ! read -r -p "Provider [$PROVIDER]: " provider_input; then
         error "guided installer input was interrupted."
         exit 1
@@ -606,7 +606,7 @@ run_guided_installer() {
       fi
 
       if [[ -z "$API_KEY" ]]; then
-        if ! read -r -s -p "API key (hidden, leave empty to switch to interactive onboarding): " api_key_input; then
+        if ! read -r -s -p "API key (hidden, leave empty to switch to interactive initialization): " api_key_input; then
           echo
           error "guided installer input was interrupted."
           exit 1
@@ -615,8 +615,8 @@ run_guided_installer() {
         if [[ -n "$api_key_input" ]]; then
           API_KEY="$api_key_input"
         else
-          warn "No API key entered. Using interactive onboarding instead."
-          INTERACTIVE_ONBOARD=true
+          warn "No API key entered. Using interactive initialization instead."
+          INTERACTIVE_INIT=true
         fi
       fi
     fi
@@ -637,10 +637,10 @@ run_guided_installer() {
   echo "    install-rust: $(bool_to_word "$INSTALL_RUST")"
   echo "    build-first: $(bool_to_word "$build_first")"
   echo "    install-binary: $(bool_to_word "$install_binary")"
-  echo "    onboard: $(bool_to_word "$RUN_ONBOARD")"
-  if [[ "$RUN_ONBOARD" == true ]]; then
-    echo "    interactive-onboard: $(bool_to_word "$INTERACTIVE_ONBOARD")"
-    if [[ "$INTERACTIVE_ONBOARD" == false ]]; then
+  echo "    init: $(bool_to_word "$RUN_INIT")"
+  if [[ "$RUN_INIT" == true ]]; then
+    echo "    interactive-init: $(bool_to_word "$INTERACTIVE_INIT")"
+    if [[ "$INTERACTIVE_INIT" == false ]]; then
       echo "    provider: $PROVIDER"
       if [[ -n "$MODEL" ]]; then
         echo "    model: $MODEL"
@@ -698,10 +698,10 @@ run_docker_bootstrap() {
 
   info "Docker data directory: $docker_data_dir"
 
-  local onboard_cmd=()
-  if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
-    info "Launching interactive onboarding in container"
-    onboard_cmd=(onboard --interactive)
+  local init_cmd=()
+  if [[ "$INTERACTIVE_INIT" == true ]]; then
+    info "Launching interactive initialization in container"
+    init_cmd=(init --interactive)
   else
     if [[ -z "$API_KEY" ]]; then
       cat <<'MSG'
@@ -711,29 +711,30 @@ Use either:
 or:
   PRX_API_KEY="sk-..." ./scripts/bootstrap.sh --docker
 or run interactive:
-  ./scripts/bootstrap.sh --docker --interactive-onboard
+  ./scripts/bootstrap.sh --docker --interactive-init
 MSG
       exit 1
     fi
     if [[ -n "$MODEL" ]]; then
-      info "Launching quick onboarding in container (provider: $PROVIDER, model: $MODEL)"
+      info "Launching quick initialization in container (provider: $PROVIDER, model: $MODEL)"
     else
-      info "Launching quick onboarding in container (provider: $PROVIDER)"
+      info "Launching quick initialization in container (provider: $PROVIDER)"
     fi
-    onboard_cmd=(onboard --api-key "$API_KEY" --provider "$PROVIDER")
+    init_cmd=(init --from-env PRX_INIT_API_KEY --provider "$PROVIDER")
     if [[ -n "$MODEL" ]]; then
-      onboard_cmd+=(--model "$MODEL")
+      init_cmd+=(--model "$MODEL")
     fi
   fi
 
-  docker run --rm -it \
+  PRX_INIT_API_KEY="$API_KEY" docker run --rm -it \
+    -e PRX_INIT_API_KEY \
     --user "$(id -u):$(id -g)" \
     -e HOME=/prx-data \
     -e PRX_WORKSPACE=/prx-data/workspace \
     -v "$docker_data_dir/.prx:/prx-data/.prx" \
     -v "$docker_data_dir/workspace:/prx-data/workspace" \
     "$docker_image" \
-    "${onboard_cmd[@]}"
+    "${init_cmd[@]}"
 }
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
@@ -749,8 +750,8 @@ INSTALL_RUST=false
 PREFER_PREBUILT=false
 PREBUILT_ONLY=false
 FORCE_SOURCE_BUILD=false
-RUN_ONBOARD=false
-INTERACTIVE_ONBOARD=false
+RUN_INIT=false
+INTERACTIVE_INIT=false
 SKIP_BUILD=false
 SKIP_INSTALL=false
 PREBUILT_INSTALLED=false
@@ -792,13 +793,13 @@ while [[ $# -gt 0 ]]; do
       FORCE_SOURCE_BUILD=true
       shift
       ;;
-    --onboard)
-      RUN_ONBOARD=true
+    --init)
+      RUN_INIT=true
       shift
       ;;
-    --interactive-onboard)
-      RUN_ONBOARD=true
-      INTERACTIVE_ONBOARD=true
+    --interactive-init)
+      RUN_INIT=true
+      INTERACTIVE_INIT=true
       shift
       ;;
     --api-key)
@@ -944,10 +945,10 @@ fi
 
 if [[ "$DOCKER_MODE" == true ]]; then
   ensure_docker_ready
-  if [[ "$RUN_ONBOARD" == false ]]; then
-    RUN_ONBOARD=true
+  if [[ "$RUN_INIT" == false ]]; then
+    RUN_INIT=true
     if [[ -z "$API_KEY" ]]; then
-      INTERACTIVE_ONBOARD=true
+      INTERACTIVE_INIT=true
     fi
   fi
   run_docker_bootstrap
@@ -961,7 +962,7 @@ DONE
   cat <<'DONE'
 
 Next steps:
-  ./scripts/bootstrap.sh --docker --interactive-onboard
+  ./scripts/bootstrap.sh --docker --interactive-init
   ./scripts/bootstrap.sh --docker --api-key "sk-..." --provider openrouter
 DONE
   exit 0
@@ -1023,16 +1024,16 @@ elif [[ -x "$WORK_DIR/target/release/prx" ]]; then
   PRX_BIN="$WORK_DIR/target/release/prx"
 fi
 
-if [[ "$RUN_ONBOARD" == true ]]; then
+if [[ "$RUN_INIT" == true ]]; then
   if [[ -z "$PRX_BIN" ]]; then
-    error "onboarding requested but prx binary is not available."
+    error "initialization requested but prx binary is not available."
     error "Run without --skip-install, or ensure prx is in PATH."
     exit 1
   fi
 
-  if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
-    info "Running interactive onboarding"
-    "$PRX_BIN" onboard --interactive
+  if [[ "$INTERACTIVE_INIT" == true ]]; then
+    info "Running interactive initialization"
+    "$PRX_BIN" init --interactive
   else
     if [[ -z "$API_KEY" ]]; then
       cat <<'MSG'
@@ -1040,22 +1041,22 @@ if [[ "$RUN_ONBOARD" == true ]]; then
 Use either:
   --api-key "sk-..."
 or:
-  PRX_API_KEY="sk-..." ./scripts/bootstrap.sh --onboard
+  PRX_API_KEY="sk-..." ./scripts/bootstrap.sh --init
 or run interactive:
-  ./scripts/bootstrap.sh --interactive-onboard
+  ./scripts/bootstrap.sh --interactive-init
 MSG
       exit 1
     fi
     if [[ -n "$MODEL" ]]; then
-      info "Running quick onboarding (provider: $PROVIDER, model: $MODEL)"
+      info "Running quick initialization (provider: $PROVIDER, model: $MODEL)"
     else
-      info "Running quick onboarding (provider: $PROVIDER)"
+      info "Running quick initialization (provider: $PROVIDER)"
     fi
-    ONBOARD_CMD=("$PRX_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
+    INIT_CMD=("$PRX_BIN" init --from-env PRX_INIT_API_KEY --provider "$PROVIDER")
     if [[ -n "$MODEL" ]]; then
-      ONBOARD_CMD+=(--model "$MODEL")
+      INIT_CMD+=(--model "$MODEL")
     fi
-    "${ONBOARD_CMD[@]}"
+    PRX_INIT_API_KEY="$API_KEY" "${INIT_CMD[@]}"
   fi
 fi
 

@@ -27,6 +27,7 @@ pub mod credentials;
 pub mod gemini;
 pub(crate) mod generation;
 mod identity;
+pub mod model_discovery;
 pub(crate) mod model_settings;
 pub mod ollama;
 pub mod openai;
@@ -85,8 +86,8 @@ pub(crate) use oauth::*;
 pub use redaction::*;
 pub use runtime_options::*;
 
+use crate::auth::discovery::is_claude_code_oauth_setup_token;
 use crate::auth::{profiles::AuthProfilesStore, select_profile_id};
-use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 use serde::{Deserialize, Serialize};
@@ -628,7 +629,7 @@ fn create_provider_with_url_and_options(
         )),
 
         _ => anyhow::bail!(
-            "Unknown provider: {}. Check README for supported providers or run `prx onboard --interactive` to reconfigure.\n\
+            "Unknown provider: {}. Check README for supported providers or run `prx init --interactive` to reconfigure.\n\
              Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
              Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints.",
             // The label may be a URL with `user:password@` (USERINFO-3).

@@ -181,7 +181,7 @@ redacted), the evidence and the fix:
 | the evolution judge: judges with the resolved default model (the route destination for a `hint:`). A default that cannot be resolved or built leaves only the deterministic mock scorer, which sends nothing: its verdict is a deferral in every mode — a proposed Auto-mode change is not written — and the `evolution_judge` health component and a warning say so. A model judge whose call fails, whose reply is not a score, or that does not answer within `[self_system] evolution_judge_timeout_secs` (default 180) is deferred the same way (`judge_failed`). Evolution changes are written only after an accepted verdict; a deferred cycle is logged as `deferred` (see [evolution](evolution.md#judge-verdicts)). The memory layer's engine scores with the mock scorer, so it never applies in Auto mode | chat | invocation |
 | `prx go` (resolved by the agent entry with `--message`, by chat start-up otherwise) | chat | invocation |
 | memory embedders and `[[embedding_routes]]` (a refused embedder falls back to keyword recall) | embeddings | invocation |
-| `prx onboard` quick setup and the interactive wizard; `POST /api/config` (and the Console) when the default changes | chat | operator |
+| `prx init` quick setup and the interactive wizard; `POST /api/config` (and the Console) when the default changes | chat | operator |
 | the agent `gateway` tool's `config.patch` (default, routes, agent bindings, embedding routes it changes) | chat / embeddings | model-made durable |
 | the agent `cron` tool: a job's `model` on `add` and on `update`/`patch` (checked on the default provider; nothing is written on a refusal) | chat | model-made durable |
 
@@ -513,7 +513,7 @@ tool_call   = "xml_function_tags"                # optional: "native" | "xml_fun
     sender that is an identity, such as a webhook `reply_target`, is stored
     as given);
   - `prx status`, `GET /api/status`, `prx config show`, `GET /api/config`
-    (including `memory.embedding_provider`), `prx doctor`, `prx onboard`,
+    (including `memory.embedding_provider`), `prx doctor`, `prx init`,
     `prx models`, and the chat banner, status bar, `/provider` and `/export`.
 
   **Still printed as configured:** saved chat session files (the label is

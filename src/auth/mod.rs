@@ -1,5 +1,6 @@
 pub mod anthropic_token;
 pub mod codex_auth;
+pub mod discovery;
 pub mod openai_oauth;
 pub mod profiles;
 

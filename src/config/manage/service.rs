@@ -329,7 +329,7 @@ impl ManagementService {
         })
     }
 
-    async fn plan_candidate(
+    pub(crate) async fn plan_candidate(
         &self,
         candidate: Config,
         revision: Option<String>,
@@ -950,7 +950,7 @@ pub fn reference_use(config: &Config, id: &str) -> Result<String, ManageError> {
 fn credential_guidance(provider: &str, in_use: CredentialInUse, encrypted_at_rest: bool) -> String {
     let provider = shown(provider);
     match in_use {
-        // Never `prx onboard`: quick setup regenerates the whole
+        // Never `prx init`: quick setup regenerates the whole
         // configuration outside the transaction (D-088 C-2).
         CredentialInUse::RootConnection if encrypted_at_rest => format!(
             "PRX sends '{provider}' the root connection today (config.toml `api_key`, `reliability.api_keys`); \
@@ -2442,7 +2442,7 @@ mod tests {
     }
 
     /// RED before PMME-g (D-088 C-2): the guidance for the root connection
-    /// named `prx onboard --from-stdin`, which regenerates the whole
+    /// named `prx init --from-stdin`, which regenerates the whole
     /// configuration outside the transaction.
     #[tokio::test]
     async fn the_root_connection_guidance_names_a_non_destructive_path() {
@@ -2450,11 +2450,7 @@ mod tests {
         let config = loaded(dir.path(), |config| config.api_key = Some(SECRET.into())).await;
         let credentials = provider_credentials(&config, "openai").expect("test: status");
         assert_eq!(credentials.in_use, CredentialInUse::RootConnection);
-        assert!(
-            !credentials.guidance.contains("prx onboard"),
-            "{}",
-            credentials.guidance
-        );
+        assert!(!credentials.guidance.contains("prx init"), "{}", credentials.guidance);
         assert!(
             credentials.guidance.contains("PUT /api/config/secrets"),
             "{}",

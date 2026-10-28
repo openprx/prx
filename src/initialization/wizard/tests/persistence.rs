@@ -55,7 +55,7 @@ async fn quick_setup_model_override_persists_to_config_toml() {
     assert!(config_raw.contains("default_model = \"openai/gpt-5-mini\""));
 }
 
-/// INT-2B B5 (D-070 amendment), RED before: `prx onboard --provider
+/// INT-2B B5 (D-070 amendment), RED before: `prx init --provider
 /// llamacpp` without `-m` chose `ggml-org/gpt-oss-20b-GGUF`, which the
 /// provider/model check refused ("not compatible with provider
 /// 'llamacpp'"), so quick setup failed. llama.cpp serves whatever model it

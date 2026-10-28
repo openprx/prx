@@ -161,21 +161,12 @@ pub(super) async fn run_sub_agent_process(
 
     let identity_dir = if let Some(identity_dir) = agent_identity_dir {
         let source_identity = workspace_root.join(identity_dir);
-        if source_identity.exists() {
+        if source_identity.is_dir() {
             let copied_identity_dir = worker_workspace.join("identity");
-            if source_identity.is_dir() {
-                copy_dir_recursive(&source_identity, &copied_identity_dir)?;
-            } else {
-                std::fs::create_dir_all(&copied_identity_dir)?;
-                let target = copied_identity_dir.join(
-                    source_identity
-                        .file_name()
-                        .unwrap_or_else(|| std::ffi::OsStr::new("identity.txt")),
-                );
-                std::fs::copy(source_identity, target)?;
-            }
+            copy_dir_recursive(&source_identity, &copied_identity_dir)?;
             Some("identity".to_string())
         } else {
+            tracing::warn!(path = %source_identity.display(), "configured agent identity directory is missing or is not a directory");
             None
         }
     } else {

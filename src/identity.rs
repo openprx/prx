@@ -4,6 +4,11 @@
 //! portable AI identity. This module handles loading and converting AIEOS v1.1
 //! JSON to ZeroClaw's system prompt format.
 
+pub mod delegated;
+pub mod roles;
+pub mod root;
+pub mod scaffold;
+
 use crate::config::IdentityConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

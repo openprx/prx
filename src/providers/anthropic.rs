@@ -1,6 +1,6 @@
+use crate::auth::discovery::is_claude_code_oauth_setup_token;
 use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
 use crate::multimodal;
-use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, ChatTrace, Provider,
     StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,

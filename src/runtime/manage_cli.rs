@@ -535,7 +535,7 @@ fn reference_id(reference: &str) -> Result<String> {
 /// one of them is named (`None` otherwise). The trailing newline of piped
 /// input is dropped; an empty secret is refused. Shared by `credential set`
 /// and the `--from-stdin`/`--from-env` alternatives of the deprecated
-/// argument flags (`onboard --api-key`, `go -k`, `auth paste-token --token`).
+/// argument flags (`init --api-key`, `go -k`, `auth paste-token --token`).
 pub(crate) fn secret_from(
     from_stdin: bool,
     from_env: Option<&str>,
@@ -853,7 +853,7 @@ async fn run_models(command: ModelCommands, config: Config, io: &mut Io<'_>) -> 
             provider,
             operation: None,
             executable: false,
-        } => openprx::onboard::run_models_list(&config, provider.as_deref()),
+        } => openprx::providers::model_discovery::run_models_list(&config, provider.as_deref()),
         ModelCommands::List {
             provider,
             operation,
@@ -885,7 +885,7 @@ async fn run_models(command: ModelCommands, config: Config, io: &mut Io<'_>) -> 
             print_model(&entry, io.out)
         }
         ModelCommands::Refresh { provider, force } => openprx::runtime::blocking::spawn_blocking(move || {
-            openprx::onboard::run_models_refresh(&config, provider.as_deref(), force)
+            openprx::providers::model_discovery::run_models_refresh(&config, provider.as_deref(), force)
         })
         .await
         .map_err(|error| anyhow::anyhow!("models refresh task failed: {error}"))?,
@@ -1217,6 +1217,26 @@ pub(crate) async fn run_config(command: ConfigCommands, config: Config, io: &mut
             Ok(())
         }
         ConfigCommands::Agents { agents_command } => match agents_command {
+            AgentsCommands::New {
+                agent,
+                provider,
+                model,
+                apply,
+            } => {
+                let plan =
+                    openprx::identity::roles::NewRolePlan::prepare(service(config), &agent, &provider, &model).await?;
+                writeln!(io.out, "{}", plan.text())?;
+                if !apply.yes {
+                    writeln!(
+                        io.out,
+                        "Dry run: nothing was written. Apply with --yes; if required, use --confirm-high-risk {}",
+                        plan.revision().unwrap_or("none")
+                    )?;
+                    return Ok(());
+                }
+                let outcome = plan.apply(apply.confirm_high_risk.as_deref()).await?;
+                print_applied(&outcome, io)
+            }
             AgentsCommands::List => {
                 let mut agents = config.agents.iter().collect::<Vec<_>>();
                 agents.sort_by(|left, right| left.0.cmp(right.0));
