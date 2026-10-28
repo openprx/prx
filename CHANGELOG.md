@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.169] - 2026-10-28
+
+### Fixed
+
+- Remove the unused Wasmtime compilation cache feature and its vulnerable
+  zstd dependencies. PRX's own WASM precompile cache remains enabled.
+
 ## [0.8.168] - 2026-10-28
 
 ### Changed
