@@ -253,13 +253,23 @@ impl CausalCandidateGenerator {
             });
         let folded = state.routing_input.as_str().to_lowercase();
         if !possible {
-            // Only a unique, current, turn-scoped discovery can identify an
-            // unnamed lifecycle proposal. Discovery grants no execution; the
-            // model must still supply a grant-bound action and exact arguments.
+            // A unique current discovery or complete native bundle target
+            // can identify the unnamed proposal surface. Neither grants
+            // execution; the model must still supply an exact requested call.
             if catalog.iter_entries().any(|entry| exact_mention(&folded, entry)) {
                 return None;
             }
-            let entry = discovered_lifecycle_entry(catalog, policy.discovered_refs)?;
+            let entry = discovered_lifecycle_entry(catalog, policy.discovered_refs).or_else(|| {
+                // A complete immutable native bundle target can offer the
+                // non-executing form before an unrelated document read. It
+                // cannot override conflicting turn-scoped discoveries.
+                if policy.discovered_refs.iter().next().is_some() {
+                    return None;
+                }
+                catalog
+                    .iter_entries()
+                    .find(|entry| collectable_approval_entry(entry) && entry.names_reviewed_bundle_target(raw))
+            })?;
             let candidate = from_entry(
                 CausalActionKind::UseTool,
                 entry.family,
@@ -284,10 +294,27 @@ impl CausalCandidateGenerator {
                 .iter_entries()
                 .filter(|item| collectable_approval_entry(item) && names_entry(&folded, item));
             let only = named.next()?;
-            if named.next().is_some() || (only.family != CapabilityTarget::Mcp && !only.collects_exact_call()) {
+            if named.next().is_some() {
+                // An explicit lifecycle operation is more specific than a
+                // bare tool name elsewhere in the request. This chooses only
+                // a non-executing proposal surface; the collector must still
+                // decline prohibited or ambiguous operations.
+                let mut operations = catalog.iter_entries().filter(|item| {
+                    collectable_approval_entry(item)
+                        && item.public_name == "skills_manage"
+                        && names_entry(&folded, item)
+                        && item.names_collectable_action(&folded)
+                });
+                let operation = operations.next()?;
+                if operations.next().is_some() {
+                    return None;
+                }
+                operation
+            } else if only.family != CapabilityTarget::Mcp && !only.collects_exact_call() {
                 return None;
+            } else {
+                only
             }
-            only
         } else if collectable_approval_entry(entry)
             && (!(entry.family == CapabilityTarget::Mcp || entry.collects_exact_call()) || names_entry(&folded, entry))
         {
@@ -397,6 +424,7 @@ impl CausalCandidateGenerator {
                     let mut approval_only = None;
                     let mut approval_only_unbound = false;
                     let mut selected = None;
+                    let mut named_files = Vec::new();
                     for entry in catalog.iter_entries().filter(|entry| {
                         entry.family == family
                             && !matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
@@ -417,8 +445,13 @@ impl CausalCandidateGenerator {
                         let admission = HardGates::check_one(state, catalog, &candidate, gates);
                         trace_rejected(&candidate, &admission, &mut generation_rejections);
                         match admission {
+                            GateOutcome::Passed if resume_target.is_none() && is_native_file_entry(entry) => {
+                                named_files.push(candidate);
+                            }
                             GateOutcome::Passed => {
-                                selected = Some(candidate);
+                                if named_files.is_empty() {
+                                    selected = Some(candidate);
+                                }
                                 break;
                             }
                             GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() => {
@@ -440,6 +473,18 @@ impl CausalCandidateGenerator {
                             }
                             _ => {}
                         }
+                    }
+                    if let Some(first) = named_files.first() {
+                        // One named file plan can require several adapters. Do
+                        // not replace write/read intent with its first read.
+                        let group = native_file_group(&named_files, first.candidate_id().namespace());
+                        let outcome = HardGates::check_one(state, catalog, &group, gates);
+                        trace_rejected(&group, &outcome, &mut generation_rejections);
+                        selected = Some(if outcome == GateOutcome::Passed {
+                            group
+                        } else {
+                            first.clone()
+                        });
                     }
                     if selected.is_none()
                         && approval_only_unbound
@@ -471,16 +516,25 @@ impl CausalCandidateGenerator {
                             gates,
                             &mut generation_rejections,
                         )? {
-                            // An admitted exact mention already represents this entry.
-                            // Preserve family fallback for other entries and unmatched input.
+                            // A complete named native plan is narrower than its
+                            // generic family fallback. Other operations remain
+                            // available through selected filesystem discovery.
                             let exact_entry_present = proposed.iter().any(|prior: &CausalCandidate| {
                                 exact_mentions.contains(prior.candidate_id())
-                                    && prior.required_capabilities().iter().any(|exact| {
-                                        candidate
+                                    && if candidate.required_capabilities().len() == 1 {
+                                        prior
                                             .required_capabilities()
                                             .iter()
-                                            .any(|fallback| exact.id == fallback.id)
-                                    })
+                                            .any(|exact| candidate.required_capabilities().contains(exact))
+                                    } else {
+                                        candidate.target() == CapabilityTarget::Filesystem
+                                            && prior.target() == CapabilityTarget::Filesystem
+                                            && prior.required_capabilities().len() > 1
+                                            && prior
+                                                .required_capabilities()
+                                                .iter()
+                                                .all(|exact| candidate.required_capabilities().contains(exact))
+                                    }
                             });
                             if !exact_entry_present
                                 && !proposed
@@ -531,8 +585,12 @@ impl CausalCandidateGenerator {
                     for (eligible, family) in discoverable_families.0.iter_mut().zip(DiscoveryFamilies::ALL) {
                         let searchable = catalog.iter_entries().filter(|entry| {
                             entry.family == family
-                                && matches!(entry.exposure, Exposure::Searchable)
-                                && !available_for_fallback(entry, policy)
+                                && entry.supports_metadata_discovery()
+                                && !policy.discovered_refs.contains(&CapabilityRef {
+                                    id: entry.id.clone(),
+                                    fingerprint: entry.fingerprint,
+                                    generation: entry.generation,
+                                })
                         });
                         if let Some(candidate) = select_family_candidate(
                             CausalActionKind::Discover,
@@ -753,6 +811,28 @@ fn select_family_candidate<'a>(
     gates: &GateInputs<'_>,
     generation_rejections: &mut BTreeMap<CandidateId, GateOutcome>,
 ) -> Result<Option<CausalCandidate>, GateError> {
+    // A selected metadata result must become the next represented operation,
+    // rather than being hidden again by an earlier Direct same-family tool.
+    // Retain the first passed fallback if the selected ref fails any gate.
+    let prefer_discovered = action == CausalActionKind::UseTool
+        && policy.discovered_refs.iter().any(|reference| {
+            catalog.entry_any(&reference.id).is_some_and(|entry| {
+                entry.family == family
+                    && entry.fingerprint == reference.fingerprint
+                    && entry.generation == reference.generation
+            })
+        });
+    let mut passed_fallback = None;
+    let native_files = action == CausalActionKind::UseTool
+        && family == CapabilityTarget::Filesystem
+        && !bind_namespace
+        && !state
+            .trusted
+            .parts()
+            .constraints
+            .iter()
+            .any(|code| code.as_str() == "resume_exact_call");
+    let mut file_members = Vec::new();
     let mut approval_only = None;
     for entry in entries {
         // G9 will reject a write effect under a read-only turn. This
@@ -780,19 +860,110 @@ fn select_family_candidate<'a>(
         {
             continue;
         }
+        let selected = prefer_discovered
+            && policy.discovered_refs.iter().any(|reference| {
+                reference.id == entry.id
+                    && reference.fingerprint == entry.fingerprint
+                    && reference.generation == entry.generation
+            });
+        let native_file = native_files && is_native_file_entry(entry);
+        if prefer_discovered && passed_fallback.is_some() && !selected && !native_file {
+            continue;
+        }
         let namespace = bind_namespace.then(|| Ns8::of(policy.key, &entry.namespace));
         let candidate = from_entry(action, family, entry, policy, namespace);
         let outcome = HardGates::check_one(state, catalog, &candidate, gates);
         trace_rejected(&candidate, &outcome, generation_rejections);
         match outcome {
-            GateOutcome::Passed => return Ok(Some(candidate)),
+            GateOutcome::Passed if native_file => file_members.push(candidate),
+            GateOutcome::Passed if !prefer_discovered || selected => return Ok(Some(candidate)),
+            GateOutcome::Passed => passed_fallback = Some(candidate),
             GateOutcome::ApprovalOnly { op_ids } if !op_ids.is_empty() && approval_only.is_none() => {
                 approval_only = Some(candidate);
             }
             _ => {}
         }
     }
-    Ok(approval_only)
+    if let Some(first) = file_members.first() {
+        if file_members.len() == 1 {
+            return Ok(Some(first.clone()));
+        }
+        let group = native_file_group(&file_members, None);
+        let outcome = HardGates::check_one(state, catalog, &group, gates);
+        trace_rejected(&group, &outcome, generation_rejections);
+        return Ok(Some(if outcome == GateOutcome::Passed {
+            group
+        } else {
+            first.clone()
+        }));
+    }
+    Ok(passed_fallback.or(approval_only))
+}
+
+/// One filesystem plan can require reading and editing, or writing and then
+/// reading. Combine only individually gated native adapters (at most three),
+/// retaining exact refs, maximum effect, all approval ids and checked estimates.
+fn is_native_file_entry(entry: &CapabilityEntry) -> bool {
+    entry.family == CapabilityTarget::Filesystem
+        && entry.namespace == "native"
+        && entry.root == entry.public_name
+        && matches!(entry.public_name.as_str(), "file_read" | "file_write" | "file_edit")
+}
+
+fn native_file_group(members: &[CausalCandidate], namespace: Option<Ns8>) -> CausalCandidate {
+    let estimated_cost = members.iter().try_fold(
+        CostEstimate {
+            tokens: 0,
+            micro_usd: 0,
+        },
+        |sum, member| {
+            let cost = member.estimated_cost()?;
+            Some(CostEstimate {
+                tokens: sum.tokens.checked_add(cost.tokens)?,
+                micro_usd: sum.micro_usd.checked_add(cost.micro_usd)?,
+            })
+        },
+    );
+    let latency = members
+        .iter()
+        .try_fold(0u32, |sum, member| sum.checked_add(member.estimated_latency_ms()?));
+    let overhead = members
+        .iter()
+        .try_fold(0u32, |sum, member| sum.checked_add(member.decision_overhead_ms()?));
+    let mut approval_required = false;
+    let mut op_ids = BTreeSet::new();
+    for member in members {
+        if let ApprovalRequirement::Required { op_ids: ids } = member.approval() {
+            approval_required = true;
+            op_ids.extend(ids.iter().cloned());
+        }
+    }
+    CausalCandidate::new(
+        CausalActionKind::UseTool,
+        CapabilityTarget::Filesystem,
+        CandidateSpec {
+            namespace,
+            required_capabilities: members
+                .iter()
+                .flat_map(|member| member.required_capabilities().iter().cloned())
+                .collect(),
+            side_effect: members
+                .iter()
+                .map(CausalCandidate::side_effect)
+                .max()
+                .unwrap_or(SideEffectClass::ReadOnly),
+            approval: if approval_required {
+                ApprovalRequirement::Required {
+                    op_ids: op_ids.into_iter().collect(),
+                }
+            } else {
+                ApprovalRequirement::None
+            },
+            estimated_cost,
+            estimated_latency_ms: latency,
+        },
+    )
+    .with_decision_overhead_ms(overhead)
 }
 
 fn from_entry(
@@ -1056,6 +1227,183 @@ mod tests {
             }
         }
         cost
+    }
+
+    #[test]
+    fn native_file_plan_keeps_each_ref_and_respects_read_only_and_exclusions() {
+        let key = fixtures::key();
+        let mut security = SecurityPolicy::default();
+        security.autonomy = crate::security::AutonomyLevel::Full;
+        let shared = Arc::new(security.clone());
+        let registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(crate::tools::file_read::FileReadTool::new(Arc::clone(&shared), false)),
+            Box::new(crate::tools::file_write::FileWriteTool::new(Arc::clone(&shared))),
+            Box::new(crate::tools::file_edit::FileEditTool::new(shared)),
+        ];
+        let surface = SurfacePolicy {
+            direct_names: BTreeSet::from(["file_read".into(), "file_write".into(), "file_edit".into()]),
+            ..SurfacePolicy::default()
+        };
+        let catalog = CapabilityCatalog::build(&registry, &CatalogSources::default(), &surface).unwrap();
+        let view = catalog.view(&CatalogScope::default());
+        let cost = fixture_cost_for_catalog(
+            &catalog,
+            CapabilityCostModel {
+                per_capability: BTreeMap::new(),
+                estimates: BTreeMap::from([
+                    (
+                        CapabilityTarget::Filesystem,
+                        (
+                            CostEstimate {
+                                tokens: 1,
+                                micro_usd: 1,
+                            },
+                            1,
+                        ),
+                    ),
+                    (
+                        CapabilityTarget::None,
+                        (
+                            CostEstimate {
+                                tokens: 1,
+                                micro_usd: 1,
+                            },
+                            1,
+                        ),
+                    ),
+                ]),
+            },
+        );
+        let policy = CandidatePolicy {
+            key: &key,
+            max_candidates: 12,
+            can_deliver_text: true,
+            may_delegate: false,
+            delegation_target: None,
+            cost_model: &cost,
+            discovered_refs: &EMPTY_DISCOVERED_REFS,
+        };
+        let calls = BTreeMap::new();
+        let history = BTreeSet::new();
+        let gates = GateInputs {
+            policy: &security,
+            owner_id: "owner-1",
+            sender: "owner-1",
+            policy_channel: "terminal",
+            chat_type: "dm",
+            model_ref: "anthropic:claude",
+            model_can_chat: true,
+            model_can_call_tools: true,
+            decision_endpoint_ready: true,
+            child_scope: None,
+            verified_approval_calls: BTreeMap::new(),
+            call_fingerprints: &calls,
+            failed_call_counts: BTreeMap::new(),
+            replayed_non_idempotent: &history,
+            retry_limit: None,
+        };
+        for (read_only, exclude_write, expected) in [(false, false, 3usize), (false, true, 2), (true, false, 1)] {
+            let mut state = fixtures::state(&key, "Perform the native workspace file task.");
+            let mut trusted = fixtures::trusted();
+            trusted.catalog_generation = *catalog.generation();
+            trusted.channel = None;
+            trusted.exclusions.clear();
+            trusted.side_effect_mode = if read_only {
+                SideEffectMode::ReadOnly
+            } else {
+                SideEffectMode::GuardedWrite
+            };
+            if exclude_write {
+                trusted.exclusions.push(Arc::from("file_write"));
+            }
+            state.trusted = TrustedState::from_runtime(trusted);
+            let CandidateSet::Legal { candidates, .. } =
+                CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap()
+            else {
+                panic!("legal file plan")
+            };
+            let file = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.action() == CausalActionKind::UseTool
+                        && candidate.target() == CapabilityTarget::Filesystem
+                })
+                .unwrap();
+            assert_eq!(file.required_capabilities().len(), expected);
+            assert_eq!(file.estimated_cost().unwrap().tokens, u32::try_from(expected).unwrap());
+            assert_eq!(
+                file.estimated_cost().unwrap().micro_usd,
+                u64::try_from(expected).unwrap()
+            );
+            assert_eq!(
+                file.side_effect(),
+                if read_only {
+                    SideEffectClass::ReadOnly
+                } else {
+                    SideEffectClass::LocalWrite
+                }
+            );
+            assert_eq!(HardGates::check_one(&state, &view, file, &gates), GateOutcome::Passed);
+            for reference in file.required_capabilities() {
+                let entry = view.entry_any(&reference.id).unwrap();
+                assert_eq!(reference.fingerprint, entry.fingerprint);
+                assert_eq!(reference.generation, entry.generation);
+                assert!(!exclude_write || entry.public_name != "file_write");
+            }
+        }
+
+        for (input, expected) in [
+            (
+                "Use file_write to create a file, then file_read to verify it.",
+                vec!["file_read", "file_write"],
+            ),
+            ("Use file_read to inspect the existing file.", vec!["file_read"]),
+        ] {
+            let mut state = fixtures::state(&key, input);
+            let mut trusted = fixtures::trusted();
+            trusted.catalog_generation = *catalog.generation();
+            trusted.channel = None;
+            trusted.exclusions.clear();
+            trusted.side_effect_mode = SideEffectMode::GuardedWrite;
+            state.trusted = TrustedState::from_runtime(trusted);
+            let CandidateSet::Legal {
+                candidates,
+                exact_mentions,
+                ..
+            } = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap()
+            else {
+                panic!("legal exact file plan")
+            };
+            let exact: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.target() == CapabilityTarget::Filesystem
+                        && exact_mentions.contains(candidate.candidate_id())
+                })
+                .collect();
+            assert_eq!(exact.len(), 1, "one complete exact plan: {input}");
+            let filesystem_plans = candidates
+                .iter()
+                .filter(|candidate| candidate.target() == CapabilityTarget::Filesystem)
+                .count();
+            assert_eq!(
+                filesystem_plans,
+                if expected.len() > 1 { 1 } else { 2 },
+                "a complete named plan supersedes its broader fallback; a single name preserves it"
+            );
+            let candidate = exact.first().unwrap();
+            let mut names: Vec<_> = candidate
+                .required_capabilities()
+                .iter()
+                .map(|reference| view.entry_any(&reference.id).unwrap().public_name.as_str())
+                .collect();
+            names.sort_unstable();
+            assert_eq!(names, expected, "all and only the named file operations: {input}");
+            assert_eq!(
+                HardGates::check_one(&state, &view, candidate, &gates),
+                GateOutcome::Passed
+            );
+        }
     }
 
     #[test]
@@ -2586,8 +2934,15 @@ mod tests {
         let key = fixtures::key();
         let mut state = fixtures::state(&key, "first unrelated request");
         let registry: Vec<Box<dyn Tool>> = vec![Box::new(ProbeTool("prx_read")), Box::new(ProbeTool("prx_search"))];
-        let catalog =
-            CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let catalog = CapabilityCatalog::build(
+            &registry,
+            &CatalogSources::default(),
+            &SurfacePolicy {
+                direct_names: BTreeSet::from(["prx_read".to_owned()]),
+                ..SurfacePolicy::default()
+            },
+        )
+        .unwrap();
         let mut trusted = fixtures::trusted();
         trusted.catalog_generation = *catalog.generation();
         trusted.channel = None;
@@ -2684,6 +3039,38 @@ mod tests {
             .iter()
             .find(|entry| &entry.id != fallback_id)
             .expect("different same-family entry");
+        assert!(matches!(first.exposure, Exposure::Direct));
+        let reference = CapabilityRef {
+            id: other.id.clone(),
+            fingerprint: other.fingerprint,
+            generation: other.generation,
+        };
+        for stale in [false, true] {
+            let mut reference = reference.clone();
+            if stale {
+                reference.fingerprint.0[0] ^= 1;
+            }
+            let selected = DiscoveredRefs::from_refs_for_test(BTreeSet::from([reference]));
+            let selected_policy = CandidatePolicy {
+                discovered_refs: &selected,
+                ..policy
+            };
+            let CandidateSet::Legal { candidates, .. } =
+                CausalCandidateGenerator::generate(&state, &view, &selected_policy, &gates).unwrap()
+            else {
+                panic!("legal discovered fixture")
+            };
+            let represented = candidates
+                .iter()
+                .find(|candidate| candidate.action() == CausalActionKind::UseTool)
+                .unwrap();
+            let expected = if stale { first } else { other };
+            assert_eq!(
+                represented.required_capabilities().first().unwrap().id,
+                expected.id,
+                "current selected metadata outranks Direct fallback; stale refs cannot do so"
+            );
+        }
         for (input, blocked, expected_exact, expected_tools) in [
             (format!("use {}", first.public_name), false, true, 1),
             ("unrelated request".to_owned(), false, false, 1),
@@ -2908,6 +3295,7 @@ mod tests {
                 summary: Arc::from("fixture"),
                 exact_mention: false,
                 available: true,
+                effective_approval_required: None,
             }])
             .expect("one prior candidate");
         let mut discovered_state = state.clone();
@@ -2917,6 +3305,7 @@ mod tests {
                 summary: Arc::from("fixture"),
                 exact_mention: false,
                 available: true,
+                effective_approval_required: None,
             }])
             .expect("one discovered candidate");
         assert_eq!(

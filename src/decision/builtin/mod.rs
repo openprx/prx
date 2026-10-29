@@ -1,5 +1,5 @@
 //! `BuiltinDecisionBackend`: the local, deterministic, always available
-//! decision backend (CDP 4.3 item 1; SP-CDP-A 5.7; model `builtin-v1`).
+//! decision backend (CDP 4.3 item 1; SP-CDP-A 5.7; model `builtin-v4`).
 //!
 //! It answers every question of a sealed request from the language-neutral
 //! features of the state v1 object (module `features`) and the versioned
@@ -93,7 +93,7 @@ impl BuiltinDecisionBackend {
     /// Answer every question of `request`.
     ///
     /// The response has no wire body (`raw_bytes = 0`), `backend = "builtin"`
-    /// and `resolved_model = "builtin-v1"`, and it satisfies every rule of
+    /// and the versioned `resolved_model`, and it satisfies every rule of
     /// the response validator. An error is impossible by construction (every
     /// value is a finite probability); it is still typed, never a panic.
     pub fn answer(request: &DecisionRequest) -> Result<DecisionResponse, DecisionError> {
@@ -152,6 +152,9 @@ fn plain_turn_has_no_read_recovery(state: &StateFeatures<'_>) -> bool {
 }
 
 fn model_managed_delegation_turn(state: &StateFeatures<'_>) -> bool {
+    // Source-configured delegation can be planned by the serving model. Exact
+    // names may be negated or contextual; a path shape cannot decide intent.
+    // This opens planning only, never execution or a new capability grant.
     state.candidates.iter().any(|candidate| {
         candidate.exact_mention
             && matches!(candidate.action, Some(Action::Delegate))
@@ -223,8 +226,9 @@ fn candidate_score(state: &StateFeatures<'_>, candidate: &CandidateFeatures<'_>)
     score
 }
 
-/// The best candidate: the highest score, ties broken by the smallest id, so
-/// the result does not depend on the order candidates are listed in.
+/// The best candidate: highest score, then lower effect risk, then id.
+/// Both global choices use this same preference only for exact probability
+/// ties; candidate listing order cannot change it.
 fn best_candidate<'f, 's>(state: &'f StateFeatures<'s>) -> Option<&'f CandidateFeatures<'s>> {
     state
         .candidates
@@ -233,7 +237,11 @@ fn best_candidate<'f, 's>(state: &'f StateFeatures<'s>) -> Option<&'f CandidateF
             let score = candidate_score(state, candidate);
             match best {
                 Some((best_score, best_candidate)) => {
-                    let better = score > best_score || (score == best_score && candidate.id < best_candidate.id);
+                    let better = score > best_score
+                        || (score == best_score
+                            && (candidate.side_effect_risk < best_candidate.side_effect_risk
+                                || (candidate.side_effect_risk == best_candidate.side_effect_risk
+                                    && candidate.id < best_candidate.id)));
                     Some(if better {
                         (score, candidate)
                     } else {
@@ -264,7 +272,14 @@ fn action_option_score(state: &StateFeatures<'_>, option: &str) -> f64 {
 }
 
 fn target_option_score(state: &StateFeatures<'_>, option: &str) -> f64 {
-    best_score(state, |candidate| candidate.target == option).unwrap_or(weights::UNMATCHED_OPTION)
+    // Targets describe the preferred action, not competing actions. In
+    // particular, an answer has no external capability target. Other actions'
+    // metadata must not manufacture uncertainty about that structural fact.
+    let action = best_candidate(state).and_then(|candidate| candidate.action);
+    best_score(state, |candidate| {
+        candidate.target == option && candidate.action == action
+    })
+    .unwrap_or(weights::UNMATCHED_OPTION)
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +323,20 @@ fn choice(
             best
         }
     });
+    // An exact tie must describe the same preferred candidate across action,
+    // target and global risk, rather than unrelated lexical option orders.
+    let preferred_index = best_candidate(state).and_then(|candidate| {
+        criteria.keys().position(|option| match meaning {
+            Meaning::Global(GlobalQuestion::NextAction) => {
+                candidate.action.is_some() && Action::from_code(option.as_str()) == candidate.action
+            }
+            Meaning::Global(GlobalQuestion::CapabilityTarget) => option.as_str() == candidate.target,
+            _ => false,
+        })
+    });
+    let chosen_index = preferred_index
+        .filter(|index| distribution.get(*index) == distribution.get(chosen_index))
+        .unwrap_or(chosen_index);
     let mut probabilities = BTreeMap::new();
     let mut chosen = None;
     for (index, (option, value)) in criteria.keys().zip(&distribution).enumerate() {
@@ -1083,6 +1112,52 @@ mod tests {
         })
     }
 
+    #[test]
+    fn configured_delegation_planning_keeps_action_and_target_consistent() {
+        let key = key();
+        for turn in [
+            "Use file_write on acceptance/root.txt, then file_read. Do not use shell or delegate.",
+            "Use file_edit on acceptance/root.txt. Then file_read. Do not use shell or delegate.",
+            "Use delegate to ask reviewer for 9 * 7. Do not use file_write or file_edit on acceptance/root.txt.",
+            "Use delegate to ask kimi for 9 * 7. Do not use shell, sessions_spawn, file_read, file_write or file_edit.",
+        ] {
+            let mut file = candidate_json("use_tool", "filesystem", "use_tool-filesystem-00000001");
+            file["exact_mention"] = json!(true);
+            file["side_effect"] = json!("local_write");
+            let mut shell = candidate_json("use_tool", "shell", "use_tool-shell-00000001");
+            shell["exact_mention"] = json!(true);
+            shell["side_effect"] = json!("process_exec");
+            let mut delegate = candidate_json("delegate", "session", "delegate-session-00000001");
+            delegate["exact_mention"] = json!(true);
+            delegate["side_effect"] = json!("process_exec");
+            let value = state(
+                turn,
+                vec![file, shell, delegate, candidate_json("answer", "none", "answer-none")],
+            );
+            let request = seal(&key, value.clone(), compiler_questions(&value));
+            let response = answer_and_validate(&request);
+            assert_eq!(
+                chosen(&response, GlobalQuestion::NextAction),
+                "answer",
+                "planning: {turn}"
+            );
+            assert_eq!(
+                chosen(&response, GlobalQuestion::CapabilityTarget),
+                "none",
+                "planning: {turn}"
+            );
+            let DecisionAnswer::Choice(target) =
+                &response.answers[&QuestionId::global(GlobalQuestion::CapabilityTarget)]
+            else {
+                panic!("target choice")
+            };
+            assert!(
+                target.confidence.get() >= 0.55,
+                "an answer's deterministic target must not borrow uncertainty from executable alternatives"
+            );
+        }
+    }
+
     /// The compiler's question set for `state`: the six global questions with
     /// the offered actions and targets, and the four per-candidate questions.
     fn compiler_questions(state: &Value) -> BTreeMap<QuestionId, DecisionQuestion> {
@@ -1234,7 +1309,7 @@ mod tests {
         let response = BuiltinDecisionBackend::answer(request).expect("test: builtin answers");
         let decision = DecisionResponseValidator::validate(request, response.clone(), &context())
             .unwrap_or_else(|error| panic!("builtin answer must validate: {error}"));
-        assert_eq!(decision.claimed_model(), "builtin-v1");
+        assert_eq!(decision.claimed_model(), weights::MODEL_VERSION);
         assert_eq!(decision.claimed_backend(), "builtin");
         assert_eq!(decision.response_sha256(), None);
         response
@@ -1276,7 +1351,7 @@ mod tests {
 
     /// `builtin_answers_every_primitive_and_validates`: over the committed
     /// state v1 fixtures, with the compiler's full question set, every
-    /// answer passes the CDP-01 validator under the exact `builtin-v1` pin.
+    /// answer passes the CDP-01 validator under the exact builtin model pin.
     #[test]
     fn builtin_answers_every_primitive_and_validates() {
         let key = key();
@@ -1388,11 +1463,44 @@ mod tests {
         assert_eq!(a, c);
     }
 
-    /// Two candidates with equal scores but different side-effect risk:
-    /// the global risk answer takes the one with the smaller id, whatever
-    /// order the state lists them in.
     #[test]
-    fn tied_candidates_are_broken_by_id_not_by_order() {
+    fn tied_global_choices_share_the_lower_effect_candidate_without_changing_probabilities() {
+        let key = key();
+        let mut read = candidate_json("use_tool", "skill", "use_tool-skill-ffffffff");
+        read["exact_mention"] = json!(true);
+        let mut write = candidate_json("use_tool", "filesystem", "use_tool-filesystem-00000001");
+        write["exact_mention"] = json!(true);
+        write["side_effect"] = json!("local_write");
+        for candidates in [vec![read.clone(), write.clone()], vec![write.clone(), read.clone()]] {
+            let value = state("Read the reference and create artifact.txt", candidates);
+            let request = seal(&key, value.clone(), compiler_questions(&value));
+            let response = answer_and_validate(&request);
+            assert_eq!(chosen(&response, GlobalQuestion::NextAction), "use_tool");
+            assert_eq!(chosen(&response, GlobalQuestion::CapabilityTarget), "skill");
+            let DecisionAnswer::Choice(choice) =
+                &response.answers[&QuestionId::global(GlobalQuestion::CapabilityTarget)]
+            else {
+                panic!("target choice")
+            };
+            assert_eq!(
+                choice.probabilities[&OptionId::code("skill")],
+                choice.probabilities[&OptionId::code("filesystem")]
+            );
+        }
+        let value = state("Use the named tools on /tmp/artifact.txt", vec![read, write]);
+        let request = seal(&key, value.clone(), compiler_questions(&value));
+        assert_eq!(
+            chosen(&answer_and_validate(&request), GlobalQuestion::CapabilityTarget),
+            "filesystem",
+            "a stronger structural score still wins; this is only an exact tie rule"
+        );
+    }
+
+    /// Two candidates with equal scores but different side-effect risk:
+    /// the global risk answer takes the lower effect, then the smaller id,
+    /// whatever order the state lists them in.
+    #[test]
+    fn tied_candidates_are_broken_by_effect_then_id_not_by_order() {
         let key = key();
         let mut safe = candidate_json("use_tool", "mcp", "use_tool-mcp-00000001");
         safe["side_effect"] = json!("read_only");

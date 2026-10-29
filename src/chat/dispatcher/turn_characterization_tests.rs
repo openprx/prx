@@ -77,11 +77,13 @@ struct FixtureProvider {
     stream_calls: AtomicUsize,
     traced_calls: AtomicUsize,
     assessment_calls: AtomicUsize,
+    requires_execution: bool,
 }
 
 impl FixtureProvider {
     fn new(steps: Vec<FixtureStep>) -> Self {
         Self {
+            requires_execution: steps.iter().any(|step| matches!(step, FixtureStep::Tool { .. })),
             steps: Mutex::new(steps.into()),
             captured_histories: Mutex::new(Vec::new()),
             stream_calls: AtomicUsize::new(0),
@@ -226,7 +228,15 @@ impl Provider for FixtureProvider {
         _model: &str,
         _temperature: f64,
     ) -> anyhow::Result<ChatTrace> {
-        if let Some(trace) = super::assessment_fixture::trace(&request, _model) {
+        if let Some(trace) = super::assessment_fixture::trace(
+            &request,
+            _model,
+            if self.requires_execution {
+                super::assessment_fixture::EXECUTION_REQUIRED
+            } else {
+                super::assessment_fixture::INFORMATIONAL
+            },
+        ) {
             self.assessment_calls.fetch_add(1, Ordering::SeqCst);
             return Ok(trace);
         }
@@ -848,7 +858,7 @@ async fn step_7_1_same_success_fixture_characterizes_stream_tool_usage_history_a
         "shared Agent owner must preserve Chat's real streaming adapter"
     );
     assert_eq!(chat_provider.traced_calls(), 0);
-    assert_eq!(chat_provider.assessment_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(chat_provider.assessment_calls.load(Ordering::SeqCst), 2);
     assert_eq!(agent_provider.assessment_calls.load(Ordering::SeqCst), 0);
     assert_eq!(agent_provider.stream_calls(), 0);
     assert_eq!(

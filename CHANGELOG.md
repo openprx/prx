@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add bounded instruction experiment planning, admission, stage execution,
+  inspection, cancellation and recovery through the existing skill lifecycle.
+  Frozen pins, shared physical request budgets and independent artifact evidence
+  keep incomplete, uncertain or neutral results from qualifying.
+
+### Fixed
+
+- Preserve original completion evidence in review repairs for single-message
+  providers and record content-free rejection diagnostics before failing closed.
+- Quarantine evaluation workspaces when cancellation grace returns an unconfirmed
+  runtime cleanup error, as well as when the grace itself expires.
+- Keep late session-save acknowledgements from changing the active chat identity
+  after a session switch.
+- Supply selected and served runtime model identities to completion review,
+  retaining unknown values and the existing evidence and execution constraints.
+- Make builtin-v4 capability targets conditional on the preferred action,
+  retain lower-effect tie handling and model-managed delegation planning,
+  and preserve numerical weights and execution gates.
+- Represent all admitted, exactly named native file operations in one candidate
+  and project current approval admission without changing executor authority.
+- Reuse canonical native capability identity rules when restoring authenticated
+  process catalogs, preserving legacy Shell and document IDs.
+- Update pulldown-cmark to 0.13.5 for the wikilink parser denial of service
+  affecting document ingestion with all Markdown extensions enabled.
+- Reserve up to one eighth of the effective input window (capped at 8,192 and
+  the configured ratio) for complete structured decisions, subtracting the
+  same amount from serving input while retaining monetary/time gates.
+- Keep managed Jev credential references resolvable during isolated instruction
+  evaluations without copying credentials into solver workspaces.
+- Omit unused terminal/global predictions from decision requests while retaining
+  the existing decision budget, candidate bound and execution gates.
+- Preserve the authenticated original request in approval-resume decision data
+  while retaining the current raw source binding and single-use execution gates.
+- Separate Shell decision discovery from filesystem tools, require positive
+  applicability for exact-action shortcuts, and keep low-utility metadata
+  recovery within its validated capability family.
+- Resolve Chat execution intent before ordinary tool dispatch and reuse that
+  result across retries, refusing informational or uncertain tool proposals.
+- Keep direct skill lifecycle roots discoverable for unnamed approval collection.
+- Use stable provider-compatible names for instruction skills while preserving
+  their original display names, exact bindings and read arguments.
+- Persist source-bound no-operation collection receipts so capability questions
+  can return a clarification without creating approval or claiming execution.
+- Ask for clarification instead of returning an internal error when the
+  current turn's execution requirement cannot be determined.
+- Keep a named tool request visible to the builtin decision model when the
+  same request also mentions delegation.
+- Propagate evolution cancellation to managed skill revision proposals.
+- Share the model token, monetary and time allowance across a pipeline's
+  proposal and judge calls, including their physical retries.
+- Refuse proposal request replays that change the model or generation budget.
+- Require CI Contracts on every required-gate path and enforce a tracked
+  first-party source file limit of 5,000 physical lines.
+
 ## [0.8.169] - 2026-10-28
 
 ### Fixed

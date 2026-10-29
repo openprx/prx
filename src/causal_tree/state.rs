@@ -512,6 +512,9 @@ pub(crate) struct DerivedCandidate {
     pub(crate) summary: Arc<str>,
     pub(crate) exact_mention: bool,
     pub(crate) available: bool,
+    /// Projection-only verdict of current admission. Unknown fixtures retain
+    /// the intrinsic requirement; execution always rechecks the original gate.
+    pub(crate) effective_approval_required: Option<bool>,
 }
 
 impl fmt::Debug for DerivedCandidate {
@@ -522,6 +525,7 @@ impl fmt::Debug for DerivedCandidate {
             .field("summary_len", &self.summary.len())
             .field("exact_mention", &self.exact_mention)
             .field("available", &self.available)
+            .field("effective_approval_required", &self.effective_approval_required)
             .finish()
     }
 }
@@ -827,6 +831,7 @@ pub(crate) mod fixtures {
             summary: Arc::from("A capability family."),
             exact_mention: false,
             available: true,
+            effective_approval_required: None,
         }
     }
 

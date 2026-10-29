@@ -361,13 +361,20 @@ fn chat_supervised_named_import_collects_approves_and_resumes_once() {
 }
 
 // Finding 115.2: a turn-engine error on the dispatcher path is shown in chat
-// and the loop keeps accepting input. Here the provider answers a collection
-// request with text instead of the one tool call it asked for.
+// and the loop keeps accepting input. The provider fails during non-executing
+// argument collection. An ordinary reply with no call is now a valid decline.
 #[test]
 #[serial(prx_chat_pty)]
 fn chat_turn_engine_error_is_visible_and_chat_keeps_running() {
     let (guard, arguments, revision) = import_fixture_at(openprx::security::AutonomyLevel::Supervised);
-    let mut sg = spawn_chat_in(&guard, &["--plain"], &[("OPENPRX_MOCK_RESPONSE", LATER_REPLY)]);
+    let mut sg = spawn_chat_in(
+        &guard,
+        &["--plain"],
+        &[
+            ("OPENPRX_MOCK_RESPONSE", LATER_REPLY),
+            ("OPENPRX_MOCK_ERROR", "PRX_COLLECTION_FIXTURE_FAILURE"),
+        ],
+    );
     let session = sg.session();
     read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
     drain_with_dsr(session, Duration::from_millis(200));

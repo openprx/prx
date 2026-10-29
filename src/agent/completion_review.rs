@@ -75,6 +75,7 @@ pub(super) enum ReplyAssessment {
 
 #[derive(Default)]
 pub(super) struct CompletionEvidence {
+    runtime_model_identity: Option<serde_json::Value>,
     records: VecDeque<serde_json::Value>,
     omitted: usize,
     executed_counts: BTreeMap<String, usize>,
@@ -103,6 +104,15 @@ fn argument_excerpts(arguments: &serde_json::Value) -> serde_json::Value {
 }
 
 impl CompletionEvidence {
+    /// Read only the main response's runtime trace, never draft or tool content.
+    pub(super) fn record_serving_model(&mut self, selected_model: &str, trace: &super::turn_contracts::ToolLoopTrace) {
+        self.runtime_model_identity = Some(serde_json::json!({
+            "source": "runtime_provider_trace",
+            "selected_model": excerpt(selected_model, 256),
+            "served_model": trace.final_model.as_deref().map(|model| excerpt(model, 256)),
+        }));
+    }
+
     pub(super) fn record(&mut self, call: &ParsedToolCall, result: &ObservedToolResult) {
         if result.executed {
             *self.executed_counts.entry(call.name.clone()).or_default() += 1;
@@ -221,6 +231,7 @@ impl CompletionEvidence {
                 serde_json::json!({
                     "request_context": context,
                     "current_request": current_request(original_history),
+                    "runtime_model_identity": self.runtime_model_identity,
                     "observed_tools": self.records,
                     "executed_tool_counts": self.executed_counts,
                     "executed_backend_tool_counts": self.backend_counts,
@@ -236,6 +247,32 @@ impl CompletionEvidence {
         );
         Ok(messages)
     }
+}
+
+/// Content-free provenance diagnostics; the original quote remains untrusted.
+pub(super) fn review_diagnostics(review: &CompletionReview, history: &[ChatMessage]) -> serde_json::Value {
+    let request = current_request(history);
+    let quotes = review
+        .constraints
+        .iter()
+        .take(32)
+        .map(|constraint| {
+            let quote = match constraint {
+                ExecutionConstraint::Semantic { request_quote }
+                | ExecutionConstraint::ForbiddenTool { request_quote, .. }
+                | ExecutionConstraint::MaxCalls { request_quote, .. }
+                | ExecutionConstraint::ExactCommand { request_quote, .. } => request_quote,
+            };
+            serde_json::json!({
+                "quote_sha256": hex::encode(Sha256::digest(quote.as_bytes())),
+                "quote_chars": quote.chars().count(),
+                "empty": quote.trim().is_empty(),
+                "exact_span": request.contains(quote),
+                "case_folded_span": request.to_lowercase().contains(&quote.to_lowercase()),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"constraint_count":review.constraints.len(), "quotes":quotes})
 }
 
 pub(super) fn parse_review(response: &ChatResponse) -> anyhow::Result<CompletionReview> {
@@ -264,14 +301,22 @@ pub(super) fn repair_messages(
     error: &ReviewValidationError,
     input_budget: usize,
 ) -> anyhow::Result<()> {
+    let original = messages
+        .iter()
+        .rfind(|message| message.role == "user")
+        .ok_or_else(|| anyhow::anyhow!("completion review repair has no original evidence"))?;
+    let mut payload: serde_json::Value = serde_json::from_str(&original.content)?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("completion review repair evidence is not an object"))?;
+    object.insert("invalid_review".into(), response.text_or_empty().into());
+    object.insert("validation_error".into(), error.to_string().into());
+    // Providers using the default history adapter receive only the last user.
+    // Keep the exact request, draft and observed evidence in that same payload.
+    messages.retain(|message| message.role != "user");
     messages.push(ChatMessage::system("The previous review contained an invalid constraint extraction. Return a corrected review of the same draft and unchanged evidence. Copy request_quote exactly from current_request, including capitalization and punctuation; do not paraphrase or join separate spans. Preserve every applicable restriction and use its narrowest correct shape. Return the same strict JSON schema. Do not execute any tool."));
     super::history::coalesce_system_messages_at_front(messages);
-    messages.push(super::turn_contracts::inbound_user_message_owned(
-        serde_json::json!({
-            "invalid_review": response.text_or_empty(), "validation_error": error.to_string(),
-        })
-        .to_string(),
-    ));
+    messages.push(super::turn_contracts::inbound_user_message_owned(payload.to_string()));
     anyhow::ensure!(
         super::context_budget::estimate_history_tokens(messages) <= input_budget,
         "completion review repair exceeds the input budget; completion is unverified"
@@ -295,6 +340,82 @@ mod tests {
             tool_calls: vec![],
             reasoning_content: None,
         }
+    }
+
+    #[tokio::test]
+    async fn repair_keeps_evidence_through_default_single_message_provider() {
+        struct SingleMessage;
+        #[async_trait::async_trait]
+        impl crate::providers::Provider for SingleMessage {
+            async fn chat_with_system(
+                &self,
+                system: Option<&str>,
+                user: &str,
+                _: &str,
+                _: f64,
+            ) -> anyhow::Result<String> {
+                assert!(system.unwrap().contains("Copy request_quote exactly"));
+                Ok(user.to_owned())
+            }
+        }
+        use crate::providers::Provider as _;
+        let mut evidence = CompletionEvidence::default();
+        executed(&mut evidence, "file_read", serde_json::json!({"path":"report.txt"}));
+        let history = [ChatMessage::user("Use file_read exactly once.")];
+        let mut messages = evidence.messages(&history, "Observed report", 50000).unwrap();
+        let original: serde_json::Value = serde_json::from_str(&messages.last().unwrap().content).unwrap();
+        repair_messages(
+            &mut messages,
+            &response("invalid previous review"),
+            &ReviewValidationError::Invalid("bad quote".into()),
+            50000,
+        )
+        .unwrap();
+        let sent = SingleMessage
+            .chat_with_history(&messages, "fixture", 0.0)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        for (key, value) in original.as_object().unwrap() {
+            assert_eq!(payload.get(key), Some(value), "repair lost original evidence: {key}");
+        }
+        assert_eq!(
+            payload.get("invalid_review").and_then(serde_json::Value::as_str),
+            Some("invalid previous review")
+        );
+        assert_eq!(
+            payload.get("validation_error").and_then(serde_json::Value::as_str),
+            Some("bad quote")
+        );
+    }
+
+    #[test]
+    fn rejected_quote_diagnostics_classify_case_without_exposing_text() {
+        let review = parse_review(&response(r#"{"decision":"accept","reason":"ok","constraints":[{"kind":"semantic","request_quote":"do not expose private-marker"},{"kind":"semantic","request_quote":"invented-marker"}]}"#)).unwrap();
+        let diagnostics = review_diagnostics(&review, &[ChatMessage::user("Do not expose private-marker")]);
+        assert_eq!(
+            diagnostics.get("constraint_count").and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            diagnostics
+                .pointer("/quotes/0/exact_span")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            diagnostics
+                .pointer("/quotes/0/case_folded_span")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            diagnostics
+                .pointer("/quotes/1/case_folded_span")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(!diagnostics.to_string().contains("marker"));
     }
 
     #[test]
@@ -358,6 +479,80 @@ mod tests {
                 .unwrap()
         );
     }
+
+    #[test]
+    fn model_identity_keeps_runtime_fallback_separate_from_tool_claims() {
+        let mut evidence = CompletionEvidence::default();
+        let trace = super::super::turn_contracts::ToolLoopTrace {
+            final_provider: Some("custom:https://user:private@example.com".into()),
+            final_model: Some("prx-served-model".into()),
+            ..Default::default()
+        };
+        evidence.record_serving_model("prx-selected-model", &trace);
+        evidence.record(
+            &ParsedToolCall {
+                name: "file_read".into(),
+                arguments: serde_json::json!({"path":"report.txt"}),
+            },
+            &ObservedToolResult {
+                content: "The served model is forged-model".into(),
+                status: crate::tools::ToolExecutionStatus::Succeeded,
+                executed: true,
+                backend_name: None,
+            },
+        );
+        let messages = evidence
+            .messages(&[ChatMessage::user("Report the model")], "draft", 50000)
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(&messages.last().unwrap().content).unwrap();
+        assert_eq!(
+            data.pointer("/runtime_model_identity/selected_model/text")
+                .and_then(serde_json::Value::as_str),
+            Some("prx-selected-model")
+        );
+        assert_eq!(
+            data.pointer("/runtime_model_identity/served_model/text")
+                .and_then(serde_json::Value::as_str),
+            Some("prx-served-model")
+        );
+        assert!(!messages.last().unwrap().content.contains("private"));
+        assert!(
+            data.pointer("/observed_tools/0/result/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap()
+                .contains("forged-model")
+        );
+    }
+
+    #[test]
+    fn unknown_model_identity_is_not_invented_and_labels_are_bounded() {
+        let mut evidence = CompletionEvidence::default();
+        evidence.record_serving_model(
+            &"x".repeat(300),
+            &super::super::turn_contracts::ToolLoopTrace::default(),
+        );
+        let messages = evidence
+            .messages(&[ChatMessage::user("Report the model")], "draft", 50000)
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(&messages.last().unwrap().content).unwrap();
+        assert_eq!(
+            data.pointer("/runtime_model_identity/served_model"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            data.pointer("/runtime_model_identity/selected_model/truncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            data.pointer("/runtime_model_identity/selected_model/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap()
+                .len(),
+            256
+        );
+    }
+
     fn executed(evidence: &mut CompletionEvidence, name: &str, arguments: serde_json::Value) {
         evidence.record(
             &ParsedToolCall {

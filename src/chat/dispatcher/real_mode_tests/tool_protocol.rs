@@ -115,7 +115,7 @@ async fn t31_driver_streaming_tool_call_protocol_executes_correctly() {
             Ok(String::new())
         }
         async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
-            super::super::assessment_fixture::response(&request)
+            super::super::assessment_fixture::response(&request, super::super::assessment_fixture::EXECUTION_REQUIRED)
                 .ok_or_else(|| anyhow::anyhow!("expected reply assessment"))
         }
         fn supports_streaming(&self) -> bool {
@@ -288,7 +288,7 @@ async fn dispatcher_tool_call_request_includes_reasoning_in_history() {
             Ok(String::new())
         }
         async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
-            super::super::assessment_fixture::response(&request)
+            super::super::assessment_fixture::response(&request, super::super::assessment_fixture::EXECUTION_REQUIRED)
                 .ok_or_else(|| anyhow::anyhow!("expected reply assessment"))
         }
         fn supports_streaming(&self) -> bool {

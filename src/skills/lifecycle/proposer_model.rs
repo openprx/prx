@@ -208,6 +208,9 @@ impl AttemptReceipt for TallyReceipt {
     fn deadline(&self) -> Instant {
         self.inner.deadline()
     }
+    fn retain_response_chunk(&self, bytes: usize) -> anyhow::Result<()> {
+        self.inner.retain_response_chunk(bytes)
+    }
     async fn settle(self: Box<Self>, usage: crate::llm::route_decision::TokenUsage) -> anyhow::Result<()> {
         let Self { inner, counters } = *self;
         inner.settle(usage).await?;

@@ -6,11 +6,11 @@ use crate::self_system::evolution::analyzer::{
 };
 use crate::self_system::evolution::commit::CommitTracker;
 use crate::self_system::evolution::config::SharedEvolutionConfig;
+use crate::self_system::evolution::engine::EngineCycleInput;
 use crate::self_system::evolution::engine::EvolutionEngine;
 use crate::self_system::evolution::gate::{EvolutionGate, GateMetrics, GateRejection, GateResult};
 use crate::self_system::evolution::judge::{JudgeConfig, JudgeEngine, JudgeResult, JudgeScoringModel, MockJudgeModel};
 use crate::self_system::evolution::record::{ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult};
-use crate::self_system::evolution::run_engine_cycle;
 use crate::self_system::evolution::safety_utils::acquire_file_lock;
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::trace::generate_experiment_id;
@@ -353,13 +353,54 @@ impl EvolutionPipeline {
         }
 
         let fitness_trend = load_fitness_trend(&self.workspace_root)?;
-        let cycle_result = run_engine_cycle(
-            engine,
-            experiment_id.clone(),
-            vec![selected_candidate.clone()],
-            fitness_trend,
-        )
-        .await?;
+        let cancel = self.commits.task_token();
+        let _cancel_when_dropped = cancel.clone().drop_guard();
+        if cancel.is_cancelled() {
+            let reason = "evolution cycle cancelled before engine start";
+            let log = build_log(&experiment_id, layer.clone(), &selected_candidate, reason);
+            let persisted = log.clone();
+            let writer = Arc::clone(&self.writer);
+            let recorded = self
+                .commits
+                .spawn(async move {
+                    writer.append_evolution(&persisted).await?;
+                    writer.flush_lines().await
+                })
+                .await;
+            errors.push(reason.into());
+            match recorded {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(format!("record_failed: {error}")),
+                Err(error) => errors.push(format!("record_failed: {error}")),
+            }
+            return Ok(PipelineRunReport {
+                experiment_id,
+                layer,
+                trigger,
+                digest,
+                trend,
+                selected_candidate: Some(selected_candidate),
+                gate_rejections,
+                judge_result: None,
+                evolution_log: Some(log),
+                shadow_mode: self.shared_config.load_full().runtime.mode.is_proposal_only(),
+                commit: CommitDecision::Deferred,
+                gate_denied: false,
+                judge_outcome: JudgeOutcome::NotRun,
+                errors,
+            });
+        }
+        let envelope = crate::runtime::evolution_model::EvolutionEnvelope::new(experiment_id.clone());
+        let cycle_result = envelope
+            .scope(engine.run_cycle_with_cancellation(
+                EngineCycleInput {
+                    cycle_id: experiment_id.clone(),
+                    analyzer_candidates: vec![selected_candidate.clone()],
+                    fitness_trend,
+                },
+                &cancel,
+            ))
+            .await?;
 
         let mut evolution_log = cycle_result.evolution_log.clone().unwrap_or_else(|| {
             build_log(
@@ -388,15 +429,13 @@ impl EvolutionPipeline {
         // The task's token is cancelled when this run is dropped (the guard)
         // and when the tracker is drained (daemon shutdown); the daemon waits
         // for the task before it returns.
-        let cancel = self.commits.task_token();
-        let _cancel_when_dropped = cancel.clone().drop_guard();
         let cleanup = crate::runtime::turn_cleanup::current_tracker();
         let verdict = self
             .commits
             .spawn(async move {
                 match cleanup {
-                    Some(owner) => owner.scope(stage.run(cancel)).await,
-                    None => stage.run(cancel).await,
+                    Some(owner) => envelope.scope(owner.scope(stage.run(cancel))).await,
+                    None => envelope.scope(stage.run(cancel)).await,
                 }
             })
             .await

@@ -329,6 +329,23 @@ impl Provider for RejectedProposalProvider<'_> {
 /// The production collector is driven by a controlled traced response. This
 /// proves rejection/Drop retention, not an HTTP transport or successful terminal.
 pub(super) async fn reject(f: Fixture<'_>, mode: u8) {
+    let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new()).unwrap();
+    let result = cleanup
+        .run(async {
+            Ok(std::panic::AssertUnwindSafe(Box::pin(reject_owned(&f, mode)))
+                .catch_unwind()
+                .await)
+        })
+        .await;
+    if result.is_err() {
+        f.cleanup_confirmed.store(false, Ordering::SeqCst);
+    }
+    if let Err(panic) = result.expect("rejected collection cleanup") {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn reject_owned(f: &Fixture<'_>, mode: u8) {
     let mut arguments = f.arguments.clone();
     if mode == 0 {
         arguments
@@ -346,7 +363,7 @@ pub(super) async fn reject(f: Fixture<'_>, mode: u8) {
         stall: mode >= 2,
         entered: tokio::sync::Notify::new(),
     };
-    let retained = RetainedProviderTrace::default();
+    let retained = Arc::new(RetainedProviderTrace::default());
     let cancellation = CancellationToken::new();
     let history = [ChatMessage::user(f.proof.routing_input())];
     let lease = f.service.begin_approval_collection(f.proof, f.context).unwrap();
@@ -386,6 +403,57 @@ pub(super) async fn reject(f: Fixture<'_>, mode: u8) {
         assert!(
             trace.is_some() && !unknown,
             "rejected arguments retain actual known usage"
+        );
+        let owner = crate::runtime::turn_cleanup::current_tracker().unwrap();
+        let route = RouteDecision::single_candidate_for_context(
+            "ollama",
+            "prx-local-model",
+            f.proof.owner_id(),
+            f.proof.session_key(),
+            f.proof.source_event_id().map(str::to_owned),
+            None,
+            "failed_collection_usage",
+            8,
+            true,
+            false,
+        );
+        let fabric = crate::memory::MemoryFabric::new(Arc::clone(f.memory), f.config.workspace_dir.to_string_lossy())
+            .with_event_recording(f.config.memory.event_recording_config());
+        let guard = crate::runtime::turn_terminal::TurnTerminalGuard::new(
+            owner.register(CancellationToken::new()).unwrap(),
+            Arc::clone(f.service),
+            Arc::clone(f.context),
+            fabric,
+            Arc::new(f.config.clone()),
+            f.envelope.clone(),
+            None,
+        )
+        .unwrap()
+        .with_provider_trace(Arc::clone(&retained), route);
+        let receipt = guard
+            .commit(crate::agent::terminal::TurnTerminalDraft {
+                decision: Some(f.service.terminal_settlement_ref(Arc::clone(f.context)).unwrap()),
+                terminal_id: f.envelope.run_id.clone().unwrap(),
+                scope: f.envelope.message_scope(),
+                status: crate::agent::terminal::TurnTerminalStatus::Failed,
+                history: None,
+                history_scope: None,
+                provider_outcome: None,
+                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                    summary: "rejected proposal after a real model reply".into(),
+                    started_at: chrono::Utc::now(),
+                    finished_at: chrono::Utc::now(),
+                },
+                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+            })
+            .await
+            .unwrap();
+        let usage = receipt
+            .usage_settlement
+            .expect("failed terminal retains provider usage without a return trace");
+        assert_eq!(
+            (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens),
+            (31, 7, 38)
         );
     }
     assert_eq!(provider.base.calls.load(Ordering::SeqCst), 1);

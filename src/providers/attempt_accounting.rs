@@ -49,6 +49,11 @@ pub(crate) trait AttemptAccounting: sealed::AccountingOwner + Send + Sync {
 #[async_trait]
 pub(crate) trait AttemptReceipt: sealed::Receipt + Send {
     fn deadline(&self) -> Instant;
+    /// Admission before retaining each response chunk. The transient chunk
+    /// is not a bandwidth or remote-provider memory quota.
+    fn retain_response_chunk(&self, _bytes: usize) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Own durable settlement before awaiting. Drop keeps unknown liability.
     async fn settle(self: Box<Self>, usage: TokenUsage) -> anyhow::Result<()>;
 }
@@ -204,20 +209,26 @@ pub(crate) async fn send_json<T: Serialize + ?Sized>(
     if deadline <= tokio::time::Instant::now() {
         return Err(AccountingRefusal.into());
     }
-    let response = tokio::time::timeout_at(deadline, async {
-        let response = builder
+    let response = tokio::time::timeout_at(deadline, async move {
+        let mut response = builder
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()
             .await?;
         let status = response.status();
         let retry_after_ms = super::traits::retry_after_ms_from_headers(response.headers());
-        let body = response.bytes().await?.to_vec();
-        Ok::<_, reqwest::Error>((status, retry_after_ms, body))
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            receipt
+                .retain_response_chunk(chunk.len())
+                .map_err(|e| e.context(AccountingRefusal))?;
+            body.extend_from_slice(&chunk);
+        }
+        Ok::<_, anyhow::Error>((status, retry_after_ms, body, receipt))
     })
     .await
     .map_err(|_| AccountingRefusal)??;
-    let (status, retry_after_ms, body) = response;
+    let (status, retry_after_ms, body, receipt) = response;
     // Parse accounting independently of semantic response decoding. A malformed
     // choice/data object must not discard otherwise reported billable usage.
     if let Some(usage) = reported_usage(&body, kind) {

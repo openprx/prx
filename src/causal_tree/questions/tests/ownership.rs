@@ -1,5 +1,6 @@
 #![cfg(test)]
-//! Literal original compiler and allocation/semantic regression evidence.
+//! Original allocation/sealing implementation under the current question policy.
+//! The 2026-10-29 policy omits all unused fixed-terminal candidate predictions.
 use super::*;
 use crate::causal_tree::branch::{CandidateSpec, SideEffectClass};
 use crate::decision::builtin::allocation_counter::count;
@@ -154,19 +155,33 @@ fn original_compile(
             levels: score_levels()?,
         },
     );
-    questions.insert(
+    omitted.push((
         QuestionId::global(GlobalQuestion::ExpectedGain),
-        DecisionQuestion::Score {
-            instructions: fixed_text("Rate the expected task gain.")?,
-            levels: score_levels()?,
-        },
-    );
+        OmissionReason::UnusedPrediction,
+    ));
 
     for candidate in candidates {
         let id = candidate.candidate_id();
         let index = *positions.get(id.as_str()).ok_or(CompileError::CandidateMismatch)?;
         let path = format!("$.candidates[{index}]");
         let key = id.key();
+        // Fixed terminal selection is code-owned; scoring/extraction never
+        // consumes these candidate predictions. Keep the omission manifest
+        // rather than paying for four unused answers per terminal.
+        if is_fixed_terminal(candidate.action()) {
+            for kind in [
+                CandidateQuestion::Applicable,
+                CandidateQuestion::Risk,
+                CandidateQuestion::Success,
+                CandidateQuestion::Gain,
+            ] {
+                omitted.push((
+                    QuestionId::candidate(&key, kind),
+                    OmissionReason::DeterministicCandidate,
+                ));
+            }
+            continue;
+        }
         questions.insert(
             QuestionId::candidate(&key, CandidateQuestion::Applicable),
             DecisionQuestion::Noul {
@@ -181,29 +196,20 @@ fn original_compile(
                 levels: score_levels()?,
             },
         );
-        if matches!(candidate.action(), CausalActionKind::Refuse | CausalActionKind::Clarify) {
-            for kind in [CandidateQuestion::Success, CandidateQuestion::Gain] {
-                omitted.push((
-                    QuestionId::candidate(&key, kind),
-                    OmissionReason::DeterministicCandidate,
-                ));
-            }
-        } else {
-            questions.insert(
-                QuestionId::candidate(&key, CandidateQuestion::Success),
-                DecisionQuestion::Noul {
-                    instructions: fixed_text(&format!("Would {path} succeed?"))?,
-                    criteria: None,
-                },
-            );
-            questions.insert(
-                QuestionId::candidate(&key, CandidateQuestion::Gain),
-                DecisionQuestion::Score {
-                    instructions: fixed_text(&format!("Rate the task gain from {path}."))?,
-                    levels: score_levels()?,
-                },
-            );
-        }
+        questions.insert(
+            QuestionId::candidate(&key, CandidateQuestion::Success),
+            DecisionQuestion::Noul {
+                instructions: fixed_text(&format!("Would {path} succeed?"))?,
+                criteria: None,
+            },
+        );
+        questions.insert(
+            QuestionId::candidate(&key, CandidateQuestion::Gain),
+            DecisionQuestion::Score {
+                instructions: fixed_text(&format!("Rate the task gain from {path}."))?,
+                levels: score_levels()?,
+            },
+        );
     }
     omitted.sort_by(|left, right| left.0.cmp(&right.0));
 

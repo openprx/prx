@@ -365,6 +365,14 @@ impl SelectedRouterReadGrant {
 }
 
 impl EngineDecision {
+    /// The engine owns the backend attempt evidence; downstream directives
+    /// may use this verdict only to narrow a selected recovery.
+    pub(crate) fn served_prediction_succeeded(&self) -> bool {
+        self.prediction
+            .as_ref()
+            .is_some_and(PredictionResult::served_attempt_succeeded)
+    }
+
     /// Admit one exact read-only retrieval source after final-gated selection.
     /// The runtime still checks the source proof and deadline at the read.
     pub(crate) fn validate_selected_retrieval(
@@ -497,7 +505,7 @@ impl EngineDecision {
                 .flat_map(CausalCandidate::required_capabilities)
                 .filter(|reference| {
                     catalog.entry_any(&reference.id).is_some_and(|entry| {
-                        matches!(entry.exposure, Exposure::Searchable)
+                        entry.supports_metadata_discovery()
                             && !trusted.excludes_entry(catalog.model_admission_entry(entry))
                     })
                 })
@@ -511,7 +519,7 @@ impl EngineDecision {
                 !matches!(
                     entry.public_name.as_str(),
                     "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate" | "sessions_spawn"
-                ) && matches!(entry.exposure, Exposure::Searchable)
+                ) && entry.supports_metadata_discovery()
                     && !trusted.excludes_entry(catalog.model_admission_entry(entry))
             })
             .into_iter()
@@ -1346,6 +1354,7 @@ fn derive_state(set: &CandidateSet, catalog: &CatalogView<'_>) -> Result<Derived
     let CandidateSet::Legal {
         candidates,
         exact_mentions,
+        report,
         ..
     } = set
     else {
@@ -1356,15 +1365,34 @@ fn derive_state(set: &CandidateSet, catalog: &CatalogView<'_>) -> Result<Derived
             .iter()
             .map(|candidate| DerivedCandidate {
                 candidate: candidate.clone(),
-                summary: Arc::from(
-                    candidate
+                summary: if candidate.action() == CausalActionKind::UseTool
+                    && candidate.target() == super::branch::CapabilityTarget::Filesystem
+                    && candidate.required_capabilities().len() > 1
+                {
+                    let names = candidate
                         .required_capabilities()
-                        .first()
-                        .and_then(|reference| catalog.entry_any(&reference.id))
-                        .map_or("Fixed terminal", |entry| entry.summary.as_str()),
-                ),
+                        .iter()
+                        .filter_map(|reference| catalog.entry_any(&reference.id))
+                        .map(|entry| entry.public_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Arc::from(format!("Native workspace file operations: {names}"))
+                } else {
+                    Arc::from(
+                        candidate
+                            .required_capabilities()
+                            .first()
+                            .and_then(|reference| catalog.entry_any(&reference.id))
+                            .map_or("Fixed terminal", |entry| entry.summary.as_str()),
+                    )
+                },
                 exact_mention: exact_mentions.contains(candidate.candidate_id()),
                 available: true,
+                effective_approval_required: match report.outcomes.get(candidate.candidate_id()) {
+                    Some(GateOutcome::Passed) => Some(false),
+                    Some(GateOutcome::ApprovalOnly { .. } | GateOutcome::ApprovalDeferred) => Some(true),
+                    _ => None,
+                },
             })
             .collect(),
     )

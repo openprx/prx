@@ -34,6 +34,8 @@ const CANCEL_GRACE: Duration = Duration::from_secs(20);
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024;
 const MAX_EXPERIENCES: usize = 16;
 
+mod owned;
+
 /// The workspace whose cost ledger and limits the evaluation spends against.
 ///
 /// Each run settles into its own scratch ledger, which is discarded with the
@@ -57,6 +59,7 @@ impl AccountingOwner {
 }
 
 /// Runs cases through `crate::agent::run` with a template configuration.
+#[derive(Clone)]
 pub struct AgentCaseExecutor {
     template: Config,
     scratch_root: PathBuf,
@@ -133,7 +136,11 @@ impl AgentCaseExecutor {
         let template = &self.template;
         let mut config = provider_sections(template)?;
         config.workspace_dir = workspace.to_path_buf();
-        config.config_path = workspace.join("config.toml");
+        // Managed profile references resolve beside the caller configuration.
+        // Keep that read-only source identity; copying auth files into the trial
+        // would expose credentials to its file tools. Runtime state still belongs
+        // to the isolated workspace, and suites cannot offer config management.
+        config.config_path.clone_from(&template.config_path);
         config.api_key.clone_from(&template.api_key);
         config.api_url.clone_from(&template.api_url);
         config.default_provider.clone_from(&template.default_provider);
@@ -470,8 +477,48 @@ impl CaseExecutor for AgentCaseExecutor {
         request: &ExecutionRequest<'_>,
         cancel: &CancellationToken,
     ) -> Result<RunObservation, EvaluationError> {
+        self.run_owned(request, cancel).await
+    }
+}
+
+impl AgentCaseExecutor {
+    async fn run_case_inner(
+        &self,
+        request: &ExecutionRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<RunObservation, EvaluationError> {
         self.admit_spend()?;
+        let experiment = crate::runtime::experiment_stage::current();
+        let before = experiment
+            .as_ref()
+            .map(|stage| {
+                self.tracker()?
+                    .physical_scope_usage(&stage.scope_id())
+                    .map_err(|error| EvaluationError::Executor(error.to_string()))
+            })
+            .transpose()?;
         let started = Instant::now();
+        if let Some(stage) = &experiment {
+            let fixtures = request.fixtures.iter().try_fold(0_u64, |total, file| {
+                total
+                    .checked_add(
+                        u64::try_from(file.content.len())
+                            .map_err(|_| EvaluationError::Executor("fixture size overflow".into()))?,
+                    )
+                    .ok_or_else(|| EvaluationError::Executor("fixture size overflow".into()))
+            })?;
+            let installed = request.skill.map_or(0, |skill| {
+                skill
+                    .bundle
+                    .files()
+                    .iter()
+                    .map(|file| u64::try_from(file.bytes().len()).unwrap_or(u64::MAX))
+                    .fold(0_u64, u64::saturating_add)
+            });
+            stage
+                .account_scratch(fixtures.saturating_add(installed))
+                .map_err(|error| EvaluationError::Executor(error.to_string()))?;
+        }
         fs::create_dir_all(&self.scratch_root).map_err(|e| io_error(&self.scratch_root, e))?;
         let scratch = tempfile::Builder::new()
             .prefix("prx-skill-eval-")
@@ -500,6 +547,14 @@ impl CaseExecutor for AgentCaseExecutor {
             None => None,
         };
 
+        let _scratch_admission = experiment
+            .as_ref()
+            .map(|stage| {
+                stage
+                    .register_scratch(&workspace, scratch_bytes(&workspace)?)
+                    .map_err(|error| EvaluationError::Executor(error.to_string()))
+            })
+            .transpose()?;
         let token = cancel.child_token();
         let mut run = Box::pin(crate::agent::entry::run_quiet(
             run_config.clone(),
@@ -507,9 +562,11 @@ impl CaseExecutor for AgentCaseExecutor {
             self.temperature,
             token.clone(),
         ));
+        let mut cleanup_unconfirmed = false;
         let (terminal, response) = match tokio::time::timeout(request.deadline, &mut run).await {
             Ok(Ok(text)) => (RunTerminal::Completed, text),
             Ok(Err(error)) => {
+                cleanup_unconfirmed = error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>();
                 // The error text can echo provider detail; only its class is kept.
                 tracing::debug!(
                     run_id = request.run_id,
@@ -527,16 +584,26 @@ impl CaseExecutor for AgentCaseExecutor {
             }
             Err(_) => {
                 token.cancel();
-                if tokio::time::timeout(CANCEL_GRACE, &mut run).await.is_err() {
+                cleanup_unconfirmed = owned::cleanup_unconfirmed_after_cancellation(&mut run).await;
+                if cleanup_unconfirmed {
                     tracing::warn!(
                         run_id = request.run_id,
-                        "evaluation agent run did not wind down after cancellation"
+                        "evaluation agent cleanup was not confirmed after cancellation"
                     );
                 }
                 (RunTerminal::TimedOut, String::new())
             }
         };
         drop(run);
+        if cleanup_unconfirmed {
+            // A retained worker may still access this root. Never remove it
+            // and report Removed while its termination is unconfirmed.
+            let retained = scratch.keep();
+            return Err(EvaluationError::Executor(format!(
+                "trial cleanup is unconfirmed; isolated workspace quarantined at {}",
+                retained.display()
+            )));
+        }
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let (hydrations, experience_terminal) = {
@@ -546,8 +613,41 @@ impl CaseExecutor for AgentCaseExecutor {
                 .map_err(|e| EvaluationError::Executor(format!("experience read task failed: {e}")))??
         };
         let artifacts = collect_artifacts(&workspace, request.collect_artifacts);
-        let usage = read_usage(&workspace);
-        self.charge_spend(&usage)?;
+        let usage = if let (Some(stage), Some(before)) = (experiment.as_ref(), before) {
+            stage
+                .flush()
+                .await
+                .map_err(|error| EvaluationError::Executor(error.to_string()))?;
+            let after = self
+                .tracker()?
+                .physical_scope_usage_since(&stage.scope_id(), &before.attempt_ids)
+                .map_err(|error| EvaluationError::Executor(error.to_string()))?;
+            let response_bytes = response.len().saturating_add(
+                artifacts
+                    .values()
+                    .filter_map(Option::as_ref)
+                    .map(Vec::len)
+                    .sum::<usize>(),
+            );
+            stage
+                .account_output(response_bytes)
+                .map_err(|error| EvaluationError::Executor(error.to_string()))?;
+            LedgerUsage {
+                tokens: (!after.unresolved).then_some(after.tokens),
+                cost_micros: (!after.unresolved).then_some(after.micro_usd),
+                models: after.models,
+                records: Vec::new(),
+            }
+        } else {
+            let usage = read_usage(&workspace);
+            self.charge_spend(&usage)?;
+            usage
+        };
+        if let Some(stage) = &experiment {
+            stage
+                .account_scratch(scratch_bytes(&workspace)?)
+                .map_err(|error| EvaluationError::Executor(error.to_string()))?;
+        }
         let cleanup = match scratch.close() {
             Ok(()) => CleanupState::Removed,
             Err(error) => {
@@ -571,6 +671,38 @@ impl CaseExecutor for AgentCaseExecutor {
             models_used: usage.models,
         })
     }
+}
+
+/// Logical file bytes, with bounded enumeration and no symlink traversal.
+/// Native writes have prospective admission; this also checks runtime metadata
+/// and retained-size overruns without claiming an OS filesystem quota.
+fn scratch_bytes(root: &Path) -> Result<u64, EvaluationError> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut count = 0_u32;
+    let mut bytes = 0_u64;
+    while let Some(directory) = directories.pop() {
+        for item in fs::read_dir(&directory).map_err(|error| io_error(&directory, error))? {
+            let item = item.map_err(|error| io_error(&directory, error))?;
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| EvaluationError::Executor("scratch entry overflow".into()))?;
+            if count > 4096 {
+                return Err(EvaluationError::Executor("scratch entry limit exceeded".into()));
+            }
+            let metadata = fs::symlink_metadata(item.path()).map_err(|error| io_error(&item.path(), error))?;
+            if metadata.is_symlink() {
+                return Err(EvaluationError::Executor("scratch contains a symlink".into()));
+            }
+            if metadata.is_dir() {
+                directories.push(item.path());
+            } else if metadata.is_file() {
+                bytes = bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| EvaluationError::Executor("scratch size overflow".into()))?;
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 fn error_class(error: &anyhow::Error) -> &'static str {

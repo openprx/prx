@@ -186,7 +186,8 @@ pub(crate) fn redacted_projection(
                 "action": candidate.action().as_str(),
                 "target": candidate.target().as_str(),
                 "side_effect": candidate.side_effect().as_str(),
-                "approval": candidate.approval().code(),
+                "approval": derived.effective_approval_required.map_or_else(
+                    || candidate.approval().code(), |required| if required { "required" } else { "none" }),
                 "cost_bucket": candidate
                     .estimated_cost()
                     .map_or(UNKNOWN_COST_BUCKET, |cost| bucket(cost.micro_usd, &COST_BUCKETS)),
@@ -663,6 +664,42 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/decision/state_v1/check_state_v1.rs"
     ));
+
+    #[test]
+    fn effective_approval_projection_does_not_change_intrinsic_execution_requirement() {
+        use super::super::branch::{ApprovalRequirement, CandidateSpec, CausalCandidate, SideEffectClass};
+        let key = key();
+        let mut turn = state(&key, "Native file operation");
+        let mut item = candidate(&key, CausalActionKind::UseTool, CapabilityTarget::Filesystem, None);
+        item.candidate = CausalCandidate::new(
+            CausalActionKind::UseTool,
+            CapabilityTarget::Filesystem,
+            CandidateSpec {
+                namespace: None,
+                required_capabilities: Vec::new(),
+                side_effect: SideEffectClass::LocalWrite,
+                approval: ApprovalRequirement::Required { op_ids: Vec::new() },
+                estimated_cost: None,
+                estimated_latency_ms: None,
+            },
+        );
+        turn.derived = derived(vec![item.clone()]);
+        let unknown_fingerprint = turn.material_fingerprint(&key);
+        for (effective, expected) in [(None, "required"), (Some(true), "required"), (Some(false), "none")] {
+            item.effective_approval_required = effective;
+            turn.derived = derived(vec![item.clone()]);
+            let (value, _) = redacted_projection(&turn).unwrap();
+            assert_eq!(value.as_json()["candidates"][0]["approval"], expected);
+            assert_eq!(state_v1_violations(value.as_json()), Vec::<String>::new());
+            assert!(matches!(
+                item.candidate.approval(),
+                ApprovalRequirement::Required { .. }
+            ));
+            if effective.is_some() {
+                assert_ne!(turn.material_fingerprint(&key), unknown_fingerprint);
+            }
+        }
+    }
 
     /// Secret values that must never reach a projection (the C 5.2.6 kind of
     /// sentinel), each with a text that carries it.

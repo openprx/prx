@@ -370,7 +370,7 @@ pub(crate) struct MockEnvProvider {
     response: String,
     /// Scripted verdict for the separate no-result assessment request. This is
     /// fixture data, not a semantic classifier; it exists only in test/mock builds.
-    execution_assessment: String,
+    execution_assessment: Option<String>,
     completion_assessment: String,
     /// 5a-6: when `OPENPRX_MOCK_TOOL_CALL=name:args_json` is set, the first streaming call
     /// emits a `ToolCallChunk`(name, args) and later calls return the `response` text.
@@ -576,8 +576,7 @@ impl MockEnvProvider {
             .filter(|value| !value.is_empty());
         Self {
             response,
-            execution_assessment: std::env::var("OPENPRX_MOCK_EXECUTION_ASSESSMENT")
-                .unwrap_or_else(|_| r#"{"requirement":"informational"}"#.to_string()),
+            execution_assessment: std::env::var("OPENPRX_MOCK_EXECUTION_ASSESSMENT").ok(),
             completion_assessment: std::env::var("OPENPRX_MOCK_COMPLETION_ASSESSMENT")
                 .unwrap_or_else(|_| r#"{"decision":"accept","reason":"fixture result","constraints":[]}"#.to_string()),
             tool_call_spec,
@@ -644,7 +643,7 @@ impl Provider for MockEnvProvider {
                 message.role == "system"
                     && (message
                         .content
-                        .starts_with("Classify the execution requirement of the CURRENT user request")
+                        .starts_with("Classify the execution requirement of current_request")
                         || message
                             .content
                             .starts_with("Review the proposed final reply against the CURRENT request"))
@@ -662,7 +661,22 @@ impl Provider for MockEnvProvider {
                     {
                         self.completion_assessment.clone()
                     } else {
-                        self.execution_assessment.clone()
+                        self.execution_assessment.clone().unwrap_or_else(|| {
+                            // A declared positive tool script needs an independent
+                            // intent reply before its first dispatch. Later plain
+                            // turns keep the informational fixture. Explicit verdicts
+                            // still drive refusal/malicious-proposal tests unchanged.
+                            let scripted_tool = self.tool_call_spec.is_some()
+                                || self
+                                    .script
+                                    .as_ref()
+                                    .is_some_and(|script| script.chunks.iter().any(|chunk| chunk.tool.is_some()));
+                            if scripted_tool && self.call_counter.load(Ordering::SeqCst) == 1 {
+                                r#"{"requirement":"execution_required"}"#.to_string()
+                            } else {
+                                r#"{"requirement":"informational"}"#.to_string()
+                            }
+                        })
                     },
                 ),
                 tool_calls: Vec::new(),

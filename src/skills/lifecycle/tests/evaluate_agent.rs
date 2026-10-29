@@ -520,7 +520,7 @@ async fn the_evaluation_config_is_built_from_an_allowlist_and_cannot_reach_the_s
     assert_eq!(config.autonomy.level, crate::security::AutonomyLevel::ReadOnly);
     assert!(config.autonomy.workspace_only);
     assert_eq!(config.workspace_dir, ws);
-    assert!(config.config_path.starts_with(&ws));
+    assert_eq!(config.config_path, tmp.path().join("config.toml"));
     assert_eq!(config.tool_tiering.always_include, ["skill_read"]);
     for name in [
         "shell",
@@ -912,4 +912,61 @@ fn rows_with_cache_tokens_verify_and_count_and_a_tampered_row_voids_the_ledger()
             "tampering with {from} must void the ledger"
         );
     }
+}
+
+#[tokio::test]
+async fn evaluation_keeps_managed_decision_credential_reference_outside_trial_workspace() {
+    use crate::config::manage::credentials::CredentialReferences;
+    use crate::providers::credentials::{ConfigCredentialSource, CredentialRef, CredentialSource};
+    let tmp = TempDir::new().expect("fixture root");
+    let source = tmp.path().join("managed-config");
+    std::fs::create_dir(&source).expect("source config directory");
+    let mut template = Config::default();
+    template.config_path = source.join("config.toml");
+    template.secrets.encrypt = false;
+    CredentialReferences::for_config(&template)
+        .expect("store")
+        .set("openrouter", "evaluation-decision", "prx-fake-decision-credential")
+        .expect("fake reference");
+    let expected_config_path = template.config_path.clone();
+    let executor = AgentCaseExecutor::new(
+        template,
+        tmp.path().join("scratch"),
+        0.0,
+        AccountingOwner::new(tmp.path().join("owner")),
+    );
+    let workspace = tmp.path().join("trial");
+    std::fs::create_dir(&workspace).expect("trial workspace");
+    let none = Vec::new();
+    let config = executor
+        .run_config(&workspace, &dummy_request(&[], &none, SideEffects::None))
+        .expect("trial configuration");
+    let reference = CredentialRef::Profile {
+        id: "cred-evaluation-decision".into(),
+    };
+    let credentials = ConfigCredentialSource::new(&config);
+    assert_eq!(
+        credentials
+            .owner_of(&reference)
+            .expect("lookup")
+            .and_then(|owner| owner.catalog_name().map(str::to_owned)),
+        Some("openrouter".into())
+    );
+    assert_eq!(
+        credentials
+            .material(&reference)
+            .expect("material")
+            .and_then(|value| value.api_key().map(str::to_owned)),
+        Some("prx-fake-decision-credential".into())
+    );
+    assert_eq!(config.config_path, expected_config_path);
+    assert_eq!(config.workspace_dir, workspace);
+    assert!(!workspace.join("auth-profiles.json").exists());
+    assert!(!workspace.join(".secret_key").exists());
+    let policy = crate::security::SecurityPolicy::from_config(&config.autonomy, &workspace);
+    let reader = crate::tools::FileReadTool::new(Arc::new(policy), false);
+    let result = crate::tools::Tool::execute(&reader, serde_json::json!({"path": source.join("auth-profiles.json")}))
+        .await
+        .expect("native file read response");
+    assert!(!result.success, "the trial cannot read the managed credential store");
 }

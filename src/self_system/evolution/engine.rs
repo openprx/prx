@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// A change an engine proposes but has not written (D-046). Engines never
 /// write their target in `run_cycle`: the pipeline judges the proposal and
@@ -115,6 +116,16 @@ pub trait EvolutionEngine: Send + Sync {
     /// Propose one cycle's change. Never writes the layer's target: the
     /// change to write goes in [`CycleResult::pending`] (D-046).
     async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult>;
+
+    /// Run with the owner's cancellation token when the engine supports it.
+    async fn run_cycle_with_cancellation(
+        &mut self,
+        input: EngineCycleInput,
+        cancel: &CancellationToken,
+    ) -> Result<CycleResult> {
+        anyhow::ensure!(!cancel.is_cancelled(), "evolution cycle cancelled before start");
+        self.run_cycle(input).await
+    }
 }
 
 /// Execute a layer engine and normalize into the cycle result contract.

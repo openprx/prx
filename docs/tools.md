@@ -88,19 +88,27 @@ deadline, interactive shell session, or permission setting is added by this
 result contract. These facts establish what executed; they do not establish
 that the user's whole task succeeded or validate arbitrary assistant prose.
 
-## Chat replies without tool results
+## Chat request intent and completion
 
-Tool-enabled `prx chat` checks a proposed final reply when the current turn has
-no tool results. The configured provider and model classify the current request
-as requiring execution, informational, or uncertain, using a strict JSON
-response. An execution requirement triggers one corrective tool round through
-the existing execution service. For text-only retries, earlier conversation is
-serialized as context data so historical approval notices are not imitated as
-new assistant replies; current system policy and the request are preserved.
-A second reply without any tool result, an
-invalid assessment, or an uncertain assessment ends with an explicit unverified
-error. Rejected drafts are not added to conversation history or streamed as
-final answers. Informational replies can finish without tools.
+Tool-enabled `prx chat` resolves the current request's execution requirement
+before its first ordinary tool batch. The configured provider and model return
+strict JSON: execution_required, informational or uncertain. The original
+source-bound request is explicit; conversation is context data. The result is
+reused for the turn and is not permission to bypass source, model, scope, cost
+or approval gates. Exact-call collection retains its non-executing path.
+
+An informational tool proposal is discarded and the model retries without
+executable tools. Repeated proposals cannot reopen execution. An uncertain
+request receives clarification without dispatch; an invalid assessment fails
+without dispatch. Assessment calls use the existing physical accounting and
+turn trace, and their configured event record identifies the pre-dispatch phase.
+
+A tool-free final draft still receives the same assessment when none exists.
+Required execution triggers one corrective tool round through the existing
+executor. Earlier conversation is serialized as context data on text-only
+retries, preserving current policy and preventing imitation of old approvals.
+A second draft without a required tool result remains explicitly unverified.
+Rejected drafts are not recorded or streamed as final answers.
 
 Tool-backed final replies also receive a bounded review against the original
 request, proposed answer and observed tool results. The review checks support for
@@ -290,7 +298,14 @@ exists. Search returns bounded offers from eligible families. An offered
 capability must pass its own admission before it can execute or join the
 appended surface. The old keyword selector and cumulative session union are
 absent from the production path. Tools offered on an earlier turn do not become
-authority for a later turn.
+authority for a later turn. The native skill lifecycle root remains discoverable
+by its metadata when `always_include` gives it direct publication. An unnamed
+lifecycle request can then collect one exact proposed call for operator review;
+this discovery neither approves nor executes it. A directory reference and one
+complete canonical `r1-<sha256>` bundle revision can also identify that native
+proposal surface before unrelated retrieval. This offers only argument
+collection: the collector must decline absent, prohibited or ambiguous import
+intent, and the owner still reviews the exact source and complete revision.
 
 Within one turn, the selected core is stable and newly admitted discoveries
 are appended after it. Both segments use canonical ordering and exact schema
@@ -1655,6 +1670,14 @@ rewrite is required.
 
 Chat supports `/approve --decision <uuid>` and `/deny --decision <uuid>` for a pending causal decision owned by the current chat. These commands record review through the signed decision-approval service; approval alone does not execute or resume the operation. Existing `/approve <seq>` and `/deny <seq>` still address child sessions. Use the canonical lowercase hyphenated decision UUID. Unknown, foreign, expired and failed reviews produce the same unconfirmed result and are not automatically retried.
 
+Argument collection can also finish without proposing an approval-bound operation.
+PRX records a source-bound decline receipt and returns a normal clarification in
+assistant history. The receipt binds the exact reply and an empty execution
+trace; it cannot be reviewed or resumed as an approval. Outcome telemetry records
+clarification rather than a successful tool action. Existing pending receipts
+keep their verification format. New readers verify old terminal records; older
+readers may refuse verification of the new declined-collection terminal binding.
+
 Use `/approval --decision <uuid>` to inspect the pending call before review. It displays the existing owner-authorized DTO, including redacted arguments and original-call availability; large output is truncated with a marker. `/revoke --decision <uuid>` records revocation of reviewed grants and does not undo any effect already executed. Neither command invokes a provider or resumes a tool. Unknown or foreign decisions do not reveal their existence.
 
 `/resume-decision <uuid>` explicitly requests execution of the original stored call after approval. Chat records a fresh canonical request and run, rechecks its source and pending approval, and uses the existing one-use direct execution service. Ordinary JSON chat messages do not select resume mode. The resume runs as a foreground ordered turn without a main-provider call; terminal status reflects the tool outcome, and a failed or uncertain attempt is not automatically repeated. A closed decision is rendered without running a tool.
@@ -1821,3 +1844,30 @@ local ReadOnly mode and the gateway's authorization policy can refuse the
 request. Success reports the gateway's new plugin generation. Trust/revoke
 alone does not reload a running owner; this command calls its existing reload
 endpoint and does not restart it or change configuration.
+
+
+### Bounded instruction experiments
+
+`prx skills lifecycle experiment` exposes the M1 lifecycle bridge. It requires an enabled lifecycle in `shadow` or `auto`, an active managed instruction revision, and an operator-registered frozen suite. It does not schedule a general/domain/compose search or publish a revision.
+
+- `plan <source>` accepts a draft with `id`, `skill_id`, `verification_split`, `resources`, `elapsed_ms`, `max_concurrent` and topologically ordered `stages`. Each draft stage supplies `id`, `dependencies`, `allocation` and the exact `operation` JSON. The service derives operation hashes and resolves the actual owner, baseline generation, binary, configuration, policy, catalog, model and suite pins without sending a model request or executing a tool.
+- `admit <source>` persists the complete frozen specification. Keep its SHA-256 separately from the mutable workspace.
+- `run <id> <digest> <stage> <source>` executes one declared proposal, paired evaluation, or independent-verification operation. Its canonical operation digest must match the frozen stage input.
+- `inspect <id> <digest>` reports the journal, conservative committed allocation, physical ledger observations and independently recomputed qualification.
+- `cancel <id> <digest>` prevents new work and requests cancellation of owned work. It does not erase usage or uncertain liabilities.
+- `recover <id> <digest>` performs no model or tool execution. Never-dispatched reservations can be closed; dispatched work becomes uncertain and cannot be automatically repeated. Missing cost rows do not prove that a request was unsent.
+
+Every admitted physical request, including solver calls, retries, fallback and auxiliary calls, uses the existing cost reservation owner. Immutable parent group ceilings apply across stage scope IDs under the same ledger lock. Unknown requests retain their estimates; actual overruns are recorded in full and block further admission. Token and monetary estimates are prospective local limits, not a vendor charge guarantee.
+
+M1 native trials admit `skill_read`, `file_read`, `file_write` and `file_edit` within registered isolated case workspaces. Existing source, security and exact-operation approval checks still apply. Resulting write/edit bytes are charged conservatively before replacement allocation and are not refunded by failure or cancellation. Retained HTTP chunks and decoded outputs consume the declared output allowance. Runtime metadata and total scratch size are checked separately; these checks do not provide an OS filesystem quota. Shell, recursive processes, private-owner filesystem routing and streaming have no admitted M1 adapter.
+
+A completed run or a model's success claim cannot qualify an experiment. The independent verifier rereads the stored case and artifact receipts, checks the pinned candidate, baseline, owner, suite split, experiment, stage and input identities, and preserves incorrect, incomplete and Unknown outcomes. Shadow never publishes. Journal evidence and unresolved cost reservations must be retained during rollback; older binaries must not be used to resume these new experiment records.
+
+Instruction-read aliases preserve existing names that satisfy `[A-Za-z0-9_-]{1,128}`. A display name containing spaces, punctuation, Unicode or excess bytes receives a stable `skill_read_<sha256>` public name. The original skill name remains in the closed `name` argument, target identity and display metadata; the backend binding and process snapshot use the same public-name mapping. Colliding public names are refused. Stale catalog references require fresh discovery and admission.
+
+
+Evaluation runs retain the managed caller configuration path for provider and
+decision credential reference lookup. Runtime state and artifacts remain in the
+isolated trial workspace. Auth-profile files and encryption keys are never copied
+into that workspace; its native file tools cannot read the caller credential
+store, and suites cannot offer configuration-management tools.

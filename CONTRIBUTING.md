@@ -27,6 +27,16 @@ cargo deny check
 cargo build --release --locked
 ```
 
+## Source file size
+
+Keep each first-party source file at or below 5,000 physical lines, including
+comments and tests. Split code by responsibility rather than moving unrelated
+logic merely to satisfy the limit. Run `python3 scripts/ci/source_size_gate.py`
+after adding files to Git; the Contracts job checks all tracked source files,
+including build definitions and executable scripts. The vendored Matrix SDK is
+separately identified by its upstream provenance. Untracked files are not part
+of the gate until added to Git.
+
 ## Architecture
 
 Trait-based pluggable architecture — every subsystem is swappable:

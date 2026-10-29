@@ -39,6 +39,12 @@ impl Capture {
     }
 }
 
+/// Retain the active serializer recorder when layering accounting around an
+/// already admitted main solver call. Absence remains disabled recording.
+pub(crate) fn current() -> Capture {
+    Capture(CURRENT.try_with(Clone::clone).unwrap_or_default())
+}
+
 pub(crate) fn record(parameters: ResolvedParameters) {
     // No recorder means event recording is disabled for this turn. Parameter
     // resolution still runs, but it must not create a separate persistence path.

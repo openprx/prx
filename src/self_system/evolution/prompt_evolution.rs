@@ -213,6 +213,16 @@ impl EvolutionEngine for PromptEvolutionEngine {
     }
 
     async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
+        self.run_cycle_with_cancellation(input, &tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    async fn run_cycle_with_cancellation(
+        &mut self,
+        input: EngineCycleInput,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<CycleResult> {
+        anyhow::ensure!(!cancel.is_cancelled(), "evolution cycle cancelled before start");
         let started_at = Utc::now().to_rfc3339();
         let fitness_trend = input.fitness_trend.clone().unwrap_or_default();
         let cycle_id = if input.cycle_id.is_empty() {
@@ -264,7 +274,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
                 std::time::Duration::from_secs(180),
             )?;
             let (draft, content) = service
-                .propose_prompt_revision(name, &before, cycle_id.clone(), budget, proposer.as_ref())
+                .propose_prompt_revision(name, &before, cycle_id.clone(), budget, Arc::clone(proposer), cancel)
                 .await?;
             if let Err(error) = Self::validate_safety(&before, &content, &prompt_cfg.blocked_keywords) {
                 let service = Arc::clone(service);

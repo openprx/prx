@@ -530,7 +530,7 @@ async fn run_console_runtime_turn(
     );
     if decision.context.approval_collection_proof().is_some() {
         anyhow::ensure!(
-            awaiting_approval,
+            awaiting_approval || decision.context.collected_declined_event().is_some(),
             "Console collection returned without a durable pending approval"
         );
     }

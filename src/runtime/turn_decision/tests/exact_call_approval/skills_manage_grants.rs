@@ -241,12 +241,25 @@ async fn env_with(autonomy: AutonomyLevel, case: Case, production: bool) -> Env 
 }
 
 async fn env_with_hops(autonomy: AutonomyLevel, case: Case, production: bool, hops: Option<u8>) -> Env {
+    env_with_discovery(autonomy, case, production, hops, false).await
+}
+
+async fn env_with_discovery(
+    autonomy: AutonomyLevel,
+    case: Case,
+    production: bool,
+    hops: Option<u8>,
+    direct_lifecycle: bool,
+) -> Env {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().expect("test: workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
     config.causal_tree.enabled = true;
+    if direct_lifecycle {
+        config.tool_tiering.always_include.push("skills_manage".into());
+    }
     if let Some(hops) = hops {
         config.causal_tree.policy.max_decision_hops = hops;
     }
@@ -315,7 +328,25 @@ async fn env_with_hops(autonomy: AutonomyLevel, case: Case, production: bool, ho
             config.sessions_spawn.clone(),
         )
         .with_shared_memory(Arc::clone(&memory));
-        let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(manage), Box::new(spawn)]);
+        let registry = crate::agent::test_admission::registry_with_search(vec![
+            Box::new(manage),
+            Box::new(spawn),
+            Box::new(crate::tools::file_read::FileReadTool::new(Arc::clone(&security), false)),
+            Box::new(crate::tools::file_write::FileWriteTool::new(Arc::clone(&security))),
+            Box::new(crate::tools::shell::ShellTool::new(
+                Arc::new(crate::runtime::NativeRuntime::new()),
+                workspace.path().to_owned(),
+            )),
+            Box::new(crate::tools::memory_search::MemorySearchTool::new(
+                workspace.path().to_owned(),
+                Arc::clone(&memory),
+                false,
+            )),
+            Box::new(crate::tools::document_search::DocumentSearchTool::new(
+                workspace.path().to_owned(),
+                Arc::clone(&memory),
+            )),
+        ]);
         let service = crate::runtime::turn_publication::TurnDecisionPublication {
             generation: Arc::clone(&generation),
             registry: Arc::clone(&registry),
@@ -463,16 +494,17 @@ async fn run(env: &Env, autonomy: AutonomyLevel, case: Case) {
     let spec = env.spec(case);
     let cancel = CancellationToken::new();
     let cleanup_confirmed = AtomicBool::new(true);
+    let original_input = format!(
+        "Call the skills_manage tool with action {} for the reviewed bundle in import-src/envprobe",
+        spec.arguments
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    );
     let (proof, envelope) = recorded_approval_source(
         &env.generation,
         Arc::clone(&env.memory),
-        &format!(
-            "Call the skills_manage tool with action {} for the reviewed bundle in import-src/envprobe",
-            spec.arguments
-                .get("action")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-        ),
+        &original_input,
         ChatMode::Edit,
         "prx_grant_original",
         1,
@@ -614,6 +646,21 @@ async fn run(env: &Env, autonomy: AutonomyLevel, case: Case) {
         .decide_agent_resume(resume.as_ref(), AgentTurnKind::Repl, &cancel)
         .await
         .expect("test: resume decision");
+    assert_eq!(resumed.engine.state.routing_input.as_str(), resume_input);
+    assert!(resumed.engine.state.goal.as_str().contains(&original_input));
+    assert!(!resumed.engine.state.goal.as_str().contains(&resume_input));
+    assert!(
+        resumed
+            .engine
+            .state
+            .goal
+            .as_str()
+            .starts_with("Resume the exact approved tool call")
+    );
+    assert!(
+        !resumed.engine.state.goal.as_str().contains(&spec.operation),
+        "sealed operation arguments are not rendered into the goal"
+    );
     assert!(matches!(
         resumed.disposition().expect("test: disposition"),
         TurnDisposition::Run
@@ -999,7 +1046,7 @@ async fn supervised_named_reads_execute_without_collecting_mutation_approval() {
 
 /// The request names a grant-bound action but the model proposes a plain one
 /// while collecting. The lease declines with an owner-readable message before
-/// anything is persisted: no pending approval, no collected receipt, nothing run.
+/// approval is persisted: a bound decline receipt exists and nothing runs.
 #[tokio::test]
 async fn collection_declines_a_plain_action_the_model_proposes() {
     let env = env(AutonomyLevel::Supervised, Case::Import).await;
@@ -1024,22 +1071,25 @@ async fn collection_declines_a_plain_action_the_model_proposes() {
             .service
             .begin_approval_collection(proof.as_ref(), &context)
             .expect("test: lease");
-        let error = lease
-            .record(
-                crate::providers::ToolCall {
-                    id: "prx_declined_call".to_owned(),
-                    name: "skills_manage".to_owned(),
-                    arguments: serde_json::json!({"action": "lifecycle_status"}).to_string(),
-                },
-                crate::tools::schema::ToolSchemaDialect::Raw,
-                &cancel,
-            )
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new()).unwrap();
+        let pending = cleanup
+            .run(async {
+                lease
+                    .record(
+                        crate::providers::ToolCall {
+                            id: "prx_declined_call".to_owned(),
+                            name: "skills_manage".to_owned(),
+                            arguments: serde_json::json!({"action": "lifecycle_status"}).to_string(),
+                        },
+                        crate::tools::schema::ToolSchemaDialect::Raw,
+                        &cancel,
+                    )
+                    .await
+            })
             .await
-            .expect_err("a plain action is not collected");
-        let declined = error
-            .downcast_ref::<crate::runtime::turn_decision::pending_approval::collection::CollectionDeclined>()
-            .expect("a typed decline, not a collection failure");
-        assert!(declined.0.contains("lifecycle_status") && declined.0.contains("nothing was recorded"));
+            .expect("plain action records a decline");
+        assert!(!pending);
+        assert!(context.collected_declined_event().is_some());
         assert!(context.collected_pending_event().is_none());
         assert!(
             env.service
@@ -1080,9 +1130,20 @@ async fn production_chat_service_supervised_rollback_reaches_a_pending_approval(
 }
 
 #[tokio::test]
-async fn production_unnamed_lifecycle_import_collects_only_after_verified_discovery() {
-    for hops in [1, 2] {
-        let env = env_with_hops(AutonomyLevel::Supervised, Case::Import, true, Some(hops)).await;
+async fn production_unnamed_reviewed_import_collects_with_competing_retrieval_tools() {
+    for (hops, direct) in [(1, true), (2, true), (1, false), (2, false)] {
+        let env = env_with_discovery(AutonomyLevel::Supervised, Case::Import, true, Some(hops), direct).await;
+        assert_eq!(
+            matches!(
+                env.service
+                    .catalog
+                    .entry_for_public_name("skills_manage")
+                    .unwrap()
+                    .exposure,
+                Exposure::Direct
+            ),
+            direct
+        );
         // Search uses bounded public summaries. The mutation must remain
         // discoverable ahead of read aliases for an executable-import request.
         let view = env.service.catalog.view(&CatalogScope::default());
@@ -1104,6 +1165,15 @@ async fn production_unnamed_lifecycle_import_collects_only_after_verified_discov
             env.source.display(),
             env.revision
         );
+        let manage = env.service.catalog.entry_for_public_name("skills_manage").unwrap();
+        assert!(manage.names_reviewed_bundle_target(&request));
+        for unbound in [
+            format!("Revision {}", env.revision),
+            format!("Source {} at revision r1-{}", env.source.display(), "f".repeat(63)),
+            format!("{request} Another revision r1-{}", "f".repeat(64)),
+        ] {
+            assert!(!manage.names_reviewed_bundle_target(&unbound));
+        }
         let (proof, envelope) = recorded_approval_source(
             &env.generation,
             Arc::clone(&env.memory),

@@ -93,6 +93,44 @@ impl CapabilityEntry {
             }
     }
 
+    /// Lifecycle argument collection can follow an unnamed metadata search.
+    /// Direct publication must not hide that root from discovery. This offers
+    /// metadata only; collection and execution retain their own approval gates.
+    pub(crate) fn supports_metadata_discovery(&self) -> bool {
+        matches!(self.exposure, Exposure::Searchable)
+            || (matches!(self.exposure, Exposure::Direct)
+                && self.public_name == "skills_manage"
+                && self.collects_exact_call())
+    }
+
+    /// A directory plus one complete bundle revision identifies the native
+    /// import proposal surface without inferring a verb or granting execution.
+    /// The collector still decides whether the current request asks to import.
+    pub(crate) fn names_reviewed_bundle_target(&self, text: &str) -> bool {
+        if self.public_name != "skills_manage"
+            || !self.collects_exact_call()
+            || !text.contains("r1-")
+            || !self
+                .schema
+                .pointer("/properties/action/enum")
+                .and_then(Value::as_array)
+                .is_some_and(|actions| {
+                    actions
+                        .iter()
+                        .any(|action| action.as_str() == Some("lifecycle_import_executable"))
+                })
+            || !crate::decision::builtin::features::text_signals(text).path
+        {
+            return false;
+        }
+        let mut revisions = text
+            .split(|character: char| !(character.is_alphanumeric() || character == '-'))
+            .filter(|token| token.starts_with("r1-"))
+            .filter_map(|token| crate::skills::lifecycle::RevisionId::parse(token).ok());
+        let Some(revision) = revisions.next() else { return false };
+        revisions.all(|other| other == revision)
+    }
+
     /// The (lowercased) request names a grant-bound action of a collectable
     /// tool. Other actions need no approval collection: the model may call them
     /// in an ordinary turn, and collecting them would end in an error.
@@ -413,6 +451,9 @@ impl CapabilityCatalog {
             )?;
             entry.binding_digest = Some(crate::skills::catalog_skill_binding_digest(skill));
             entry.skill_metadata = Some(Arc::new(skill.clone()));
+            if entry.public_name != skill.name {
+                entry.aliases.push(skill.name.clone());
+            }
             insert(entry, &mut entries, &mut seen_names, &mut seen_ids)?;
         }
         for hook in &sources.hooks {
@@ -845,6 +886,22 @@ fn insert(
     Ok(())
 }
 
+// Native identities remain compatible with existing manifests while semantic
+// families distinguish document/process work. Creation and authenticated
+// process restoration must use this one canonical identity rule.
+fn canonical_identity_family(family: CapabilityTarget, namespace: &str, name: &str) -> CapabilityTarget {
+    if namespace == "native"
+        && matches!(
+            (family, name),
+            (CapabilityTarget::Shell, "shell") | (CapabilityTarget::Document, "document_ingest" | "document_sync")
+        )
+    {
+        CapabilityTarget::Filesystem
+    } else {
+        family
+    }
+}
+
 fn entry_from_spec(
     spec: ToolSpec,
     root: String,
@@ -858,7 +915,8 @@ fn entry_from_spec(
     surface: &SurfacePolicy,
 ) -> Result<CapabilityEntry, CatalogError> {
     crate::tools::schema::SchemaCleanr::validate(&spec.parameters).map_err(|_| CatalogError::Schema)?;
-    let id = CapabilityId::new(family, &namespace, &spec.name).map_err(|_| CatalogError::Identity)?;
+    let identity_family = canonical_identity_family(family, &namespace, &spec.name);
+    let id = CapabilityId::new(identity_family, &namespace, &spec.name).map_err(|_| CatalogError::Identity)?;
     let fingerprint = tool_spec_fingerprint(&spec.name, &spec.description, &spec.parameters);
     let exposure = if !surface.permits(&spec.name, &root, &target)
         || surface.excluded_names.contains(&spec.name)
@@ -935,10 +993,15 @@ fn family_for(descriptor: &ToolDescriptor) -> CapabilityTarget {
         ToolAdapterKind::WasmPlugin => CapabilityTarget::Wasm,
         ToolAdapterKind::Skill => CapabilityTarget::Skill,
         ToolAdapterKind::Native => {
-            if descriptor.public_name == "document_search" {
+            if matches!(
+                descriptor.public_name.as_str(),
+                "document_search" | "document_ingest" | "document_sync"
+            ) {
                 CapabilityTarget::Document
             } else if descriptor.public_name == "sessions_history" {
                 CapabilityTarget::Session
+            } else if descriptor.public_name == "shell" {
+                CapabilityTarget::Shell
             } else if descriptor.categories.contains(&ToolCategory::FileSystem) {
                 CapabilityTarget::Filesystem
             } else if descriptor.categories.contains(&ToolCategory::Memory) {
@@ -947,8 +1010,6 @@ fn family_for(descriptor: &ToolDescriptor) -> CapabilityTarget {
                 CapabilityTarget::Web
             } else if descriptor.categories.contains(&ToolCategory::Communication) {
                 CapabilityTarget::Im
-            } else if descriptor.public_name == "shell" {
-                CapabilityTarget::Shell
             } else {
                 CapabilityTarget::NativeTool
             }
@@ -984,6 +1045,7 @@ fn generation_of(sources: &CatalogSources, surface: &SurfacePolicy, entries: &[C
     for entry in entries {
         for value in [
             entry.id.as_str().as_bytes(),
+            entry.family.as_str().as_bytes(),
             entry.fingerprint.0.as_slice(),
             entry.root.as_bytes(),
             entry.public_name.as_bytes(),
@@ -1053,6 +1115,46 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    struct DocumentCategoryProbe(&'static str);
+    #[async_trait]
+    impl Tool for DocumentCategoryProbe {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "Native document index operation"
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn categories(&self) -> &'static [ToolCategory] {
+            &[ToolCategory::Memory, ToolCategory::FileSystem]
+        }
+        async fn execute(&self, _: Value) -> anyhow::Result<ToolResult> {
+            anyhow::bail!("metadata fixture never executes")
+        }
+    }
+
+    #[test]
+    fn document_index_tools_keep_legacy_ids_without_entering_filesystem_discovery() {
+        let registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(DocumentCategoryProbe("document_ingest")),
+            Box::new(DocumentCategoryProbe("document_sync")),
+        ];
+        let catalog =
+            CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        for name in ["document_ingest", "document_sync"] {
+            let entry = catalog.entry_for_public_name(name).unwrap();
+            assert_eq!(entry.family, CapabilityTarget::Document);
+            assert_eq!(entry.id.as_str(), format!("filesystem:native:{name}"));
+        }
+        let view = catalog.view(&CatalogScope {
+            families: BTreeSet::from([CapabilityTarget::Filesystem]),
+            ..CatalogScope::default()
+        });
+        assert!(view.iter_entries().next().is_none());
     }
 
     fn registry() -> Vec<Box<dyn Tool>> {
@@ -1301,7 +1403,7 @@ mod tests {
     }
 
     /// The canonical ids that `required-tools` takes are the ones the catalog
-    /// builds: the shell tool is a file-system tool first, and a discovered MCP
+    /// builds: Shell retains its historical file-system ID, and a discovered MCP
     /// tool is filed under its server with its alias as the public name.
     #[test]
     fn canonical_ids_of_the_shell_and_a_discovered_mcp_tool_are_the_documented_ones() {
@@ -1331,6 +1433,26 @@ mod tests {
             .as_str()
             .to_owned();
         assert_eq!(shell, "filesystem:native:shell");
+        let shell_entry = catalog.entry_for_public_name("shell").unwrap();
+        assert!(shell_entry.categories.contains(&ToolCategory::FileSystem));
+        assert_eq!(shell_entry.family, CapabilityTarget::Shell);
+        assert_eq!(shell_entry.effect, SideEffectClass::ProcessExec);
+        let filesystem = catalog.view(&CatalogScope {
+            families: BTreeSet::from([CapabilityTarget::Filesystem]),
+            ..CatalogScope::default()
+        });
+        assert!(filesystem.iter_entries().all(|entry| entry.public_name != "shell"));
+        let mut legacy_entries = catalog.entries.clone();
+        legacy_entries
+            .iter_mut()
+            .find(|entry| entry.public_name == "shell")
+            .unwrap()
+            .family = CapabilityTarget::Filesystem;
+        assert_ne!(
+            generation_of(&sources, &SurfacePolicy::default(), &legacy_entries),
+            *catalog.generation(),
+            "semantic family drift must invalidate approvals even with stable capability IDs"
+        );
         assert_eq!(mcp, "mcp:notes:mcp__notes__search");
         // Exactly these strings are accepted by the lifecycle manifest check.
         let skill = format!("---\nname: ids\ndescription: ids\nrequired-tools: [{shell}, {mcp}]\n---\n\nBody.\n");
@@ -1721,6 +1843,86 @@ mod tests {
         assert!(catalog.check_parity(&service).is_ok());
         state.store(1, Ordering::SeqCst);
         assert!(catalog.check_parity(&service).is_err());
+    }
+
+    #[test]
+    fn instruction_read_wire_alias_collision_is_refused_instead_of_merging_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill = SkillMetadata {
+            name: "Deploy helper".into(),
+            description: "Read one skill".into(),
+            location: temp.path().join("first/SKILL.md"),
+            frontmatter_sha: [4; 32],
+        };
+        let mut colliding = skill.clone();
+        colliding.name = crate::tools::skills::catalog_skill_read_name(&skill.name);
+        colliding.location = temp.path().join("second/SKILL.md");
+        let sources = CatalogSources {
+            skills: vec![skill, colliding],
+            ..Default::default()
+        };
+        assert!(matches!(
+            CapabilityCatalog::build(&[], &sources, &SurfacePolicy::default()),
+            Err(CatalogError::Duplicate)
+        ));
+    }
+
+    #[test]
+    fn native_identity_and_instruction_alias_survive_the_bound_process_snapshot() {
+        let skill = SkillMetadata {
+            name: "Deploy helper".into(),
+            description: "Read one skill".into(),
+            location: std::path::PathBuf::from("/prx-workspace/skills/deploy/SKILL.md"),
+            frontmatter_sha: [4; 32],
+        };
+        let alias = crate::tools::skills::catalog_skill_read_name(&skill.name);
+        let sources = CatalogSources {
+            skills: vec![skill.clone()],
+            ..Default::default()
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(crate::tools::shell::ShellTool::new(
+                Arc::new(crate::runtime::NativeRuntime::new()),
+                workspace.path().to_path_buf(),
+            )),
+            Box::new(DocumentCategoryProbe("document_ingest")),
+            Box::new(DocumentCategoryProbe("document_sync")),
+        ];
+        let catalog = CapabilityCatalog::build(&registry, &sources, &SurfacePolicy::default()).unwrap();
+        let key = crate::decision::DecisionKey::ephemeral();
+        let snapshot = catalog.bind_process(&key).unwrap();
+        let restored = CapabilityCatalog::restore_process(&snapshot, &key, *catalog.generation()).unwrap();
+        for (name, family) in [
+            ("shell", CapabilityTarget::Shell),
+            ("document_ingest", CapabilityTarget::Document),
+            ("document_sync", CapabilityTarget::Document),
+        ] {
+            let entry = restored.entry_for_public_name(name).unwrap();
+            let parent = catalog.entry_for_public_name(name).unwrap();
+            assert_eq!(entry.family, family);
+            assert_eq!(entry.id.as_str(), format!("filesystem:native:{name}"));
+            assert_eq!(entry.id, parent.id);
+            assert_eq!(entry.fingerprint, parent.fingerprint);
+            assert_eq!(entry.generation, parent.generation);
+        }
+        assert!(
+            CapabilityCatalog::restore_process(&snapshot, &DecisionKey::ephemeral(), *catalog.generation()).is_err(),
+            "identity compatibility cannot bypass catalog authentication"
+        );
+        let entry = restored.entry_for_public_name(&alias).unwrap();
+        assert_eq!(entry.skill_metadata.as_ref().unwrap().name, skill.name);
+        assert_eq!(
+            entry.binding_digest,
+            Some(crate::skills::catalog_skill_binding_digest(&skill))
+        );
+        assert_eq!(
+            entry.schema.pointer("/properties/name/const"),
+            Some(&json!("Deploy helper"))
+        );
+        assert!(
+            matches!(&entry.target, ExecutionTarget::Skill { name, root } if name=="Deploy helper" && root=="skill_read")
+        );
     }
 
     struct CountingBindingTool {

@@ -191,12 +191,7 @@ pub async fn run(
     // ── Memory ───────────────────────────────────────────────────
     // Both MemoryOnly and Interactive profiles build memory, so it is always
     // Some here; take it explicitly without panicking (iron rules 1/6).
-    let mem: Arc<dyn Memory> = ctx
-        .memory
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build a memory backend for chat"))?;
-    let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
-        .with_event_recording(config.memory.event_recording_config());
+    let (mem, memory_fabric) = startup::chat_memory(&ctx, &config)?;
 
     // ── List sessions (early return) ─────────────────────────────
     // Early-exit before tools/provider/TUI are needed (MemoryOnly profile never

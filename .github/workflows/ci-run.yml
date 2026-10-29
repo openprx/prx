@@ -29,6 +29,8 @@ jobs:
               run: ./scripts/ci/installer_contract_gate.sh
             - name: Verify CI gate contracts
               run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+            - name: Verify source file size limit
+              run: python3 scripts/ci/source_size_gate.py
 
     windows-installer:
         name: Windows Installer Contract
@@ -278,13 +280,18 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, windows-check, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval]
+        needs: [contracts, windows-installer, changes, lint, test, build, windows-check, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval]
         runs-on: ubuntu-latest
         steps:
             - name: Enforce required status
               shell: bash
               run: |
                   set -euo pipefail
+
+                  if [ "${{ needs.contracts.result }}" != "success" ] || [ "${{ needs.windows-installer.result }}" != "success" ]; then
+                    echo "Contracts did not pass."
+                    exit 1
+                  fi
 
                   event_name="${{ github.event_name }}"
                   rust_changed="${{ needs.changes.outputs.rust_changed }}"

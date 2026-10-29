@@ -422,6 +422,8 @@ pub struct EvaluationSummary {
 #[serde(deny_unknown_fields)]
 pub struct EvaluationReceipt {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experiment: Option<super::experiment::ExperimentRunBinding>,
     pub record_id: String,
     pub owner_scope: OwnerScope,
     pub suite_id: String,

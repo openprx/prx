@@ -369,18 +369,7 @@ impl crate::providers::attempt_accounting::AttemptAccounting for AuxiliaryAccoun
                 remaining_attempts: 1,
             })
             .await?;
-        Ok(Box::new(AuxiliaryReceipt(receipt)))
-    }
-}
-struct AuxiliaryReceipt(super::decision_accounting::OwnedReceipt);
-impl crate::providers::attempt_accounting::sealed::Receipt for AuxiliaryReceipt {}
-#[async_trait::async_trait]
-impl crate::providers::attempt_accounting::AttemptReceipt for AuxiliaryReceipt {
-    fn deadline(&self) -> std::time::Instant {
-        crate::decision::budget::DecisionAttemptReceipt::deadline(&self.0)
-    }
-    async fn settle(self: Box<Self>, usage: crate::llm::route_decision::TokenUsage) -> anyhow::Result<()> {
-        Box::new(self.0).settle_provider_usage(usage).map_err(Into::into)
+        Ok(receipt.into_provider_receipt())
     }
 }
 

@@ -170,7 +170,10 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                             head: head.clone(),
                             body: request_body.clone(),
                         });
-                        requests.iter().filter(|request| request.marker == marker).count()
+                        requests
+                            .iter()
+                            .filter(|request| request.marker == marker && !is_assessment_request(request))
+                            .count()
                     };
                     let assistant = if request_body
                         .contains("Review the proposed final reply against the CURRENT request")
@@ -181,8 +184,22 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                             request_body.contains("observed_tools") && request_body.contains("proposed_final_reply")
                         );
                         serde_json::json!({"role":"assistant", "content": r#"{"decision":"accept","reason":"fixture evidence accepted","constraints":[]}"#})
-                    } else if request_body.contains("Classify the execution requirement of the CURRENT user request") {
-                        serde_json::json!({"role":"assistant", "content": r#"{"requirement":"informational"}"#})
+                    } else if request_body.contains("Classify the execution requirement of current_request") {
+                        let requirement = if matches!(
+                            marker,
+                            "PRX-ROUTE-PARENT"
+                                | "PRX-AGENT-PARENT"
+                                | "PRX-DENIED-PARENT"
+                                | "PRX-NESTED-PARENT"
+                                | "PRX-NESTED-CHILD"
+                                | "PRX-FANOUT-PARENT"
+                                | "PRX-FANOUT-CHILD"
+                        ) {
+                            "execution_required"
+                        } else {
+                            "informational"
+                        };
+                        serde_json::json!({"role":"assistant", "content": serde_json::json!({"requirement":requirement}).to_string()})
                     } else {
                         match (marker, request_index) {
                             ("PRX-ROUTE-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
@@ -411,6 +428,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
             requests
                 .iter()
                 .filter(|request| request.marker == "PRX-DENIED-PARENT"
+                    && !is_assessment_request(request)
                     && !request
                         .body
                         .contains("Review the proposed final reply against the CURRENT request"))
@@ -1002,10 +1020,19 @@ fn assert_completion_journal(workspace: &Path, manifest: &WorkerManifest) {
     assert_eq!(evidence_run_id, Some(manifest.run_id.as_str()));
 }
 
+fn is_assessment_request(request: &ProviderRequest) -> bool {
+    request
+        .body
+        .contains("Classify the execution requirement of current_request")
+        || request
+            .body
+            .contains("Review the proposed final reply against the CURRENT request")
+}
+
 fn assert_parent_join(requests: &[ProviderRequest], marker: &str, expected_total: usize) {
     let post_join = requests
         .iter()
-        .filter(|request| request.marker == marker)
+        .filter(|request| request.marker == marker && !is_assessment_request(request))
         .nth(2)
         .expect("parent post-join request");
     assert_join_summary(post_join, expected_total);

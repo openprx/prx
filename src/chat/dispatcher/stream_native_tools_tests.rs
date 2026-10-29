@@ -393,8 +393,11 @@ mod tests {
                 let sink = Arc::clone(&sink);
                 async move {
                     if request["stream"] != true {
-                        let text = super::super::assessment_fixture::reply(&wire.system_text(&request))
-                            .expect("non-streaming request is a reply assessment");
+                        let text = super::super::assessment_fixture::reply(
+                            &wire.system_text(&request),
+                            super::super::assessment_fixture::EXECUTION_REQUIRED,
+                        )
+                        .expect("non-streaming request is a reply assessment");
                         assert!(request["tools"].as_array().is_none_or(Vec::is_empty));
                         sink.lock().push(request);
                         let body = match wire {
@@ -681,7 +684,7 @@ mod tests {
 
         // 3. One result follow-up and one bounded completion assessment.
         assert_completion_assessment(wire, run);
-        let second = run.requests.get(1).expect("test: second request");
+        let second = run.requests.get(2).expect("test: tool-result follow-up request");
         assert!(
             result_carried(second),
             "the second request must carry the tool result; body: {second}"
@@ -696,7 +699,7 @@ mod tests {
 
         // 6. Prompt pin (D-020 Q5): native mode is unchanged, so the system text
         //    never carries the prompt-guided tool protocol or its grammar.
-        for request in run.requests.iter().take(2) {
+        for request in run.requests.iter().filter(|request| request["stream"] == true) {
             let system = wire.system_text(request);
             assert!(system.contains(FIXTURE_SYSTEM), "system prompt kept: {system}");
             assert!(
@@ -783,12 +786,19 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn assert_completion_assessment(wire: Wire, run: &ChatRun) {
-        assert_eq!(run.requests.len(), 3, "two task requests plus one assessment");
-        let review = run.requests.get(2).expect("completion assessment request");
+        assert_eq!(
+            run.requests.len(),
+            4,
+            "two task requests plus intent and completion assessments"
+        );
+        let review = run.requests.get(3).expect("completion assessment request");
         assert_ne!(review["stream"], true);
         assert!(review["tools"].as_array().is_none_or(Vec::is_empty));
         assert_eq!(
-            super::super::assessment_fixture::reply(&wire.system_text(review)),
+            super::super::assessment_fixture::reply(
+                &wire.system_text(review),
+                super::super::assessment_fixture::EXECUTION_REQUIRED
+            ),
             Some(super::super::assessment_fixture::ACCEPT),
         );
         let body = review.to_string();
@@ -934,7 +944,7 @@ mod tests {
             _: &str,
             _: f64,
         ) -> anyhow::Result<crate::providers::traits::ChatResponse> {
-            super::super::assessment_fixture::response(&request)
+            super::super::assessment_fixture::response(&request, super::super::assessment_fixture::EXECUTION_REQUIRED)
                 .ok_or_else(|| anyhow::anyhow!("expected reply assessment"))
         }
 
@@ -1240,7 +1250,7 @@ mod tests {
 
             assert_eq!(run.tool_calls, 0, "the refused call never runs");
             assert_completion_assessment(wire, &run);
-            let second = run.requests.get(1).expect("test: second request");
+            let second = run.requests.get(2).expect("test: tool-result follow-up request");
             let replayed: Vec<serde_json::Value> = second["messages"]
                 .as_array()
                 .into_iter()
@@ -1307,7 +1317,7 @@ mod tests {
 
                 assert_eq!(run.tool_calls, 0, "{arguments}: the call never runs");
                 assert_completion_assessment(wire, &run);
-                let second = run.requests.get(1).expect("test: second request");
+                let second = run.requests.get(2).expect("test: tool-result follow-up request");
                 let replayed: Vec<serde_json::Value> = second["messages"]
                     .as_array()
                     .into_iter()

@@ -2,7 +2,10 @@
 //! transport's charge bound or grant permission to invoke that transport.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 #[cfg(unix)]
 use std::io::Write;
@@ -59,6 +62,18 @@ pub(crate) struct EstimatedReservationRequest {
     pub reservation: ReservationRequest,
     pub reserved_tokens: u64,
     pub turn_token_limit: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<ReservationGroup>,
+}
+/// Immutable parent ceilings on the existing physical reservation journal.
+/// This is a grouping key, not another balance or permission authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReservationGroup {
+    pub id: String,
+    pub calls: u64,
+    pub tokens: u64,
+    pub micro_usd: u64,
 }
 impl EstimatedReservationRequest {
     fn validate(&self) -> Result<()> {
@@ -67,6 +82,12 @@ impl EstimatedReservationRequest {
             self.reserved_tokens > 0 && self.reserved_tokens <= self.turn_token_limit,
             "invalid estimated token reservation"
         );
+        if let Some(group) = &self.group {
+            ensure!(
+                group.id.len() == 64 && group.id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "invalid physical reservation group"
+            );
+        }
         Ok(())
     }
 }
@@ -75,6 +96,7 @@ struct EstimatedTokens {
     reserved: u64,
     limit: u64,
     actual: Option<u128>,
+    group: Option<ReservationGroup>,
 }
 
 /// Possession is necessary for a transition, but dispatch must still consume
@@ -146,7 +168,79 @@ pub(super) struct Reservations {
     estimates: BTreeMap<String, EstimatedTokens>,
 }
 
+/// Read-only projection of the existing physical journal, not a new ledger.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct ScopeUsage {
+    pub calls: u64,
+    pub settled_calls: u64,
+    pub tokens: u64,
+    pub micro_usd: u64,
+    pub unresolved: bool,
+    pub models: Vec<String>,
+    #[serde(skip)]
+    pub attempt_ids: BTreeSet<String>,
+}
+
 impl Reservations {
+    pub(super) fn scope_models(
+        &self,
+        workspace: &Path,
+        scope: &str,
+        previous: &BTreeSet<String>,
+    ) -> Result<Vec<String>> {
+        let mut models = std::collections::BTreeSet::new();
+        if let Some(ledger) = super::tracker::read_state_ledger_bounded(workspace, "costs.jsonl")? {
+            for line in ledger.lines().filter(|line| !line.trim().is_empty()) {
+                let record: super::types::CostRecord = serde_json::from_str(line)?;
+                if record.settlement_id.as_ref().is_some_and(|id| {
+                    self.entries
+                        .get(id)
+                        .is_some_and(|(request, _)| request.turn_id == scope && !previous.contains(id))
+                }) {
+                    models.insert(record.usage.model);
+                }
+            }
+        }
+        Ok(models.into_iter().collect())
+    }
+    pub(super) fn scope_usage(&self, scope: &str) -> Result<ScopeUsage> {
+        self.scope_usage_since(scope, &BTreeSet::new())
+    }
+    pub(super) fn scope_usage_since(&self, scope: &str, previous: &BTreeSet<String>) -> Result<ScopeUsage> {
+        let mut usage = ScopeUsage::default();
+        for (id, (request, state)) in &self.entries {
+            if request.turn_id != scope || previous.contains(id) {
+                continue;
+            }
+            usage.attempt_ids.insert(id.clone());
+            usage.calls = usage.calls.checked_add(1).context("physical count overflow")?;
+            let (tokens, money) = match state {
+                State::Released => {
+                    usage.settled_calls += 1;
+                    (0, 0)
+                }
+                State::Settled { actual_micro_usd } | State::OverBound { actual_micro_usd } => {
+                    let actual = self
+                        .estimates
+                        .get(id)
+                        .and_then(|estimate| estimate.actual)
+                        .context("settled experiment request has no token reconciliation")?;
+                    usage.settled_calls += 1;
+                    (u64::try_from(actual)?, u64::try_from(*actual_micro_usd)?)
+                }
+                _ => {
+                    usage.unresolved = true;
+                    (
+                        self.estimates.get(id).map_or(0, |estimate| estimate.reserved),
+                        request.maximum_micro_usd,
+                    )
+                }
+            };
+            usage.tokens = usage.tokens.checked_add(tokens).context("token total overflow")?;
+            usage.micro_usd = usage.micro_usd.checked_add(money).context("cost total overflow")?;
+        }
+        Ok(usage)
+    }
     pub(super) fn load(workspace: &Path) -> Result<Self> {
         let mut result = Self::default();
         if let Some(contents) = super::tracker::read_state_ledger_bounded(workspace, JOURNAL)? {
@@ -224,6 +318,7 @@ impl Reservations {
             Event::EstimatedReservedV1 { request } => {
                 request.validate()?;
                 self.check_tokens(&request)?;
+                self.check_group(&request)?;
                 let id = request.reservation.attempt_id.clone();
                 self.apply(Event::Reserved {
                     request: request.reservation,
@@ -234,6 +329,7 @@ impl Reservations {
                         reserved: request.reserved_tokens,
                         limit: request.turn_token_limit,
                         actual: None,
+                        group: request.group,
                     },
                 );
             }
@@ -374,6 +470,7 @@ impl Reservations {
                 estimate.limit == request.turn_token_limit,
                 "estimated turn token limit changed"
             );
+            ensure!(estimate.group == request.group, "physical turn parent changed");
             let liability = if *state == State::Released {
                 0
             } else {
@@ -410,12 +507,14 @@ impl Reservations {
                 previous == &request.reservation
                     && *state == State::Reserved
                     && estimate.reserved == request.reserved_tokens
-                    && estimate.limit == request.turn_token_limit,
+                    && estimate.limit == request.turn_token_limit
+                    && estimate.group == request.group,
                 "estimated reservation replay conflicts or consumed"
             );
         } else {
             self.check_turn(&request.reservation)?;
             self.check_tokens(&request)?;
+            self.check_group(&request)?;
             ensure!(
                 u128::from(request.reservation.maximum_micro_usd) <= remaining,
                 "workspace reservation allowance exhausted"
@@ -430,6 +529,50 @@ impl Reservations {
             request: request.reservation,
             workspace: canonical_workspace,
         })
+    }
+
+    fn check_group(&self, request: &EstimatedReservationRequest) -> Result<()> {
+        let Some(group) = &request.group else {
+            return Ok(());
+        };
+        let mut calls = 1_u64;
+        let mut tokens = u128::from(request.reserved_tokens);
+        let mut money = u128::from(request.reservation.maximum_micro_usd);
+        for (id, estimate) in &self.estimates {
+            if id == &request.reservation.attempt_id {
+                continue;
+            }
+            let Some(previous) = &estimate.group else {
+                continue;
+            };
+            if previous.id != group.id {
+                continue;
+            }
+            ensure!(previous == group, "physical parent ceilings changed");
+            calls = calls.checked_add(1).context("physical parent call count overflow")?;
+            let (reservation, state) = self.entries.get(id).context("missing grouped reservation")?;
+            let (token_liability, money_liability) = match state {
+                State::Released => (0, 0),
+                State::Settled { actual_micro_usd } | State::OverBound { actual_micro_usd } => (
+                    estimate.actual.context("grouped settlement has no tokens")?,
+                    *actual_micro_usd,
+                ),
+                State::Reserved | State::Dispatched => {
+                    (u128::from(estimate.reserved), u128::from(reservation.maximum_micro_usd))
+                }
+            };
+            tokens = tokens
+                .checked_add(token_liability)
+                .context("physical parent tokens overflow")?;
+            money = money
+                .checked_add(money_liability)
+                .context("physical parent cost overflow")?;
+        }
+        ensure!(
+            calls <= group.calls && tokens <= u128::from(group.tokens) && money <= u128::from(group.micro_usd),
+            "physical parent allowance exhausted"
+        );
+        Ok(())
     }
 
     /// Persist the estimated reservation and its one-use dispatch transition
@@ -452,10 +595,12 @@ impl Reservations {
             ensure!(
                 previous == &request.reservation
                     && estimate.reserved == request.reserved_tokens
-                    && estimate.limit == request.turn_token_limit,
+                    && estimate.limit == request.turn_token_limit
+                    && estimate.group == request.group,
                 "estimated dispatch replay conflicts"
             );
             ensure!(*state == State::Reserved, "estimated dispatch was consumed");
+            self.check_group(&request)?;
             let event = Event::Dispatched {
                 attempt_id: request.reservation.attempt_id.clone(),
             };
@@ -464,6 +609,7 @@ impl Reservations {
         } else {
             self.check_turn(&request.reservation)?;
             self.check_tokens(&request)?;
+            self.check_group(&request)?;
             ensure!(
                 u128::from(request.reservation.maximum_micro_usd) <= remaining,
                 "workspace reservation allowance exhausted"

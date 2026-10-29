@@ -78,6 +78,9 @@ impl AttemptReceipt for RouterEmbeddingReceipt {
     fn deadline(&self) -> Instant {
         self.deadline.min(self.receipt.deadline())
     }
+    fn retain_response_chunk(&self, bytes: usize) -> anyhow::Result<()> {
+        self.receipt.retain_response_chunk(bytes).map_err(Into::into)
+    }
     async fn settle(self: Box<Self>, usage: TokenUsage) -> anyhow::Result<()> {
         self.receipt.settle_provider_usage(usage).map_err(Into::into)
     }

@@ -267,19 +267,33 @@ impl QuestionCompiler {
                 levels: score_levels()?,
             },
         );
-        questions.insert(
+        omitted.push((
             QuestionId::global(GlobalQuestion::ExpectedGain),
-            DecisionQuestion::Score {
-                instructions: fixed_text("Rate the expected task gain.")?,
-                levels: score_levels()?,
-            },
-        );
+            OmissionReason::UnusedPrediction,
+        ));
 
         for candidate in candidates {
             let id = candidate.candidate_id();
             let index = *positions.get(id.as_str()).ok_or(CompileError::CandidateMismatch)?;
             let path = format!("$.candidates[{index}]");
             let key = id.key();
+            // Fixed terminal selection is code-owned; scoring/extraction never
+            // consumes these candidate predictions. Keep the omission manifest
+            // rather than paying for four unused answers per terminal.
+            if is_fixed_terminal(candidate.action()) {
+                for kind in [
+                    CandidateQuestion::Applicable,
+                    CandidateQuestion::Risk,
+                    CandidateQuestion::Success,
+                    CandidateQuestion::Gain,
+                ] {
+                    omitted.push((
+                        QuestionId::candidate(&key, kind),
+                        OmissionReason::DeterministicCandidate,
+                    ));
+                }
+                continue;
+            }
             questions.insert(
                 QuestionId::candidate(&key, CandidateQuestion::Applicable),
                 DecisionQuestion::Noul {
@@ -294,29 +308,20 @@ impl QuestionCompiler {
                     levels: score_levels()?,
                 },
             );
-            if matches!(candidate.action(), CausalActionKind::Refuse | CausalActionKind::Clarify) {
-                for kind in [CandidateQuestion::Success, CandidateQuestion::Gain] {
-                    omitted.push((
-                        QuestionId::candidate(&key, kind),
-                        OmissionReason::DeterministicCandidate,
-                    ));
-                }
-            } else {
-                questions.insert(
-                    QuestionId::candidate(&key, CandidateQuestion::Success),
-                    DecisionQuestion::Noul {
-                        instructions: fixed_text(&format!("Would {path} succeed?"))?,
-                        criteria: None,
-                    },
-                );
-                questions.insert(
-                    QuestionId::candidate(&key, CandidateQuestion::Gain),
-                    DecisionQuestion::Score {
-                        instructions: fixed_text(&format!("Rate the task gain from {path}."))?,
-                        levels: score_levels()?,
-                    },
-                );
-            }
+            questions.insert(
+                QuestionId::candidate(&key, CandidateQuestion::Success),
+                DecisionQuestion::Noul {
+                    instructions: fixed_text(&format!("Would {path} succeed?"))?,
+                    criteria: None,
+                },
+            );
+            questions.insert(
+                QuestionId::candidate(&key, CandidateQuestion::Gain),
+                DecisionQuestion::Score {
+                    instructions: fixed_text(&format!("Rate the task gain from {path}."))?,
+                    levels: score_levels()?,
+                },
+            );
         }
         omitted.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -577,6 +582,7 @@ mod tests {
                     ),
                     exact_mention: exact_mentions.contains(candidate.candidate_id()),
                     available: true,
+                    effective_approval_required: None,
                 })
                 .collect(),
         )
@@ -1047,6 +1053,83 @@ mod tests {
     }
 
     #[test]
+    fn fixed_terminals_remain_choices_without_unused_predictions_on_the_wire() {
+        let key = fixtures::key();
+        let mut state = fixtures::state(&key, "neutral request");
+        let working = fixtures::candidate(&key, CausalActionKind::UseTool, CapabilityTarget::Mcp, None);
+        let mut candidates = vec![working];
+        for action in [
+            CausalActionKind::Clarify,
+            CausalActionKind::RequestApproval,
+            CausalActionKind::Refuse,
+        ] {
+            candidates.push(fixtures::candidate(&key, action, CapabilityTarget::None, None));
+        }
+        state.derived = DerivedState::new(candidates).unwrap();
+        let set = legal(&state);
+        let compiled = QuestionCompiler::compile(
+            &state,
+            &set,
+            &CompilerPolicy {
+                key: &key,
+                model: Some("prx_fixture"),
+                expires_at: Instant::now() + Duration::from_secs(30),
+                limits: RequestLimits::default(),
+            },
+        )
+        .unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(
+            &SystemOneCodec::new(compiled.request(), &key)
+                .unwrap()
+                .encode_request()
+                .unwrap(),
+        )
+        .unwrap();
+        let questions = wire.get("questions").and_then(Value::as_object).unwrap();
+        let projected = wire
+            .get("state")
+            .and_then(|value| value.get("candidates"))
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(questions.len(), compiled.request().questions().len());
+        for action in ["clarify", "request_approval", "refuse"] {
+            let index = projected
+                .iter()
+                .position(|candidate| candidate.get("action").and_then(Value::as_str) == Some(action))
+                .expect("terminal remains in transmitted state");
+            let reference = format!("$.candidates[{index}]");
+            assert!(
+                !questions
+                    .values()
+                    .any(|question| question.to_string().contains(&reference)),
+                "no unused terminal prediction is sent"
+            );
+            assert!(
+                !compiled
+                    .request()
+                    .questions()
+                    .keys()
+                    .any(|id| id.as_str().starts_with(&format!("candidate.{action}-")))
+            );
+        }
+        let response = crate::decision::builtin::BuiltinDecisionBackend::answer(compiled.request()).unwrap();
+        let validated = crate::decision::DecisionResponseValidator::validate(
+            compiled.request(),
+            response,
+            &crate::decision::ValidationContext {
+                received_at: Instant::now(),
+                max_response_bytes: 256 * 1024,
+                version_policy: crate::decision::ModelVersionPolicy::Unpinned,
+                local_backend: crate::decision::builtin::BuiltinDecisionBackend::identity(),
+            },
+        )
+        .unwrap();
+        let evidence =
+            crate::causal_tree::decision_score::PredictionEvidence::extract(&validated, &compiled, &set).unwrap();
+        assert_eq!(evidence.candidates.len(), 1, "only the working path is scored");
+    }
+
+    #[test]
     fn one_working_candidate_forces_choice_and_omits_staleness_without_artifacts() {
         let key = fixtures::key();
         let mut state = fixtures::state(&key, "neutral request");
@@ -1091,9 +1174,12 @@ mod tests {
                 .map(|(id, _)| id.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "candidate.refuse-none.applicable",
                 "candidate.refuse-none.gain",
+                "candidate.refuse-none.risk",
                 "candidate.refuse-none.success",
                 "capability_target",
+                "expected_gain",
                 "needs_fresh_state",
                 "next_action",
             ],

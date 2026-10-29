@@ -160,10 +160,32 @@ pub struct SkillReadTool {
     pin_tasks: bool,
 }
 
+/// Stable provider-compatible identity. Display names and bound read arguments
+/// retain their original spelling; punctuation must not collapse two targets.
+pub(crate) fn catalog_skill_read_name(name: &str) -> String {
+    if !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return name.to_owned();
+    }
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"prx-skill-read-public-name-v1\0");
+    hash.update(name.as_bytes());
+    format!("skill_read_{}", hex::encode(hash.finalize()))
+}
 pub(crate) fn catalog_skill_read_spec(skill: &crate::skills::SkillMetadata) -> ToolSpec {
+    let name = catalog_skill_read_name(&skill.name);
     ToolSpec {
-        name: skill.name.clone(),
-        description: skill.description.clone(),
+        description: if name == skill.name {
+            skill.description.clone()
+        } else {
+            format!("Read skill {}: {}", skill.name, skill.description)
+        },
+        name,
         parameters: json!({
             "type": "object",
             "properties": {
@@ -195,9 +217,12 @@ impl SkillReadTool {
     }
 
     fn metadata_for_name(&self, name: &str) -> Option<crate::skills::SkillMetadata> {
-        crate::skills::catalog_skill_metadata(&self.workspace_dir, &self.config)
-            .into_iter()
+        let skills = crate::skills::catalog_skill_metadata(&self.workspace_dir, &self.config);
+        skills
+            .iter()
             .find(|skill| skill.name == name)
+            .or_else(|| skills.iter().find(|skill| catalog_skill_read_name(&skill.name) == name))
+            .cloned()
     }
 
     /// Serves a lifecycle-managed skill from its immutable revision instead of
@@ -339,7 +364,16 @@ impl Tool for SkillReadTool {
     fn catalog_binding_snapshot(&self) -> std::collections::BTreeMap<String, [u8; 32]> {
         crate::skills::catalog_skill_metadata(&self.workspace_dir, &self.config)
             .into_iter()
-            .map(|skill| (skill.name.clone(), crate::skills::catalog_skill_binding_digest(&skill)))
+            .flat_map(|skill| {
+                let digest = crate::skills::catalog_skill_binding_digest(&skill);
+                // Synthetic dispatch binds the original `name` argument;
+                // native descriptor lookup binds the public alias. Both must
+                // resolve to the same immutable metadata, under the same root.
+                [
+                    (skill.name.clone(), digest),
+                    (catalog_skill_read_name(&skill.name), digest),
+                ]
+            })
             .collect()
     }
 
@@ -1812,6 +1846,90 @@ mod tests {
         for task in ["task-tool-1", "task-tool-2", "task-tool-3"] {
             crate::skills::lifecycle::release_task_pins(&owner_scope, task);
         }
+    }
+
+    #[test]
+    fn skill_read_wire_alias_preserves_valid_names_and_distinguishes_display_names() {
+        assert_eq!(catalog_skill_read_name("docx"), "docx");
+        let names = [
+            "Deploy helper".to_string(),
+            "Deploy.helper".into(),
+            "Skill / report".into(),
+            "\u{3b1}\u{3b2}".into(),
+            "x".repeat(129),
+        ];
+        let mut aliases = std::collections::BTreeSet::new();
+        for name in names {
+            let alias = catalog_skill_read_name(&name);
+            assert_eq!(catalog_skill_read_name(&name), alias);
+            assert!(
+                alias.len() <= 128
+                    && alias
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            );
+            assert!(aliases.insert(alias));
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_read_wire_alias_keeps_the_bound_display_name_and_backend_identity() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("skills/demo");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            skill_md("kept display name").replace("name: demo", "name: Deploy helper"),
+        )
+        .unwrap();
+        let config = test_config(temp.path());
+        let metadata = crate::skills::catalog_skill_metadata(temp.path(), &config);
+        let metadata = metadata.first().unwrap();
+        assert_eq!(metadata.name, "Deploy helper");
+        let spec = catalog_skill_read_spec(metadata);
+        assert_ne!(spec.name, metadata.name);
+        assert_eq!(
+            spec.parameters.pointer("/properties/name/const"),
+            Some(&json!("Deploy helper"))
+        );
+        let tool = SkillReadTool::new(temp.path().into(), config);
+        assert!(tool.supports_name(&spec.name));
+        assert_eq!(tool.spec_for_name(&spec.name).unwrap().name, spec.name);
+        assert_eq!(
+            tool.catalog_binding_snapshot().get(&spec.name),
+            Some(&crate::skills::catalog_skill_binding_digest(metadata))
+        );
+        assert_eq!(
+            tool.catalog_binding_snapshot().get(&metadata.name),
+            Some(&crate::skills::catalog_skill_binding_digest(metadata))
+        );
+        let result = tool
+            .execute_named(&spec.name, json!({"name":"Deploy helper"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("kept display name"));
+        assert!(
+            tool.execute_named(&spec.name, json!({"name":"another skill"}))
+                .await
+                .is_err()
+        );
+        let sources = crate::tools::capability::catalog::CatalogSources {
+            skills: vec![metadata.clone()],
+            ..Default::default()
+        };
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let catalog = crate::tools::capability::catalog::CapabilityCatalog::build(
+            &registry,
+            &sources,
+            &crate::tools::capability::catalog::SurfacePolicy::default(),
+        )
+        .unwrap();
+        let service = crate::tools::ToolExecutionService::with_security_policy(
+            registry,
+            Arc::new(crate::security::SecurityPolicy::default()),
+        );
+        assert!(catalog.check_parity(&service).is_ok());
     }
 
     #[tokio::test]

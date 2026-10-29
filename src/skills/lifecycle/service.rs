@@ -20,6 +20,7 @@
 //! `DraftOnly`-like for publication (spec 8.2): [`SkillsLifecycleSettings::
 //! publication_block`] says why.
 
+mod experiments;
 mod proposals;
 mod script_proposals;
 

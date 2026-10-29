@@ -295,6 +295,7 @@ impl SkillLifecycleStore {
         let end_generation = self.skill_generation(&suite)?;
         let stale = end_generation != request.observed_generation;
         let mut receipt = EvaluationReceipt {
+            experiment: crate::runtime::experiment_stage::current().map(|stage| stage.binding()),
             schema_version: EVALUATION_SCHEMA_VERSION,
             record_id: evaluation_id.clone(),
             owner_scope: self.owner_scope().clone(),

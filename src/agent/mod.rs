@@ -29,6 +29,7 @@ pub mod terminal;
 pub(crate) mod tool_call_parser;
 pub(crate) mod tool_result_recording;
 pub(crate) mod tool_scheduler;
+mod turn_assessment;
 pub(crate) mod turn_context;
 pub(crate) mod turn_contracts;
 pub(crate) mod turn_engine;

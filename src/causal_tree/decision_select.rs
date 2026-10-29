@@ -317,7 +317,11 @@ impl CausalSelector {
         let exact_selected_action = matches!(top.action(), CausalActionKind::UseTool | CausalActionKind::Delegate)
             && exact_mentions.contains(top.candidate_id())
             && prediction.chosen_action == top.action().as_str()
-            && prediction.chosen_target == top.target().as_str();
+            && prediction.chosen_target == top.target().as_str()
+            && prediction
+                .candidates
+                .get(top.candidate_id())
+                .is_some_and(|features| features.applicability_probability >= policy.minimum_choice_confidence);
         let exact_current_action = exact_selected_action && context.direct_candidates.contains(top.candidate_id());
         let retrieve = passed
             .iter()
@@ -452,6 +456,33 @@ impl CausalSelector {
             return Ok(Selection::Commit {
                 candidate_id: top.candidate_id().clone(),
                 propensity: DETERMINISTIC_PROPENSITY,
+            });
+        }
+        // A family's first visible tool need not be the operation the source
+        // needs. A confident tool-family choice with low business utility may
+        // inspect the already gated metadata once, never execute that tool or
+        // lower its commit threshold. The ordinary hop/deadline bounds remain.
+        if !context.discovery_completed
+            && fresh_ok
+            && prediction.chosen_action == CausalActionKind::UseTool.as_str()
+            && prediction.action_confidence >= policy.minimum_choice_confidence
+            && prediction.target_confidence >= policy.minimum_choice_confidence
+            && (top_score.execution_utility < threshold || margin < policy.minimum_top_margin)
+            && let Some((candidate, _, _)) = passed.iter().find(|(candidate, _, _)| {
+                candidate.action() == CausalActionKind::Discover
+                    && (discoverable_families
+                        .iter()
+                        .any(|family| family.as_str() == prediction.chosen_target)
+                        || (discoverable_families.iter().next().is_none()
+                            && candidate.target().as_str() == prediction.chosen_target
+                            && crate::causal_tree::candidate_generator::DiscoveryFamilies::supports(
+                                candidate.target(),
+                            )))
+            })
+        {
+            return Ok(Selection::Recover {
+                candidate_id: candidate.candidate_id().clone(),
+                reason_code: "discover_unrepresented_operation",
             });
         }
         terminal_abstain(candidates, pre_commit, context, "commit_threshold_or_margin")
@@ -715,6 +746,72 @@ mod tests {
             policy,
             context,
         )
+    }
+
+    #[test]
+    fn low_utility_tool_choice_gets_one_gated_metadata_recovery() {
+        let (mut set, mut scores, mut evidence, mut report, policy, mut context) = fixture(0.5);
+        let tool = candidate(CausalActionKind::UseTool, CapabilityTarget::Filesystem);
+        let discovery = candidate(CausalActionKind::Discover, CapabilityTarget::Filesystem);
+        for score in scores.values_mut() {
+            score.execution_utility = 0.1;
+        }
+        let prediction = evidence.candidates.values().next().unwrap().clone();
+        for (candidate, utility) in [(&tool, 0.2), (&discovery, 0.05)] {
+            scores.insert(
+                candidate.candidate_id().clone(),
+                CandidateScore {
+                    semantic_utility: utility,
+                    execution_utility: utility,
+                },
+            );
+            evidence.candidates.insert(candidate.candidate_id().clone(), prediction);
+            report
+                .outcomes
+                .insert(candidate.candidate_id().clone(), GateOutcome::Passed);
+        }
+        let CandidateSet::Legal { candidates, .. } = &mut set else {
+            panic!("legal fixture")
+        };
+        candidates.extend([tool.clone(), discovery.clone()]);
+        context.direct_candidates.insert(tool.candidate_id().clone());
+        evidence.chosen_action = "use_tool".into();
+        evidence.chosen_target = "filesystem".into();
+        evidence.target_probabilities.insert(CapabilityTarget::Filesystem, 0.9);
+        let select = |evidence: &PredictionEvidence, report: &GateReport, context: &SelectorContext| {
+            CausalSelector::select(&set, &scores, evidence, report, &policy, context).unwrap()
+        };
+        assert!(
+            matches!(select(&evidence, &report, &context), Selection::Recover { candidate_id, reason_code: "discover_unrepresented_operation" } if candidate_id == *discovery.candidate_id())
+        );
+        context.discovery_completed = true;
+        assert!(matches!(
+            select(&evidence, &report, &context),
+            Selection::Abstain { .. }
+        ));
+        context.discovery_completed = false;
+        for (action, target, confidence) in [
+            ("answer", "filesystem", 0.9),
+            ("use_tool", "memory", 0.9),
+            ("use_tool", "filesystem", 0.1),
+        ] {
+            let mut changed = evidence.clone();
+            changed.chosen_action = action.into();
+            changed.chosen_target = target.into();
+            changed.action_confidence = confidence;
+            assert!(matches!(select(&changed, &report, &context), Selection::Abstain { .. }));
+        }
+        report.outcomes.insert(
+            discovery.candidate_id().clone(),
+            GateOutcome::Blocked {
+                gate: 6,
+                reason_code: "budget",
+            },
+        );
+        assert!(matches!(
+            select(&evidence, &report, &context),
+            Selection::Abstain { .. }
+        ));
     }
 
     #[test]
@@ -1326,6 +1423,19 @@ mod tests {
                 propensity: 1.0,
             }
         );
+
+        // A coarse action/family choice cannot turn a negated exact name
+        // into permission to bypass the ordinary utility/confidence checks.
+        evidence.candidates.get_mut(&tool_id).unwrap().applicability_probability = 0.2;
+        evidence.action_confidence = 0.99;
+        evidence.target_confidence = 0.99;
+        assert!(matches!(
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).unwrap(),
+            Selection::Abstain { .. }
+        ));
+        evidence.candidates.get_mut(&tool_id).unwrap().applicability_probability = 1.0;
+        evidence.action_confidence = 0.01;
+        evidence.target_confidence = 0.01;
 
         context.direct_candidates.remove(&tool_id);
         assert!(matches!(

@@ -535,9 +535,19 @@ impl CostTracker {
 
     /// Append an estimated reservation and its dispatched state in one synced
     /// batch under the actual ledger lock before a latency-bounded physical send.
+    #[cfg(test)]
     pub(crate) fn reserve_dispatched_estimated_attempt(
         &self,
         request: super::reservation::EstimatedReservationRequest,
+        may_dispatch: impl FnOnce() -> bool,
+    ) -> Result<super::reservation::ReservationReceipt> {
+        self.reserve_dispatched_estimated_attempt_with_limit(request, None, may_dispatch)
+    }
+
+    pub(crate) fn reserve_dispatched_estimated_attempt_with_limit(
+        &self,
+        request: super::reservation::EstimatedReservationRequest,
+        call_limit: Option<u64>,
         may_dispatch: impl FnOnce() -> bool,
     ) -> Result<super::reservation::ReservationReceipt> {
         let config = self.config.clone();
@@ -546,6 +556,12 @@ impl CostTracker {
         storage.refresh_from_disk()?;
         let workspace = storage.workspace()?;
         let mut reservations = super::reservation::Reservations::load(workspace)?;
+        if let Some(limit) = call_limit {
+            anyhow::ensure!(
+                reservations.scope_usage(&request.reservation.turn_id)?.calls < limit,
+                "experiment physical-call allowance exhausted"
+            );
+        }
         let active = reservations.active_micro_usd()?;
         let daily = storage
             .daily_micro_usd
@@ -561,6 +577,27 @@ impl CostTracker {
             .min(u128::from(request.reservation.security_daily_micro_usd).saturating_sub(daily));
         anyhow::ensure!(may_dispatch(), "attempt deadline elapsed before durable dispatch");
         reservations.reserve_dispatched_estimated(workspace, request, remaining)
+    }
+
+    /// Bounded by the existing ledger loader; no accounting mutations.
+    pub(crate) fn physical_scope_usage(&self, scope: &str) -> Result<super::reservation::ScopeUsage> {
+        self.physical_scope_usage_since(scope, &std::collections::BTreeSet::new())
+    }
+    /// A case observes only attempts created after its owned snapshot. Parent
+    /// admission always reads the complete ledger and cannot use this filter.
+    pub(crate) fn physical_scope_usage_since(
+        &self,
+        scope: &str,
+        previous: &std::collections::BTreeSet<String>,
+    ) -> Result<super::reservation::ScopeUsage> {
+        let mut storage = self.lock_storage();
+        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+        storage.refresh_from_disk()?;
+        let workspace = storage.workspace()?;
+        let reservations = super::reservation::Reservations::load(workspace)?;
+        let mut usage = reservations.scope_usage_since(scope, previous)?;
+        usage.models = reservations.scope_models(workspace, scope, previous)?;
+        Ok(usage)
     }
 
     /// Release a completed dispatch batch whose unique receipt has never been
@@ -1297,6 +1334,7 @@ mod tests {
             reservation: reservation(attempt, money, 1_000_000),
             reserved_tokens: tokens,
             turn_token_limit: token_limit,
+            group: None,
         }
     }
 

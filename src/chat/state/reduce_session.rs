@@ -86,14 +86,19 @@ impl ChatState {
         ]
     }
 
-    /// `Action::SessionSaved { id }` — update the session id (the server may assign one on first save).
+    /// A save acknowledgement may initialize an empty identity, but cannot
+    /// switch an established session after a newer SessionLoaded action.
     pub(super) fn reduce_session_saved(&mut self, id: String) -> Vec<Effect> {
-        if self.session.id != id {
+        if self.session.id.is_empty() {
             self.session.id = id.clone();
         }
         vec![Effect::LogTrace {
             level: tracing::Level::INFO,
-            msg: format!("Session saved: {id}"),
+            msg: if self.session.id == id {
+                format!("Session saved: {id}")
+            } else {
+                format!("Inactive session save acknowledged: {id}")
+            },
         }]
     }
 

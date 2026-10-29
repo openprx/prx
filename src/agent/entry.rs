@@ -288,8 +288,9 @@ impl CliPendingInput {
             .with_ingress_recovery(&self.generation.effective, &self.ticket)
             .await?;
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        let experiment_stage = crate::runtime::experiment_stage::current();
         tokio::spawn(async move {
-            let operation = async {
+            let operation = crate::runtime::experiment_stage::retain(experiment_stage, async {
                 let event = self
                     .fabric
                     .record_inbound_user_message(self.scope.clone(), self.input.clone(), Some(self.key.clone()), None)
@@ -303,7 +304,7 @@ impl CliPendingInput {
                     );
                 let proof = self.issue(event.as_ref()).await?;
                 Ok::<_, anyhow::Error>((event, proof))
-            };
+            });
             let result = tokio::time::timeout(std::time::Duration::from_secs(15), operation)
                 .await
                 .map_err(|_| anyhow::anyhow!("CLI input persistence timed out"))

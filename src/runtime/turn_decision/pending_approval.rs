@@ -36,11 +36,11 @@ struct PendingRecord {
     expires_at: DateTime<Utc>,
 }
 
-/// A real durable pending receipt. Only exact writer/readback can construct it.
-pub(super) struct CollectedPendingCommitment {
+/// A durable pending or declined collection result. Only writer/readback can construct it.
+pub(super) struct CollectedApprovalResult {
     event: MessageEvent,
 }
-impl CollectedPendingCommitment {
+impl CollectedApprovalResult {
     pub(super) const fn event(&self) -> &MessageEvent {
         &self.event
     }
@@ -364,8 +364,8 @@ impl TurnDecisionService {
             owner.retain_pending(expires_at);
         }
         context
-            .collected_pending
-            .set(Box::new(CollectedPendingCommitment { event }))
+            .collected_approval_result
+            .set(Box::new(CollectedApprovalResult { event }))
             .map_err(|_| anyhow::anyhow!("collection pending receipt already installed"))
     }
 
@@ -1612,6 +1612,8 @@ impl TurnDecisionService {
 }
 
 pub(super) struct ResumeGateEvidence {
+    /// Authenticated original source content, still untrusted decision data.
+    pub(super) original_request: Arc<str>,
     pub(super) candidate_reference: crate::causal_tree::branch::CapabilityRef,
     pub(super) calls: std::collections::BTreeMap<crate::causal_tree::branch::CandidateId, [u8; 32]>,
     pub(super) approvals:
@@ -1703,6 +1705,7 @@ impl AdmittedDecisionResume {
             generation: entry.generation,
         };
         Ok(ResumeGateEvidence {
+            original_request: Arc::from(self.prepared.approval.pending.source.content.as_str()),
             candidate_reference: reference.clone(),
             calls: BTreeMap::from([
                 (CandidateId::new(CausalActionKind::UseTool, entry.family, None), digest),

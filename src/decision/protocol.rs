@@ -527,6 +527,8 @@ impl DecisionQuestion {
 /// Why a question the compiler could have asked was left out (CDP section 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OmissionReason {
+    /// This pipeline's scorer/selector does not consume this prediction.
+    UnusedPrediction,
     /// Only one legal non-terminal candidate exists, so the choice is forced.
     SingleLegalCandidate,
     /// No artifact exists, so nothing can be stale.
@@ -543,6 +545,7 @@ impl OmissionReason {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::UnusedPrediction => "unused_prediction",
             Self::SingleLegalCandidate => "single_legal_candidate",
             Self::NoArtifacts => "no_artifacts",
             Self::SingleTarget => "single_target",

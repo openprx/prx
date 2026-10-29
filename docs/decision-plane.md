@@ -57,6 +57,22 @@ execution binding and the final authority checks. A terminal outcome joins the
 decision after terminal persistence. A delegation launch acknowledgement is not
 proof that its child completed.
 
+The current local model identity is `builtin-v4`. When candidate log scores
+are exactly tied, it prefers lower side-effect risk, then stable candidate ID.
+Capability-target scores are conditional on the preferred action: targets of
+other actions receive the existing unmatched-option prior. An answer therefore
+does not borrow target uncertainty from executable alternatives. Numerical
+weights, the entropy-confidence formula and execution thresholds are unchanged;
+the conditional target distribution is an explicit model revision.
+
+Exactly named source-configured delegation stays available for serving-model
+planning even when other tool names or path shapes are present. These mentions
+can be positive, prohibited or contextual. They do not establish intent or
+permission; the execution assessment and ordinary executor still validate each
+proposed operation. Older recorded `builtin-v2`/`builtin-v3` results retain their
+historical identity. This does not change the configured hosted backend or
+count as hosted Jev activation.
+
 With the default builtin backend, a nonempty conversational turn with no
 structural or exact capability target can proceed to the serving model when its
 best admitted candidate is a direct answer, without requiring a retrieval
@@ -76,6 +92,16 @@ attempts all rejected for semantic validation remain fail
 closed even when the builtin shadow completes discovery. Transport, 5xx,
 circuit-open and local decision-budget failures fall back to the builtin; a
 later configured attempt that serves also keeps the normal terminal path.
+
+Exactly named native file operations can form one bounded file plan instead
+of keeping only the first name in that family. It includes only individually
+admitted `file_read`, `file_write` and `file_edit` refs, with maximum effect,
+unioned approval operation IDs and checked summed estimates; the aggregate
+passes the hard gates again. One-name and authenticated exact-resume paths
+remain narrow. Mentions identify candidates, including negated or contextual
+mentions; they never establish positive execution intent or grant permission.
+The normal applicability/source/current-ref checks, execution assessment and
+per-call executor validation remain required.
 
 An exactly named, current Searchable tool, or an exactly named source-configured
 Delegate with a sealed child manifest, uses a narrower selection path. It may
@@ -124,15 +150,18 @@ separate contracts. The admission input is currently populated as follows:
 | Single-shot/REPL Agent CLI, channels, cron, Xin, delegate and session workers | False; these sources admit the raw current input even when their provider request or worker state carries earlier context |
 
 The effective model window is pinned before decision dispatch. After the
-configured response reserve, the runtime reserves one sixteenth of the remaining
-window for the sealed decision request, capped at 4,096 tokens and by
+configured response reserve, the runtime reserves one eighth of the remaining
+window for the sealed decision request, capped at 8,192 tokens and by
 `causal_tree.policy.extra_token_ratio_limit` times that baseline window
 (the limit must be finite and greater than 0; zero or non-finite values are
 rejected at config load). The
 decision and main-turn input slices must both be positive. A smaller effective
 window, or a configured ratio too small to fund one decision token, fails closed with
 `resolved Agent context window has no safe decision reserve` before provider
-execution. Published tool schemas and their prompt instructions are then
+execution. This reservation is deducted from the serving model input; it
+cannot increase the combined context or the source monetary/time allowance.
+The previous 4,096 cap did not cover the complete default-registry structured
+Jev request. Published tool schemas and their prompt instructions are then
 reserved from the main-turn slice as part of each provider preflight.
 
 Use `prx causal backends` to inspect the computed backend order and exclusion
@@ -296,6 +325,36 @@ without the marker default to unconfirmed silence; ordinary serialization omits
 a false marker. Older strict readers may reject new signed silent records, so
 retain the originating revision and evidence for rollback instead of rewriting
 those records. Runtime and performance acceptance of this candidate is pending.
+
+The question compiler retains clarification, approval and refusal candidates in
+state and global choices, but omits their candidate-level applicability,
+success, gain and risk questions with `deterministic_candidate`. Their terminal
+selection is code-owned and the scorer does not consume those predictions.
+Working-path predictions, candidate limits, the decision token reserve and hard
+gates are unchanged; redundant terminal predictions do not consume hosted usage.
+The compiler also omits the unconsumed global `expected_gain` question with
+`unused_prediction`; candidate-level task gain remains part of scoring.
+
+An exact tool name is not itself positive intent. The exact-action shortcut
+requires per-candidate applicability at the configured choice confidence floor,
+as well as the current direct reference and normal hard gates. When a confident
+use-tool/family prediction has no sufficiently useful represented operation,
+one gated metadata recovery may inspect that selected family. It neither lowers
+the commit threshold nor executes the candidate. The validated family restriction
+persists through subsequent search and tool publication for this recovery; an
+incompatible later execution fails closed. Pending approval always blocks its
+terminal continuation, and same-family exact actions retain their guard.
+Native Shell has its own decision/search family while retaining the historical
+`filesystem:native:shell` manifest ID. Semantic family is included in the catalog
+generation, so pending approvals from a changed generation must be recollected.
+
+
+A verified approval resume retains the authenticated original user request as
+untrusted decision-goal data, with the normal redaction and size bounds. The
+current raw routing body remains the source binding. Transport IDs and sealed
+call arguments are not rendered as the goal. Original request content does not
+grant authority: the backend can still abstain, and current gates plus the
+single-use execution claim govern the effect.
 
 ## Endpoints and credentials
 
@@ -602,6 +661,16 @@ These values are fixed constants, not configuration:
 | Approval lifetime | at most 5 minutes | an approval request whose expiry is later than five minutes after issue is refused |
 
 ## Terminal authority and logical task completion
+
+Session-save acknowledgements do not switch an established active chat identity.
+Late acknowledgements for an older session leave the currently loaded session
+and its subsequent persistence key unchanged.
+
+Completion review receives bounded selected and last-served model identifiers
+from the main response's runtime trace. Unknown served identity stays null;
+provider endpoint labels are omitted. Drafts and tool output cannot supply this
+fact. The fact supports model-name claims without bypassing evidence review,
+request constraints or execution gates.
 
 Enabled and disabled model turns finalize through `TurnTerminalCommit`, whose
 `decision` field is required. Callers assemble `TurnTerminalDraft`; its optional

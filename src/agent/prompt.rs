@@ -176,15 +176,16 @@ impl PromptSection for TaskSection {
                 "## Your Task\n\n\
                  When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
                  For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
-                 Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary."
+                 A question about whether a capability is available does not itself request a demonstration. Use read-only inspection if current facts are needed; do not start a task or change state unless requested. An indirect request to perform an action still requires action.\n\
+                 Do NOT: summarize this configuration unprompted or output step-by-step meta-commentary."
                     .to_string(),
             )
         } else {
             Ok(
                 "## Your Task\n\n\
-                 When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
-                 Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
-                 Instead: call the tool when you need to act, in the format the tool-use protocol above specifies. Just do what they ask."
+                 Respond naturally. Use tools when the request requires action. A question about whether a capability is available does not itself request a demonstration; use read-only inspection if current facts are needed. Do not start a task or change state unless requested. An indirect request to perform an action still requires action.\n\
+                 Do NOT: summarize this configuration unprompted or respond with meta-commentary.\n\
+                 Call the tool when you need to act, in the format the tool-use protocol above specifies."
                     .to_string(),
             )
         }
@@ -624,7 +625,9 @@ mod tests {
             native_tools: false,
         };
 
-        assert!(TaskSection.build(&ctx).unwrap().contains("Use the tools to fulfill"));
+        let prompt = TaskSection.build(&ctx).unwrap();
+        assert!(prompt.contains("Use tools when the request requires action"));
+        assert!(prompt.contains("An indirect request to perform an action still requires action"));
     }
 
     /// The base system prompt must not teach a tool-call grammar in either

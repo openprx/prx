@@ -249,10 +249,37 @@ pub enum SkillCommands {
     },
 }
 
+/// Individual bounded experiment operations, under the existing lifecycle policy.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillExperimentCommands {
+    /// Resolve authoritative pins in a spec file without starting model or tool work.
+    Plan { source: String },
+    /// Freeze a fully pinned specification in the owner store.
+    Admit { source: String },
+    /// Inspect immutable plan, usage liabilities and stage records.
+    Inspect { id: String, digest: String },
+    /// Prevent further stage work; in-flight liabilities remain accounted.
+    Cancel { id: String, digest: String },
+    /// Reconcile interrupted handoffs conservatively, without retrying effects.
+    Recover { id: String, digest: String },
+    /// Execute exactly one frozen stage using the supplied operation JSON.
+    Run {
+        id: String,
+        digest: String,
+        stage: String,
+        source: String,
+    },
+}
+
 /// Skill lifecycle subcommands. Every mutation goes through the lifecycle
 /// service under the `[skills_lifecycle]` settings.
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillLifecycleCommands {
+    /// Operate a frozen bounded instruction experiment. Scheduling is explicit.
+    Experiment {
+        #[command(subcommand)]
+        command: SkillExperimentCommands,
+    },
     /// Validate a frozen evaluation suite and print its canonical digest.
     SuiteDigest { source: String },
     /// Install a suite whose digest is already registered by operator configuration.

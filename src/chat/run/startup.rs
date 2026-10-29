@@ -33,6 +33,20 @@ pub(super) fn chat_tracing_guard() -> Option<TracingChatGuard> {
     }
 }
 
+/// Bind the bootstrap-owned memory backend to Chat's event-recording scope.
+pub(super) fn chat_memory(
+    ctx: &crate::runtime::bootstrap::AppContext,
+    config: &Config,
+) -> Result<(Arc<dyn Memory>, super::MemoryFabric)> {
+    let memory = ctx
+        .memory
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build a memory backend for chat"))?;
+    let fabric = super::MemoryFabric::new(memory.clone(), config.workspace_dir.to_string_lossy())
+        .with_event_recording(config.memory.event_recording_config());
+    Ok((memory, fabric))
+}
+
 pub(super) fn session_tools(
     config: &Config,
     provider_name: &str,

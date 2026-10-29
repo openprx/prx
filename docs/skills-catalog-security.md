@@ -105,13 +105,16 @@ required-tools: [filesystem:native:shell, filesystem:native:file_read, mcp:notes
 An id is exactly three non-empty parts, `family:namespace:public_name`, as the
 capability catalog builds it:
 
-- The family is the first matching category of the tool, checked in this order:
-  `document_search` is `document`, `sessions_history` is `session`, a tool in
-  the file-system category is `filesystem`, then `memory`, `web`, `im`, and a
-  tool named `shell` is `shell`; every other built-in tool is `native_tool`.
-  The shell tool is in the file-system category, so its id is
-  `filesystem:native:shell`, not `shell:native:shell`. Skill tools are `skill`,
-  MCP tools `mcp`, plugin tools `wasm`.
+- Native decision families first distinguish `document_search`, `sessions_history`
+  and `shell` as `document`, `session` and `shell`. Other native tools match
+  file-system, memory, browsing and communication categories as `filesystem`,
+  `memory`, `web` and `im`, then fall back to `native_tool`. Skill tools use
+  `skill`, MCP tools `mcp`, and plugin tools `wasm`.
+  Native Shell keeps its historical `filesystem:native:shell` identity for
+  existing manifests. Its decision/search family is `shell`, so filesystem
+  discovery cannot select Shell merely because it shares a tool category.
+  Catalog generations include the decision family; stale approvals must be
+  recollected after this classification change.
 - The namespace is `native` for built-in tools. For MCP it is the server name
   once the tool has been discovered, and the literal `mcp` for a configured
   alias that has not been discovered yet, so the same tool can have two ids

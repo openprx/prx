@@ -28,6 +28,7 @@ mod consolidate;
 mod evaluate;
 mod evaluator;
 mod executable;
+pub mod experiment;
 mod facts;
 mod gate;
 mod gate_judge;

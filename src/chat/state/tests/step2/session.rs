@@ -363,6 +363,26 @@ fn test_redux_session_saved_same_id_idempotent() {
     assert!(has_log_trace(&effects));
 }
 
+#[test]
+fn late_save_acknowledgement_cannot_replace_a_loaded_session() {
+    let mut state = s();
+    state.session.id = "prx-old-session".into();
+    let mut loaded = crate::chat::session::ChatSession::new("prx-provider", "prx-model");
+    loaded.id = "prx-new-session".into();
+    loaded.add_user_turn("new request");
+    let _ = state.reduce(Action::SessionLoaded(loaded));
+    let effects = state.reduce(Action::SessionSaved {
+        id: "prx-old-session".into(),
+    });
+    assert_eq!(state.session.id, "prx-new-session");
+    assert_eq!(
+        state.session.turns.first().map(|turn| turn.content.as_str()),
+        Some("new request")
+    );
+    assert!(has_log_trace(&effects));
+    assert!(!effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))));
+}
+
 /// Step4-7: SessionSwitched → SaveSession + LogTrace + RequestRedraw
 #[test]
 fn test_redux_session_switched_saves_current_then_logs() {

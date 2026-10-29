@@ -22,6 +22,7 @@ const SOURCE_DOMAIN: &[u8] = b"terminal-replay-source-v1";
 const CLAIM_DOMAIN: &[u8] = b"terminal-replay-claim-v1";
 const ASSISTANT_DOMAIN: &[u8] = b"terminal-replay-assistant-v1";
 const COLLECTION_DOMAIN: &[u8] = b"terminal-replay-collected-pending-v1";
+const COLLECTION_DECLINED_DOMAIN: &[u8] = b"terminal-replay-collected-declined-v1";
 const RESUME_DOMAIN: &[u8] = b"terminal-replay-resume-claim-v1";
 
 #[derive(Serialize, Deserialize)]
@@ -62,6 +63,8 @@ struct ReplayBinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     collected_pending: Option<EventBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    collected_declined: Option<EventBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     router_read: Option<router_history::RouterReadReplay>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     served_auxiliary: Option<ServedAuxiliaryReplay>,
@@ -85,6 +88,32 @@ struct ReplayBinding {
     run_capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_claim: Option<EventBinding>,
+}
+
+fn validate_collection_decline(
+    receipt: &MessageEvent,
+    source_id: &str,
+    decision_id: &str,
+    reply: &str,
+) -> anyhow::Result<()> {
+    use sha2::Digest;
+    let payload: Value = serde_json::from_str(
+        receipt
+            .raw_payload_json
+            .as_deref()
+            .context("collection decline payload missing")?,
+    )?;
+    anyhow::ensure!(
+        receipt.role == "event"
+            && receipt.event_type == "approval.collection.declined"
+            && payload.get("version").and_then(Value::as_u64) == Some(1)
+            && payload.get("source_event_id").and_then(Value::as_str) == Some(source_id)
+            && payload.get("decision_id").and_then(Value::as_str) == Some(decision_id)
+            && payload.get("reply_sha256").and_then(Value::as_str)
+                == Some(hex::encode(sha2::Sha256::digest(reply.as_bytes())).as_str()),
+        "collection decline differs from source or reply"
+    );
+    Ok(())
 }
 
 /// Can only be produced from the service-issued settlement reference before
@@ -395,16 +424,39 @@ impl PreparedReplay {
             .map(|event| event_binding(&recorded.key, COLLECTION_DOMAIN, event))
             .transpose()?;
         let collection = link.context.approval_collection_proof().is_some();
+        let collected_declined = link
+            .context
+            .collected_declined_event()
+            .map(|event| {
+                let reply = commit.history.as_ref().context("declined collection reply missing")?;
+                validate_collection_decline(
+                    event,
+                    source_id,
+                    &link.context.decision_id().to_string(),
+                    &reply.assistant_content,
+                )?;
+                anyhow::ensure!(
+                    link.context.execution_refs().is_empty(),
+                    "declined collection has execution references"
+                );
+                event_binding(&recorded.key, COLLECTION_DECLINED_DOMAIN, event)
+            })
+            .transpose()?;
         anyhow::ensure!(
-            collected_pending.is_none() || collection,
+            (collected_pending.is_none() && collected_declined.is_none() || collection)
+                && !(collected_pending.is_some() && collected_declined.is_some()),
             "pending collection on ordinary terminal"
         );
         anyhow::ensure!(
-            !collection || commit.status != TurnTerminalStatus::Completed || collected_pending.is_some(),
+            !collection
+                || commit.status != TurnTerminalStatus::Completed
+                || collected_pending.is_some()
+                || collected_declined.is_some(),
             "completed collection lacks durable pending receipt"
         );
         Ok(Self(ReplayBinding {
             collected_pending,
+            collected_declined,
             version: 1,
             router_read,
             served_auxiliary,
@@ -484,6 +536,7 @@ impl PreparedReplay {
 /// generation's source proof. Consumers may use this only to repair telemetry.
 pub(crate) struct VerifiedTerminalReplay {
     collected_pending: bool,
+    collected_declined: bool,
     parent_digest: Option<String>,
     decision_digest: String,
     parent_decision_id: Option<DecisionId>,
@@ -498,6 +551,9 @@ pub(crate) struct VerifiedTerminalReplay {
 impl VerifiedTerminalReplay {
     pub(crate) const fn collected_pending(&self) -> bool {
         self.collected_pending
+    }
+    pub(crate) const fn collected_declined(&self) -> bool {
+        self.collected_declined
     }
     pub(crate) fn parent_digest(&self) -> Option<&str> {
         self.parent_digest.as_deref()
@@ -926,11 +982,15 @@ async fn verify_terminal_replay_inner(
     );
     let collection = decision.directive_kind == "collect_approval_arguments";
     anyhow::ensure!(
-        binding.collected_pending.is_none() || collection,
+        (binding.collected_pending.is_none() && binding.collected_declined.is_none() || collection)
+            && !(binding.collected_pending.is_some() && binding.collected_declined.is_some()),
         "collection receipt on ordinary decision"
     );
     anyhow::ensure!(
-        !collection || terminal_status != TurnTerminalStatus::Completed || binding.collected_pending.is_some(),
+        !collection
+            || terminal_status != TurnTerminalStatus::Completed
+            || binding.collected_pending.is_some()
+            || binding.collected_declined.is_some(),
         "completed collection replay lacks pending receipt"
     );
     if let Some(pending) = &binding.collected_pending {
@@ -956,6 +1016,50 @@ async fn verify_terminal_replay_inner(
                 && receipt.idempotency_key.as_deref()
                     == Some(format!("decision-approval:{}:pending", decision.decision_id).as_str()),
             "collection pending replay scope mismatch"
+        );
+    }
+    if let Some(declined) = &binding.collected_declined {
+        let receipt = read_replay_event(
+            memory,
+            workspace_id,
+            owner_id,
+            event,
+            crate::memory::ingress_recovery::IngressEventLookup::OwnedEventId(declined.event_id.clone()),
+            bounded,
+        )
+        .await?
+        .context("collection decline replay event missing")?;
+        verify_event_mac(key, COLLECTION_DECLINED_DOMAIN, &receipt, &declined.mac)?;
+        anyhow::ensure!(
+            receipt.id > source.id
+                && receipt.id < event.id
+                && receipt.workspace_id == workspace_id
+                && receipt.owner_id.as_deref() == Some(owner_id)
+                && receipt.session_key.as_deref() == Some(binding.session_key.as_str())
+                && receipt.run_id.as_deref() == Some(binding.run_id.as_str())
+                && receipt.idempotency_key.as_deref()
+                    == Some(format!("decision-approval:{}:declined", decision.decision_id).as_str()),
+            "collection decline replay scope mismatch"
+        );
+        let reply = payload
+            .get("history")
+            .and_then(|value| value.get("assistant_content"))
+            .and_then(Value::as_str)
+            .context("declined collection assistant history missing")?;
+        validate_collection_decline(
+            &receipt,
+            &binding.source.event_id,
+            &decision.decision_id.to_string(),
+            reply,
+        )?;
+        let trace = payload
+            .get("execution_trace")
+            .context("declined collection trace missing")?;
+        anyhow::ensure!(
+            trace.get("calls").and_then(Value::as_array).is_some_and(Vec::is_empty)
+                && trace.get("started_attempts").and_then(Value::as_u64) == Some(0)
+                && trace.get("awaiting_approval_attempts").and_then(Value::as_u64) == Some(0),
+            "declined collection terminal claims execution"
         );
     }
     if let Some(resume) = &binding.resume_claim {
@@ -1004,6 +1108,7 @@ async fn verify_terminal_replay_inner(
     }
     Ok(VerifiedTerminalReplay {
         collected_pending: binding.collected_pending.is_some(),
+        collected_declined: binding.collected_declined.is_some(),
         parent_digest: binding.parent.map(|parent| parent.digest),
         decision_digest: binding
             .hops
@@ -1069,5 +1174,42 @@ async fn read_replay_decision(
         .await
     } else {
         Ok(reader.replay_record(scope, id)?)
+    }
+}
+
+#[cfg(test)]
+mod collection_decline_tests {
+    use super::*;
+    use sha2::Digest;
+
+    #[test]
+    fn decline_receipt_binds_source_decision_and_exact_clarification() {
+        let reply = crate::runtime::turn_decision::DECLINED_COLLECTION_REPLY;
+        let payload = serde_json::json!({
+            "version": 1, "decision_id": "prx-decision", "source_event_id": "prx-source",
+            "reply_sha256": hex::encode(sha2::Sha256::digest(reply.as_bytes())),
+        });
+        let mut receipt: MessageEvent = serde_json::from_value(serde_json::json!({
+            "id": 2, "event_id": "prx-decline", "workspace_id": "prx-workspace", "source": "chat",
+            "role": "event", "event_type": "approval.collection.declined", "content": "no operation proposed",
+            "raw_payload_json": payload.to_string(), "visibility": "session",
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        }))
+        .expect("receipt fixture");
+        validate_collection_decline(&receipt, "prx-source", "prx-decision", reply).expect("bound clarification");
+        assert!(validate_collection_decline(&receipt, "prx-foreign-source", "prx-decision", reply).is_err());
+        assert!(validate_collection_decline(&receipt, "prx-source", "prx-foreign-decision", reply).is_err());
+        assert!(
+            validate_collection_decline(&receipt, "prx-source", "prx-decision", "The operation completed.").is_err()
+        );
+        for field in ["version", "decision_id", "source_event_id", "reply_sha256"] {
+            let mut tampered = payload.clone();
+            tampered.as_object_mut().expect("object").remove(field);
+            receipt.raw_payload_json = Some(tampered.to_string());
+            assert!(
+                validate_collection_decline(&receipt, "prx-source", "prx-decision", reply).is_err(),
+                "missing {field}"
+            );
+        }
     }
 }

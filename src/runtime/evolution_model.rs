@@ -3,13 +3,16 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::decision_accounting::{AccountingScope, OwnedReceipt, PhysicalEstimate};
+use super::decision_accounting::{AccountingScope, PhysicalEstimate};
 use crate::config::Config;
 use crate::providers::attempt_accounting::{self, AttemptAccounting, AttemptReceipt, PhysicalRequest};
 use crate::skills::lifecycle::{
     ManagedProviderModel, ModelBinding, ModelCallError, ModelReply, ProposerModel, TallyCounters,
 };
 use async_trait::async_trait;
+
+mod envelope;
+pub(crate) use envelope::{EvolutionEnvelope, current_envelope, retain_envelope};
 
 #[derive(Clone, Copy)]
 pub(crate) enum EvolutionPurpose {
@@ -77,30 +80,48 @@ impl EvolutionModel {
         let cleanup = super::turn_cleanup::current_tracker()
             .ok_or_else(|| anyhow::anyhow!("evolution call has no runtime cleanup owner"))?;
         let key = Arc::clone(&self.key);
-        let call_id = uuid::Uuid::new_v4().to_string();
+        let envelope = current_envelope();
+        let call_id = envelope
+            .as_ref()
+            .map_or_else(|| uuid::Uuid::new_v4().to_string(), |value| value.identity.clone());
         let scope_id = key.hmac(
             crate::decision::KeyDomain::TerminalClaim,
             &[
                 b"evolution-model-call-v1",
-                self.purpose.label().as_bytes(),
+                if envelope.is_some() {
+                    b"experiment"
+                } else {
+                    self.purpose.label().as_bytes()
+                },
                 call_id.as_bytes(),
                 self.config.workspace_dir.to_string_lossy().as_bytes(),
                 self.binding.digest().as_bytes(),
             ],
         );
         let duration = Duration::from_secs(self.config.self_system.evolution_judge_timeout_secs);
-        let scope = Arc::new(AccountingScope::new(
-            Arc::clone(&self.config),
-            Arc::clone(&key),
-            cleanup,
-            scope_id,
-            crate::causal_tree::state::TurnBudgets {
-                tokens: self.config.self_system.evolution_model_max_tokens,
-                micro_usd: self.config.self_system.evolution_model_max_micro_usd,
-                latency_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-            },
-            Instant::now() + duration,
-        ));
+        let create_scope = || {
+            Arc::new(AccountingScope::new(
+                Arc::clone(&self.config),
+                Arc::clone(&key),
+                cleanup,
+                scope_id,
+                crate::causal_tree::state::TurnBudgets {
+                    tokens: self.config.self_system.evolution_model_max_tokens,
+                    micro_usd: self.config.self_system.evolution_model_max_micro_usd,
+                    latency_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                },
+                Instant::now() + duration,
+            ))
+        };
+        let scope = if let Some(envelope) = envelope {
+            let config_pin = key.hmac(
+                crate::decision::KeyDomain::TerminalClaim,
+                &[b"experiment-config-v1", &serde_json::to_vec(self.config.as_ref())?],
+            );
+            envelope.accounting(hex::encode(config_pin), create_scope)?
+        } else {
+            create_scope()
+        };
         let targets = self
             .provider
             .accounting_targets(&self.binding.model)
@@ -185,18 +206,7 @@ impl AttemptAccounting for EvolutionAccounting {
                 remaining_attempts: 1,
             })
             .await?;
-        Ok(Box::new(EvolutionReceipt(receipt)))
-    }
-}
-struct EvolutionReceipt(OwnedReceipt);
-impl attempt_accounting::sealed::Receipt for EvolutionReceipt {}
-#[async_trait]
-impl AttemptReceipt for EvolutionReceipt {
-    fn deadline(&self) -> Instant {
-        crate::decision::budget::DecisionAttemptReceipt::deadline(&self.0)
-    }
-    async fn settle(self: Box<Self>, usage: crate::llm::route_decision::TokenUsage) -> anyhow::Result<()> {
-        Box::new(self.0).settle_provider_usage(usage).map_err(Into::into)
+        Ok(receipt.into_provider_receipt())
     }
 }
 
@@ -276,6 +286,53 @@ mod tests {
             .collect();
         // The journal's attempt IDs must distinguish separate completed calls.
         assert!(ids.len() >= 2, "separate calls must not reuse a reservation: {rows}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn experiment_envelope_shares_physical_owner_across_proposal_and_judge() -> anyhow::Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let probe = CredentialProbe::start().await;
+        let cfg = config(workspace.path(), &probe.custom_provider());
+        let proposer = EvolutionModel::from_config(&cfg, EvolutionPurpose::Proposer)?;
+        let judge = EvolutionModel::from_config(&cfg, EvolutionPurpose::Judge)?;
+        CleanupScope::new(None, CancellationToken::new())?
+            .run(async {
+                let envelope = EvolutionEnvelope::new("experiment-fixture".into());
+                envelope
+                    .scope(async {
+                        let first = proposer
+                            .complete("Fixture.", "First.", Arc::new(TallyCounters::default()))
+                            .await?;
+                        // Spawn boundaries use the same explicit handoff as proposal
+                        // work and the production verdict task.
+                        let retained = current_envelope();
+                        let owner = crate::runtime::turn_cleanup::current_tracker().expect("cleanup owner");
+                        let second = tokio::spawn(async move {
+                            retain_envelope(
+                                retained,
+                                owner.scope(judge.complete("Fixture.", "Second.", Arc::new(TallyCounters::default()))),
+                            )
+                            .await
+                        })
+                        .await??;
+                        assert_eq!(first.accounting_scope_id, second.accounting_scope_id);
+                        let mut changed = cfg.clone();
+                        changed.self_system.evolution_model_max_tokens += 1;
+                        let incompatible = EvolutionModel::from_config(&changed, EvolutionPurpose::Proposer)?;
+                        assert!(
+                            incompatible.call_model().is_err(),
+                            "a changed budget cannot refresh the experiment"
+                        );
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+            .await?;
+        assert_eq!(probe.requests().len(), 2);
+        let rows = std::fs::read_to_string(workspace.path().join("state/costs.reservations.jsonl"))?;
+        assert_eq!(rows.matches("estimated_settled_v1").count(), 2);
+        assert!(rows.contains("evolution_proposer") && rows.contains("evolution_judge"));
         Ok(())
     }
 

@@ -86,6 +86,10 @@ pub trait DecisionAttemptReceipt: sealed::AttemptReceipt + Send {
     /// Retaining provenance makes local deadline expiry distinct from a backend
     /// timeout, including the case where both deadlines are equal.
     fn deadline(&self) -> Instant;
+    /// Reserve retained response bytes when the parent has an output ceiling.
+    fn retain_response_chunk(&self, _bytes: usize) -> Result<(), DecisionError> {
+        Ok(())
+    }
 
     /// Record actual usage before semantic prediction validation. Both token
     /// fields must be known to release an estimate; reported vendor cost is a
@@ -162,6 +166,9 @@ impl sealed::AttemptReceipt for ObservedReceipt {}
 impl DecisionAttemptReceipt for ObservedReceipt {
     fn deadline(&self) -> Instant {
         self.receipt.deadline()
+    }
+    fn retain_response_chunk(&self, bytes: usize) -> Result<(), DecisionError> {
+        self.receipt.retain_response_chunk(bytes)
     }
     async fn settle(self: Box<Self>, usage: DecisionUsage) -> Result<(), DecisionError> {
         let Self { receipt, observation } = *self;

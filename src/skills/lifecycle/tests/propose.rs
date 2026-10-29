@@ -202,10 +202,17 @@ async fn evolution_prompt_bridge_uses_verified_evidence_and_keeps_publication_se
         },
     )
     .expect("service");
-    let model = ScriptedModel::replying(&good_patch());
+    let model = Arc::new(ScriptedModel::replying(&good_patch()));
     let before = skill_md_with(20);
     let (draft, after) = service
-        .propose_prompt_revision("Deploy helper", &before, "evolution-cycle".into(), budget(), &model)
+        .propose_prompt_revision(
+            "Deploy helper",
+            &before,
+            "evolution-cycle".into(),
+            budget(),
+            model.clone(),
+            &CancellationToken::new(),
+        )
         .await
         .expect("managed proposal");
     assert_eq!(draft.status, Status::Draft);
@@ -223,12 +230,127 @@ async fn evolution_prompt_bridge_uses_verified_evidence_and_keeps_publication_se
             "stale projection",
             "different-cycle".into(),
             budget(),
-            &model,
+            model.clone(),
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("projection differs"));
     assert_eq!(model.calls(), 1, "stale projection must fail before another model call");
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let error = service
+        .propose_prompt_revision(
+            "Deploy helper",
+            &before,
+            "cancelled-cycle".into(),
+            budget(),
+            model.clone(),
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(model.calls(), 1, "cancelled proposal must not send a model call");
+}
+
+#[tokio::test]
+async fn evolution_prompt_bridge_records_parent_cancellation_during_model_call() {
+    use crate::skills::lifecycle::{SkillsLifecycleService, SkillsLifecycleSettings};
+    let f = fixture();
+    usable_pattern(&f);
+    let service = SkillsLifecycleService::new(
+        Arc::clone(&f.store),
+        SkillsLifecycleSettings {
+            enabled: true,
+            ..SkillsLifecycleSettings::default()
+        },
+    )
+    .expect("service");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let signal = Arc::clone(&started);
+    let mut model = ScriptedModel::new(vec![Script::Hang]);
+    model.before = Some(Box::new(move || signal.notify_one()));
+    let model = Arc::new(model);
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    let cancel_after_start = async move {
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("model call started");
+        trigger.cancel();
+    };
+    let before = skill_md_with(20);
+    let proposal = service.propose_prompt_revision(
+        "Deploy helper",
+        &before,
+        "parent-cancel-cycle".into(),
+        budget(),
+        model.clone(),
+        &cancel,
+    );
+    let (outcome, ()) = tokio::join!(proposal, cancel_after_start);
+    assert!(outcome.unwrap_err().to_string().contains("cancelled"));
+    assert!(model.hung_dropped.load(Ordering::SeqCst));
+    let records = f.store.list_proposals().expect("proposals");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, Status::Cancelled);
+    assert!(records[0].candidate_revision.is_none());
+}
+
+#[tokio::test]
+async fn evolution_prompt_bridge_joins_record_after_foreground_drop() {
+    use crate::skills::lifecycle::{SkillsLifecycleService, SkillsLifecycleSettings};
+    let f = fixture();
+    usable_pattern(&f);
+    let service = Arc::new(
+        SkillsLifecycleService::new(
+            Arc::clone(&f.store),
+            SkillsLifecycleSettings {
+                enabled: true,
+                ..SkillsLifecycleSettings::default()
+            },
+        )
+        .expect("service"),
+    );
+    let started = Arc::new(tokio::sync::Notify::new());
+    let signal = Arc::clone(&started);
+    let mut model = ScriptedModel::new(vec![Script::Hang]);
+    model.before = Some(Box::new(move || signal.notify_one()));
+    let model = Arc::new(model);
+    let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+    let worker_owner = Arc::clone(&owner);
+    let worker_model = model.clone();
+    let worker = tokio::spawn(async move {
+        worker_owner
+            .scope(async move {
+                service
+                    .propose_prompt_revision(
+                        "Deploy helper",
+                        &skill_md_with(20),
+                        "drop-cycle".into(),
+                        budget(),
+                        worker_model,
+                        &CancellationToken::new(),
+                    )
+                    .await
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("model call started");
+    worker.abort();
+    assert!(worker.await.expect_err("foreground aborted").is_cancelled());
+    owner
+        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("owned work joined");
+    assert!(model.hung_dropped.load(Ordering::SeqCst));
+    let records = f.store.list_proposals().expect("proposals");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, Status::Cancelled);
+    assert!(records[0].candidate_revision.is_none());
 }
 
 fn append_patch(words: u64) -> String {
@@ -527,6 +649,25 @@ async fn the_same_request_id_is_idempotent_and_different_inputs_conflict() {
     };
     assert_eq!(first, again);
     assert_eq!(model.calls(), 1, "a reused proposal costs no second call");
+
+    let mut changed = request("req-1", &[&pattern]);
+    changed.budget = ProposerBudget::new(64 * 1024, 8 * 1024, Duration::from_secs(7)).unwrap();
+    let error = propose_revision(Arc::clone(&f.store), changed, &model, &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LifecycleError::ProposalConflict { .. }));
+    let mut changed_model = ScriptedModel::replying(&good_patch());
+    changed_model.binding.model = "different-fixture-model".into();
+    let error = propose_revision(
+        Arc::clone(&f.store),
+        request("req-1", &[&pattern]),
+        &changed_model,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, LifecycleError::ProposalConflict { .. }));
+    assert_eq!(changed_model.calls(), 0, "changed inputs must not dispatch");
 
     let other = consolidate(
         &f,
@@ -2415,3 +2556,5 @@ mod from_trace {
         assert!(matches!(staged, ProposeOutcome::Staged(_)));
     }
 }
+
+mod experiments;

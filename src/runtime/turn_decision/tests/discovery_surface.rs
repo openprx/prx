@@ -797,6 +797,25 @@ async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() 
         assert_eq!(service.admit_offered_discoveries(&proof, &context, |_, _| false), 0);
 
         let port = service.capability_search_port(&proof, &context).unwrap();
+        // An exact query for an already-declared core must return that schema,
+        // not fuzzy unrelated offers; it adds no new executable declaration.
+        let core_result = with_search_authority(
+            Some(port.clone()),
+            CapabilitySearchTool.execute(
+                serde_json::json!({"query":"file_read","limit":crate::tools::capability::search_tool::MAX_SEARCH_HITS}),
+            ),
+        )
+        .await
+        .unwrap();
+        let core_output: serde_json::Value = serde_json::from_str(&core_result.output).unwrap();
+        let hits = core_output.get("hits").unwrap().as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits.first().unwrap().get("schema").unwrap().get("name").unwrap(),
+            "file_read"
+        );
+        assert_eq!(service.admit_offered_discoveries(&proof, &context, |_, _| false), 0);
+        assert_eq!(context.execution_refs(), &original_refs);
         let queries = if direct_shell {
             vec!["shell"]
         } else {
@@ -1275,6 +1294,126 @@ async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_executi
         "the selected Skill body must load through skill_read"
     );
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(transports.0.load(Ordering::SeqCst), 0);
+    context.terminal_execution_trace();
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn selected_native_write_can_discover_read_peer_without_offering_shell() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.causal_tree.enabled = true;
+    config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+    config.autonomy.level = crate::security::AutonomyLevel::Full;
+    config.providers.models.push(
+        toml::from_str(
+            "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+        )
+        .unwrap(),
+    );
+    let generation = crate::config::new_shared(config.clone()).pin();
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+        Box::new(crate::tools::file_write::FileWriteTool::new(Arc::clone(&security))),
+        Box::new(crate::tools::file_edit::FileEditTool::new(Arc::clone(&security))),
+        Box::new(crate::tools::file_read::FileReadTool::new(Arc::clone(&security), false)),
+        Box::new(crate::tools::shell::ShellTool::new(
+            Arc::new(crate::runtime::NativeRuntime::new()),
+            workspace.path().to_owned(),
+        )),
+        Box::new(CapabilitySearchTool),
+    ]);
+    let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
+        Arc::clone(&registry),
+        Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+        Arc::new(DenyApprovalStrategy),
+        Arc::new(AdapterOwnedPreparation),
+        Arc::new(TracingToolExecutionAudit),
+    ));
+    let provider_catalog = ProviderCatalogView::from_config(&config);
+    let transports = CountingTransports(AtomicUsize::new(0));
+    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let service = build_turn_decision_service(
+        TurnSurfaceKind::AgentLoop,
+        TurnServiceBuild {
+            parent_grant: None,
+            generation: Arc::clone(&generation),
+            registry,
+            execution,
+            catalog_sources: sources(&generation, &config),
+            surface_policy: SurfacePolicy {
+                direct_names: BTreeSet::from([
+                    "file_write".to_owned(),
+                    "file_read".to_owned(),
+                    "file_edit".to_owned(),
+                    "shell".to_owned(),
+                ]),
+                ..SurfacePolicy::default()
+            },
+            provider_catalog: &provider_catalog,
+            transports: &transports,
+            events: Arc::new(SilentEvents),
+            memory: Arc::clone(&memory),
+            security,
+        },
+    )
+    .await
+    .unwrap();
+    let cli = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+        &generation,
+        memory,
+        "Use file_write to create proof.txt with PRX marker, then read it back.",
+        "prx_native_file_peer",
+        ("ollama", "prx-local-model"),
+    )
+    .await;
+    let proof = crate::runtime::turn_source::OwnedTurnSourceProof::capture(&cli);
+    let context = service
+        .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
+    let core = service.agent_execution_specs(&proof, &context).unwrap();
+    assert!(core.specs.iter().any(|spec| spec.name == "file_write"));
+    assert!(
+        core.specs
+            .iter()
+            .all(|spec| spec.name != "file_read" && spec.name != "file_edit" && spec.name != "shell")
+    );
+    let port = service.capability_search_port(&proof, &context).unwrap();
+    for (query, expected) in [
+        ("file_read", Some("file_read")),
+        ("file_edit", Some("file_edit")),
+        ("shell", None),
+    ] {
+        let result = with_search_authority(
+            Some(port.clone()),
+            CapabilitySearchTool.execute(
+                serde_json::json!({"query":query,"limit":crate::tools::capability::search_tool::MAX_SEARCH_HITS}),
+            ),
+        )
+        .await
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let hits = output.get("hits").unwrap().as_array().unwrap();
+        assert_eq!(hits.len(), usize::from(expected.is_some()));
+        if let Some(expected) = expected {
+            assert_eq!(
+                hits.first().unwrap().get("schema").unwrap().get("name").unwrap(),
+                expected
+            );
+        }
+    }
+    assert_eq!(service.admit_offered_discoveries(&proof, &context, |_, _| false), 2);
+    let appended = service.agent_appended_execution_specs(&proof, &context).unwrap();
+    let names: BTreeSet<_> = appended.specs.iter().map(|spec| spec.name.as_str()).collect();
+    assert_eq!(names, BTreeSet::from(["file_read", "file_edit"]));
+    assert!(
+        !workspace.path().join("proof.txt").exists(),
+        "metadata discovery executes nothing"
+    );
     assert_eq!(transports.0.load(Ordering::SeqCst), 0);
     context.terminal_execution_trace();
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;

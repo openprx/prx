@@ -509,7 +509,11 @@ impl SkillLifecycleStore {
         {
             let lock = self.lock_proposals()?;
             if let Some(mut existing) = self.read_proposal_record(&proposal_id)? {
-                if existing.skill_id != *skill || existing.requested_patterns != requested {
+                if existing.skill_id != *skill
+                    || existing.requested_patterns != requested
+                    || existing.budget != request.budget.record()
+                    || existing.author.model != *model
+                {
                     return Err(LifecycleError::ProposalConflict { proposal_id });
                 }
                 // An attempt still in flight long after its own deadline was

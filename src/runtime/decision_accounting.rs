@@ -26,6 +26,7 @@ use crate::providers::ProviderId;
 pub(crate) mod timing;
 
 mod output_allowance;
+mod provider_receipt;
 mod settlement;
 
 #[cfg(feature = "llm-router")]
@@ -49,6 +50,10 @@ pub(crate) struct AccountingScope {
     budgets: TurnBudgets,
     deadline: Instant,
     remaining: OnceLock<Arc<RemainingBudgets>>,
+    parent: Option<Arc<Self>>,
+    call_limit: Option<u64>,
+    group: Option<crate::cost::reservation::ReservationGroup>,
+    stage: OnceLock<std::sync::Weak<super::experiment_stage::ExperimentStageRuntime>>,
 }
 
 struct RemainingBudgets {
@@ -103,7 +108,7 @@ impl AccountingScope {
                 latency_ms: 0,
             };
         }
-        TurnBudgets {
+        let mut budget = TurnBudgets {
             tokens: self
                 .remaining
                 .get()
@@ -115,7 +120,14 @@ impl AccountingScope {
             latency_ms: self.budgets.latency_ms.min(
                 u64::try_from(self.deadline.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX),
             ),
+        };
+        if let Some(parent) = &self.parent {
+            let upper = parent.remaining_budgets();
+            budget.tokens = budget.tokens.min(upper.tokens);
+            budget.micro_usd = budget.micro_usd.min(upper.micro_usd);
+            budget.latency_ms = budget.latency_ms.min(upper.latency_ms);
         }
+        budget
     }
 
     /// Share the original monetary/token balance and settlement serialization;
@@ -138,10 +150,14 @@ impl AccountingScope {
             budgets: self.budgets,
             deadline,
             remaining: OnceLock::from(Arc::clone(remaining)),
+            parent: self.parent.clone(),
+            call_limit: self.call_limit,
+            group: self.group.clone(),
+            stage: self.stage.clone(),
         }
     }
 
-    pub(crate) const fn new(
+    pub(crate) fn new(
         config: Arc<Config>,
         key: Arc<DecisionKey>,
         cleanup: Arc<CleanupTracker>,
@@ -157,7 +173,41 @@ impl AccountingScope {
             budgets,
             deadline,
             remaining: OnceLock::new(),
+            parent: super::experiment_stage::current().map(|stage| Arc::clone(&stage.accounting)),
+            call_limit: None,
+            group: None,
+            stage: OnceLock::new(),
         }
+    }
+}
+
+impl AccountingScope {
+    pub(super) fn bind_stage(
+        &self,
+        stage: &Arc<super::experiment_stage::ExperimentStageRuntime>,
+    ) -> anyhow::Result<()> {
+        self.stage
+            .set(Arc::downgrade(stage))
+            .map_err(|_| anyhow::anyhow!("stage accounting already bound"))
+    }
+    pub(super) async fn flush(&self) -> anyhow::Result<()> {
+        let Some(remaining) = self.remaining.get() else {
+            return Ok(());
+        };
+        let _guard = tokio::time::timeout_at(self.deadline.into(), remaining.settlement_gate.lock()).await?;
+        anyhow::ensure!(
+            !remaining.settlement_failed.load(Ordering::Acquire),
+            "stage physical settlement is unconfirmed"
+        );
+        Ok(())
+    }
+    pub(super) const fn with_call_limit(mut self, maximum: u64) -> Self {
+        self.call_limit = Some(maximum);
+        self
+    }
+    pub(super) fn with_group(mut self, group: crate::cost::reservation::ReservationGroup) -> Self {
+        self.group = Some(group);
+        self
     }
 }
 
@@ -241,16 +291,43 @@ pub(super) struct PhysicalEstimate<'a> {
 
 impl AccountingScope {
     pub(super) fn scope_id(&self) -> String {
-        hex::encode(self.scope_id)
+        self.parent
+            .as_ref()
+            .map_or_else(|| hex::encode(self.scope_id), |parent| parent.scope_id())
     }
     #[cfg(test)]
     pub(crate) fn scope_id_for_tests(&self) -> String {
         self.scope_id()
     }
-    pub(super) const fn deadline(&self) -> Instant {
-        self.deadline
+    pub(super) fn deadline(&self) -> Instant {
+        self.parent
+            .as_ref()
+            .map_or(self.deadline, |parent| self.deadline.min(parent.deadline))
     }
     pub(super) async fn begin_physical(&self, attempt: PhysicalEstimate<'_>) -> Result<OwnedReceipt, DecisionError> {
+        if let Some(stage) = super::experiment_stage::current() {
+            stage.ensure_active().map_err(|_| DecisionError::Cancelled)?;
+            if self.parent.is_none() && self.scope_id != stage.accounting.scope_id {
+                return stage.accounting.begin_physical_owned(attempt, self.budgets).await;
+            }
+        }
+        match self.parent.as_ref() {
+            Some(parent) => parent.begin_physical_owned(attempt, self.budgets).await,
+            None => self.begin_physical_owned(attempt, self.budgets).await,
+        }
+    }
+    async fn begin_physical_owned(
+        &self,
+        attempt: PhysicalEstimate<'_>,
+        per_call: TurnBudgets,
+    ) -> Result<OwnedReceipt, DecisionError> {
+        if let Some(stage) = self.stage.get() {
+            stage
+                .upgrade()
+                .ok_or(DecisionError::Cancelled)?
+                .ensure_active()
+                .map_err(|_| DecisionError::Cancelled)?;
+        }
         let auxiliary = matches!(
             attempt.purpose,
             "signal_vision"
@@ -307,6 +384,9 @@ impl AccountingScope {
         );
         let turn_id = hex::encode(self.scope_id);
         let budgets = self.budgets;
+        let call_limit = self.call_limit;
+        let group = self.group.clone();
+        let stage = self.stage.get().cloned();
         // Copy only on a real configured physical attempt; the same full
         // guarded bytes are measured without removing image or request data.
         let config = Arc::clone(&self.config);
@@ -327,7 +407,11 @@ impl AccountingScope {
                     let token_timing = diagnostic_timing
                         .as_ref()
                         .map(|_| crate::agent::context_budget::token_timing::Scope::new());
-                    let allowance = preparation_remaining.tokens.load(Ordering::Acquire) / planned;
+                    let allowance = preparation_remaining
+                        .tokens
+                        .load(Ordering::Acquire)
+                        .min(per_call.tokens)
+                        / planned;
                     let mut prepared = PreparedInput::new(text, allowance);
                     prepared.fits(allowance, || estimate_input_tokens(text))?;
                     #[cfg(test)]
@@ -383,9 +467,14 @@ impl AccountingScope {
                 let mut diagnostic_stage = "input_fit";
                 let result = (|| -> anyhow::Result<OwnedReceipt> {
                     let text = request_body.as_ref();
-                    tokens = claim_prepared_input(&remaining.tokens, planned, text, &mut prepared, || {
-                        estimate_input_tokens(text)
-                    })?;
+                    tokens = claim_prepared_input_capped(
+                        &remaining.tokens,
+                        planned,
+                        text,
+                        &mut prepared,
+                        per_call.tokens,
+                        || estimate_input_tokens(text),
+                    )?;
                     #[cfg(test)]
                     if let Some(timing) = &mut diagnostic_timing {
                         timing.mark("input_fit_finished");
@@ -397,6 +486,10 @@ impl AccountingScope {
                         &model,
                         tokens,
                     )?;
+                    anyhow::ensure!(
+                        maximum <= per_call.micro_usd,
+                        "physical request exceeds source monetary allowance"
+                    );
                     anyhow::ensure!(
                         remaining
                             .micro_usd
@@ -427,6 +520,7 @@ impl AccountingScope {
                         },
                         reserved_tokens: tokens,
                         turn_token_limit: budgets.tokens,
+                        group,
                     };
                     #[cfg(test)]
                     {
@@ -443,18 +537,19 @@ impl AccountingScope {
                             timing.mark("reserve");
                         }
                     }
-                    let receipt = match tracker.reserve_dispatched_estimated_attempt(request, || {
-                        !cancel.is_cancelled() && Instant::now() < deadline
-                    }) {
-                        Ok(receipt) => receipt,
-                        Err(error) => {
-                            if error.is::<crate::cost::reservation::ReservationWriteUnconfirmed>() {
-                                confirmed = false;
-                                restore_tokens = false;
+                    let receipt =
+                        match tracker.reserve_dispatched_estimated_attempt_with_limit(request, call_limit, || {
+                            !cancel.is_cancelled() && Instant::now() < deadline
+                        }) {
+                            Ok(receipt) => receipt,
+                            Err(error) => {
+                                if error.is::<crate::cost::reservation::ReservationWriteUnconfirmed>() {
+                                    confirmed = false;
+                                    restore_tokens = false;
+                                }
+                                return Err(error);
                             }
-                            return Err(error);
-                        }
-                    };
+                        };
                     // From this point the reservation and its one-use dispatched
                     // state are durable. Unknown send/usage retains the liability.
                     restore_tokens = false;
@@ -470,6 +565,7 @@ impl AccountingScope {
                         reserved_tokens: tokens,
                         reserved_micro_usd: maximum,
                         deadline: owner_deadline,
+                        stage,
                     })
                 })();
                 #[cfg(test)]
@@ -589,6 +685,20 @@ pub(super) struct OwnedReceipt {
     reserved_tokens: u64,
     reserved_micro_usd: u64,
     deadline: Instant,
+    stage: Option<std::sync::Weak<super::experiment_stage::ExperimentStageRuntime>>,
+}
+
+impl OwnedReceipt {
+    fn retain_response_chunk(&self, bytes: usize) -> anyhow::Result<()> {
+        if let Some(stage) = &self.stage {
+            let stage = stage
+                .upgrade()
+                .ok_or_else(|| anyhow::anyhow!("response stage retired"))?;
+            stage.ensure_active()?;
+            stage.account_output(bytes)?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for OwnedReceipt {
@@ -608,6 +718,9 @@ impl budget::sealed::AttemptReceipt for OwnedReceipt {}
 impl DecisionAttemptReceipt for OwnedReceipt {
     fn deadline(&self) -> Instant {
         self.deadline
+    }
+    fn retain_response_chunk(&self, bytes: usize) -> Result<(), DecisionError> {
+        Self::retain_response_chunk(self, bytes).map_err(|_| DecisionError::BudgetExceeded)
     }
 
     async fn settle(self: Box<Self>, usage: DecisionUsage) -> Result<(), DecisionError> {
@@ -819,16 +932,29 @@ fn claim_input_tokens(
     claim_prepared_input(remaining, planned, text, &mut prepared, &mut estimate)
 }
 
+#[cfg(test)]
 fn claim_prepared_input(
     remaining: &AtomicU64,
     planned: u64,
     text: &str,
     prepared: &mut PreparedInput,
+    estimate: impl FnMut() -> usize,
+) -> anyhow::Result<u64> {
+    claim_prepared_input_capped(remaining, planned, text, prepared, u64::MAX, estimate)
+}
+
+fn claim_prepared_input_capped(
+    remaining: &AtomicU64,
+    planned: u64,
+    text: &str,
+    prepared: &mut PreparedInput,
+    per_call: u64,
     mut estimate: impl FnMut() -> usize,
 ) -> anyhow::Result<u64> {
     let mut available = remaining.load(Ordering::Acquire);
     loop {
-        let share = available / planned;
+        let cap = available.min(per_call);
+        let share = cap / planned;
         let tokens = if prepared.fits(share, &mut estimate)? {
             share
         } else {
@@ -836,12 +962,9 @@ fn claim_prepared_input(
             // not merely one token. A wire without an output cap keeps the
             // whole available allowance conservatively reserved.
             let input = u64::try_from(prepared.measure(&mut estimate))?;
-            anyhow::ensure!(
-                input < available,
-                "physical input exhausts the remaining token allowance"
-            );
-            let output = output_allowance::request_output_cap(text)?.unwrap_or(available);
-            input.saturating_add(output).min(available)
+            anyhow::ensure!(input < cap, "physical input exhausts the remaining token allowance");
+            let output = output_allowance::request_output_cap(text)?.unwrap_or(cap);
+            input.saturating_add(output).min(cap)
         };
         match remaining.compare_exchange_weak(available, available - tokens, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return Ok(tokens),

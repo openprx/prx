@@ -10,6 +10,7 @@ pub(crate) mod decision_accounting;
 pub mod docker;
 pub mod envelope;
 pub(crate) mod evolution_model;
+pub(crate) mod experiment_stage;
 pub mod native;
 pub mod registry;
 mod shell_cgroup;

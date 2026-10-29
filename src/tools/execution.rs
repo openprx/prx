@@ -2346,7 +2346,14 @@ impl ToolExecutionService {
         // tokio worker stack when a tool starts another agent loop. Keep the
         // canonical pipeline on the heap so every caller carries only a pointer
         // while it is pending.
-        let outcome = Box::pin(self.execute_inner(command, context, cancellation)).await;
+        let mut outcome = Box::pin(self.execute_inner(command, context, cancellation)).await;
+        if let Some(stage) = crate::runtime::experiment_stage::current() {
+            if let Err(error) = stage.account_output(outcome.model_content.len()) {
+                outcome.status = ToolExecutionStatus::Failed;
+                outcome.error = Some(error.to_string());
+                outcome.model_content = error.to_string();
+            }
+        }
         if let Some(pending) = pending {
             pending.finish_with_error(outcome.status, outcome.error.as_deref());
         }
@@ -2406,6 +2413,25 @@ impl ToolExecutionService {
             );
         };
         let descriptor = resolved.descriptor;
+        if let Some(stage) = crate::runtime::experiment_stage::current() {
+            if let Err(error) = stage.claim_tool(&descriptor.backend_name) {
+                let error = error.to_string();
+                return self.finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    None,
+                    None,
+                    ToolExecutionStatus::Failed,
+                    error.clone(),
+                    None,
+                    Some(error),
+                    None,
+                    started,
+                );
+            }
+        }
+
         if let Some(bindings) = &context.execution_bindings {
             let verified = bindings
                 .get(&command.name)

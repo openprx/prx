@@ -1,11 +1,11 @@
-//! The versioned constants of the builtin decision model `builtin-v1`
+//! The versioned constants of the builtin decision model `builtin-v4`
 //! (SP-CDP-A 5.7). Every number the builtin uses is here; changing one is a
 //! new model version.
 
 use super::features::Action;
 
 /// The model identifier the builtin reports.
-pub const MODEL_VERSION: &str = "builtin-v1";
+pub const MODEL_VERSION: &str = "builtin-v4";
 
 /// An artifact younger than this (ms) is fresh evidence.
 pub const FRESH_ARTIFACT_MS: u64 = 5 * 60 * 1000;

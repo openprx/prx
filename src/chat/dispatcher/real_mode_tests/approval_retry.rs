@@ -71,14 +71,10 @@ async fn t31_driver_default_causal_approval_persists_without_backend_execution()
             Ok(String::new())
         }
 
-        async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
-            Ok(ChatResponse {
-                text: None,
-                tool_calls: Vec::new(),
-                reasoning_content: None,
-            })
+        async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+            super::super::assessment_fixture::response(&request, super::super::assessment_fixture::EXECUTION_REQUIRED)
+                .ok_or_else(|| anyhow::anyhow!("expected execution assessment"))
         }
-
         fn supports_streaming(&self) -> bool {
             true
         }

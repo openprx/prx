@@ -3,6 +3,64 @@
 use super::*;
 
 #[tokio::test]
+async fn queued_save_acknowledgement_preserves_loaded_session_and_next_snapshot_key() {
+    let temp_memory = tempfile::TempDir::new().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp_memory.path()).unwrap());
+    let (deps, mut action_rx, _hooks, _temp) = build_deps(Arc::clone(&memory), CancellationToken::new());
+    let executor = EffectExecutor::new_with_deps(deps);
+    let mut old = ChatSession::new("prx-provider", "prx-model");
+    old.id = "prx-old-session".into();
+    executor.execute(Effect::SaveSession(old)).await;
+    let acknowledgement = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(&acknowledgement, Action::SessionSaved { id } if id == "prx-old-session"));
+
+    // A newer load can already be ahead of this save acknowledgement in the
+    // reducer queue. Its identity must survive the real executor's old reply.
+    let mut state = crate::chat::state::ChatState::new(
+        Arc::from("prx-provider"),
+        Arc::from("prx-model"),
+        CancellationToken::new(),
+    );
+    let mut loaded = ChatSession::new("prx-provider", "prx-model");
+    loaded.id = "prx-new-session".into();
+    let _ = state.reduce(Action::SessionLoaded(loaded));
+    let _ = state.reduce(acknowledgement);
+    assert_eq!(state.session.id, "prx-new-session");
+    let _ = state.reduce(Action::RecordUserTurn("new request".into()));
+    let _ = state.reduce(Action::TurnStarted {
+        draft_id: "prx-new-draft".into(),
+        cancel: CancellationToken::new(),
+    });
+    let _ = state.reduce(Action::RecordAssistantTurn {
+        task_id: None,
+        content: "new reply".into(),
+    });
+    let effects = state.reduce(Action::StreamCompleted {
+        draft_id: "prx-new-draft".into(),
+        final_text: "new reply".into(),
+        reasoning: String::new(),
+    });
+    let save = effects
+        .into_iter()
+        .find(|effect| matches!(effect, Effect::SaveSession(_)))
+        .expect("completed new turn must save its own snapshot");
+    executor.execute(save).await;
+
+    let saved = memory.get("chat_session:prx-new-session").await.unwrap().unwrap();
+    let saved = ChatSession::from_json(&saved.content).unwrap();
+    assert_eq!(saved.turns.len(), 2);
+    assert_eq!(
+        saved.turns.first().map(|turn| turn.content.as_str()),
+        Some("new request")
+    );
+    let previous = memory.get("chat_session:prx-old-session").await.unwrap().unwrap();
+    assert!(ChatSession::from_json(&previous.content).unwrap().turns.is_empty());
+}
+
+#[tokio::test]
 async fn real_mode_save_session_triggers_memory_store() {
     // Prove that the reducer's pre-sanitized snapshot is really written to Memory after the dispatcher's
     // second sanitization, and that marker/hash/byte-count stay single-copy.

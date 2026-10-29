@@ -154,6 +154,8 @@ impl FileEditTool {
         // Read the current contents. Use O_NOFOLLOW on Unix so a symlinked target
         // is rejected atomically (no TOCTOU between resolve and open).
         let read_target = resolved_target.clone();
+        let experiment = crate::runtime::experiment_stage::current();
+        let read_limit = experiment.as_ref().map(|stage| stage.scratch_limit());
         let read_result = crate::runtime::blocking::spawn_blocking(move || -> Result<String, String> {
             let mut opts = std::fs::OpenOptions::new();
             opts.read(true);
@@ -171,7 +173,22 @@ impl FileEditTool {
                 format!("Failed to read file: {e}")
             })?;
             let mut contents = String::new();
-            std::io::Read::read_to_string(&mut file, &mut contents).map_err(|e| format!("Failed to read file: {e}"))?;
+            if let Some(limit) = read_limit {
+                use std::io::Read;
+                if file.metadata().map_err(|error| error.to_string())?.len() > limit {
+                    return Err("experiment edit input exceeds scratch allowance".into());
+                }
+                (&mut file)
+                    .take(limit.saturating_add(1))
+                    .read_to_string(&mut contents)
+                    .map_err(|error| error.to_string())?;
+                if u64::try_from(contents.len()).unwrap_or(u64::MAX) > limit {
+                    return Err("experiment edit input exceeds scratch allowance".into());
+                }
+            } else {
+                std::io::Read::read_to_string(&mut file, &mut contents)
+                    .map_err(|e| format!("Failed to read file: {e}"))?;
+            }
             Ok(contents)
         })
         .await;
@@ -219,6 +236,19 @@ impl FileEditTool {
             });
         }
 
+        let replacements = if replace_all { occurrences } else { 1 };
+        let resulting_bytes = replacements
+            .checked_mul(old_string.len())
+            .and_then(|removed| contents.len().checked_sub(removed))
+            .and_then(|remaining| {
+                replacements
+                    .checked_mul(new_string.len())
+                    .and_then(|added| remaining.checked_add(added))
+            })
+            .ok_or_else(|| anyhow::anyhow!("file edit size overflow"))?;
+        let experiment_write = experiment
+            .map(|stage| stage.prepare_native_write(&self.security.workspace_dir, &resolved_target, resulting_bytes))
+            .transpose()?;
         let (new_contents, replacements) = if replace_all {
             (contents.replace(old_string, new_string), occurrences)
         } else {
@@ -232,22 +262,31 @@ impl FileEditTool {
         let write_target = resolved_target.clone();
         let data = new_contents;
         let write_result = crate::runtime::blocking::spawn_blocking(move || -> Result<(), String> {
-            use std::io::Write;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(false).truncate(true);
-            #[cfg(unix)]
-            opts.custom_flags(libc::O_NOFOLLOW);
-
-            let mut file = opts.open(&write_target).map_err(|e| {
-                #[cfg(unix)]
-                if e.raw_os_error() == Some(libc::ELOOP) {
-                    return format!("Refusing to write through symlink: {}", write_target.display());
+            let result = (|| -> Result<(), String> {
+                if let Some(admission) = &experiment_write {
+                    admission.check().map_err(|error| error.to_string())?;
                 }
-                format!("Failed to write file: {e}")
-            })?;
-            file.write_all(data.as_bytes())
-                .map_err(|e| format!("Failed to write file: {e}"))?;
-            Ok(())
+                use std::io::Write;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create(false).truncate(true);
+                #[cfg(unix)]
+                opts.custom_flags(libc::O_NOFOLLOW);
+
+                let mut file = opts.open(&write_target).map_err(|e| {
+                    #[cfg(unix)]
+                    if e.raw_os_error() == Some(libc::ELOOP) {
+                        return format!("Refusing to write through symlink: {}", write_target.display());
+                    }
+                    format!("Failed to write file: {e}")
+                })?;
+                file.write_all(data.as_bytes())
+                    .map_err(|e| format!("Failed to write file: {e}"))?;
+                Ok(())
+            })();
+            if let Some(admission) = experiment_write {
+                admission.finish();
+            }
+            result
         })
         .await;
 

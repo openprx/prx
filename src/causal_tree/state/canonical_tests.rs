@@ -69,6 +69,11 @@ fn canonical_fixture(key: &DecisionKey, size: u8) -> CausalState {
             summary: Arc::from("PRX borrowed summary \" \u{2603}"),
             exact_mention: position % 2 == 0,
             available: position % 2 != 0,
+            effective_approval_required: match position % 3 {
+                0 => None,
+                1 => Some(false),
+                _ => Some(true),
+            },
         });
     }
     state.derived = DerivedState::new(list).expect("distinct typed component candidate ids");
@@ -93,7 +98,7 @@ fn assert_oracle(state: &CausalState, key: &DecisionKey) {
 }
 
 #[test]
-fn canonical_bytes_and_keyed_digests_match_frozen_owned_oracle() {
+fn canonical_bytes_and_keyed_digests_match_independent_owned_oracle() {
     let key = fixtures::key();
     let other_key = fixtures::key();
     for size in [0, 1, 13] {
@@ -410,7 +415,7 @@ fn legacy_canonical(state: &CausalState, record: bool) -> String {
                     json!(["required", legacy_sorted_set(op_ids.iter().map(OpId::as_str))])
                 }
             };
-            json!({
+            let mut value = json!({
                 "id": candidate.candidate_id().as_str(),
                 "side_effect": candidate.side_effect().as_str(),
                 "approval": approval,
@@ -424,7 +429,13 @@ fn legacy_canonical(state: &CausalState, record: bool) -> String {
                 "summary": derived.summary.as_ref(),
                 "exact_mention": derived.exact_mention,
                 "available": derived.available,
-            })
+            });
+            // Retain old bytes when the new admission facet is absent, while
+            // independently checking its documented optional representation.
+            if let (Some(required), Some(object)) = (derived.effective_approval_required, value.as_object_mut()) {
+                object.insert("effective_approval_required".to_owned(), json!(required));
+            }
+            value
         }).collect::<Vec<_>>(),
         "routing_input": state.routing_input.as_str(),
         "goal": state.goal.as_str(),

@@ -7,6 +7,9 @@ use anyhow::Context;
 use std::sync::{Arc, atomic::Ordering};
 use tokio_util::sync::CancellationToken;
 
+mod decline;
+pub(crate) use decline::DECLINED_REPLY;
+
 /// The model proposed a call that needs no approval of its own (a read or a
 /// non-grant-bound `skills_manage` action) while the turn was collecting a
 /// grant-bound one. Nothing was recorded or executed; the message is written
@@ -75,7 +78,7 @@ impl ApprovalCollectionLease {
         call: crate::providers::ToolCall,
         dialect: crate::tools::schema::ToolSchemaDialect,
         cancellation: &CancellationToken,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         use crate::acl::approval_grant::{DecisionApprovalBinding, Subject};
         use crate::decision::KeyDomain;
         use crate::tools::capability::execution_binding::{CallDigestSource, decision_call_digest};
@@ -113,11 +116,8 @@ impl ApprovalCollectionLease {
             if call.name == "skills_manage"
                 && !crate::security::approval_operation::requires_explicit_grant(&call.name, &arguments)
             {
-                let action = arguments
-                    .get("action")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                return Err(CollectionDeclined(format!("skills_manage {action} needs no collected approval; nothing was recorded or run. Request the read-only lifecycle capability for a query.")).into());
+                self.decline(cancellation).await?;
+                return Ok(false);
             }
             match crate::security::approval_operation::grant_op_for_call(&call.name, &arguments) {
                 Some(crate::security::approval_operation::GrantOp::Command(command)) => {
@@ -289,5 +289,6 @@ impl ApprovalCollectionLease {
         })
         .await
         .context("collection persistence owner task failed")?
+        .map(|()| true)
     }
 }

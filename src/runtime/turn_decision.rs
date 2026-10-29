@@ -39,6 +39,7 @@ pub(crate) use execution::{OperatorChildPublication, OrdinaryChildPublication, O
 mod owner_filesystem;
 mod pending_approval;
 pub(crate) use pending_approval::collection::ApprovalCollectionLease;
+pub(crate) use pending_approval::collection::DECLINED_REPLY as DECLINED_COLLECTION_REPLY;
 #[path = "turn_decision/routing/replay_facts.rs"]
 mod router_replay_facts;
 pub(crate) use router_replay_facts::{RouterReadFacts, provider_binding as router_provider_binding};
@@ -82,6 +83,7 @@ use crate::causal_tree::decision_rehearsal::RehearsalPorts;
 use crate::causal_tree::decision_rehearsal::{CatalogProbe, MemoryProbe, PinnedCount, ProbeUnavailable, SkillProbe};
 use crate::causal_tree::directive::{
     DirectiveContext, DirectiveError, TurnExecutionDirective, directive_from_selection, render_terminal_directive,
+    selected_discovery_family,
 };
 use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
 use crate::causal_tree::ids::DecisionId;
@@ -661,7 +663,7 @@ pub(crate) struct TurnDecisionContext {
     served_auxiliary: std::sync::OnceLock<crate::agent::terminal::served_auxiliary::ServedAuxiliaryLink>,
     execution_closed: AtomicBool,
     approval_collection_started: AtomicBool,
-    collected_pending: std::sync::OnceLock<Box<pending_approval::CollectedPendingCommitment>>,
+    collected_approval_result: std::sync::OnceLock<Box<pending_approval::CollectedApprovalResult>>,
     discovery_offers: std::sync::OnceLock<parking_lot::Mutex<discovery::DiscoveryOffers>>,
     discovery_admissions: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<String, discovery::DiscoveryAdmission>>>,
     engine: EngineDecision,
@@ -1014,17 +1016,35 @@ fn direct_answer_refs(
         .collect()
 }
 
+fn discovery_scope<'a>(
+    decisions: impl Iterator<Item = &'a EngineDecision>,
+) -> Result<Option<CapabilityTarget>, DirectiveError> {
+    let mut scope = None;
+    for decision in decisions {
+        if let Some(family) = selected_discovery_family(decision)? {
+            if scope.is_some_and(|prior| prior != family) {
+                return Err(DirectiveError::ActionMismatch);
+            }
+            scope = Some(family);
+        }
+    }
+    Ok(scope)
+}
+
+#[cfg(test)]
 fn discovery_source_guards_clear(state: &CausalState) -> bool {
+    discovery_source_guards_clear_in(state, None)
+}
+
+fn discovery_source_guards_clear_in(state: &CausalState, family: Option<CapabilityTarget>) -> bool {
     !state.trusted.parts().approval_pending
-        && !state
-            .derived
-            .candidates()
-            .iter()
-            .any(|candidate| candidate.exact_mention)
+        && !state.derived.candidates().iter().any(|candidate| {
+            candidate.exact_mention && family.is_none_or(|family| candidate.candidate.target() == family)
+        })
 }
 
 fn discovery_can_answer(decision: &EngineDecision) -> bool {
-    discovery_source_guards_clear(&decision.state)
+    selected_discovery_family(decision).is_ok_and(|family| discovery_source_guards_clear_in(&decision.state, family))
         && decision
             .prediction
             .as_ref()
@@ -1183,7 +1203,17 @@ impl TurnDecisionContext {
     /// grants no dispatch lease; the constrained reader must recheck scope,
     /// generation, security and approval at its execution boundary.
     pub(crate) fn collected_pending_event(&self) -> Option<&crate::memory::MessageEvent> {
-        self.collected_pending.get().map(|pending| pending.event())
+        self.collected_approval_result
+            .get()
+            .map(|result| result.event())
+            .filter(|event| event.event_type == "approval.decision.pending")
+    }
+
+    pub(crate) fn collected_declined_event(&self) -> Option<&crate::memory::MessageEvent> {
+        self.collected_approval_result
+            .get()
+            .map(|result| result.event())
+            .filter(|event| event.event_type == "approval.collection.declined")
     }
 
     pub(crate) const fn approval_collection_proof(
@@ -1452,7 +1482,9 @@ fn session_artifacts_from_selected_read(
 
 impl DecisionTokenReservation {
     /// Use the selected route's effective compaction window, after its
-    /// response reserve. The fixed marginal slice is also capped by the
+    /// response reserve. The eighth-window slice funds the complete bounded
+    /// structured question set; a sixteenth/4096 slice was smaller than real
+    /// default-registry Jev requests. The marginal slice is also capped by the
     /// configured ratio to that baseline window. Very small windows and a
     /// ratio that cannot fund one token fail closed instead of silently
     /// authorizing a zero-token decision budget.
@@ -1473,7 +1505,7 @@ impl DecisionTokenReservation {
         } else {
             ratio_limit as usize
         };
-        let decision_tokens = (available / 16).min(4096).min(ratio_limit);
+        let decision_tokens = (available / 8).min(8192).min(ratio_limit);
         let main_input_limit = available
             .checked_sub(decision_tokens)
             .ok_or(DecisionReserveUnavailable)?;
@@ -2326,6 +2358,18 @@ impl TurnDecisionService {
             resolved_model: Arc::clone(&model_ref),
         });
         let projected_input = crate::multimodal::project_image_markers_for_routing(proof.routing_input()).into_owned();
+        let goal = resume_evidence.as_ref().map_or_else(
+            || projected_input.clone(),
+            |evidence| {
+                // The authenticated original request supplies intent that the new
+                // decision-ID transport body cannot. It remains projected data,
+                // not a grant, and sealed call arguments are never rendered here.
+                let original = crate::multimodal::project_image_markers_for_routing(&evidence.original_request);
+                format!(
+                    "Resume the exact approved tool call for the original request below. Current hard gates and the single-use execution claim still apply. Original user request (data): {original}"
+                )
+            },
+        );
         let mut state = CausalState {
             trusted,
             observed: segment_observation::initial_observations(segment_observation, deadline, cancellation)?,
@@ -2333,7 +2377,7 @@ impl TurnDecisionService {
             derived: DerivedState::default(),
             has_conversation_history: proof.has_conversation_history(),
             routing_input: RawRoutingInput::new(projected_input.clone()),
-            goal: RawRoutingInput::new(projected_input),
+            goal: RawRoutingInput::new(goal),
             lineage: HopLineage::First,
             built_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
         };
@@ -2577,7 +2621,7 @@ impl TurnDecisionService {
                 served_auxiliary: std::sync::OnceLock::new(),
                 execution_closed: AtomicBool::new(false),
                 approval_collection_started: AtomicBool::new(false),
-                collected_pending: std::sync::OnceLock::new(),
+                collected_approval_result: std::sync::OnceLock::new(),
                 discovery_offers: std::sync::OnceLock::new(),
                 discovery_admissions: std::sync::OnceLock::new(),
                 engine: decision,
@@ -2634,7 +2678,7 @@ impl TurnDecisionService {
                         served_auxiliary: std::sync::OnceLock::new(),
                         execution_closed: AtomicBool::new(false),
                         approval_collection_started: AtomicBool::new(false),
-                        collected_pending: std::sync::OnceLock::new(),
+                        collected_approval_result: std::sync::OnceLock::new(),
                         discovery_offers: std::sync::OnceLock::new(),
                         discovery_admissions: std::sync::OnceLock::new(),
                         engine: decision,
@@ -2876,7 +2920,15 @@ impl TurnDecisionService {
                 }
                 TurnExecutionDirective::AnswerDirectly => {
                     let selected_discovery_refs = discovered_refs.iter().cloned().collect();
-                    let execution_refs = direct_answer_refs(&decision, &catalog, &gates, &selected_discovery_refs);
+                    let mut execution_refs = direct_answer_refs(&decision, &catalog, &gates, &selected_discovery_refs);
+                    let recovery_family = discovery_scope(prior_hops.iter().chain(std::iter::once(&decision)))?;
+                    if let Some(family) = recovery_family {
+                        execution_refs.retain(|reference| {
+                            catalog
+                                .entry_any(&reference.id)
+                                .is_some_and(|entry| entry.family == family || entry.public_name == "capability_search")
+                        });
+                    }
                     if cancellation.is_cancelled() {
                         if has_router_transition {
                             return terminal_after_catalog_drift(&state, prior_hops)
@@ -2901,7 +2953,7 @@ impl TurnDecisionService {
                             served_auxiliary: std::sync::OnceLock::new(),
                             execution_closed: AtomicBool::new(false),
                             approval_collection_started: AtomicBool::new(false),
-                            collected_pending: std::sync::OnceLock::new(),
+                            collected_approval_result: std::sync::OnceLock::new(),
                             discovery_offers: std::sync::OnceLock::new(),
                             discovery_admissions: std::sync::OnceLock::new(),
                             engine: decision,
@@ -2946,7 +2998,7 @@ impl TurnDecisionService {
                             served_auxiliary: std::sync::OnceLock::new(),
                             execution_closed: AtomicBool::new(false),
                             approval_collection_started: AtomicBool::new(false),
-                            collected_pending: std::sync::OnceLock::new(),
+                            collected_approval_result: std::sync::OnceLock::new(),
                             discovery_offers: std::sync::OnceLock::new(),
                             discovery_admissions: std::sync::OnceLock::new(),
                             engine: decision,
@@ -2965,6 +3017,16 @@ impl TurnDecisionService {
                 }
                 TurnExecutionDirective::Execute { .. } | TurnExecutionDirective::Delegate { .. } => {
                     let execution_refs = selected_execute_refs(&decision, &directive, &catalog)?;
+                    let recovery_family = discovery_scope(prior_hops.iter().chain(std::iter::once(&decision)))?;
+                    if let Some(family) = recovery_family
+                        && execution_refs.iter().any(|reference| {
+                            catalog
+                                .entry_any(&reference.id)
+                                .is_none_or(|entry| entry.family != family)
+                        })
+                    {
+                        return Err(DirectiveError::NotAdmitted.into());
+                    }
                     if self.check_live_parity().is_err() {
                         return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry));
                     }
@@ -2992,7 +3054,7 @@ impl TurnDecisionService {
                             served_auxiliary: std::sync::OnceLock::new(),
                             execution_closed: AtomicBool::new(false),
                             approval_collection_started: AtomicBool::new(false),
-                            collected_pending: std::sync::OnceLock::new(),
+                            collected_approval_result: std::sync::OnceLock::new(),
                             discovery_offers: std::sync::OnceLock::new(),
                             discovery_admissions: std::sync::OnceLock::new(),
                             engine: decision,

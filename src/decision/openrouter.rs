@@ -101,6 +101,7 @@ pub fn decode_response(
     elapsed_ms: u64,
 ) -> Result<DecisionResponse, DecisionError> {
     if serde_json::from_slice::<WithError>(body).is_ok() {
+        tracing::warn!("OpenRouter decision response contains an error envelope; contents omitted");
         return Err(DecisionError::Transport);
     }
     let extras = serde_json::from_slice::<Extras>(body).ok();

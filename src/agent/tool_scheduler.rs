@@ -362,6 +362,7 @@ fn spawn_delegation_tool(
     context: crate::tools::ToolExecutionContext,
     cancellation: Option<CancellationToken>,
 ) -> DelegationExecutionTask {
+    let experiment_stage = crate::runtime::experiment_stage::current();
     let cleanup = crate::runtime::turn_cleanup::current_tracker();
     let parent_work = crate::runtime::registry::current_work_id();
     let progress = crate::agent::idle::current_beat();
@@ -393,7 +394,11 @@ fn spawn_delegation_tool(
                     None => execute.await,
                 }
             };
-            crate::agent::idle::scope_beat(progress, execute).await
+            crate::runtime::experiment_stage::retain(
+                experiment_stage,
+                crate::agent::idle::scope_beat(progress, execute),
+            )
+            .await
         });
     DelegationExecutionTask::spawn(work)
 }

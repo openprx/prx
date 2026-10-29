@@ -497,6 +497,22 @@ impl TurnTerminalGuard {
         mut proposal: crate::agent::terminal::TurnTerminalDraft,
     ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
         bind_terminal_decision(&mut proposal, &self.settlement)?;
+        // A failed foreground caller may have lost its return trace after a
+        // real provider reply. Use the same observed evidence as abort_commit;
+        // the single terminal writer still owns settlement and replay.
+        if proposal.provider_outcome.is_none()
+            && matches!(
+                proposal.status,
+                crate::agent::terminal::TurnTerminalStatus::Failed
+                    | crate::agent::terminal::TurnTerminalStatus::Cancelled
+            )
+            && let Some((retained, route)) = &self.provider_trace
+        {
+            proposal.provider_outcome = retained
+                .snapshot()
+                .0
+                .map(|trace| crate::agent::terminal::provider_outcome_from_trace(route, self.started_at, trace));
+        }
         if self
             .provider_trace
             .as_ref()
@@ -515,7 +531,7 @@ impl TurnTerminalGuard {
             );
             state.pending = Some(proposal);
         }
-        self.flush().await
+        Box::pin(self.flush()).await
     }
 
     async fn flush(&self) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
@@ -543,7 +559,9 @@ impl TurnTerminalGuard {
         if let Some(cleanup) = &self.child_cleanup {
             cleanup.wait().await?;
         }
-        let receipt = finalize_and_rejoin(&self.service, &self.fabric, &self.config, proposal).await?;
+        // Keep the canonical writer in its existing owner, with a bounded
+        // heap await state rather than adding another terminal task owner.
+        let receipt = Box::pin(finalize_and_rejoin(&self.service, &self.fabric, &self.config, proposal)).await?;
         if let Some(collector) = &self.usage_collector {
             collector
                 .record_with_recovery(&receipt, &self.context, &self.envelope)
@@ -576,7 +594,7 @@ impl TurnTerminalGuard {
                 ));
             }
         }
-        self.flush().await.map(|_| ())
+        Box::pin(self.flush()).await.map(|_| ())
     }
 }
 

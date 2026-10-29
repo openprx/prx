@@ -432,9 +432,15 @@ async fn run_turn_unguarded(
             lease,
         )
         .await?;
-        outcome.pending?;
+        let pending = outcome.pending?;
         let mut trace = outcome.trace;
         trace.execution_trace = Some(context.terminal_execution_trace());
+        if !pending {
+            return Ok((
+                ToolLoopOutcome::Text(crate::runtime::turn_decision::DECLINED_COLLECTION_REPLY.into()),
+                trace,
+            ));
+        }
         return Ok((
             ToolLoopOutcome::AwaitingApproval {
                 reply: format!(
@@ -711,6 +717,12 @@ async fn run_turn_unguarded(
                 .collect::<std::collections::BTreeMap<_, _>>()
         };
         crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
+        if matches!(
+            execution_requirement,
+            Some(super::execution_requirement::ExecutionRequirement::Informational)
+        ) {
+            tool_specs.clear();
+        }
         let mut tool_surface = request_tool_surface_cache.measure(mode_capabilities.native_tool_calling, &tool_specs);
         let mut tool_surface_counts =
             RequestToolSurfaceCounts::measure(tools_registry.len(), selected_tools.len(), &tool_catalog, &tool_specs);
@@ -825,8 +837,18 @@ async fn run_turn_unguarded(
         // history as data to prevent imitation of earlier runtime notices. Both
         // paths keep the leading system policy unchanged and the "exactly one
         // system message, at index 0" shape that strict chat templates require.
-        let verify_chat_completion =
-            runtime_adapter.verify_chat_completion && !chat_mode.intercepts_writes() && !tool_specs.is_empty();
+        let verify_chat_completion = runtime_adapter.verify_chat_completion
+            && !chat_mode.intercepts_writes()
+            && (!tool_specs.is_empty() || execution_requirement.is_some());
+        if matches!(
+            execution_requirement,
+            Some(super::execution_requirement::ExecutionRequirement::Informational)
+        ) {
+            append_corrective_aside(
+                &mut prepared_messages.messages,
+                super::execution_requirement::INFORMATIONAL_REPLY_MESSAGE,
+            );
+        }
         if inject_execution_retry && image_marker_count == 0 {
             prepared_messages.messages = super::execution_requirement::retry_messages(&prepared_messages.messages);
         }
@@ -909,6 +931,16 @@ async fn run_turn_unguarded(
         if let Some(required) = required_lookup_spec {
             tool_specs.retain(|spec| spec.name != crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME);
             tool_specs.push(required);
+        }
+        if matches!(
+            execution_requirement,
+            Some(super::execution_requirement::ExecutionRequirement::Informational)
+        ) {
+            tool_specs.clear();
+            #[cfg(feature = "wasm-plugins")]
+            {
+                tool_specs_rewritten = true;
+            }
         }
         {
             let fingerprints = &decision_fingerprints;
@@ -1164,6 +1196,10 @@ async fn run_turn_unguarded(
         if let Some(retained) = &runtime_adapter.provider_trace {
             retained.begin();
         }
+        anyhow::ensure!(
+            !runtime_adapter.stream_provider || crate::runtime::experiment_stage::current().is_none(),
+            "experiment solver streaming has no admitted physical accounting adapter"
+        );
         let chat_result = if runtime_adapter.stream_provider {
             parameter_capture
                 .scope(run_streaming_provider_turn(
@@ -1179,7 +1215,15 @@ async fn run_turn_unguarded(
                 ))
                 .await
         } else {
-            let chat_future = parameter_capture.scope(provider.chat_traced(
+            let chat_future = parameter_capture.scope(crate::runtime::experiment_stage::chat_traced(
+                provider,
+                provider_name,
+                runtime_adapter
+                    .tool_execution_context
+                    .envelope
+                    .run_id
+                    .as_deref()
+                    .unwrap_or(""),
                 ChatRequest {
                     messages: &prepared_messages.messages,
                     tools: request_tools,
@@ -1259,6 +1303,7 @@ async fn run_turn_unguarded(
                     tokens_used: TokenUsage::default(),
                     execution_trace: None,
                 };
+                completion_evidence.record_serving_model(model, &last_turn_trace);
                 if let Some(retained) = &runtime_adapter.provider_trace {
                     retained.completed(
                         &last_turn_trace,
@@ -1404,7 +1449,7 @@ async fn run_turn_unguarded(
         // On context overflow, compact and retry for as long as each pass makes
         // measurable progress. This has no arbitrary retry ceiling and cannot
         // spin forever once history reaches its minimal representation.
-        let (response_text, parsed_text, mut tool_calls, assistant_history_content, native_tool_calls) =
+        let (mut response_text, parsed_text, mut tool_calls, assistant_history_content, native_tool_calls) =
             match chat_processed {
                 // A stream that failed after model output is never compacted
                 // and replayed: the unsafe-replay refusal it carries stands.
@@ -1595,6 +1640,75 @@ async fn run_turn_unguarded(
             parsed_text
         };
 
+        // A provider tool call is only a proposal until the current request's
+        // execution requirement has been resolved. Reuse that result for the
+        // whole turn; a model reply cannot change it after dispatch starts.
+        if verify_chat_completion && !tool_calls.is_empty() {
+            use super::execution_requirement::ExecutionRequirement;
+            let already_resolved = execution_requirement.is_some();
+            if !already_resolved {
+                let budget = compaction_config.map_or(8192, |config| {
+                    config.max_context_tokens.saturating_sub(config.reserve_tokens)
+                });
+                let source = assessment_source.as_deref().unwrap_or(history);
+                let messages =
+                    super::execution_requirement::assessment_messages(source, proof.routing_input(), budget)?;
+                if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
+                    Box::pin(record_assessment_request(
+                        fabric,
+                        scope.clone(),
+                        provider_name,
+                        model,
+                        "execution_requirement",
+                        &messages,
+                    ))
+                    .await?;
+                }
+                let trace = Box::pin(
+                    super::turn_assessment::AssessmentCall {
+                        provider,
+                        provider_name,
+                        model,
+                        observer,
+                        hooks,
+                        runtime_adapter: &runtime_adapter,
+                        execution_trace: execution_adapter.tool_execution_context.execution_trace.as_ref(),
+                        parameter_capture: &parameter_capture,
+                        cancellation_token: cancellation_token.as_ref(),
+                        last_turn_trace: &mut last_turn_trace,
+                        usage_accumulator: &mut usage_accumulator,
+                        any_turn_had_fallback: &mut any_turn_had_fallback,
+                    }
+                    .chat(&messages, "execution_requirement"),
+                )
+                .await?;
+                let requirement = super::execution_requirement::parse_assessment(&trace.response)?;
+                super::turn_assessment::record_outcome(
+                    event_fabric.as_ref(),
+                    request_event_scope.as_ref(),
+                    &super::completion_review::ReplyAssessment::Execution(requirement),
+                    &trace,
+                    "pre_dispatch",
+                )
+                .await?;
+                execution_requirement = Some(requirement);
+            }
+            let Some(requirement) = execution_requirement else {
+                anyhow::bail!("execution requirement was not resolved; nothing was dispatched");
+            };
+            match requirement {
+                ExecutionRequirement::ExecutionRequired => {}
+                ExecutionRequirement::Informational if !already_resolved => continue,
+                ExecutionRequirement::Informational | ExecutionRequirement::Uncertain => {
+                    // Do not put the discarded native call into history or the
+                    // executor. Repeated proposals cannot reopen this turn.
+                    tool_calls.clear();
+                    response_text = super::execution_requirement::CLARIFICATION_REPLY.to_string();
+                    display_text.clone_from(&response_text);
+                }
+            }
+        }
+
         if tool_calls.is_empty() {
             // No tool calls — this is the final response.
             if is_tool_summary_only_response(&response_text) {
@@ -1668,105 +1782,41 @@ async fn run_turn_unguarded(
                     let mut assessment_messages = if observed_tool_results {
                         completion_evidence.messages(source, &display_text, budget)?
                     } else {
-                        assessment_messages(source, budget)?
+                        assessment_messages(source, proof.routing_input(), budget)?
                     };
                     let purpose = if observed_tool_results { "completion_review" } else { "execution_requirement" };
                     let mut review_repair_attempted = false;
                     loop {
                     if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
-                        Box::pin(record_assessment_request(
-                            fabric, scope.clone(), provider_name, model, purpose, &assessment_messages,
-                        )).await?;
+                        Box::pin(record_assessment_request(fabric, scope.clone(), provider_name, model, purpose, &assessment_messages)).await?;
                     }
-                    let observation = execution_adapter
-                        .tool_execution_context
-                        .execution_trace
-                        .as_ref()
-                        .map(|trace| trace.begin_provider())
-                        .transpose()?;
-                    if let Some(retained) = &runtime_adapter.provider_trace {
-                        retained.begin();
-                    }
-                    let assessment_started = Instant::now();
-                    observer.record_event(&ObserverEvent::LlmRequest {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        messages_count: assessment_messages.len(),
-                    });
-                    hooks
-                        .emit(
-                            HookEvent::LlmRequest,
-                            serde_json::json!({
-                                "provider":provider_name, "model":model, "purpose":purpose,
-                                "messages_count":assessment_messages.len(), "tool_count":0,
-                            }),
-                        )
-                        .await;
-                    let assessment_future = parameter_capture.scope(provider.chat_traced(
-                        ChatRequest {
-                            messages: &assessment_messages,
-                            tools: None,
-                        },
-                        model,
-                        0.0,
-                    ));
-                    let assessment_result = if let Some(token) = cancellation_token.as_ref() {
-                        tokio::select! {
-                            () = token.cancelled() => {
-                                if let Some(observation) = observation { observation.cancelled(); }
-                                if let Some(retained) = &runtime_adapter.provider_trace { retained.failed(); }
-                                return Err(ToolLoopCancelled.into());
-                            }
-                            result = assessment_future => result,
-                        }
-                    } else {
-                        assessment_future.await
-                    };
-                    if let Some(observation) = observation {
-                        observation.finish(assessment_result.as_ref().ok().map(|trace| trace.attempts.as_slice()));
-                    }
-                    crate::agent::idle::beat(crate::agent::idle::ProgressKind::ProviderResponse);
-                    let duration = assessment_started.elapsed();
-                    let error_message = assessment_result.as_ref().err().map(ToString::to_string);
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration,
-                        success: assessment_result.is_ok(),
-                        error_message: error_message.clone(),
-                    });
-                    hooks.emit(HookEvent::LlmResponse, serde_json::json!({
-                        "provider":provider_name, "model":model, "purpose":purpose,
-                        "duration_ms":duration.as_millis(), "success":assessment_result.is_ok(), "error_message":error_message,
-                    })).await;
-                    if assessment_result.is_err()
-                        && let Some(retained) = &runtime_adapter.provider_trace
-                    {
-                        retained.failed();
-                    }
-                    let trace = assessment_result?;
-                    usage_accumulator.record(trace.tokens_used.clone());
-                    any_turn_had_fallback |=
-                        trace.attempts.len() > 1 || trace.final_provider != provider_name || trace.final_model != model;
-                    last_turn_trace
-                        .prepared_parameters
-                        .extend(parameter_capture.snapshot_from(last_turn_trace.prepared_parameters.len()));
-                    if let Some(retained) = &runtime_adapter.provider_trace {
-                        retained.completed(
-                            &last_turn_trace,
-                            usage_accumulator.finish(),
-                            any_turn_had_fallback,
-                            trace.tokens_used.is_reported()
-                                && trace.tokens_used.has_any_tokens()
-                                && !trace
-                                    .attempts
-                                    .iter()
-                                    .any(|attempt| attempt.status == crate::llm::route_decision::AttemptStatus::Failed),
-                        );
-                    }
+                    let trace = Box::pin(super::turn_assessment::AssessmentCall {
+                        provider, provider_name, model, observer, hooks,
+                        runtime_adapter: &runtime_adapter,
+                        execution_trace: execution_adapter.tool_execution_context.execution_trace.as_ref(),
+                        parameter_capture: &parameter_capture,
+                        cancellation_token: cancellation_token.as_ref(),
+                        last_turn_trace: &mut last_turn_trace,
+                        usage_accumulator: &mut usage_accumulator,
+                        any_turn_had_fallback: &mut any_turn_had_fallback,
+                    }.chat(&assessment_messages, purpose)).await?;
                     let assessment = if observed_tool_results {
-                        let review = super::completion_review::parse_review(&trace.response)?;
+                        let review = match super::completion_review::parse_review(&trace.response) {
+                            Ok(review) => review,
+                            Err(error) => {
+                                super::turn_assessment::record_rejected_review(
+                                    event_fabric.as_ref(), request_event_scope.as_ref(), &trace.response,
+                                    None, review_repair_attempted,
+                                ).await?;
+                                return Err(error);
+                            }
+                        };
                         if let Err(error) = completion_evidence.validate_review(&review, source) {
+                            super::turn_assessment::record_rejected_review(
+                                event_fabric.as_ref(), request_event_scope.as_ref(), &trace.response,
+                                Some(super::completion_review::review_diagnostics(&review, source)),
+                                review_repair_attempted,
+                            ).await?;
                             use super::completion_review::ReviewValidationError;
                             if review_repair_attempted || matches!(error, ReviewValidationError::Violation(_)) {
                                 return Err(error.into());
@@ -1789,28 +1839,10 @@ async fn run_turn_unguarded(
                     } else {
                         ReplyAssessment::Execution(parse_assessment(&trace.response)?)
                     };
-                    if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
-                        let payload = serde_json::json!({
-                            "assessment": format!("{assessment:?}"),
-                            "requirement": match &assessment {
-                                ReplyAssessment::Execution(requirement) => Some(format!("{requirement:?}")),
-                                ReplyAssessment::Completion(_) => None,
-                            },
-                            "provider": crate::providers::redact_endpoint_userinfo(&trace.final_provider),
-                            "model": trace.final_model,
-                            "tool_results_observed": observed_tool_results,
-                        });
-                        if let Err(error) = fabric
-                            .record_runtime_event(
-                                scope.clone(),
-                                if observed_tool_results { "turn.completion_review.assessed" } else { "turn.execution_requirement.assessed" },
-                                "Chat reply assessed".to_string(),
-                                Some(payload.to_string()),
-                            )
-                            .await
-                        {
-                            tracing::warn!(%error, "Failed to record execution requirement assessment");
-                        }
+                    if let Err(error) = super::turn_assessment::record_outcome(
+                        event_fabric.as_ref(), request_event_scope.as_ref(), &assessment, &trace, "reply_review",
+                    ).await {
+                        tracing::warn!(%error, "Failed to record execution requirement assessment");
                     }
                         break Ok::<_, anyhow::Error>(assessment);
                     }
@@ -1827,7 +1859,9 @@ async fn run_turn_unguarded(
                         continue;
                     }
                     ReplyAssessment::Execution(ExecutionRequirement::Uncertain) => {
-                        anyhow::bail!("execution requirement is uncertain; execution is unverified")
+                        // Do not release the unverified draft or claim an action
+                        // occurred. Ask the operator to disambiguate the turn.
+                        display_text = super::execution_requirement::CLARIFICATION_REPLY.to_string();
                     }
                     ReplyAssessment::Execution(ExecutionRequirement::Informational) => {}
                     ReplyAssessment::Completion(review) => match review.decision {
@@ -2294,6 +2328,9 @@ async fn run_turn_unguarded(
     }
 }
 
+#[path = "turn_tests/turn_engine.rs"]
+mod tests;
+
 /// Account for the separate, tool-free assessment request as well as task
 /// requests. Persist only measurements and purpose, never the supplied evidence.
 async fn record_assessment_request(
@@ -2340,6 +2377,3 @@ async fn record_assessment_request(
         .await?;
     Ok(())
 }
-
-#[path = "turn_tests/turn_engine.rs"]
-mod tests;

@@ -62,6 +62,8 @@ struct CanonicalCandidate<'a> {
     available: bool,
     capabilities: Vec<(&'a str, String, String)>,
     cost: Option<[u64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_approval_required: Option<bool>,
     exact_mention: bool,
     id: &'a str,
     latency_ms: Option<u32>,
@@ -105,6 +107,7 @@ pub(super) fn serialize(state: &CausalState, record: bool) -> Result<String, ser
                         }
                     },
                     available: derived.available,
+                    effective_approval_required: derived.effective_approval_required,
                     capabilities: candidate
                         .required_capabilities()
                         .iter()

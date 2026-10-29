@@ -62,8 +62,16 @@ impl Provider for CatalogRecordingProvider {
     }
 
     async fn chat_traced(&self, request: ChatRequest<'_>, model: &str, _temperature: f64) -> anyhow::Result<ChatTrace> {
-        super::assessment_fixture::trace(&request, model)
-            .ok_or_else(|| anyhow::anyhow!("unexpected non-assessment request in streaming fixture"))
+        super::assessment_fixture::trace(
+            &request,
+            model,
+            if self.discover.is_some() || self.call.is_some() {
+                super::assessment_fixture::EXECUTION_REQUIRED
+            } else {
+                super::assessment_fixture::INFORMATIONAL
+            },
+        )
+        .ok_or_else(|| anyhow::anyhow!("unexpected non-assessment request in streaming fixture"))
     }
 
     fn supports_streaming(&self) -> bool {

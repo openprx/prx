@@ -192,7 +192,11 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
                 .lock()
                 .expect("request sink")
                 .iter()
-                .filter(|(_, body)| body.contains("PRX_CHAT_PARENT"))
+                .filter(|(_, body)| {
+                    body.contains("PRX_CHAT_PARENT")
+                        && !body.contains("Classify the execution requirement of current_request")
+                        && !body.contains("Review the proposed final reply against")
+                })
                 .count();
             let request: serde_json::Value = serde_json::from_str(&body).expect("JSON request");
             let completion_review = request["messages"].as_array().is_some_and(|messages| {
@@ -203,7 +207,15 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
                             .is_some_and(|content| content.starts_with("Review the proposed final reply against"))
                 })
             });
-            let message = if completion_review {
+            let intent_review = body.contains("Classify the execution requirement of current_request");
+            let message = if intent_review {
+                let requirement = if body.contains("PRX_CHAT_PARENT") {
+                    "execution_required"
+                } else {
+                    "informational"
+                };
+                serde_json::json!({"role":"assistant","content":serde_json::json!({"requirement":requirement}).to_string()})
+            } else if completion_review {
                 serde_json::json!({"role":"assistant","content":r#"{"decision":"accept","reason":"Observed spawn and join results","constraints":[]}"#})
             } else if body.contains("PRX_CHAT_PARENT") && parent_count == 1 {
                 serde_json::json!({"role":"assistant","content":null,"tool_calls":[{
@@ -327,13 +339,16 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
     });
     assert!(
         joined,
-        "parent did not observe one completed child; parent requests={}, total requests={}, tool results={observed_results:?}, stdout={}",
+        "parent did not observe one completed child; parent requests={}, total requests={}, tool results={observed_results:?}, stdout={}, stderr={}",
         requests
             .iter()
-            .filter(|(_, body)| body.contains("PRX_CHAT_PARENT"))
+            .filter(|(_, body)| body.contains("PRX_CHAT_PARENT")
+                && !body.contains("Classify the execution requirement of current_request")
+                && !body.contains("Review the proposed final reply against"))
             .count(),
         requests.len(),
-        String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(
         requests.iter().any(|(_, body)| body.contains("PRX_CHAT_CHILD")),

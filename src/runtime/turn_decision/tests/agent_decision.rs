@@ -65,7 +65,7 @@ fn record_builder_distinguishes_local_terminal_from_failed_compiled_request() {
         served_auxiliary: std::sync::OnceLock::new(),
         execution_closed: AtomicBool::new(false),
         approval_collection_started: AtomicBool::new(false),
-        collected_pending: std::sync::OnceLock::new(),
+        collected_approval_result: std::sync::OnceLock::new(),
         discovery_offers: std::sync::OnceLock::new(),
         discovery_admissions: std::sync::OnceLock::new(),
         engine,
@@ -509,8 +509,8 @@ fn decision_token_ratio_reservation_uses_effective_window_and_rejects_tiny_windo
         crate::causal_tree::config::CausalPolicy::default().extra_token_ratio_limit,
     )
     .unwrap();
-    assert_eq!(reservation.decision_tokens, 1_792);
-    assert_eq!(reservation.main_input_limit, 26_880);
+    assert_eq!(reservation.decision_tokens, 3_584);
+    assert_eq!(reservation.main_input_limit, 25_088);
     assert_eq!(reservation.decision_tokens + reservation.main_input_limit, 28_672);
     let reserved = reservation
         .reserved_compaction(
@@ -518,7 +518,7 @@ fn decision_token_ratio_reservation_uses_effective_window_and_rejects_tiny_windo
             crate::causal_tree::config::CausalPolicy::default().extra_token_ratio_limit,
         )
         .unwrap();
-    assert_eq!(reserved.reserve_tokens, 5_888);
+    assert_eq!(reserved.reserve_tokens, 7_680);
     assert_eq!(
         reserved.max_context_tokens - reserved.reserve_tokens,
         reservation.main_input_limit
@@ -544,8 +544,8 @@ fn decision_token_ratio_reservation_uses_effective_window_and_rejects_tiny_windo
         crate::causal_tree::config::CausalPolicy::default().extra_token_ratio_limit,
     )
     .unwrap();
-    assert_eq!(capped.decision_tokens, 4_096);
-    assert_eq!(capped.main_input_limit, 95_903);
+    assert_eq!(capped.decision_tokens, 8_192);
+    assert_eq!(capped.main_input_limit, 91_807);
 
     config.max_context_tokens = 16;
     config.reserve_tokens = 0;
@@ -554,8 +554,8 @@ fn decision_token_ratio_reservation_uses_effective_window_and_rejects_tiny_windo
         crate::causal_tree::config::CausalPolicy::default().extra_token_ratio_limit,
     )
     .unwrap();
-    assert_eq!(smallest.decision_tokens, 1);
-    assert_eq!(smallest.main_input_limit, 15);
+    assert_eq!(smallest.decision_tokens, 2);
+    assert_eq!(smallest.main_input_limit, 14);
 
     config.max_context_tokens = 32_768;
     config.reserve_tokens = 4_096;
@@ -568,7 +568,7 @@ fn decision_token_ratio_reservation_uses_effective_window_and_rejects_tiny_windo
         "a zero ratio cannot admit an unaccounted decision request"
     );
 
-    for (window, response_reserve) in [(0, 0), (4, 5), (15, 0), (4_096, 4_096)] {
+    for (window, response_reserve) in [(0, 0), (4, 5), (7, 0), (4_096, 4_096)] {
         config.max_context_tokens = window;
         config.reserve_tokens = response_reserve;
         assert_eq!(
@@ -609,14 +609,14 @@ async fn agent_budget_uses_pinned_route_and_read_only_spend_snapshot() {
     let service = disabled_agent_service(&generation, &provider_catalog).await;
     let proof = crate::agent::entry::test_cli_agent_turn_proof(&generation, "ollama", "prx-local-model");
     let snapshot = service.agent_budget_snapshot(&proof).expect("source-owned budget");
-    assert_eq!(snapshot.budgets.tokens, 1_792);
+    assert_eq!(snapshot.budgets.tokens, 3_584);
     assert_eq!(snapshot.budgets.micro_usd, 500_000);
     assert_eq!(
         snapshot.budgets.latency_ms,
         config.causal_tree.policy.extra_latency_budget_ms
     );
     assert_eq!(snapshot.main_compaction.max_context_tokens, 32_768);
-    assert_eq!(snapshot.main_compaction.reserve_tokens, 5_888);
+    assert_eq!(snapshot.main_compaction.reserve_tokens, 7_680);
     assert_eq!(config.agent.compaction.reserve_tokens, 4_096);
     assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
 

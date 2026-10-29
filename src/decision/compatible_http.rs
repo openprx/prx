@@ -392,7 +392,18 @@ impl CompatibleHttpBackend {
             .map_err(|_| Failure::from(deadline_error()))?;
         #[cfg(test)]
         material_send.returned();
-        let mut response = sent.map_err(|error| Failure::from(transport_class(&error)))?;
+        let mut response = sent.map_err(|error| {
+            tracing::warn!(
+                backend = self.identity.kind.as_str(),
+                builder = error.is_builder(),
+                connect = error.is_connect(),
+                timeout = error.is_timeout(),
+                request = error.is_request(),
+                body = error.is_body(),
+                "decision HTTP request failed"
+            );
+            Failure::from(transport_class(&error))
+        })?;
         if self.transport == BackendLocality::Loopback
             && !response.remote_addr().is_some_and(|peer| peer.ip().is_loopback())
         {
@@ -404,8 +415,8 @@ impl CompatibleHttpBackend {
             // backend may echo the request state in it (D-086 F-1, F-7).
             // Dropping the response closes the connection.
             let retry_after_ms = retry_after_ms(response.headers());
-            tracing::debug!(
-                endpoint = %crate::providers::redact_endpoint_userinfo(&self.url),
+            tracing::warn!(
+                backend = self.identity.kind.as_str(),
                 status = status.as_u16(),
                 body_bytes = ?response.content_length(),
                 "decision backend refused the request"
@@ -442,6 +453,7 @@ impl CompatibleHttpBackend {
                 .map_err(|_| Failure::from(deadline_error()))?
                 .map_err(|error| Failure::from(transport_class(&error)))?;
             let Some(chunk) = chunk else { break };
+            receipt.retain_response_chunk(chunk.len()).map_err(Failure::from)?;
             if bytes.len().saturating_add(chunk.len()) > limit {
                 // Dropping the response closes the connection.
                 return Err(DecisionError::InvalidResponse(ValidationRule::Oversize).into());

@@ -581,6 +581,7 @@ fn shadow_fields(hop: &EngineDecision) -> RecordedShadow {
 /// constructor as outcome fields.
 pub(crate) struct TerminalFacts {
     collected_pending: bool,
+    collected_declined: bool,
     resume_claimed: bool,
     terminal_id: String,
     status: TurnTerminalStatus,
@@ -630,6 +631,7 @@ impl TerminalFacts {
     ) -> Self {
         self.resume_claimed = replay.resume_claimed();
         self.collected_pending = replay.collected_pending();
+        self.collected_declined = replay.collected_declined();
         self
     }
 
@@ -665,6 +667,7 @@ impl TerminalFacts {
     /// alone does not prove that constrained execution was consumed.
     pub(crate) fn has_completed_run_evidence(&self, decision: &DecisionView, run_capabilities: &[String]) -> bool {
         if self.collected_pending
+            || self.collected_declined
             || self.status != TurnTerminalStatus::Completed
             || !matches!(
                 self.provider_outcome.as_ref().map(|outcome| &outcome.status),
@@ -763,6 +766,7 @@ impl TerminalFacts {
         let latency_ms = u64::try_from(elapsed.num_milliseconds()).map_err(|_| OutcomeCorrelationError::Number)?;
         Ok(Self {
             collected_pending: false,
+            collected_declined: false,
             resume_claimed: false,
             terminal_id: marker.terminal_id,
             status: marker.status,
@@ -854,6 +858,7 @@ impl TerminalFacts {
         let latency_ms = u64::try_from(elapsed.num_milliseconds()).map_err(|_| OutcomeCorrelationError::Number)?;
         Ok(Self {
             collected_pending: context.collected_pending_event().is_some(),
+            collected_declined: context.collected_declined_event().is_some(),
             resume_claimed: context.claimed_resume_event().is_some(),
             terminal_id: marker.terminal_id,
             status: marker.status,
@@ -968,85 +973,91 @@ impl OutcomeCorrelator {
         {
             return Err(OutcomeCorrelationError::Unsupported);
         }
-        let classification = if facts.collected_pending && facts.status == TurnTerminalStatus::Completed {
-            if action.is_some()
-                || target.is_some()
-                || facts
+        let classification =
+            if (facts.collected_pending || facts.collected_declined) && facts.status == TurnTerminalStatus::Completed {
+                if facts.collected_pending && facts.collected_declined
+                    || action.is_some()
+                    || target.is_some()
+                    || facts
+                        .execution_trace
+                        .as_ref()
+                        .is_some_and(|trace| trace.started_attempts != 0 || !trace.calls.is_empty())
+                    || !facts.provider_outcome.as_ref().is_some_and(|outcome| {
+                        matches!(
+                            outcome.status,
+                            ExecutionStatus::Success | ExecutionStatus::FallbackSuccess
+                        )
+                    })
+                {
+                    return Err(OutcomeCorrelationError::Unsupported);
+                }
+                if facts.collected_declined {
+                    OutcomeClassification::Clarification
+                } else {
+                    OutcomeClassification::AwaitingApproval
+                }
+            } else if facts.status == TurnTerminalStatus::Silent {
+                let confirmed = facts
                     .execution_trace
                     .as_ref()
-                    .is_some_and(|trace| trace.started_attempts != 0 || !trace.calls.is_empty())
-                || !facts.provider_outcome.as_ref().is_some_and(|outcome| {
-                    matches!(
-                        outcome.status,
-                        ExecutionStatus::Success | ExecutionStatus::FallbackSuccess
-                    )
-                })
-            {
-                return Err(OutcomeCorrelationError::Unsupported);
-            }
-            OutcomeClassification::AwaitingApproval
-        } else if facts.status == TurnTerminalStatus::Silent {
-            let confirmed = facts
-                .execution_trace
-                .as_ref()
-                .zip(facts.provider_outcome.as_ref())
-                .is_some_and(|(trace, outcome)| trace.confirms_silent(outcome));
-            if !confirmed {
-                return Err(OutcomeCorrelationError::Unsupported);
-            }
-            OutcomeClassification::Silent
-        } else if matches!(
-            action,
-            Some(super::branch::CausalActionKind::UseTool | super::branch::CausalActionKind::Delegate)
-        ) && facts.status == TurnTerminalStatus::Completed
-        {
-            let trace = facts
-                .execution_trace
-                .as_ref()
-                .ok_or(OutcomeCorrelationError::Unsupported)?;
-            if trace.pending_attempts != 0 || trace.provider_pending != 0 {
-                return Err(OutcomeCorrelationError::Unsupported);
-            }
-            let provider_status = facts.provider_outcome.as_ref().map(|outcome| &outcome.status);
-            if trace.awaiting_approval_attempts > 0 {
-                OutcomeClassification::AwaitingApproval
-            } else if trace.selected_successful_attempts == 0
-                || trace.unbound_attempts > 0
-                || trace.successful_attempts != trace.started_attempts
-                || trace.failed_attempts > 0
-                || trace.cancelled_attempts > 0
-                || trace.denied_attempts > 0
-            {
-                OutcomeClassification::Failed
-            } else {
-                match provider_status {
-                    None if action == Some(super::branch::CausalActionKind::UseTool)
-                        && facts.resume_claimed
-                        && facts.execution_trace.as_ref().is_some_and(|trace| {
-                            let capabilities: Vec<_> =
-                                trace.calls.iter().map(|call| call.capability_id.clone()).collect();
-                            facts.has_completed_resume_evidence(&capabilities)
-                        }) =>
-                    {
-                        OutcomeClassification::Success
-                    }
-                    Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess)
-                        if action == Some(super::branch::CausalActionKind::Delegate) =>
-                    {
-                        OutcomeClassification::Delegated
-                    }
-                    Some(ExecutionStatus::Success) => OutcomeClassification::Success,
-                    Some(ExecutionStatus::FallbackSuccess) => OutcomeClassification::FallbackSuccess,
-                    _ => return Err(OutcomeCorrelationError::Unsupported),
+                    .zip(facts.provider_outcome.as_ref())
+                    .is_some_and(|(trace, outcome)| trace.confirms_silent(outcome));
+                if !confirmed {
+                    return Err(OutcomeCorrelationError::Unsupported);
                 }
-            }
-        } else {
-            classify_terminal(
+                OutcomeClassification::Silent
+            } else if matches!(
                 action,
-                facts.status,
-                facts.provider_outcome.as_ref().map(|outcome| &outcome.status),
-            )?
-        };
+                Some(super::branch::CausalActionKind::UseTool | super::branch::CausalActionKind::Delegate)
+            ) && facts.status == TurnTerminalStatus::Completed
+            {
+                let trace = facts
+                    .execution_trace
+                    .as_ref()
+                    .ok_or(OutcomeCorrelationError::Unsupported)?;
+                if trace.pending_attempts != 0 || trace.provider_pending != 0 {
+                    return Err(OutcomeCorrelationError::Unsupported);
+                }
+                let provider_status = facts.provider_outcome.as_ref().map(|outcome| &outcome.status);
+                if trace.awaiting_approval_attempts > 0 {
+                    OutcomeClassification::AwaitingApproval
+                } else if trace.selected_successful_attempts == 0
+                    || trace.unbound_attempts > 0
+                    || trace.successful_attempts != trace.started_attempts
+                    || trace.failed_attempts > 0
+                    || trace.cancelled_attempts > 0
+                    || trace.denied_attempts > 0
+                {
+                    OutcomeClassification::Failed
+                } else {
+                    match provider_status {
+                        None if action == Some(super::branch::CausalActionKind::UseTool)
+                            && facts.resume_claimed
+                            && facts.execution_trace.as_ref().is_some_and(|trace| {
+                                let capabilities: Vec<_> =
+                                    trace.calls.iter().map(|call| call.capability_id.clone()).collect();
+                                facts.has_completed_resume_evidence(&capabilities)
+                            }) =>
+                        {
+                            OutcomeClassification::Success
+                        }
+                        Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess)
+                            if action == Some(super::branch::CausalActionKind::Delegate) =>
+                        {
+                            OutcomeClassification::Delegated
+                        }
+                        Some(ExecutionStatus::Success) => OutcomeClassification::Success,
+                        Some(ExecutionStatus::FallbackSuccess) => OutcomeClassification::FallbackSuccess,
+                        _ => return Err(OutcomeCorrelationError::Unsupported),
+                    }
+                }
+            } else {
+                classify_terminal(
+                    action,
+                    facts.status,
+                    facts.provider_outcome.as_ref().map(|outcome| &outcome.status),
+                )?
+            };
         let provider_attempts = facts.provider_outcome.as_ref().map(|outcome| {
             outcome
                 .attempts
@@ -1289,6 +1300,7 @@ mod tests {
         let now = chrono::Utc::now();
         let mut facts = TerminalFacts {
             collected_pending: true,
+            collected_declined: false,
             resume_claimed: false,
             terminal_id: "prx_collection_terminal".into(),
             status: TurnTerminalStatus::Completed,
@@ -1314,6 +1326,17 @@ mod tests {
         assert_eq!(record.classification, OutcomeClassification::AwaitingApproval);
         assert!(record.executed_action.is_none() && record.executed_target.is_none());
         facts.collected_pending = false;
+        facts.collected_declined = true;
+        let record =
+            OutcomeCorrelator::record_for(DecisionId::new_runtime(), None, None, &facts).expect("decline evidence");
+        assert_eq!(record.classification, OutcomeClassification::Clarification);
+        assert_eq!(record.executed_action.as_deref(), Some("clarify"));
+        assert_eq!(record.executed_target.as_deref(), Some("none"));
+        assert!(
+            OutcomeCorrelator::record_for(DecisionId::new_runtime(), Some(CausalActionKind::UseTool), None, &facts)
+                .is_err()
+        );
+        facts.collected_declined = false;
         assert!(OutcomeCorrelator::record_for(DecisionId::new_runtime(), None, None, &facts).is_err());
         facts.collected_pending = true;
         assert!(
@@ -1336,6 +1359,7 @@ mod tests {
     fn silent_marker_without_physical_facts_is_unsupported_and_cancellation_still_wins() {
         let mut facts = TerminalFacts {
             collected_pending: false,
+            collected_declined: false,
             resume_claimed: false,
             terminal_id: "prx_silent_fixture".into(),
             status: TurnTerminalStatus::Silent,
@@ -1670,6 +1694,7 @@ mod tests {
         let now = chrono::Utc::now();
         TerminalFacts {
             collected_pending: false,
+            collected_declined: false,
             resume_claimed: false,
             terminal_id: "recovered-terminal".to_owned(),
             status,

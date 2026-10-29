@@ -10,6 +10,7 @@ enum Case {
     Controlled,
     Builtin,
     Multiple,
+    Abstain,
 }
 const DECISION_MODEL: &str = "prx-console-decision";
 const MODEL: &str = "prx-local-model";
@@ -57,6 +58,7 @@ impl crate::tools::Tool for CountedWrite {
 struct CollectionProvider {
     calls: AtomicUsize,
     multiple: bool,
+    abstain: bool,
 }
 #[async_trait]
 impl Provider for CollectionProvider {
@@ -79,7 +81,13 @@ impl Provider for CollectionProvider {
             let tools = request.tools.context("collection proposal schema missing")?;
             assert_eq!(tools.len(), 1);
             assert_eq!(tools.first().unwrap().name, "file_write");
-            (0..if self.multiple { 2 } else { 1 })
+            (0..if self.abstain {
+                0
+            } else if self.multiple {
+                2
+            } else {
+                1
+            })
                 .map(|index| crate::providers::ToolCall {
                     id: format!("prx-collection-{index}"),
                     name: "file_write".into(),
@@ -176,7 +184,7 @@ async fn exercise(
         .iter()
         .filter(|event| event.event_type == "approval.decision.pending")
         .count();
-    assert_eq!(pending, usize::from(case != Case::Multiple));
+    assert_eq!(pending, usize::from(!matches!(case, Case::Multiple | Case::Abstain)));
     let terminal = events
         .iter()
         .find(|event| event.event_type == "turn.finalized")
@@ -200,6 +208,40 @@ async fn exercise(
         usage.get("source").and_then(serde_json::Value::as_str),
         Some("reported")
     );
+    if case == Case::Abstain {
+        assert!(
+            status.is_success(),
+            "a durable decline completes a clarification: {value}"
+        );
+        assert!(events.iter().any(|event| event.role == "assistant"
+            && event.content == crate::runtime::turn_decision::DECLINED_COLLECTION_REPLY));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "approval.collection.declined")
+                .count(),
+            1
+        );
+        assert_eq!(
+            payload.get("status").and_then(serde_json::Value::as_str),
+            Some("completed")
+        );
+        assert!(payload.pointer("/terminal_replay_v1/collected_declined").is_some());
+        assert!(payload.pointer("/terminal_replay_v1/collected_pending").is_none());
+        let declined_id = payload
+            .get("decision_id")
+            .and_then(serde_json::Value::as_str)
+            .context("declined decision")?;
+        let resume = post_decision_resume(
+            State(state.clone()),
+            Path((SESSION.into(), declined_id.into())),
+            request(serde_json::json!({}), Some("prx-test-token")),
+        )
+        .await;
+        assert!(!resume.status().is_success(), "a clarification cannot grant resume");
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        return Ok(());
+    }
     if case == Case::Multiple {
         assert!(
             !status.is_success(),
@@ -498,6 +540,7 @@ async fn run_case_work(
     let provider = Arc::new(CollectionProvider {
         calls: AtomicUsize::new(0),
         multiple: case == Case::Multiple,
+        abstain: case == Case::Abstain,
     });
     let writes = Arc::new(AtomicUsize::new(0));
     let mut state = test_app_state(config.clone(), provider.clone());
@@ -575,6 +618,11 @@ async fn console_controlled_decision_file_write_requires_owner_review_and_fresh_
 #[tokio::test]
 async fn console_multiple_collection_calls_fail_without_pending_or_file_write() -> anyhow::Result<()> {
     run_case(Case::Multiple).await
+}
+
+#[tokio::test]
+async fn console_declined_collection_clarifies_without_pending_or_execution() -> anyhow::Result<()> {
+    run_case(Case::Abstain).await
 }
 
 #[tokio::test]

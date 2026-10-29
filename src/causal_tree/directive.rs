@@ -176,10 +176,13 @@ pub(crate) fn directive_from_selection(
                     // The builtin's language-neutral candidate searches all
                     // eligible families. A concrete selected family remains
                     // valid for exact recovery and issuer revalidation.
-                    families: match discoverable_families.iter().collect::<Vec<_>>() {
-                        families if !families.is_empty() => families,
-                        _ => vec![candidate.target()],
-                    },
+                    families: selected_discovery_family(decision)?.map_or_else(
+                        || match discoverable_families.iter().collect::<Vec<_>>() {
+                            families if !families.is_empty() => families,
+                            _ => vec![candidate.target()],
+                        },
+                        |family| vec![family],
+                    ),
                     query: decision.state.routing_input.as_str().to_string(),
                     limit: match context.discovery_limit {
                         1..=64 => context.discovery_limit,
@@ -285,6 +288,52 @@ pub(crate) fn directive_from_selection(
             }
         }
     }
+}
+
+/// The low-utility recovery may inspect only the validated chosen family.
+/// This narrows metadata search; it grants no execution authority.
+pub(crate) fn selected_discovery_family(decision: &EngineDecision) -> Result<Option<CapabilityTarget>, DirectiveError> {
+    if !matches!(
+        decision.selection,
+        Selection::Recover {
+            reason_code: "discover_unrepresented_operation",
+            ..
+        }
+    ) {
+        return Ok(None);
+    }
+    if !decision.served_prediction_succeeded() {
+        return Err(DirectiveError::NotAdmitted);
+    }
+    let trace = decision.audit_trace.as_ref().ok_or(DirectiveError::NotAdmitted)?;
+    let key = crate::decision::GlobalQuestion::CapabilityTarget.as_str();
+    let chosen = match trace.answers.get(key) {
+        Some(super::decision_engine::PredictionAuditAnswer::Choice { chosen, .. }) => chosen,
+        None => trace.forced_choices.get(key).ok_or(DirectiveError::NotAdmitted)?,
+        _ => return Err(DirectiveError::NotAdmitted),
+    };
+    let family = CapabilityTarget::ALL
+        .into_iter()
+        .find(|family| family.as_str() == chosen)
+        .filter(|family| super::candidate_generator::DiscoveryFamilies::supports(*family))
+        .ok_or(DirectiveError::NotAdmitted)?;
+    let CandidateSet::Legal {
+        discoverable_families,
+        candidates,
+        ..
+    } = &decision.candidates
+    else {
+        return Err(DirectiveError::NotAdmitted);
+    };
+    let eligible = discoverable_families.iter().any(|eligible| eligible == family)
+        || (discoverable_families.iter().next().is_none()
+            && candidates
+                .iter()
+                .any(|candidate| candidate.action() == CausalActionKind::Discover && candidate.target() == family));
+    if !eligible {
+        return Err(DirectiveError::NotAdmitted);
+    }
+    Ok(Some(family))
 }
 
 fn require_pass(candidate_id: &CandidateId, decision: &EngineDecision) -> Result<(), DirectiveError> {

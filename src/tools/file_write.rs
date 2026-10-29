@@ -118,6 +118,9 @@ impl FileWriteTool {
             });
         }
 
+        let experiment_write = crate::runtime::experiment_stage::current()
+            .map(|stage| stage.prepare_native_write(&self.security.workspace_dir, &resolved_target, content.len()))
+            .transpose()?;
         // Only an authorized operation may create its missing directories.
         // Re-resolve afterward: a symlink change must not redirect the write
         // away from the exact operation just authorized.
@@ -152,22 +155,31 @@ impl FileWriteTool {
         let target = resolved_target.clone();
         let data = content.to_string();
         let write_result = crate::runtime::blocking::spawn_blocking(move || -> Result<(), String> {
-            use std::io::Write;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            opts.custom_flags(libc::O_NOFOLLOW);
-
-            let mut file = opts.open(&target).map_err(|e| {
-                #[cfg(unix)]
-                if e.raw_os_error() == Some(libc::ELOOP) {
-                    return format!("Refusing to write through symlink: {}", target.display());
+            let result = (|| -> Result<(), String> {
+                if let Some(admission) = &experiment_write {
+                    admission.check().map_err(|error| error.to_string())?;
                 }
-                format!("Failed to write file: {e}")
-            })?;
-            file.write_all(data.as_bytes())
-                .map_err(|e| format!("Failed to write file: {e}"))?;
-            Ok(())
+                use std::io::Write;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                opts.custom_flags(libc::O_NOFOLLOW);
+
+                let mut file = opts.open(&target).map_err(|e| {
+                    #[cfg(unix)]
+                    if e.raw_os_error() == Some(libc::ELOOP) {
+                        return format!("Refusing to write through symlink: {}", target.display());
+                    }
+                    format!("Failed to write file: {e}")
+                })?;
+                file.write_all(data.as_bytes())
+                    .map_err(|e| format!("Failed to write file: {e}"))?;
+                Ok(())
+            })();
+            if let Some(admission) = experiment_write {
+                admission.finish();
+            }
+            result
         })
         .await;
 

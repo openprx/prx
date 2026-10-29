@@ -8,6 +8,8 @@
 //! Script generation creates private, unreviewed artifacts. Publication uses
 //! a separate explicit import bound to the complete bundle the operator reviewed.
 
+mod experiment;
+
 use crate::config::Config;
 use crate::skills::lifecycle::{
     ForceClose, LifecycleStatus, ProposalSummary, RevisionId, ServiceError, SkillId, SkillsLifecycleService,
@@ -58,6 +60,7 @@ pub(crate) async fn execute(
         bail!("the skill lifecycle is disabled; set [skills_lifecycle] enabled = true");
     };
     match command {
+        SkillLifecycleCommands::Experiment { command } => experiment::dispatch(command, service, config).await,
         SkillLifecycleCommands::SuiteDigest { source } => {
             let suite = read_suite(&source).await?;
             Ok(serde_json::json!({"skill_id":suite.suite().skill_id,"digest":suite.digest()}).to_string())

@@ -330,7 +330,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             served_auxiliary: std::sync::OnceLock::new(),
             execution_closed: AtomicBool::new(false),
             approval_collection_started: AtomicBool::new(false),
-            collected_pending: std::sync::OnceLock::new(),
+            collected_approval_result: std::sync::OnceLock::new(),
             discovery_offers: std::sync::OnceLock::new(),
             discovery_admissions: std::sync::OnceLock::new(),
             hop_ids: vec![decision.decision_id, terminal.decision_id],
@@ -767,6 +767,8 @@ async fn builtin_agent_discovery_runs_a_bounded_dependent_hop() {
                 !discovery_source_guards_clear(&exact_state),
                 "an exact capability mention must block a terminal discovery answer"
             );
+            let discovery_id = discovery_decision.decision_id;
+
             assert!(
                 context.hop_ids().len() >= 2,
                 "selected discovery should lead to a dependent hop: {:?}; candidates={:?}; gates={:?}",
@@ -809,6 +811,98 @@ async fn builtin_agent_discovery_runs_a_bounded_dependent_hop() {
                 0,
                 "selected discovery never executes a tool"
             );
+            // A family-scoped low-utility recovery must preserve its scope at
+            // directive construction and at the serving/search boundary.
+            let mut owned = Arc::try_unwrap(context).ok().expect("exclusive fixture context");
+            let scoped = owned
+                .prior_hops
+                .iter_mut()
+                .find(|hop| hop.decision_id == discovery_id)
+                .expect("selected discovery predecessor");
+            let CandidateSet::Legal {
+                discoverable_families, ..
+            } = &scoped.candidates
+            else {
+                panic!("legal discovery fixture");
+            };
+            let family = discoverable_families.iter().next().expect("eligible family");
+            let (Selection::Recover { candidate_id, .. } | Selection::Commit { candidate_id, .. }) = &scoped.selection
+            else {
+                panic!("selected discovery");
+            };
+            scoped.selection = Selection::Recover {
+                candidate_id: candidate_id.clone(),
+                reason_code: "discover_unrepresented_operation",
+            };
+            let key = crate::decision::GlobalQuestion::CapabilityTarget.as_str().to_owned();
+            scoped
+                .audit_trace
+                .as_mut()
+                .expect("validated prediction trace")
+                .answers
+                .insert(
+                    key.clone(),
+                    crate::causal_tree::decision_engine::PredictionAuditAnswer::Choice {
+                        chosen: family.as_str().into(),
+                        probabilities: BTreeMap::from([(family.as_str().into(), 1.0)]),
+                        confidence: 1.0,
+                    },
+                );
+            assert_eq!(selected_discovery_family(scoped).unwrap(), Some(family));
+            let directive = directive_from_selection(
+                scoped,
+                &DirectiveContext {
+                    current_generation: *service.catalog.generation(),
+                    approval_expires_at: chrono::Utc::now(),
+                    discovery_limit: 8,
+                },
+            )
+            .expect("gated family-scoped metadata directive");
+            assert!(matches!(directive, TurnExecutionDirective::Discover { families, .. } if families == vec![family]));
+            assert_eq!(discovery_scope(std::iter::once(&*scoped)).unwrap(), Some(family));
+            let mut exact = exact_state.derived.candidates().first().unwrap().clone();
+            let exact_for = |target| {
+                CausalCandidate::new(
+                    CausalActionKind::UseTool,
+                    target,
+                    CandidateSpec {
+                        namespace: None,
+                        required_capabilities: Vec::new(),
+                        side_effect: crate::causal_tree::branch::SideEffectClass::ProcessExec,
+                        approval: crate::causal_tree::branch::ApprovalRequirement::None,
+                        estimated_cost: None,
+                        estimated_latency_ms: None,
+                    },
+                )
+            };
+            exact.candidate = exact_for(CapabilityTarget::Shell);
+            exact_state.derived = DerivedState::new(vec![exact.clone()]).unwrap();
+            assert!(discovery_source_guards_clear_in(
+                &exact_state,
+                Some(CapabilityTarget::Filesystem)
+            ));
+            assert!(!discovery_source_guards_clear_in(
+                &pending_state,
+                Some(CapabilityTarget::Filesystem)
+            ));
+            exact.candidate = exact_for(CapabilityTarget::Filesystem);
+            exact_state.derived = DerivedState::new(vec![exact]).unwrap();
+            assert!(!discovery_source_guards_clear_in(
+                &exact_state,
+                Some(CapabilityTarget::Filesystem)
+            ));
+            let trace = scoped.audit_trace.take();
+            assert!(selected_discovery_family(scoped).is_err());
+            assert!(!discovery_can_answer(scoped));
+            scoped.audit_trace = trace;
+            scoped.audit_trace.as_mut().unwrap().answers.remove(&key);
+            scoped
+                .audit_trace
+                .as_mut()
+                .unwrap()
+                .forced_choices
+                .insert(key, family.as_str().into());
+            assert_eq!(selected_discovery_family(scoped).unwrap(), Some(family));
         });
     ledger_probe::finish_service_fixture(&service, work).await
 }

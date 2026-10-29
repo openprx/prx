@@ -175,6 +175,9 @@ impl TurnDecisionService {
             "turn does not permit capability discovery"
         );
         self.agent_execution_specs(proof, context)?;
+        if let Some(family) = super::discovery_scope(context.audit_hops())? {
+            return Ok(vec![family]);
+        }
         let mut families = Vec::new();
         for decision in context.audit_hops() {
             if let CandidateSet::Legal {
@@ -201,8 +204,10 @@ impl TurnDecisionService {
     }
 
     /// A selected Skill needs a way to discover its execution tools after its
-    /// loader narrows the serving slice. Otherwise only source-named direct
-    /// peers are offered. These IDs are search eligibility, never grants;
+    /// loader narrows the serving slice. A selected filesystem operation also
+    /// needs its read/write peers; process execution is excluded from that
+    /// family handoff. Otherwise only source-named direct peers are offered.
+    /// These IDs are search eligibility, never grants;
     /// exclusions, read-only mode, child scope and publication gates still apply.
     fn direct_discovery_ids(&self, context: &TurnDecisionContext) -> BTreeSet<CapabilityId> {
         let view = self.catalog_view();
@@ -214,13 +219,24 @@ impl TurnDecisionService {
                 )
             })
         });
+        let selected_filesystem = super::discovery_scope(context.audit_hops()).ok().flatten()
+            == Some(CapabilityTarget::Filesystem)
+            || matches!(context.directive(), TurnExecutionDirective::Execute { .. })
+                && context.execution_refs.iter().any(|reference| {
+                    view.entry_any(&reference.id).is_some_and(|entry| {
+                        entry.family == CapabilityTarget::Filesystem
+                            && entry.effect <= crate::causal_tree::branch::SideEffectClass::LocalWrite
+                    })
+                });
         let mut entries =
             CatalogSearch::exact_mentions(&view, context.engine.state.routing_input.as_str(), 64).unwrap_or_default();
-        if selected_skill {
-            entries.extend(
-                view.iter_entries()
-                    .filter(|entry| matches!(entry.exposure, Exposure::Direct)),
-            );
+        if selected_skill || selected_filesystem {
+            entries.extend(view.iter_entries().filter(|entry| {
+                matches!(entry.exposure, Exposure::Direct)
+                    && (selected_skill
+                        || entry.family == CapabilityTarget::Filesystem
+                            && entry.effect <= crate::causal_tree::branch::SideEffectClass::LocalWrite)
+            }));
         }
         entries
             .into_iter()
@@ -245,11 +261,25 @@ impl CapabilitySearchAuthority {
             service.agent_capability_search_spec(&self.proof, &context)?.is_some(),
             "capability search is no longer exposed"
         );
-        let families = service.discovery_families(&self.proof, &context)?;
+        let mut families = service.discovery_families(&self.proof, &context)?;
         let view = service
             .catalog
             .view(&CatalogScope::default())
             .with_surface(&service.publication_policy);
+        // Looking up a schema that is already declared cannot expand the
+        // executable surface, even if its family has no undiscovered peers.
+        let exact_core = context.execution_refs.iter().find_map(|reference| {
+            view.entry_any(&reference.id).filter(|entry| {
+                entry.fingerprint == reference.fingerprint
+                    && entry.generation == reference.generation
+                    && (query.trim().eq_ignore_ascii_case(&entry.public_name) || query.trim() == entry.id.as_str())
+            })
+        });
+        if let Some(entry) = exact_core
+            && !families.contains(&entry.family)
+        {
+            families.push(entry.family);
+        }
         let trusted = context.engine.state.trusted.parts();
         let offered_direct = service.direct_discovery_ids(&context);
         let mut results = Vec::new();
@@ -258,8 +288,9 @@ impl CapabilitySearchAuthority {
             !matches!(
                 entry.public_name.as_str(),
                 "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate" | "sessions_spawn"
-            ) && (matches!(entry.exposure, Exposure::Searchable)
-                || matches!(entry.exposure, Exposure::Direct) && offered_direct.contains(&entry.id))
+            ) && (entry.supports_metadata_discovery()
+                || matches!(entry.exposure, Exposure::Direct)
+                    && (offered_direct.contains(&entry.id) || exact_core.is_some_and(|core| core.id == entry.id)))
                 && entry.availability.level >= CapabilityAvailabilityLevel::Configured
                 && !trusted.excludes_entry(view.model_admission_entry(entry))
                 && !(trusted.side_effect_mode == crate::causal_tree::state::SideEffectMode::ReadOnly

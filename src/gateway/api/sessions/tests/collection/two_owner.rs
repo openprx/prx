@@ -113,6 +113,7 @@ impl Provider for OwnerCollectionProvider {
         let fixture = CollectionProvider {
             calls: AtomicUsize::new(0),
             multiple: false,
+            abstain: false,
         };
         let mut trace = fixture.chat_traced(request, model, temperature).await?;
         let call = trace

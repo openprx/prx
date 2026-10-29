@@ -136,7 +136,8 @@ impl CapabilityCatalog {
                 .into_iter()
                 .find(|family| family.as_str() == entry.family)
                 .ok_or_else(|| anyhow::anyhow!("process catalog family is invalid"))?;
-            let id = CapabilityId::new(family, &entry.namespace, &entry.public_name)?;
+            let identity_family = super::canonical_identity_family(family, &entry.namespace, &entry.public_name);
+            let id = CapabilityId::new(identity_family, &entry.namespace, &entry.public_name)?;
             anyhow::ensure!(
                 id.as_str() == entry.id && !entry.root.is_empty() && entry.schema.is_object(),
                 "process catalog identity or schema is invalid"
@@ -159,7 +160,7 @@ impl CapabilityCatalog {
             if let Some(metadata) = &entry.skill_metadata {
                 anyhow::ensure!(
                     family == CapabilityTarget::Skill
-                        && metadata.name == entry.public_name
+                        && crate::tools::skills::catalog_skill_read_name(&metadata.name) == entry.public_name
                         && entry.binding_digest == Some(crate::skills::catalog_skill_binding_digest(metadata)),
                     "process skill metadata binding differs"
                 );

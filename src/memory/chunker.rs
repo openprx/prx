@@ -301,6 +301,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_wikilink_labels_preserve_subsequent_document_blocks() {
+        // Untrusted document ingestion enables wikilinks via Options::all().
+        // RUSTSEC-2026-0414 duplicated subsequent parser events for this input.
+        let links = "[[a|]] ".repeat(16);
+        let input = format!("# PRX\n\n{links}\n\n# Final\n\nMarker");
+        let blocks = parse_markdown_blocks(&input);
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[1].content, links.trim());
+        assert_eq!(blocks[2].content, "# Final");
+        assert_eq!(blocks[3].content, "Marker");
+        assert_eq!(blocks[3].heading_path, vec!["Final"]);
+        assert!(blocks.iter().map(|block| block.content.len()).sum::<usize>() <= input.len());
+    }
+
+    #[test]
     fn keeps_code_lists_tables_and_frontmatter_atomic() {
         let input = "---\ntitle: Demo\n---\n\n- one\n  - two\n\n```rust\nfn main() {}\n```\n\n|a|b|\n|-|-|\n|1|2|";
         let blocks = parse_markdown_blocks(input);

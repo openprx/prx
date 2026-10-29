@@ -40,10 +40,10 @@ fn decision_sized_fixture_config(
 ) -> crate::config::AgentCompactionConfig {
     let main_window = config.max_context_tokens.checked_sub(config.reserve_tokens).unwrap();
     let mut available = main_window;
-    while available - (available / 16).min(4096) < main_window {
+    while available - (available / 8).min(8192) < main_window {
         available = available.checked_add(1).unwrap();
     }
-    let decision_tokens = (available / 16).min(4096);
+    let decision_tokens = (available / 8).min(8192);
     assert!(
         decision_tokens >= 137,
         "fixture must fund the observed candidate estimates"
@@ -56,7 +56,7 @@ fn decision_sized_fixture_config(
 fn fixture_main_compaction(config: &crate::config::AgentCompactionConfig) -> crate::config::AgentCompactionConfig {
     let mut main = config.clone();
     let available = main.max_context_tokens.checked_sub(main.reserve_tokens).unwrap();
-    main.reserve_tokens = main.reserve_tokens.checked_add((available / 16).min(4096)).unwrap();
+    main.reserve_tokens = main.reserve_tokens.checked_add((available / 8).min(8192)).unwrap();
     main
 }
 
@@ -78,7 +78,7 @@ async fn configured_extra_token_ratio_caps_real_turn_decision_admission() {
     let baseline_tokens = 32_768_usize - 4_096;
     let ratio_limit = ((baseline_tokens as f64) * f64::from(0.01_f32)).floor() as usize;
     assert_eq!(ratio_limit, 286, "fixture must exercise the configured ratio cap");
-    assert!(ratio_limit < baseline_tokens / 16, "the ratio must be the active cap");
+    assert!(ratio_limit < baseline_tokens / 8, "the ratio must be the active cap");
     assert_eq!(admission.compaction().reserve_tokens, 4_096 + ratio_limit);
     assert_eq!(
         admission
@@ -116,10 +116,10 @@ async fn context_budget_counts_native_tool_schemas_before_provider_call() {
         let usable_window = config.max_context_tokens.saturating_sub(config.reserve_tokens);
         // Q53: scale the paired schemas and history together, retaining the same
         // headroom formula and response reserve. The real decision slice is capped
-        // at 4096 and the loopback plan splits that slice across two possible sends.
-        let decision_tokens = (usable_window / 16).min(4096);
+        // at 8192 and the loopback plan splits that slice across two possible sends.
+        let decision_tokens = (usable_window / 8).min(8192);
         assert_eq!(
-            decision_tokens, 4096,
+            decision_tokens, 8192,
             "scaled fixture must reach the existing decision reservation cap"
         );
         assert_eq!(config.reserve_tokens, CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS);
@@ -430,14 +430,14 @@ async fn configured_small_native_schema_fixture() {
         .content
         .push_str(" Use file_read.");
     let original_len = history.len();
-    let config = context_budget_fixture_config(&history, wide_tool_tokens / 2);
+    let config = decision_sized_fixture_config(context_budget_fixture_config(&history, wide_tool_tokens / 2));
     let usable_window = config.max_context_tokens.saturating_sub(config.reserve_tokens);
     // Q53: scale the paired schemas and history together, retaining the same
     // headroom formula and response reserve. The real decision slice is capped
-    // at 4096 and the loopback plan splits that slice across two possible sends.
-    let decision_tokens = (usable_window / 16).min(4096);
+    // at 8192 and the loopback plan splits that slice across two possible sends.
+    let decision_tokens = (usable_window / 8).min(8192);
     assert_eq!(
-        decision_tokens, 4096,
+        decision_tokens, 8192,
         "scaled fixture must reach the existing decision reservation cap"
     );
     assert_eq!(config.reserve_tokens, CONTEXT_BUDGET_FIXTURE_RESERVE_TOKENS);
@@ -447,13 +447,15 @@ async fn configured_small_native_schema_fixture() {
         .saturating_add(compiled_instruction_tokens(&tool_specs));
     assert!(
         narrow_total <= main_input_limit,
-        "scaled small request must fit after the unchanged decision reservation"
+        "scaled small request must fit after the declared decision reservation"
     );
-    // Preserve the original registered-wide construction premise; it is not
-    // proof that an actual business-only wide request would exceed this window.
+    // Compare both schema controls against the same usable main window after
+    // the declared reservation. The inverse fixture sizing preserves that
+    // original main window while funding the larger decision slice.
     assert!(
-        budgeted_tokens(estimate_history_tokens_with_source(&history)).saturating_add(wide_tool_tokens) > usable_window,
-        "paired wide request must still exceed the same original window"
+        budgeted_tokens(estimate_history_tokens_with_source(&history)).saturating_add(wide_tool_tokens)
+            > main_input_limit,
+        "paired wide request must still exceed the same main window"
     );
 
     assert!(
@@ -656,6 +658,7 @@ async fn configured_small_native_schema_fixture() {
             }
         })
         .await;
+    std::fs::remove_dir_all(&workspace).expect("remove successful owned native schema fixture");
 }
 /// One estimator, two inputs: the preflight measures `history`, the event
 /// measures the prepared request. The event carries both totals, so the
@@ -2144,9 +2147,9 @@ async fn preflight_compacts_before_provider_call_when_over_hard_limit() {
     }
 
     let available = config.max_context_tokens.checked_sub(config.reserve_tokens).unwrap();
-    let fixture_main_window = available.checked_sub((available / 16).min(4096)).unwrap();
+    let fixture_main_window = available.checked_sub((available / 8).min(8192)).unwrap();
     assert_eq!(config.reserve_tokens, 10);
-    assert!((available / 16).min(4096) >= 128);
+    assert!((available / 8).min(8192) >= 128);
     assert!(budgeted_tokens(estimate_history_tokens_with_source(&history)) > fixture_main_window);
 
     let workspace = TempDir::new().expect("budget fixture workspace");
@@ -2364,9 +2367,9 @@ async fn off_mode_preflight_trims_without_silent_summary() {
     }
 
     let available = config.max_context_tokens.checked_sub(config.reserve_tokens).unwrap();
-    let fixture_main_window = available.checked_sub((available / 16).min(4096)).unwrap();
+    let fixture_main_window = available.checked_sub((available / 8).min(8192)).unwrap();
     assert_eq!(config.reserve_tokens, 10);
-    assert!((available / 16).min(4096) >= 128);
+    assert!((available / 8).min(8192) >= 128);
     assert!(budgeted_tokens(estimate_history_tokens_with_source(&history)) > fixture_main_window);
     let current_request_tokens = budgeted_tokens(estimate_history_tokens_with_source(&[history
         .last()

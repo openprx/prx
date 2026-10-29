@@ -97,6 +97,10 @@ async fn apply_file_operation_inner(
     operation: NativeFileOperation,
     arguments: serde_json::Value,
 ) -> anyhow::Result<String> {
+    ensure!(
+        crate::runtime::experiment_stage::current().is_none(),
+        "experiment file adapter requires its registered native scratch root"
+    );
     let path = arguments
         .get("path")
         .and_then(serde_json::Value::as_str)

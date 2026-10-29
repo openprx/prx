@@ -144,7 +144,7 @@ pub const UNLISTED_MODEL: &str = "unlisted";
 pub const MAX_MODEL_LABEL_CHARS: usize = 64;
 
 /// The builtin decision backend's model, always listed.
-const BUILTIN_MODEL: &str = "builtin-v1";
+const BUILTIN_MODEL: &str = crate::decision::builtin::weights::MODEL_VERSION;
 
 /// A configured-model allowlist. The process has one ([`ModelAllowlist::global`]),
 /// which the configuration generation manager refreshes on every applied
@@ -206,7 +206,7 @@ pub fn model_label(model: &str) -> Cow<'_, str> {
 /// [`model_label`] against the allowlist `models`.
 fn label_in<'a>(models: Option<&HashSet<Box<str>>>, model: &'a str) -> Cow<'a, str> {
     let model = model.trim();
-    let listed = model == BUILTIN_MODEL || models.is_some_and(|models| models.contains(model));
+    let listed = model == BUILTIN_MODEL || model == "builtin-v1" || models.is_some_and(|models| models.contains(model));
     if !listed || model.is_empty() {
         return Cow::Borrowed(UNLISTED_MODEL);
     }

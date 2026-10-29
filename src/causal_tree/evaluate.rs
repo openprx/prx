@@ -1390,7 +1390,10 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(written["report_version"], REPORT_VERSION);
-        assert_eq!(written["builtin_version"], "builtin-v1");
+        assert_eq!(
+            written["builtin_version"],
+            crate::decision::builtin::weights::MODEL_VERSION
+        );
         assert!(
             write_report(temp.path(), &report).is_err(),
             "a report is never overwritten"
