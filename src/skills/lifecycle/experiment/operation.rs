@@ -39,6 +39,9 @@ pub enum ExperimentOperation {
         probe_stages: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_selection: Option<String>,
+        /// Final literal guidance block digest, resolved by the service.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lesson_context_sha256: Option<String>,
         max_input_bytes: usize,
         max_output_bytes: usize,
         timeout_ms: u64,

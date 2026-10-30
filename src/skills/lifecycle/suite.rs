@@ -297,6 +297,34 @@ impl FrozenSuite {
         hex::encode(hasher.finalize())
     }
 
+    /// Case-ID/split-independent task and fixture-source identities for
+    /// adopted-guidance exclusion. No validator/oracle/body is retained in the
+    /// returned hashes, and fixture renaming cannot hide identical source.
+    /// This exact normalization is not a semantic-equivalence detector.
+    #[must_use]
+    pub(crate) fn lesson_root_digests(&self) -> Vec<String> {
+        let mut roots = BTreeSet::new();
+        for case in &self.suite.cases {
+            let prompt = normalized_prompt(&case.prompt);
+            let mut task = Sha256::new();
+            task.update(b"prx-lesson-task-root-v1\0");
+            task.update(prompt.as_bytes());
+            roots.insert(hex::encode(task.finalize()));
+            for fixture in &case.fixtures {
+                let mut source = Sha256::new();
+                source.update(b"prx-lesson-task-fixture-source-root-v1\0");
+                // A common/empty fixture is not an identity shared by every
+                // real task. Bind its source bytes to the actual task content.
+                source.update(u64::try_from(prompt.len()).unwrap_or(u64::MAX).to_be_bytes());
+                source.update(prompt.as_bytes());
+                source.update(u64::try_from(fixture.content.len()).unwrap_or(u64::MAX).to_be_bytes());
+                source.update(fixture.content.as_bytes());
+                roots.insert(hex::encode(source.finalize()));
+            }
+        }
+        roots.into_iter().collect()
+    }
+
     #[must_use]
     pub const fn attempt_limit(&self, split: EvalSplit) -> Option<u32> {
         match split {

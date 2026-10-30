@@ -384,6 +384,60 @@ fn acquire_cost_ledger_lock(path: &Path) -> Result<CostLedgerLockGuard> {
     }
 }
 
+/// One coherent, read-only view of existing physical owners. Missing old
+/// evidence is Unknown (None), never a fresh empty tracker or a zero balance.
+/// No mkdir, migration, reservation, settlement, projection refresh or write.
+pub(crate) fn physical_scopes_read_only(
+    workspace: &Path,
+    scopes: &[String],
+) -> Result<Option<std::collections::BTreeMap<String, super::reservation::ScopeUsage>>> {
+    anyhow::ensure!(
+        scopes.len() <= 64
+            && scopes
+                .iter()
+                .all(|scope| scope.len() == 64 && scope.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            && scopes.iter().collect::<std::collections::BTreeSet<_>>().len() == scopes.len(),
+        "invalid or repeated physical scope snapshot"
+    );
+    let path = workspace.join("state").join("costs.jsonl.lock");
+    let Some((file, _)) = open_cost_file(&path, CostFileAccess::Read)? else {
+        return Ok(None);
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock_shared() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if started.elapsed() > COST_LEDGER_LOCK_TIMEOUT {
+                    return Err(anyhow!("timed out reading the existing physical ledger"));
+                }
+                std::thread::sleep(COST_LEDGER_LOCK_POLL);
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+    let _lock = CostLedgerLockGuard { _file: file };
+    // Existing bounded no-follow readers and reservation replay validate every
+    // terminal cost projection while the same original writer lock is shared.
+    if read_state_ledger_bounded(workspace, super::reservation::JOURNAL)?.is_none()
+        || read_state_ledger_bounded(workspace, "costs.jsonl")?.is_none()
+    {
+        return Ok(None);
+    }
+    let reservations = super::reservation::Reservations::load(workspace)?;
+    let mut result = std::collections::BTreeMap::new();
+    for scope in scopes {
+        let mut usage = reservations.scope_usage(scope)?;
+        usage.models = reservations.scope_models(workspace, scope, &std::collections::BTreeSet::new())?;
+        anyhow::ensure!(
+            !usage.unresolved && usage.calls == usage.settled_calls,
+            "physical owner still has unresolved work"
+        );
+        result.insert(scope.clone(), usage);
+    }
+    Ok(Some(result))
+}
+
 /// Cost tracker for API usage monitoring and budget enforcement.
 pub struct CostTracker {
     config: CostConfig,

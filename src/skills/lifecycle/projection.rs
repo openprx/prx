@@ -55,6 +55,13 @@ pub(super) enum ProjectionChange {
     Written,
 }
 
+/// Read-only historical publication observation, never repair authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PublicationProjectionObservation {
+    Current,
+    Superseded,
+}
+
 /// Outcome of the projection pass of the recovery sweep.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectionRepair {
@@ -79,6 +86,71 @@ fn unsafe_path(path: &Path, reason: &str) -> LifecycleError {
 }
 
 impl SkillLifecycleStore {
+    /// Caller holds the proposal owner (and therefore shared store) lock.
+    /// Only the actual skill lock is acquired; no recursive store lock, mkdir,
+    /// projection refresh, reconciliation or cache mutation is allowed here.
+    pub(super) fn observe_committed_publication_locked(
+        &self,
+        _owner: &super::proposal::ProposalLock,
+        entry: &super::JournalEntry,
+    ) -> Result<PublicationProjectionObservation, LifecycleError> {
+        let invalid = || LifecycleError::ProposalRefused("publication projection is pending, missing or unsafe".into());
+        if entry.state != super::TransactionState::Committed || entry.owner_scope != *self.owner_scope() {
+            return Err(invalid());
+        }
+        let _skill = self.lock_skill(&entry.skill_id, Duration::from_secs(5))?;
+        let binding = self.active_binding(&entry.skill_id)?.ok_or_else(invalid)?;
+        if binding.transaction_id != entry.transaction_id {
+            if binding.generation <= entry.new_generation {
+                return Err(invalid());
+            }
+            let later = self.journal_entry(&binding.transaction_id)?.ok_or_else(invalid)?;
+            if later.state != super::TransactionState::Committed
+                || later.owner_scope != *self.owner_scope()
+                || later.skill_id != entry.skill_id
+                || later.candidate_revision_id != binding.revision_id
+                || later.candidate_record_digest != binding.record_digest
+                || later.new_generation != binding.generation
+                || later.enabled != binding.enabled
+                || later.finished_at.is_none()
+            {
+                return Err(invalid());
+            }
+            self.read_revision(&entry.skill_id, &binding.revision_id, Some(&binding.record_digest))?;
+            return Ok(PublicationProjectionObservation::Superseded);
+        }
+        if binding.generation != entry.new_generation
+            || binding.revision_id != entry.candidate_revision_id
+            || binding.record_digest != entry.candidate_record_digest
+            || binding.enabled != entry.enabled
+        {
+            return Err(invalid());
+        }
+        let verified = self.read_revision(&entry.skill_id, &binding.revision_id, Some(&binding.record_digest))?;
+        let skills_root = crate::skills::skills_dir(self.workspace_dir()?);
+        let metadata = fs::symlink_metadata(&skills_root).map_err(|_| invalid())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(invalid());
+        }
+        let directory = self.projection_dir_name(&skills_root, &entry.skill_id)?;
+        if !projection_is_current(&skills_root.join(&directory), &verified.bundle) {
+            return Err(invalid());
+        }
+        let marker_dir = skills_root.join(DISABLED_MARKER_DIR);
+        if let Ok(metadata) = fs::symlink_metadata(&marker_dir) {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(invalid());
+            }
+        }
+        let marker = marker_dir.join(directory);
+        match fs::symlink_metadata(&marker) {
+            Ok(metadata) if !binding.enabled && metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Err(error) if binding.enabled && error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(invalid()),
+        }
+        Ok(PublicationProjectionObservation::Current)
+    }
+
     /// The owner workspace this store lives in (`<workspace>/self/skill-lifecycle`).
     fn workspace_dir(&self) -> Result<&Path, LifecycleError> {
         self.root()

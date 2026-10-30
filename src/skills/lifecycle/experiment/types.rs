@@ -95,6 +95,13 @@ pub struct ExperimentStage {
     pub allocation: ExperimentResources,
 }
 
+/// Optional adopted-guidance lookup intent. The service resolves all evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LessonQueryIntent {
+    pub task_family: String,
+}
+
 /// Operator intent before authoritative pins and operation hashes are resolved.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,6 +112,8 @@ pub struct ExperimentDraft {
     /// Explicit intent; the service resolves the registered suite's holdout pin.
     #[serde(default, skip_serializing_if = "is_false")]
     pub verify_holdout: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson_query: Option<LessonQueryIntent>,
     pub resources: ExperimentResources,
     pub elapsed_ms: u64,
     pub max_concurrent: u32,
@@ -140,6 +149,9 @@ pub struct ExperimentPins {
     pub verification_split_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holdout_split_digest: Option<String>,
+    /// Untrusted frozen pins, verified by service admission and each physical send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lesson_snapshot: Option<crate::skills::lifecycle::adoption::LessonSnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

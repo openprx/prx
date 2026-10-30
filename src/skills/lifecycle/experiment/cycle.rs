@@ -37,6 +37,8 @@ pub struct InstructionCycleDraft {
     pub gate_allocation: Option<ExperimentResources>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holdout_allocation: Option<ExperimentResources>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson_query: Option<super::types::LessonQueryIntent>,
     pub elapsed_ms: u64,
     pub max_input_bytes: usize,
     pub max_output_bytes: usize,
@@ -333,6 +335,7 @@ impl InstructionCycleDraft {
             skill_id: self.skill_id,
             verification_split: self.verification_split,
             verify_holdout: self.holdout_allocation.is_some(),
+            lesson_query: self.lesson_query.clone(),
             resources: self.resources,
             elapsed_ms: self.elapsed_ms,
             max_concurrent: if self.schedule == InstructionSchedule::Parallel2 {
@@ -363,6 +366,7 @@ impl InstructionCycleDraft {
                     probe_stages: probes,
                     patterns: self.patterns.clone(),
                     parent_selection: parent.map(str::to_owned),
+                    lesson_context_sha256: None,
                     max_input_bytes: self.max_input_bytes,
                     max_output_bytes: self.max_output_bytes,
                     timeout_ms: self.proposal_timeout_ms,

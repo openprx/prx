@@ -85,6 +85,7 @@ async fn experiment_prepare_real_cli_fixture() -> Result<()> {
         skill_id: f.pin.skill_id.clone(),
         verification_split: EvalSplit::Validation,
         verify_holdout: false,
+        lesson_query: None,
         resources,
         elapsed_ms: 1_800_000,
         max_concurrent: 1,

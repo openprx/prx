@@ -801,8 +801,15 @@ impl SkillLifecycleStore {
         now: DateTime<Utc>,
         keep: impl Fn(&SkillExperience) -> bool,
     ) -> Result<usize, LifecycleError> {
-        let _store_lock = self.lock_store(false, CAPTURE_LOCK_TIMEOUT)?;
-        self.prune_experiences_locked(retention, now, keep, usize::MAX, true)
+        let store_lock = self.lock_store(false, CAPTURE_LOCK_TIMEOUT)?;
+        let retained = self.retained_lifecycle_runs_locked(&store_lock)?;
+        self.prune_experiences_locked(
+            retention,
+            now,
+            |record| keep(record) || lifecycle_run_referenced(record, &retained),
+            usize::MAX,
+            true,
+        )
     }
 
     /// Remove at most 128 expired, terminal, unreferenced experiences per
@@ -814,7 +821,8 @@ impl SkillLifecycleStore {
         retention: &ExperienceRetention,
         now: DateTime<Utc>,
     ) -> Result<usize, LifecycleError> {
-        let _store_lock = self.lock_store(false, CAPTURE_LOCK_TIMEOUT)?;
+        let store_lock = self.lock_store(false, CAPTURE_LOCK_TIMEOUT)?;
+        let retained_runs = self.retained_lifecycle_runs_locked(&store_lock)?;
         let mut keep = self.retained_pattern_experiences()?;
         for proposal in self.list_proposals()? {
             keep.extend(proposal.evidence_ids);
@@ -871,11 +879,42 @@ impl SkillLifecycleStore {
             |record| {
                 record.terminal.is_none()
                     || keep.contains(&record.record_id)
+                    || lifecycle_run_referenced(record, &retained_runs)
                     || super::binding::task_has_pins(self.owner_scope(), &record.task_id)
             },
             128,
             false,
         )
+    }
+
+    fn retained_lifecycle_runs_locked(
+        &self,
+        owner: &super::generation::StoreLock,
+    ) -> Result<std::collections::BTreeSet<String>, LifecycleError> {
+        let mut runs = self.lesson_retention_runs_locked(owner)?;
+        let mut examined = 0_usize;
+        for proposal in self.list_proposals()? {
+            runs.extend(proposal.evidence_ids.iter().cloned());
+            for id in &proposal.bound_evaluation_attempts {
+                examined += 1;
+                if examined > 64 {
+                    return Err(LifecycleError::ProposalRefused(
+                        "bound evaluation retention budget exhausted".into(),
+                    ));
+                }
+                self.check_bound_attempt_reference(&proposal.proposal_id, id)?;
+            }
+            // Missing, corrupt or unclean own evidence blocks this maintenance
+            // pass. Legacy None attempts are not invented into new leases.
+            self.require_bound_attempts_terminal(&proposal)?;
+            for id in &proposal.bound_evaluation_attempts {
+                let verified = self
+                    .verify_evaluation(id, None)
+                    .map_err(|_| LifecycleError::ProposalRefused("bound evaluation retention proof missing".into()))?;
+                runs.extend(verified.cases.into_iter().map(|case| case.run.run_id));
+            }
+        }
+        Ok(runs)
     }
 
     fn prune_experiences_locked(
@@ -958,4 +997,16 @@ impl SkillLifecycleStore {
         sync_dir(&dir)?;
         Ok(removed)
     }
+}
+
+fn lifecycle_run_referenced(record: &SkillExperience, runs: &std::collections::BTreeSet<String>) -> bool {
+    runs.contains(&record.record_id)
+        || runs.contains(&record.task_id)
+        || record.correlation.run_id.as_ref().is_some_and(|id| runs.contains(id))
+        || record.correlation.task_id.as_ref().is_some_and(|id| runs.contains(id))
+        || record
+            .correlation
+            .parent_run_id
+            .as_ref()
+            .is_some_and(|id| runs.contains(id))
 }

@@ -32,6 +32,7 @@ pub(super) fn draft(
         probe_allocation: base.spec.stages[0].allocation,
         evaluation_allocation: evaluation,
         holdout_allocation: additional.then_some(evaluation),
+        lesson_query: None,
         gate_allocation: None,
         elapsed_ms: 300_000,
         max_input_bytes: 65536,

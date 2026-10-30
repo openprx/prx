@@ -112,7 +112,8 @@ impl SkillLifecycleStore {
         }
         let _store = self.lock_store(true, Duration::from_millis(query.limits.elapsed_ms))?;
         budget.check()?;
-        let index = self.read_adoption_index_locked(&query.task_family, &query.skill_id)?;
+        let index =
+            self.read_adoption_index_bounded_locked(&query.task_family, &query.skill_id, query.limits.index_bytes)?;
         budget.check()?;
         let (entries, index_sha256) = if let Some((index, bytes)) = index {
             let bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -153,7 +154,24 @@ impl SkillLifecycleStore {
             }
             // Charge the known immutable bundle before the existing verifier
             // reads it; a mismatch is corruption, never an estimate or free I/O.
-            budget.charge(record.adopted_bundle_bytes)?;
+            let revision_metadata = self
+                .root()
+                .join("revisions")
+                .join(record.skill_id.as_str())
+                .join(record.adopted_revision.as_str())
+                .join("revision.json");
+            budget.check()?;
+            let metadata_bytes = read_bounded_bytes(&revision_metadata, query.limits.record_bytes)?;
+            budget.charge(u64::try_from(metadata_bytes.len()).unwrap_or(u64::MAX))?;
+            let actual_bytes = super::snapshot::bounded_bundle_metadata(
+                &self.bundle_dir(&record.skill_id, &record.adopted_revision),
+                record.adopted_bundle_bytes,
+                &mut budget,
+            )?;
+            if actual_bytes != record.adopted_bundle_bytes {
+                return Err(refusal("adopted source size changed"));
+            }
+            budget.charge(actual_bytes)?;
             let revision = self.read_revision(
                 &record.skill_id,
                 &record.adopted_revision,

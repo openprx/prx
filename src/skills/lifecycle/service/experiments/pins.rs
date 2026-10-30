@@ -116,6 +116,7 @@ impl SkillsLifecycleService {
             verification_split,
             verification_split_digest: suite.split_digest(verification_split),
             holdout_split_digest: verify_holdout.then(|| suite.split_digest(EvalSplit::Holdout)),
+            lesson_snapshot: None,
         })
     }
 }

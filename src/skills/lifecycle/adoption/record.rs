@@ -51,6 +51,7 @@ impl SupportedGuidance {
         for edit in &self.edits {
             if !matches!(edit.op.as_str(), "replace" | "append")
                 || (edit.op == "replace" && edit.old.as_ref().is_none_or(String::is_empty))
+                || (edit.op == "append" && edit.old.is_some())
                 || edit.new.is_empty()
             {
                 return Err(refusal("unsupported adopted edit"));
@@ -96,6 +97,8 @@ pub(super) struct AdoptionRecord {
     pub excluded_roots: Vec<String>,
     pub source: SupportedGuidance,
     pub root_cost_evidence_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_cost_evidence: Option<super::proof::AdoptionRootCostEvidence>,
     pub committed_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -211,7 +214,7 @@ impl SkillLifecycleStore {
         }
         Ok((sealed.value, sha256))
     }
-    fn adoption_sealed_bytes<T: Serialize>(
+    pub(super) fn adoption_sealed_bytes<T: Serialize>(
         &self,
         value: &T,
         path: &Path,
@@ -244,6 +247,18 @@ impl SkillLifecycleStore {
             return Err(refusal("adoption evidence belongs to another origin"));
         }
         record.source.render()?;
+        match (&record.root_cost_evidence, &record.root_cost_evidence_sha256) {
+            (Some(body), Some(hash))
+                if body.owner_scope == record.owner_scope
+                    && body.experiment_id == record.experiment_id
+                    && body.experiment_sha256 == record.experiment_sha256
+                    && body
+                        .digest()
+                        .map_err(|_| refusal("invalid adoption root cost evidence"))?
+                        == *hash => {}
+            (None, None) => {} // Legacy missing coverage remains explicitly unknown.
+            _ => return Err(refusal("adoption root cost evidence digest or owner changed")),
+        }
         Ok(record)
     }
     pub(super) fn read_adoption_index_locked(
@@ -251,13 +266,21 @@ impl SkillLifecycleStore {
         family: &str,
         skill: &SkillId,
     ) -> Result<Option<(AdoptionIndex, Vec<u8>)>, LifecycleError> {
+        self.read_adoption_index_bounded_locked(family, skill, INDEX_CAP)
+    }
+    pub(super) fn read_adoption_index_bounded_locked(
+        &self,
+        family: &str,
+        skill: &SkillId,
+        cap: u64,
+    ) -> Result<Option<(AdoptionIndex, Vec<u8>)>, LifecycleError> {
         let path = self.adoption_index_path(family, skill)?;
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(LifecycleError::io(&path, error)),
             _ => {}
         }
-        let bytes = read_bounded_bytes(&path, INDEX_CAP)?;
+        let bytes = read_bounded_bytes(&path, cap.min(INDEX_CAP))?;
         let (index, _): (AdoptionIndex, _) = self.read_adoption_sealed(&bytes, b"prx-adoption-index-v1")?;
         if index.schema_version != 1
             || index.owner_scope != *self.owner_scope()
@@ -272,8 +295,9 @@ impl SkillLifecycleStore {
         }
         Ok(Some((index, bytes)))
     }
-    pub(super) fn persist_verified_adoption(
+    pub(super) fn persist_verified_adoption_locked(
         &self,
+        _owner: &crate::skills::lifecycle::proposal::ProposalLock,
         verified: &VerifiedAdoptionRecord,
     ) -> Result<LessonRef, LifecycleError> {
         let record = &verified.0;
@@ -281,7 +305,6 @@ impl SkillLifecycleStore {
             return Err(refusal("adoption owner mismatch"));
         }
         let reference = record.reference()?;
-        let _store = self.lock_store(true, Duration::from_secs(5))?;
         let _skill = self.lock_skill(&record.skill_id, Duration::from_secs(5))?;
         let root = self.adoption_directory();
         ensure_dir_synced(self.root(), &root)?;
@@ -293,7 +316,12 @@ impl SkillLifecycleStore {
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > RECORD_CAP {
             return Err(refusal("adoption exceeds record capacity"));
         }
-        if fs::symlink_metadata(&path).is_ok() {
+        let existed = match fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(LifecycleError::io(&path, error)),
+        };
+        if existed {
             self.decode_adoption(&read_bounded_bytes(&path, RECORD_CAP)?, &reference)?;
         } else {
             self.write_atomic(&record.skill_id, &path, &bytes)?;
@@ -319,6 +347,11 @@ impl SkillLifecycleStore {
                 return Err(refusal("conflicting adoption index pin"));
             }
             return Ok(reference);
+        }
+        if existed {
+            return Err(refusal(
+                "existing adoption has no exact status index; refusing possible resurrection",
+            ));
         }
         index.entries.push(IndexEntry {
             reference: reference.clone(),

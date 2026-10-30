@@ -4,6 +4,8 @@ mod development_proposals;
 mod gate_review;
 pub(in crate::skills::lifecycle) use gate_review::{GateReviewPin, VerifiedGateReviewHistory};
 mod guarded_proposer;
+mod lesson_context;
+mod lesson_preparation;
 mod operations;
 mod pins;
 mod probes;
@@ -28,13 +30,23 @@ impl SkillsLifecycleService {
     /// Operator drafts contain intent and limits; they never invent pin values.
     pub(crate) fn plan_experiment_draft(
         &self,
-        draft: crate::skills::lifecycle::experiment::ExperimentDraft,
+        mut draft: crate::skills::lifecycle::experiment::ExperimentDraft,
         config: &Config,
     ) -> Result<FrozenExperiment> {
         self.require_evaluation("planning an instruction experiment")?;
         let created_at = Utc::now();
         let duration = chrono::Duration::try_milliseconds(i64::try_from(draft.elapsed_ms)?)
             .context("experiment duration is out of range")?;
+        let expires_at = created_at
+            .checked_add_signed(duration)
+            .context("experiment expiry is out of range")?;
+        let mut pins = self.experiment_pins(&draft.skill_id, config, draft.verification_split, draft.verify_holdout)?;
+        if let Some(intent) = &draft.lesson_query {
+            pins.lesson_snapshot = Some(self.resolve_lesson_query(intent, &pins, created_at, expires_at)?);
+        }
+        for stage in &mut draft.stages {
+            Self::pin_lesson_operation(pins.lesson_snapshot.as_ref(), &stage.id, &mut stage.operation)?;
+        }
         let operations = draft
             .stages
             .iter()
@@ -44,14 +56,12 @@ impl SkillsLifecycleService {
             schema_version: crate::skills::lifecycle::experiment::EXPERIMENT_SCHEMA_VERSION,
             id: draft.id,
             owner_scope: self.owner_scope().clone(),
-            pins: self.experiment_pins(&draft.skill_id, config, draft.verification_split, draft.verify_holdout)?,
+            pins,
             resources: draft.resources,
             elapsed_ms: draft.elapsed_ms,
             max_concurrent: draft.max_concurrent,
             created_at,
-            expires_at: created_at
-                .checked_add_signed(duration)
-                .context("experiment expiry is out of range")?,
+            expires_at,
             stages: draft
                 .stages
                 .into_iter()
@@ -152,16 +162,18 @@ impl SkillsLifecycleService {
             plan.spec().owner_scope == *self.owner_scope(),
             "experiment belongs to another owner"
         );
+        let mut expected_pins = self.experiment_pins(
+            &plan.spec().pins.skill_id,
+            config,
+            plan.spec().pins.verification_split,
+            plan.spec().pins.holdout_split_digest.is_some(),
+        )?;
+        expected_pins.lesson_snapshot = plan.spec().pins.lesson_snapshot.clone();
         ensure!(
-            plan.spec().pins
-                == self.experiment_pins(
-                    &plan.spec().pins.skill_id,
-                    config,
-                    plan.spec().pins.verification_split,
-                    plan.spec().pins.holdout_split_digest.is_some()
-                )?,
+            plan.spec().pins == expected_pins,
             "experiment runtime, baseline or policy pins changed"
         );
+        self.check_lesson_pins(plan)?;
         Ok(())
     }
     /// Recovery never dispatches work. Dispatched stages become unknown, and

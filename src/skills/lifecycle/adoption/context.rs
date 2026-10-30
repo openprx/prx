@@ -102,8 +102,8 @@ pub(crate) enum LessonPlacement {
     FirstSoleUserText,
 }
 
-/// Opaque runtime data, not serializable authority. This interface commit
-/// deliberately exposes no factory: unverified snapshots cannot create one.
+/// Opaque runtime data, not serializable authority. Only the actual bound
+/// editor factory below may construct it after signed-source revalidation.
 pub(crate) struct PreparedLessonContext {
     store: Arc<SkillLifecycleStore>,
     skill_id: SkillId,
@@ -115,6 +115,7 @@ pub(crate) struct PreparedLessonContext {
     expected_user_slot_sha256: String,
     expected_user_slot_bytes: u64,
     placement: LessonPlacement,
+    plan: crate::skills::lifecycle::experiment::FrozenExperiment,
 }
 impl PreparedLessonContext {
     pub(crate) fn block(&self) -> &str {
@@ -158,17 +159,29 @@ impl PreparedLessonContext {
         Ok(digest)
     }
 
-    /// The small contract commit has no verified adoption/profile factory.
-    /// Until A installs that proof and runtime revalidation, no transport can
-    /// acquire a handoff guard; callers must preserve admitted liability.
+    /// Hold the existing store shared owner through B's durable handoff write.
+    /// Status invalidation and retention take this same owner exclusively.
     pub(crate) fn lock_handoff(
         &self,
-        _actual_model: &ModelBinding,
-        _now: DateTime<Utc>,
+        actual_model: &ModelBinding,
+        now: DateTime<Utc>,
     ) -> Result<LessonHandoffGuard<'_>, LifecycleError> {
-        Err(LifecycleError::ProposalRefused(
-            "verified lesson preparation is unavailable".into(),
-        ))
+        let snapshot = self
+            .plan
+            .spec()
+            .pins
+            .lesson_snapshot
+            .as_ref()
+            .ok_or_else(|| super::record::refusal("prepared lesson snapshot missing"))?;
+        let store_lock = self
+            .store
+            .lock_store(true, std::time::Duration::from_millis(snapshot.limits.elapsed_ms))?;
+        self.store
+            .validate_prepared_lesson_locked(&self.plan, &self.binding, actual_model, now)?;
+        Ok(LessonHandoffGuard {
+            _store_lock: store_lock,
+            prepared: self,
+        })
     }
 }
 
@@ -187,5 +200,132 @@ impl LessonHandoffGuard<'_> {
     }
     pub(in crate::skills::lifecycle) const fn prepared(&self) -> &PreparedLessonContext {
         self.prepared
+    }
+    /// B calls only after taking this target skill lock, before its first
+    /// durable handoff write. Publication cannot change the active target in
+    /// the shared-store to actual-skill acquisition interval unnoticed.
+    pub(in crate::skills::lifecycle) fn recheck_target_locked(&self, now: DateTime<Utc>) -> Result<(), LifecycleError> {
+        self.prepared.store.validate_prepared_lesson_locked(
+            &self.prepared.plan,
+            &self.prepared.binding,
+            &self.prepared.plan.spec().pins.model,
+            now,
+        )
+    }
+}
+
+impl SkillLifecycleStore {
+    pub(in crate::skills::lifecycle) fn prepare_verified_lesson_context(
+        self: &Arc<Self>,
+        plan: &crate::skills::lifecycle::experiment::FrozenExperiment,
+        binding: ExperimentRunBinding,
+        final_user: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Arc<PreparedLessonContext>>, LifecycleError> {
+        let Some(snapshot) = &plan.spec().pins.lesson_snapshot else {
+            return Ok(None);
+        };
+        let _owner = self.lock_store(true, std::time::Duration::from_millis(snapshot.limits.elapsed_ms))?;
+        self.validate_prepared_lesson_locked(plan, &binding, &plan.spec().pins.model, now)?;
+        if snapshot.entries.is_empty() {
+            return Ok(None);
+        }
+        // NFC is identity only for this supported ASCII editor surface. The
+        // frozen profile's byte alphabet and boundary reserve cover its block.
+        if !final_user.is_ascii() {
+            return Err(super::record::refusal(
+                "verified lesson profile requires an ASCII logical user slot",
+            ));
+        }
+        let block = super::snapshot::format_lesson_block(snapshot, &binding.stage)?;
+        if final_user.matches(&block).count() != 1 {
+            return Err(super::record::refusal(
+                "final editor user slot has no unique complete frozen lesson block",
+            ));
+        }
+        let prepared = PreparedLessonContext {
+            store: Arc::clone(self),
+            skill_id: plan.spec().pins.skill_id.clone(),
+            binding,
+            refs: snapshot.entries.iter().map(|entry| entry.reference.clone()).collect(),
+            snapshot_sha256: super::record::digest(
+                &serde_json::to_vec(snapshot).map_err(|_| super::record::refusal("lesson snapshot encoding failed"))?,
+            ),
+            block_sha256: super::record::digest(block.as_bytes()),
+            block,
+            expected_user_slot_sha256: super::record::digest(final_user.as_bytes()),
+            expected_user_slot_bytes: u64::try_from(final_user.len())
+                .map_err(|_| super::record::refusal("lesson user size overflow"))?,
+            placement: LessonPlacement::FirstSoleUserText,
+            plan: plan.clone(),
+        };
+        Ok(Some(Arc::new(prepared)))
+    }
+
+    fn validate_prepared_lesson_locked(
+        &self,
+        plan: &crate::skills::lifecycle::experiment::FrozenExperiment,
+        binding: &ExperimentRunBinding,
+        actual_model: &ModelBinding,
+        now: DateTime<Utc>,
+    ) -> Result<(), LifecycleError> {
+        use crate::skills::lifecycle::experiment::{ExperimentStageKind, StageState};
+        let refuse = super::record::refusal;
+        plan.ensure_live(now).map_err(|_| refuse("lesson experiment expired"))?;
+        let pins = &plan.spec().pins;
+        if self.owner_scope() != &plan.spec().owner_scope
+            || actual_model != &pins.model
+            || binding.experiment_sha256 != plan.digest()
+            || !plan.spec().stages.iter().any(|stage| {
+                stage.id == binding.stage
+                    && stage.input_sha256 == binding.input_sha256
+                    && stage.kind == ExperimentStageKind::ModelProposal
+            })
+        {
+            return Err(refuse("lesson actual owner, model or editor binding changed"));
+        }
+        let journal = self
+            .read_experiment(&plan.spec().id, plan.digest())
+            .map_err(|_| refuse("lesson admitted experiment cannot be read"))?;
+        if journal.state.cancelled || !matches!(journal.state.stages.get(&binding.stage), Some(StageState::Dispatched))
+        {
+            return Err(refuse("lesson editor is not currently dispatched"));
+        }
+        let baseline = self
+            .active_binding(&pins.skill_id)?
+            .ok_or_else(|| refuse("lesson baseline missing"))?;
+        if !baseline.enabled
+            || baseline.revision_id != pins.baseline_revision
+            || baseline.record_digest != pins.baseline_record_digest
+            || baseline.generation != pins.baseline_generation
+        {
+            return Err(refuse("lesson active baseline changed"));
+        }
+        let snapshot = pins
+            .lesson_snapshot
+            .as_ref()
+            .ok_or_else(|| refuse("lesson snapshot missing"))?;
+        let suite = self
+            .read_suite(&pins.suite_digest)
+            .map_err(|_| refuse("lesson suite cannot be verified"))?;
+        if suite
+            .suite()
+            .cases
+            .iter()
+            .any(|case| case.task_family != snapshot.task_family)
+        {
+            return Err(refuse("lesson task family changed"));
+        }
+        let compatibility =
+            self.lesson_profile_compatibility(actual_model, &pins.policy_sha256, &pins.binary_sha256)?;
+        self.validate_lesson_snapshot_locked(
+            snapshot,
+            &pins.skill_id,
+            &pins.baseline_revision,
+            &pins.baseline_record_digest,
+            &compatibility,
+            &suite.lesson_root_digests(),
+            now,
+        )
     }
 }

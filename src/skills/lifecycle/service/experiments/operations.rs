@@ -197,6 +197,13 @@ impl SkillsLifecycleService {
                     ..
                 } = operation
                 {
+                    let mut expected_operation = operation.clone();
+                    Self::pin_lesson_operation(
+                        journal.plan.spec().pins.lesson_snapshot.as_ref(),
+                        stage,
+                        &mut expected_operation,
+                    )?;
+                    ensure!(expected_operation == *operation, "development lesson input pin changed");
                     self.development_context(journal, stage, *role, probe_stages, parent_selection.as_deref())?;
                 }
             }
@@ -518,6 +525,7 @@ impl SkillsLifecycleService {
                 patterns,
                 probe_stages,
                 parent_selection,
+                lesson_context_sha256: _,
                 max_input_bytes,
                 max_output_bytes,
                 timeout_ms,
@@ -526,6 +534,7 @@ impl SkillsLifecycleService {
                     config,
                     journal,
                     stage,
+                    operation,
                     *role,
                     patterns.clone(),
                     probe_stages,

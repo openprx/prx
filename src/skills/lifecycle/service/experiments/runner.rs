@@ -12,12 +12,15 @@ impl SkillsLifecycleService {
         config: &Config,
     ) -> Result<InstructionExperimentPlan> {
         let draft = draft.compile()?;
-        let operations = draft
+        let mut operations: std::collections::BTreeMap<_, _> = draft
             .stages
             .iter()
             .map(|stage| (stage.id.clone(), stage.operation.clone()))
             .collect();
         let spec = self.plan_experiment_draft(draft, config)?.spec().clone();
+        for (stage, operation) in &mut operations {
+            Self::pin_lesson_operation(spec.pins.lesson_snapshot.as_ref(), stage, operation)?;
+        }
         let plan = InstructionExperimentPlan { spec, operations };
         plan.validate()?;
         Ok(plan)

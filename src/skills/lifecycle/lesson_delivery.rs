@@ -97,6 +97,7 @@ pub(crate) fn persist_lesson_delivery(
     let skill = guard.skill_id();
     let remaining = request.deadline.saturating_duration_since(Instant::now());
     let _skill = store.lock_skill(skill, remaining.min(super::PUBLICATION_LOCK_TIMEOUT))?;
+    guard.recheck_target_locked(Utc::now())?;
     active(cancel, request.deadline)?;
     let physical = &request.physical;
     for id in [&physical.turn_id, &physical.attempt_id] {

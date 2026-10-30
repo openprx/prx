@@ -41,6 +41,7 @@ pub(crate) fn specification() -> ExperimentSpec {
             verification_split: EvalSplit::Validation,
             verification_split_digest: "c".repeat(64),
             holdout_split_digest: None,
+            lesson_snapshot: None,
         },
         resources,
         max_concurrent: 1,

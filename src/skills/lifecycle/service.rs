@@ -20,6 +20,8 @@
 //! `DraftOnly`-like for publication (spec 8.2): [`SkillsLifecycleSettings::
 //! publication_block`] says why.
 
+mod adoption_status;
+mod adoptions;
 mod experiments;
 pub(in crate::skills::lifecycle) use experiments::{GateReviewPin, VerifiedGateReviewHistory};
 mod proposals;

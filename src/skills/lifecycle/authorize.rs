@@ -75,7 +75,7 @@ pub struct PublicationOutcome {
 }
 
 /// Deterministic transaction id of a proposal's publication attempt.
-fn publication_tx(proposal_id: &str, attempt: u32) -> Result<TransactionId, LifecycleError> {
+pub(super) fn publication_tx(proposal_id: &str, attempt: u32) -> Result<TransactionId, LifecycleError> {
     let digest = proposal_id.strip_prefix("prop-").unwrap_or(proposal_id);
     TransactionId::parse(&format!("pub-{digest}-{attempt}"))
 }
@@ -599,7 +599,7 @@ pub struct Finalization {
 
 /// Digest of the authorization a publication runs under; pinned in the
 /// PREPARED journal entry.
-fn authorization_pin(proposal_id: &str, auth: &PublicationAuthorization) -> String {
+pub(super) fn authorization_pin(proposal_id: &str, auth: &PublicationAuthorization) -> String {
     let mut hasher = Sha256::new();
     hasher.update(AUTHORIZATION_PIN_DOMAIN);
     for part in [
