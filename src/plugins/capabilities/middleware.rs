@@ -303,8 +303,10 @@ impl MiddlewareChain {
     /// Observe the real store-entry boundary for a single-adapter test chain.
     #[cfg(test)]
     pub(crate) fn notify_next_store_entry(&self, entered: tokio::sync::oneshot::Sender<()>) {
-        assert_eq!(self.middlewares.len(), 1);
-        self.middlewares[0].inner.notify_next_store_entry(entered);
+        let [middleware] = self.middlewares.as_slice() else {
+            panic!("store-entry notification requires exactly one middleware");
+        };
+        middleware.inner.notify_next_store_entry(entered);
     }
 
     /// Returns true if the chain has no middlewares.
