@@ -78,8 +78,8 @@ pub use consolidate::{ConsolidationOutcome, ConsolidationRequest};
 pub use evaluate::{
     Arm, ArmBinding, ArtifactDigest, CaseExecutor, CaseReceipt, CaseVerdict, CleanupState, EVALUATION_SCHEMA_VERSION,
     EvaluationError, EvaluationOutcome, EvaluationReceipt, EvaluationSummary, ExecutionRequest, ExperienceTerminalFact,
-    HydrationFact, IncompleteReason, InstallSkill, InstalledSkill, InvalidReason, RUNNER_IDENTITY, RunObservation,
-    RunReceipt, RunTerminal, ValidatorOutcome, VerifiedEvaluation,
+    HydrationFact, IncompleteReason, InstallSkill, InstalledSkill, InvalidReason, ProposalEvaluationBinding,
+    RUNNER_IDENTITY, RunObservation, RunReceipt, RunTerminal, ValidatorOutcome, VerifiedEvaluation,
 };
 pub use evaluator::{EvaluationRequest, RecordedEvaluation};
 pub use executable::{

@@ -369,6 +369,10 @@ pub struct SkillProposal {
     /// earlier do not count for it.
     #[serde(default)]
     pub evaluating_since: Option<DateTime<Utc>>,
+    /// Append-only owner-local references to newly bound evaluation attempts.
+    /// Empty legacy records acquire no inferred execution lease.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bound_evaluation_attempts: Vec<String>,
     /// Set when the proposal became `PublicationAuthorized` (SL08).
     #[serde(default)]
     pub authorization: Option<PublicationAuthorization>,
@@ -482,6 +486,37 @@ pub(super) struct ProposalLock {
 }
 
 impl SkillLifecycleStore {
+    /// Restricted completion of the exact observed epoch, under the same owner
+    /// lock and pending-attempt guard as every other proposal mutation.
+    pub(super) fn finish_bound_evaluation(
+        &self,
+        expected: &super::ProposalEvaluationBinding,
+        note: &str,
+    ) -> Result<SkillProposal, LifecycleError> {
+        let lock = self.lock_proposals()?;
+        let mut proposal = self
+            .read_proposal(&expected.proposal_id)?
+            .ok_or_else(|| LifecycleError::ProposalRefused("evaluated proposal is missing".into()))?;
+        if note.trim().is_empty()
+            || !matches!(proposal.status, ProposalStatus::Evaluating | ProposalStatus::Evaluated)
+            || proposal.evaluation_epoch != expected.evaluation_epoch
+            || proposal.evaluating_since != Some(expected.evaluating_since)
+        {
+            return Err(LifecycleError::ProposalRefused(
+                "proposal no longer matches the completed evaluation epoch".into(),
+            ));
+        }
+        self.require_bound_epoch_terminal(&proposal)?;
+        if proposal.status == ProposalStatus::Evaluated {
+            return Ok(proposal);
+        }
+        proposal.status = ProposalStatus::Evaluated;
+        proposal.status_reason = Some(bounded(note));
+        proposal.updated_at = Utc::now();
+        self.write_proposal(&lock, &proposal)?;
+        Ok(proposal)
+    }
+
     fn proposals_dir(&self) -> PathBuf {
         self.root().join(PROPOSALS_DIR)
     }
@@ -588,6 +623,24 @@ impl SkillLifecycleStore {
         if record.candidate_revision.is_some() != record.diff.is_some() {
             return Err(tampered("candidate revision and diff must be present together"));
         }
+        self.verify_bound_evaluation_refs(record, path)?;
+        Ok(())
+    }
+
+    fn verify_bound_evaluation_refs(&self, record: &SkillProposal, path: &Path) -> Result<(), LifecycleError> {
+        let unique: std::collections::BTreeSet<_> = record.bound_evaluation_attempts.iter().collect();
+        if record.bound_evaluation_attempts.len() > super::evaluate::MAX_EVALUATION_ENTRIES
+            || unique.len() != record.bound_evaluation_attempts.len()
+            || record
+                .bound_evaluation_attempts
+                .iter()
+                .any(|id| !super::evaluate::is_evaluation_id(id))
+        {
+            return Err(LifecycleError::Tampered {
+                path: path.to_path_buf(),
+                reason: "invalid bound evaluation references".into(),
+            });
+        }
         Ok(())
     }
 
@@ -678,8 +731,38 @@ impl SkillLifecycleStore {
     /// Writes (replaces) `proposal.json`. The caller holds the proposal lock.
     pub(super) fn write_proposal(&self, lock: &ProposalLock, proposal: &SkillProposal) -> Result<(), LifecycleError> {
         let dir = self.proposal_dir(&proposal.proposal_id);
-        ensure_dir_synced(&self.proposals_dir(), &dir)?;
         let path = dir.join(PROPOSAL_FILE);
+        self.verify_bound_evaluation_refs(proposal, &path)?;
+        let previous = self.read_proposal_record(&proposal.proposal_id)?;
+        let old_refs = previous
+            .as_ref()
+            .map_or(&[][..], |old| old.bound_evaluation_attempts.as_slice());
+        if !proposal.bound_evaluation_attempts.starts_with(old_refs) {
+            return Err(LifecycleError::ProposalRefused(
+                "bound evaluation references are append-only".into(),
+            ));
+        }
+        for id in old_refs {
+            self.check_bound_attempt_reference(&proposal.proposal_id, id)?;
+        }
+        for id in proposal.bound_evaluation_attempts.iter().skip(old_refs.len()) {
+            self.check_new_bound_attempt(proposal, id)?;
+        }
+        if let Some(previous) = previous {
+            if previous.status != proposal.status
+                || previous.evaluation_epoch != proposal.evaluation_epoch
+                || previous.evaluating_since != proposal.evaluating_since
+                || previous.candidate_revision != proposal.candidate_revision
+                || previous.baseline_revision != proposal.baseline_revision
+                || previous.required_suite != proposal.required_suite
+                || previous.expected_generation != proposal.expected_generation
+                || previous.skill_id != proposal.skill_id
+                || previous.owner_scope != proposal.owner_scope
+            {
+                self.require_bound_attempts_terminal(&previous)?;
+            }
+        }
+        ensure_dir_synced(&self.proposals_dir(), &dir)?;
         self.write_atomic(&lock.lock_id, &path, &record_bytes(proposal, &path)?)
     }
 

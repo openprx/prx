@@ -51,6 +51,9 @@ pub enum ExperimentOperation {
     SelectedEvaluation {
         selection_stage: String,
         split: EvalSplit,
+        /// The verified primary validation required before one final holdout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        validation_stage: Option<String>,
     },
 }
 impl ExperimentOperation {

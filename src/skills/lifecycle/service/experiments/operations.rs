@@ -86,6 +86,7 @@ impl SkillsLifecycleService {
         if !journal.state.qualified(&journal.plan) {
             return Ok(false);
         }
+        let mut splits = std::collections::BTreeMap::new();
         for stage in &journal.plan.spec().stages {
             if stage.kind != ExperimentStageKind::IndependentVerification {
                 continue;
@@ -110,11 +111,23 @@ impl SkillsLifecycleService {
                         && verified.receipt_digest == *digest
                         && verified.outcome.is_pass()
                     {
+                        splits.insert(verified.receipt.split, verified.receipt.proposal_evaluation.clone());
                         matched = true;
                     }
                 }
             }
             if !matched {
+                return Ok(false);
+            }
+        }
+        let pins = &journal.plan.spec().pins;
+        if !splits.contains_key(&pins.verification_split) {
+            return Ok(false);
+        }
+        if pins.holdout_split_digest.is_some() {
+            let validation = splits.get(&EvalSplit::Validation).and_then(Option::as_ref);
+            let holdout = splits.get(&EvalSplit::Holdout).and_then(Option::as_ref);
+            if validation.is_none() || validation != holdout {
                 return Ok(false);
             }
         }
@@ -218,16 +231,24 @@ impl SkillsLifecycleService {
             } => {
                 self.choose_development_candidate(journal, stage, probe_stages, parent_selections)?;
             }
-            ExperimentOperation::SelectedEvaluation { selection_stage, split } => {
+            ExperimentOperation::SelectedEvaluation {
+                selection_stage,
+                split,
+                validation_stage,
+            } => {
                 ensure!(
                     declared.dependencies.contains(selection_stage),
                     "selection is not a direct dependency"
                 );
                 ensure!(
-                    *split == journal.plan.spec().pins.verification_split,
+                    *split == journal.plan.spec().pins.verification_split && validation_stage.is_none()
+                        || *split == EvalSplit::Holdout && validation_stage.is_some(),
                     "final split was not admitted"
                 );
                 self.selected_development_proposal(journal, selection_stage)?;
+                if let Some(validation) = validation_stage {
+                    self.holdout_binding(journal, stage, selection_stage, validation)?;
+                }
             }
         }
         Ok(())
@@ -270,6 +291,12 @@ impl SkillsLifecycleService {
         };
         let receipt = &verified.receipt;
         ensure!(
+            receipt.proposal_evaluation.as_ref().is_none_or(|binding| {
+                binding.evaluation_epoch > 0 && binding.evaluating_since <= receipt.started_at
+            }),
+            "evaluation has an invalid sealed proposal window"
+        );
+        ensure!(
             receipt.experiment.as_ref() == Some(&expected),
             "evaluation is from another experiment, stage or input"
         );
@@ -280,7 +307,8 @@ impl SkillsLifecycleService {
                 && receipt.observed_generation == pins.baseline_generation
                 && receipt.end_generation == pins.baseline_generation
                 && receipt.baseline.as_ref().map(|arm| &arm.revision_id) == Some(&pins.baseline_revision)
-                && receipt.split == pins.verification_split,
+                && (receipt.split == pins.verification_split
+                    || receipt.split == EvalSplit::Holdout && pins.holdout_split_digest.is_some()),
             "evaluation does not match admitted independent verification"
         );
         ensure!(
@@ -298,12 +326,90 @@ impl SkillsLifecycleService {
         let matching_candidate = proposal_stages
             .iter()
             .filter_map(|dependency| self.experiment_proposal(journal, dependency).ok())
-            .any(|proposal| proposal.candidate_revision.as_ref() == Some(&receipt.candidate.revision_id));
+            .any(|proposal| {
+                proposal.candidate_revision.as_ref() == Some(&receipt.candidate.revision_id)
+                    && receipt.proposal_evaluation.as_ref().map_or_else(
+                        || pins.holdout_split_digest.is_none(),
+                        |binding| binding.proposal_id == proposal.proposal_id,
+                    )
+            });
         ensure!(
             matching_candidate,
             "evaluation candidate is not from the admitted proposal"
         );
         Ok(verified)
+    }
+
+    /// Additional holdout is never an entry point to reopen or review a proposal.
+    fn holdout_binding(
+        &self,
+        journal: &ExperimentJournal,
+        stage: &str,
+        selection: &str,
+        validation: &str,
+    ) -> Result<crate::skills::lifecycle::ProposalEvaluationBinding> {
+        let pins = &journal.plan.spec().pins;
+        ensure!(
+            pins.verification_split == EvalSplit::Validation && pins.holdout_split_digest.is_some(),
+            "additional holdout was not admitted"
+        );
+        let declared = journal
+            .plan
+            .spec()
+            .stages
+            .iter()
+            .find(|value| value.id == stage)
+            .context("holdout stage missing")?;
+        let primary = journal
+            .plan
+            .spec()
+            .stages
+            .iter()
+            .find(|value| value.id == validation)
+            .context("validation stage missing")?;
+        ensure!(
+            primary.input_sha256
+                == (ExperimentOperation::SelectedEvaluation {
+                    selection_stage: selection.into(),
+                    split: EvalSplit::Validation,
+                    validation_stage: None,
+                })
+                .digest()?,
+            "validation belongs to another selection or operation"
+        );
+        let verified = self.verified_stage_evaluation(journal, validation)?;
+        ensure!(
+            verified.outcome.is_pass() && verified.receipt.split == EvalSplit::Validation,
+            "holdout requires passing validation"
+        );
+        let verify_digest = (ExperimentOperation::Verify {
+            evaluation_stage: validation.into(),
+        })
+        .digest()?;
+        ensure!(
+            declared.dependencies.iter().any(|dependency| {
+                journal.plan.spec().stages.iter().any(|value| {
+                    &value.id == dependency
+                        && value.kind == ExperimentStageKind::IndependentVerification
+                        && value.input_sha256 == verify_digest
+                        && value.dependencies.contains(&validation.to_owned())
+                        && journal
+                            .state
+                            .stages
+                            .get(dependency)
+                            .is_some_and(super::StageState::successful)
+                        && journal.entries.iter().any(|entry| matches!(&entry.event,
+                            ExperimentEvent::Settled { stage, reference: Some(reference), evidence_sha256, successful: true, .. }
+                            if stage == dependency && reference == &verified.receipt.record_id && evidence_sha256 == &verified.receipt_digest))
+                })
+            }),
+            "holdout has no successful direct validation verifier"
+        );
+        let selected = self
+            .selected_development_proposal(journal, selection)?
+            .context("holdout has no selected proposal")?;
+        let proposal = self.experiment_proposal(journal, &selected)?;
+        Ok(self.require_validation_epoch(&proposal.proposal_id, &verified)?)
     }
     pub(super) async fn execute_stage_operation(
         &self,
@@ -383,36 +489,8 @@ impl SkillsLifecycleService {
                 })
             }
             ExperimentOperation::Evaluation { proposal_stage, split } => {
-                let proposal = self.experiment_proposal(journal, proposal_stage)?;
-                if proposal.status != crate::skills::lifecycle::ProposalStatus::Evaluating {
-                    self.review_source(&proposal.proposal_id, "PRXExperiment")?;
-                    self.begin_evaluation(&proposal.proposal_id, "admitted bounded experiment")?;
-                }
-                let scratch = tempfile::Builder::new()
-                    .prefix("prx-experiment-eval-")
-                    .tempdir_in(&config.workspace_dir)?;
-                // The evaluator owns child workers that can outlive a dropped
-                // waiter. Preserve their parent directory on every error.
-                let scratch = scratch.keep();
-                let executor = AgentCaseExecutor::new(
-                    config.clone(),
-                    scratch.clone(),
-                    0.0,
-                    AccountingOwner::new(config.workspace_dir.clone()),
-                );
-                let evaluation = self.evaluate(&proposal.proposal_id, *split, &executor, cancel).await?;
-                runtime.account_output(serde_json::to_vec(&evaluation.receipt)?.len())?;
-                ensure!(
-                    std::fs::read_dir(&scratch)?.next().is_none(),
-                    "trial workspaces remain quarantined; cleanup is unconfirmed"
-                );
-                std::fs::remove_dir(&scratch)?;
-                Ok(StageEvidence {
-                    record_id: evaluation.receipt.record_id,
-                    digest: evaluation.receipt_digest,
-                    successful: true,
-                    scratch_bytes: 0,
-                })
+                self.execute_proposal_evaluation(config, journal, proposal_stage, *split, None, cancel)
+                    .await
             }
             ExperimentOperation::Verify { evaluation_stage } => {
                 let verified = self.verified_stage_evaluation(journal, evaluation_stage)?;
@@ -457,29 +535,78 @@ impl SkillsLifecycleService {
                 probe_stages,
                 parent_selections,
             } => self.choose_development_candidate(journal, stage, probe_stages, parent_selections),
-            ExperimentOperation::SelectedEvaluation { selection_stage, split } => {
-                match self.selected_development_proposal(journal, selection_stage)? {
-                    Some(proposal_stage) => {
-                        Box::pin(self.execute_stage_operation(
-                            config,
-                            journal,
-                            stage,
-                            &ExperimentOperation::Evaluation {
-                                proposal_stage,
-                                split: *split,
-                            },
-                            cancel,
-                        ))
-                        .await
-                    }
-                    None => Ok(StageEvidence {
-                        record_id: "baseline".into(),
-                        digest: journal.plan.spec().pins.baseline_record_digest.clone(),
-                        successful: false,
-                        scratch_bytes: 0,
-                    }),
+            ExperimentOperation::SelectedEvaluation {
+                selection_stage,
+                split,
+                validation_stage,
+            } => match self.selected_development_proposal(journal, selection_stage)? {
+                Some(proposal_stage) => {
+                    let expected = validation_stage
+                        .as_deref()
+                        .map(|validation| self.holdout_binding(journal, stage, selection_stage, validation))
+                        .transpose()?;
+                    self.execute_proposal_evaluation(
+                        config,
+                        journal,
+                        &proposal_stage,
+                        *split,
+                        expected.as_ref(),
+                        cancel,
+                    )
+                    .await
                 }
-            }
+                None => Ok(StageEvidence {
+                    record_id: "baseline".into(),
+                    digest: journal.plan.spec().pins.baseline_record_digest.clone(),
+                    successful: false,
+                    scratch_bytes: 0,
+                }),
+            },
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_proposal_evaluation(
+        &self,
+        config: &Config,
+        journal: &ExperimentJournal,
+        proposal_stage: &str,
+        split: EvalSplit,
+        expected: Option<&crate::skills::lifecycle::ProposalEvaluationBinding>,
+        cancel: &CancellationToken,
+    ) -> Result<StageEvidence> {
+        let proposal = self.experiment_proposal(journal, proposal_stage)?;
+        if expected.is_none() && proposal.status != crate::skills::lifecycle::ProposalStatus::Evaluating {
+            self.review_source(&proposal.proposal_id, "PRXExperiment")?;
+            self.begin_evaluation(&proposal.proposal_id, "admitted bounded experiment")?;
+        }
+        let scratch = tempfile::Builder::new()
+            .prefix("prx-experiment-eval-")
+            .tempdir_in(&config.workspace_dir)?;
+        // The evaluator owns child workers that can outlive a dropped
+        // waiter. Preserve their parent directory on every error.
+        let scratch = scratch.keep();
+        let executor = AgentCaseExecutor::new(
+            config.clone(),
+            scratch.clone(),
+            0.0,
+            AccountingOwner::new(config.workspace_dir.clone()),
+        );
+        let evaluation = self
+            .evaluate_in_epoch(&proposal.proposal_id, split, expected, &executor, cancel)
+            .await?;
+        let runtime = crate::runtime::experiment_stage::current().context("stage has no accounting binding")?;
+        runtime.account_output(serde_json::to_vec(&evaluation.receipt)?.len())?;
+        ensure!(
+            std::fs::read_dir(&scratch)?.next().is_none(),
+            "trial workspaces remain quarantined; cleanup is unconfirmed"
+        );
+        std::fs::remove_dir(&scratch)?;
+        Ok(StageEvidence {
+            record_id: evaluation.receipt.record_id,
+            digest: evaluation.receipt_digest,
+            successful: true,
+            scratch_bytes: 0,
+        })
     }
 }
