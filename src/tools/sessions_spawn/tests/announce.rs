@@ -2,6 +2,28 @@
 
 use super::*;
 
+/// A task's terminal row is committed before its announcement. Await the
+/// retained task owner, including its delivery/refusal, rather than assuming
+/// that a fixed scheduler delay or a terminal status proves delivery finished.
+async fn await_announcement_owners(tool: &SessionsSpawnTool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let runs = tool.active_runs_snapshot().await;
+            assert!(!runs.is_empty(), "announcement test has no spawned run");
+            if runs.iter().all(|run| {
+                run.abort_handle
+                    .as_ref()
+                    .is_some_and(tokio::task::AbortHandle::is_finished)
+            }) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("announcement owner did not finish delivery/refusal within the bounded deadline");
+}
+
 /// Regression for the cross-channel mis-routing bug: a sub-agent spawned from
 /// wacli (a `@g.us` group recipient) must announce its result back on the
 /// wacli channel — not on the construction-time default channel (which, in a
@@ -31,8 +53,7 @@ async fn announce_routes_to_active_channel_not_construction_default() {
         .unwrap();
     assert!(result.success, "spawn should succeed: {:?}", result.error);
 
-    // Wait for the fire-and-forget sub-agent to finish and announce.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    await_announcement_owners(&tool).await;
 
     let on_wacli = wacli_sent.lock().await;
     let on_signal = signal_sent.lock().await;
@@ -90,7 +111,7 @@ async fn announce_uses_per_turn_channel_not_shared_state() {
     .unwrap();
     assert!(result.success, "spawn should succeed: {:?}", result.error);
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    await_announcement_owners(&tool).await;
 
     let on_wacli = wacli_sent.lock().await;
     let on_signal = signal_sent.lock().await;
@@ -179,7 +200,7 @@ async fn announce_to_a_denied_recipient_is_withheld_and_recorded_on_the_run() {
         result.error
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    await_announcement_owners(&tool).await;
 
     assert!(
         wacli_sent.lock().await.is_empty(),
@@ -220,7 +241,7 @@ async fn announce_is_unchanged_when_no_outbound_rules_are_configured() {
     .unwrap();
     assert!(result.success, "spawn should succeed: {:?}", result.error);
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    await_announcement_owners(&tool).await;
 
     let sent = wacli_sent.lock().await;
     assert_eq!(
@@ -261,7 +282,7 @@ async fn announce_is_not_denied_by_a_channel_registry_fallback() {
     .unwrap();
     assert!(result.success, "spawn should succeed: {:?}", result.error);
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    await_announcement_owners(&tool).await;
 
     let sent = signal_sent.lock().await;
     assert_eq!(
@@ -302,7 +323,7 @@ async fn a_model_supplied_recipient_cannot_bypass_send_deny() {
     .unwrap();
     assert!(denied.success, "spawn should succeed: {:?}", denied.error);
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    await_announcement_owners(&tool).await;
     assert!(
         wacli_sent.lock().await.is_empty(),
         "a model-chosen recipient must not escape the operator's send_deny"
@@ -322,7 +343,7 @@ async fn a_model_supplied_recipient_cannot_bypass_send_deny() {
     .unwrap();
     assert!(allowed.success, "spawn should succeed: {:?}", allowed.error);
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    await_announcement_owners(&tool).await;
     let sent = wacli_sent.lock().await;
     assert_eq!(sent.len(), 1, "the undenied recipient must still receive the result");
     assert!(sent[0].contains("sub-agent done"));
