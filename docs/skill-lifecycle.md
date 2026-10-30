@@ -166,6 +166,8 @@ settings, not a running scheduler.
 
 ## Operator commands and agent actions
 
+Bounded instruction experiments are currently operated explicitly through the local CLI/service; see [bounded instruction experiments](tools.md#bounded-instruction-experiments). Existing agent actions for proposal inspection, publication, cancellation and rollback do not imply experiment plan/run/control actions in Chat or Gateway. Adopted-result service records require authentic already-Committed publication proof and never create publication authority. Mechanism delivery, supported-entrypoint acceptance, measured benefit and production rollout remain separate claims.
+
 All lifecycle CLI commands go through the same service and configured mode.
 Replace angle-bracket placeholders with actual ids or observed generations:
 

@@ -1847,6 +1847,10 @@ endpoint and does not restart it or change configuration.
 
 ### Bounded instruction experiments
 
+The current experiment product surface is the explicit local CLI/service. Bounded recursion and adopted-result service mechanics do not provide conversational experiment actions or Gateway experiment control. Native Chat file-tool regression evidence is separate from a complete Chat experiment workflow; shared infrastructure does not establish entrypoint parity or measured learning benefit.
+
+Adopted-result annotation is a separate service operation over authentic already-Committed publication, exact gate/history and original physical costs. An experiment becoming qualified does not publish or annotate it automatically. Rollback uses its existing generation check, while lesson retirement/invalidation remains a separate monotonic operation. Unknown dispatch, incomplete cleanup and repair-required publication remain explicitly nonqualifying or unresolved as applicable.
+
 `prx skills lifecycle experiment` exposes the bounded lifecycle bridge and an explicit instruction-cycle scheduler. It requires an enabled lifecycle in `shadow` or `auto`, an active managed instruction revision, verified proposal patterns, and an operator-registered frozen suite. Experiment execution never publishes a revision.
 
 - `plan <source>` accepts a draft with `id`, `skill_id`, `verification_split`, `resources`, `elapsed_ms`, `max_concurrent` and topologically ordered `stages`. Each draft stage supplies `id`, `dependencies`, `allocation` and the exact `operation` JSON. The service derives operation hashes and resolves the actual owner, baseline generation, binary, configuration, policy, catalog, model and suite pins without sending a model request or executing a tool.
