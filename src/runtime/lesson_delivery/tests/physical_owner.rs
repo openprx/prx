@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Real reservation/Tally/transport boundary. No prepared-context constructor
 //! or adoption/profile proof is fabricated by this owned-receipt fixture.
 use super::*;

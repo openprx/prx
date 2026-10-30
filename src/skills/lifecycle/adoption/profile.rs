@@ -1,14 +1,20 @@
 //! One explicitly verified local Splash tokenizer profile, never an alias-only
-//! assertion or a general tokenizer framework. No inference/server mutation.
+//! assertion or a general tokenizer framework. Owns only the immutable proof
+//! cache; existing runtime owners manage two fixed read-only process probes.
+//! No inference, lifecycle write, shell, credentials or server mutation.
 use super::context::LessonCompatibility;
 use super::record::{digest, refusal, valid_digest};
 use crate::skills::lifecycle::{LifecycleError, ModelBinding, SkillLifecycleStore};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Stdio;
 use std::sync::OnceLock;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
 const TOKENIZER_SHA: &str = "8e852142d8ab38bb7678f650bd504ba28c29d9c6357e6ed762bebdbd474689eb";
 const CONFIG_SHA: &str = "c0435ea80b819a4fb16914a820960ff7c38f9d48cb94e7e8a28780fe01e8dea0";
@@ -34,15 +40,72 @@ fn read_asset(path: &Path, cap: u64) -> Result<Vec<u8>, LifecycleError> {
     }
     Ok(bytes)
 }
-fn command_text(program: &str, arguments: &[&str]) -> Result<String, LifecycleError> {
-    let output = Command::new(program)
-        .args(arguments)
-        .output()
-        .map_err(|_| refusal("actual Splash mapping inspection unavailable"))?;
-    if !output.status.success() || output.stdout.len() > 32 * 1024 {
-        return Err(refusal("actual Splash mapping inspection failed or exceeded its bound"));
-    }
-    String::from_utf8(output.stdout).map_err(|_| refusal("Splash mapping is not UTF-8"))
+enum MappingProbe {
+    Listener,
+    Owner(NonZeroU32),
+}
+fn listener_command() -> Command {
+    let mut command = Command::new("/usr/sbin/lsof");
+    command.args(["-nP", "-iTCP:18086", "-sTCP:LISTEN", "-t"]);
+    command
+}
+fn owner_command(pid: NonZeroU32) -> Command {
+    let mut command = Command::new("/bin/ps");
+    command.args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "command="]);
+    command
+}
+fn command_text(probe: MappingProbe) -> Result<String, LifecycleError> {
+    // Planning is synchronous and handoff runs inside owned blocking I/O.
+    // Reuse the existing safe sync bridge and managed process-group owner.
+    crate::runtime::blocking::run_sync_blocking("lesson-profile-probe", move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(async move {
+            let mut command = match probe {
+                MappingProbe::Listener => listener_command(),
+                MappingProbe::Owner(pid) => owner_command(pid),
+            };
+            command
+                .env_clear()
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let mut child = crate::runtime::shell_process::spawn_managed_shell_child(command)?;
+            let stdout = child
+                .take_stdout()
+                .ok_or_else(|| anyhow::anyhow!("profile probe has no stdout"))?;
+            let operation = async {
+                let read = async move {
+                    let mut bytes = Vec::new();
+                    let mut limited = stdout.take(32 * 1024 + 1);
+                    limited.read_to_end(&mut bytes).await?;
+                    drop(limited);
+                    anyhow::ensure!(bytes.len() <= 32 * 1024, "profile probe output exceeds its bound");
+                    Ok::<_, anyhow::Error>(bytes)
+                };
+                let wait = async { Ok::<_, anyhow::Error>(child.wait().await?) };
+                let (bytes, status) = tokio::try_join!(read, wait)?;
+                anyhow::ensure!(status.success(), "profile probe failed");
+                Ok::<_, anyhow::Error>(String::from_utf8(bytes)?)
+            };
+            let result = tokio::time::timeout(Duration::from_millis(500), operation).await;
+            match result {
+                Ok(Ok(text)) => {
+                    child.mark_complete();
+                    Ok(text)
+                }
+                _ => {
+                    // Termination/reap must join even after the bounded probe
+                    // deadline; an unconfirmed owner stays visible, never sent.
+                    if child.terminate_and_reap().await {
+                        child.mark_complete();
+                    }
+                    Err(anyhow::anyhow!("bounded profile probe did not complete"))
+                }
+            }
+        })
+    })
+    .map_err(|_| refusal("actual Splash mapping inspection failed, timed out or exceeded its bound"))
 }
 fn flag_value<'a>(command: &'a str, flag: &str) -> Option<&'a str> {
     let (_, value) = command.split_once(&format!("{flag} "))?;
@@ -54,15 +117,15 @@ fn actual_mapping() -> Result<(PathBuf, String), LifecycleError> {
             "this lesson profile supports only the verified local Splash deployment",
         ));
     }
-    let pid = command_text("/usr/sbin/lsof", &["-nP", "-iTCP:18086", "-sTCP:LISTEN", "-t"])?;
+    let pid = command_text(MappingProbe::Listener)?;
     let pids: Vec<_> = pid.split_whitespace().collect();
     let [pid] = pids.as_slice() else {
         return Err(refusal("Splash endpoint does not have one actual process owner"));
     };
-    if !pid.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(refusal("invalid Splash process owner"));
-    }
-    let command = command_text("/bin/ps", &["-p", pid, "-o", "lstart=", "-o", "command="])?;
+    let pid = pid
+        .parse::<NonZeroU32>()
+        .map_err(|_| refusal("invalid Splash process owner"))?;
+    let command = command_text(MappingProbe::Owner(pid))?;
     if !command.contains("/splash/")
         || !command.contains("-m server.server")
         || flag_value(&command, "--model") != Some(MODEL)

@@ -241,6 +241,12 @@ const ALLOWED_GIT_PROGRAM_LITERALS: &[&str] = &[
 /// expression (a constant, a variable, a path, `sh -c`), is reviewed here:
 /// git must go through `security::git_launch::git_command`.
 const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
+    // Root architecture review 2026-10-30: Splash tokenizer identity only.
+    // Closed Listener/Owner(NonZeroU32) probes, fixed absolute binaries/argv,
+    // cleared env, null stdin, managed process group, 500ms/32KiB bounds and reap.
+    // No generic program/argument input, shell, model call or module wildcard.
+    "src/skills/lifecycle/adoption/profile.rs::listener_command::let mut command = Command::new(\"/usr/sbin/lsof\");",
+    "src/skills/lifecycle/adoption/profile.rs::owner_command::let mut command = Command::new(\"/bin/ps\");",
     "src/channels/imessage.rs::send::let output = tokio::process::Command::new(\"osascript\")",
     "src/channels/service.rs::maybe_restart_managed_daemon_service::if let Ok(status_output) = Command::new(\"rc-service\")",
     "src/channels/service.rs::maybe_restart_managed_daemon_service::let _ = Command::new(\"launchctl\")",

@@ -53,7 +53,16 @@ async fn donor(
     let journal = CleanupScope::new(None, cancel.clone())?
         .run(service.run_instruction_plan(config, &plan, &cancel))
         .await?;
-    assert!(service.experiment_qualified(&journal)?);
+    let qualified = service.experiment_qualified(&journal)?;
+    let diagnostic = serde_json::json!({
+        "qualified":qualified,"actual_stage_state":format!("{:?}",journal.state),
+        "admitted_spec":journal.plan.spec(),"head_sha256":journal.head_sha256,"journal_entries":journal.entries,
+    });
+    assert!(
+        qualified,
+        "donor qualification failed; content-free exact stage/journal evidence: {}",
+        diagnostic
+    );
     let witness = gate_review::witness(f, &journal)?;
     let request = RecordAdoptionRequest {
         proposal_id: witness.subject.proposal_id.clone(),
@@ -178,7 +187,13 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         let mut config = config(&f, &server);
         let price=config.cost.prices.get_mut(&format!("{}/experiment-loopback",config.default_provider.as_deref().unwrap()))
             .context("fixture model pricing missing")?;
-        price.input=1.0;price.output=1.0;
+        // Synthetic nonzero tariff leaves conservative admission headroom
+        // inside every ORIGINAL six-component stage/root allocation. Price1
+        // cannot fit an editor estimate of 131072 tokens inside its unchanged
+        // 100000 micro-USD allowance. It also couples the probe's 500000
+        // token/micro ceilings at binary64 rounding boundaries.
+        // This is fixture data, not a production price or accounting change.
+        price.input=0.25;price.output=0.25;
         let _profile = f.store.register_lesson_fixture_profile(&binding(&config))?;
         let (origin, draft, journal, mut request) = donor(&f, &config).await?;
         let before_publish = server.count.load(Ordering::SeqCst);
