@@ -156,7 +156,7 @@ still governs publication time/repair evidence; missing proof fails closed.
 
 D stable boundary is:
 verify_gate_review_witness(experiment_id, experiment_sha256, GateReviewPin)
--> Result<VerifiedGateReviewHistory>. Pin is only stage/witness_sha256/gate_id/
+-> `Result<VerifiedGateReviewHistory>`. Pin is only stage/witness_sha256/gate_id/
 gate_sha256, not confirmation. D rereads the exact journal and semantically
 verifies history. Its result has no Deserialize/public constructor/VerifiedGate
 conversion; read-only actual binding, immutable subject/C triple, exact gate pins,
@@ -199,7 +199,6 @@ refuse pruning before deletion, with reproducible tests, rather than silently
 remove new dependencies. Keep append-only C references intact. No memory update,
 root budget increase, holdout-policy reduction or broad entrypoint parity is part
 of this contract.
-
 
 The supported downgrade boundary is the production maintenance collector
 `prune_unreferenced_experiences`. Before the first C05 adoption reference, the

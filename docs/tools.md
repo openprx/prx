@@ -1845,7 +1845,6 @@ request. Success reports the gateway's new plugin generation. Trust/revoke
 alone does not reload a running owner; this command calls its existing reload
 endpoint and does not restart it or change configuration.
 
-
 ### Bounded instruction experiments
 
 `prx skills lifecycle experiment` exposes the bounded lifecycle bridge and an explicit instruction-cycle scheduler. It requires an enabled lifecycle in `shadow` or `auto`, an active managed instruction revision, verified proposal patterns, and an operator-registered frozen suite. Experiment execution never publishes a revision.
@@ -1870,7 +1869,6 @@ M1 native trials admit `skill_read`, `file_read`, `file_write` and `file_edit` w
 A completed run or a model's success claim cannot qualify an experiment. The independent verifier rereads the stored case and artifact receipts, checks the pinned candidate, baseline, owner, suite split, experiment, stage and input identities, and preserves incorrect, incomplete and Unknown outcomes. Shadow never publishes. Journal evidence and unresolved cost reservations must be retained during rollback; older binaries must not be used to resume these new experiment records.
 
 Instruction-read aliases preserve existing names that satisfy `[A-Za-z0-9_-]{1,128}`. A display name containing spaces, punctuation, Unicode or excess bytes receives a stable `skill_read_<sha256>` public name. The original skill name remains in the closed `name` argument, target identity and display metadata; the backend binding and process snapshot use the same public-name mapping. Colliding public names are refused. Stale catalog references require fresh discovery and admission.
-
 
 Evaluation runs retain the managed caller configuration path for provider and
 decision credential reference lookup. Runtime state and artifacts remain in the

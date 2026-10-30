@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.171] - 2026-10-31
+
+### Added
+
+- Add bounded sequential and parallel two-round instruction refinement, with
+  conservative development selection and one final independent evaluation.
+- Add an optional independently verified holdout and budgeted private gate review
+  before the existing separate publication authorization.
+- Store authenticated adopted lessons and deliver bounded lesson context to
+  managed editors across tasks, with exact physical request ownership receipts,
+  retention barriers, retirement and fail-closed replay protection.
+
+### Fixed
+
+- Preserve complete ordered refinement patches while limiting parent context to
+  instruction content and retaining the original edit and resource ceilings.
+- Keep adopted-lesson wire evidence within existing size limits and reject
+  uncertain handoffs without granting improvement or causal credit.
+
 ## [0.8.170] - 2026-10-30
 
 ### Added
