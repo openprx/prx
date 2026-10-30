@@ -102,7 +102,7 @@ jobs:
         if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
         runs-on: ubuntu-latest
         # A cold serial build takes about 29 minutes before the guarded tests.
-        timeout-minutes: 60
+        timeout-minutes: 90
         # Full-debug test compilation exhausted 16 GiB RAM and 3 GiB swap
         # before tests started. Reduce build memory, not test coverage.
         env:
