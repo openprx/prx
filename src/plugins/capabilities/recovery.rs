@@ -945,8 +945,11 @@ impl Supervisor {
         self.ensure_live(inner, operation, announcements).await;
 
         #[cfg(test)]
-        if let Some(entered) = self.next_store_entry.lock().take() {
-            let _ = entered.send(());
+        {
+            let entered = self.next_store_entry.lock().take();
+            if let Some(entered) = entered {
+                let _ = entered.send(());
+            }
         }
 
         let outcome = {
