@@ -42,8 +42,7 @@ impl SkillsLifecycleService {
             self.experiment_qualified(&journal)?,
             "origin experiment is not historically qualified"
         );
-        Ok(self
-            .store
-            .record_committed_adoption_locked(&owner, request, &journal, &repeated, &compatibility, config)?)
+        self.store
+            .record_committed_adoption_locked(&owner, request, &journal, &repeated, &compatibility, config)
     }
 }

@@ -205,7 +205,7 @@ impl SkillsLifecycleService {
             prepared.user.push_str("\nH2 observed development data:\n");
             prepared.user.push_str(&context);
             if let Some(block) = &lesson_block {
-                prepared.user.push_str("\n");
+                prepared.user.push('\n');
                 prepared.user.push_str(block);
             }
             let reserved_boundary_bytes = if lesson_block.is_some() { 320 } else { 0 };

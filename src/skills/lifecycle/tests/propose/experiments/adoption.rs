@@ -36,7 +36,15 @@ async fn donor(
     ExperimentJournal,
     RecordAdoptionRequest,
 )> {
-    let service = auto_service(f, &suite(f), config)?;
+    // Two actual origin families isolate the orphan-fault identity from the
+    // positive adoption, with the same original cases/calls/root allocation.
+    let mut origin_suite = suite(f).suite().clone();
+    origin_suite
+        .cases
+        .first_mut()
+        .context("origin suite is empty")?
+        .task_family = "deploy-fault".into();
+    let service = auto_service(f, &origin_suite.freeze()?, config)?;
     let pattern = usable_pattern(f);
     let draft = gate_review::draft(f, &service, config, pattern.pattern_id)?;
     let plan = service.plan_instruction_cycle(draft.clone(), config)?;
@@ -143,6 +151,23 @@ fn delivery_records(f: &Fixture) -> Result<Vec<serde_json::Value>> {
         .into_iter()
         .map(|path| Ok(serde_json::from_slice(&std::fs::read(path)?)?))
         .collect()
+}
+
+// Explicit synthetic capture input, associated with an already executed run
+// only for retention. Unknown/default facts assert no new execution success.
+fn retention_capture(f: &Fixture, task: &str, run: Option<&str>) -> Result<String> {
+    let correlation = Correlation {
+        run_id: run.map(str::to_owned),
+        ..Default::default()
+    };
+    f.store.record_selection(task, &f.pin, &correlation)?;
+    f.store.join_terminal_with(
+        task,
+        "retention-fixture-terminal",
+        ExperienceOutcome::Unknown,
+        &TerminalFacts::default(),
+    )?;
+    Ok(crate::skills::lifecycle::experience_id(f.store.owner_scope(), task))
 }
 
 #[tokio::test]
@@ -301,10 +326,10 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.entries[0].reference, reference);
         confirm(&f, &snapshot, &q, Utc::now())?;
-        let block = crate::skills::lifecycle::adoption::format_lesson_block(&snapshot, "general-proposal")?;
+        let block = crate::skills::lifecycle::adoption::format_lesson_block(&snapshot, "general")?;
         assert_eq!(
             block,
-            crate::skills::lifecycle::adoption::format_lesson_block(&snapshot, "general-proposal")?
+            crate::skills::lifecycle::adoption::format_lesson_block(&snapshot, "general")?
         );
         assert!(block.is_ascii() && block.len() + 320 <= 1536);
         let mut overlap = q.clone();
@@ -458,6 +483,29 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
             assert_eq!(refs.refs, vec![reference.clone()]);
             assert_eq!(refs.examined_records, 3);
         }
+        let probe_digest = completed.entries.iter().find_map(|entry| match &entry.event {
+            ExperimentEvent::Settled { stage, reference: Some(reference), evidence_sha256, .. }
+                if stage == "baseline" && reference == "probe:baseline" => Some(evidence_sha256),
+            _ => None,
+        }).context("retained root has no actual baseline probe pin")?;
+        let probe = f.store.read_development_probe(&completed.plan.spec().id, "baseline", probe_digest)?;
+        let probe_run = &probe.cases.first().context("retained probe has no executed case")?.run.run_id;
+        let evaluation = holdout::evaluation(&f, &completed, "final-evaluation")?;
+        let evaluation_run = &evaluation.cases.first().context("retained evaluation has no executed case")?.run.run_id;
+        let proposals = f.store.list_proposals()?;
+        assert!(proposals.iter().any(|proposal| proposal.bound_evaluation_attempts.contains(&evaluation.receipt.record_id)),
+            "the selected real evaluation must have an existing C owner-local reference");
+        let retained_captures = [
+            retention_capture(&f, "retention-associated-real-probe", Some(probe_run))?,
+            retention_capture(&f, "retention-associated-real-evaluation", Some(evaluation_run))?,
+        ];
+        let control = retention_capture(&f, "retention-unreferenced-terminal-control", None)?;
+        let legacy_patterns = f.store.retained_pattern_experiences()?;
+        for id in retained_captures.iter().chain(std::iter::once(&control)) {
+            assert!(!legacy_patterns.contains(id) && proposals.iter().all(|proposal| !proposal.evidence_ids.contains(id)),
+                "these captures must not be retained by a legacy pattern/proposal chain");
+            assert!(f.store.read_experience_by_id(id)?.is_some());
+        }
         let revision_before = f.store.read_revision(
             &f.pin.skill_id,
             &reference.adopted_revision,
@@ -480,6 +528,12 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
                 .record_digest,
             revision_before.record_digest
         );
+        for id in &retained_captures {
+            assert!(f.store.read_experience_by_id(id)?.is_some(),
+                "actual retained probe/evaluation run references must protect expired terminal captures");
+        }
+        assert!(f.store.read_experience_by_id(&control)?.is_none(),
+            "same-API expired terminal capture with no retained run reference must be deleted");
         let next_witness = gate_review::witness(&f, &completed)?;
         let published = next.publish(&next_witness.subject.proposal_id)?;
         let next_digest = next_witness.digest()?;
@@ -558,25 +612,18 @@ async fn owned_attempts_then_retire(
     let frozen = plan.spec.clone().freeze()?;
     server.h2_mode.store(9, Ordering::SeqCst);
     target.admit_experiment(plan.spec.clone(), config)?;
-    let mut journal = run_stage(
-        &target,
-        config,
-        &frozen,
-        "baseline-probe",
-        &plan.operations["baseline-probe"],
-    )
-    .await?;
+    let mut journal = run_stage(&target, config, &frozen, "baseline", &plan.operations["baseline"]).await?;
     for (name, event) in [
         (
             "reserve",
             ExperimentEvent::Reserved {
-                stage: "general-proposal".into(),
+                stage: "general".into(),
             },
         ),
         (
             "dispatch",
             ExperimentEvent::Dispatched {
-                stage: "general-proposal".into(),
+                stage: "general".into(),
             },
         ),
     ] {
@@ -597,7 +644,7 @@ async fn owned_attempts_then_retire(
             crate::runtime::experiment_stage::ExperimentStageRuntime::new(
                 config,
                 &frozen,
-                "general-proposal",
+                "general",
                 cancel.clone(),
                 f.store.clone(),
             )
@@ -605,7 +652,7 @@ async fn owned_attempts_then_retire(
         .await?;
     let block = crate::skills::lifecycle::adoption::format_lesson_block(
         plan.spec.pins.lesson_snapshot.as_ref().unwrap(),
-        "general-proposal",
+        "general",
     )?;
     let user = format!("Fixture release editor task.\n{block}");
     let model = crate::runtime::evolution_model::EvolutionModel::from_config(
@@ -614,7 +661,7 @@ async fn owned_attempts_then_retire(
     )?;
     let scope = runtime.scope_id();
     cleanup.run(runtime.scope(async {
-            let prepared=target.prepare_lesson_context(&frozen,"general-proposal",&plan.operations["general-proposal"],&user)
+            let prepared=target.prepare_lesson_context(&frozen,"general",&plan.operations["general"],&user)
                 .await?.context("genuine factory returned no context")?;
             assert_eq!(prepared.block(),block);assert_eq!(prepared.refs(),&[reference.clone()]);
             assert_eq!(prepared.expected_user_slot_bytes(),u64::try_from(user.len())?);
@@ -655,7 +702,7 @@ async fn owned_attempts_then_retire(
         &journal.head_sha256,
         "owned-editor-unknown",
         ExperimentEvent::DispatchUnknown {
-            stage: "general-proposal".into(),
+            stage: "general".into(),
         },
         Utc::now(),
     )?;
@@ -793,8 +840,10 @@ fn retention_barrier_faults_then_record(
         service.experiment_qualified(&journal)?,
         "the added barrier cannot change sealed proposal/evaluation pins"
     );
+    let mut fault_request = request.clone();
+    fault_request.task_family = "deploy-fault".into();
     crate::skills::lifecycle::publish::crash_hooks::arm("c05_adoption_record_written");
-    let orphan = service.record_adoption(request, config);
+    let orphan = service.record_adoption(&fault_request, config);
     crate::skills::lifecycle::publish::crash_hooks::disarm();
     assert!(orphan.is_err());
     assert_eq!(
@@ -822,13 +871,20 @@ fn retention_barrier_faults_then_record(
         "an orphan record is retained evidence, not usable indexed guidance"
     );
     assert_eq!(std::fs::read(&paths[0])?, orphan_bytes);
-    let reference = service.record_adoption(request, config)?;
-    assert_eq!(record_path(f, &reference), paths[0]);
+    assert!(
+        service.record_adoption(&fault_request, config).is_err(),
+        "an existing orphan without its exact status index stays quarantined on retry"
+    );
     assert_eq!(
         std::fs::read(&paths[0])?,
         orphan_bytes,
-        "explicit retry must not rewrite immutable history"
+        "failed retry must preserve orphan evidence without resurrection"
     );
+    // A separately registered real origin family gets its own adoption ID and
+    // index. No orphan is deleted or fabricated into a successful record.
+    let reference = service.record_adoption(request, config)?;
+    assert_ne!(record_path(f, &reference), paths[0]);
+    assert_eq!(std::fs::read(&paths[0])?, orphan_bytes);
     assert_eq!(service.record_adoption(request, config)?, reference);
     Ok(reference)
 }

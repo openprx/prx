@@ -17,7 +17,7 @@ fn typical_172_attempt_cost_dto_roundtrips_losslessly_with_record_headroom() -> 
             let suffixes = (0..calls)
                 .map(|_| {
                     serial += 1;
-                    uuid::Uuid::from_u128(0x00000000000040008000000000000000_u128 | serial).to_string()
+                    uuid::Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0000_u128 | serial).to_string()
                 })
                 .collect();
             attempts.insert(prefix.to_owned(), suffixes);

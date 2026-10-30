@@ -277,9 +277,13 @@ impl SkillLifecycleStore {
             || actual_model != &pins.model
             || binding.experiment_sha256 != plan.digest()
             || !plan.spec().stages.iter().any(|stage| {
-                stage.id == binding.stage
-                    && stage.input_sha256 == binding.input_sha256
-                    && stage.kind == ExperimentStageKind::ModelProposal
+                let declared = (&stage.id, &stage.input_sha256, stage.kind);
+                let expected = (
+                    &binding.stage,
+                    &binding.input_sha256,
+                    ExperimentStageKind::ModelProposal,
+                );
+                declared == expected
             })
         {
             return Err(refuse("lesson actual owner, model or editor binding changed"));

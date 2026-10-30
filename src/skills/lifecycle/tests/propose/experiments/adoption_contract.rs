@@ -13,7 +13,7 @@ fn lesson_none_preserves_pre_extension_operation_bytes_and_hash() -> Result<()> 
         lesson_context_sha256: None,
         max_input_bytes: 65536,
         max_output_bytes: 16384,
-        timeout_ms: 120000,
+        timeout_ms: 120_000,
     };
     let legacy = br#"{"operation":"development_proposal","role":"general","patterns":[],"probe_stages":["baseline"],"max_input_bytes":65536,"max_output_bytes":16384,"timeout_ms":120000}"#;
     assert_eq!(serde_json::to_vec(&operation)?, legacy);
@@ -182,7 +182,8 @@ async fn verified_fixture_profile_is_exact_owner_model_endpoint_and_guard_scoped
                 .lesson_profile_compatibility(&binding, &policy, &source)
                 .is_err()
         );
-        let guard = f.store.register_lesson_fixture_profile(&binding)?;
+        let guard: crate::skills::lifecycle::adoption::LessonFixtureProfileGuard =
+            f.store.register_lesson_fixture_profile(&binding)?;
         let expected = f.store.lesson_profile_compatibility(&binding, &policy, &source)?;
         assert_eq!(expected.model_sha256, binding.digest());
         assert!(

@@ -41,7 +41,7 @@ fn fixture_binding(model: &ModelBinding) -> Result<(), LifecycleError> {
         .provider_label
         .strip_prefix("custom:")
         .ok_or_else(|| refusal("fixture profile requires the actual custom loopback endpoint"))?;
-    let url = url::Url::parse(endpoint).map_err(|_| refusal("invalid fixture profile endpoint"))?;
+    let url = reqwest::Url::parse(endpoint).map_err(|_| refusal("invalid fixture profile endpoint"))?;
     if model.model != "experiment-loopback"
         || model.temperature_milli != 100
         || url.scheme() != "http"

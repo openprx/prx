@@ -226,11 +226,12 @@ impl SkillLifecycleStore {
 }
 
 fn eligible(record: &AdoptionRecord, query: &LessonQuery) -> bool {
+    let adopted_source = (&record.adopted_revision, &record.adopted_record_sha256);
+    let target_baseline = (&query.baseline_revision, &query.baseline_record_sha256);
     record.owner_scope == query.owner_scope
         && record.skill_id == query.skill_id
         && record.task_family == query.task_family
-        && record.adopted_revision == query.baseline_revision
-        && record.adopted_record_sha256 == query.baseline_record_sha256
+        && adopted_source == target_baseline
         && record.compatibility == query.compatibility
         && record.expires_at > query.planned_at
         && !record

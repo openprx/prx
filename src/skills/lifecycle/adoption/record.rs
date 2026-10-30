@@ -294,10 +294,10 @@ impl SkillLifecycleStore {
             || proposal.record_id != record.proposal_id
             || proposal.skill_id != record.skill_id
             || proposal.candidate_revision.as_ref() != Some(&record.adopted_revision)
-            || !proposal
+            || proposal
                 .publication
                 .as_ref()
-                .is_some_and(|publication| publication.transaction_id.as_str() == record.publication_tx)
+                .is_none_or(|publication| publication.transaction_id.as_str() != record.publication_tx)
         {
             return Err(refusal(
                 "C05 origin retention barrier missing or mismatched; explicit historical reproof required",

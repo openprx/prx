@@ -281,7 +281,7 @@ impl SkillLifecycleStore {
             model_sha256: model.digest(),
             policy_sha256: policy_sha256.into(),
             source_profile_sha256: source_profile_sha256.into(),
-            tokenizer_profile_sha256: profile.sha256.clone(),
+            tokenizer_profile_sha256: profile.sha256,
         })
     }
 }

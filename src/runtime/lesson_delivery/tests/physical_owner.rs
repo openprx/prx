@@ -203,7 +203,13 @@ async fn wrong_actual_owner_refuses_before_wire_with_real_spent_liability_and_ta
     // The new read-only aggregate must not turn this genuine admitted,
     // undispatched-to-wire liability into complete zero-cost coverage.
     let before_snapshot = std::fs::read(&ledger_path)?;
-    assert!(crate::cost::tracker::physical_scopes_read_only(workspace.path(), &[actual.scope_id()]).is_err());
+    assert!(
+        matches!(
+            crate::cost::tracker::physical_scopes_read_only(workspace.path(), &[actual.scope_id()]),
+            Err(_) | Ok(None)
+        ),
+        "missing or unresolved ledger coverage must remain Unknown, never complete zero"
+    );
     assert_eq!(std::fs::read(&ledger_path)?, before_snapshot);
     let rows: Vec<serde_json::Value> = std::str::from_utf8(&refused_bytes)?
         .lines()
