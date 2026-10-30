@@ -64,7 +64,21 @@ async fn development_probes_run_one_arm_and_preserve_independent_attempts() -> R
         assert_eq!(server.count.load(Ordering::SeqCst), 0);
         for stage in ["baseline-probe", "proposal", "candidate-probe"] {
             let journal = run_stage(&service, &config, &plan, stage, &inputs[stage]).await?;
-            assert!(journal.state.stages[stage].successful());
+            if !journal.state.stages[stage].successful() {
+                let evidence = json!({
+                    "stage":stage, "entries":journal.entries,
+                    "probes":service.experiment_development_probes(&journal)?,
+                    "proposals":f.store.list_proposals()?,
+                    "physical":service.experiment_physical_observations(&journal,&config)?,
+                    "requests":server.bodies.lock().clone(),
+                });
+                let path = std::env::temp_dir().join(format!("prx-m2-probe-failure-{}.json", uuid::Uuid::new_v4()));
+                std::fs::write(&path, serde_json::to_vec_pretty(&evidence)?)?;
+                panic!(
+                    "development stage {stage} is nonqualifying; retained exact evidence at {}",
+                    path.display()
+                );
+            }
         }
         let journal = service.inspect_experiment(&plan.spec().id, plan.digest())?;
         let probes = service.experiment_development_probes(&journal)?;
