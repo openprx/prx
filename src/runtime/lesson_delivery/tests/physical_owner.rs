@@ -200,6 +200,11 @@ async fn wrong_actual_owner_refuses_before_wire_with_real_spent_liability_and_ta
     assert_eq!(tracker.physical_scope_usage(&expected.scope_id())?.calls, 0);
     let ledger_path = workspace.path().join("state/costs.reservations.jsonl");
     let refused_bytes = std::fs::read(&ledger_path)?;
+    // The new read-only aggregate must not turn this genuine admitted,
+    // undispatched-to-wire liability into complete zero-cost coverage.
+    let before_snapshot = std::fs::read(&ledger_path)?;
+    assert!(crate::cost::tracker::physical_scopes_read_only(workspace.path(), &[actual.scope_id()]).is_err());
+    assert_eq!(std::fs::read(&ledger_path)?, before_snapshot);
     let rows: Vec<serde_json::Value> = std::str::from_utf8(&refused_bytes)?
         .lines()
         .map(serde_json::from_str)

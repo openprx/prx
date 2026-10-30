@@ -4,7 +4,7 @@ use super::*;
 use crate::skills::lifecycle::experiment::{ExperimentStageKind, GateReviewWitness};
 use crate::skills::lifecycle::{GateDecision, GateError, GatePolicy, ModelJudge, ProposalStatus};
 
-fn reviewed_service(
+pub(super) fn reviewed_service(
     f: &Fixture,
     suite: &crate::skills::lifecycle::FrozenSuite,
     config: &Config,
@@ -33,7 +33,7 @@ fn reviewed_service(
     service.install_operator_suite(suite)?;
     Ok(service)
 }
-fn draft(
+pub(super) fn draft(
     f: &Fixture,
     service: &SkillsLifecycleService,
     config: &Config,
@@ -43,7 +43,7 @@ fn draft(
     draft.gate_allocation = Some(draft.proposal_allocation);
     Ok(draft)
 }
-fn witness(f: &Fixture, journal: &ExperimentJournal) -> Result<GateReviewWitness> {
+pub(super) fn witness(f: &Fixture, journal: &ExperimentJournal) -> Result<GateReviewWitness> {
     let digest = journal
         .entries
         .iter()

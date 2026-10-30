@@ -409,3 +409,7 @@ impl SkillLifecycleStore {
         Ok(reference)
     }
 }
+
+#[cfg(test)]
+#[path = "cost_wire_tests.rs"]
+mod cost_wire_tests;

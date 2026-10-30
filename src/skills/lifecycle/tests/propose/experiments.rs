@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod admission;
+mod adoption;
+mod adoption_contract;
 mod development_probes;
 mod gate_review;
 mod holdout;
@@ -130,6 +132,14 @@ impl Server {
                             if messages.iter().any(|message| message["content"].as_str().is_some_and(|value| value.contains("You revise one instruction skill"))) {
                                 let system = messages.iter().filter(|message| message["role"] == "system").map(|message| message["content"].to_string()).collect::<Vec<_>>().join(" ");
                                 let mode = h2_behavior.load(Ordering::SeqCst);
+                                if mode == 9 {
+                                    let role = if system.contains("H2 role: general.") { "general" }
+                                        else if system.contains("H2 role: domain.") { "domain" } else { "composition" };
+                                    return json!({"summary":"Add release preflight guidance", "edits":[{
+                                        "file":"SKILL.md", "op":"replace", "old":"the check number 4 before",
+                                        "new":format!("the release preflight and {role} check before")
+                                    }]}).to_string();
+                                }
                                 if (6..=8).contains(&mode) {
                                     let development = messages.iter().filter(|message| message["role"] == "user")
                                         .filter_map(|message| message["content"].as_str())
@@ -160,6 +170,7 @@ impl Server {
                                 let hydrated: Vec<_> = messages.iter().filter(|message| message["role"] == "tool" || message["content"].as_str().is_some_and(|text| text.contains("<tool_result name=\"skill_read\">"))).map(|message| message["content"].to_string()).collect();
                                 if hydrated.iter().any(|text| text.contains("Step 3:")) {
                                     let mode = h2_behavior.load(Ordering::SeqCst);
+                                    if mode == 9 { return if hydrated.iter().any(|text| text.contains("release preflight")) { "MIGRATION-PASS".into() } else { "BASELINE-FAIL".into() }; }
                                     let harmful = mode == 2 && hydrated.iter().any(|text| text.contains("composition check"));
                                     if !harmful && (mode == 1 || hydrated.iter().any(|text| text.contains("migration step"))) { "MIGRATION-PASS".into() } else { "BASELINE-FAIL".into() }
                                 } else {
