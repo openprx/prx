@@ -9,7 +9,9 @@
 //! network.
 
 use crate::providers::Provider;
-use crate::providers::attempt_accounting::{self, AttemptAccounting, AttemptReceipt, PhysicalRequest, sealed};
+use crate::providers::attempt_accounting::{
+    self, AttemptAccounting, AttemptReceipt, PhysicalAttemptIdentity, PhysicalRequest, sealed,
+};
 use crate::providers::traits::{ChatMessage, ChatRequest};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -208,6 +210,12 @@ impl AttemptReceipt for TallyReceipt {
     fn deadline(&self) -> Instant {
         self.inner.deadline()
     }
+    fn physical_identity(&self) -> Option<PhysicalAttemptIdentity<'_>> {
+        self.inner.physical_identity()
+    }
+    async fn prepare_handoff(&mut self, final_body: &[u8]) -> anyhow::Result<()> {
+        self.inner.prepare_handoff(final_body).await
+    }
     fn retain_response_chunk(&self, bytes: usize) -> anyhow::Result<()> {
         self.inner.retain_response_chunk(bytes)
     }
@@ -307,5 +315,69 @@ impl ProposerModel for ManagedProviderModel {
             text,
             usage,
         })
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+
+    struct InnerReceipt {
+        counters: Arc<TallyCounters>,
+        preparations: Arc<AtomicU32>,
+    }
+
+    impl sealed::Receipt for InnerReceipt {}
+
+    #[async_trait]
+    impl AttemptReceipt for InnerReceipt {
+        fn deadline(&self) -> Instant {
+            Instant::now() + std::time::Duration::from_secs(5)
+        }
+
+        fn physical_identity(&self) -> Option<PhysicalAttemptIdentity<'_>> {
+            Some(PhysicalAttemptIdentity {
+                turn_id: "fixture-turn",
+                attempt_id: "fixture-attempt",
+                binding_sha256: "fixture-keyed-binding",
+            })
+        }
+
+        async fn prepare_handoff(&mut self, body: &[u8]) -> anyhow::Result<()> {
+            anyhow::ensure!(self.counters.snapshot().physical_requests == 1);
+            anyhow::ensure!(body == b"fixture-final-body");
+            self.preparations.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("fixture preparation refused")
+        }
+
+        async fn settle(self: Box<Self>, _usage: crate::llm::route_decision::TokenUsage) -> anyhow::Result<()> {
+            anyhow::bail!("refused fixture cannot settle")
+        }
+    }
+
+    #[tokio::test]
+    async fn tally_forwards_inner_identity_and_fallible_preparation_without_zeroing_admitted_count()
+    -> anyhow::Result<()> {
+        let counters = Arc::new(TallyCounters::default());
+        counters.record_reservation();
+        let preparations = Arc::new(AtomicU32::new(0));
+        let mut receipt = TallyReceipt {
+            inner: Box::new(InnerReceipt {
+                counters: Arc::clone(&counters),
+                preparations: Arc::clone(&preparations),
+            }),
+            counters: Arc::clone(&counters),
+        };
+        let identity = receipt
+            .physical_identity()
+            .ok_or_else(|| anyhow::anyhow!("inner physical identity missing"))?;
+        assert_eq!(identity.turn_id, "fixture-turn");
+        assert_eq!(identity.attempt_id, "fixture-attempt");
+        assert_eq!(identity.binding_sha256, "fixture-keyed-binding");
+        assert!(receipt.prepare_handoff(b"fixture-final-body").await.is_err());
+        assert_eq!(preparations.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.snapshot().physical_requests, 1);
+        assert_eq!(counters.snapshot().settled_requests, 0);
+        Ok(())
     }
 }

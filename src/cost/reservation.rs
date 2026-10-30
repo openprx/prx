@@ -108,8 +108,16 @@ pub(crate) struct ReservationReceipt {
 }
 
 impl ReservationReceipt {
+    pub(crate) fn turn_id(&self) -> &str {
+        &self.request.turn_id
+    }
+
     pub(crate) fn attempt_id(&self) -> &str {
         &self.request.attempt_id
+    }
+
+    pub(crate) fn binding_sha256(&self) -> &str {
+        &self.request.binding_sha256
     }
 
     #[cfg(test)]

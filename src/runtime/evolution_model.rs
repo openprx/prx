@@ -137,6 +137,7 @@ impl EvolutionModel {
                     scope,
                     provider_label: self.binding.provider_label.clone(),
                     purpose: self.purpose,
+                    lesson_invocation: super::lesson_delivery::capture_invocation(),
                 }),
             },
             accounting_scope_id,
@@ -167,6 +168,7 @@ struct EvolutionAccounting {
     scope: Arc<AccountingScope>,
     provider_label: String,
     purpose: EvolutionPurpose,
+    lesson_invocation: Option<Arc<super::lesson_delivery::LessonInvocation>>,
 }
 impl attempt_accounting::sealed::AccountingOwner for EvolutionAccounting {}
 #[async_trait]
@@ -206,7 +208,17 @@ impl AttemptAccounting for EvolutionAccounting {
                 remaining_attempts: 1,
             })
             .await?;
-        Ok(receipt.into_provider_receipt())
+        Ok(super::lesson_delivery::wrap_receipt(
+            receipt.into_provider_receipt(),
+            Arc::clone(&self.key),
+            ModelBinding {
+                provider_label: provider.to_owned(),
+                model: model.to_owned(),
+                temperature_milli: 100,
+            },
+            self.purpose.label(),
+            self.lesson_invocation.as_ref().map(Arc::clone),
+        ))
     }
 }
 

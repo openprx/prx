@@ -40,6 +40,7 @@ mod gate_judge;
 mod generation;
 mod journal;
 mod knowledge;
+mod lesson_delivery;
 mod manifest;
 mod migrate;
 mod operator_import;
@@ -112,6 +113,9 @@ pub use knowledge::{
     ConfidenceBasis, FailureClass, FailureFacts, KnowledgePattern, MAX_PATTERN_EVIDENCE,
     MIN_DISTINCT_TASKS_FOR_PROPOSAL, PatternId, PatternIndex, PatternIndexEntry, PatternKind, PatternScope,
     classify_failure,
+};
+pub(crate) use lesson_delivery::{
+    LessonDeliveryRequest, LessonDeliveryWriteUnconfirmed, LessonPhysicalIdentity, persist_lesson_delivery,
 };
 pub use manifest::{ManifestError, ManifestInfo, validate_manifest, validate_manifest_strict};
 pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationReport, apply_migration, plan_migration};
