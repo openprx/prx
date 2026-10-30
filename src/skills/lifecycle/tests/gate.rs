@@ -142,6 +142,7 @@ pub(super) fn stage_draft(fx: &Fixture, request_id: &str, bundle: &Bundle, new_t
         evaluation_epoch: 0,
         evaluating_since: None,
         bound_evaluation_attempts: Vec::new(),
+        c05_retention_format: None,
         authorization: None,
         publication: None,
         created_at: now,

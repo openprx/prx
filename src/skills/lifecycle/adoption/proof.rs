@@ -187,6 +187,9 @@ impl SkillLifecycleStore {
             cost == cost_again,
             "root physical evidence changed during adoption proof"
         );
+        // Same shared-store/proposal owner: legacy maintenance cannot pass
+        // its strict proposal listing between this barrier and the new refs.
+        self.ensure_c05_retention_barrier_locked(owner, &second.0.proposal_id)?;
         Ok(self.persist_verified_adoption_locked(owner, &second)?)
     }
 

@@ -144,6 +144,13 @@ impl SkillLifecycleStore {
             budget.charge(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
             let record = self.decode_adoption(&bytes, &descriptor.reference)?;
             budget.check()?;
+            let barrier = read_bounded_bytes(
+                &self.adoption_retention_barrier_path(&record)?,
+                query.limits.record_bytes,
+            )?;
+            budget.charge(u64::try_from(barrier.len()).unwrap_or(u64::MAX))?;
+            self.check_adoption_retention_barrier(&record, &barrier)?;
+            budget.check()?;
             if !eligible(&record, query) {
                 budget.stats.excluded += 1;
                 continue;

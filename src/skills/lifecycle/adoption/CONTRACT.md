@@ -199,3 +199,18 @@ refuse pruning before deletion, with reproducible tests, rather than silently
 remove new dependencies. Keep append-only C references intact. No memory update,
 root budget increase, holdout-policy reduction or broad entrypoint parity is part
 of this contract.
+
+
+The supported downgrade boundary is the production maintenance collector
+`prune_unreferenced_experiences`. Before the first C05 adoption reference, the
+same existing shared-store/proposal owner confirms a monotonic
+`c05_retention_format: 1` field on its exact Committed source proposal, with no
+other metadata/timestamp or evidence change. Known older strict proposal readers
+(including the C field-aware reader) refuse their complete proposal listing before
+any maintenance deletion. Marker failure forbids the new reference; a durable
+marker with a later annotation failure remains conservatively protective. Current
+queries/handoffs reject otherwise self-consistent records without this barrier;
+only explicit historical adoption reproof can install it. No background upgrade
+or marker removal is supported. Explicit old low-level `prune_experiences`
+callers bypassing reference collection, and direct filesystem deletion, are
+outside this downgrade safety claim.

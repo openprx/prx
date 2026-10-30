@@ -373,6 +373,10 @@ pub struct SkillProposal {
     /// Empty legacy records acquire no inferred execution lease.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bound_evaluation_attempts: Vec<String>,
+    /// Monotonic C05 dependency-format barrier. Old strict maintenance readers
+    /// must refuse this proposal before deleting otherwise unknown references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c05_retention_format: Option<u32>,
     /// Set when the proposal became `PublicationAuthorized` (SL08).
     #[serde(default)]
     pub authorization: Option<PublicationAuthorization>,
@@ -623,6 +627,9 @@ impl SkillLifecycleStore {
         if record.candidate_revision.is_some() != record.diff.is_some() {
             return Err(tampered("candidate revision and diff must be present together"));
         }
+        if record.c05_retention_format.is_some_and(|version| version != 1) {
+            return Err(tampered("unsupported C05 retention format"));
+        }
         self.verify_bound_evaluation_refs(record, path)?;
         Ok(())
     }
@@ -733,7 +740,19 @@ impl SkillLifecycleStore {
         let dir = self.proposal_dir(&proposal.proposal_id);
         let path = dir.join(PROPOSAL_FILE);
         self.verify_bound_evaluation_refs(proposal, &path)?;
+        if proposal.c05_retention_format.is_some_and(|version| version != 1) {
+            return Err(LifecycleError::ProposalRefused(
+                "unsupported C05 retention format".into(),
+            ));
+        }
         let previous = self.read_proposal_record(&proposal.proposal_id)?;
+        if previous.as_ref().is_some_and(|old| {
+            old.c05_retention_format.is_some() && old.c05_retention_format != proposal.c05_retention_format
+        }) {
+            return Err(LifecycleError::ProposalRefused(
+                "C05 retention format is monotonic and cannot be cleared or changed".into(),
+            ));
+        }
         let old_refs = previous
             .as_ref()
             .map_or(&[][..], |old| old.bound_evaluation_attempts.as_slice());
@@ -764,6 +783,35 @@ impl SkillLifecycleStore {
         }
         ensure_dir_synced(&self.proposals_dir(), &dir)?;
         self.write_atomic(&lock.lock_id, &path, &record_bytes(proposal, &path)?)
+    }
+
+    /// Caller owns the existing shared-store/proposal lock. Confirm the
+    /// downgrade barrier before the first C05 reference; never reacquire it.
+    pub(in crate::skills::lifecycle) fn ensure_c05_retention_barrier_locked(
+        &self,
+        owner: &ProposalLock,
+        proposal_id: &str,
+    ) -> Result<(), LifecycleError> {
+        crash_point!("c05_before_retention_barrier");
+        let mut proposal = self
+            .read_proposal_record(proposal_id)?
+            .ok_or_else(|| LifecycleError::ProposalRefused("C05 origin proposal is missing".into()))?;
+        if proposal.status != ProposalStatus::Committed || proposal.publication.is_none() {
+            return Err(LifecycleError::ProposalRefused(
+                "C05 retention barrier requires an actual Committed publication".into(),
+            ));
+        }
+        if proposal.c05_retention_format.is_none() {
+            proposal.c05_retention_format = Some(1);
+            self.write_proposal(owner, &proposal)?;
+        }
+        if self.read_proposal_record(proposal_id)?.as_ref() != Some(&proposal) {
+            return Err(LifecycleError::ProposalRefused(
+                "C05 retention barrier durable readback is uncertain".into(),
+            ));
+        }
+        crash_point!("c05_retention_barrier_confirmed");
+        Ok(())
     }
 
     /// Stages `bundle` as the candidate of `id`, replacing a leftover from an

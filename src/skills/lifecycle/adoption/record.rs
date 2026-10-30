@@ -261,6 +261,42 @@ impl SkillLifecycleStore {
         }
         Ok(record)
     }
+    pub(super) fn adoption_retention_barrier_path(&self, record: &AdoptionRecord) -> Result<PathBuf, LifecycleError> {
+        if !crate::skills::lifecycle::proposal::is_proposal_id(&record.proposal_id) {
+            return Err(refusal("adoption origin proposal id is invalid"));
+        }
+        Ok(self
+            .root()
+            .join("proposals")
+            .join(&record.proposal_id)
+            .join("proposal.json"))
+    }
+    /// Pure bounded-input check. Missing protection is not silently upgraded
+    /// by queries/sends. Explicit record_adoption must reprove history first.
+    pub(super) fn check_adoption_retention_barrier(
+        &self,
+        record: &AdoptionRecord,
+        bytes: &[u8],
+    ) -> Result<(), LifecycleError> {
+        let proposal: crate::skills::lifecycle::SkillProposal =
+            serde_json::from_slice(bytes).map_err(|_| refusal("C05 origin retention barrier cannot be read"))?;
+        if proposal.c05_retention_format != Some(1)
+            || proposal.owner_scope != record.owner_scope
+            || proposal.proposal_id != record.proposal_id
+            || proposal.record_id != record.proposal_id
+            || proposal.skill_id != record.skill_id
+            || proposal.candidate_revision.as_ref() != Some(&record.adopted_revision)
+            || !proposal
+                .publication
+                .as_ref()
+                .is_some_and(|publication| publication.transaction_id.as_str() == record.publication_tx)
+        {
+            return Err(refusal(
+                "C05 origin retention barrier missing or mismatched; explicit historical reproof required",
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn read_adoption_index_locked(
         &self,
         family: &str,
@@ -304,6 +340,8 @@ impl SkillLifecycleStore {
         if record.owner_scope != *self.owner_scope() || record.schema_version != 1 {
             return Err(refusal("adoption owner mismatch"));
         }
+        let barrier = read_bounded_bytes(&self.adoption_retention_barrier_path(record)?, RECORD_CAP)?;
+        self.check_adoption_retention_barrier(record, &barrier)?;
         let reference = record.reference()?;
         let _skill = self.lock_skill(&record.skill_id, Duration::from_secs(5))?;
         let root = self.adoption_directory();
@@ -326,6 +364,7 @@ impl SkillLifecycleStore {
         } else {
             self.write_atomic(&record.skill_id, &path, &bytes)?;
         }
+        crash_point!("c05_adoption_record_written");
         let mut index = self
             .read_adoption_index_locked(&record.task_family, &record.skill_id)?
             .map_or_else(

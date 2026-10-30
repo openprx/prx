@@ -42,7 +42,10 @@ impl SkillLifecycleStore {
             budget.examine()?;
             let bytes = read_bounded_bytes(&path, RECORD_CAP)?;
             budget.charge(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
-            self.decode_adoption(&bytes, &reference)?;
+            let record = self.decode_adoption(&bytes, &reference)?;
+            let barrier = read_bounded_bytes(&self.adoption_retention_barrier_path(&record)?, RECORD_CAP)?;
+            budget.charge(u64::try_from(barrier.len()).unwrap_or(u64::MAX))?;
+            self.check_adoption_retention_barrier(&record, &barrier)?;
         }
         let record_dir = self.adoption_directory().join("records");
         match fs::read_dir(&record_dir) {
@@ -60,6 +63,9 @@ impl SkillLifecycleStore {
                         return Err(refusal("unknown adoption record path; pruning refused"));
                     }
                     self.decode_adoption(&bytes, &record.reference()?)?;
+                    let barrier = read_bounded_bytes(&self.adoption_retention_barrier_path(&record)?, RECORD_CAP)?;
+                    budget.charge(u64::try_from(barrier.len()).unwrap_or(u64::MAX))?;
+                    self.check_adoption_retention_barrier(&record, &barrier)?;
                     // This also retains orphans after an uncertain status-index
                     // write. They are not silently recreated or made eligible.
                     self.read_proposal(&record.proposal_id)?

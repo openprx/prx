@@ -18,6 +18,8 @@ impl SkillLifecycleStore {
         let _store = self.lock_store(false, Duration::from_secs(5))?;
         let record_path = self.adoption_record_path(&reference.adoption_id)?;
         let record = self.decode_adoption(&read_bounded_bytes(&record_path, RECORD_CAP)?, reference)?;
+        let barrier = read_bounded_bytes(&self.adoption_retention_barrier_path(&record)?, RECORD_CAP)?;
+        self.check_adoption_retention_barrier(&record, &barrier)?;
         let _skill = self.lock_skill(&record.skill_id, Duration::from_secs(5))?;
         let (mut index, _) = self
             .read_adoption_index_locked(&record.task_family, &record.skill_id)?

@@ -143,6 +143,13 @@ impl SkillLifecycleStore {
             budget.charge(u64::try_from(bytes.len()).map_err(|_| refusal("lesson record size overflow"))?)?;
             let record = self.decode_adoption(&bytes, &descriptor.reference)?;
             budget.check()?;
+            let barrier = read_bounded_bytes(
+                &self.adoption_retention_barrier_path(&record)?,
+                snapshot.limits.record_bytes,
+            )?;
+            budget.charge(u64::try_from(barrier.len()).unwrap_or(u64::MAX))?;
+            self.check_adoption_retention_barrier(&record, &barrier)?;
+            budget.check()?;
             if record.owner_scope != *self.owner_scope()
                 || record.skill_id != *skill
                 || record.task_family != snapshot.task_family

@@ -641,6 +641,7 @@ impl SkillLifecycleStore {
             evaluation_epoch: 0,
             evaluating_since: None,
             bound_evaluation_attempts: Vec::new(),
+            c05_retention_format: None,
             authorization: None,
             publication: None,
             created_at: now,
