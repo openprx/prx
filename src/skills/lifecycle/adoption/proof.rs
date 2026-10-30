@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// source, owner, compatibility, exclusions and content are resolved by service.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RecordAdoptionRequest {
+pub struct RecordAdoptionRequest {
     pub proposal_id: String,
     pub publication_tx: String,
     pub experiment_id: String,

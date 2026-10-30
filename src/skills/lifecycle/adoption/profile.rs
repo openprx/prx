@@ -99,49 +99,9 @@ fn alphabet() -> BTreeSet<char> {
     out
 }
 
-fn verify_profile() -> Result<SupportedProfile, LifecycleError> {
-    let (resolved, runtime_signature) = actual_mapping()?;
-    let manifest_path = resolved.join("model.json");
-    let manifest_bytes = read_asset(&manifest_path, 16 * 1024)?;
-    let manifest: Value =
-        serde_json::from_slice(&manifest_bytes).map_err(|_| refusal("invalid actual Splash manifest"))?;
-    if manifest.get("model").and_then(Value::as_str) != Some(MODEL)
-        || resolved.file_name().and_then(|name| name.to_str()) != Some(digest(&manifest_bytes).as_str())
-    {
-        return Err(refusal("Splash manifest does not bind its actual resolved model"));
-    }
-    let mut files = Vec::new();
-    let mut asset = |name: &str, expected: &str, cap: u64| -> Result<Vec<u8>, LifecycleError> {
-        let path = resolved
-            .join(name)
-            .canonicalize()
-            .map_err(|error| LifecycleError::io(&resolved, error))?;
-        let bytes = read_asset(&path, cap)?;
-        let item = manifest
-            .get("files")
-            .and_then(|value| value.get(name))
-            .ok_or_else(|| refusal("tokenizer asset is absent from the actual manifest"))?;
-        if digest(&bytes) != expected
-            || item.get("digest").and_then(Value::as_str) != Some(expected)
-            || item.get("bytes").and_then(Value::as_u64) != Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-        {
-            return Err(refusal("tokenizer asset differs from its pinned manifest/hash"));
-        }
-        let metadata = fs::metadata(&path).map_err(|error| LifecycleError::io(&path, error))?;
-        files.push((
-            path,
-            metadata.len(),
-            metadata
-                .modified()
-                .map_err(|_| refusal("tokenizer asset lacks stable metadata"))?,
-        ));
-        Ok(bytes)
-    };
-    let bytes = asset("tokenizer/tokenizer.json", TOKENIZER_SHA, 16 * 1024 * 1024)?;
-    let tokenizer: Value = serde_json::from_slice(&bytes).map_err(|_| refusal("invalid supported tokenizer JSON"))?;
-    let config: Value = serde_json::from_slice(&asset("tokenizer/tokenizer_config.json", CONFIG_SHA, 16 * 1024)?)
-        .map_err(|_| refusal("invalid supported tokenizer config"))?;
-    let _template = asset("tokenizer/chat_template.jinja", TEMPLATE_SHA, 16 * 1024)?;
+/// Pure shared proof: ASCII normalization is identity, splitting cannot add
+/// symbols, BPE only merges a complete byte alphabet, and no empty token exists.
+fn certify_byte_bpe(tokenizer: &Value, config: &Value) -> Result<usize, LifecycleError> {
     let normalizer = tokenizer.get("normalizer");
     if normalizer != Some(&serde_json::json!({"type":"NFC"}))
         || config.get("tokenizer_class").and_then(Value::as_str) != Some("TokenizersBackend")
@@ -205,6 +165,53 @@ fn verify_profile() -> Result<SupportedProfile, LifecycleError> {
     if max_token_bytes > 256 {
         return Err(refusal("tokenizer boundary exceeds the certified reserve"));
     }
+    Ok(max_token_bytes)
+}
+
+fn verify_profile() -> Result<SupportedProfile, LifecycleError> {
+    let (resolved, runtime_signature) = actual_mapping()?;
+    let manifest_path = resolved.join("model.json");
+    let manifest_bytes = read_asset(&manifest_path, 16 * 1024)?;
+    let manifest: Value =
+        serde_json::from_slice(&manifest_bytes).map_err(|_| refusal("invalid actual Splash manifest"))?;
+    if manifest.get("model").and_then(Value::as_str) != Some(MODEL)
+        || resolved.file_name().and_then(|name| name.to_str()) != Some(digest(&manifest_bytes).as_str())
+    {
+        return Err(refusal("Splash manifest does not bind its actual resolved model"));
+    }
+    let mut files = Vec::new();
+    let mut asset = |name: &str, expected: &str, cap: u64| -> Result<Vec<u8>, LifecycleError> {
+        let path = resolved
+            .join(name)
+            .canonicalize()
+            .map_err(|error| LifecycleError::io(&resolved, error))?;
+        let bytes = read_asset(&path, cap)?;
+        let item = manifest
+            .get("files")
+            .and_then(|value| value.get(name))
+            .ok_or_else(|| refusal("tokenizer asset is absent from the actual manifest"))?;
+        if digest(&bytes) != expected
+            || item.get("digest").and_then(Value::as_str) != Some(expected)
+            || item.get("bytes").and_then(Value::as_u64) != Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+        {
+            return Err(refusal("tokenizer asset differs from its pinned manifest/hash"));
+        }
+        let metadata = fs::metadata(&path).map_err(|error| LifecycleError::io(&path, error))?;
+        files.push((
+            path,
+            metadata.len(),
+            metadata
+                .modified()
+                .map_err(|_| refusal("tokenizer asset lacks stable metadata"))?,
+        ));
+        Ok(bytes)
+    };
+    let bytes = asset("tokenizer/tokenizer.json", TOKENIZER_SHA, 16 * 1024 * 1024)?;
+    let tokenizer: Value = serde_json::from_slice(&bytes).map_err(|_| refusal("invalid supported tokenizer JSON"))?;
+    let config: Value = serde_json::from_slice(&asset("tokenizer/tokenizer_config.json", CONFIG_SHA, 16 * 1024)?)
+        .map_err(|_| refusal("invalid supported tokenizer config"))?;
+    let _template = asset("tokenizer/chat_template.jinja", TEMPLATE_SHA, 16 * 1024)?;
+    let max_token_bytes = certify_byte_bpe(&tokenizer, &config)?;
     // This exact text-only template/profile is certified, not arbitrary Jinja.
     // Reserve 256 for the final merge boundary and 64 for fixed role/BOS/EOS/
     // thinking prefixes. No new message is inserted; total remains under 1536.
@@ -227,7 +234,16 @@ fn verify_profile() -> Result<SupportedProfile, LifecycleError> {
     })
 }
 
-pub(super) fn supported_profile(model: &ModelBinding) -> Result<&'static SupportedProfile, LifecycleError> {
+pub(super) fn supported_profile(
+    store: &SkillLifecycleStore,
+    model: &ModelBinding,
+) -> Result<SupportedProfile, LifecycleError> {
+    #[cfg(test)]
+    if let Some(profile) = fixture::registered(store, model)? {
+        return Ok(profile);
+    }
+    #[cfg(not(test))]
+    let _ = store;
     static PROFILE: OnceLock<SupportedProfile> = OnceLock::new();
     if model.provider_label != "custom:http://127.0.0.1:18086/v1" || model.model != "qwen38-27b-splash" {
         return Err(refusal("no verified tokenizer profile for the actual model"));
@@ -248,7 +264,7 @@ pub(super) fn supported_profile(model: &ModelBinding) -> Result<&'static Support
             "actual Splash model/tokenizer mapping changed after profile verification",
         ));
     }
-    Ok(profile)
+    Ok(profile.clone())
 }
 impl SkillLifecycleStore {
     pub(in crate::skills::lifecycle) fn lesson_profile_compatibility(
@@ -260,7 +276,7 @@ impl SkillLifecycleStore {
         if !valid_digest(policy_sha256) || !valid_digest(source_profile_sha256) {
             return Err(refusal("invalid lesson policy/source pin"));
         }
-        let profile = supported_profile(model)?;
+        let profile = supported_profile(self, model)?;
         Ok(LessonCompatibility {
             model_sha256: model.digest(),
             policy_sha256: policy_sha256.into(),
@@ -269,3 +285,8 @@ impl SkillLifecycleStore {
         })
     }
 }
+
+#[cfg(test)]
+mod fixture;
+#[cfg(test)]
+pub(crate) use fixture::LessonFixtureProfileGuard;

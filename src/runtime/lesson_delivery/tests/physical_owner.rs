@@ -35,12 +35,18 @@ impl AttemptAccounting for OwnerCheckedAccounting {
                 request.body(),
             ],
         );
+        let actual_body: serde_json::Value = serde_json::from_slice(request.body())?;
+        let actual_model = actual_body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .context("physical fixture body has no actual model")?;
+        ensure!(actual_model == PROBE_MODEL, "fixture physical model changed");
         let receipt = self
             .actual
             .begin_physical(PhysicalEstimate {
                 purpose: "evolution_proposer",
                 provider: PROVIDER,
-                model: request.model(),
+                model: actual_model,
                 body: request.body(),
                 transport_binding: &binding,
                 request_id: "lesson-owner-boundary-fixture",

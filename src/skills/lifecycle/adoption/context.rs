@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// Pure data. Deserialization or a matching hash is never adoption authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LessonRef {
+pub struct LessonRef {
     pub adoption_id: String,
     pub adoption_sha256: String,
     pub publication_tx: String,

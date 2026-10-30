@@ -4,7 +4,7 @@ use crate::skills::lifecycle::LessonRef;
 
 impl SkillsLifecycleService {
     /// True adds a retired/invalidated marker; false does not revive history.
-    pub(crate) fn set_adoption_status(
+    pub fn set_adoption_status(
         &self,
         reference: &LessonRef,
         retired: bool,

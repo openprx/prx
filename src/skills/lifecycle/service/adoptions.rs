@@ -8,7 +8,7 @@ use anyhow::{Result, ensure};
 impl SkillsLifecycleService {
     /// Record one already-Committed adoption using only trusted owner evidence.
     /// No current relaxed policy or caller-supplied compatibility is accepted.
-    pub(crate) fn record_adoption(
+    pub fn record_adoption(
         &self,
         request: &RecordAdoptionRequest,
         config: &crate::config::Config,

@@ -22,7 +22,8 @@ mod agent_executor;
 // Shared A/B contracts become used as the independently implemented factory
 // and physical wrapper integrate; no lesson feature is activated by exports.
 #[allow(unused_imports)]
-pub(crate) use adoption::{LessonHandoffGuard, LessonPlacement, LessonRef, LessonSnapshot, PreparedLessonContext};
+pub(crate) use adoption::{LessonHandoffGuard, LessonPlacement, LessonSnapshot, PreparedLessonContext};
+pub use adoption::{LessonRef, RecordAdoptionRequest};
 mod authorize;
 mod binding;
 mod bundle;
