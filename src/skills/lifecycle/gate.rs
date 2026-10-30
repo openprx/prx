@@ -58,6 +58,10 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+mod experiment;
+pub use experiment::GateExperimentBinding;
+pub(crate) use experiment::GateReviewSubject;
+
 /// Identity stamped on every gate receipt as the reviewer.
 pub const GATE_IDENTITY: &str = "prx-skill-gate/1";
 const GATES_DIR: &str = "gates";
@@ -104,6 +108,8 @@ pub enum GateError {
     SuiteChanged(String),
     #[error("gate receipt expired at {0}")]
     Expired(DateTime<Utc>),
+    #[error("historical gate has insufficient temporal evidence: {0}")]
+    InsufficientTemporalEvidence(String),
     #[error("gate receipt is invalid: {0}")]
     Tampered(String),
     #[error("gating was cancelled before a decision was made")]
@@ -348,6 +354,9 @@ pub struct SkillGateDecision {
     pub schema_version: u32,
     pub record_id: String,
     pub owner_scope: OwnerScope,
+    /// Captured only from an admitted runtime at gate creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experiment: Option<GateExperimentBinding>,
     pub proposal_id: String,
     /// Evaluation epoch of the proposal this decision belongs to.
     pub epoch: u32,
@@ -1096,12 +1105,22 @@ impl SkillLifecycleStore {
         cancel: &CancellationToken,
     ) -> Result<GateOutcome, GateError> {
         request.policy.validate()?;
+        let experiment = self.current_gate_experiment_binding()?;
+        let expected_subject = self.current_gate_review_subject()?;
         if cancel.is_cancelled() {
             return Err(GateError::Cancelled);
         }
         let proposal = self
             .read_proposal(request.proposal_id)?
             .ok_or_else(|| GateError::Unsupported(format!("no such proposal {}", request.proposal_id)))?;
+        // This is the exact immutable clone later used by resolve_evaluations,
+        // JudgeBrief and the sealed decision. Never silently capture a new epoch.
+        self.require_expected_gate_subject(
+            &proposal,
+            request.suite_digest,
+            request.evaluations,
+            expected_subject.as_ref(),
+        )?;
         let Some(candidate) = proposal.candidate_revision.clone() else {
             return Err(GateError::Unsupported(
                 "the proposal has no staged candidate".to_string(),
@@ -1117,6 +1136,11 @@ impl SkillLifecycleStore {
         }
         let gate_id = gate_id_of(self.owner_scope(), &proposal.proposal_id, proposal.evaluation_epoch);
         if let Some(existing) = self.read_gate(&gate_id)? {
+            if existing.decision.experiment != experiment {
+                return Err(GateError::Unbound(
+                    "an existing gate belongs to another physical accounting context".into(),
+                ));
+            }
             // Resume: the decision for this epoch was already made and sealed.
             let mut stored: Vec<(&str, &str)> = existing
                 .decision
@@ -1242,6 +1266,7 @@ impl SkillLifecycleStore {
             schema_version: SCHEMA_VERSION,
             record_id: gate_id,
             owner_scope: self.owner_scope().clone(),
+            experiment,
             proposal_id: proposal.proposal_id.clone(),
             epoch: proposal.evaluation_epoch,
             operation: proposal.operation,
@@ -1520,6 +1545,25 @@ impl SkillLifecycleStore {
         let _store = self.lock_store(true, GATE_LOCK_TIMEOUT)?;
         let _skill = self.lock_skill(&lock_id, GATE_LOCK_TIMEOUT)?;
         if let Some(existing) = self.read_gate(&decision.record_id)? {
+            if existing.decision.experiment != decision.experiment {
+                return Err(GateError::Unbound(
+                    "a concurrent gate won under another physical accounting context".into(),
+                ));
+            }
+            if decision.experiment.is_some()
+                && (existing.decision.proposal_id != decision.proposal_id
+                    || existing.decision.epoch != decision.epoch
+                    || existing.decision.candidate_revision != decision.candidate_revision
+                    || existing.decision.baseline_revision != decision.baseline_revision
+                    || existing.decision.expected_generation != decision.expected_generation
+                    || existing.decision.suite_digest != decision.suite_digest
+                    || existing.decision.policy != decision.policy
+                    || existing.decision.evaluations != decision.evaluations)
+            {
+                return Err(GateError::Unbound(
+                    "a concurrent gate captured different immutable subject/evaluation inputs".into(),
+                ));
+            }
             return Ok(existing);
         }
         let digest = seal_digest(decision)?;

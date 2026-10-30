@@ -21,6 +21,7 @@
 //! publication_block`] says why.
 
 mod experiments;
+pub(in crate::skills::lifecycle) use experiments::{GateReviewPin, VerifiedGateReviewHistory};
 mod proposals;
 mod script_proposals;
 

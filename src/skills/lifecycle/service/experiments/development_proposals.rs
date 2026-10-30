@@ -238,6 +238,7 @@ impl SkillsLifecycleService {
             0
         };
         Ok(StageEvidence {
+            pending_gate: None,
             record_id: proposal.proposal_id.clone(),
             digest: proposal_evidence(&proposal)?,
             successful: proposal.candidate_revision.is_some(),

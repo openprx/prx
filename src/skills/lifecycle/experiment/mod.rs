@@ -1,6 +1,8 @@
 //! Owner-scoped bounded experiment records and state contracts.
 //! Execution, accounting, verification and publication retain their existing owners.
 mod cycle;
+mod gate_review;
+pub(in crate::skills::lifecycle) use gate_review::{GateReviewPhysical, GateReviewWitness, GateVerificationWindow};
 mod journal;
 mod operation;
 mod probe;

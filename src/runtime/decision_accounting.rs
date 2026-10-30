@@ -307,6 +307,11 @@ impl AccountingScope {
     pub(super) async fn begin_physical(&self, attempt: PhysicalEstimate<'_>) -> Result<OwnedReceipt, DecisionError> {
         if let Some(stage) = super::experiment_stage::current() {
             stage.ensure_active().map_err(|_| DecisionError::Cancelled)?;
+            // A retained envelope may have been created by another live stage.
+            // Refuse that parent before reserving or dispatching any work.
+            if self.parent.is_some() && self.scope_id() != stage.scope_id() {
+                return Err(DecisionError::BudgetExceeded);
+            }
             if self.parent.is_none() && self.scope_id != stage.accounting.scope_id {
                 return stage.accounting.begin_physical_owned(attempt, self.budgets).await;
             }

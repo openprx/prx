@@ -22,6 +22,8 @@ pub(crate) struct ExperimentStageRuntime {
     cancel: CancellationToken,
     tools: AtomicU64,
     resources: ExperimentResources,
+    kind: crate::skills::lifecycle::experiment::ExperimentStageKind,
+    gate_subject: std::sync::OnceLock<crate::skills::lifecycle::GateReviewSubject>,
     output: AtomicU64,
     scratch: AtomicU64,
     files: files::ScratchWrites,
@@ -89,6 +91,8 @@ impl ExperimentStageRuntime {
             cancel,
             tools: AtomicU64::new(0),
             resources,
+            kind: admitted.kind,
+            gate_subject: std::sync::OnceLock::new(),
             output: AtomicU64::new(0),
             scratch: AtomicU64::new(0),
             files: files::ScratchWrites::default(),
@@ -184,6 +188,50 @@ impl ExperimentStageRuntime {
     pub(crate) fn binding(&self) -> crate::skills::lifecycle::experiment::ExperimentRunBinding {
         self.binding.clone()
     }
+    /// One in-memory expected immutable subject, not a second durable owner.
+    pub(crate) fn bind_gate_subject(&self, subject: crate::skills::lifecycle::GateReviewSubject) -> anyhow::Result<()> {
+        self.ensure_active()?;
+        anyhow::ensure!(
+            self.kind == crate::skills::lifecycle::experiment::ExperimentStageKind::GateReview,
+            "only GateReview binds a judge subject"
+        );
+        if let Some(existing) = self.gate_subject.get() {
+            anyhow::ensure!(existing == &subject, "GateReview expected subject cannot change");
+        } else {
+            self.gate_subject
+                .set(subject)
+                .map_err(|_| anyhow::anyhow!("GateReview expected subject raced"))?;
+        }
+        Ok(())
+    }
+    pub(crate) fn gate_subject(&self) -> Option<crate::skills::lifecycle::GateReviewSubject> {
+        self.gate_subject.get().cloned()
+    }
+    /// Actual stage accounting identity, never an input supplied to GateRequest.
+    pub(crate) fn gate_record_binding(
+        &self,
+        owner: &crate::skills::lifecycle::OwnerScope,
+    ) -> anyhow::Result<crate::skills::lifecycle::GateExperimentBinding> {
+        self.ensure_active()?;
+        anyhow::ensure!(
+            self.store.owner_scope() == owner,
+            "gate runtime owner differs from store"
+        );
+        anyhow::ensure!(
+            self.kind == crate::skills::lifecycle::experiment::ExperimentStageKind::GateReview,
+            "only an admitted GateReview stage can bind an experiment gate"
+        );
+        anyhow::ensure!(
+            self.gate_subject.get().is_some(),
+            "gate runtime has no expected immutable subject"
+        );
+        Ok(crate::skills::lifecycle::GateExperimentBinding {
+            owner_scope: owner.clone(),
+            experiment: self.binding(),
+            physical_scope_id: self.scope_id(),
+        })
+    }
+
     pub(crate) fn scope_id(&self) -> String {
         self.accounting.scope_id()
     }

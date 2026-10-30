@@ -110,6 +110,15 @@ impl ModelJudge {
     pub fn new(model: Arc<dyn ProposerModel>) -> Self {
         Self { model }
     }
+    /// Pure identity reconstruction for sealed historical evidence.
+    pub(crate) fn identity_for(binding: &super::ModelBinding) -> String {
+        format!(
+            "model-judge/{}/{}/{}",
+            JUDGE_PROMPT_VERSION,
+            binding.model,
+            binding.digest().get(..16).unwrap_or_default()
+        )
+    }
 }
 
 fn sha256_hex(parts: &[&str]) -> String {
@@ -220,13 +229,7 @@ fn parse_opinion(text: &str) -> Result<JudgeOpinion, String> {
 #[async_trait]
 impl GateJudge for ModelJudge {
     fn identity(&self) -> String {
-        let binding = self.model.binding();
-        format!(
-            "model-judge/{}/{}/{}",
-            JUDGE_PROMPT_VERSION,
-            binding.model,
-            binding.digest().get(..16).unwrap_or_default()
-        )
+        Self::identity_for(self.model.binding())
     }
 
     async fn review(&self, brief: &JudgeBrief<'_>, tally: Arc<TallyCounters>) -> Result<JudgeReply, JudgeError> {

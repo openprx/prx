@@ -55,6 +55,14 @@ pub enum ExperimentOperation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         validation_stage: Option<String>,
     },
+    /// Private gate creation after both exact independent verifiers succeeded.
+    GateReview {
+        selection_stage: String,
+        validation_stage: String,
+        validation_verifier: String,
+        holdout_stage: String,
+        holdout_verifier: String,
+    },
 }
 impl ExperimentOperation {
     pub fn digest(&self) -> Result<String, ExperimentError> {
@@ -72,6 +80,7 @@ impl ExperimentOperation {
             }
             Self::Verify { .. } => ExperimentStageKind::IndependentVerification,
             Self::DevelopmentSelection { .. } => ExperimentStageKind::Selection,
+            Self::GateReview { .. } => ExperimentStageKind::GateReview,
         }
     }
 }
