@@ -8,6 +8,16 @@ fn cycle(
     config: &Config,
     pattern: PatternId,
 ) -> Result<InstructionExperimentPlan> {
+    cycle_with_schedule(f, service, config, pattern, InstructionSchedule::Single)
+}
+
+pub(super) fn cycle_with_schedule(
+    f: &Fixture,
+    service: &SkillsLifecycleService,
+    config: &Config,
+    pattern: PatternId,
+    schedule: InstructionSchedule,
+) -> Result<InstructionExperimentPlan> {
     let (_, inputs) = plan(f, service, config, vec![pattern.clone()])?;
     let proposal_allocation = ExperimentResources {
         calls: 4,
@@ -26,20 +36,33 @@ fn cycle(
         scratch_bytes: 32 * 1024 * 1024,
     };
     assert!(inputs.contains_key("proposal"));
+    let resources = if schedule == InstructionSchedule::Single {
+        ExperimentResources {
+            calls: 512,
+            tokens: 4_000_000,
+            micro_usd: 4_000_000,
+            tool_calls: 512,
+            output_bytes: 4_000_000,
+            scratch_bytes: 256 * 1024 * 1024,
+        }
+    } else {
+        ExperimentResources {
+            calls: 1024,
+            tokens: 8_000_000,
+            micro_usd: 8_000_000,
+            tool_calls: 1024,
+            output_bytes: 8_000_000,
+            scratch_bytes: 512 * 1024 * 1024,
+        }
+    };
     service.plan_instruction_cycle(
         InstructionCycleDraft {
             id: ExperimentId::parse("automatic-instruction-cycle")?,
             skill_id: f.pin.skill_id.clone(),
+            schedule,
             patterns: vec![pattern],
             verification_split: EvalSplit::Validation,
-            resources: ExperimentResources {
-                calls: 512,
-                tokens: 4_000_000,
-                micro_usd: 4_000_000,
-                tool_calls: 512,
-                output_bytes: 4_000_000,
-                scratch_bytes: 256 * 1024 * 1024,
-            },
+            resources,
             proposal_allocation,
             probe_allocation,
             evaluation_allocation: probe_allocation,

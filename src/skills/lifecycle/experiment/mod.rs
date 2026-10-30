@@ -9,7 +9,7 @@ mod state;
 mod state_tests;
 #[cfg(test)]
 mod tests;
-pub use cycle::{InstructionCycleDraft, InstructionExperimentPlan};
+pub use cycle::{InstructionCycleDraft, InstructionExperimentPlan, InstructionSchedule};
 pub use operation::*;
 pub use probe::DevelopmentProbeReceipt;
 pub(in crate::skills::lifecycle) use probe::probe_run_count;

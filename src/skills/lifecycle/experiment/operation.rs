@@ -37,12 +37,16 @@ pub enum ExperimentOperation {
         role: DevelopmentRole,
         patterns: Vec<PatternId>,
         probe_stages: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_selection: Option<String>,
         max_input_bytes: usize,
         max_output_bytes: usize,
         timeout_ms: u64,
     },
     DevelopmentSelection {
         probe_stages: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parent_selections: Vec<String>,
     },
     SelectedEvaluation {
         selection_stage: String,

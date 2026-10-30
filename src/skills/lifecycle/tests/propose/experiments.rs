@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod development_probes;
 mod instruction_cycle;
 mod live_fixture;
+mod refinement;
 
 struct Server {
     url: String,
@@ -43,6 +44,8 @@ impl Server {
         let large = oversized.clone();
         let h2_mode = Arc::new(AtomicUsize::new(0));
         let h2_behavior = h2_mode.clone();
+        let editor_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let editor_count = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
@@ -50,7 +53,7 @@ impl Server {
                     biased;
                     () = stop.cancelled() => { connections.abort_all(); while connections.join_next().await.is_some() {} return Ok(()); },
                     accepted = listener.accept() => {
-                        let (mut socket, _) = accepted?; let count = counter.clone(); let captured = captured.clone(); let large = large.clone(); let h2_behavior = h2_behavior.clone();
+                        let (mut socket, _) = accepted?; let count = counter.clone(); let captured = captured.clone(); let large = large.clone(); let h2_behavior = h2_behavior.clone(); let editor_barrier = editor_barrier.clone(); let editor_count = editor_count.clone();
                         connections.spawn(async move {
                             let mut bytes = Vec::new(); let mut chunk = [0_u8; 4096];
                             let body = loop {
@@ -65,7 +68,7 @@ impl Server {
                                 }
                             };
                             count.fetch_add(1, Ordering::SeqCst);
-                            { let mut retained = captured.lock(); if retained.len() < 64 { retained.push(body.clone()); } }
+                            { let mut retained = captured.lock(); if retained.len() < 256 { retained.push(body.clone()); } }
                             if body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool| {
                                 tool["function"]["name"].as_str().is_none_or(|name| name.is_empty() || name.len()>128
                                     || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte,b'_'|b'-')))
@@ -83,6 +86,19 @@ impl Server {
                                 && message["content"].as_str().is_some_and(|text| text.starts_with("Review the proposed final reply against"))) {
                                 Some(r#"{"decision":"accept","reason":"Scripted native results are present","constraints":[]}"#)
                             } else { None };
+                            let is_editor = messages.iter().any(|message| message["content"].as_str().is_some_and(|value| value.contains("You revise one instruction skill")));
+                            let editor_number = if is_editor { Some(editor_count.fetch_add(1, Ordering::SeqCst)) } else { None };
+                            if is_editor {
+                                match h2_behavior.load(Ordering::SeqCst) {
+                                    3 => { tokio::time::timeout(Duration::from_secs(20), editor_barrier.wait()).await?; },
+                                    4 => { std::future::pending::<()>().await; },
+                                    5 => {
+                                        tokio::time::timeout(Duration::from_secs(20), editor_barrier.wait()).await?;
+                                        if editor_number != Some(0) { std::future::pending::<()>().await; }
+                                    },
+                                    _ => {},
+                                }
+                            }
                             let text = assessment_response.map_or_else(|| {
                             if messages.iter().any(|message| message["content"].as_str().is_some_and(|value| value.contains("You revise one instruction skill"))) {
                                 let system = messages.iter().filter(|message| message["role"] == "system").map(|message| message["content"].to_string()).collect::<Vec<_>>().join(" ");
@@ -129,7 +145,7 @@ impl Server {
                                 }).context("solver has no offered instruction-read alias")?;
                                 json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("fixture-read-{}",count.load(Ordering::SeqCst)),"type":"function","function":{"name":name,"arguments":"{\"name\":\"Deploy helper\"}"}}]})
                             } else { json!({"role":"assistant","content":text}) };
-                            let message = if large.load(Ordering::SeqCst) { json!({"role":"assistant","content":"x".repeat(256*1024)}) } else { message };
+                            let message = if large.load(Ordering::SeqCst) || (h2_behavior.load(Ordering::SeqCst) == 5 && editor_number == Some(0)) { json!({"role":"assistant","content":"x".repeat(256*1024)}) } else { message };
                             let body = json!({"choices":[{"message":message,"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150}}).to_string();
                             let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                             socket.write_all(reply.as_bytes()).await?; socket.shutdown().await?; Ok::<_, anyhow::Error>(())

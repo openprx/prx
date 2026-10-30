@@ -1,4 +1,4 @@
-//! Pure k1 stage compiler. Owns only ordering and operation identities; the
+//! Pure bounded instruction-cycle compiler. Owns only ordering and operation identities; the
 //! existing service resolves authority, runs stages and records their effects.
 use super::{
     DevelopmentRole, ExperimentDraft, ExperimentDraftStage, ExperimentError, ExperimentId, ExperimentOperation,
@@ -8,12 +8,25 @@ use crate::skills::lifecycle::{EvalSplit, PatternId, SkillId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionSchedule {
+    #[default]
+    Single,
+    #[serde(rename = "sequential_2")]
+    Sequential2,
+    #[serde(rename = "parallel_2")]
+    Parallel2,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstructionCycleDraft {
     pub id: ExperimentId,
     pub skill_id: SkillId,
     pub patterns: Vec<PatternId>,
+    #[serde(default)]
+    pub schedule: InstructionSchedule,
     pub verification_split: EvalSplit,
     pub resources: ExperimentResources,
     pub proposal_allocation: ExperimentResources,
@@ -54,9 +67,7 @@ impl InstructionExperimentPlan {
 }
 impl InstructionCycleDraft {
     pub fn compile(self) -> Result<ExperimentDraft, ExperimentError> {
-        use ExperimentOperation::{
-            DevelopmentProbe, DevelopmentProposal, DevelopmentSelection, SelectedEvaluation, Verify,
-        };
+        use ExperimentOperation::{DevelopmentProbe, DevelopmentSelection, SelectedEvaluation, Verify};
         if self.patterns.is_empty() || self.patterns.len() > super::super::MAX_PROPOSAL_PATTERNS {
             return Err(ExperimentError::InvalidSpec(
                 "cycle needs bounded verified pattern inputs".into(),
@@ -67,99 +78,55 @@ impl InstructionCycleDraft {
             self.max_output_bytes,
             std::time::Duration::from_millis(self.proposal_timeout_ms),
         )?;
-        let proposal = |role, probes| DevelopmentProposal {
-            role,
-            probe_stages: probes,
-            patterns: self.patterns.clone(),
-            max_input_bytes: self.max_input_bytes,
-            max_output_bytes: self.max_output_bytes,
-            timeout_ms: self.proposal_timeout_ms,
-        };
-        let ids = |names: &[&str]| names.iter().map(|name| (*name).into()).collect::<Vec<String>>();
-        let contrasts = ids(&["baseline", "general-probe", "domain-probe"]);
-        let comparisons = ids(&["baseline", "general-probe", "domain-probe", "compose-probe"]);
-        let mut stages = Vec::new();
-        let mut add = |name: &str, dependencies: Vec<String>, operation, allocation| {
-            stages.push(ExperimentDraftStage {
-                id: name.into(),
-                dependencies,
-                operation,
-                allocation,
-            })
-        };
-        add(
-            "baseline",
-            vec![],
-            DevelopmentProbe { proposal_stage: None },
-            self.probe_allocation,
-        );
-        add(
-            "general",
-            ids(&["baseline"]),
-            proposal(DevelopmentRole::General, ids(&["baseline"])),
-            self.proposal_allocation,
-        );
-        add(
-            "domain",
-            ids(&["baseline"]),
-            proposal(DevelopmentRole::Domain, ids(&["baseline"])),
-            self.proposal_allocation,
-        );
-        add(
-            "general-probe",
-            ids(&["general"]),
-            DevelopmentProbe {
-                proposal_stage: Some("general".into()),
+        let mut stages = vec![ExperimentDraftStage {
+            id: "baseline".into(),
+            dependencies: vec![],
+            operation: DevelopmentProbe { proposal_stage: None },
+            allocation: self.probe_allocation,
+        }];
+        match self.schedule {
+            InstructionSchedule::Single => stages.extend(self.round("", "select", None)),
+            InstructionSchedule::Sequential2 => {
+                stages.extend(self.round("", "select-round1", None));
+                stages.extend(self.round("round2-", "select", Some("select-round1")));
+            }
+            InstructionSchedule::Parallel2 => {
+                let left = self.round("branch-a-", "select-a", None);
+                let right = self.round("branch-b-", "select-b", None);
+                for (a, b) in left.into_iter().zip(right) {
+                    stages.push(a);
+                    stages.push(b);
+                }
+                stages.push(ExperimentDraftStage {
+                    id: "select".into(),
+                    dependencies: vec!["baseline".into(), "select-a".into(), "select-b".into()],
+                    operation: DevelopmentSelection {
+                        probe_stages: vec!["baseline".into()],
+                        parent_selections: vec!["select-a".into(), "select-b".into()],
+                    },
+                    allocation: ExperimentResources::default(),
+                });
+            }
+        }
+        stages.extend([
+            ExperimentDraftStage {
+                id: "final-evaluation".into(),
+                dependencies: vec!["select".into()],
+                operation: SelectedEvaluation {
+                    selection_stage: "select".into(),
+                    split: self.verification_split,
+                },
+                allocation: self.evaluation_allocation,
             },
-            self.probe_allocation,
-        );
-        add(
-            "domain-probe",
-            ids(&["domain"]),
-            DevelopmentProbe {
-                proposal_stage: Some("domain".into()),
+            ExperimentDraftStage {
+                id: "verify".into(),
+                dependencies: vec!["final-evaluation".into()],
+                operation: Verify {
+                    evaluation_stage: "final-evaluation".into(),
+                },
+                allocation: ExperimentResources::default(),
             },
-            self.probe_allocation,
-        );
-        add(
-            "compose",
-            contrasts.clone(),
-            proposal(DevelopmentRole::Compose, contrasts),
-            self.proposal_allocation,
-        );
-        add(
-            "compose-probe",
-            ids(&["compose"]),
-            DevelopmentProbe {
-                proposal_stage: Some("compose".into()),
-            },
-            self.probe_allocation,
-        );
-        add(
-            "select",
-            comparisons.clone(),
-            DevelopmentSelection {
-                probe_stages: comparisons,
-            },
-            ExperimentResources::default(),
-        );
-        add(
-            "final-evaluation",
-            ids(&["select"]),
-            SelectedEvaluation {
-                selection_stage: "select".into(),
-                split: self.verification_split,
-            },
-            self.evaluation_allocation,
-        );
-        add(
-            "verify",
-            ids(&["final-evaluation"]),
-            Verify {
-                evaluation_stage: "final-evaluation".into(),
-            },
-            ExperimentResources::default(),
-        );
+        ]);
         let reserved = stages.iter().try_fold(ExperimentResources::default(), |sum, stage| {
             sum.checked_add(stage.allocation)
         })?;
@@ -172,8 +139,71 @@ impl InstructionCycleDraft {
             verification_split: self.verification_split,
             resources: self.resources,
             elapsed_ms: self.elapsed_ms,
-            max_concurrent: 1,
+            max_concurrent: if self.schedule == InstructionSchedule::Parallel2 {
+                2
+            } else {
+                1
+            },
             stages,
         })
+    }
+    fn round(&self, prefix: &str, selection: &str, parent: Option<&str>) -> Vec<ExperimentDraftStage> {
+        use ExperimentOperation::{DevelopmentProbe, DevelopmentProposal, DevelopmentSelection};
+        let general = format!("{prefix}general");
+        let domain = format!("{prefix}domain");
+        let compose = format!("{prefix}compose");
+        let gp = format!("{prefix}general-probe");
+        let dp = format!("{prefix}domain-probe");
+        let cp = format!("{prefix}compose-probe");
+        let proposal = |id: String, role, probes: Vec<String>| {
+            let mut dependencies = probes.clone();
+            dependencies.extend(parent.map(str::to_owned));
+            ExperimentDraftStage {
+                id,
+                dependencies,
+                allocation: self.proposal_allocation,
+                operation: DevelopmentProposal {
+                    role,
+                    probe_stages: probes,
+                    patterns: self.patterns.clone(),
+                    parent_selection: parent.map(str::to_owned),
+                    max_input_bytes: self.max_input_bytes,
+                    max_output_bytes: self.max_output_bytes,
+                    timeout_ms: self.proposal_timeout_ms,
+                },
+            }
+        };
+        let probe = |id: String, proposal: String| ExperimentDraftStage {
+            id,
+            dependencies: vec![proposal.clone()],
+            operation: DevelopmentProbe {
+                proposal_stage: Some(proposal),
+            },
+            allocation: self.probe_allocation,
+        };
+        let comparisons = vec!["baseline".into(), gp.clone(), dp.clone(), cp.clone()];
+        let mut dependencies = comparisons.clone();
+        dependencies.extend(parent.map(str::to_owned));
+        vec![
+            proposal(general.clone(), DevelopmentRole::General, vec!["baseline".into()]),
+            proposal(domain.clone(), DevelopmentRole::Domain, vec!["baseline".into()]),
+            probe(gp.clone(), general),
+            probe(dp.clone(), domain),
+            proposal(
+                compose.clone(),
+                DevelopmentRole::Compose,
+                vec!["baseline".into(), gp, dp],
+            ),
+            probe(cp, compose),
+            ExperimentDraftStage {
+                id: selection.into(),
+                dependencies,
+                operation: DevelopmentSelection {
+                    probe_stages: comparisons,
+                    parent_selections: parent.map(str::to_owned).into_iter().collect(),
+                },
+                allocation: ExperimentResources::default(),
+            },
+        ]
     }
 }

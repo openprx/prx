@@ -32,38 +32,94 @@ impl SkillsLifecycleService {
         plan.validate()?;
         let frozen = plan.spec.clone().freeze()?;
         let mut journal = self.inspect_experiment(&plan.spec.id, frozen.digest())?;
-        for stage in &plan.spec.stages {
-            ensure!(
-                !cancel.is_cancelled() && !journal.state.cancelled,
-                "instruction experiment cancelled"
-            );
-            match journal.state.stages.get(&stage.id).context("planned stage missing")? {
-                state if state.successful() => continue,
+        // Refuse any active/uncertain stage before starting unrelated work.
+        for state in journal.state.stages.values() {
+            match state {
+                StageState::Planned => {}
+                state if state.successful() => {}
                 StageState::Settled {
                     cleanup_confirmed: true,
                     ..
                 } => return Ok(journal),
-                StageState::Planned => {}
-                _ => anyhow::bail!(
-                    "stage {} requires inspection/reconciliation; no effects repeated",
-                    stage.id
-                ),
-            }
-            let operation = plan.operations.get(&stage.id).context("stage input missing")?.clone();
-            journal = self
-                .run_experiment_stage(
-                    config,
-                    plan.spec.id.clone(),
-                    frozen.digest().into(),
-                    stage.id.clone(),
-                    operation,
-                    cancel,
-                )
-                .await?;
-            if !journal.state.stages.get(&stage.id).is_some_and(StageState::successful) {
-                return Ok(journal);
+                _ => anyhow::bail!("instruction experiment requires inspection/reconciliation; no effects repeated"),
             }
         }
-        Ok(journal)
+        use futures_util::{StreamExt, stream::FuturesUnordered};
+        let workers_cancel = cancel.child_token();
+        let _cancel_on_drop = workers_cancel.clone().drop_guard();
+        let mut active = FuturesUnordered::new();
+        let mut running = std::collections::BTreeSet::new();
+        loop {
+            journal = self.inspect_experiment(&plan.spec.id, frozen.digest())?;
+            if cancel.is_cancelled() || journal.state.cancelled {
+                workers_cancel.cancel();
+                while active.next().await.is_some() {}
+                anyhow::bail!("instruction experiment cancelled");
+            }
+            for stage in &plan.spec.stages {
+                if active.len() >= usize::try_from(plan.spec.max_concurrent)? {
+                    break;
+                }
+                if running.contains(&stage.id)
+                    || !matches!(journal.state.stages.get(&stage.id), Some(StageState::Planned))
+                    || !stage
+                        .dependencies
+                        .iter()
+                        .all(|id| journal.state.stages.get(id).is_some_and(StageState::successful))
+                {
+                    continue;
+                }
+                let operation = plan.operations.get(&stage.id).context("stage input missing")?.clone();
+                if let crate::skills::lifecycle::experiment::ExperimentOperation::DevelopmentProposal {
+                    parent_selection: Some(parent),
+                    ..
+                } = &operation
+                {
+                    if self.selected_development_proposal(&journal, parent)?.is_none() {
+                        workers_cancel.cancel();
+                        while active.next().await.is_some() {}
+                        return self.inspect_experiment(&plan.spec.id, frozen.digest());
+                    }
+                }
+                let stage_id = stage.id.clone();
+                let digest = frozen.digest().to_owned();
+                let child = workers_cancel.clone();
+                running.insert(stage_id.clone());
+                active.push(async move {
+                    let outcome = self
+                        .run_experiment_stage(
+                            config,
+                            plan.spec.id.clone(),
+                            digest,
+                            stage_id.clone(),
+                            operation,
+                            &child,
+                        )
+                        .await;
+                    (stage_id, outcome)
+                });
+            }
+            let Some((stage, outcome)) = active.next().await else {
+                ensure!(
+                    journal.state.stages.values().all(StageState::successful),
+                    "instruction DAG cannot progress"
+                );
+                return Ok(journal);
+            };
+            running.remove(&stage);
+            match outcome {
+                Ok(result) if result.state.stages.get(&stage).is_some_and(StageState::successful) => {}
+                Ok(_) => {
+                    workers_cancel.cancel();
+                    while active.next().await.is_some() {}
+                    return self.inspect_experiment(&plan.spec.id, frozen.digest());
+                }
+                Err(error) => {
+                    workers_cancel.cancel();
+                    while active.next().await.is_some() {}
+                    return Err(error);
+                }
+            }
+        }
     }
 }

@@ -172,8 +172,14 @@ impl SkillsLifecycleService {
                         .is_some_and(|bytes| bytes <= declared.allocation.scratch_bytes),
                     "proposal candidate storage exceeds stage allowance"
                 );
-                if let ExperimentOperation::DevelopmentProposal { role, probe_stages, .. } = operation {
-                    self.development_context(journal, stage, *role, probe_stages)?;
+                if let ExperimentOperation::DevelopmentProposal {
+                    role,
+                    probe_stages,
+                    parent_selection,
+                    ..
+                } = operation
+                {
+                    self.development_context(journal, stage, *role, probe_stages, parent_selection.as_deref())?;
                 }
             }
             ExperimentOperation::Evaluation { proposal_stage, split } => {
@@ -206,12 +212,11 @@ impl SkillsLifecycleService {
             ExperimentOperation::DevelopmentProbe { proposal_stage } => {
                 self.validate_development_probe(journal, stage, proposal_stage.as_deref())?;
             }
-            ExperimentOperation::DevelopmentSelection { probe_stages } => {
-                ensure!(
-                    declared.dependencies == *probe_stages,
-                    "selection dependency order differs from frozen comparison order"
-                );
-                self.choose_development_candidate(journal, stage, probe_stages)?;
+            ExperimentOperation::DevelopmentSelection {
+                probe_stages,
+                parent_selections,
+            } => {
+                self.choose_development_candidate(journal, stage, probe_stages, parent_selections)?;
             }
             ExperimentOperation::SelectedEvaluation { selection_stage, split } => {
                 ensure!(
@@ -426,6 +431,7 @@ impl SkillsLifecycleService {
                 role,
                 patterns,
                 probe_stages,
+                parent_selection,
                 max_input_bytes,
                 max_output_bytes,
                 timeout_ms,
@@ -437,6 +443,7 @@ impl SkillsLifecycleService {
                     *role,
                     patterns.clone(),
                     probe_stages,
+                    parent_selection.as_deref(),
                     ProposerBudget::new(
                         *max_input_bytes,
                         *max_output_bytes,
@@ -446,9 +453,10 @@ impl SkillsLifecycleService {
                 )
                 .await
             }
-            ExperimentOperation::DevelopmentSelection { probe_stages } => {
-                self.choose_development_candidate(journal, stage, probe_stages)
-            }
+            ExperimentOperation::DevelopmentSelection {
+                probe_stages,
+                parent_selections,
+            } => self.choose_development_candidate(journal, stage, probe_stages, parent_selections),
             ExperimentOperation::SelectedEvaluation { selection_stage, split } => {
                 match self.selected_development_proposal(journal, selection_stage)? {
                     Some(proposal_stage) => {

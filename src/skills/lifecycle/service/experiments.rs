@@ -1,4 +1,4 @@
-//! Immutable experiment admission, bounded stage execution and k1 scheduling.
+//! Immutable experiment admission, bounded stage execution and instruction scheduling.
 //! Existing accounting/cleanup owners remain authoritative; no publication grant.
 mod development_proposals;
 mod guarded_proposer;
@@ -96,11 +96,10 @@ impl SkillsLifecycleService {
         event: ExperimentEvent,
     ) -> Result<ExperimentJournal> {
         let mut current = old.clone();
-        // A reservation uses a unique writer nonce and may never be retried
-        // as idempotent admission. Its sole owner may retry dispatch CAS when
-        // only another stage changed the head; recovery/cancel still refuses it.
-        let retryable = !matches!(event, ExperimentEvent::Reserved { .. });
-        for _ in 0..4 {
+        // A new reservation can retry a stale head only while its exact stage
+        // remains Planned. The unique nonce is never treated as ownership of an
+        // already reserved stage. I/O uncertainty is never retried here.
+        for _ in 0..16 {
             match self.store.append_experiment(
                 &current.plan.spec().id,
                 current.plan.digest(),
@@ -111,8 +110,15 @@ impl SkillsLifecycleService {
                 Utc::now(),
             ) {
                 Ok(journal) => return Ok(journal),
-                Err(crate::skills::lifecycle::experiment::ExperimentError::Conflict) if retryable => {
+                Err(crate::skills::lifecycle::experiment::ExperimentError::Conflict) => {
                     current = self.inspect_experiment(&old.plan.spec().id, old.plan.digest())?;
+                    if let ExperimentEvent::Reserved { stage } = &event {
+                        ensure!(
+                            !current.state.cancelled
+                                && matches!(current.state.stages.get(stage), Some(StageState::Planned)),
+                            "experiment reservation ownership was superseded"
+                        );
+                    }
                     if let ExperimentEvent::Dispatched { stage } = &event {
                         ensure!(
                             !current.state.cancelled
