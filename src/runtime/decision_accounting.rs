@@ -689,6 +689,14 @@ pub(super) struct OwnedReceipt {
 }
 
 impl OwnedReceipt {
+    fn physical_identity(&self) -> crate::providers::attempt_accounting::PhysicalAttemptIdentity<'_> {
+        crate::providers::attempt_accounting::PhysicalAttemptIdentity {
+            turn_id: self.receipt.turn_id(),
+            attempt_id: self.receipt.attempt_id(),
+            binding_sha256: self.receipt.binding_sha256(),
+        }
+    }
+
     fn retain_response_chunk(&self, bytes: usize) -> anyhow::Result<()> {
         if let Some(stage) = &self.stage {
             let stage = stage

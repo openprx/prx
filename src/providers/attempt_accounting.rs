@@ -36,6 +36,14 @@ impl PhysicalRequest<'_> {
         self.kind
     }
 }
+/// Borrowed identity of the existing durable physical reservation. This view
+/// grants no dispatch or settlement authority and contains no transport secrets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PhysicalAttemptIdentity<'a> {
+    pub(crate) turn_id: &'a str,
+    pub(crate) attempt_id: &'a str,
+    pub(crate) binding_sha256: &'a str,
+}
 #[async_trait]
 pub(crate) trait AttemptAccounting: sealed::AccountingOwner + Send + Sync {
     fn deadline(&self) -> Instant;
@@ -49,6 +57,14 @@ pub(crate) trait AttemptAccounting: sealed::AccountingOwner + Send + Sync {
 #[async_trait]
 pub(crate) trait AttemptReceipt: sealed::Receipt + Send {
     fn deadline(&self) -> Instant;
+    fn physical_identity(&self) -> Option<PhysicalAttemptIdentity<'_>> {
+        None
+    }
+    /// Complete any owned durable preparation before native transport is polled.
+    /// `final_body` is the exact serialized byte vector handed to that transport.
+    async fn prepare_handoff(&mut self, _final_body: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Admission before retaining each response chunk. The transient chunk
     /// is not a bandwidth or remote-provider memory quota.
     fn retain_response_chunk(&self, _bytes: usize) -> anyhow::Result<()> {
@@ -195,7 +211,7 @@ pub(crate) async fn send_json<T: Serialize + ?Sized>(
         return Ok(Response::Live(builder.json(request).send().await?));
     };
     let body = serde_json::to_vec(request)?;
-    let receipt = owner
+    let mut receipt = owner
         .begin(PhysicalRequest {
             model,
             endpoint,
@@ -206,6 +222,13 @@ pub(crate) async fn send_json<T: Serialize + ?Sized>(
         .await
         .map_err(|e| e.context(AccountingRefusal))?;
     let deadline = tokio::time::Instant::from_std(receipt.deadline());
+    if deadline <= tokio::time::Instant::now() {
+        return Err(AccountingRefusal.into());
+    }
+    tokio::time::timeout_at(deadline, receipt.prepare_handoff(&body))
+        .await
+        .map_err(|_| AccountingRefusal)?
+        .map_err(|error| error.context(AccountingRefusal))?;
     if deadline <= tokio::time::Instant::now() {
         return Err(AccountingRefusal.into());
     }
@@ -269,6 +292,9 @@ fn reported_usage(body: &[u8], kind: PhysicalKind) -> Option<TokenUsage> {
         source: TokenUsageSource::Reported,
     })
 }
+
+#[cfg(test)]
+mod handoff_tests;
 
 #[cfg(test)]
 mod tests {
