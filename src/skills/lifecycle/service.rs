@@ -777,6 +777,17 @@ impl SkillsLifecycleService {
         executor: &dyn CaseExecutor,
         cancel: &CancellationToken,
     ) -> Result<RecordedEvaluation, ServiceError> {
+        self.evaluate_in_epoch(id, split, None, executor, cancel).await
+    }
+
+    pub(super) async fn evaluate_in_epoch(
+        &self,
+        id: &str,
+        split: EvalSplit,
+        expected: Option<&super::ProposalEvaluationBinding>,
+        executor: &dyn CaseExecutor,
+        cancel: &CancellationToken,
+    ) -> Result<RecordedEvaluation, ServiceError> {
         self.require_evaluation("evaluating a proposal")?;
         let proposal = self.proposal_of(id)?;
         if proposal.status != ProposalStatus::Evaluating {
@@ -806,7 +817,40 @@ impl SkillsLifecycleService {
             candidate,
             observed_generation: proposal.expected_generation,
         };
-        Ok(self.store.evaluate(&request, executor, cancel).await?)
+        Ok(self
+            .store
+            .evaluate_proposal(&request, id, expected, executor, cancel)
+            .await?)
+    }
+
+    /// Identity guard only. The experiment owner additionally verifies the
+    /// validation pin, selection mapping, verifier dependency and root budget.
+    pub(super) fn require_validation_epoch(
+        &self,
+        id: &str,
+        validation: &super::VerifiedEvaluation,
+    ) -> Result<super::ProposalEvaluationBinding, ServiceError> {
+        let proposal = self.proposal_of(id)?;
+        let receipt = &validation.receipt;
+        let invalid =
+            || super::EvaluationError::Stale("holdout validation proposal, status, epoch or window changed".into());
+        let binding = receipt.proposal_evaluation.as_ref().ok_or_else(invalid)?;
+        if !validation.outcome.is_pass()
+            || receipt.split != EvalSplit::Validation
+            || receipt.owner_scope != *self.owner_scope()
+            || receipt.skill_id != proposal.skill_id
+            || Some(receipt.suite_digest.as_str()) != proposal.required_suite.as_deref()
+            || Some(&receipt.candidate.revision_id) != proposal.candidate_revision.as_ref()
+            || receipt.baseline.as_ref().map(|arm| &arm.revision_id) != proposal.baseline_revision.as_ref()
+            || receipt.observed_generation != proposal.expected_generation
+            || proposal.status != ProposalStatus::Evaluating
+            || binding.proposal_id != proposal.proposal_id
+            || binding.evaluation_epoch != proposal.evaluation_epoch
+            || Some(binding.evaluating_since) != proposal.evaluating_since
+        {
+            return Err(invalid().into());
+        }
+        Ok(binding.clone())
     }
 
     /// Marks an `Evaluating` proposal `Evaluated`: its evaluations are
@@ -814,6 +858,17 @@ impl SkillsLifecycleService {
     pub fn finish_evaluation(&self, id: &str, note: &str) -> Result<SkillProposal, ServiceError> {
         self.require_evaluation("evaluating a proposal")?;
         Ok(self.store.advance_proposal(id, ProposalStatus::Evaluated, note)?)
+    }
+
+    /// Completes only the supplied observed epoch. The binding restricts an
+    /// existing operation; it does not grant evaluation or publication authority.
+    pub fn finish_evaluation_bound(
+        &self,
+        expected: &super::ProposalEvaluationBinding,
+        note: &str,
+    ) -> Result<SkillProposal, ServiceError> {
+        self.require_evaluation("finishing a bound proposal evaluation")?;
+        Ok(self.store.finish_bound_evaluation(expected, note)?)
     }
 
     /// Gates an `Evaluated` proposal under the operator's policy and the

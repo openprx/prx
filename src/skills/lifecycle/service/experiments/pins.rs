@@ -38,6 +38,7 @@ impl SkillsLifecycleService {
         skill: &SkillId,
         config: &Config,
         verification_split: EvalSplit,
+        verify_holdout: bool,
     ) -> Result<ExperimentPins> {
         ensure!(
             verification_split != EvalSplit::Development,
@@ -45,6 +46,23 @@ impl SkillsLifecycleService {
         );
         let registered = self.registered_suite(skill)?;
         let suite = self.store.read_suite(registered)?;
+        if verify_holdout {
+            ensure!(
+                verification_split == EvalSplit::Validation,
+                "additional holdout requires primary validation"
+            );
+            ensure!(
+                suite.cases_of(EvalSplit::Holdout).count() >= usize::try_from(suite.suite().min_cases)?,
+                "registered suite has insufficient holdout cases"
+            );
+            let runs = u64::try_from(suite.cases_of(EvalSplit::Holdout).count())?
+                .checked_mul(2)
+                .and_then(|count| count.checked_mul(u64::from(suite.suite().trials)));
+            ensure!(
+                runs.is_some_and(|runs| runs <= u64::from(suite.suite().budget.max_runs)),
+                "holdout exceeds registered paired-run budget"
+            );
+        }
         ensure!(
             suite.suite().owner_scope == *self.owner_scope() && suite.suite().skill_id == *skill,
             "registered suite owner or skill mismatch"
@@ -92,6 +110,7 @@ impl SkillsLifecycleService {
             development_split_digest: suite.split_digest(EvalSplit::Development),
             verification_split,
             verification_split_digest: suite.split_digest(verification_split),
+            holdout_split_digest: verify_holdout.then(|| suite.split_digest(EvalSplit::Holdout)),
         })
     }
 }

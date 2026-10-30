@@ -42,7 +42,7 @@ pub(super) const EVALUATIONS_DIR: &str = "evaluations";
 pub(super) const RECEIPT_FILE: &str = "receipt.json";
 pub(super) const CASES_FILE: &str = "cases.jsonl";
 const MAX_CASES_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_EVALUATION_ENTRIES: usize = 4096;
+pub(super) const MAX_EVALUATION_ENTRIES: usize = 4096;
 const MAX_DETAIL_BYTES: usize = 240;
 const EVALUATION_ID_PREFIX: &str = "eval-";
 pub(super) const ATTEMPT_FILE: &str = "attempt.json";
@@ -68,6 +68,22 @@ pub(super) struct AttemptRecord {
     #[serde(default)]
     pub(super) observed_generation: Option<u64>,
     pub(super) reserved_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) proposal_evaluation: Option<ProposalEvaluationBinding>,
+}
+
+fn bound_attempt_matches_proposal(attempt: &AttemptRecord, proposal: &super::SkillProposal) -> bool {
+    attempt.owner_scope == proposal.owner_scope
+        && attempt.skill_id == proposal.skill_id
+        && Some(attempt.suite_digest.as_str()) == proposal.required_suite.as_deref()
+        && attempt.candidate_revision == proposal.candidate_revision
+        && attempt.baseline_revision == proposal.baseline_revision
+        && attempt.observed_generation == Some(proposal.expected_generation)
+        && attempt.proposal_evaluation.as_ref().is_some_and(|binding| {
+            binding.proposal_id == proposal.proposal_id
+                && binding.evaluation_epoch == proposal.evaluation_epoch
+                && Some(binding.evaluating_since) == proposal.evaluating_since
+        })
 }
 
 /// Failure to start, record or verify an evaluation. Every variant is a
@@ -418,12 +434,26 @@ pub struct EvaluationSummary {
     pub failure_categories: BTreeMap<String, u32>,
 }
 
+/// Static proposal identity sealed with a new proposal-owned evaluation.
+/// Historical verification never compares this with mutable current status.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalEvaluationBinding {
+    pub proposal_id: String,
+    pub evaluation_epoch: u32,
+    pub evaluating_since: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationReceipt {
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experiment: Option<super::experiment::ExperimentRunBinding>,
+    /// Captured by the service/evaluator from the actual evaluated proposal.
+    /// Evidence identity only; this cannot authorize another evaluation or publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_evaluation: Option<ProposalEvaluationBinding>,
     pub record_id: String,
     pub owner_scope: OwnerScope,
     pub suite_id: String,
@@ -1171,7 +1201,7 @@ pub struct VerifiedEvaluation {
     pub receipt_digest: String,
 }
 
-fn is_evaluation_id(id: &str) -> bool {
+pub(super) fn is_evaluation_id(id: &str) -> bool {
     id.strip_prefix(EVALUATION_ID_PREFIX)
         .is_some_and(|rest| rest.len() == 32 && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
 }
@@ -1343,9 +1373,70 @@ impl SkillLifecycleStore {
         baseline: Option<&RevisionId>,
         observed_generation: u64,
     ) -> Result<(), EvaluationError> {
+        let _store = self.lock_store(true, super::publish::PUBLICATION_LOCK_TIMEOUT)?;
+        self.reserve_attempt_locked(
+            suite,
+            split,
+            evaluation_id,
+            candidate,
+            baseline,
+            observed_generation,
+            None,
+        )
+    }
+
+    /// The owner lock spans both durable writes. Nothing may execute unless
+    /// the attempt and its append-only proposal reference are both confirmed.
+    pub(super) fn reserve_proposal_attempt_locked(
+        &self,
+        owner: &super::proposal::ProposalLock,
+        request: &super::EvaluationRequest<'_>,
+        id: &str,
+        expected: Option<&ProposalEvaluationBinding>,
+        evaluation_id: &str,
+    ) -> Result<ProposalEvaluationBinding, EvaluationError> {
+        let binding = self.proposal_evaluation_binding(request, id)?;
+        if expected.is_some_and(|expected| expected != &binding) {
+            return Err(EvaluationError::Stale(
+                "proposal evaluation epoch or window changed".into(),
+            ));
+        }
+        let mut proposal = self
+            .read_proposal(id)?
+            .ok_or_else(|| EvaluationError::Stale("evaluated proposal is missing".into()))?;
+        self.reserve_attempt_locked(
+            request.suite,
+            request.split,
+            evaluation_id,
+            &request.candidate,
+            request.baseline.as_ref(),
+            request.observed_generation,
+            Some(&binding),
+        )?;
+        #[cfg(test)]
+        super::publish::crash_hooks::check("evaluation_attempt_durable")?;
+        proposal.bound_evaluation_attempts.push(evaluation_id.into());
+        self.write_proposal(owner, &proposal)?;
+        #[cfg(test)]
+        super::publish::crash_hooks::check("evaluation_reference_durable")?;
+        Ok(binding)
+    }
+
+    /// Caller already holds the store lock (and the proposal owner lock for
+    /// bound admissions). The only additional lock is the actual skill lock.
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_attempt_locked(
+        &self,
+        suite: &FrozenSuite,
+        split: EvalSplit,
+        evaluation_id: &str,
+        candidate: &RevisionId,
+        baseline: Option<&RevisionId>,
+        observed_generation: u64,
+        proposal_evaluation: Option<&ProposalEvaluationBinding>,
+    ) -> Result<(), EvaluationError> {
         let skill = &suite.suite().skill_id;
         let split_digest = suite.split_digest(split);
-        let _store = self.lock_store(true, super::publish::PUBLICATION_LOCK_TIMEOUT)?;
         let _skill = self.lock_skill(skill, super::publish::PUBLICATION_LOCK_TIMEOUT)?;
         if let Some(limit) = suite.attempt_limit(split) {
             let mut used = 0_u32;
@@ -1388,10 +1479,117 @@ impl SkillLifecycleStore {
             baseline_revision: baseline.cloned(),
             observed_generation: Some(observed_generation),
             reserved_at: Utc::now(),
+            proposal_evaluation: proposal_evaluation.cloned(),
         };
         let path = dir.join(ATTEMPT_FILE);
         self.write_atomic(skill, &path, &record_bytes(&record, &path)?)?;
         super::store::sync_dir(&parent)?;
+        Ok(())
+    }
+
+    fn read_bound_attempt(&self, proposal_id: &str, id: &str) -> Result<AttemptRecord, LifecycleError> {
+        let invalid = || {
+            LifecycleError::ProposalRefused(format!(
+                "proposal {proposal_id} has an invalid bound evaluation attempt {id}"
+            ))
+        };
+        if !is_evaluation_id(id) {
+            return Err(invalid());
+        }
+        let path = self.evaluation_dir(id).join(ATTEMPT_FILE);
+        check_private(&path).map_err(|_| invalid())?;
+        let attempt: AttemptRecord = read_record(&path).map_err(|_| invalid())?;
+        if attempt.schema_version != EVALUATION_SCHEMA_VERSION
+            || attempt.evaluation_id != id
+            || attempt.owner_scope != *self.owner_scope()
+            || !attempt.proposal_evaluation.as_ref().is_some_and(|binding| {
+                binding.proposal_id == proposal_id
+                    && binding.evaluation_epoch > 0
+                    && binding.evaluating_since <= attempt.reserved_at
+            })
+            || attempt.candidate_revision.is_none()
+            || attempt.observed_generation.is_none()
+        {
+            return Err(invalid());
+        }
+        let suite = self.read_suite(&attempt.suite_digest).map_err(|_| invalid())?;
+        if suite.suite().skill_id != attempt.skill_id || suite.split_digest(attempt.split) != attempt.split_digest {
+            return Err(invalid());
+        }
+        Ok(attempt)
+    }
+
+    pub(super) fn check_bound_attempt_reference(&self, proposal_id: &str, id: &str) -> Result<(), LifecycleError> {
+        self.read_bound_attempt(proposal_id, id).map(|_| ())
+    }
+
+    pub(super) fn check_new_bound_attempt(
+        &self,
+        proposal: &super::SkillProposal,
+        id: &str,
+    ) -> Result<(), LifecycleError> {
+        let attempt = self.read_bound_attempt(&proposal.proposal_id, id)?;
+        if proposal.status != super::ProposalStatus::Evaluating || !bound_attempt_matches_proposal(&attempt, proposal) {
+            return Err(LifecycleError::ProposalRefused(
+                "new bound evaluation reference describes another proposal epoch or subject".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bound completion additionally needs terminal evidence for this actual
+    /// subject/epoch. Historical terminal checks themselves remain independent
+    /// of mutable current proposal fields.
+    pub(super) fn require_bound_epoch_terminal(&self, proposal: &super::SkillProposal) -> Result<(), LifecycleError> {
+        self.require_bound_attempts_terminal(proposal)?;
+        for id in &proposal.bound_evaluation_attempts {
+            if bound_attempt_matches_proposal(&self.read_bound_attempt(&proposal.proposal_id, id)?, proposal) {
+                return Ok(());
+            }
+        }
+        Err(LifecycleError::ProposalRefused(
+            "no bound terminal evaluation describes this proposal subject and epoch".into(),
+        ))
+    }
+
+    /// Only explicit owner-local references participate. Legacy unbound or
+    /// unrelated history cannot be inferred to hold a lease on this proposal.
+    pub(super) fn require_bound_attempts_terminal(
+        &self,
+        proposal: &super::SkillProposal,
+    ) -> Result<(), LifecycleError> {
+        for id in &proposal.bound_evaluation_attempts {
+            let pending = || {
+                LifecycleError::ProposalRefused(format!(
+                    "proposal {} has an unresolved bound evaluation attempt {id}; no state change or automatic retry is allowed",
+                    proposal.proposal_id
+                ))
+            };
+            let attempt = self.read_bound_attempt(&proposal.proposal_id, id)?;
+            let binding = attempt.proposal_evaluation.as_ref().ok_or_else(pending)?;
+            let verified = self.verify_evaluation(id, None).map_err(|_| pending())?;
+            let receipt = &verified.receipt;
+            let suite = self.read_suite(&attempt.suite_digest).map_err(|_| pending())?;
+            if receipt.proposal_evaluation.as_ref() != Some(binding)
+                || receipt.skill_id != attempt.skill_id
+                || receipt.suite_digest != attempt.suite_digest
+                || receipt.split != attempt.split
+                || Some(&receipt.candidate.revision_id) != attempt.candidate_revision.as_ref()
+                || receipt.baseline.as_ref().map(|arm| &arm.revision_id) != attempt.baseline_revision.as_ref()
+                || Some(receipt.observed_generation) != attempt.observed_generation
+                || suite.split_digest(attempt.split) != attempt.split_digest
+                || receipt.started_at < attempt.reserved_at
+                || receipt.started_at < binding.evaluating_since
+                || verified
+                    .cases
+                    .iter()
+                    .any(|case| case.run.cleanup != CleanupState::Removed)
+            {
+                return Err(pending());
+            }
+            // Every deserialized RunTerminal variant is terminal. Removed is
+            // additionally required; Failed/quarantined cleanup never unlocks.
+        }
         Ok(())
     }
 

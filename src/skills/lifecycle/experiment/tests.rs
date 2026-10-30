@@ -40,6 +40,7 @@ pub(crate) fn specification() -> ExperimentSpec {
             development_split_digest: "b".repeat(64),
             verification_split: EvalSplit::Validation,
             verification_split_digest: "c".repeat(64),
+            holdout_split_digest: None,
         },
         resources,
         max_concurrent: 1,
@@ -63,6 +64,24 @@ pub(crate) fn specification() -> ExperimentSpec {
             },
         ],
     }
+}
+
+#[test]
+fn no_holdout_pin_preserves_pre_extension_frozen_spec_hash() {
+    let spec = specification();
+    assert!(
+        serde_json::to_value(&spec)
+            .unwrap()
+            .get("pins")
+            .unwrap()
+            .get("holdout_split_digest")
+            .is_none()
+    );
+    // Compact pre-extension specification, including its original field order.
+    assert_eq!(
+        spec.freeze().unwrap().digest(),
+        "4e07350e4c7f3d91aee38dc5b5a1c3a015de01e1dc4a9293e412089b334a4cb0"
+    );
 }
 
 #[test]

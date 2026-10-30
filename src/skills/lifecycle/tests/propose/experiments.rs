@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod development_probes;
 mod instruction_cycle;
+mod holdout;
+mod admission;
 mod live_fixture;
 mod refinement;
 mod selection_policy;

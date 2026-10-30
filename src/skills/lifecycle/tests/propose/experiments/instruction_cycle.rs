@@ -66,6 +66,7 @@ pub(super) fn cycle_with_schedule(
             proposal_allocation,
             probe_allocation,
             evaluation_allocation: probe_allocation,
+            holdout_allocation: None,
             elapsed_ms: 300_000,
             max_input_bytes: 64 * 1024,
             max_output_bytes: 16 * 1024,

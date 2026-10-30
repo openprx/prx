@@ -32,6 +32,8 @@ pub struct InstructionCycleDraft {
     pub proposal_allocation: ExperimentResources,
     pub probe_allocation: ExperimentResources,
     pub evaluation_allocation: ExperimentResources,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_allocation: Option<ExperimentResources>,
     pub elapsed_ms: u64,
     pub max_input_bytes: usize,
     pub max_output_bytes: usize,
@@ -62,6 +64,71 @@ impl InstructionExperimentPlan {
                 return Err(ExperimentError::InvalidSpec("operation changed after planning".into()));
             }
         }
+        self.validate_holdout()?;
+        Ok(())
+    }
+
+    fn validate_holdout(&self) -> Result<(), ExperimentError> {
+        use ExperimentOperation::{SelectedEvaluation, Verify};
+        let refuse = |reason: &str| ExperimentError::InvalidSpec(reason.into());
+        let requested = self.spec.pins.holdout_split_digest.is_some();
+        let mut validation = None;
+        let mut holdout = None;
+        for stage in &self.spec.stages {
+            match self
+                .operations
+                .get(&stage.id)
+                .ok_or_else(|| refuse("stage operation missing"))?
+            {
+                SelectedEvaluation {
+                    selection_stage,
+                    split,
+                    validation_stage,
+                } => {
+                    if let Some(primary) = validation_stage {
+                        if !requested || *split != EvalSplit::Holdout || holdout.is_some() {
+                            return Err(refuse("unexpected or repeated final holdout"));
+                        }
+                        holdout = Some((stage, selection_stage, primary));
+                    } else if requested {
+                        if *split != EvalSplit::Validation || validation.is_some() {
+                            return Err(refuse("additional holdout needs exactly one primary validation"));
+                        }
+                        validation = Some((stage, selection_stage));
+                    }
+                }
+                ExperimentOperation::Evaluation { split, .. } if requested && *split != EvalSplit::Development => {
+                    return Err(refuse("additional holdout must evaluate the same final selection"));
+                }
+                _ => {}
+            }
+        }
+        if !requested {
+            return Ok(());
+        }
+        let (validation, selection) = validation.ok_or_else(|| refuse("primary validation is missing"))?;
+        let (holdout, holdout_selection, primary) = holdout.ok_or_else(|| refuse("requested holdout is missing"))?;
+        if primary != &validation.id
+            || holdout_selection != selection
+            || !validation.dependencies.contains(selection)
+            || !holdout.dependencies.contains(selection)
+        {
+            return Err(refuse(
+                "holdout must retain the primary validation's selected candidate",
+            ));
+        }
+        for evaluation in [validation, holdout] {
+            let verifiers: Vec<_> = self.spec.stages.iter().filter(|stage| {
+                matches!(self.operations.get(&stage.id), Some(Verify { evaluation_stage }) if evaluation_stage == &evaluation.id)
+                    && stage.dependencies.contains(&evaluation.id)
+            }).collect();
+            let [verifier] = verifiers.as_slice() else {
+                return Err(refuse("each requested split needs exactly one direct verifier"));
+            };
+            if evaluation.id == validation.id && !holdout.dependencies.contains(&verifier.id) {
+                return Err(refuse("holdout must depend on successful validation verification"));
+            }
+        }
         Ok(())
     }
 }
@@ -71,6 +138,11 @@ impl InstructionCycleDraft {
         if self.patterns.is_empty() || self.patterns.len() > super::super::MAX_PROPOSAL_PATTERNS {
             return Err(ExperimentError::InvalidSpec(
                 "cycle needs bounded verified pattern inputs".into(),
+            ));
+        }
+        if self.holdout_allocation.is_some() && self.verification_split != EvalSplit::Validation {
+            return Err(ExperimentError::InvalidSpec(
+                "additional holdout requires primary validation".into(),
             ));
         }
         super::super::ProposerBudget::new(
@@ -115,6 +187,7 @@ impl InstructionCycleDraft {
                 operation: SelectedEvaluation {
                     selection_stage: "select".into(),
                     split: self.verification_split,
+                    validation_stage: None,
                 },
                 allocation: self.evaluation_allocation,
             },
@@ -127,6 +200,28 @@ impl InstructionCycleDraft {
                 allocation: ExperimentResources::default(),
             },
         ]);
+        if let Some(allocation) = self.holdout_allocation {
+            stages.extend([
+                ExperimentDraftStage {
+                    id: "final-holdout".into(),
+                    dependencies: vec!["select".into(), "verify".into()],
+                    operation: SelectedEvaluation {
+                        selection_stage: "select".into(),
+                        split: EvalSplit::Holdout,
+                        validation_stage: Some("final-evaluation".into()),
+                    },
+                    allocation,
+                },
+                ExperimentDraftStage {
+                    id: "verify-holdout".into(),
+                    dependencies: vec!["final-holdout".into()],
+                    operation: Verify {
+                        evaluation_stage: "final-holdout".into(),
+                    },
+                    allocation: ExperimentResources::default(),
+                },
+            ]);
+        }
         let reserved = stages.iter().try_fold(ExperimentResources::default(), |sum, stage| {
             sum.checked_add(stage.allocation)
         })?;
@@ -137,6 +232,7 @@ impl InstructionCycleDraft {
             id: self.id,
             skill_id: self.skill_id,
             verification_split: self.verification_split,
+            verify_holdout: self.holdout_allocation.is_some(),
             resources: self.resources,
             elapsed_ms: self.elapsed_ms,
             max_concurrent: if self.schedule == InstructionSchedule::Parallel2 {
