@@ -4,7 +4,7 @@
 use super::context::{LessonCompatibility, LessonRef};
 use crate::decision::{DecisionKey, KeyDomain};
 use crate::skills::lifecycle::generation::ensure_dir_synced;
-use crate::skills::lifecycle::store::{check_private, record_bytes};
+use crate::skills::lifecycle::store::check_private;
 use crate::skills::lifecycle::{LifecycleError, OwnerScope, RevisionId, SkillId, SkillLifecycleStore};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -230,7 +230,15 @@ impl SkillLifecycleStore {
                 &[domain, self.owner_scope().as_str().as_bytes(), &payload],
             )),
         };
-        record_bytes(&sealed, path)
+        // Only the new C05 wire envelope is compact. The canonical payload
+        // above already determines the reference, digest and MAC independently
+        // of layout; legacy record serialization and existing files are intact.
+        let mut bytes = serde_json::to_vec(&sealed).map_err(|error| LifecycleError::InvalidRecord {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })?;
+        bytes.push(b'\n');
+        Ok(bytes)
     }
     pub(super) fn decode_adoption(
         &self,
