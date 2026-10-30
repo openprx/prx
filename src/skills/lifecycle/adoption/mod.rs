@@ -3,8 +3,11 @@
 // The factory is intentionally absent in the small A/B interface commit.
 #![allow(dead_code)]
 mod context;
+mod lookup;
+mod record;
 #[allow(unused_imports)]
 pub(crate) use context::{
     LessonCompatibility, LessonHandoffGuard, LessonLimits, LessonPlacement, LessonRef, LessonSnapshot,
     LessonSnapshotEntry, LessonSnapshotStats, PreparedLessonContext,
 };
+pub(crate) use lookup::LessonQuery;
