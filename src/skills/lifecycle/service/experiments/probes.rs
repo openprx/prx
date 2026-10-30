@@ -136,6 +136,7 @@ impl SkillsLifecycleService {
             && !cancel.is_cancelled()
             && receipt.cases.iter().all(|case| case.split == EvalSplit::Development);
         Ok(StageEvidence {
+            pending_gate: None,
             record_id: format!("probe:{stage}"),
             digest,
             successful,

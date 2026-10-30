@@ -1,6 +1,8 @@
 //! Immutable experiment admission, bounded stage execution and instruction scheduling.
 //! Existing accounting/cleanup owners remain authoritative; no publication grant.
 mod development_proposals;
+mod gate_review;
+pub(in crate::skills::lifecycle) use gate_review::{GateReviewPin, VerifiedGateReviewHistory};
 mod guarded_proposer;
 mod operations;
 mod pins;
@@ -289,6 +291,12 @@ impl SkillsLifecycleService {
         // Cancellation can race a foreground result. Reload before append;
         // neither late results nor cancellation authorize another reservation.
         journal = self.inspect_experiment(&id, &digest)?;
+        let operation_result = match operation_result {
+            Ok(evidence) if evidence.pending_gate.is_some() && !usage.unresolved => {
+                self.finalize_gate_review_after_cleanup(&journal, runtime.as_ref(), &usage, evidence)
+            }
+            result => result,
+        };
         match operation_result {
             Ok(evidence) if !usage.unresolved => {
                 let resources = crate::skills::lifecycle::experiment::ExperimentResources {

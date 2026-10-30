@@ -32,6 +32,9 @@ pub struct InstructionCycleDraft {
     pub proposal_allocation: ExperimentResources,
     pub probe_allocation: ExperimentResources,
     pub evaluation_allocation: ExperimentResources,
+    /// Optional private judge stage, inside the unchanged root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_allocation: Option<ExperimentResources>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holdout_allocation: Option<ExperimentResources>,
     pub elapsed_ms: u64,
@@ -65,9 +68,79 @@ impl InstructionExperimentPlan {
             }
         }
         self.validate_holdout()?;
+        self.validate_gate_review()?;
         Ok(())
     }
 
+    fn validate_gate_review(&self) -> Result<(), ExperimentError> {
+        use ExperimentOperation::{GateReview, SelectedEvaluation, Verify};
+        let gates: Vec<_> = self
+            .spec
+            .stages
+            .iter()
+            .filter(|stage| stage.kind == super::ExperimentStageKind::GateReview)
+            .collect();
+        if gates.is_empty() {
+            return Ok(());
+        }
+        let [stage] = gates.as_slice() else {
+            return Err(ExperimentError::InvalidSpec(
+                "cycle admits at most one private gate".into(),
+            ));
+        };
+        let Some(GateReview {
+            selection_stage,
+            validation_stage,
+            validation_verifier,
+            holdout_stage,
+            holdout_verifier,
+        }) = self.operations.get(&stage.id)
+        else {
+            return Err(ExperimentError::InvalidSpec("gate operation is missing".into()));
+        };
+        let expected = [
+            (
+                validation_stage,
+                SelectedEvaluation {
+                    selection_stage: selection_stage.clone(),
+                    split: EvalSplit::Validation,
+                    validation_stage: None,
+                },
+            ),
+            (
+                holdout_stage,
+                SelectedEvaluation {
+                    selection_stage: selection_stage.clone(),
+                    split: EvalSplit::Holdout,
+                    validation_stage: Some(validation_stage.clone()),
+                },
+            ),
+            (
+                validation_verifier,
+                Verify {
+                    evaluation_stage: validation_stage.clone(),
+                },
+            ),
+            (
+                holdout_verifier,
+                Verify {
+                    evaluation_stage: holdout_stage.clone(),
+                },
+            ),
+        ];
+        if self.spec.pins.verification_split != EvalSplit::Validation
+            || self.spec.pins.holdout_split_digest.is_none()
+            || !stage.dependencies.contains(selection_stage)
+            || !expected
+                .iter()
+                .all(|(name, input)| stage.dependencies.contains(name) && self.operations.get(*name) == Some(input))
+        {
+            return Err(ExperimentError::InvalidSpec(
+                "gate requires both exact independent evaluations and their verifiers".into(),
+            ));
+        }
+        Ok(())
+    }
     fn validate_holdout(&self) -> Result<(), ExperimentError> {
         use ExperimentOperation::{SelectedEvaluation, Verify};
         let refuse = |reason: &str| ExperimentError::InvalidSpec(reason.into());
@@ -143,6 +216,13 @@ impl InstructionCycleDraft {
         if self.holdout_allocation.is_some() && self.verification_split != EvalSplit::Validation {
             return Err(ExperimentError::InvalidSpec(
                 "additional holdout requires primary validation".into(),
+            ));
+        }
+        if self.gate_allocation.is_some()
+            && (self.holdout_allocation.is_none() || self.verification_split != EvalSplit::Validation)
+        {
+            return Err(ExperimentError::InvalidSpec(
+                "private gate review requires an allocated final holdout".into(),
             ));
         }
         super::super::ProposerBudget::new(
@@ -221,6 +301,26 @@ impl InstructionCycleDraft {
                     allocation: ExperimentResources::default(),
                 },
             ]);
+        }
+        if let Some(allocation) = self.gate_allocation {
+            stages.push(ExperimentDraftStage {
+                id: "gate-review".into(),
+                dependencies: vec![
+                    "select".into(),
+                    "final-evaluation".into(),
+                    "verify".into(),
+                    "final-holdout".into(),
+                    "verify-holdout".into(),
+                ],
+                operation: ExperimentOperation::GateReview {
+                    selection_stage: "select".into(),
+                    validation_stage: "final-evaluation".into(),
+                    validation_verifier: "verify".into(),
+                    holdout_stage: "final-holdout".into(),
+                    holdout_verifier: "verify-holdout".into(),
+                },
+                allocation,
+            });
         }
         let reserved = stages.iter().try_fold(ExperimentResources::default(), |sum, stage| {
             sum.checked_add(stage.allocation)

@@ -1762,3 +1762,5 @@ async fn a_damaged_receipt_of_this_subject_is_never_adjudicated_away() {
         assert_eq!(status(&fx, &proposal), ProposalStatus::Evaluated);
     }
 }
+
+mod experiment;

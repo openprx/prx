@@ -180,3 +180,142 @@ async fn experiment_stage_forwards_child_accounting_and_enforces_durable_cancel(
     assert!(journal.state.cancelled);
     Ok(())
 }
+
+#[tokio::test]
+async fn live_foreign_parent_is_refused_before_physical_admission_and_unparented_scope_redirects() -> anyhow::Result<()>
+{
+    use crate::decision::budget::DecisionAttemptReceipt;
+    use crate::runtime::decision_accounting::{AccountingScope, PhysicalEstimate};
+    use crate::runtime::{experiment_stage::ExperimentStageRuntime, turn_cleanup::CleanupScope};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+    use tokio_util::sync::CancellationToken;
+    let root = tempfile::tempdir()?;
+    let mut spec = specification();
+    spec.created_at = chrono::Utc::now();
+    spec.expires_at = spec.created_at + chrono::Duration::seconds(60);
+    spec.resources.micro_usd = 500_000;
+    spec.max_concurrent = 2;
+    for stage in &mut spec.stages {
+        stage.dependencies.clear();
+        // Two active stages share the original root in every component.
+        // The second reservation must be legal before owner isolation is tested.
+        stage.allocation = ExperimentResources {
+            calls: spec.resources.calls / 2,
+            tokens: spec.resources.tokens / 2,
+            micro_usd: spec.resources.micro_usd / 2,
+            tool_calls: spec.resources.tool_calls / 2,
+            output_bytes: spec.resources.output_bytes / 2,
+            scratch_bytes: spec.resources.scratch_bytes / 2,
+        };
+    }
+    let plan = spec.freeze()?;
+    let store = Arc::new(crate::skills::lifecycle::SkillLifecycleStore::open(
+        root.path(),
+        plan.spec().owner_scope.clone(),
+    )?);
+    let mut journal = store.admit_experiment(&plan, chrono::Utc::now())?;
+    for stage in ["proposal", "verify"] {
+        for (name, event) in [
+            ("reserve", ExperimentEvent::Reserved { stage: stage.into() }),
+            ("dispatch", ExperimentEvent::Dispatched { stage: stage.into() }),
+        ] {
+            journal = store.append_experiment(
+                &plan.spec().id,
+                plan.digest(),
+                journal.next_sequence(),
+                &journal.head_sha256,
+                &format!("{stage}-{name}"),
+                event,
+                chrono::Utc::now(),
+            )?;
+        }
+    }
+    let mut config = crate::config::Config {
+        workspace_dir: root.path().into(),
+        ..Default::default()
+    };
+    config.cost.prices.insert(
+        "openrouter/prx-stage".into(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let cancel = CancellationToken::new();
+    let cleanup = CleanupScope::new(None, cancel.clone())?;
+    let (first, second) = cleanup
+        .scope_admission(async {
+            Ok::<_, anyhow::Error>((
+                ExperimentStageRuntime::new(&config, &plan, "proposal", cancel.clone(), store.clone())?,
+                ExperimentStageRuntime::new(&config, &plan, "verify", cancel.clone(), store.clone())?,
+            ))
+        })
+        .await?;
+    cleanup
+        .run(async {
+            let key = crate::decision::DecisionKey::load_or_create(root.path())?;
+            let child = || {
+                Arc::new(AccountingScope::new(
+                    Arc::new(config.clone()),
+                    key.clone(),
+                    crate::runtime::turn_cleanup::current_tracker().unwrap(),
+                    [9; 32],
+                    crate::causal_tree::state::TurnBudgets {
+                        tokens: 1024,
+                        micro_usd: 10_000,
+                        latency_ms: 30_000,
+                    },
+                    Instant::now() + Duration::from_secs(30),
+                ))
+            };
+            // Both admitted owners remain active. Cancellation cannot explain the
+            // refusal: this is a retained envelope carrying the wrong live parent.
+            let retained = first.scope(async { child() }).await;
+            let unparented = child();
+            assert_eq!(retained.scope_id_for_tests(), first.scope_id());
+            let estimate = || PhysicalEstimate {
+                purpose: "evolution_judge",
+                provider: "openrouter",
+                model: "prx-stage",
+                body: br#"{"messages":[],"max_tokens":32}"#,
+                transport_binding: &[4; 32],
+                request_id: "wrong-parent",
+                deadline: Instant::now() + Duration::from_secs(20),
+                remaining_attempts: 1,
+            };
+            first.ensure_active()?;
+            second.ensure_active()?;
+            let refused = second.scope(retained.begin_physical(estimate())).await;
+            assert!(matches!(refused, Err(crate::decision::DecisionError::BudgetExceeded)));
+            let tracker = crate::cost::tracker::CostTracker::for_workspace(config.cost.clone(), root.path())?;
+            for runtime in [&first, &second] {
+                let usage = tracker.physical_scope_usage(&runtime.scope_id())?;
+                assert_eq!((usage.calls, usage.settled_calls), (0, 0));
+                assert!(usage.attempt_ids.is_empty() && !usage.unresolved);
+            }
+            assert!(!root.path().join("state/costs.reservations.jsonl").exists());
+            // The existing no-parent redirect is still legal and settles only in
+            // the current second owner; same-parent forwarding has its own test.
+            let receipt = second.scope(unparented.begin_physical(estimate())).await?;
+            Box::new(receipt)
+                .settle(crate::decision::protocol::DecisionUsage {
+                    input_tokens: Some(5),
+                    output_tokens: Some(2),
+                    cost_micro_usd: None,
+                })
+                .await?;
+            second.flush().await?;
+            let actual = tracker.physical_scope_usage(&second.scope_id())?;
+            assert_eq!((actual.calls, actual.settled_calls, actual.tokens), (1, 1, 7));
+            assert_eq!(actual.attempt_ids.len(), 1);
+            assert!(!actual.unresolved);
+            assert_eq!(tracker.physical_scope_usage(&first.scope_id())?.calls, 0);
+            Ok(())
+        })
+        .await
+}

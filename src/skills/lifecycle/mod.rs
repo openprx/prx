@@ -96,9 +96,11 @@ pub use facts::{
     Adherence, Exclusion, FactState, MAX_ADHERENCE_NAMES, MAX_ADHERENCE_SKILLS, ObservedCallStatus, ObservedToolCall,
     ProviderEnd, SkillAdherence, TerminalFacts, TerminalObservations,
 };
+pub(crate) use gate::GateReviewSubject;
 pub use gate::{
-    EvaluationPin, GATE_IDENTITY, GateDecision, GateError, GateEvaluationEntry, GateOutcome, GatePolicy, GateReason,
-    GateRequest, JudgeRecord, JudgeResult, MAX_GATE_EPOCHS, RecordedGate, SkillGateDecision, VerifiedGate,
+    EvaluationPin, GATE_IDENTITY, GateDecision, GateError, GateEvaluationEntry, GateExperimentBinding, GateOutcome,
+    GatePolicy, GateReason, GateRequest, JudgeRecord, JudgeResult, MAX_GATE_EPOCHS, RecordedGate, SkillGateDecision,
+    VerifiedGate,
 };
 pub use gate_judge::{
     GateJudge, JUDGE_PROMPT_VERSION, JudgeBrief, JudgeError, JudgeOpinion, JudgeReply, JudgedEvaluation,
@@ -137,6 +139,7 @@ pub use receipts::{
 };
 pub use rejection::{NewRejection, ProposalOperation, RejectionRecord, material_digest};
 pub use review::{ReviewCheck, ReviewFinding, SOURCE_REVIEW_IDENTITY, SourceReviewOutcome, SourceReviewRecord};
+pub(in crate::skills::lifecycle) use service::{GateReviewPin, VerifiedGateReviewHistory};
 pub use service::{
     LifecycleLimits, LifecycleMode, LifecycleStatus, MIN_PUBLICATION_CASES_FLOOR, ProposalDetail, ProposalSummary,
     ReviewSummary, ServiceError, SkillsLifecycleService, SkillsLifecycleSettings, SkippedProposal, StartupReport,

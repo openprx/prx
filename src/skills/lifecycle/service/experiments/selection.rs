@@ -200,6 +200,7 @@ impl SkillsLifecycleService {
         hash.update(serde_json::to_vec(&value)?);
         Ok(DevelopmentChoice {
             evidence: StageEvidence {
+                pending_gate: None,
                 record_id: reference,
                 digest: hex::encode(hash.finalize()),
                 successful: true,

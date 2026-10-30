@@ -33,6 +33,13 @@ fn binary_digest() -> Result<String> {
     Ok(value)
 }
 impl SkillsLifecycleService {
+    /// Exact original policy input, retained only by an explicitly budgeted witness.
+    pub(super) fn experiment_policy_snapshot(&self, config: &Config) -> serde_json::Value {
+        serde_json::json!({"mode": self.settings.mode, "gate": self.settings.gate_policy, "limits": self.settings.limits, "autonomy": config.autonomy})
+    }
+    pub(super) fn experiment_policy_digest(snapshot: &serde_json::Value) -> Result<String> {
+        Ok(digest(&serde_json::to_vec(snapshot)?))
+    }
     pub(super) fn experiment_pins(
         &self,
         skill: &SkillId,
@@ -81,9 +88,7 @@ impl SkillsLifecycleService {
             crate::decision::KeyDomain::TerminalClaim,
             &[b"instruction-experiment-config-v1", &canonical_config(config)?],
         ));
-        let policy = digest(&serde_json::to_vec(
-            &serde_json::json!({"mode": self.settings.mode, "gate": self.settings.gate_policy, "limits": self.settings.limits, "autonomy": config.autonomy}),
-        )?);
+        let policy = Self::experiment_policy_digest(&self.experiment_policy_snapshot(config))?;
         let catalog = digest(&serde_json::to_vec(
             &serde_json::json!({"tools": crate::tools::STATIC_PUBLIC_TOOL_NAMES, "tiers": config.tool_tiering}),
         )?);

@@ -9,6 +9,7 @@ use crate::skills::lifecycle::{
 };
 
 pub(super) struct StageEvidence {
+    pub pending_gate: Option<Box<super::gate_review::GateReviewPending>>,
     pub record_id: String,
     pub digest: String,
     pub successful: bool,
@@ -88,6 +89,10 @@ impl SkillsLifecycleService {
         }
         let mut splits = std::collections::BTreeMap::new();
         for stage in &journal.plan.spec().stages {
+            if stage.kind == ExperimentStageKind::GateReview {
+                self.verify_gate_review_history(journal, &stage.id)?;
+                continue;
+            }
             if stage.kind != ExperimentStageKind::IndependentVerification {
                 continue;
             }
@@ -231,6 +236,7 @@ impl SkillsLifecycleService {
             } => {
                 self.choose_development_candidate(journal, stage, probe_stages, parent_selections)?;
             }
+            ExperimentOperation::GateReview { .. } => self.validate_gate_review(journal, stage, operation)?,
             ExperimentOperation::SelectedEvaluation {
                 selection_stage,
                 split,
@@ -253,7 +259,7 @@ impl SkillsLifecycleService {
         }
         Ok(())
     }
-    fn verified_stage_evaluation(
+    pub(super) fn verified_stage_evaluation(
         &self,
         journal: &ExperimentJournal,
         stage: &str,
@@ -482,6 +488,7 @@ impl SkillsLifecycleService {
                     None => 0,
                 };
                 Ok(StageEvidence {
+                    pending_gate: None,
                     record_id: proposal.proposal_id,
                     digest,
                     successful: proposal.candidate_revision.is_some(),
@@ -495,6 +502,7 @@ impl SkillsLifecycleService {
             ExperimentOperation::Verify { evaluation_stage } => {
                 let verified = self.verified_stage_evaluation(journal, evaluation_stage)?;
                 Ok(StageEvidence {
+                    pending_gate: None,
                     record_id: verified.receipt.record_id,
                     digest: verified.receipt_digest,
                     successful: verified.outcome.is_pass(),
@@ -535,6 +543,10 @@ impl SkillsLifecycleService {
                 probe_stages,
                 parent_selections,
             } => self.choose_development_candidate(journal, stage, probe_stages, parent_selections),
+            ExperimentOperation::GateReview { .. } => {
+                self.execute_gate_review(config, journal, stage, operation, cancel)
+                    .await
+            }
             ExperimentOperation::SelectedEvaluation {
                 selection_stage,
                 split,
@@ -556,6 +568,7 @@ impl SkillsLifecycleService {
                     .await
                 }
                 None => Ok(StageEvidence {
+                    pending_gate: None,
                     record_id: "baseline".into(),
                     digest: journal.plan.spec().pins.baseline_record_digest.clone(),
                     successful: false,
@@ -603,6 +616,7 @@ impl SkillsLifecycleService {
         );
         std::fs::remove_dir(&scratch)?;
         Ok(StageEvidence {
+            pending_gate: None,
             record_id: evaluation.receipt.record_id,
             digest: evaluation.receipt_digest,
             successful: true,

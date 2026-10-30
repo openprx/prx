@@ -13,10 +13,11 @@ use chrono::Utc;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-mod development_probes;
-mod instruction_cycle;
-mod holdout;
 mod admission;
+mod development_probes;
+mod gate_review;
+mod holdout;
+mod instruction_cycle;
 mod live_fixture;
 mod refinement;
 mod selection_policy;
@@ -27,6 +28,8 @@ struct Server {
     bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     oversized: Arc<AtomicBool>,
     h2_mode: Arc<AtomicUsize>,
+    judge_mode: Arc<AtomicUsize>,
+    judge_count: Arc<AtomicUsize>,
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<Result<()>>,
 }
@@ -47,6 +50,10 @@ impl Server {
         let large = oversized.clone();
         let h2_mode = Arc::new(AtomicUsize::new(0));
         let h2_behavior = h2_mode.clone();
+        let judge_mode = Arc::new(AtomicUsize::new(0));
+        let judge_behavior = judge_mode.clone();
+        let judge_count = Arc::new(AtomicUsize::new(0));
+        let judges = judge_count.clone();
         let editor_barrier = Arc::new(tokio::sync::Barrier::new(2));
         let editor_count = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn(async move {
@@ -56,7 +63,7 @@ impl Server {
                     biased;
                     () = stop.cancelled() => { connections.abort_all(); while connections.join_next().await.is_some() {} return Ok(()); },
                     accepted = listener.accept() => {
-                        let (mut socket, _) = accepted?; let count = counter.clone(); let captured = captured.clone(); let large = large.clone(); let h2_behavior = h2_behavior.clone(); let editor_barrier = editor_barrier.clone(); let editor_count = editor_count.clone();
+                        let (mut socket, _) = accepted?; let count = counter.clone(); let captured = captured.clone(); let large = large.clone(); let h2_behavior = h2_behavior.clone(); let editor_barrier = editor_barrier.clone(); let editor_count = editor_count.clone(); let judge_behavior = judge_behavior.clone(); let judges = judges.clone();
                         connections.spawn(async move {
                             let mut bytes = Vec::new(); let mut chunk = [0_u8; 4096];
                             let body = loop {
@@ -82,7 +89,24 @@ impl Server {
                             }
                             if hang { std::future::pending::<()>().await; }
                             let messages = body["messages"].as_array().context("missing messages")?;
-                            let assessment_response = if messages.iter().any(|message| message["role"] == "system"
+                            let is_gate = messages.iter().any(|message| message["role"] == "system"
+                                && message["content"].as_str().is_some_and(|text|text.starts_with("You review one proposed change to an instruction skill")));
+                            if is_gate {
+                                let number = judges.fetch_add(1, Ordering::SeqCst);
+                                if judge_behavior.load(Ordering::SeqCst) == 2 { std::future::pending::<()>().await; }
+                                if judge_behavior.load(Ordering::SeqCst) == 4 && number == 0 {
+                                    let error = r#"{"error":{"message":"fixture judge transient unavailable"}}"#;
+                                    socket.write_all(format!("HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}",error.len()).as_bytes()).await?;
+                                    return Ok::<_, anyhow::Error>(());
+                                }
+                            }
+                            let assessment_response = if is_gate {
+                                Some(match judge_behavior.load(Ordering::SeqCst) {
+                                    1 => r#"{"verdict":"concern","reason":"fixture procedural concern"}"#,
+                                    3 => "malformed fixture judge response",
+                                    _ => r#"{"verdict":"approve"}"#,
+                                })
+                            } else if messages.iter().any(|message| message["role"] == "system"
                                 && message["content"].as_str().is_some_and(|text| text.starts_with("Classify the execution requirement of current_request"))) {
                                 Some(r#"{"requirement":"execution_required"}"#)
                             } else if messages.iter().any(|message| message["role"] == "system"
@@ -189,6 +213,8 @@ impl Server {
             bodies,
             oversized,
             h2_mode,
+            judge_mode,
+            judge_count,
             cancel,
             task,
         })
@@ -358,16 +384,16 @@ fn plan(
                 _ => vec![],
             },
             allocation: match input {
-                ExperimentOperation::Proposal { .. } | ExperimentOperation::DevelopmentProposal { .. } => {
-                    ExperimentResources {
-                        calls: 4,
-                        tokens: 131_072,
-                        micro_usd: 100_000,
-                        tool_calls: 0,
-                        output_bytes: 131_072,
-                        scratch_bytes: 8 * 1024 * 1024,
-                    }
-                }
+                ExperimentOperation::Proposal { .. }
+                | ExperimentOperation::DevelopmentProposal { .. }
+                | ExperimentOperation::GateReview { .. } => ExperimentResources {
+                    calls: 4,
+                    tokens: 131_072,
+                    micro_usd: 100_000,
+                    tool_calls: 0,
+                    output_bytes: 131_072,
+                    scratch_bytes: 8 * 1024 * 1024,
+                },
                 ExperimentOperation::Evaluation { .. }
                 | ExperimentOperation::DevelopmentProbe { .. }
                 | ExperimentOperation::SelectedEvaluation { .. } => ExperimentResources {

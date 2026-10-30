@@ -771,7 +771,7 @@ async fn refinement_planning_checks_each_aggregate_resource_and_legacy_operation
                 let mut reduced=resources;
                 match component {0=>reduced.calls-=1,1=>reduced.tokens-=1,2=>reduced.micro_usd-=1,3=>reduced.tool_calls-=1,4=>reduced.output_bytes-=1,_=>reduced.scratch_bytes-=1}
                 let draft=InstructionCycleDraft {id:plan.spec.id.clone(),skill_id:f.pin.skill_id.clone(),patterns:vec![pattern.pattern_id.clone()],schedule,
-                    verification_split:EvalSplit::Validation, holdout_allocation:None, resources:reduced, proposal_allocation:plan.spec.stages[1].allocation,
+                    verification_split:EvalSplit::Validation, holdout_allocation:None,gate_allocation:None, resources:reduced, proposal_allocation:plan.spec.stages[1].allocation,
                     probe_allocation:plan.spec.stages[0].allocation,evaluation_allocation:plan.spec.stages.iter().find(|stage|stage.id=="final-evaluation").unwrap().allocation,
                     elapsed_ms:300_000,max_input_bytes:65536,max_output_bytes:16384,proposal_timeout_ms:120_000};
                 assert!(matches!(draft.compile(),Err(ExperimentError::BudgetExceeded)),"component {component} must fail before sending");

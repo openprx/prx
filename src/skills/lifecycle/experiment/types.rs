@@ -81,6 +81,8 @@ pub enum ExperimentStageKind {
     SolverTrial,
     IndependentVerification,
     Selection,
+    /// A privately judged decision; never publication authority.
+    GateReview,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,7 +270,7 @@ impl ExperimentSpec {
             }
             if matches!(
                 stage.kind,
-                ExperimentStageKind::ModelProposal | ExperimentStageKind::SolverTrial
+                ExperimentStageKind::ModelProposal | ExperimentStageKind::SolverTrial | ExperimentStageKind::GateReview
             ) && (stage.allocation.calls == 0 || stage.allocation.tokens == 0 || stage.allocation.output_bytes == 0)
             {
                 return Err(refuse("model stage has no admitted call/token allocation"));
