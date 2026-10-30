@@ -200,8 +200,16 @@ async fn live_foreign_parent_is_refused_before_physical_admission_and_unparented
     spec.max_concurrent = 2;
     for stage in &mut spec.stages {
         stage.dependencies.clear();
-        stage.allocation.calls = 1;
-        stage.allocation.micro_usd = 100_000;
+        // Two active stages share the original root in every component.
+        // The second reservation must be legal before owner isolation is tested.
+        stage.allocation = ExperimentResources {
+            calls: spec.resources.calls / 2,
+            tokens: spec.resources.tokens / 2,
+            micro_usd: spec.resources.micro_usd / 2,
+            tool_calls: spec.resources.tool_calls / 2,
+            output_bytes: spec.resources.output_bytes / 2,
+            scratch_bytes: spec.resources.scratch_bytes / 2,
+        };
     }
     let plan = spec.freeze()?;
     let store = Arc::new(crate::skills::lifecycle::SkillLifecycleStore::open(
