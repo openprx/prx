@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Update Wasmtime and WASI to 50.0.1 for RUSTSEC-2026-0420,
+  RUSTSEC-2026-0422, RUSTSEC-2026-0423 and RUSTSEC-2026-0424.
+
 - Preserve complete ordered refinement patches while limiting parent context to
   instruction content and retaining the original edit and resource ceilings.
 - Keep adopted-lesson wire evidence within existing size limits and reject
