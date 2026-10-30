@@ -1,6 +1,6 @@
 //! Transport boundary checks; no lesson policy or durable store is mocked in.
 use super::*;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,11 +60,7 @@ impl AttemptReceipt for Receipt {
 
     async fn prepare_handoff(&mut self, body: &[u8]) -> anyhow::Result<()> {
         anyhow::ensure!(self.0.admitted.load(Ordering::SeqCst) == 1);
-        self.0
-            .prepared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fixture preparation lock poisoned"))?
-            .push(body.to_vec());
+        self.0.prepared.lock().push(body.to_vec());
         self.0.entered.notify_one();
         match self.0.preparation {
             Preparation::Allow => Ok(()),
@@ -157,13 +153,7 @@ async fn handoff_preparation_borrows_the_single_serialized_native_body() -> anyh
     result?;
     let wire = server.await??;
     assert_eq!(serializations.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        *owner
-            .prepared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fixture preparation lock poisoned"))?,
-        vec![wire]
-    );
+    assert_eq!(*owner.prepared.lock(), vec![wire]);
     assert_eq!(owner.admitted.load(Ordering::SeqCst), 1);
     assert_eq!(owner.settled.load(Ordering::SeqCst), 1);
     Ok(())
@@ -194,14 +184,7 @@ async fn handoff_refusal_is_typed_and_never_connects_after_admission() -> anyhow
     assert!(is_local_refusal(&error));
     assert_eq!(owner.admitted.load(Ordering::SeqCst), 1);
     assert_eq!(owner.settled.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        owner
-            .prepared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fixture preparation lock poisoned"))?
-            .len(),
-        1
-    );
+    assert_eq!(owner.prepared.lock().len(), 1);
     assert_eq!(
         listener
             .accept()
@@ -236,14 +219,7 @@ async fn handoff_deadline_refuses_an_unfinished_preparation_before_native_transp
         .err()
         .ok_or_else(|| anyhow::anyhow!("unfinished preparation unexpectedly sent"))?;
     assert!(is_local_refusal(&error));
-    assert_eq!(
-        owner
-            .prepared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fixture preparation lock poisoned"))?
-            .len(),
-        1
-    );
+    assert_eq!(owner.prepared.lock().len(), 1);
     assert_eq!(owner.admitted.load(Ordering::SeqCst), 1);
     assert_eq!(owner.settled.load(Ordering::SeqCst), 0);
     assert_eq!(

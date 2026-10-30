@@ -87,7 +87,12 @@ fn typical_172_attempt_cost_dto_roundtrips_losslessly_with_record_headroom() -> 
         wire.len()
     );
     let (decoded, _): (serde_json::Value, _) = store.read_adoption_sealed(&wire, b"prx-test-cost-dto-v1")?;
-    let decoded: AdoptionRootCostEvidence = serde_json::from_value(decoded["root_cost_evidence"].clone())?;
+    let decoded: AdoptionRootCostEvidence = serde_json::from_value(
+        decoded
+            .get("root_cost_evidence")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("actual wire omitted the root cost body"))?,
+    )?;
     assert_eq!(decoded, body);
     let mut ids = BTreeSet::new();
     for stage in &decoded.stages {

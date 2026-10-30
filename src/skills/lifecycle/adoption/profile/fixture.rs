@@ -3,9 +3,10 @@
 //! external model assets, process mapping or production model registry.
 use super::{SupportedProfile, alphabet, certify_byte_bpe, digest, refusal};
 use crate::skills::lifecycle::{LifecycleError, ModelBinding, SkillLifecycleStore};
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 type Key = (PathBuf, String, String);
 struct Registration {
@@ -22,10 +23,9 @@ pub(crate) struct LessonFixtureProfileGuard {
 }
 impl Drop for LessonFixtureProfileGuard {
     fn drop(&mut self) {
-        if let Ok(mut registry) = REGISTRY.lock() {
-            if registry.get(&self.key).is_some_and(|entry| entry.id == self.id) {
-                registry.remove(&self.key);
-            }
+        let mut registry = REGISTRY.lock();
+        if registry.get(&self.key).is_some_and(|entry| entry.id == self.id) {
+            registry.remove(&self.key);
         }
     }
 }
@@ -106,9 +106,7 @@ impl SkillLifecycleStore {
         let profile = certified_fixture(model)?;
         let key = key(self, model);
         let id = uuid::Uuid::new_v4().to_string();
-        let mut registry = REGISTRY
-            .lock()
-            .map_err(|_| refusal("fixture profile registry poisoned"))?;
+        let mut registry = REGISTRY.lock();
         if registry.contains_key(&key) {
             return Err(refusal("fixture profile already registered for this owner/model"));
         }
@@ -122,12 +120,7 @@ impl SkillLifecycleStore {
         Ok(LessonFixtureProfileGuard { key, id })
     }
 }
-pub(super) fn registered(
-    store: &SkillLifecycleStore,
-    model: &ModelBinding,
-) -> Result<Option<SupportedProfile>, LifecycleError> {
-    let registry = REGISTRY
-        .lock()
-        .map_err(|_| refusal("fixture profile registry poisoned"))?;
-    Ok(registry.get(&key(store, model)).map(|entry| entry.profile.clone()))
+pub(super) fn registered(store: &SkillLifecycleStore, model: &ModelBinding) -> Option<SupportedProfile> {
+    let registry = REGISTRY.lock();
+    registry.get(&key(store, model)).map(|entry| entry.profile.clone())
 }

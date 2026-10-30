@@ -1,6 +1,6 @@
 //! Default/negative contracts use no fabricated adoption or prepared authority.
 use super::*;
-use crate::skills::lifecycle::adoption::{LessonCompatibility, LessonLimits, LessonQuery};
+use crate::skills::lifecycle::adoption::{LessonCompatibility, LessonLimits, LessonQuery, LessonSnapshotEntry};
 use sha2::{Digest, Sha256};
 
 #[test]
@@ -146,8 +146,11 @@ fn empty_query_rejects_owner_and_caps_without_inventing_eligible_lessons() -> Re
         expires_at: now + chrono::Duration::minutes(5),
     };
     let snapshot = f.store.query_adopted_lessons(&query)?;
-    assert!(snapshot.entries.is_empty());
-    assert!(crate::skills::lifecycle::adoption::format_lesson_block(&snapshot, "general-proposal")?.is_empty());
+    assert_eq!(snapshot.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
+    assert_eq!(
+        crate::skills::lifecycle::adoption::format_lesson_block(&snapshot, "general-proposal")?,
+        ""
+    );
     let mut foreign = query.clone();
     foreign.owner_scope = crate::skills::lifecycle::OwnerScope::new("fixture-foreign-owner")?;
     assert!(f.store.query_adopted_lessons(&foreign).is_err());

@@ -267,12 +267,16 @@ impl SkillLifecycleStore {
             .context("committed proposal has no publication")?;
         let authorized_gate = (&auth.gate_id, &auth.gate_digest);
         let requested_gate = (&pin.gate_id, &pin.gate_sha256);
+        let valid_attempt = (1..=MAX_PUBLICATION_ATTEMPTS).contains(&auth.attempt);
+        let derived_transaction_matches = publication_tx(&proposal.proposal_id, auth.attempt)? == transaction;
+        let committed_transaction_matches = publication.transaction_id == request.publication_tx;
+        let committed_revision_matches = publication.revision_id == subject.candidate_revision;
         ensure!(
-            (1..=MAX_PUBLICATION_ATTEMPTS).contains(&auth.attempt)
-                && publication_tx(&proposal.proposal_id, auth.attempt)? == transaction
+            valid_attempt
+                && derived_transaction_matches
                 && authorized_gate == requested_gate
-                && publication.transaction_id == request.publication_tx
-                && publication.revision_id == subject.candidate_revision,
+                && committed_transaction_matches
+                && committed_revision_matches,
             "publication authorization/transaction differs from the exact gate"
         );
         let entry = self

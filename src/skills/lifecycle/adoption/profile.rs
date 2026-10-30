@@ -239,7 +239,7 @@ pub(super) fn supported_profile(
     model: &ModelBinding,
 ) -> Result<SupportedProfile, LifecycleError> {
     #[cfg(test)]
-    if let Some(profile) = fixture::registered(store, model)? {
+    if let Some(profile) = fixture::registered(store, model) {
         return Ok(profile);
     }
     #[cfg(not(test))]

@@ -2,7 +2,7 @@
 //! All model behavior is deterministic loopback; no Prepared or success record
 //! constructor, publication bypass or production profile exception is used.
 use super::*;
-use crate::skills::lifecycle::adoption::{LessonLimits, LessonQuery, LessonSnapshot};
+use crate::skills::lifecycle::adoption::{LessonLimits, LessonQuery, LessonSnapshot, LessonSnapshotEntry};
 use crate::skills::lifecycle::{LessonRef, RecordAdoptionRequest};
 use sha2::Digest as _;
 use std::collections::BTreeSet;
@@ -255,7 +255,7 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         assert_eq!(usage, journal.state.committed(&journal.plan)?);
         assert_eq!(usage.calls, u64::try_from(before_publish)?);
         assert!(usage.micro_usd>0,"priced real requests must contribute actual fees under the original allowance");
-        assert!(!cost["models"].as_array().unwrap().is_empty());
+        assert_ne!(cost["models"].as_array().unwrap().as_slice(), &[] as &[serde_json::Value]);
         let mut ids = BTreeSet::new();
         let mut scopes = Vec::new();
         for stage in cost["stages"].as_array().unwrap() {
@@ -334,10 +334,10 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         assert!(block.is_ascii() && block.len() + 320 <= 1536);
         let mut overlap = q.clone();
         overlap.excluded_roots = suite(&f).lesson_root_digests();
-        assert!(f.store.query_adopted_lessons(&overlap)?.entries.is_empty());
+        assert_eq!(f.store.query_adopted_lessons(&overlap)?.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
         let mut family = q.clone();
         family.task_family = "unrelated-family".into();
-        assert!(f.store.query_adopted_lessons(&family)?.entries.is_empty());
+        assert_eq!(f.store.query_adopted_lessons(&family)?.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
         let mut old = q.clone();
         old.baseline_revision = f.pin.revision_id.clone();
         old.baseline_record_sha256 = f.pin.record_digest.clone();
@@ -580,7 +580,7 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         owned_attempts_then_retire(&f, &server, &config, &next, &owner_service, owned_draft, &second).await?;
         origin.set_adoption_status(&reference, true, false)?;
         let sends = server.count.load(Ordering::SeqCst);
-        assert!(f.store.query_adopted_lessons(&q)?.entries.is_empty());
+        assert_eq!(f.store.query_adopted_lessons(&q)?.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
         assert!(
             confirm(&f, &snapshot, &q, Utc::now()).is_err(),
             "retirement between planning and handoff must revoke the snapshot"
@@ -663,7 +663,7 @@ async fn owned_attempts_then_retire(
     cleanup.run(runtime.scope(async {
             let prepared=target.prepare_lesson_context(&frozen,"general",&plan.operations["general"],&user)
                 .await?.context("genuine factory returned no context")?;
-            assert_eq!(prepared.block(),block);assert_eq!(prepared.refs(),&[reference.clone()]);
+            assert_eq!(prepared.block(),block);assert_eq!(prepared.refs(),std::slice::from_ref(reference));
             assert_eq!(prepared.expected_user_slot_bytes(),u64::try_from(user.len())?);
             let before=server.count.load(Ordering::SeqCst);
             for _ in 0..2 {
