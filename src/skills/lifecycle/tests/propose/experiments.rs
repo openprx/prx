@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod development_probes;
 mod instruction_cycle;
 mod live_fixture;
+mod selection_policy;
 
 struct Server {
     url: String,

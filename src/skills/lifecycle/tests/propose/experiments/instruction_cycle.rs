@@ -2,7 +2,7 @@
 //! transport. These are deterministic mechanism tests, not live Splash results.
 use super::*;
 
-fn cycle(
+pub(super) fn cycle(
     f: &Fixture,
     service: &SkillsLifecycleService,
     config: &Config,
