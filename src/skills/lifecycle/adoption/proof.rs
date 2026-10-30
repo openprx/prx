@@ -446,17 +446,14 @@ impl SkillLifecycleStore {
             "complete_root_cost":root_cost,
             "complete_root_cost_unknown":root_cost.is_none(),
         });
-        let identity = serde_json::json!([
-            "prx-adoption-identity-v1",
-            self.owner_scope(),
-            proposal.proposal_id,
-            request.publication_tx,
-            request.task_family
-        ]);
         Ok(VerifiedAdoptionRecord(AdoptionRecord {
             schema_version: 1,
             owner_scope: self.owner_scope().clone(),
-            adoption_id: format!("adopt-{}", digest(&serde_json::to_vec(&identity)?)),
+            adoption_id: self.exact_adoption_id(
+                &proposal.proposal_id,
+                &request.publication_tx,
+                &request.task_family,
+            )?,
             skill_id: subject.skill_id.clone(),
             task_family: request.task_family.clone(),
             proposal_id: proposal.proposal_id,

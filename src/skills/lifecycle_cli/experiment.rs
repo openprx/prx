@@ -1,5 +1,6 @@
 //! Explicit experiment planning/execution through the shared lifecycle service.
 //! This adapter owns no stage state, accounting policy or publication authority.
+mod product;
 use super::{Arc, Config, Context, Result, SkillsLifecycleService};
 use crate::SkillExperimentCommands;
 use crate::skills::lifecycle::experiment::{ExperimentDraft, ExperimentId, ExperimentJournal, ExperimentOperation};
@@ -32,6 +33,7 @@ pub(super) async fn dispatch(
     config: &Config,
 ) -> Result<String> {
     match command {
+        SkillExperimentCommands::Product { command } => product::dispatch(command, service, config).await,
         SkillExperimentCommands::PlanCycle { source } => {
             let draft = read_input(&source).await?;
             let config = config.clone();

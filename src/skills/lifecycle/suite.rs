@@ -427,7 +427,7 @@ fn validate_validator(validator: &Validator) -> Result<(), EvaluationError> {
     }
 }
 
-fn validate_case(case: &EvalCase) -> Result<(), EvaluationError> {
+pub(super) fn validate_case(case: &EvalCase) -> Result<(), EvaluationError> {
     check_ident("case id", &case.case_id)?;
     check_ident("task family", &case.task_family)?;
     check_text("prompt", &case.prompt, MAX_CASE_PROMPT_BYTES)?;

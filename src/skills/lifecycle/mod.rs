@@ -45,6 +45,7 @@ mod lesson_delivery;
 mod manifest;
 mod migrate;
 mod operator_import;
+mod product;
 mod projection;
 mod proposal;
 mod propose;
@@ -121,6 +122,7 @@ pub(crate) use lesson_delivery::{
 pub use manifest::{ManifestError, ManifestInfo, validate_manifest, validate_manifest_strict};
 pub use migrate::{MigrationAction, MigrationEntry, MigrationPlan, MigrationReport, apply_migration, plan_migration};
 pub use operator_import::ExecutableImport;
+pub use product::*;
 pub use projection::ProjectionRepair;
 pub use proposal::{
     AppliedEdit, AttemptOutcome, AttemptRecord, AuthorBinding, BoundedDiff, BudgetRecord, DescriptionChange, EditOp,

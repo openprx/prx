@@ -22,6 +22,7 @@
 
 mod adoption_status;
 mod adoptions;
+mod experiment_product;
 mod experiments;
 pub(in crate::skills::lifecycle) use experiments::{GateReviewPin, VerifiedGateReviewHistory};
 mod proposals;

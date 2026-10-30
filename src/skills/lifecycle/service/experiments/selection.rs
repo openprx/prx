@@ -283,7 +283,7 @@ impl SkillsLifecycleService {
         }))
     }
 
-    pub(super) fn selected_development_proposal(
+    pub(in crate::skills::lifecycle) fn selected_development_proposal(
         &self,
         journal: &ExperimentJournal,
         selection: &str,

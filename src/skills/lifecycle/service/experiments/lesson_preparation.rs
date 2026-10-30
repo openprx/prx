@@ -28,7 +28,7 @@ impl SkillsLifecycleService {
         Ok(())
     }
 
-    pub(super) fn resolve_lesson_query(
+    pub(in crate::skills::lifecycle) fn resolve_lesson_query(
         &self,
         intent: &LessonQueryIntent,
         pins: &ExperimentPins,

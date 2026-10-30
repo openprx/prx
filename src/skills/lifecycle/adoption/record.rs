@@ -305,6 +305,21 @@ impl SkillLifecycleStore {
         }
         Ok(())
     }
+    pub(super) fn exact_adoption_id(
+        &self,
+        proposal: &str,
+        transaction: &str,
+        family: &str,
+    ) -> Result<String, LifecycleError> {
+        let identity = serde_json::json!([
+            "prx-adoption-identity-v1",
+            self.owner_scope(),
+            proposal,
+            transaction,
+            family
+        ]);
+        Ok(format!("adopt-{}", digest(&serde_json::to_vec(&identity)?)))
+    }
     pub(super) fn read_adoption_index_locked(
         &self,
         family: &str,

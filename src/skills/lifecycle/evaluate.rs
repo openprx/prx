@@ -227,7 +227,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 impl RunReceipt {
-    fn from_observation(observation: &RunObservation) -> Self {
+    pub(super) fn from_observation(observation: &RunObservation) -> Self {
         Self {
             run_id: observation.run_id.clone(),
             terminal: observation.terminal,
@@ -559,7 +559,7 @@ pub trait CaseExecutor: Send + Sync {
 // ---------------------------------------------------------------------------
 // Judgement
 
-fn run_validators(
+pub(super) fn run_validators(
     case: &EvalCase,
     response: &str,
     artifacts: &BTreeMap<String, Option<Vec<u8>>>,

@@ -40,7 +40,7 @@ impl SkillsLifecycleService {
     pub(super) fn experiment_policy_digest(snapshot: &serde_json::Value) -> Result<String> {
         Ok(digest(&serde_json::to_vec(snapshot)?))
     }
-    pub(super) fn experiment_pins(
+    pub(in crate::skills::lifecycle) fn experiment_pins(
         &self,
         skill: &SkillId,
         config: &Config,

@@ -16,13 +16,8 @@ pub(super) struct StageEvidence {
     pub scratch_bytes: u64,
 }
 pub(super) fn proposal_request_id(journal: &ExperimentJournal, stage: &str) -> String {
-    // Length-independent, immutable and owner-scoped by proposal_id_of.
-    use sha2::{Digest, Sha256};
-    let mut hash = Sha256::new();
-    hash.update(journal.plan.digest());
-    hash.update(b"\0");
-    hash.update(stage);
-    format!("experiment-{}", hex::encode(hash.finalize()))
+    // Same historical bytes; one constructor is shared by publication binding.
+    crate::skills::lifecycle::product::experiment_proposal_request_id(journal.plan.digest(), stage)
 }
 pub(super) fn proposal_evidence(proposal: &crate::skills::lifecycle::SkillProposal) -> Result<String> {
     use sha2::{Digest, Sha256};

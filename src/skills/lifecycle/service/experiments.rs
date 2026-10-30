@@ -113,6 +113,14 @@ impl SkillsLifecycleService {
         }
         self.experiment_append(&journal, "cancel", ExperimentEvent::Cancelled)
     }
+    pub(in crate::skills::lifecycle) fn cancel_product_experiment(
+        &self,
+        id: &ExperimentId,
+        digest: &str,
+    ) -> Result<ExperimentJournal> {
+        let journal = self.inspect_experiment(id, digest)?;
+        self.experiment_append(&journal, "product-cancel", ExperimentEvent::Cancelled)
+    }
     fn experiment_append(
         &self,
         old: &ExperimentJournal,
@@ -124,6 +132,23 @@ impl SkillsLifecycleService {
         // remains Planned. The unique nonce is never treated as ownership of an
         // already reserved stage. I/O uncertainty is never retried here.
         for _ in 0..16 {
+            // Product cancellation observes the same CAS head on every retry.
+            // A terminal completed root is historical evidence, not live work.
+            if event_id == "product-cancel"
+                && matches!(event, ExperimentEvent::Cancelled)
+                && (current.state.cancelled
+                    || current.state.stages.values().all(|state| {
+                        matches!(
+                            state,
+                            StageState::Settled {
+                                cleanup_confirmed: true,
+                                ..
+                            }
+                        )
+                    }))
+            {
+                return Ok(current);
+            }
             match self.store.append_experiment(
                 &current.plan.spec().id,
                 current.plan.digest(),

@@ -113,9 +113,36 @@ impl SkillLifecycleStore {
         policy: &GatePolicy,
         suite_digest: &str,
     ) -> Result<SkillProposal, GateError> {
+        self.authorize_publication_inner(proposal_id, gate_digest, policy, suite_digest, None)
+    }
+
+    pub(in crate::skills::lifecycle) fn authorize_experiment_publication(
+        &self,
+        expected: &super::ExperimentFinalExpectation,
+        policy: &GatePolicy,
+        suite_digest: &str,
+    ) -> Result<SkillProposal, GateError> {
+        self.authorize_publication_inner(
+            &expected.proposal_id,
+            &expected.gate_sha256,
+            policy,
+            suite_digest,
+            Some(expected),
+        )
+    }
+
+    fn authorize_publication_inner(
+        &self,
+        proposal_id: &str,
+        gate_digest: &str,
+        policy: &GatePolicy,
+        suite_digest: &str,
+        expected: Option<&super::ExperimentFinalExpectation>,
+    ) -> Result<SkillProposal, GateError> {
         let proposal = self
             .read_proposal(proposal_id)?
             .ok_or_else(|| GateError::Unsupported(format!("no such proposal {proposal_id}")))?;
+        self.require_experiment_publication_intent(&proposal, expected)?;
         match proposal.status {
             ProposalStatus::Eligible => {}
             ProposalStatus::PublicationAuthorized => {
@@ -128,12 +155,27 @@ impl SkillLifecycleStore {
                 let mut current = self
                     .read_proposal_record(proposal_id)?
                     .ok_or_else(|| GateError::Unsupported(format!("no such proposal {proposal_id}")))?;
+                self.require_experiment_publication_binding(&current, expected)?;
                 // A committed attempt is the publication's business; verifying
                 // the gate again would see its own binding as stale. An aborted
                 // or unpublished one is verified like any other authorization.
                 if self.settle_publication(&lock, &mut current)? == Settlement::Committed {
                     return Ok(current);
                 }
+            }
+            status
+                if expected.is_some()
+                    && super::product::recorded_publication_status(status)
+                    && proposal.publication.is_some() =>
+            {
+                let _lock = self.lock_proposals()?;
+                let current = self
+                    .read_proposal_record(proposal_id)?
+                    .ok_or_else(|| GateError::Unbound("the expected proposal is missing".into()))?;
+                self.require_experiment_publication_binding(&current, expected)?;
+                // No authorization is minted. The following original publisher
+                // validates the actual Committed transaction before returning it.
+                return Ok(current);
             }
             status => {
                 return Err(GateError::NotAuthorized {
@@ -145,7 +187,7 @@ impl SkillLifecycleStore {
         let gate_id = gate_id_of(self.owner_scope(), &proposal.proposal_id, proposal.evaluation_epoch);
         let verified = self
             .verify_gate(&gate_id, gate_digest, policy, suite_digest)
-            .map_err(|e| self.stale_after(&proposal.proposal_id, e))?;
+            .map_err(|e| self.stale_after_expected(&proposal.proposal_id, e, expected))?;
         check_bound(&proposal, &gate_id, &verified)?;
         self.require_source_review(&proposal)?;
         let candidate = self.candidate_record_digest(&proposal)?;
@@ -156,6 +198,16 @@ impl SkillLifecycleStore {
         let mut current = self
             .read_proposal_record(&proposal.proposal_id)?
             .ok_or_else(|| GateError::Unsupported(format!("no such proposal {}", proposal.proposal_id)))?;
+        self.require_experiment_publication_binding(&current, expected)?;
+        if expected.is_some()
+            && super::product::recorded_publication_status(current.status)
+            && current.publication.is_some()
+        {
+            return Ok(current);
+        }
+        if let Some(expected) = expected {
+            self.require_experiment_fresh_publication(expected)?;
+        }
         if current.evaluation_epoch != proposal.evaluation_epoch {
             return Err(GateError::Unsupported(
                 "the proposal moved to another evaluation epoch during authorization".to_string(),
@@ -213,14 +265,39 @@ impl SkillLifecycleStore {
         policy: &GatePolicy,
         suite_digest: &str,
     ) -> Result<PublicationOutcome, GateError> {
+        self.publish_authorized_inner(proposal_id, policy, suite_digest, None)
+    }
+
+    pub(in crate::skills::lifecycle) fn publish_experiment_authorized(
+        &self,
+        expected: &super::ExperimentFinalExpectation,
+        policy: &GatePolicy,
+        suite_digest: &str,
+    ) -> Result<PublicationOutcome, GateError> {
+        self.publish_authorized_inner(&expected.proposal_id, policy, suite_digest, Some(expected))
+    }
+
+    fn publish_authorized_inner(
+        &self,
+        proposal_id: &str,
+        policy: &GatePolicy,
+        suite_digest: &str,
+        expected: Option<&super::ExperimentFinalExpectation>,
+    ) -> Result<PublicationOutcome, GateError> {
         let lock = self.lock_proposals()?;
         let mut proposal = self
             .read_proposal(proposal_id)?
             .ok_or_else(|| GateError::Unsupported(format!("no such proposal {proposal_id}")))?;
-        if !matches!(
-            proposal.status,
-            ProposalStatus::PublicationAuthorized | ProposalStatus::Committed
-        ) {
+        self.require_experiment_publication_binding(&proposal, expected)?;
+        let historical_product = expected.is_some()
+            && super::product::recorded_publication_status(proposal.status)
+            && proposal.publication.is_some();
+        if !historical_product
+            && !matches!(
+                proposal.status,
+                ProposalStatus::PublicationAuthorized | ProposalStatus::Committed
+            )
+        {
             return Err(GateError::NotAuthorized {
                 proposal_id: proposal.proposal_id,
                 status: proposal.status.as_str(),
@@ -239,7 +316,42 @@ impl SkillLifecycleStore {
         let transaction_id = publication_tx(&proposal.proposal_id, auth.attempt)?;
         let request = publish_request(&proposal, &auth)?;
         let pin = authorization_pin(&proposal.proposal_id, &auth);
+        if historical_product {
+            // Product replay is historical observation only. In particular a
+            // later rollback, gate expiry or projection does not reactivate or
+            // repair this old revision and cannot create another transaction.
+            let entry = self.journal_entry(&transaction_id)?.ok_or_else(|| {
+                GateError::Unbound("committed experiment publication has no actual transaction".into())
+            })?;
+            let publication = proposal
+                .publication
+                .as_ref()
+                .ok_or_else(|| GateError::Unbound("committed experiment proposal has no publication record".into()))?;
+            if entry.state != TransactionState::Committed
+                || entry.kind != super::TransactionKind::Publish
+                || entry.skill_id != request.skill_id
+                || entry.candidate_revision_id != request.candidate
+                || entry.candidate_record_digest != request.candidate_record_digest
+                || entry.expected_generation != request.expected_generation
+                || entry.authorization_digest.as_deref() != Some(pin.as_str())
+                || publication.transaction_id != transaction_id.as_str()
+                || publication.revision_id != entry.candidate_revision_id
+                || publication.generation != entry.new_generation
+                || Some(publication.committed_at) != entry.finished_at
+            {
+                return Err(GateError::Unbound(
+                    "committed experiment publication history is inconsistent".into(),
+                ));
+            }
+            return Ok(PublicationOutcome {
+                proposal,
+                transaction: TransactionOutcome { entry, replayed: true },
+            });
+        }
         if proposal.status == ProposalStatus::PublicationAuthorized && self.journal_entry(&transaction_id)?.is_none() {
+            if let Some(expected) = expected {
+                self.require_experiment_fresh_publication(expected)?;
+            }
             // Nothing was journaled for this attempt: the authorization must
             // still hold under the caller's own rules.
             match self.verify_gate(&auth.gate_id, &auth.gate_digest, policy, suite_digest) {
@@ -449,6 +561,33 @@ impl SkillLifecycleStore {
             Ok(None) => error,
             Err(e) => e.into(),
         }
+    }
+
+    /// H2 error reconciliation is also guarded by the exact source-owned final.
+    /// A caller-supplied stale or forged expectation cannot trigger settlement
+    /// or a terminal proposal mutation through the authorization error path.
+    fn stale_after_expected(
+        &self,
+        proposal_id: &str,
+        error: GateError,
+        expected: Option<&super::ExperimentFinalExpectation>,
+    ) -> GateError {
+        let Some(expected) = expected else {
+            return self.stale_after(proposal_id, error);
+        };
+        let lock = match self.lock_proposals() {
+            Ok(lock) => lock,
+            Err(error) => return error.into(),
+        };
+        let mut proposal = match self.read_proposal_record(proposal_id) {
+            Ok(Some(proposal)) => proposal,
+            Ok(None) => return GateError::Unbound("the expected proposal is missing".into()),
+            Err(error) => return error.into(),
+        };
+        if let Err(error) = self.require_experiment_publication_binding(&proposal, Some(expected)) {
+            return error;
+        }
+        self.stale_locked(&lock, &mut proposal, error)
     }
 
     /// Like [`Self::stale_after`] with the proposal lock already held.

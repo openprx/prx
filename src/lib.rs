@@ -252,6 +252,11 @@ pub enum SkillCommands {
 /// Individual bounded experiment operations, under the existing lifecycle policy.
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillExperimentCommands {
+    /// Typed product flow: exact final publication, annotation and honest status.
+    Product {
+        #[command(subcommand)]
+        command: SkillExperimentProductCommands,
+    },
     /// Compile one bounded general/domain/compose cycle, without model work.
     PlanCycle { source: String },
     /// Run or continue a complete admitted plan without replaying uncertain work.
@@ -273,6 +278,35 @@ pub enum SkillExperimentCommands {
         stage: String,
         source: String,
     },
+}
+
+/// Explicit local operator inputs; files contain intent and pins, never grants.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillExperimentProductCommands {
+    /// Plan one complete cycle without model/tool execution.
+    Plan { source: String },
+    /// Admit the complete typed plan, including all exact operation hashes.
+    Admit { source: String },
+    /// Run or safely continue an already admitted complete plan.
+    Run { source: String },
+    /// Inspect owner records without recovery, repair or model work.
+    Inspect { id: String, digest: String },
+    /// Persist cancel intent; cleanup and termination remain separate observations.
+    Cancel { id: String, digest: String },
+    /// Reconcile only the existing experiment; never retry uncertain effects.
+    Recover { id: String, digest: String },
+    /// Review the exact final expectation with the existing source reviewer.
+    Review { source: String },
+    /// Publish the sealed exact final or return its original Committed transaction.
+    Publish { source: String },
+    /// Annotate one authentic already-Committed publication; never publish.
+    Annotate { source: String },
+    /// Query eligible lessons using actual current owner/model/policy pins.
+    QueryLessons { source: String },
+    /// Roll back this experiment's skill through the original generation-CAS owner.
+    Rollback { source: String },
+    /// Set monotonic flags on an exact owner/experiment adoption reference.
+    SetAdoptionStatus { source: String },
 }
 
 /// Skill lifecycle subcommands. Every mutation goes through the lifecycle
@@ -324,7 +358,7 @@ pub enum SkillLifecycleCommands {
         /// Proposal id
         proposal_id: String,
     },
-    /// Publish an eligible proposal (needs `mode = "auto"` and a valid policy)
+    /// Publish an eligible non-experiment proposal (H2 uses experiment product publish)
     Publish {
         /// Proposal id
         proposal_id: String,
