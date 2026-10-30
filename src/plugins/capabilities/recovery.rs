@@ -765,6 +765,8 @@ pub(crate) struct Supervisor {
     announce_restarts: bool,
     respawn: Respawn,
     status: AdapterStatus,
+    #[cfg(test)]
+    next_store_entry: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Supervisor {
@@ -785,6 +787,8 @@ impl Supervisor {
             announce_restarts: false,
             respawn,
             status: AdapterStatus::default(),
+            #[cfg(test)]
+            next_store_entry: parking_lot::Mutex::new(None),
         }
     }
 
@@ -828,6 +832,12 @@ impl Supervisor {
     pub(crate) async fn inject_fault(&self, reason: &str) {
         let mut guard = self.inner.lock().await;
         self.mark_dead(&mut guard, "test", reason.to_string(), DeathCause::Fault);
+    }
+
+    /// Notify once a call owns the store mutex and has checked its live state.
+    #[cfg(test)]
+    pub(crate) fn notify_next_store_entry(&self, entered: tokio::sync::oneshot::Sender<()>) {
+        assert!(self.next_store_entry.lock().replace(entered).is_none());
     }
 
     /// Acquire the store mutex. Exposed for tests that drive the cancellation
@@ -933,6 +943,11 @@ impl Supervisor {
     ) -> PluginResult<O::Output> {
         let operation = op.operation();
         self.ensure_live(inner, operation, announcements).await;
+
+        #[cfg(test)]
+        if let Some(entered) = self.next_store_entry.lock().take() {
+            let _ = entered.send(());
+        }
 
         let outcome = {
             let mut call = GuestCall::arm(self, inner, operation);

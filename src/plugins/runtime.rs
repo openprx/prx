@@ -2744,25 +2744,18 @@ optional = []
 
         let chain = runtime.middleware();
         let trapping = oversized_middleware_envelope();
-        // The waiter has to queue behind the trapping caller for this test to
-        // exercise anything, so the trapping task announces that it is running
-        // before it takes the store lock.
+        // Announce only after the trapping call owns the real store mutex and
+        // has checked the live state. Copying the envelope and scheduling the
+        // detached guest task must not let the healthy caller enter first.
         let (entered, has_entered) = tokio::sync::oneshot::channel();
+        chain.notify_next_store_entry(entered);
         let trapping_call = tokio::spawn({
             let chain = Arc::clone(&chain);
-            async move {
-                let _ = entered.send(());
-                chain.process(MIDDLEWARE_RECOVERY_STAGE, &trapping).await
-            }
+            async move { chain.process(MIDDLEWARE_RECOVERY_STAGE, &trapping).await }
         });
         has_entered.await.unwrap();
-        // `MiddlewareChain::process` copies the envelope before it takes the
-        // store lock, so the trapping caller carries a four-megabyte copy (well
-        // under a millisecond) that the healthy caller does not. The delay only
-        // has to cover that copy: landing late is harmless, because a waiter
-        // that arrives after the trap has already been recorded still finds the
-        // adapter dead and still performs exactly one rebuild.
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // A late waiter may observe the already-recorded trap; either way, it
+        // must rebuild exactly once instead of entering the poisoned store.
         let healthy_call = tokio::spawn({
             let chain = Arc::clone(&chain);
             async move { chain.process(MIDDLEWARE_RECOVERY_STAGE, r#"{"text":"hello"}"#).await }
