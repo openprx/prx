@@ -640,6 +640,7 @@ impl SkillLifecycleStore {
             required_suite: None,
             evaluation_epoch: 0,
             evaluating_since: None,
+            bound_evaluation_attempts: Vec::new(),
             authorization: None,
             publication: None,
             created_at: now,

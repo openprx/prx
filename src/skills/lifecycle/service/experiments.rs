@@ -33,11 +33,16 @@ impl SkillsLifecycleService {
         let created_at = Utc::now();
         let duration = chrono::Duration::try_milliseconds(i64::try_from(draft.elapsed_ms)?)
             .context("experiment duration is out of range")?;
+        let operations = draft
+            .stages
+            .iter()
+            .map(|stage| (stage.id.clone(), stage.operation.clone()))
+            .collect();
         let spec = ExperimentSpec {
             schema_version: crate::skills::lifecycle::experiment::EXPERIMENT_SCHEMA_VERSION,
             id: draft.id,
             owner_scope: self.owner_scope().clone(),
-            pins: self.experiment_pins(&draft.skill_id, config, draft.verification_split)?,
+            pins: self.experiment_pins(&draft.skill_id, config, draft.verification_split, draft.verify_holdout)?,
             resources: draft.resources,
             elapsed_ms: draft.elapsed_ms,
             max_concurrent: draft.max_concurrent,
@@ -59,7 +64,9 @@ impl SkillsLifecycleService {
                 })
                 .collect::<Result<Vec<_>>>()?,
         };
-        Ok(spec.freeze()?)
+        let plan = crate::skills::lifecycle::experiment::InstructionExperimentPlan { spec, operations };
+        plan.validate()?;
+        Ok(plan.spec.freeze()?)
     }
     /// Resolves actual owner/baseline/suite/model/runtime pins without a model
     /// send. The caller explicitly freezes the returned spec before admission.
@@ -67,7 +74,12 @@ impl SkillsLifecycleService {
     pub(crate) fn plan_experiment(&self, mut spec: ExperimentSpec, config: &Config) -> Result<FrozenExperiment> {
         self.require_evaluation("planning an instruction experiment")?;
         spec.owner_scope = self.owner_scope().clone();
-        spec.pins = self.experiment_pins(&spec.pins.skill_id, config, spec.pins.verification_split)?;
+        spec.pins = self.experiment_pins(
+            &spec.pins.skill_id,
+            config,
+            spec.pins.verification_split,
+            spec.pins.holdout_split_digest.is_some(),
+        )?;
         Ok(spec.freeze()?)
     }
     pub(crate) fn admit_experiment(&self, spec: ExperimentSpec, config: &Config) -> Result<ExperimentJournal> {
@@ -140,7 +152,12 @@ impl SkillsLifecycleService {
         );
         ensure!(
             plan.spec().pins
-                == self.experiment_pins(&plan.spec().pins.skill_id, config, plan.spec().pins.verification_split)?,
+                == self.experiment_pins(
+                    &plan.spec().pins.skill_id,
+                    config,
+                    plan.spec().pins.verification_split,
+                    plan.spec().pins.holdout_split_digest.is_some()
+                )?,
             "experiment runtime, baseline or policy pins changed"
         );
         Ok(())

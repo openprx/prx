@@ -9,6 +9,12 @@ use std::collections::BTreeSet;
 pub const EXPERIMENT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_EXPERIMENT_STAGES: usize = 64;
 
+// Serde's skip_serializing_if callback receives a reference to the field.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// The storage identity is scoped by the existing lifecycle owner and directory.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -94,6 +100,9 @@ pub struct ExperimentDraft {
     pub id: ExperimentId,
     pub skill_id: SkillId,
     pub verification_split: EvalSplit,
+    /// Explicit intent; the service resolves the registered suite's holdout pin.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub verify_holdout: bool,
     pub resources: ExperimentResources,
     pub elapsed_ms: u64,
     pub max_concurrent: u32,
@@ -127,6 +136,8 @@ pub struct ExperimentPins {
     pub development_split_digest: String,
     pub verification_split: EvalSplit,
     pub verification_split_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_split_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +226,24 @@ impl ExperimentSpec {
             return Err(refuse(
                 "independent verification must use a distinct validation or holdout split",
             ));
+        }
+        if let Some(holdout) = &pins.holdout_split_digest {
+            if pins.verification_split != EvalSplit::Validation
+                || !is_digest(holdout)
+                || holdout == &pins.development_split_digest
+                || holdout == &pins.verification_split_digest
+            {
+                return Err(refuse("additional holdout needs a distinct pin and primary validation"));
+            }
+            let reserved = self
+                .stages
+                .iter()
+                .try_fold(ExperimentResources::default(), |sum, stage| {
+                    sum.checked_add(stage.allocation)
+                })?;
+            if !reserved.within(self.resources) {
+                return Err(ExperimentError::BudgetExceeded);
+            }
         }
         if pins.model.provider_label.is_empty() || pins.model.model.is_empty() {
             return Err(refuse("missing model binding"));

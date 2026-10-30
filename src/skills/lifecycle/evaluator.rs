@@ -11,7 +11,8 @@ use super::bundle::Bundle;
 use super::evaluate::{
     Arm, ArmBinding, ArmResources, CaseContext, CaseExecutor, CaseReceipt, CaseVerdict, EVALUATION_SCHEMA_VERSION,
     EvaluationError, EvaluationOutcome, EvaluationReceipt, ExecutionRequest, InstallSkill, InvalidReason,
-    RUNNER_IDENTITY, RunObservation, RunPlan, assess, build_case_receipt, new_evaluation_id, resource_digests,
+    ProposalEvaluationBinding, RUNNER_IDENTITY, RunObservation, RunPlan, assess, build_case_receipt, new_evaluation_id,
+    resource_digests,
 };
 use super::store::SkillLifecycleStore;
 use super::suite::{EvalCase, EvalSplit, FrozenSuite};
@@ -83,6 +84,50 @@ fn artifact_paths(case: &EvalCase) -> Vec<String> {
 }
 
 impl SkillLifecycleStore {
+    pub(super) fn proposal_evaluation_binding(
+        &self,
+        request: &EvaluationRequest<'_>,
+        id: &str,
+    ) -> Result<ProposalEvaluationBinding, EvaluationError> {
+        let proposal = self
+            .read_proposal(id)?
+            .ok_or_else(|| EvaluationError::Stale("evaluated proposal is missing".into()))?;
+        if proposal.status != super::ProposalStatus::Evaluating
+            || proposal.skill_id != request.suite.suite().skill_id
+            || proposal.required_suite.as_deref() != Some(request.suite.digest())
+            || proposal.candidate_revision.as_ref() != Some(&request.candidate)
+            || proposal.baseline_revision != request.baseline
+            || proposal.expected_generation != request.observed_generation
+            || proposal.evaluation_epoch == 0
+            || proposal.evaluating_since.is_some_and(|since| since > Utc::now())
+        {
+            return Err(EvaluationError::Stale(
+                "proposal no longer matches the admitted evaluation".into(),
+            ));
+        }
+        Ok(ProposalEvaluationBinding {
+            proposal_id: proposal.proposal_id,
+            evaluation_epoch: proposal.evaluation_epoch,
+            evaluating_since: proposal
+                .evaluating_since
+                .ok_or_else(|| EvaluationError::Stale("proposal has no evaluation window".into()))?,
+        })
+    }
+
+    /// Internal proposal-owned entry point. Capture identity from stored state;
+    /// caller metadata can only restrict an existing binding, never create it.
+    pub(super) async fn evaluate_proposal(
+        &self,
+        request: &EvaluationRequest<'_>,
+        id: &str,
+        expected: Option<&ProposalEvaluationBinding>,
+        executor: &dyn CaseExecutor,
+        cancel: &CancellationToken,
+    ) -> Result<RecordedEvaluation, EvaluationError> {
+        self.evaluate_with_binding(request, Some((id, expected)), executor, cancel)
+            .await
+    }
+
     fn skill_generation(&self, suite: &FrozenSuite) -> Result<u64, EvaluationError> {
         Ok(self
             .active_binding(&suite.suite().skill_id)?
@@ -100,6 +145,16 @@ impl SkillLifecycleStore {
     pub async fn evaluate(
         &self,
         request: &EvaluationRequest<'_>,
+        executor: &dyn CaseExecutor,
+        cancel: &CancellationToken,
+    ) -> Result<RecordedEvaluation, EvaluationError> {
+        self.evaluate_with_binding(request, None, executor, cancel).await
+    }
+
+    async fn evaluate_with_binding(
+        &self,
+        request: &EvaluationRequest<'_>,
+        proposal: Option<(&str, Option<&ProposalEvaluationBinding>)>,
         executor: &dyn CaseExecutor,
         cancel: &CancellationToken,
     ) -> Result<RecordedEvaluation, EvaluationError> {
@@ -172,14 +227,24 @@ impl SkillLifecycleStore {
         let evaluation_id = new_evaluation_id();
         // Everything that can be refused has been; from here the attempt is
         // spent whatever happens (see `reserve_attempt`).
-        self.reserve_attempt(
-            &suite,
-            request.split,
-            &evaluation_id,
-            &request.candidate,
-            request.baseline.as_ref(),
-            request.observed_generation,
-        )?;
+        let proposal_evaluation = if let Some((id, expected)) = proposal {
+            let owner = self.lock_proposals()?;
+            let binding = self.reserve_proposal_attempt_locked(&owner, request, id, expected, &evaluation_id)?;
+            drop(owner);
+            Some(binding)
+        } else {
+            self.reserve_attempt(
+                &suite,
+                request.split,
+                &evaluation_id,
+                &request.candidate,
+                request.baseline.as_ref(),
+                request.observed_generation,
+            )?;
+            None
+        };
+        #[cfg(test)]
+        super::publish::crash_hooks::check("evaluation_before_first_executor")?;
         let denied_paths = [self.root().to_path_buf()];
         let context = CaseContext {
             owner: self.owner_scope(),
@@ -198,6 +263,13 @@ impl SkillLifecycleStore {
         let mut order: u32 = 0;
         let mut cancelled = false;
         let mut budget_exhausted = false;
+        let binding_is_current = || {
+            proposal_evaluation.as_ref().is_none_or(|expected| {
+                self.proposal_evaluation_binding(request, &expected.proposal_id)
+                    .is_ok_and(|actual| &actual == expected)
+            })
+        };
+        let mut proposal_changed = false;
 
         'cases: for (case_index, case) in cases.iter().enumerate() {
             let collect = artifact_paths(case);
@@ -209,6 +281,10 @@ impl SkillLifecycleStore {
                     [Arm::Candidate, Arm::Baseline]
                 };
                 for arm in arms {
+                    if !binding_is_current() {
+                        proposal_changed = true;
+                        break 'cases;
+                    }
                     if cancel.is_cancelled() {
                         cancelled = true;
                         break 'cases;
@@ -293,9 +369,10 @@ impl SkillLifecycleStore {
 
         // Stale again at the end: the skill may have been published meanwhile.
         let end_generation = self.skill_generation(&suite)?;
-        let stale = end_generation != request.observed_generation;
+        let stale = end_generation != request.observed_generation || proposal_changed || !binding_is_current();
         let mut receipt = EvaluationReceipt {
             experiment: crate::runtime::experiment_stage::current().map(|stage| stage.binding()),
+            proposal_evaluation,
             schema_version: EVALUATION_SCHEMA_VERSION,
             record_id: evaluation_id.clone(),
             owner_scope: self.owner_scope().clone(),
