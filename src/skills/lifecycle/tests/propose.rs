@@ -65,9 +65,14 @@ struct Fixture {
 }
 
 fn fixture_with(skill_md: &str) -> Fixture {
+    fixture_with_entries(baseline_entries(skill_md))
+}
+
+/// Create and activate a legal immutable revision with all supplied assets.
+fn fixture_with_entries(entries: Vec<BundleEntry>) -> Fixture {
     let tmp = TempDir::new().expect("test: tempdir");
     let store = SkillLifecycleStore::open(tmp.path(), owner(OWNER)).expect("test: store");
-    let bundle = Bundle::from_entries(baseline_entries(skill_md)).expect("test: bundle");
+    let bundle = Bundle::from_entries(entries).expect("test: bundle");
     // The baseline declares one tool, so that following it is checkable.
     let mut new = NewRevision::new(skill(), SourceKind::Operator);
     new.capability_requirements = vec![DECLARED_TOOL.to_string()];

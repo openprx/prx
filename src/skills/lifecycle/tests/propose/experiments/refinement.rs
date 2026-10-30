@@ -104,16 +104,11 @@ async fn refinement_sequential_carries_exact_parent_and_retains_it_on_tie() -> R
                     .len(),
                 3
             );
-            for file in bundle.files() {
-                assert!(
-                    context["selected_parent"]["files"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|value| value["path"] == file.path()
-                            && value["content"] == String::from_utf8_lossy(file.bytes()).as_ref())
-                );
-            }
+            assert_eq!(
+                context["selected_parent"]["files"],
+                json!([{"path":"SKILL.md", "content":std::str::from_utf8(bundle.file("SKILL.md").unwrap().bytes())?}]),
+                "only the editable UTF-8 instructions enter parent context"
+            );
             assert!(!text.contains("validation-0") && !text.contains("holdout-0"));
             assert!(text.contains("patch against the original baseline"));
         }
@@ -265,6 +260,128 @@ async fn refinement_round_two_replays_ordered_parent_patch_and_description_exact
             sends,
             "whole-plan replay sends nothing"
         );
+        Ok(())
+    }
+    .await;
+    server.finish().await?;
+    result
+}
+
+#[tokio::test]
+async fn refinement_parent_context_omits_assets_while_replay_preserves_the_complete_bundle() -> Result<()> {
+    const SCRIPT: &[u8] = b"#!/bin/sh\n# C04-SCRIPT-CONTENT-MARKER\nexit 0\n";
+    const REFERENCE: &[u8] = b"# C04-REFERENCE-CONTENT-MARKER\n";
+    const BINARY: &[u8] = b"\xff\x00C04-BINARY-CONTENT-MARKER\xfe";
+    let f = fixture_with_entries(vec![
+        entry("SKILL.md", skill_md_with(20).as_bytes()),
+        exec_entry("scripts/run.sh", SCRIPT),
+        entry("references/guide.md", REFERENCE),
+        entry("assets/opaque.bin", BINARY),
+    ]);
+    let pattern = usable_pattern(&f);
+    let server = Server::start(false).await?;
+    server.h2_mode.store(6, Ordering::SeqCst);
+    let result = async {
+        let config = config(&f, &server);
+        let suite = suite(&f);
+        let service = service(&f, &suite);
+        let plan = cycle_with_schedule(
+            &f,
+            &service,
+            &config,
+            pattern.pattern_id,
+            InstructionSchedule::Sequential2,
+        )?;
+        service.admit_experiment(plan.spec.clone(), &config)?;
+        let cancel = CancellationToken::new();
+        let journal = CleanupScope::new(None, cancel.clone())?
+            .run(service.run_instruction_plan(&config, &plan, &cancel))
+            .await?;
+        assert!(service.experiment_qualified(&journal)?);
+        assert_eq!(choice(&journal, "select"), choice(&journal, "select-round1"));
+        let parent = f.store.read_proposal(&choice(&journal, "general").unwrap())?.unwrap();
+        let parent_bundle = f.store.read_candidate_bundle(&parent.proposal_id)?;
+        assert_eq!(parent_bundle.files().len(), 4);
+        for (path, bytes) in [
+            ("scripts/run.sh", SCRIPT),
+            ("references/guide.md", REFERENCE),
+            ("assets/opaque.bin", BINARY),
+        ] {
+            assert_eq!(parent_bundle.file(path).unwrap().bytes(), bytes);
+        }
+        assert!(parent_bundle.file("scripts/run.sh").unwrap().is_executable());
+        let requests = editors(&server);
+        assert_eq!(requests.len(), 6);
+        for editor in &requests {
+            let wire = serde_json::to_string(editor)?;
+            for marker in [
+                "C04-SCRIPT-CONTENT-MARKER",
+                "C04-REFERENCE-CONTENT-MARKER",
+                "C04-BINARY-CONTENT-MARKER",
+            ] {
+                assert!(
+                    !wire.contains(marker),
+                    "non-instruction asset must not enter editor wire: {marker}"
+                );
+            }
+        }
+        for (editor, stage) in requests
+            .iter()
+            .skip(3)
+            .zip(["round2-general", "round2-domain", "round2-compose"])
+        {
+            let content = editor["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let context: serde_json::Value =
+                serde_json::from_str(content.split_once("H2 observed development data:\n").unwrap().1)?;
+            assert_eq!(
+                context["selected_parent"]["files"],
+                json!([{
+                    "path":"SKILL.md", "content":std::str::from_utf8(parent_bundle.file("SKILL.md").unwrap().bytes())?
+                }])
+            );
+            assert_eq!(context["selected_parent"]["baseline_patch"], ordered_parent_patch());
+            assert_eq!(
+                context["selected_parent"]["revision"],
+                serde_json::to_value(&parent.candidate_revision)?
+            );
+            assert_eq!(context["selected_parent"]["diff"], serde_json::to_value(&parent.diff)?);
+            assert_eq!(
+                context["selected_parent"]["development_evidence"]["probe_stage"],
+                "general-probe"
+            );
+            assert!(!content.contains("validation-0") && !content.contains("holdout-0"));
+            let replay = f.store.read_proposal(&choice(&journal, stage).unwrap())?.unwrap();
+            assert_eq!(replay.candidate_revision, parent.candidate_revision);
+            let bundle = f.store.read_candidate_bundle(&replay.proposal_id)?;
+            assert_eq!(bundle.files().len(), parent_bundle.files().len());
+            for file in parent_bundle.files() {
+                let replay_file = bundle.file(file.path()).unwrap();
+                assert_eq!(
+                    replay_file.bytes(),
+                    file.bytes(),
+                    "complete asset bytes: {}",
+                    file.path()
+                );
+                assert_eq!(replay_file.is_executable(), file.is_executable());
+            }
+        }
+        assert_eq!(f.store.list_evaluation_ids()?.len(), 1);
+        assert_eq!(
+            f.store.active_binding(&f.pin.skill_id)?.unwrap().generation,
+            f.pin.generation
+        );
+        let sends = server.count.load(Ordering::SeqCst);
+        let repeated = CleanupScope::new(None, cancel.clone())?
+            .run(service.run_instruction_plan(&config, &plan, &cancel))
+            .await?;
+        assert_eq!(repeated.head_sha256, journal.head_sha256);
+        assert_eq!(server.count.load(Ordering::SeqCst), sends);
         Ok(())
     }
     .await;

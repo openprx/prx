@@ -124,18 +124,27 @@ impl SkillsLifecycleService {
                 .context("neutral parent cannot start refinement")?;
             let proposal = self.experiment_proposal(journal, &parent)?;
             let bundle = self.store.read_candidate_bundle(&proposal.proposal_id)?;
+            let instructions = bundle.file("SKILL.md").context("selected parent has no SKILL.md")?;
+            let instructions =
+                std::str::from_utf8(instructions.bytes()).context("selected parent SKILL.md is not UTF-8")?;
             let baseline_patch = parent_baseline_patch(
                 proposal
                     .diff
                     .as_ref()
                     .context("selected parent has no verified source diff")?,
             );
-            context.as_object_mut().context("development context is not an object")?.insert("selected_parent".into(), serde_json::json!({
-                "selection_stage":selection, "proposal_stage":parent, "revision":proposal.candidate_revision,
-                "baseline_patch":baseline_patch,
-                "development_evidence":self.selected_development_context(journal, selection)?,
-                "diff":proposal.diff, "files":bundle.files().iter().map(|file| serde_json::json!({"path":file.path(), "content":String::from_utf8_lossy(file.bytes())})).collect::<Vec<_>>()
-            }));
+            context
+                .as_object_mut()
+                .context("development context is not an object")?
+                .insert(
+                    "selected_parent".into(),
+                    serde_json::json!({
+                        "selection_stage":selection, "proposal_stage":parent, "revision":proposal.candidate_revision,
+                        "baseline_patch":baseline_patch,
+                        "development_evidence":self.selected_development_context(journal, selection)?,
+                        "diff":proposal.diff, "files":[{"path":"SKILL.md", "content":instructions}]
+                    }),
+                );
         }
         Ok(context)
     }
