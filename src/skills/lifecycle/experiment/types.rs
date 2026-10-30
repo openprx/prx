@@ -74,6 +74,7 @@ pub enum ExperimentStageKind {
     ModelProposal,
     SolverTrial,
     IndependentVerification,
+    Selection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

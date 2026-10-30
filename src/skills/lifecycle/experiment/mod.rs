@@ -1,13 +1,21 @@
 //! Owner-scoped bounded experiment records and state contracts.
 //! Execution, accounting, verification and publication retain their existing owners.
+mod cycle;
 mod journal;
 mod operation;
+mod probe;
 mod state;
 #[cfg(test)]
 mod state_tests;
 #[cfg(test)]
 mod tests;
+pub use cycle::{InstructionCycleDraft, InstructionExperimentPlan};
 pub use operation::*;
+pub use probe::DevelopmentProbeReceipt;
+pub(in crate::skills::lifecycle) use probe::probe_run_count;
+pub(crate) fn probe_within_budget(receipt: &DevelopmentProbeReceipt, suite: &super::FrozenSuite) -> bool {
+    receipt.within_budget(suite)
+}
 mod types;
 pub use journal::*;
 pub use state::*;

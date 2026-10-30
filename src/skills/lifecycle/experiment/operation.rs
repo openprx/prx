@@ -1,8 +1,15 @@
-//! Frozen inputs for individual M1 bridges; scheduling belongs to M2.
+//! Frozen bounded-stage inputs. Scheduling belongs to the separate cycle compiler.
 use super::{ExperimentError, ExperimentStageKind};
 use crate::skills::lifecycle::{EvalSplit, PatternId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevelopmentRole {
+    General,
+    Domain,
+    Compose,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExperimentOperation {
@@ -19,6 +26,28 @@ pub enum ExperimentOperation {
     Verify {
         evaluation_stage: String,
     },
+    /// One development arm, without rerunning a paired baseline or consuming
+    /// validation/holdout attempts. None selects the immutable active baseline.
+    DevelopmentProbe {
+        proposal_stage: Option<String>,
+    },
+    /// A bounded role-specific revision grounded only in completed development
+    /// probes. Its source review and publication requirements stay unchanged.
+    DevelopmentProposal {
+        role: DevelopmentRole,
+        patterns: Vec<PatternId>,
+        probe_stages: Vec<String>,
+        max_input_bytes: usize,
+        max_output_bytes: usize,
+        timeout_ms: u64,
+    },
+    DevelopmentSelection {
+        probe_stages: Vec<String>,
+    },
+    SelectedEvaluation {
+        selection_stage: String,
+        split: EvalSplit,
+    },
 }
 impl ExperimentOperation {
     pub fn digest(&self) -> Result<String, ExperimentError> {
@@ -30,9 +59,12 @@ impl ExperimentOperation {
     }
     pub const fn kind(&self) -> ExperimentStageKind {
         match self {
-            Self::Proposal { .. } => ExperimentStageKind::ModelProposal,
-            Self::Evaluation { .. } => ExperimentStageKind::SolverTrial,
+            Self::Proposal { .. } | Self::DevelopmentProposal { .. } => ExperimentStageKind::ModelProposal,
+            Self::Evaluation { .. } | Self::DevelopmentProbe { .. } | Self::SelectedEvaluation { .. } => {
+                ExperimentStageKind::SolverTrial
+            }
             Self::Verify { .. } => ExperimentStageKind::IndependentVerification,
+            Self::DevelopmentSelection { .. } => ExperimentStageKind::Selection,
         }
     }
 }

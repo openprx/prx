@@ -13,6 +13,8 @@ use chrono::Utc;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+mod development_probes;
+mod instruction_cycle;
 mod live_fixture;
 
 struct Server {
@@ -20,6 +22,7 @@ struct Server {
     count: Arc<AtomicUsize>,
     bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     oversized: Arc<AtomicBool>,
+    h2_mode: Arc<AtomicUsize>,
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<Result<()>>,
 }
@@ -38,6 +41,8 @@ impl Server {
         let captured = bodies.clone();
         let oversized = Arc::new(AtomicBool::new(false));
         let large = oversized.clone();
+        let h2_mode = Arc::new(AtomicUsize::new(0));
+        let h2_behavior = h2_mode.clone();
         let task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
@@ -45,7 +50,7 @@ impl Server {
                     biased;
                     () = stop.cancelled() => { connections.abort_all(); while connections.join_next().await.is_some() {} return Ok(()); },
                     accepted = listener.accept() => {
-                        let (mut socket, _) = accepted?; let count = counter.clone(); let captured = captured.clone(); let large = large.clone();
+                        let (mut socket, _) = accepted?; let count = counter.clone(); let captured = captured.clone(); let large = large.clone(); let h2_behavior = h2_behavior.clone();
                         connections.spawn(async move {
                             let mut bytes = Vec::new(); let mut chunk = [0_u8; 4096];
                             let body = loop {
@@ -80,11 +85,18 @@ impl Server {
                             } else { None };
                             let text = assessment_response.map_or_else(|| {
                             if messages.iter().any(|message| message["content"].as_str().is_some_and(|value| value.contains("You revise one instruction skill"))) {
-                                good_patch()
+                                let system = messages.iter().filter(|message| message["role"] == "system").map(|message| message["content"].to_string()).collect::<Vec<_>>().join(" ");
+                                let qualifier = if system.contains("H2 role: general.") { "general" }
+                                    else if system.contains("H2 role: domain.") { "domain" }
+                                    else if system.contains("H2 role: compose.") { "composition" } else { "" };
+                                if qualifier.is_empty() { good_patch() }
+                                else { good_patch().replace("migration step before continuing", &format!("migration step and the {qualifier} check before continuing")) }
                             } else {
                                 let hydrated: Vec<_> = messages.iter().filter(|message| message["role"] == "tool" || message["content"].as_str().is_some_and(|text| text.contains("<tool_result name=\"skill_read\">"))).map(|message| message["content"].to_string()).collect();
                                 if hydrated.iter().any(|text| text.contains("Step 3:")) {
-                                    if hydrated.iter().any(|text| text.contains("migration step")) { "MIGRATION-PASS".into() } else { "BASELINE-FAIL".into() }
+                                    let mode = h2_behavior.load(Ordering::SeqCst);
+                                    let harmful = mode == 2 && hydrated.iter().any(|text| text.contains("composition check"));
+                                    if !harmful && (mode == 1 || hydrated.iter().any(|text| text.contains("migration step"))) { "MIGRATION-PASS".into() } else { "BASELINE-FAIL".into() }
                                 } else {
                                     "<tool_call>\n{\"name\":\"skill_read\",\"arguments\":{\"name\":\"Deploy helper\"}}\n</tool_call>".into()
                                 }
@@ -135,6 +147,7 @@ impl Server {
             count,
             bodies,
             oversized,
+            h2_mode,
             cancel,
             task,
         })
@@ -291,15 +304,19 @@ fn plan(
                 _ => vec![],
             },
             allocation: match input {
-                ExperimentOperation::Proposal { .. } => ExperimentResources {
-                    calls: 4,
-                    tokens: 131_072,
-                    micro_usd: 100_000,
-                    tool_calls: 0,
-                    output_bytes: 131_072,
-                    scratch_bytes: 8 * 1024 * 1024,
-                },
-                ExperimentOperation::Evaluation { .. } => ExperimentResources {
+                ExperimentOperation::Proposal { .. } | ExperimentOperation::DevelopmentProposal { .. } => {
+                    ExperimentResources {
+                        calls: 4,
+                        tokens: 131_072,
+                        micro_usd: 100_000,
+                        tool_calls: 0,
+                        output_bytes: 131_072,
+                        scratch_bytes: 8 * 1024 * 1024,
+                    }
+                }
+                ExperimentOperation::Evaluation { .. }
+                | ExperimentOperation::DevelopmentProbe { .. }
+                | ExperimentOperation::SelectedEvaluation { .. } => ExperimentResources {
                     calls: 64,
                     tokens: 500_000,
                     micro_usd: 500_000,
@@ -307,7 +324,9 @@ fn plan(
                     output_bytes: 500_000,
                     scratch_bytes: 32 * 1024 * 1024,
                 },
-                ExperimentOperation::Verify { .. } => ExperimentResources::default(),
+                ExperimentOperation::Verify { .. } | ExperimentOperation::DevelopmentSelection { .. } => {
+                    ExperimentResources::default()
+                }
             },
         })
         .collect();

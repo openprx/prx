@@ -1,9 +1,13 @@
-//! M1 service bridge: immutable admission, one bounded stage, inspection and recovery.
-//! This supplies no search scheduler or publication authority.
+//! Immutable experiment admission, bounded stage execution and k1 scheduling.
+//! Existing accounting/cleanup owners remain authoritative; no publication grant.
+mod development_proposals;
 mod guarded_proposer;
 mod operations;
 mod pins;
+mod probes;
 mod reconciliation;
+mod runner;
+mod selection;
 use super::SkillsLifecycleService;
 use crate::config::Config;
 use crate::runtime::{

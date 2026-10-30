@@ -1,4 +1,5 @@
-//! Operator entrypoint for M1 bridges. No implicit stage scheduling or publication.
+//! Explicit experiment planning/execution through the shared lifecycle service.
+//! This adapter owns no stage state, accounting policy or publication authority.
 use super::{Arc, Config, Context, Result, SkillsLifecycleService};
 use crate::SkillExperimentCommands;
 use crate::skills::lifecycle::experiment::{ExperimentDraft, ExperimentId, ExperimentJournal, ExperimentOperation};
@@ -22,6 +23,7 @@ fn render(service: &SkillsLifecycleService, config: &Config, journal: Experiment
         "committed":journal.state.committed(&journal.plan)?, "cancelled":journal.state.cancelled,
         "head_sha256":journal.head_sha256, "qualified":service.experiment_qualified(&journal)?, "published":false,
         "physical_observations":service.experiment_physical_observations(&journal, config)?,
+        "development_probes":service.experiment_development_probes(&journal)?,
     }))?)
 }
 pub(super) async fn dispatch(
@@ -30,6 +32,24 @@ pub(super) async fn dispatch(
     config: &Config,
 ) -> Result<String> {
     match command {
+        SkillExperimentCommands::PlanCycle { source } => {
+            let draft = read_input(&source).await?;
+            let config = config.clone();
+            let plan = blocking(&service, move |service| service.plan_instruction_cycle(draft, &config)).await?;
+            Ok(serde_json::to_string_pretty(&plan)?)
+        }
+        SkillExperimentCommands::RunPlan { source } => {
+            let plan = read_input(&source).await?;
+            let cancel = CancellationToken::new();
+            let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, cancel.clone())?;
+            render(
+                &service,
+                config,
+                cleanup
+                    .run(service.run_instruction_plan(config, &plan, &cancel))
+                    .await?,
+            )
+        }
         SkillExperimentCommands::Plan { source } => {
             let spec: ExperimentDraft = read_input(&source).await?;
             let config = config.clone();

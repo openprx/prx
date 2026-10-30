@@ -334,7 +334,7 @@ impl SkillLifecycleStore {
 }
 
 /// Invalidity only the evaluator can see across runs.
-fn evaluator_invalidity(
+pub(super) fn evaluator_invalidity(
     observation: &RunObservation,
     run_ids: &mut BTreeSet<String>,
     environment_hash: &mut Option<String>,
@@ -361,7 +361,7 @@ fn evaluator_invalidity(
 /// Runs the executor; an executor that outlives its deadline plus grace is cut
 /// off and the run is recorded as invalid (executor error) rather than waited
 /// for forever.
-async fn run_with_backstop(
+pub(super) async fn run_with_backstop(
     executor: &dyn CaseExecutor,
     request: &ExecutionRequest<'_>,
     cancel: &CancellationToken,

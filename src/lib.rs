@@ -252,6 +252,10 @@ pub enum SkillCommands {
 /// Individual bounded experiment operations, under the existing lifecycle policy.
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillExperimentCommands {
+    /// Compile one bounded general/domain/compose cycle, without model work.
+    PlanCycle { source: String },
+    /// Run or continue a complete admitted plan without replaying uncertain work.
+    RunPlan { source: String },
     /// Resolve authoritative pins in a spec file without starting model or tool work.
     Plan { source: String },
     /// Freeze a fully pinned specification in the owner store.
