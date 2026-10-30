@@ -103,6 +103,28 @@ impl Server {
                             let text = assessment_response.map_or_else(|| {
                             if messages.iter().any(|message| message["content"].as_str().is_some_and(|value| value.contains("You revise one instruction skill"))) {
                                 let system = messages.iter().filter(|message| message["role"] == "system").map(|message| message["content"].to_string()).collect::<Vec<_>>().join(" ");
+                                let mode = h2_behavior.load(Ordering::SeqCst);
+                                if (6..=8).contains(&mode) {
+                                    let development = messages.iter().filter(|message| message["role"] == "user")
+                                        .filter_map(|message| message["content"].as_str())
+                                        .find_map(|text| text.split_once("H2 observed development data:\n").map(|(_, data)| data))
+                                        .expect("ordered-parent fixture needs actual development JSON");
+                                    let context: serde_json::Value = serde_json::from_str(development).expect("valid development JSON");
+                                    if let Some(parent) = context.get("selected_parent") {
+                                        let patch = parent["baseline_patch"].as_object().expect("parent must provide its replayable baseline patch");
+                                        if mode == 7 {
+                                            let previous = parent["baseline_patch"]["edits"].as_array().unwrap().last().unwrap()["new"].as_str().unwrap();
+                                            return json!({"summary":"Incorrectly assume the parent is installed", "edits":[{"file":"SKILL.md", "op":"replace", "old":previous, "new":"the migration step and another check before"}]}).to_string();
+                                        }
+                                        let mut replay = serde_json::Value::Object(patch.clone());
+                                        if mode == 8 {
+                                            let remaining = parent["diff"]["allowed_tokens"].as_u64().unwrap() - parent["diff"]["changed_tokens"].as_u64().unwrap();
+                                            replay["edits"].as_array_mut().unwrap().push(json!({"file":"SKILL.md", "op":"append", "new":"x ".repeat(usize::try_from(remaining + 1).unwrap())}));
+                                        }
+                                        return replay.to_string();
+                                    }
+                                    if system.contains("H2 role: general.") { return ordered_parent_patch().to_string(); }
+                                }
                                 let qualifier = if system.contains("H2 role: general.") { "general" }
                                     else if system.contains("H2 role: domain.") { "domain" }
                                     else if system.contains("H2 role: compose.") { "composition" } else { "" };
@@ -174,6 +196,19 @@ impl Server {
         tokio::time::timeout(Duration::from_secs(5), self.task).await??
     }
 }
+/// The second replacement deliberately targets text made by the first. The
+/// final native candidate also changes the allowed description scalar.
+fn ordered_parent_patch() -> serde_json::Value {
+    json!({
+        "summary":"Retain ordered migration guidance",
+        "description":"Helps with migration-aware deploys",
+        "edits":[
+            {"file":"SKILL.md", "op":"replace", "old":"the check number 2 before", "new":"the migration step before"},
+            {"file":"SKILL.md", "op":"replace", "old":"the migration step before", "new":"the migration step and general check before"},
+        ]
+    })
+}
+
 fn config(f: &Fixture, server: &Server) -> Config {
     let mut config = Config {
         workspace_dir: f.tmp.path().into(),
