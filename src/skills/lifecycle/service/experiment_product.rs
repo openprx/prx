@@ -144,7 +144,7 @@ impl SkillsLifecycleService {
             &RecordAdoptionRequest {
                 proposal_id: expected.proposal_id.clone(),
                 publication_tx: request.publication_tx.clone(),
-                experiment_id: expected.handle.experiment_id.to_string(),
+                experiment_id: expected.handle.experiment_id.as_str().to_string(),
                 experiment_sha256: expected.handle.plan_sha256.clone(),
                 gate_stage: expected.gate_stage.clone(),
                 gate_witness_sha256: expected.gate_witness_sha256.clone(),

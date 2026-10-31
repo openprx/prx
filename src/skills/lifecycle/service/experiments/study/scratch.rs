@@ -76,3 +76,6 @@ impl Drop for OwnedStudyScratch {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

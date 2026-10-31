@@ -12,7 +12,7 @@ use crate::skills::lifecycle::experiment::{
     ExperimentId, ExperimentOperation, ExperimentSpec, ExperimentStage, ExperimentStageKind, InstructionExperimentPlan,
 };
 use crate::skills::lifecycle::study::{
-    STUDY_SCHEMA_VERSION, StudyArm, StudyDraft, StudyExcludedRoot, StudyManifest, StudyPhase, StudyPlan, StudyReport,
+    STUDY_SCHEMA_VERSION, StudyDraft, StudyExcludedRoot, StudyManifest, StudyPhase, StudyPlan, StudyReport,
     StudyStatus, StudyTrialInput,
 };
 use crate::skills::lifecycle::{EvalSplit, TransactionId};

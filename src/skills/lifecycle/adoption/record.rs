@@ -318,7 +318,8 @@ impl SkillLifecycleStore {
             transaction,
             family
         ]);
-        Ok(format!("adopt-{}", digest(&serde_json::to_vec(&identity)?)))
+        let bytes = serde_json::to_vec(&identity).map_err(|_| refusal("adoption identity encoding failed"))?;
+        Ok(format!("adopt-{}", digest(&bytes)))
     }
     pub(super) fn read_adoption_index_locked(
         &self,

@@ -407,6 +407,7 @@ fn plan(
                     scratch_bytes: 8 * 1024 * 1024,
                 },
                 ExperimentOperation::Evaluation { .. }
+                | ExperimentOperation::StudyTrial { .. }
                 | ExperimentOperation::DevelopmentProbe { .. }
                 | ExperimentOperation::SelectedEvaluation { .. } => ExperimentResources {
                     calls: 64,

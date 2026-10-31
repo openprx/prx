@@ -231,7 +231,11 @@ impl SkillsLifecycleService {
             } else {
                 ExperimentRootDrainStatus::Unconfirmed
             },
-            observation_provenance: "durable_owner_events_and_read_only_physical_observations; no_live_draining_claim",
+            observation_provenance: if root_drained {
+                "durable_owner_events_and_read_only_physical_observations; current_owned_scope_drain_confirmed"
+            } else {
+                "durable_owner_events_and_read_only_physical_observations; root_worker_drain_unconfirmed"
+            },
             physical_observations,
             evidence_issues: issues,
         })
