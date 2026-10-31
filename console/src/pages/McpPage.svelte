@@ -1,12 +1,13 @@
 <script>
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
+  import { loadFailureVariant } from '../lib/load-state';
   import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
 
   let servers = $state([]);
   let loading = $state(true);
-  let errorMessage = $state('');
+  let loadError = $state(null);
   let expandedServer = $state(null);
 
   async function loadServers() {
@@ -15,10 +16,10 @@
     try {
       const response = await api.getMcpServers();
       servers = Array.isArray(response?.servers) ? response.servers : [];
-      errorMessage = '';
+      loadError = null;
     } catch (error) {
       servers = [];
-      errorMessage = error instanceof Error ? error.message : t('mcp.loadFailed');
+      loadError = error;
     } finally {
       loading = false;
     }
@@ -49,10 +50,12 @@
     </button>
   </div>
 
+  <StateBlock variant="unavailable" message={t('mcp.lifecycleUnavailable')} />
+
   {#if loading}
     <StateBlock variant="loading" message={t('mcp.loading')} />
-  {:else if errorMessage}
-    <StateBlock variant="error" message={errorMessage} />
+  {:else if loadError}
+    <StateBlock variant={loadFailureVariant(loadError)} message={loadError?.message || t('mcp.loadFailed')} />
   {:else if servers.length === 0}
     <StateBlock variant="empty" message={t('mcp.noServers')} />
   {:else}

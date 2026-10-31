@@ -39,4 +39,15 @@ test('group table covers every current nav path once and chat counts as sessions
   }
 
   expect(activeNavTarget('/chat/example')).toEqual({ groupId: 'work', path: '/sessions' });
+  expect(NAV_GROUPS.find((group) => group.id === 'capabilities').items.map((item) => item.path)).toEqual([
+    '/providers',
+    '/models',
+    '/routing',
+    '/channels',
+    '/skills',
+    '/plugins',
+    '/mcp',
+    '/config',
+    '/changes'
+  ]);
 });

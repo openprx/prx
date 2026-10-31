@@ -25,7 +25,9 @@ export const NAV_GROUPS = [
       { labelKey: 'nav.channels', path: '/channels' },
       { labelKey: 'nav.skills', path: '/skills' },
       { labelKey: 'nav.plugins', path: '/plugins' },
-      { labelKey: 'nav.mcp', path: '/mcp' }
+      { labelKey: 'nav.mcp', path: '/mcp' },
+      { labelKey: 'nav.config', path: '/config' },
+      { labelKey: 'nav.changes', path: '/changes' }
     ]
   },
   {
@@ -41,8 +43,6 @@ export const NAV_GROUPS = [
     labelKey: 'nav.groups.operations',
     items: [
       { labelKey: 'nav.overview', path: '/overview' },
-      { labelKey: 'nav.config', path: '/config' },
-      { labelKey: 'nav.changes', path: '/changes' },
       { labelKey: 'nav.logs', path: '/logs' }
     ]
   }

@@ -299,6 +299,20 @@ Two ways to collect the result:
 | `POST /api/runtime/tasks/{id}/message` | Hand a running sub-agent an operator instruction |
 | `POST /api/channels/{name}/send` | Send one message on a configured channel, on behalf of an entry point that owns none |
 
+`POST /api/channels/{name}/send` accepts `{recipient, message, as_voice?}`. The
+response is `{channel, delivered, detail}`. The Console shows those fields and
+does not treat a missing field as delivered. A client timeout or a dropped
+connection is uncertain delivery: the Console does not send the message again.
+`403` means `send_allow` refused the operator plane. Channel `status` on
+`GET /api/channels/status` is the literal `configured`; it is not a health check.
+
+`POST /api/config/reload` returns `{success, message}`. `message` is the reload
+tool's output string. HTTP 200 does not mean every participant reloaded. The
+Console then reads `GET /api/status` and shows `config_reload_status`,
+`config_reload_in_progress`, `restart_required`, the active and desired source
+revisions, the active generation, participants, and `last_config_reload_failure`
+when those fields are present.
+
 Job status is one of `running`, `succeeded`, `failed`, `cancelled`. Finished
 jobs are retained for one hour; running jobs are never evicted. The `work_id` in
 a job's payload is its runtime-registry id, so `prx tasks list` and
@@ -476,3 +490,32 @@ An operator can call the authenticated plugin reload route through
 `prx plugin reload NAME --gateway-url URL --token-from-stdin --yes`. The command
 uses an existing paired token supplied on stdin and reports the returned plugin
 generation. It does not start or restart the gateway.
+
+`prx plugin enable NAME` previews a disabled-enable. `--yes` moves that one
+disabled plugin back into the active directory and refreshes the process that
+ran the command. It calls the existing disabled-enable owner only. It does not
+write trust, and it does not change `[plugins] enabled`. Read-only autonomy
+refuses the write. A name that is not in the disabled set is not first-discoverable
+by reload.
+
+The Console plugin routes use that same owner:
+
+| Route | Body | Risk |
+| --- | --- | --- |
+| `POST /api/plugins/{name}/enable` | `{}` | Low |
+| `POST /api/plugins/{name}/disable` | `{}` | Low |
+| `POST /api/plugins/refresh` | `{}` | Low. Rebuilds every eligible plugin. Not first discovery of one name. |
+| `POST /api/plugins/install` | `{source, sha256, manifest_sha256, permissions}` | High. Requires `?confirm_high_risk=true`. |
+| `POST /api/plugins/update` | same as install | High. Requires `?confirm_high_risk=true`. |
+| `DELETE /api/plugins/{name}` and `POST /api/plugins/{name}/remove` | POST body `{}` | High. Requires `?confirm_high_risk=true`. Revokes trust and returns `recoverable_backup`. |
+
+Install and update use one operator action (TRANSPORT-GAPS option A). The
+handler checks `sha256` and `manifest_sha256` against the workspace source
+directory, then calls `PluginManageTool` install or update. That tool records
+trust after a successful compile. A prior `prx plugin trust` record is not
+required, and the handler does not record trust itself. Unknown JSON fields are
+rejected. A missing runtime answers `503`. Read-only autonomy answers `403`
+before that check. A partial enable that rolls back is an error, not success.
+`GET /api/plugins` lists the loaded generation only. It does not report separate
+trusted, enabled, healthy, or listening facts, and it does not include artifact
+hashes.

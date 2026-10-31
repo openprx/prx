@@ -390,6 +390,48 @@ export const api = {
   reloadPlugin: (name) =>
     request(`/api/plugins/${encodeURIComponent(name)}/reload`, {
       method: 'POST'
+    }),
+  // Capability writes. Appended after reloadPlugin so a concurrent sessions
+  // client can land above this block without a conflict.
+  sendChannel: (name, { recipient, message, asVoice = false } = {}, { signal } = {}) =>
+    request(`/api/channels/${encodeURIComponent(name)}/send`, {
+      method: 'POST',
+      body: JSON.stringify({ recipient, message, as_voice: Boolean(asVoice) }),
+      signal: signal ?? AbortSignal.timeout(20_000)
+    }),
+  reloadConfig: () =>
+    request('/api/config/reload', {
+      method: 'POST',
+      body: JSON.stringify({})
+    }),
+  enablePlugin: (name) =>
+    request(`/api/plugins/${encodeURIComponent(name)}/enable`, {
+      method: 'POST',
+      body: '{}'
+    }),
+  disablePlugin: (name) =>
+    request(`/api/plugins/${encodeURIComponent(name)}/disable`, {
+      method: 'POST',
+      body: '{}'
+    }),
+  refreshPlugins: () =>
+    request('/api/plugins/refresh', {
+      method: 'POST',
+      body: '{}'
+    }),
+  installPlugin: (body) =>
+    request(`/api/plugins/install${confirmSuffix(true)}`, {
+      method: 'POST',
+      body: JSON.stringify(body)
+    }),
+  updatePlugin: (body) =>
+    request(`/api/plugins/update${confirmSuffix(true)}`, {
+      method: 'POST',
+      body: JSON.stringify(body)
+    }),
+  removePlugin: (name) =>
+    request(`/api/plugins/${encodeURIComponent(name)}${confirmSuffix(true)}`, {
+      method: 'DELETE'
     })
 };
 
