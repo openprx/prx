@@ -187,7 +187,7 @@ impl StudyReport {
         }
         digest(b"prx-v01-validated-report-v1\0", &value)
     }
-    pub fn arm(&self, arm: StudyArm) -> &StudyArmSummary {
+    pub const fn arm(&self, arm: StudyArm) -> &StudyArmSummary {
         match arm {
             StudyArm::Baseline => &self.baseline,
             StudyArm::H2 => &self.h2,

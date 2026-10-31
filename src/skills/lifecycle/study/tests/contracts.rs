@@ -34,7 +34,7 @@ fn mixed_study_and_verification_or_a_downgraded_operation_map_are_invalid_before
             "a distinct study kind must expose mixed plans to the original spec owner"
         );
     }
-    let mut downgraded = plan.experiment.clone();
+    let mut downgraded = plan.experiment;
     for stage in &mut downgraded.spec.stages {
         stage.kind = ExperimentStageKind::SolverTrial;
     }
@@ -111,7 +111,7 @@ fn prose_absence_and_unlisted_tool_substitutions_are_not_an_artifact_study_profi
             .validators = vec![oracle];
         assert!(altered.validate().is_err());
     }
-    let mut altered = plan.manifest.clone();
+    let mut altered = plan.manifest;
     altered.case_tools.insert("case-0".into(), vec!["file_edit".into()]);
     assert!(
         altered.validate().is_err(),
@@ -154,7 +154,7 @@ fn training_source_relabel_and_changed_pair_order_are_rejected() -> Result<()> {
         .context("case")?;
     overlapping.training_source_roots = crate::skills::lifecycle::suite::case_lesson_root_digests(case);
     assert!(overlapping.validate().is_err());
-    let mut reordered = plan.manifest.clone();
+    let mut reordered = plan.manifest;
     let pair = reordered.pairs.first_mut().context("pair")?;
     pair.first_arm = pair.first_arm.other();
     assert!(

@@ -40,9 +40,10 @@ impl SkillsLifecycleService {
             .as_ref()
             .context("study publication has no original authorization")?;
         let pin = history.pin();
+        let reviewed_gate_digest = &pin.gate_sha256;
         ensure!(
             authorization.gate_id == pin.gate_id
-                && authorization.gate_digest == pin.gate_sha256
+                && &authorization.gate_digest == reviewed_gate_digest
                 && proposal.candidate_revision.as_ref() == Some(&subject.candidate_revision)
                 && publication.revision_id == subject.candidate_revision
                 && proposal.evaluation_epoch == subject.evaluation_epoch

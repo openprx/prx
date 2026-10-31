@@ -29,8 +29,9 @@ impl StudyTrialReceipt {
             .context("study grade pair absent")?;
         let case = manifest.case(pair)?;
         let revision = manifest.revision(self.input.arm);
+        let expected_revision_id = &revision.revision;
         ensure!(
-            bundle.revision_id() == &revision.revision
+            bundle.revision_id() == expected_revision_id
                 && self.root_task_id == pair.root_task_id
                 && self.case_id == pair.case_id
                 && self.repetition == pair.repetition,
@@ -95,8 +96,8 @@ impl StudyTrialReceipt {
         let installed = run.installed.as_ref();
         if !installed.is_some_and(|installed| {
             installed.skill_id == manifest.skill_id
-                && installed.revision_id == revision.revision
-                && installed.bundle_manifest_hash == revision.revision.digest_hex()
+                && &installed.revision_id == expected_revision_id
+                && installed.bundle_manifest_hash == expected_revision_id.digest_hex()
         }) {
             invalid.push("actual_installed_revision_mismatch".into());
         }
@@ -104,7 +105,7 @@ impl StudyTrialReceipt {
         for read in &run.hydrations {
             let file = bundle.files().iter().find(|file| file.path() == read.resource_path);
             if read.skill_id != manifest.skill_id
-                || read.revision_id != revision.revision
+                || &read.revision_id != expected_revision_id
                 || installed.is_none_or(|installed| read.generation != installed.generation)
                 || file.is_none_or(|file| hex::encode(Sha256::digest(file.bytes())) != read.resource_sha256)
             {

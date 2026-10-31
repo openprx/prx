@@ -72,7 +72,7 @@ fn altered_owner_metadata_and_unmetered_padding_do_not_survive_a_valid_mac_refer
             .read_study_plan(&plan.manifest.id, Some(&plan.manifest.sha256()?))
             .is_ok()
     );
-    let mut padded = original.clone();
+    let mut padded = original;
     padded.push(b' ');
     private_file(&path, &padded)?;
     assert!(
@@ -107,7 +107,7 @@ fn same_identity_inspects_but_relabelled_duplicate_sample_is_not_a_fresh_holdout
                 .join("plan.json")
         )?
     );
-    let mut relabelled = plan.clone();
+    let mut relabelled = plan;
     relabelled.manifest.id = ExperimentId::parse("renamed-study-fixture")?;
     relabelled.experiment.spec.id = relabelled.manifest.id.clone();
     for root in &mut relabelled.manifest.roots {
@@ -172,7 +172,7 @@ fn unknown_prior_history_is_not_skipped_to_admit_a_fresh_sample() -> Result<()> 
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o700))?;
     }
-    let mut fresh = plan.clone();
+    let mut fresh = plan;
     fresh.manifest.id = ExperimentId::parse("fresh-study")?;
     for root in &mut fresh.manifest.roots {
         root.root_task_id.push_str("-fresh");

@@ -333,7 +333,7 @@ impl StudyManifest {
     pub fn sha256(&self) -> Result<String> {
         digest(b"prx-v01-study-manifest-v1\0", self)
     }
-    pub fn revision(&self, arm: StudyArm) -> &StudyRevisionPin {
+    pub const fn revision(&self, arm: StudyArm) -> &StudyRevisionPin {
         match arm {
             StudyArm::Baseline => &self.origin.baseline,
             StudyArm::H2 => &self.origin.h2,
@@ -595,12 +595,13 @@ impl StudyPlan {
         self.experiment.validate()?;
         let manifest = &self.manifest;
         let spec = &self.experiment.spec;
+        let frozen_runtime_pins = &manifest.runtime;
         ensure!(
             spec.controlled_admission.is_none(),
             "V01 study transport is local operator CLI, not a deserialized entrypoint delegation"
         );
         ensure!(
-            spec.id == manifest.id && spec.owner_scope == manifest.owner_scope && spec.pins == manifest.runtime,
+            spec.id == manifest.id && spec.owner_scope == manifest.owner_scope && &spec.pins == frozen_runtime_pins,
             "study plan identity/runtime mismatch"
         );
         ensure!(
