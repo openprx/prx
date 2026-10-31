@@ -116,7 +116,7 @@ cargo build --release --locked --bin prx --features channel-matrix
 | [Tools](docs/tools.md) | Built-in tools, hooks system, webhooks |
 | [Remote Nodes](docs/remote-nodes.md) | `prx-node` agent, device pairing, JSON-RPC |
 | [Web Console](docs/web-console.md) | Browser-based management interface |
-| [Skill Lifecycle](docs/skill-lifecycle.md) | New instruction skills, reviewed executable bundles, evidence gates, publication and recovery (opt-in) |
+| [Skill Lifecycle](docs/skill-lifecycle.md) | New instruction skills, reviewed executable bundles, evidence gates, publication and recovery (opt-in); [controlled V01 studies](docs/v01-controlled-study.md) |
 | [Evolution](docs/evolution.md) | Self-improvement pipeline |
 | [Configuration](docs/configuration.md) | Config reference, workspace files, security |
 | [Router](docs/router.md) | LLM Router config, flow, safety boundaries |

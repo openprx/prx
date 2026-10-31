@@ -25,12 +25,12 @@ The immutable owner study directory is a retained sample claim. Admission inspec
 The current transport is local CLI/service. Study commands are not exposed as model-facing TUI/Gateway actions. The ordinary instruction-experiment product remains a separate entrypoint family.
 
 ```sh
-prx skills experiment study plan draft.json
-prx skills experiment study admit frozen-plan.json
-prx skills experiment study run STUDY_ID EXPERIMENT_SHA256 STUDY_SHA256
-prx skills experiment study inspect STUDY_ID EXPERIMENT_SHA256 STUDY_SHA256
-prx skills experiment study report STUDY_ID EXPERIMENT_SHA256 STUDY_SHA256
-prx skills experiment study export STUDY_ID EXPERIMENT_SHA256 STUDY_SHA256
+prx skills lifecycle experiment study plan draft.json
+prx skills lifecycle experiment study admit frozen-plan.json
+prx skills lifecycle experiment study run STUDY_ID EXPERIMENT_SHA256 STUDY_SHA256
+prx skills lifecycle experiment study inspect STUDY_ID EXPERIMENT_SHA256 STUDY_SHA256
+prx skills lifecycle experiment study report STUDY_ID EXPERIMENT_SHA256 STUDY_SHA256
+prx skills lifecycle experiment study export STUDY_ID EXPERIMENT_SHA256 STUDY_SHA256
 ```
 
 Use the existing explicit owner/workspace configuration and guarded runtime procedure. Keep draft, frozen plan, detailed report and export private. `StudyDraft` is defined in `src/skills/lifecycle/study/types.rs`; its resource and protocol parameters are explicit operator intent, not default approval or runtime authority. Plan returns the resolved frozen intent without a model/tool call. Admission independently re-resolves its source/runtime facts before sealing it.
