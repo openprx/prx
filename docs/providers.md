@@ -34,7 +34,7 @@ setting remains adapter-owned.
 | `gemini` | `gemini-3.5-flash`; `gemini-3.1-pro-preview`; `gemini-3.1-flash-lite` | Google Generative Language API; [Gemini models](https://ai.google.dev/gemini-api/docs/models) | `v1beta/models?key=...` |
 | `qwen` | `qwen3.7-max`; `qwen3.7-plus`; `qwen3.6-flash` | China `dashscope.aliyuncs.com`, international `dashscope-intl.aliyuncs.com`, US `dashscope-us.aliyuncs.com`; [Model Studio models](https://help.aliyun.com/en/model-studio/models) | regional `GET /compatible-mode/v1/models` |
 | `openrouter` | dynamic `vendor/model` IDs | `https://openrouter.ai/api/v1`; [model catalog](https://openrouter.ai/docs/guides/overview/models) | public `GET /models`; response `model` identifies router-selected model |
-| `xai` | `grok-4.20`; `grok-4.20-non-reasoning-latest` | `https://api.x.ai/v1`; [Grok 4.20](https://docs.x.ai/developers/models/grok-4.20-experimental-beta-0304) | `GET /models`, bearer token |
+| `xai` | `grok-4.20`; `grok-4.20-non-reasoning-latest` | `https://api.x.ai/v1`; [Grok 4.20](https://docs.x.ai/developers/models/grok-4.20-experimental-beta-0304) | `GET /models`, API key or Grok subscription OAuth bearer |
 | `glm` / `zai` | global `glm-5`; China `glm-5.2` | global `api.z.ai`, China `open.bigmodel.cn`; [GLM-5](https://docs.z.ai/guides/llm/glm-5), [GLM-5.2](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.2) | regional `GET /models` |
 | `bedrock` | `anthropic.claude-sonnet-5`; `anthropic.claude-opus-4-8`; Haiku 4.5 regional ID | AWS Converse; [model/API compatibility](https://docs.aws.amazon.com/bedrock/latest/userguide/models-api-compatibility.html) | AWS regional catalog; invocation uses Converse/ConverseStream |
 | `copilot` | `gpt-5.4`; `gpt-5.3-codex`; `claude-sonnet-4.6` | GitHub Copilot service; [supported models](https://docs.github.com/en/copilot/reference/ai-models/supported-models) | service-managed; OAuth token auto-refresh |
@@ -44,6 +44,15 @@ setting remains adapter-owned.
 | `litellm` | proxy alias or upstream model ID | default `http://localhost:4000`; [LiteLLM proxy](https://docs.litellm.ai/) | `GET /v1/models`; upstream capabilities are route-dependent |
 | `huggingface` | router model ID | `https://router.huggingface.co/v1`; [chat completion](https://huggingface.co/docs/inference-providers/en/tasks/chat-completion) | `GET /v1/models`, bearer token |
 | `compatible` | endpoint-defined | configured OpenAI-compatible `/v1` base URL | `GET <base>/models`; capabilities are endpoint/model-dependent |
+
+`xai` keeps the API-key path (`Authorization: Bearer` on `https://api.x.ai/v1`).
+With no API key, a Grok subscription (SuperGrok or X Premium) signs in through
+`prx auth login --provider xai` (browser PKCE on `127.0.0.1:56121`) or
+`prx auth login --provider xai --device-code` (RFC 8628, for SSH and other
+hosts without a browser). `prx init --interactive` offers the same choice.
+The OAuth access token is refreshed automatically and is sent only to
+`https://api.x.ai`. An explicit `api_key` overrides the subscription profile.
+`prx init` is the setup command; there is no `onboard` command.
 
 Release entries are onboarding defaults and model evidence within the adapter
 ceiling; they do not grant credentials or transport support. Live discovery

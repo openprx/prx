@@ -3,6 +3,7 @@ pub mod codex_auth;
 pub mod discovery;
 pub mod openai_oauth;
 pub mod profiles;
+pub mod xai_oauth;
 
 use crate::auth::codex_auth::{default_codex_auth_json_path, load_openai_codex_profile_from_auth_json};
 use crate::auth::openai_oauth::refresh_access_token;
@@ -17,9 +18,11 @@ use std::time::{Duration, Instant};
 
 const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 const ANTHROPIC_PROVIDER: &str = "anthropic";
+const XAI_PROVIDER: &str = "xai";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
+const XAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
 static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -28,6 +31,10 @@ pub struct AuthService {
     client: reqwest::Client,
     codex_auth_json_path: PathBuf,
     codex_auth_json_auto_import: bool,
+    /// Test seam: refresh xAI tokens here instead of the rewritten loopback
+    /// token host. Production leaves this unset.
+    #[cfg(test)]
+    xai_token_endpoint: Option<String>,
 }
 
 impl AuthService {
@@ -56,7 +63,16 @@ impl AuthService {
             client: reqwest::Client::new(),
             codex_auth_json_path: codex_auth_json_path.unwrap_or_else(default_codex_auth_json_path),
             codex_auth_json_auto_import,
+            #[cfg(test)]
+            xai_token_endpoint: None,
         }
+    }
+
+    /// Point xAI token refresh at a local mock. Test builds only.
+    #[cfg(test)]
+    pub fn with_xai_token_endpoint(mut self, url: impl Into<String>) -> Self {
+        self.xai_token_endpoint = Some(url.into());
+        self
     }
 
     /// Every profile, read-only: nothing is rewritten (D-084 E-3).
@@ -73,6 +89,18 @@ impl AuthService {
     ) -> Result<AuthProfile> {
         let mut profile = AuthProfile::new_oauth(OPENAI_CODEX_PROVIDER, profile_name, token_set);
         profile.account_id = account_id;
+        self.store.upsert_profile(profile.clone(), set_active)?;
+        Ok(profile)
+    }
+
+    /// Store a Grok subscription OAuth token set under the `xai` provider.
+    pub fn store_xai_tokens(
+        &self,
+        profile_name: &str,
+        token_set: crate::auth::profiles::TokenSet,
+        set_active: bool,
+    ) -> Result<AuthProfile> {
+        let profile = AuthProfile::new_oauth(XAI_PROVIDER, profile_name, token_set);
         self.store.upsert_profile(profile.clone(), set_active)?;
         Ok(profile)
     }
@@ -212,7 +240,7 @@ impl AuthService {
             refreshed.refresh_token.clone_from(&latest_tokens.refresh_token);
         }
 
-        let account_id = openai_oauth::extract_account_id_from_jwt(&refreshed.access_token)
+        let account_id = openai_oauth::extract_account_id(&refreshed.access_token, refreshed.id_token.as_deref())
             .or_else(|| latest_profile.account_id.clone());
 
         let updated = crate::runtime::blocking::spawn_blocking({
@@ -233,6 +261,91 @@ impl AuthService {
         .map_err(|err| anyhow::anyhow!("Auth profile update task failed: {err}"))??;
 
         Ok(updated.token_set.map(|t| t.access_token))
+    }
+
+    /// A usable xAI access token, refreshing it when it is due.
+    ///
+    /// Refresh tokens rotate. The new pair is stored before the access token
+    /// is returned. The refresh request goes only to the xAI token endpoint
+    /// (or a test override), never to the inference host.
+    pub async fn get_valid_xai_access_token(&self, profile_override: Option<&str>) -> Result<Option<String>> {
+        let data = self.store.load_read_only()?;
+        let Some(profile_id) = select_profile_id(&data, XAI_PROVIDER, profile_override) else {
+            return Ok(None);
+        };
+        let Some(profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+        if profile.kind != AuthProfileKind::OAuth {
+            return Ok(profile.token.clone().filter(|token| !token.trim().is_empty()));
+        }
+        let Some(token_set) = profile.token_set.clone() else {
+            anyhow::bail!("xAI auth profile is missing its token set: {profile_id}");
+        };
+        if !xai_oauth::access_needs_refresh(&token_set) {
+            return Ok(Some(token_set.access_token));
+        }
+        let Some(refresh_token) = token_set.refresh_token.clone() else {
+            return Ok(Some(token_set.access_token).filter(|token| !token.trim().is_empty()));
+        };
+
+        let refresh_lock = refresh_lock_for_profile(&profile_id);
+        let _guard = refresh_lock.lock().await;
+
+        let data = self.store.load()?;
+        let Some(latest_profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+        let Some(latest_tokens) = latest_profile.token_set.clone() else {
+            anyhow::bail!("xAI auth profile is missing its token set: {profile_id}");
+        };
+        if !xai_oauth::access_needs_refresh(&latest_tokens) {
+            return Ok(Some(latest_tokens.access_token));
+        }
+        let refresh_token = latest_tokens.refresh_token.clone().unwrap_or(refresh_token);
+        if let Some(remaining) = refresh_backoff_remaining(&profile_id) {
+            anyhow::bail!("xAI token refresh is in backoff for {remaining}s due to previous failures");
+        }
+
+        let mut refreshed =
+            match xai_oauth::refresh_access_token_at(&self.client, &self.xai_token_url(), &refresh_token).await {
+                Ok(tokens) => {
+                    clear_refresh_backoff(&profile_id);
+                    tokens
+                }
+                Err(err) => {
+                    set_refresh_backoff(&profile_id, Duration::from_secs(XAI_REFRESH_FAILURE_BACKOFF_SECS));
+                    return Err(err);
+                }
+            };
+        if refreshed.refresh_token.is_none() {
+            refreshed.refresh_token.clone_from(&latest_tokens.refresh_token);
+        }
+
+        let updated = crate::runtime::blocking::spawn_blocking({
+            let store = self.store.clone();
+            let profile_id = profile_id.clone();
+            let refreshed = refreshed.clone();
+            move || {
+                store.update_profile(&profile_id, |profile| {
+                    profile.kind = AuthProfileKind::OAuth;
+                    profile.token_set = Some(refreshed.clone());
+                    Ok(())
+                })
+            }
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("Auth profile update task failed: {err}"))??;
+
+        Ok(updated.token_set.map(|tokens| tokens.access_token))
+    }
+
+    fn xai_token_url(&self) -> String {
+        #[cfg(test)]
+        if let Some(url) = &self.xai_token_endpoint {
+            return url.clone();
+        }
+        xai_oauth::production_token_url()
     }
 
     fn prepare_openai_profile_data(&self, profile_override: Option<&str>) -> Result<AuthProfilesData> {

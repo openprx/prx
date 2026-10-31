@@ -341,7 +341,22 @@ pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
         }
     }
 
+    // Current Codex CLI access tokens nest the ChatGPT account id here.
+    if let Some(value) = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(|value| value.as_str())
+        && !value.trim().is_empty()
+    {
+        return Some(value.to_string());
+    }
+
     None
+}
+
+/// Account id from the access token, then the id token.
+pub fn extract_account_id(access_token: &str, id_token: Option<&str>) -> Option<String> {
+    extract_account_id_from_jwt(access_token).or_else(|| id_token.and_then(extract_account_id_from_jwt))
 }
 
 pub fn extract_expiry_from_jwt(token: &str) -> Option<chrono::DateTime<Utc>> {
@@ -503,6 +518,27 @@ mod tests {
 
         let account = extract_account_id_from_jwt(&token);
         assert_eq!(account.as_deref(), Some("acct_123"));
+    }
+
+    #[test]
+    fn extract_account_id_reads_the_nested_chatgpt_claim_and_the_id_token() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        let access_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_nested"}}"#);
+        let access = format!("{header}.{access_payload}.sig");
+        assert_eq!(extract_account_id_from_jwt(&access).as_deref(), Some("acct_nested"));
+
+        let id_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"account_id":"acct_from_id"}"#);
+        let id_token = format!("{header}.{id_payload}.sig");
+        let bare = format!(
+            "{header}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}")
+        );
+        let bare = format!("{bare}.sig");
+        assert_eq!(
+            extract_account_id(&bare, Some(&id_token)).as_deref(),
+            Some("acct_from_id")
+        );
     }
 
     #[test]
