@@ -20,6 +20,10 @@ async fn original_owner_rejects_stripped_changed_and_copied_controlled_admission
         // An authentic MAC alone cannot reserve a copied root without live scope.
         crate::runtime::h2_entry::retain_run_continuation(None, async {
             assert!(store.admit_experiment(&plan, chrono::Utc::now()).is_err());
+            assert!(
+                !store.root().join("experiments").exists(),
+                "missing live source cannot create an experiment directory"
+            );
         })
         .await;
         bound
@@ -110,6 +114,105 @@ async fn invalid_owner_mac_and_operation_map_never_consume_declared_root_ceiling
         barrier.wait();
         assert!(threads.into_iter().all(|thread| thread.join().unwrap()));
         assert_eq!(crate::runtime::h2_entry::test_scope_root_claims(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn conflicting_authentic_spec_does_not_consume_capacity_or_replace_the_admitted_root() {
+    crate::runtime::h2_entry::test_recorded_terminal_scope(|config| async move {
+        let owner = config.skills_lifecycle.owner().unwrap().unwrap();
+        let store = SkillLifecycleStore::open_existing(&config.workspace_dir, owner.clone())
+            .unwrap()
+            .unwrap();
+        let mut spec = super::super::tests::specification();
+        spec.owner_scope = owner;
+        spec.created_at = chrono::Utc::now();
+        spec.expires_at = spec.created_at + chrono::Duration::seconds(60);
+        let mut alternate = spec.clone();
+        alternate.resources.calls += 1;
+        let plan = store.freeze_experiment_admission(spec, &config).unwrap();
+        let conflict = store.freeze_experiment_admission(alternate, &config).unwrap();
+        assert_eq!(
+            plan.spec().id,
+            conflict.spec().id,
+            "same source/skill/business ID keeps original conflict semantics"
+        );
+        assert_ne!(plan.digest(), conflict.digest());
+        store.verify_experiment_admission(&plan).unwrap();
+        store.verify_experiment_admission(&conflict).unwrap();
+        let source = crate::runtime::h2_entry::current_run_continuation().unwrap();
+        let bound = source
+            .for_admitted_plan(&plan, &plan.spec().controlled_admission.as_ref().unwrap().pin, &config)
+            .unwrap();
+        let original = bound
+            .sync_scope(|| store.admit_experiment(&plan, chrono::Utc::now()))
+            .unwrap();
+        assert_eq!(crate::runtime::h2_entry::test_scope_root_claims(), 1);
+        let conflicting = source
+            .for_admitted_plan(
+                &conflict,
+                &conflict.spec().controlled_admission.as_ref().unwrap().pin,
+                &config,
+            )
+            .unwrap();
+        assert!(matches!(
+            conflicting.sync_scope(|| store.admit_experiment(&conflict, chrono::Utc::now())),
+            Err(ExperimentError::Conflict)
+        ));
+        assert_eq!(
+            crate::runtime::h2_entry::test_scope_root_claims(),
+            1,
+            "a rejected real-MAC conflict cannot reserve a second root"
+        );
+        let replay = bound
+            .sync_scope(|| store.admit_experiment(&plan, chrono::Utc::now()))
+            .unwrap();
+        assert_eq!(original.plan.digest(), replay.plan.digest());
+        assert_eq!(original.head_sha256, replay.head_sha256);
+        assert_eq!(crate::runtime::h2_entry::test_scope_root_claims(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn controlled_identity_separates_actual_skills_without_changing_legacy_ids() {
+    crate::runtime::h2_entry::test_recorded_terminal_scope(|config| async move {
+        let owner = config.skills_lifecycle.owner().unwrap().unwrap();
+        let store = SkillLifecycleStore::open_existing(&config.workspace_dir, owner.clone())
+            .unwrap()
+            .unwrap();
+        let mut spec = super::super::tests::specification();
+        spec.owner_scope = owner;
+        spec.created_at = chrono::Utc::now();
+        spec.expires_at = spec.created_at + chrono::Duration::seconds(60);
+        let mut other = spec.clone();
+        other.pins.skill_id = crate::skills::lifecycle::SkillId::parse("second-real-skill-identity").unwrap();
+        let first = store.freeze_experiment_admission(spec.clone(), &config).unwrap();
+        let second = store.freeze_experiment_admission(other.clone(), &config).unwrap();
+        assert_ne!(
+            first.spec().id,
+            second.spec().id,
+            "different skill locks cannot address the same controlled experiment directory"
+        );
+        store.verify_experiment_admission(&first).unwrap();
+        store.verify_experiment_admission(&second).unwrap();
+        assert_eq!(
+            crate::runtime::h2_entry::test_scope_root_claims(),
+            0,
+            "planning identities grants no capacity"
+        );
+        crate::runtime::h2_entry::retain_run_continuation(None, async {
+            let original = spec.clone().freeze().unwrap();
+            let legacy = store.freeze_experiment_admission(spec, &config).unwrap();
+            assert_eq!(legacy.spec().id, original.spec().id);
+            assert_eq!(legacy.digest(), original.digest());
+            let other_original = other.clone().freeze().unwrap();
+            let other_legacy = store.freeze_experiment_admission(other, &config).unwrap();
+            assert_eq!(other_legacy.spec().id, other_original.spec().id);
+            assert_eq!(other_legacy.digest(), other_original.digest());
+        })
+        .await;
     })
     .await;
 }

@@ -59,27 +59,60 @@ impl SkillLifecycleStore {
         plan.ensure_live(now)?;
         let _store_lock = self.lock_store(true, LOCK_TIMEOUT)?;
         let _skill_lock = self.lock_skill(&plan.spec().pins.skill_id, LOCK_TIMEOUT)?;
-        self.require_live_experiment_admission(plan)?;
+        let live = self.require_live_experiment_admission(plan)?;
         let parent = self.root().join("experiments");
-        ensure_dir_synced(self.root(), &parent)?;
         let directory = self.experiment_dir(&plan.spec().id);
-        ensure_dir_synced(&parent, &directory)?;
+        // Inspect only: unauthenticated/conflicting requests never create a
+        // directory or consume launch capacity. Existing components must be safe.
+        for component in [&parent, &directory] {
+            match fs::symlink_metadata(component) {
+                Ok(metadata) => {
+                    check_private(component)?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        return Err(LifecycleError::UnsafeStorePath {
+                            path: component.to_path_buf(),
+                            reason: "experiment component is not a real directory".into(),
+                        }
+                        .into());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(LifecycleError::io(component, error).into()),
+            }
+        }
         let path = directory.join("spec.json");
-        match fs::symlink_metadata(&path) {
+        let exists = match fs::symlink_metadata(&path) {
             Ok(_) => {
                 check_private(&path)?;
                 let stored: ExperimentSpec = read_record(&path)?;
                 let stored = stored.freeze()?;
                 self.verify_experiment_admission(&stored)?;
-                if stored.digest() != plan.digest() {
+                if stored.spec().id != plan.spec().id || stored.digest() != plan.digest() {
                     return Err(ExperimentError::Conflict);
                 }
+                true
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let bytes = record_bytes(plan.spec(), &path)?;
-                self.write_atomic(&plan.spec().pins.skill_id, &path, &bytes)?;
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(LifecycleError::io(&path, error).into()),
+        };
+        if let Some(live) = live {
+            let envelope =
+                plan.spec().controlled_admission.as_ref().ok_or_else(|| {
+                    ExperimentError::InvalidEvidence("controlled admission envelope disappeared".into())
+                })?;
+            live.claim_store_admission(
+                &envelope.pin,
+                plan,
+                self.admission_workspace()?,
+                self.owner_scope().as_str(),
+            )
+            .map_err(|_| ExperimentError::InvalidEvidence("controlled admission capacity or source refused".into()))?;
+        }
+        if !exists {
+            ensure_dir_synced(self.root(), &parent)?;
+            ensure_dir_synced(&parent, &directory)?;
+            let bytes = record_bytes(plan.spec(), &path)?;
+            self.write_atomic(&plan.spec().pins.skill_id, &path, &bytes)?;
         }
         self.read_experiment(&plan.spec().id, plan.digest())
     }

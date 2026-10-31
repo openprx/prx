@@ -67,8 +67,9 @@ impl SkillLifecycleStore {
         let pin = crate::runtime::h2_entry::current_admission_pin(config)
             .map_err(|_| refusal("controlled planning has no valid live source scope"))?;
         if let Some(pin) = pin {
-            let identity = serde_json::to_vec(&("prx-h2-controlled-id-v1", spec.id.as_str(), &pin))
-                .map_err(|_| refusal("controlled identity encoding failed"))?;
+            let identity =
+                serde_json::to_vec(&("prx-h2-controlled-id-v2", spec.id.as_str(), &spec.pins.skill_id, &pin))
+                    .map_err(|_| refusal("controlled identity encoding failed"))?;
             let suffix: String = hex::encode(Sha256::digest(identity)).chars().take(60).collect();
             spec.id = ExperimentId::parse(&format!("{CONTROLLED_PREFIX}{suffix}"))?;
             let (unsigned, payload) = self.admission_mac_parts(&spec, &pin)?;
@@ -137,24 +138,27 @@ impl SkillLifecycleStore {
             _ => Err(refusal("controlled admission namespace/envelope cannot be downgraded")),
         }
     }
-    /// Called under the original admission locks before either creation or
-    /// idempotent admission. A copied MAC does not authorize a new live run.
+    /// Pure authentication under the original admission locks, before any
+    /// directory write or capacity claim. A copied MAC cannot create authority.
     pub(in crate::skills::lifecycle) fn require_live_experiment_admission(
         &self,
         plan: &FrozenExperiment,
-    ) -> Result<(), ExperimentError> {
+    ) -> Result<Option<crate::runtime::h2_entry::RunContinuation>, ExperimentError> {
         self.verify_experiment_admission(plan)?;
         let current = crate::runtime::h2_entry::current_run_continuation();
         match (plan.spec().controlled_admission.as_ref(), current) {
-            (None, None) => Ok(()),
-            (Some(envelope), Some(current)) => current
-                .ensure_store_admission(
-                    &envelope.pin,
-                    plan,
-                    self.admission_workspace()?,
-                    self.owner_scope().as_str(),
-                )
-                .map_err(|_| refusal("controlled admission has no matching live owned continuation")),
+            (None, None) => Ok(None),
+            (Some(envelope), Some(current)) => {
+                current
+                    .ensure_store_admission(
+                        &envelope.pin,
+                        plan,
+                        self.admission_workspace()?,
+                        self.owner_scope().as_str(),
+                    )
+                    .map_err(|_| refusal("controlled admission has no matching live owned continuation"))?;
+                Ok(Some(current))
+            }
             _ => Err(refusal("controlled admission cannot fall back to a legacy source")),
         }
     }
