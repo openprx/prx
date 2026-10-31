@@ -37,6 +37,8 @@ const MAX_EXPERIENCES: usize = 16;
 
 mod controlled;
 mod owned;
+#[cfg(all(test, unix))]
+mod provision_tests;
 
 /// The workspace whose cost ledger and limits the evaluation spends against.
 ///
@@ -399,14 +401,38 @@ fn io_error(path: &Path, source: std::io::Error) -> EvaluationError {
     EvaluationError::Lifecycle(LifecycleError::io(path, source))
 }
 
+// Controlled native adapters require every provisioned DATA directory and
+// file to be owner-only. Do not chmod an existing path into compliance.
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 fn write_fixtures(workspace: &Path, fixtures: &[FixtureFile]) -> Result<(), EvaluationError> {
+    use std::io::Write;
     for fixture in fixtures {
         check_relative_path("fixture path", &fixture.path)?;
         let target = workspace.join(&fixture.path);
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+            create_private_dir_all(parent).map_err(|e| io_error(parent, e))?;
         }
-        fs::write(&target, fixture.content.as_bytes()).map_err(|e| io_error(&target, e))?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&target)
+            .and_then(|mut file| file.write_all(fixture.content.as_bytes()))
+            .map_err(|e| io_error(&target, e))?;
     }
     Ok(())
 }
@@ -573,7 +599,7 @@ impl AgentCaseExecutor {
         let container = scratch.path().canonicalize().map_err(|e| io_error(scratch.path(), e))?;
         let workspace = if self.controlled.is_some() {
             let state = container.join("runtime-state");
-            fs::create_dir(&state).map_err(|e| io_error(&state, e))?;
+            create_private_dir_all(&state).map_err(|e| io_error(&state, e))?;
             state
         } else {
             container.clone()
@@ -587,7 +613,7 @@ impl AgentCaseExecutor {
         let owner = OwnerScope::new(&owner_id)?;
         let controlled_scope = if self.controlled.is_some() {
             let private = container.join("case-data");
-            fs::create_dir(&private).map_err(|e| io_error(&private, e))?;
+            create_private_dir_all(&private).map_err(|e| io_error(&private, e))?;
             Some(
                 crate::runtime::h2_entry::ControlledCaseScope::create(&private, &workspace, &owner_id)
                     .map_err(|e| EvaluationError::Executor(e.to_string()))?,
@@ -599,7 +625,7 @@ impl AgentCaseExecutor {
             .as_ref()
             .map_or(workspace.as_path(), |scope| scope.data_root())
             .to_path_buf();
-        fs::create_dir_all(&data_root).map_err(|e| io_error(&data_root, e))?;
+        create_private_dir_all(&data_root).map_err(|e| io_error(&data_root, e))?;
         write_fixtures(&data_root, request.fixtures)?;
 
         let installed = match request.skill {
