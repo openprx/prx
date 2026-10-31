@@ -1,1806 +1,2869 @@
-//! Complete native H2 intent contract. Owner-issued plan fields are echo data,
-//! never constructors for runtime authority. Study has no model action.
-use serde_json::Value;
+//! Complete native H2 intent contract. Owner-issued fields are echo data.
+//! Build typed Values directly: no deep json! expansion or runtime parser.
+use serde_json::{Map, Value};
 
-#[rustfmt::skip]
-pub(super) fn parameters_schema()->Value {
-    serde_json::json!(
-{
-  "type": "object",
-  "properties": {
-    "action": {
-      "type": "string",
-      "enum": [
-        "lifecycle_experiment_catalog",
-        "lifecycle_experiment_plan",
-        "lifecycle_experiment_admit",
-        "lifecycle_experiment_run",
-        "lifecycle_experiment_inspect",
-        "lifecycle_experiment_cancel",
-        "lifecycle_experiment_recover",
-        "lifecycle_experiment_review",
-        "lifecycle_experiment_publish",
-        "lifecycle_experiment_annotate",
-        "lifecycle_experiment_rollback",
-        "lifecycle_experiment_retire",
-        "lifecycle_experiment_lessons"
-      ],
-      "description": "Choose exactly one action. Request DTO mapping: catalog=Catalog; plan=Draft; admit=IssuedPlan; run=IssuedPlan; inspect=Handle; cancel=Handle; recover=Handle; review=Final; publish=Publish; annotate=Annotation; rollback=Rollback; retire=Retirement; lessons=Lessons."
-    },
-    "request": {
-      "oneOf": [
-        {
-          "$ref": "#/$defs/Catalog"
-        },
-        {
-          "$ref": "#/$defs/Draft"
-        },
-        {
-          "$ref": "#/$defs/IssuedPlan"
-        },
-        {
-          "$ref": "#/$defs/Handle"
-        },
-        {
-          "$ref": "#/$defs/Final"
-        },
-        {
-          "$ref": "#/$defs/Publish"
-        },
-        {
-          "$ref": "#/$defs/Annotation"
-        },
-        {
-          "$ref": "#/$defs/Rollback"
-        },
-        {
-          "$ref": "#/$defs/Retirement"
-        },
-        {
-          "$ref": "#/$defs/Lessons"
-        }
-      ],
-      "description": "Match the DTO named for action. Plan uses business intent; admit/run echo the complete plan result; handles/final selection/lesson refs come from actual prior results. Missing evidence is a reason to inspect or report unavailable, never invent signed data."
-    }
-  },
-  "required": [
-    "action",
-    "request"
-  ],
-  "additionalProperties": false,
-  "description": "Controlled instruction lifecycle. Start with catalog using {} to discover real candidate skill/pattern IDs, then plan with selected IDs and explicit user budgets. Catalog is bounded read-only discovery, not eligibility or authority; Plan revalidates candidates. Then admit and run the returned immutable plan. Inspect the actual snapshot. If final_selection exists, review it, publish {expected:final_selection}, then annotate the actual committed transaction. Approval is separate from execution: use the original terminal/Console review and explicit resume. Cancel persists a request; recover reconciles original facts; neither proves termination or retries Unknown. Historical inspect/query/replay and fresh authorized maintenance do not resume an old root. Study is local CLI only.",
-  "$defs": {
-    "Catalog": {
-      "type": "object",
-      "properties": {
-        "after_skill": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SkillId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Optional advisory cursor copied from actual catalog next_after_skill; omit or null for the first page."
-        }
-      },
-      "additionalProperties": false,
-      "description": "Bounded candidate discovery: no plan/root/owner or MAC fields. Returns state complete|partial|unavailable, skills[{skill_id,display_name,description,patterns[{pattern_id,statement}]}], next_after_skill, observations, scanned_entries and input_bytes. At most 16 skills/8 patterns each/32KiB output; partial/unavailable is not an empty-store proof. Cursor pages skills, not exhaustive patterns. Plan revalidates every selected ID.",
-      "examples": [
-        {}
-      ]
-    },
-    "Digest": {
-      "type": "string",
-      "description": "Lowercase SHA256 copied from the actual service result; never guess or recompute owner evidence.",
-      "pattern": "^[0-9a-f]{64}$",
-      "minLength": 64,
-      "maxLength": 64
-    },
-    "Id": {
-      "type": "string",
-      "description": "Exact record/request ID, not a display label.",
-      "pattern": "^[A-Za-z0-9_-]{1,64}$",
-      "minLength": 1,
-      "maxLength": 64
-    },
-    "StageId": {
-      "type": "string",
-      "description": "Service-issued stage identity; retain unchanged.",
-      "pattern": "^[A-Za-z0-9_-]{1,48}$",
-      "minLength": 1,
-      "maxLength": 48
-    },
-    "SkillId": {
-      "type": "string",
-      "description": "Existing managed skill ID chosen in the business request; not its display name.",
-      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
-      "minLength": 1,
-      "maxLength": 64
-    },
-    "PatternId": {
-      "type": "string",
-      "description": "Existing verified evidence pattern ID chosen for this skill; a syntactically valid invented ID is not usable evidence.",
-      "pattern": "^pat-[0-9a-f]{32}$",
-      "minLength": 36,
-      "maxLength": 36
-    },
-    "RevisionId": {
-      "type": "string",
-      "description": "Actual published/candidate revision copied from a service observation.",
-      "pattern": "^r1-[0-9a-f]{64}$",
-      "minLength": 67,
-      "maxLength": 67
-    },
-    "Timestamp": {
-      "type": "string",
-      "description": "RFC3339 UTC timestamp. User-requested expiry must be future and fit the original root; observed timestamps must be copied unchanged.",
-      "format": "date-time"
-    },
-    "Owner": {
-      "type": "string",
-      "description": "Owner-issued data: copy from the plan; never choose a caller owner or treat this string as authority.",
-      "minLength": 1,
-      "maxLength": 512
-    },
-    "Family": {
-      "type": "string",
-      "description": "Same bounded task family used by the actual adopted evidence.",
-      "minLength": 1,
-      "maxLength": 128
-    },
-    "Split": {
-      "type": "string",
-      "enum": [
-        "development",
-        "validation",
-        "holdout"
-      ]
-    },
-    "IndependentSplit": {
-      "type": "string",
-      "enum": [
-        "validation",
-        "holdout"
-      ],
-      "description": "Independent verification cannot use development. Full publication uses validation plus separately allocated holdout and private gate."
-    },
-    "Resources": {
-      "type": "object",
-      "properties": {
-        "calls": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX,
-          "description": "Provider call count."
-        },
-        "tokens": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX,
-          "description": "Provider tokens."
-        },
-        "micro_usd": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX,
-          "description": "Integer micro-US dollars."
-        },
-        "tool_calls": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX,
-          "description": "Native tool calls."
-        },
-        "output_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX,
-          "description": "Captured output bytes."
-        },
-        "scratch_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX,
-          "description": "Owned scratch/native-write bytes."
-        }
-      },
-      "required": [
-        "calls",
-        "tokens",
-        "micro_usd",
-        "tool_calls",
-        "output_bytes",
-        "scratch_bytes"
-      ],
-      "additionalProperties": false,
-      "description": "All six integer units are required. Zero is valid only where the service permits it. Unknown usage retains its original allocation."
-    },
-    "ActiveResources": {
-      "type": "object",
-      "properties": {
-        "calls": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": u64::MAX,
-          "description": "Provider call count."
-        },
-        "tokens": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": u64::MAX,
-          "description": "Provider tokens."
-        },
-        "micro_usd": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX,
-          "description": "Integer micro-US dollars."
-        },
-        "tool_calls": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX,
-          "description": "Native tool calls."
-        },
-        "output_bytes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": u64::MAX,
-          "description": "Captured output bytes."
-        },
-        "scratch_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX,
-          "description": "Owned scratch/native-write bytes."
-        }
-      },
-      "required": [
-        "calls",
-        "tokens",
-        "micro_usd",
-        "tool_calls",
-        "output_bytes",
-        "scratch_bytes"
-      ],
-      "additionalProperties": false,
-      "description": "Calls, tokens and output_bytes must be positive for root/model-stage allocations. Every stage allocation and their declared total must fit the explicitly confirmed root ceilings."
-    },
-    "LessonQueryIntent": {
-      "type": "object",
-      "properties": {
-        "task_family": {
-          "$ref": "#/$defs/Family"
-        }
-      },
-      "required": [
-        "task_family"
-      ],
-      "additionalProperties": false,
-      "description": "Optional business lookup intent. The owner resolves guidance and compatibility; no caller-supplied evidence snapshot."
-    },
-    "Draft": {
-      "type": "object",
-      "properties": {
-        "id": {
-          "$ref": "#/$defs/Id",
-          "description": "New business request ID; plan returns a different owner-derived controlled experiment ID. Reuse the returned plan rather than planning again to refresh time."
-        },
-        "skill_id": {
-          "$ref": "#/$defs/SkillId"
-        },
-        "patterns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PatternId"
-          },
-          "minItems": 1,
-          "maxItems": 8
-        },
-        "schedule": {
-          "type": "string",
-          "enum": [
-            "single",
-            "sequential_2",
-            "parallel_2"
-          ],
-          "default": "single",
-          "description": "One bounded cycle, sequential k2, or parallel k2; not unbounded recursion."
-        },
-        "verification_split": {
-          "$ref": "#/$defs/IndependentSplit"
-        },
-        "resources": {
-          "$ref": "#/$defs/ActiveResources"
-        },
-        "proposal_allocation": {
-          "$ref": "#/$defs/ActiveResources"
-        },
-        "probe_allocation": {
-          "$ref": "#/$defs/ActiveResources"
-        },
-        "evaluation_allocation": {
-          "$ref": "#/$defs/ActiveResources"
-        },
-        "gate_allocation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ActiveResources",
-              "description": "Required for publication: an explicit private gate allocation after exact validation and holdout verification."
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "holdout_allocation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ActiveResources",
-              "description": "With a gate, use verification_split=validation and allocate a separate final holdout."
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "lesson_query": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/LessonQueryIntent"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "elapsed_ms": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": u64::MAX,
-          "description": "Original immutable root lifetime in milliseconds; must fit the launch ceiling."
-        },
-        "max_input_bytes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 262144
-        },
-        "max_output_bytes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65536
-        },
-        "proposal_timeout_ms": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 600000
-        }
-      },
-      "required": [
-        "id",
-        "skill_id",
-        "patterns",
-        "verification_split",
-        "resources",
-        "proposal_allocation",
-        "probe_allocation",
-        "evaluation_allocation",
-        "elapsed_ms",
-        "max_input_bytes",
-        "max_output_bytes",
-        "proposal_timeout_ms"
-      ],
-      "additionalProperties": false,
-      "description": "Business intent for plan. Supply IDs and explicit budgets, not workspace/owner/MAC/pins/proof. The compiler assigns max_concurrent and all authoritative pins. For a publishable final candidate, include holdout_allocation and gate_allocation with primary validation. Allocation sum, suite evidence, policy and actual expiry are checked by the owner.",
-      "allOf": [
-        {
-          "if": {
-            "required": [
-              "holdout_allocation"
-            ],
-            "properties": {
-              "holdout_allocation": {
-                "type": "object"
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "verification_split": {
-                "const": "validation"
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "required": [
-              "gate_allocation"
-            ],
-            "properties": {
-              "gate_allocation": {
-                "type": "object"
-              }
-            }
-          },
-          "then": {
-            "required": [
-              "holdout_allocation"
-            ],
-            "properties": {
-              "verification_split": {
-                "const": "validation"
-              },
-              "holdout_allocation": {
-                "type": "object"
-              }
-            }
-          }
-        }
-      ]
-    },
-    "Handle": {
-      "type": "object",
-      "properties": {
-        "experiment_id": {
-          "$ref": "#/$defs/Id"
-        },
-        "plan_sha256": {
-          "$ref": "#/$defs/Digest"
-        }
-      },
-      "required": [
-        "experiment_id",
-        "plan_sha256"
-      ],
-      "additionalProperties": false,
-      "description": "Copy snapshot.handle exactly. A plan response yields experiment_id=plan.spec.id and plan_sha256 from the subsequent admission snapshot; the handle is a selector, never execution authority."
-    },
-    "Final": {
-      "type": "object",
-      "properties": {
-        "handle": {
-          "$ref": "#/$defs/Handle"
-        },
-        "proposal_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "proposal_stage": {
-          "$ref": "#/$defs/StageId"
-        },
-        "skill_id": {
-          "$ref": "#/$defs/SkillId"
-        },
-        "baseline_revision": {
-          "$ref": "#/$defs/RevisionId"
-        },
-        "baseline_record_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "baseline_generation": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        },
-        "candidate_revision": {
-          "$ref": "#/$defs/RevisionId"
-        },
-        "candidate_record_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "evaluation_epoch": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u32::MAX
-        },
-        "evaluating_since": {
-          "$ref": "#/$defs/Timestamp"
-        },
-        "suite_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "gate_stage": {
-          "$ref": "#/$defs/StageId"
-        },
-        "gate_witness_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "gate_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "gate_sha256": {
-          "$ref": "#/$defs/Digest"
-        }
-      },
-      "required": [
-        "handle",
-        "proposal_id",
-        "proposal_stage",
-        "skill_id",
-        "baseline_revision",
-        "baseline_record_sha256",
-        "baseline_generation",
-        "candidate_revision",
-        "candidate_record_sha256",
-        "evaluation_epoch",
-        "evaluating_since",
-        "suite_sha256",
-        "gate_stage",
-        "gate_witness_sha256",
-        "gate_id",
-        "gate_sha256"
-      ],
-      "additionalProperties": false,
-      "description": "Copy actual snapshot.final_selection unchanged for review/publish/annotate. If it is null or absent, inspect/run has not produced this result: do not invent candidate, epoch, gate or hashes. A final expectation is data checked against the original owner under its lock, never a grant."
-    },
-    "Publish": {
-      "type": "object",
-      "properties": {
-        "expected": {
-          "$ref": "#/$defs/Final"
-        }
-      },
-      "required": [
-        "expected"
-      ],
-      "additionalProperties": false,
-      "description": "Exact final publication intent; original source review, private gate, local-owner approval and CAS remain mandatory. Committed replay is historical."
-    },
-    "Annotation": {
-      "type": "object",
-      "properties": {
-        "expected": {
-          "$ref": "#/$defs/Final"
-        },
-        "publication_tx": {
-          "type": "string",
-          "description": "Copy publication.transaction.transaction_id (or actual committed transaction observation), never an authorization-attempt ID.",
-          "minLength": 1
-        },
-        "task_family": {
-          "$ref": "#/$defs/Family"
-        },
-        "expires_at": {
-          "$ref": "#/$defs/Timestamp"
-        }
-      },
-      "required": [
-        "expected",
-        "publication_tx",
-        "task_family",
-        "expires_at"
-      ],
-      "additionalProperties": false,
-      "description": "Annotate a real committed publication. This records adopted evidence, not a claim of demonstrated benefit."
-    },
-    "Rollback": {
-      "type": "object",
-      "properties": {
-        "handle": {
-          "$ref": "#/$defs/Handle"
-        },
-        "prior_revision": {
-          "$ref": "#/$defs/RevisionId",
-          "description": "Choose an actual previously published target for this skill, not an arbitrary candidate."
-        },
-        "observed_generation": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX,
-          "description": "Actual current active generation observed before rollback; stale generation must be re-observed, not guessed."
-        }
-      },
-      "required": [
-        "handle",
-        "prior_revision",
-        "observed_generation"
-      ],
-      "additionalProperties": false,
-      "description": "Fresh exact rollback authority plus authentic publication history; cannot restart an old root."
-    },
-    "LessonRef": {
-      "type": "object",
-      "properties": {
-        "adoption_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "adoption_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "publication_tx": {
-          "type": "string",
-          "minLength": 1
-        },
-        "adopted_revision": {
-          "$ref": "#/$defs/RevisionId"
-        },
-        "adopted_record_sha256": {
-          "$ref": "#/$defs/Digest"
-        }
-      },
-      "required": [
-        "adoption_id",
-        "adoption_sha256",
-        "publication_tx",
-        "adopted_revision",
-        "adopted_record_sha256"
-      ],
-      "additionalProperties": false,
-      "description": "Copy one actual lessons.references item or snapshot.adoption.records[].reference. IDs and matching strings alone are not adoption authority."
-    },
-    "Retirement": {
-      "type": "object",
-      "properties": {
-        "handle": {
-          "$ref": "#/$defs/Handle"
-        },
-        "reference": {
-          "$ref": "#/$defs/LessonRef"
-        },
-        "retired": {
-          "type": "boolean",
-          "description": "true requests monotone retirement; cannot undo an existing retirement."
-        },
-        "invalidated": {
-          "type": "boolean",
-          "description": "true requests monotone invalidation; cannot undo existing invalidation."
-        }
-      },
-      "required": [
-        "handle",
-        "reference",
-        "retired",
-        "invalidated"
-      ],
-      "additionalProperties": false,
-      "description": "Maintain an authentic adopted reference. Preserve both booleans; false is not a reset command."
-    },
-    "Lessons": {
-      "type": "object",
-      "properties": {
-        "handle": {
-          "$ref": "#/$defs/Handle"
-        },
-        "task_family": {
-          "$ref": "#/$defs/Family"
-        },
-        "lifetime_ms": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": u64::MAX,
-          "description": "Bounded query lifetime, at most the original plan elapsed_ms; never refreshes the experiment."
-        }
-      },
-      "required": [
-        "handle",
-        "task_family",
-        "lifetime_ms"
-      ],
-      "additionalProperties": false,
-      "description": "Resolve eligible lessons for the actual current target baseline/model/policy. Empty references is valid; lookup is not proof of delivery or quality."
-    },
-    "ModelBinding": {
-      "type": "object",
-      "properties": {
-        "provider_label": {
-          "type": "string",
-          "minLength": 1
-        },
-        "model": {
-          "type": "string",
-          "minLength": 1
-        },
-        "temperature_milli": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u32::MAX
-        }
-      },
-      "required": [
-        "provider_label",
-        "model",
-        "temperature_milli"
-      ],
-      "additionalProperties": false,
-      "description": "Copy the owner-issued model binding; this does not select a different model or credential."
-    },
-    "OriginData": {
-      "type": "object",
-      "properties": {
-        "version": {
-          "type": "integer",
-          "const": 1
-        },
-        "authority_expires_at": {
-          "$ref": "#/$defs/Timestamp"
-        },
-        "kind": {
-          "type": "string",
-          "enum": [
-            "terminal",
-            "gateway"
-          ]
-        },
-        "boot": {
-          "type": "string",
-          "minLength": 1
-        },
-        "profile": {
-          "$ref": "#/$defs/Digest"
-        },
-        "actor": {
-          "type": "string",
-          "minLength": 1
-        },
-        "target_owner": {
-          "$ref": "#/$defs/Owner"
-        },
-        "workspace": {
-          "type": "string",
-          "minLength": 1
-        },
-        "session": {
-          "type": "string",
-          "minLength": 1
-        },
-        "run": {
-          "type": "string",
-          "minLength": 1
-        },
-        "event": {
-          "type": "string",
-          "minLength": 1
-        },
-        "input": {
-          "$ref": "#/$defs/Digest"
-        },
-        "routing": {
-          "$ref": "#/$defs/Digest"
-        },
-        "sequence": {
-          "anyOf": [
-            {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": u64::MAX
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "required": [
-        "version",
-        "authority_expires_at",
-        "kind",
-        "boot",
-        "profile",
-        "actor",
-        "target_owner",
-        "workspace",
-        "session",
-        "run",
-        "event",
-        "input",
-        "routing"
-      ],
-      "additionalProperties": false,
-      "description": "Copy plan.spec.controlled_admission.pin.source wholesale. These are owner-authenticated observations; JSON cannot create a producer, origin proof, approval or continuation."
-    },
-    "Admission": {
-      "type": "object",
-      "properties": {
-        "pin": {
-          "type": "object",
-          "properties": {
-            "version": {
-              "type": "integer",
-              "const": 1
-            },
-            "source": {
-              "$ref": "#/$defs/OriginData"
-            }
-          },
-          "required": [
-            "version",
-            "source"
-          ],
-          "additionalProperties": false
-        },
-        "owner_mac": {
-          "$ref": "#/$defs/Digest"
-        }
-      },
-      "required": [
-        "pin",
-        "owner_mac"
-      ],
-      "additionalProperties": false,
-      "description": "Copy the exact returned controlled_admission object. Never fill in a MAC, boot, principal, owner or source yourself. Missing/mismatched evidence fails closed; it is not repaired by the tool."
-    },
-    "LessonCompatibility": {
-      "type": "object",
-      "properties": {
-        "model_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "policy_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "source_profile_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "tokenizer_profile_sha256": {
-          "$ref": "#/$defs/Digest"
-        }
-      },
-      "required": [
-        "model_sha256",
-        "policy_sha256",
-        "source_profile_sha256",
-        "tokenizer_profile_sha256"
-      ],
-      "additionalProperties": false
-    },
-    "LessonLimits": {
-      "type": "object",
-      "properties": {
-        "examined": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u32::MAX
-        },
-        "index_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        },
-        "record_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        },
-        "decoded_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        },
-        "lessons": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u32::MAX
-        },
-        "item_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        },
-        "context_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        },
-        "context_token_upper_bound": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        },
-        "elapsed_ms": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        }
-      },
-      "required": [
-        "examined",
-        "index_bytes",
-        "record_bytes",
-        "decoded_bytes",
-        "lessons",
-        "item_bytes",
-        "context_bytes",
-        "context_token_upper_bound",
-        "elapsed_ms"
-      ],
-      "additionalProperties": false
-    },
-    "LessonStats": {
-      "type": "object",
-      "properties": {
-        "examined": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u32::MAX
-        },
-        "index_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        },
-        "decoded_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        },
-        "excluded": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u32::MAX
-        },
-        "elapsed_ms": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        }
-      },
-      "required": [
-        "examined",
-        "index_bytes",
-        "decoded_bytes",
-        "excluded",
-        "elapsed_ms"
-      ],
-      "additionalProperties": false
-    },
-    "LessonSnapshotEntry": {
-      "type": "object",
-      "properties": {
-        "reference": {
-          "$ref": "#/$defs/LessonRef"
-        },
-        "evidence_pin_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "sanitized_guidance": {
-          "type": "string"
-        },
-        "guidance_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "expires_at": {
-          "$ref": "#/$defs/Timestamp"
-        }
-      },
-      "required": [
-        "reference",
-        "evidence_pin_sha256",
-        "sanitized_guidance",
-        "guidance_sha256",
-        "expires_at"
-      ],
-      "additionalProperties": false
-    },
-    "LessonSnapshot": {
-      "type": "object",
-      "properties": {
-        "schema_version": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u32::MAX
-        },
-        "owner_scope": {
-          "$ref": "#/$defs/Owner"
-        },
-        "task_family": {
-          "$ref": "#/$defs/Family"
-        },
-        "query_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "index_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "compatibility": {
-          "$ref": "#/$defs/LessonCompatibility"
-        },
-        "exclusions": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "limits": {
-          "$ref": "#/$defs/LessonLimits"
-        },
-        "stats": {
-          "$ref": "#/$defs/LessonStats"
-        },
-        "entries": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/LessonSnapshotEntry"
-          },
-          "maxItems": 2
-        },
-        "formatter_version": {
-          "type": "string"
-        },
-        "planned_at": {
-          "$ref": "#/$defs/Timestamp"
-        },
-        "expires_at": {
-          "$ref": "#/$defs/Timestamp"
-        }
-      },
-      "required": [
-        "schema_version",
-        "owner_scope",
-        "task_family",
-        "query_sha256",
-        "index_sha256",
-        "compatibility",
-        "exclusions",
-        "limits",
-        "stats",
-        "entries",
-        "formatter_version",
-        "planned_at",
-        "expires_at"
-      ],
-      "additionalProperties": false,
-      "description": "Optional owner-resolved guidance snapshot copied from the returned plan only. Never supply your own sanitized guidance or compatibility claims."
-    },
-    "Pins": {
-      "type": "object",
-      "properties": {
-        "skill_id": {
-          "$ref": "#/$defs/SkillId"
-        },
-        "baseline_revision": {
-          "$ref": "#/$defs/RevisionId"
-        },
-        "baseline_record_digest": {
-          "$ref": "#/$defs/Digest"
-        },
-        "baseline_generation": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": u64::MAX
-        },
-        "binary_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "config_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "policy_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "catalog_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "environment_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "edit_scope_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "model": {
-          "$ref": "#/$defs/ModelBinding"
-        },
-        "suite_digest": {
-          "$ref": "#/$defs/Digest"
-        },
-        "development_split_digest": {
-          "$ref": "#/$defs/Digest"
-        },
-        "verification_split": {
-          "$ref": "#/$defs/IndependentSplit"
-        },
-        "verification_split_digest": {
-          "$ref": "#/$defs/Digest"
-        },
-        "holdout_split_digest": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Digest"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "lesson_snapshot": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/LessonSnapshot"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "required": [
-        "skill_id",
-        "baseline_revision",
-        "baseline_record_digest",
-        "baseline_generation",
-        "binary_sha256",
-        "config_sha256",
-        "policy_sha256",
-        "catalog_sha256",
-        "environment_sha256",
-        "edit_scope_sha256",
-        "model",
-        "suite_digest",
-        "development_split_digest",
-        "verification_split",
-        "verification_split_digest"
-      ],
-      "additionalProperties": false,
-      "description": "Copy exact plan.spec.pins from plan. The runtime resolves these from the real target; caller labels/digests cannot authorize a store/model/suite."
-    },
-    "Stage": {
-      "type": "object",
-      "properties": {
-        "id": {
-          "$ref": "#/$defs/StageId"
-        },
-        "kind": {
-          "type": "string",
-          "enum": [
-            "model_proposal",
-            "solver_trial",
-            "independent_verification",
-            "selection",
-            "gate_review"
-          ]
-        },
-        "dependencies": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/StageId"
-          },
-          "uniqueItems": true,
-          "maxItems": 64
-        },
-        "input_sha256": {
-          "$ref": "#/$defs/Digest"
-        },
-        "allocation": {
-          "$ref": "#/$defs/Resources"
-        }
-      },
-      "required": [
-        "id",
-        "kind",
-        "dependencies",
-        "input_sha256",
-        "allocation"
-      ],
-      "additionalProperties": false
-    },
-    "Spec": {
-      "type": "object",
-      "properties": {
-        "controlled_admission": {
-          "$ref": "#/$defs/Admission"
-        },
-        "schema_version": {
-          "type": "integer",
-          "const": 1
-        },
-        "id": {
-          "type": "string",
-          "description": "Copy owner-issued controlled ID from plan.",
-          "pattern": "^h2c-[0-9a-f]{60}$",
-          "minLength": 64,
-          "maxLength": 64
-        },
-        "owner_scope": {
-          "$ref": "#/$defs/Owner"
-        },
-        "pins": {
-          "$ref": "#/$defs/Pins"
-        },
-        "resources": {
-          "$ref": "#/$defs/ActiveResources"
-        },
-        "max_concurrent": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 64
-        },
-        "elapsed_ms": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": u64::MAX
-        },
-        "created_at": {
-          "$ref": "#/$defs/Timestamp"
-        },
-        "expires_at": {
-          "$ref": "#/$defs/Timestamp"
-        },
-        "stages": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Stage"
-          },
-          "minItems": 1,
-          "maxItems": 64
-        }
-      },
-      "required": [
-        "controlled_admission",
-        "schema_version",
-        "id",
-        "owner_scope",
-        "pins",
-        "resources",
-        "max_concurrent",
-        "elapsed_ms",
-        "created_at",
-        "expires_at",
-        "stages"
-      ],
-      "additionalProperties": false,
-      "description": "Copy the complete server-issued immutable spec, including all pins and MAC. Do not reconstruct it from business inputs. Native controlled admit/run require controlled_admission even though the legacy general Rust DTO permits None."
-    },
-    "Operation": {
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "proposal"
-            },
-            "patterns": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/PatternId"
-              },
-              "minItems": 1,
-              "maxItems": 8
-            },
-            "max_input_bytes": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 262144
-            },
-            "max_output_bytes": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 65536
-            },
-            "timeout_ms": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 600000
-            }
-          },
-          "required": [
-            "operation",
-            "patterns",
-            "max_input_bytes",
-            "max_output_bytes",
-            "timeout_ms"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "evaluation"
-            },
-            "proposal_stage": {
-              "$ref": "#/$defs/StageId"
-            },
-            "split": {
-              "$ref": "#/$defs/Split"
-            }
-          },
-          "required": [
-            "operation",
-            "proposal_stage",
-            "split"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "verify"
-            },
-            "evaluation_stage": {
-              "$ref": "#/$defs/StageId"
-            }
-          },
-          "required": [
-            "operation",
-            "evaluation_stage"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "development_probe"
-            },
-            "proposal_stage": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/StageId"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "operation"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "development_proposal"
-            },
-            "role": {
-              "type": "string",
-              "enum": [
-                "general",
-                "domain",
-                "compose"
-              ]
-            },
-            "patterns": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/PatternId"
-              },
-              "minItems": 1,
-              "maxItems": 8
-            },
-            "probe_stages": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/StageId"
-              }
-            },
-            "parent_selection": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/StageId"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "lesson_context_sha256": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Digest"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "max_input_bytes": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 262144
-            },
-            "max_output_bytes": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 65536
-            },
-            "timeout_ms": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 600000
-            }
-          },
-          "required": [
-            "operation",
-            "role",
-            "patterns",
-            "probe_stages",
-            "max_input_bytes",
-            "max_output_bytes",
-            "timeout_ms"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "development_selection"
-            },
-            "probe_stages": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/StageId"
-              }
-            },
-            "parent_selections": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/StageId"
-              }
-            }
-          },
-          "required": [
-            "operation",
-            "probe_stages"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "selected_evaluation"
-            },
-            "selection_stage": {
-              "$ref": "#/$defs/StageId"
-            },
-            "split": {
-              "$ref": "#/$defs/Split"
-            },
-            "validation_stage": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/StageId"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "operation",
-            "selection_stage",
-            "split"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "gate_review"
-            },
-            "selection_stage": {
-              "$ref": "#/$defs/StageId"
-            },
-            "validation_stage": {
-              "$ref": "#/$defs/StageId"
-            },
-            "validation_verifier": {
-              "$ref": "#/$defs/StageId"
-            },
-            "holdout_stage": {
-              "$ref": "#/$defs/StageId"
-            },
-            "holdout_verifier": {
-              "$ref": "#/$defs/StageId"
-            }
-          },
-          "required": [
-            "operation",
-            "selection_stage",
-            "validation_stage",
-            "validation_verifier",
-            "holdout_stage",
-            "holdout_verifier"
-          ],
-          "additionalProperties": false
-        }
-      ],
-      "description": "Copy only operations returned by plan; operation hashes and dependency graph are frozen. No StudyTrial action or operation is exposed on this model surface."
-    },
-    "IssuedPlan": {
-      "type": "object",
-      "properties": {
-        "spec": {
-          "$ref": "#/$defs/Spec"
-        },
-        "operations": {
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/$defs/Operation"
-          },
-          "minProperties": 1,
-          "maxProperties": 64
-        }
-      },
-      "required": [
-        "spec",
-        "operations"
-      ],
-      "additionalProperties": false,
-      "description": "The exact complete object returned by lifecycle_experiment_plan. Copy both spec and operations unchanged to admit/run. This is verifiable data, not runtime authority; do not regenerate any nested owner/MAC/pin/source fields."
-    }
-  },
-  "allOf": [
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_catalog"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/Catalog"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_plan"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/Draft"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_admit"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/IssuedPlan"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_run"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/IssuedPlan"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_inspect"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/Handle"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_cancel"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/Handle"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_recover"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/Handle"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_review"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/Final"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_publish"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/Publish"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_annotate"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/Annotation"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_rollback"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/Rollback"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_retire"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/Retirement"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "action": {
-            "const": "lifecycle_experiment_lessons"
-          }
-        },
-        "required": [
-          "action"
-        ]
-      },
-      "then": {
-        "properties": {
-          "request": {
-            "$ref": "#/$defs/Lessons"
-          }
-        }
-      }
-    }
-  ],
-  "examples": [
-    {
-      "action": "lifecycle_experiment_catalog",
-      "request": {}
-    },
-    {
-      "action": "lifecycle_experiment_inspect",
-      "request": {
-        "experiment_id": "h2c-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "plan_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-      }
-    }
-  ]
+pub(super) fn parameters_schema() -> Value {
+    let mut definitions = Map::new();
+    definitions.insert("Catalog".into(), definition_catalog());
+    definitions.insert("Digest".into(), definition_digest());
+    definitions.insert("Id".into(), definition_id());
+    definitions.insert("StageId".into(), definition_stage_id());
+    definitions.insert("SkillId".into(), definition_skill_id());
+    definitions.insert("PatternId".into(), definition_pattern_id());
+    definitions.insert("RevisionId".into(), definition_revision_id());
+    definitions.insert("Timestamp".into(), definition_timestamp());
+    definitions.insert("Owner".into(), definition_owner());
+    definitions.insert("Family".into(), definition_family());
+    definitions.insert("Split".into(), definition_split());
+    definitions.insert("IndependentSplit".into(), definition_independent_split());
+    definitions.insert("Resources".into(), definition_resources());
+    definitions.insert("ActiveResources".into(), definition_active_resources());
+    definitions.insert("LessonQueryIntent".into(), definition_lesson_query_intent());
+    definitions.insert("Draft".into(), definition_draft());
+    definitions.insert("Handle".into(), definition_handle());
+    definitions.insert("Final".into(), definition_final());
+    definitions.insert("Publish".into(), definition_publish());
+    definitions.insert("Annotation".into(), definition_annotation());
+    definitions.insert("Rollback".into(), definition_rollback());
+    definitions.insert("LessonRef".into(), definition_lesson_ref());
+    definitions.insert("Retirement".into(), definition_retirement());
+    definitions.insert("Lessons".into(), definition_lessons());
+    definitions.insert("ModelBinding".into(), definition_model_binding());
+    definitions.insert("OriginData".into(), definition_origin_data());
+    definitions.insert("Admission".into(), definition_admission());
+    definitions.insert("LessonCompatibility".into(), definition_lesson_compatibility());
+    definitions.insert("LessonLimits".into(), definition_lesson_limits());
+    definitions.insert("LessonStats".into(), definition_lesson_stats());
+    definitions.insert("LessonSnapshotEntry".into(), definition_lesson_snapshot_entry());
+    definitions.insert("LessonSnapshot".into(), definition_lesson_snapshot());
+    definitions.insert("Pins".into(), definition_pins());
+    definitions.insert("Stage".into(), definition_stage());
+    definitions.insert("Spec".into(), definition_spec());
+    definitions.insert("Operation".into(), definition_operation());
+    definitions.insert("IssuedPlan".into(), definition_issued_plan());
+    let mut root = Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "action".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        (
+                            "enum".into(),
+                            Value::Array(vec![
+                                Value::from("lifecycle_experiment_catalog"),
+                                Value::from("lifecycle_experiment_plan"),
+                                Value::from("lifecycle_experiment_admit"),
+                                Value::from("lifecycle_experiment_run"),
+                                Value::from("lifecycle_experiment_inspect"),
+                                Value::from("lifecycle_experiment_cancel"),
+                                Value::from("lifecycle_experiment_recover"),
+                                Value::from("lifecycle_experiment_review"),
+                                Value::from("lifecycle_experiment_publish"),
+                                Value::from("lifecycle_experiment_annotate"),
+                                Value::from("lifecycle_experiment_rollback"),
+                                Value::from("lifecycle_experiment_retire"),
+                                Value::from("lifecycle_experiment_lessons"),
+                            ]),
+                        ),
+                        (
+                            "description".into(),
+                            Value::from(
+                                "Choose exactly one action. Request DTO mapping: catalog=Catalog; plan=Draft; admit=IssuedPlan; run=IssuedPlan; inspect=Handle; cancel=Handle; recover=Handle; review=Final; publish=Publish; annotate=Annotation; rollback=Rollback; retire=Retirement; lessons=Lessons.",
+                            ),
+                        ),
+                    ])),
+                ),
+                (
+                    "request".into(),
+                    Value::Object(Map::from([
+                        (
+                            "oneOf".into(),
+                            Value::Array(vec![
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Catalog"))])),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Draft"))])),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/IssuedPlan"))])),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Final"))])),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Publish"))])),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Annotation"))])),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Rollback"))])),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Retirement"))])),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Lessons"))])),
+                            ]),
+                        ),
+                        (
+                            "description".into(),
+                            Value::from(
+                                "Match the DTO named for action. Plan uses business intent; admit/run echo the complete plan result; handles/final selection/lesson refs come from actual prior results. Missing evidence is a reason to inspect or report unavailable, never invent signed data.",
+                            ),
+                        ),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![Value::from("action"), Value::from("request")]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Controlled instruction lifecycle. Start with catalog using {} to discover real candidate skill/pattern IDs, then plan with selected IDs and explicit user budgets. Catalog is bounded read-only discovery, not eligibility or authority; Plan revalidates candidates. Then admit and run the returned immutable plan. Inspect the actual snapshot. If final_selection exists, review it, publish {expected:final_selection}, then annotate the actual committed transaction. Approval is separate from execution: use the original terminal/Console review and explicit resume. Cancel persists a request; recover reconciles original facts; neither proves termination or retries Unknown. Historical inspect/query/replay and fresh authorized maintenance do not resume an old root. Study is local CLI only.",
+            ),
+        ),
+        (
+            "allOf".into(),
+            Value::Array(vec![
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_catalog"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Catalog"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_plan"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Draft"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_admit"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/IssuedPlan"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_run"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/IssuedPlan"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_inspect"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_cancel"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_recover"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_review"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Final"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_publish"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Publish"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_annotate"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Annotation"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_rollback"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Rollback"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_retire"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Retirement"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "action".into(),
+                                    Value::Object(Map::from([(
+                                        "const".into(),
+                                        Value::from("lifecycle_experiment_lessons"),
+                                    )])),
+                                )])),
+                            ),
+                            ("required".into(), Value::Array(vec![Value::from("action")])),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "request".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Lessons"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+            ]),
+        ),
+        (
+            "examples".into(),
+            Value::Array(vec![
+                Value::Object(Map::from([
+                    ("action".into(), Value::from("lifecycle_experiment_catalog")),
+                    ("request".into(), Value::Object(Map::new())),
+                ])),
+                Value::Object(Map::from([
+                    ("action".into(), Value::from("lifecycle_experiment_inspect")),
+                    (
+                        "request".into(),
+                        Value::Object(Map::from([
+                            (
+                                "experiment_id".into(),
+                                Value::from("h2c-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                            ),
+                            (
+                                "plan_sha256".into(),
+                                Value::from("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                            ),
+                        ])),
+                    ),
+                ])),
+            ]),
+        ),
+    ]);
+    root.insert("$defs".into(), Value::Object(definitions));
+    Value::Object(root)
 }
-    )
+
+fn definition_catalog() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([(
+                "after_skill".into(),
+                Value::Object(Map::from([
+                    (
+                        "anyOf".into(),
+                        Value::Array(vec![
+                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/SkillId"))])),
+                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                        ]),
+                    ),
+                    (
+                        "description".into(),
+                        Value::from(
+                            "Optional advisory cursor copied from actual catalog next_after_skill; omit or null for the first page.",
+                        ),
+                    ),
+                ])),
+            )])),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Bounded candidate discovery: no plan/root/owner or MAC fields. Returns state complete|partial|unavailable, skills[{skill_id,display_name,description,patterns[{pattern_id,statement}]}], next_after_skill, observations, scanned_entries and input_bytes. At most 16 skills/8 patterns each/32KiB output; partial/unavailable is not an empty-store proof. Cursor pages skills, not exhaustive patterns. Plan revalidates every selected ID.",
+            ),
+        ),
+        ("examples".into(), Value::Array(vec![Value::Object(Map::new())])),
+    ]))
+}
+
+fn definition_digest() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("string")),
+        (
+            "description".into(),
+            Value::from(
+                "Lowercase SHA256 copied from the actual service result; never guess or recompute owner evidence.",
+            ),
+        ),
+        ("pattern".into(), Value::from("^[0-9a-f]{64}$")),
+        ("minLength".into(), Value::from(64_u64)),
+        ("maxLength".into(), Value::from(64_u64)),
+    ]))
+}
+
+fn definition_id() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("string")),
+        (
+            "description".into(),
+            Value::from("Exact record/request ID, not a display label."),
+        ),
+        ("pattern".into(), Value::from("^[A-Za-z0-9_-]{1,64}$")),
+        ("minLength".into(), Value::from(1_u64)),
+        ("maxLength".into(), Value::from(64_u64)),
+    ]))
+}
+
+fn definition_stage_id() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("string")),
+        (
+            "description".into(),
+            Value::from("Service-issued stage identity; retain unchanged."),
+        ),
+        ("pattern".into(), Value::from("^[A-Za-z0-9_-]{1,48}$")),
+        ("minLength".into(), Value::from(1_u64)),
+        ("maxLength".into(), Value::from(48_u64)),
+    ]))
+}
+
+fn definition_skill_id() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("string")),
+        (
+            "description".into(),
+            Value::from("Existing managed skill ID chosen in the business request; not its display name."),
+        ),
+        ("pattern".into(), Value::from("^[a-z0-9][a-z0-9_-]{0,63}$")),
+        ("minLength".into(), Value::from(1_u64)),
+        ("maxLength".into(), Value::from(64_u64)),
+    ]))
+}
+
+fn definition_pattern_id() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("string")),
+        (
+            "description".into(),
+            Value::from(
+                "Existing verified evidence pattern ID chosen for this skill; a syntactically valid invented ID is not usable evidence.",
+            ),
+        ),
+        ("pattern".into(), Value::from("^pat-[0-9a-f]{32}$")),
+        ("minLength".into(), Value::from(36_u64)),
+        ("maxLength".into(), Value::from(36_u64)),
+    ]))
+}
+
+fn definition_revision_id() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("string")),
+        (
+            "description".into(),
+            Value::from("Actual published/candidate revision copied from a service observation."),
+        ),
+        ("pattern".into(), Value::from("^r1-[0-9a-f]{64}$")),
+        ("minLength".into(), Value::from(67_u64)),
+        ("maxLength".into(), Value::from(67_u64)),
+    ]))
+}
+
+fn definition_timestamp() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("string")),
+        (
+            "description".into(),
+            Value::from(
+                "RFC3339 UTC timestamp. User-requested expiry must be future and fit the original root; observed timestamps must be copied unchanged.",
+            ),
+        ),
+        ("format".into(), Value::from("date-time")),
+    ]))
+}
+
+fn definition_owner() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("string")),
+        (
+            "description".into(),
+            Value::from(
+                "Owner-issued data: copy from the plan; never choose a caller owner or treat this string as authority.",
+            ),
+        ),
+        ("minLength".into(), Value::from(1_u64)),
+        ("maxLength".into(), Value::from(512_u64)),
+    ]))
+}
+
+fn definition_family() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("string")),
+        (
+            "description".into(),
+            Value::from("Same bounded task family used by the actual adopted evidence."),
+        ),
+        ("minLength".into(), Value::from(1_u64)),
+        ("maxLength".into(), Value::from(128_u64)),
+    ]))
+}
+
+fn definition_split() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("string")),
+        (
+            "enum".into(),
+            Value::Array(vec![
+                Value::from("development"),
+                Value::from("validation"),
+                Value::from("holdout"),
+            ]),
+        ),
+    ]))
+}
+
+fn definition_independent_split() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("string")),
+        (
+            "enum".into(),
+            Value::Array(vec![Value::from("validation"), Value::from("holdout")]),
+        ),
+        (
+            "description".into(),
+            Value::from(
+                "Independent verification cannot use development. Full publication uses validation plus separately allocated holdout and private gate.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_resources() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "calls".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Provider call count.")),
+                    ])),
+                ),
+                (
+                    "tokens".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Provider tokens.")),
+                    ])),
+                ),
+                (
+                    "micro_usd".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Integer micro-US dollars.")),
+                    ])),
+                ),
+                (
+                    "tool_calls".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Native tool calls.")),
+                    ])),
+                ),
+                (
+                    "output_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Captured output bytes.")),
+                    ])),
+                ),
+                (
+                    "scratch_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Owned scratch/native-write bytes.")),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("calls"),
+                Value::from("tokens"),
+                Value::from("micro_usd"),
+                Value::from("tool_calls"),
+                Value::from("output_bytes"),
+                Value::from("scratch_bytes"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "All six integer units are required. Zero is valid only where the service permits it. Unknown usage retains its original allocation.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_active_resources() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "calls".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Provider call count.")),
+                    ])),
+                ),
+                (
+                    "tokens".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Provider tokens.")),
+                    ])),
+                ),
+                (
+                    "micro_usd".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Integer micro-US dollars.")),
+                    ])),
+                ),
+                (
+                    "tool_calls".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Native tool calls.")),
+                    ])),
+                ),
+                (
+                    "output_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Captured output bytes.")),
+                    ])),
+                ),
+                (
+                    "scratch_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        ("description".into(), Value::from("Owned scratch/native-write bytes.")),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("calls"),
+                Value::from("tokens"),
+                Value::from("micro_usd"),
+                Value::from("tool_calls"),
+                Value::from("output_bytes"),
+                Value::from("scratch_bytes"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Calls, tokens and output_bytes must be positive for root/model-stage allocations. Every stage allocation and their declared total must fit the explicitly confirmed root ceilings.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_lesson_query_intent() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([(
+                "task_family".into(),
+                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Family"))])),
+            )])),
+        ),
+        ("required".into(), Value::Array(vec![Value::from("task_family")])),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Optional business lookup intent. The owner resolves guidance and compatibility; no caller-supplied evidence snapshot.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_draft() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "id".into(),
+                    Value::Object(Map::from([
+                        ("$ref".into(), Value::from("#/$defs/Id")),
+                        (
+                            "description".into(),
+                            Value::from(
+                                "New business request ID; plan returns a different owner-derived controlled experiment ID. Reuse the returned plan rather than planning again to refresh time.",
+                            ),
+                        ),
+                    ])),
+                ),
+                (
+                    "skill_id".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/SkillId"))])),
+                ),
+                (
+                    "patterns".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("array")),
+                        (
+                            "items".into(),
+                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/PatternId"))])),
+                        ),
+                        ("minItems".into(), Value::from(1_u64)),
+                        ("maxItems".into(), Value::from(8_u64)),
+                    ])),
+                ),
+                (
+                    "schedule".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        (
+                            "enum".into(),
+                            Value::Array(vec![
+                                Value::from("single"),
+                                Value::from("sequential_2"),
+                                Value::from("parallel_2"),
+                            ]),
+                        ),
+                        ("default".into(), Value::from("single")),
+                        (
+                            "description".into(),
+                            Value::from("One bounded cycle, sequential k2, or parallel k2; not unbounded recursion."),
+                        ),
+                    ])),
+                ),
+                (
+                    "verification_split".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/IndependentSplit"))])),
+                ),
+                (
+                    "resources".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ActiveResources"))])),
+                ),
+                (
+                    "proposal_allocation".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ActiveResources"))])),
+                ),
+                (
+                    "probe_allocation".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ActiveResources"))])),
+                ),
+                (
+                    "evaluation_allocation".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ActiveResources"))])),
+                ),
+                (
+                    "gate_allocation".into(),
+                    Value::Object(Map::from([(
+                        "anyOf".into(),
+                        Value::Array(vec![
+                            Value::Object(Map::from([
+                                ("$ref".into(), Value::from("#/$defs/ActiveResources")),
+                                (
+                                    "description".into(),
+                                    Value::from(
+                                        "Required for publication: an explicit private gate allocation after exact validation and holdout verification.",
+                                    ),
+                                ),
+                            ])),
+                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                        ]),
+                    )])),
+                ),
+                (
+                    "holdout_allocation".into(),
+                    Value::Object(Map::from([(
+                        "anyOf".into(),
+                        Value::Array(vec![
+                            Value::Object(Map::from([
+                                ("$ref".into(), Value::from("#/$defs/ActiveResources")),
+                                (
+                                    "description".into(),
+                                    Value::from(
+                                        "With a gate, use verification_split=validation and allocate a separate final holdout.",
+                                    ),
+                                ),
+                            ])),
+                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                        ]),
+                    )])),
+                ),
+                (
+                    "lesson_query".into(),
+                    Value::Object(Map::from([(
+                        "anyOf".into(),
+                        Value::Array(vec![
+                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonQueryIntent"))])),
+                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                        ]),
+                    )])),
+                ),
+                (
+                    "elapsed_ms".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        (
+                            "description".into(),
+                            Value::from(
+                                "Original immutable root lifetime in milliseconds; must fit the launch ceiling.",
+                            ),
+                        ),
+                    ])),
+                ),
+                (
+                    "max_input_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1_u64)),
+                        ("maximum".into(), Value::from(262144_u64)),
+                    ])),
+                ),
+                (
+                    "max_output_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1_u64)),
+                        ("maximum".into(), Value::from(65536_u64)),
+                    ])),
+                ),
+                (
+                    "proposal_timeout_ms".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1_u64)),
+                        ("maximum".into(), Value::from(600000_u64)),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("id"),
+                Value::from("skill_id"),
+                Value::from("patterns"),
+                Value::from("verification_split"),
+                Value::from("resources"),
+                Value::from("proposal_allocation"),
+                Value::from("probe_allocation"),
+                Value::from("evaluation_allocation"),
+                Value::from("elapsed_ms"),
+                Value::from("max_input_bytes"),
+                Value::from("max_output_bytes"),
+                Value::from("proposal_timeout_ms"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Business intent for plan. Supply IDs and explicit budgets, not workspace/owner/MAC/pins/proof. The compiler assigns max_concurrent and all authoritative pins. For a publishable final candidate, include holdout_allocation and gate_allocation with primary validation. Allocation sum, suite evidence, policy and actual expiry are checked by the owner.",
+            ),
+        ),
+        (
+            "allOf".into(),
+            Value::Array(vec![
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            ("required".into(), Value::Array(vec![Value::from("holdout_allocation")])),
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "holdout_allocation".into(),
+                                    Value::Object(Map::from([("type".into(), Value::from("object"))])),
+                                )])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([(
+                            "properties".into(),
+                            Value::Object(Map::from([(
+                                "verification_split".into(),
+                                Value::Object(Map::from([("const".into(), Value::from("validation"))])),
+                            )])),
+                        )])),
+                    ),
+                ])),
+                Value::Object(Map::from([
+                    (
+                        "if".into(),
+                        Value::Object(Map::from([
+                            ("required".into(), Value::Array(vec![Value::from("gate_allocation")])),
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([(
+                                    "gate_allocation".into(),
+                                    Value::Object(Map::from([("type".into(), Value::from("object"))])),
+                                )])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "then".into(),
+                        Value::Object(Map::from([
+                            ("required".into(), Value::Array(vec![Value::from("holdout_allocation")])),
+                            (
+                                "properties".into(),
+                                Value::Object(Map::from([
+                                    (
+                                        "verification_split".into(),
+                                        Value::Object(Map::from([("const".into(), Value::from("validation"))])),
+                                    ),
+                                    (
+                                        "holdout_allocation".into(),
+                                        Value::Object(Map::from([("type".into(), Value::from("object"))])),
+                                    ),
+                                ])),
+                            ),
+                        ])),
+                    ),
+                ])),
+            ]),
+        ),
+    ]))
+}
+
+fn definition_handle() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "experiment_id".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Id"))])),
+                ),
+                (
+                    "plan_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![Value::from("experiment_id"), Value::from("plan_sha256")]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Copy snapshot.handle exactly. A plan response yields experiment_id=plan.spec.id and plan_sha256 from the subsequent admission snapshot; the handle is a selector, never execution authority.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_final() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "handle".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                ),
+                (
+                    "proposal_id".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "proposal_stage".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                ),
+                (
+                    "skill_id".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/SkillId"))])),
+                ),
+                (
+                    "baseline_revision".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
+                ),
+                (
+                    "baseline_record_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "baseline_generation".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+                (
+                    "candidate_revision".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
+                ),
+                (
+                    "candidate_record_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "evaluation_epoch".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u32::MAX)),
+                    ])),
+                ),
+                (
+                    "evaluating_since".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                ),
+                (
+                    "suite_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "gate_stage".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                ),
+                (
+                    "gate_witness_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "gate_id".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "gate_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("handle"),
+                Value::from("proposal_id"),
+                Value::from("proposal_stage"),
+                Value::from("skill_id"),
+                Value::from("baseline_revision"),
+                Value::from("baseline_record_sha256"),
+                Value::from("baseline_generation"),
+                Value::from("candidate_revision"),
+                Value::from("candidate_record_sha256"),
+                Value::from("evaluation_epoch"),
+                Value::from("evaluating_since"),
+                Value::from("suite_sha256"),
+                Value::from("gate_stage"),
+                Value::from("gate_witness_sha256"),
+                Value::from("gate_id"),
+                Value::from("gate_sha256"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Copy actual snapshot.final_selection unchanged for review/publish/annotate. If it is null or absent, inspect/run has not produced this result: do not invent candidate, epoch, gate or hashes. A final expectation is data checked against the original owner under its lock, never a grant.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_publish() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([(
+                "expected".into(),
+                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Final"))])),
+            )])),
+        ),
+        ("required".into(), Value::Array(vec![Value::from("expected")])),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Exact final publication intent; original source review, private gate, local-owner approval and CAS remain mandatory. Committed replay is historical.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_annotation() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "expected".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Final"))])),
+                ),
+                (
+                    "publication_tx".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        (
+                            "description".into(),
+                            Value::from(
+                                "Copy publication.transaction.transaction_id (or actual committed transaction observation), never an authorization-attempt ID.",
+                            ),
+                        ),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "task_family".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Family"))])),
+                ),
+                (
+                    "expires_at".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("expected"),
+                Value::from("publication_tx"),
+                Value::from("task_family"),
+                Value::from("expires_at"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Annotate a real committed publication. This records adopted evidence, not a claim of demonstrated benefit.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_rollback() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "handle".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                ),
+                (
+                    "prior_revision".into(),
+                    Value::Object(Map::from([
+                        ("$ref".into(), Value::from("#/$defs/RevisionId")),
+                        (
+                            "description".into(),
+                            Value::from(
+                                "Choose an actual previously published target for this skill, not an arbitrary candidate.",
+                            ),
+                        ),
+                    ])),
+                ),
+                (
+                    "observed_generation".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        (
+                            "description".into(),
+                            Value::from(
+                                "Actual current active generation observed before rollback; stale generation must be re-observed, not guessed.",
+                            ),
+                        ),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("handle"),
+                Value::from("prior_revision"),
+                Value::from("observed_generation"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Fresh exact rollback authority plus authentic publication history; cannot restart an old root.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_lesson_ref() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "adoption_id".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "adoption_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "publication_tx".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "adopted_revision".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
+                ),
+                (
+                    "adopted_record_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("adoption_id"),
+                Value::from("adoption_sha256"),
+                Value::from("publication_tx"),
+                Value::from("adopted_revision"),
+                Value::from("adopted_record_sha256"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Copy one actual lessons.references item or snapshot.adoption.records[].reference. IDs and matching strings alone are not adoption authority.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_retirement() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "handle".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                ),
+                (
+                    "reference".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonRef"))])),
+                ),
+                (
+                    "retired".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("boolean")),
+                        (
+                            "description".into(),
+                            Value::from("true requests monotone retirement; cannot undo an existing retirement."),
+                        ),
+                    ])),
+                ),
+                (
+                    "invalidated".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("boolean")),
+                        (
+                            "description".into(),
+                            Value::from("true requests monotone invalidation; cannot undo existing invalidation."),
+                        ),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("handle"),
+                Value::from("reference"),
+                Value::from("retired"),
+                Value::from("invalidated"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Maintain an authentic adopted reference. Preserve both booleans; false is not a reset command.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_lessons() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "handle".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                ),
+                (
+                    "task_family".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Family"))])),
+                ),
+                (
+                    "lifetime_ms".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                        (
+                            "description".into(),
+                            Value::from(
+                                "Bounded query lifetime, at most the original plan elapsed_ms; never refreshes the experiment.",
+                            ),
+                        ),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("handle"),
+                Value::from("task_family"),
+                Value::from("lifetime_ms"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Resolve eligible lessons for the actual current target baseline/model/policy. Empty references is valid; lookup is not proof of delivery or quality.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_model_binding() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "provider_label".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "model".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "temperature_milli".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u32::MAX)),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("provider_label"),
+                Value::from("model"),
+                Value::from("temperature_milli"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from("Copy the owner-issued model binding; this does not select a different model or credential."),
+        ),
+    ]))
+}
+
+fn definition_origin_data() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "version".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("const".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "authority_expires_at".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                ),
+                (
+                    "kind".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        (
+                            "enum".into(),
+                            Value::Array(vec![Value::from("terminal"), Value::from("gateway")]),
+                        ),
+                    ])),
+                ),
+                (
+                    "boot".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "profile".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "actor".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "target_owner".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Owner"))])),
+                ),
+                (
+                    "workspace".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "session".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "run".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "event".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "input".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "routing".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "sequence".into(),
+                    Value::Object(Map::from([(
+                        "anyOf".into(),
+                        Value::Array(vec![
+                            Value::Object(Map::from([
+                                ("type".into(), Value::from("integer")),
+                                ("minimum".into(), Value::from(0_u64)),
+                                ("maximum".into(), Value::from(u64::MAX)),
+                            ])),
+                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                        ]),
+                    )])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("version"),
+                Value::from("authority_expires_at"),
+                Value::from("kind"),
+                Value::from("boot"),
+                Value::from("profile"),
+                Value::from("actor"),
+                Value::from("target_owner"),
+                Value::from("workspace"),
+                Value::from("session"),
+                Value::from("run"),
+                Value::from("event"),
+                Value::from("input"),
+                Value::from("routing"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Copy plan.spec.controlled_admission.pin.source wholesale. These are owner-authenticated observations; JSON cannot create a producer, origin proof, approval or continuation.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_admission() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "pin".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("object")),
+                        (
+                            "properties".into(),
+                            Value::Object(Map::from([
+                                (
+                                    "version".into(),
+                                    Value::Object(Map::from([
+                                        ("type".into(), Value::from("integer")),
+                                        ("const".into(), Value::from(1_u64)),
+                                    ])),
+                                ),
+                                (
+                                    "source".into(),
+                                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/OriginData"))])),
+                                ),
+                            ])),
+                        ),
+                        (
+                            "required".into(),
+                            Value::Array(vec![Value::from("version"), Value::from("source")]),
+                        ),
+                        ("additionalProperties".into(), Value::from(false)),
+                    ])),
+                ),
+                (
+                    "owner_mac".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![Value::from("pin"), Value::from("owner_mac")]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Copy the exact returned controlled_admission object. Never fill in a MAC, boot, principal, owner or source yourself. Missing/mismatched evidence fails closed; it is not repaired by the tool.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_lesson_compatibility() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "model_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "policy_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "source_profile_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "tokenizer_profile_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("model_sha256"),
+                Value::from("policy_sha256"),
+                Value::from("source_profile_sha256"),
+                Value::from("tokenizer_profile_sha256"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+    ]))
+}
+
+fn definition_lesson_limits() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "examined".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u32::MAX)),
+                    ])),
+                ),
+                (
+                    "index_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+                (
+                    "record_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+                (
+                    "decoded_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+                (
+                    "lessons".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u32::MAX)),
+                    ])),
+                ),
+                (
+                    "item_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+                (
+                    "context_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+                (
+                    "context_token_upper_bound".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+                (
+                    "elapsed_ms".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("examined"),
+                Value::from("index_bytes"),
+                Value::from("record_bytes"),
+                Value::from("decoded_bytes"),
+                Value::from("lessons"),
+                Value::from("item_bytes"),
+                Value::from("context_bytes"),
+                Value::from("context_token_upper_bound"),
+                Value::from("elapsed_ms"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+    ]))
+}
+
+fn definition_lesson_stats() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "examined".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u32::MAX)),
+                    ])),
+                ),
+                (
+                    "index_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+                (
+                    "decoded_bytes".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+                (
+                    "excluded".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u32::MAX)),
+                    ])),
+                ),
+                (
+                    "elapsed_ms".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("examined"),
+                Value::from("index_bytes"),
+                Value::from("decoded_bytes"),
+                Value::from("excluded"),
+                Value::from("elapsed_ms"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+    ]))
+}
+
+fn definition_lesson_snapshot_entry() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "reference".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonRef"))])),
+                ),
+                (
+                    "evidence_pin_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "sanitized_guidance".into(),
+                    Value::Object(Map::from([("type".into(), Value::from("string"))])),
+                ),
+                (
+                    "guidance_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "expires_at".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("reference"),
+                Value::from("evidence_pin_sha256"),
+                Value::from("sanitized_guidance"),
+                Value::from("guidance_sha256"),
+                Value::from("expires_at"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+    ]))
+}
+
+fn definition_lesson_snapshot() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "schema_version".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u32::MAX)),
+                    ])),
+                ),
+                (
+                    "owner_scope".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Owner"))])),
+                ),
+                (
+                    "task_family".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Family"))])),
+                ),
+                (
+                    "query_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "index_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "compatibility".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonCompatibility"))])),
+                ),
+                (
+                    "exclusions".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("array")),
+                        (
+                            "items".into(),
+                            Value::Object(Map::from([("type".into(), Value::from("string"))])),
+                        ),
+                    ])),
+                ),
+                (
+                    "limits".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonLimits"))])),
+                ),
+                (
+                    "stats".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonStats"))])),
+                ),
+                (
+                    "entries".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("array")),
+                        (
+                            "items".into(),
+                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonSnapshotEntry"))])),
+                        ),
+                        ("maxItems".into(), Value::from(2_u64)),
+                    ])),
+                ),
+                (
+                    "formatter_version".into(),
+                    Value::Object(Map::from([("type".into(), Value::from("string"))])),
+                ),
+                (
+                    "planned_at".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                ),
+                (
+                    "expires_at".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("schema_version"),
+                Value::from("owner_scope"),
+                Value::from("task_family"),
+                Value::from("query_sha256"),
+                Value::from("index_sha256"),
+                Value::from("compatibility"),
+                Value::from("exclusions"),
+                Value::from("limits"),
+                Value::from("stats"),
+                Value::from("entries"),
+                Value::from("formatter_version"),
+                Value::from("planned_at"),
+                Value::from("expires_at"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Optional owner-resolved guidance snapshot copied from the returned plan only. Never supply your own sanitized guidance or compatibility claims.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_pins() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "skill_id".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/SkillId"))])),
+                ),
+                (
+                    "baseline_revision".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
+                ),
+                (
+                    "baseline_record_digest".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "baseline_generation".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(0_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+                (
+                    "binary_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "config_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "policy_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "catalog_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "environment_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "edit_scope_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "model".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ModelBinding"))])),
+                ),
+                (
+                    "suite_digest".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "development_split_digest".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "verification_split".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/IndependentSplit"))])),
+                ),
+                (
+                    "verification_split_digest".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "holdout_split_digest".into(),
+                    Value::Object(Map::from([(
+                        "anyOf".into(),
+                        Value::Array(vec![
+                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                        ]),
+                    )])),
+                ),
+                (
+                    "lesson_snapshot".into(),
+                    Value::Object(Map::from([(
+                        "anyOf".into(),
+                        Value::Array(vec![
+                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonSnapshot"))])),
+                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                        ]),
+                    )])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("skill_id"),
+                Value::from("baseline_revision"),
+                Value::from("baseline_record_digest"),
+                Value::from("baseline_generation"),
+                Value::from("binary_sha256"),
+                Value::from("config_sha256"),
+                Value::from("policy_sha256"),
+                Value::from("catalog_sha256"),
+                Value::from("environment_sha256"),
+                Value::from("edit_scope_sha256"),
+                Value::from("model"),
+                Value::from("suite_digest"),
+                Value::from("development_split_digest"),
+                Value::from("verification_split"),
+                Value::from("verification_split_digest"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Copy exact plan.spec.pins from plan. The runtime resolves these from the real target; caller labels/digests cannot authorize a store/model/suite.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_stage() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "id".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                ),
+                (
+                    "kind".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        (
+                            "enum".into(),
+                            Value::Array(vec![
+                                Value::from("model_proposal"),
+                                Value::from("solver_trial"),
+                                Value::from("independent_verification"),
+                                Value::from("selection"),
+                                Value::from("gate_review"),
+                            ]),
+                        ),
+                    ])),
+                ),
+                (
+                    "dependencies".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("array")),
+                        (
+                            "items".into(),
+                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                        ),
+                        ("uniqueItems".into(), Value::from(true)),
+                        ("maxItems".into(), Value::from(64_u64)),
+                    ])),
+                ),
+                (
+                    "input_sha256".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                ),
+                (
+                    "allocation".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Resources"))])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("id"),
+                Value::from("kind"),
+                Value::from("dependencies"),
+                Value::from("input_sha256"),
+                Value::from("allocation"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+    ]))
+}
+
+fn definition_spec() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "controlled_admission".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Admission"))])),
+                ),
+                (
+                    "schema_version".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("const".into(), Value::from(1_u64)),
+                    ])),
+                ),
+                (
+                    "id".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("string")),
+                        (
+                            "description".into(),
+                            Value::from("Copy owner-issued controlled ID from plan."),
+                        ),
+                        ("pattern".into(), Value::from("^h2c-[0-9a-f]{60}$")),
+                        ("minLength".into(), Value::from(64_u64)),
+                        ("maxLength".into(), Value::from(64_u64)),
+                    ])),
+                ),
+                (
+                    "owner_scope".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Owner"))])),
+                ),
+                (
+                    "pins".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Pins"))])),
+                ),
+                (
+                    "resources".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ActiveResources"))])),
+                ),
+                (
+                    "max_concurrent".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1_u64)),
+                        ("maximum".into(), Value::from(64_u64)),
+                    ])),
+                ),
+                (
+                    "elapsed_ms".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1_u64)),
+                        ("maximum".into(), Value::from(u64::MAX)),
+                    ])),
+                ),
+                (
+                    "created_at".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                ),
+                (
+                    "expires_at".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                ),
+                (
+                    "stages".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("array")),
+                        (
+                            "items".into(),
+                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Stage"))])),
+                        ),
+                        ("minItems".into(), Value::from(1_u64)),
+                        ("maxItems".into(), Value::from(64_u64)),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("controlled_admission"),
+                Value::from("schema_version"),
+                Value::from("id"),
+                Value::from("owner_scope"),
+                Value::from("pins"),
+                Value::from("resources"),
+                Value::from("max_concurrent"),
+                Value::from("elapsed_ms"),
+                Value::from("created_at"),
+                Value::from("expires_at"),
+                Value::from("stages"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "Copy the complete server-issued immutable spec, including all pins and MAC. Do not reconstruct it from business inputs. Native controlled admit/run require controlled_admission even though the legacy general Rust DTO permits None.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_operation() -> Value {
+    Value::Object(Map::from([
+        (
+            "oneOf".into(),
+            Value::Array(vec![
+                Value::Object(Map::from([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from([
+                            (
+                                "operation".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("string")),
+                                    ("const".into(), Value::from("proposal")),
+                                ])),
+                            ),
+                            (
+                                "patterns".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("array")),
+                                    (
+                                        "items".into(),
+                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/PatternId"))])),
+                                    ),
+                                    ("minItems".into(), Value::from(1_u64)),
+                                    ("maxItems".into(), Value::from(8_u64)),
+                                ])),
+                            ),
+                            (
+                                "max_input_bytes".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("integer")),
+                                    ("minimum".into(), Value::from(1_u64)),
+                                    ("maximum".into(), Value::from(262144_u64)),
+                                ])),
+                            ),
+                            (
+                                "max_output_bytes".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("integer")),
+                                    ("minimum".into(), Value::from(1_u64)),
+                                    ("maximum".into(), Value::from(65536_u64)),
+                                ])),
+                            ),
+                            (
+                                "timeout_ms".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("integer")),
+                                    ("minimum".into(), Value::from(1_u64)),
+                                    ("maximum".into(), Value::from(600000_u64)),
+                                ])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "required".into(),
+                        Value::Array(vec![
+                            Value::from("operation"),
+                            Value::from("patterns"),
+                            Value::from("max_input_bytes"),
+                            Value::from("max_output_bytes"),
+                            Value::from("timeout_ms"),
+                        ]),
+                    ),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
+                Value::Object(Map::from([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from([
+                            (
+                                "operation".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("string")),
+                                    ("const".into(), Value::from("evaluation")),
+                                ])),
+                            ),
+                            (
+                                "proposal_stage".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                            ),
+                            (
+                                "split".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Split"))])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "required".into(),
+                        Value::Array(vec![
+                            Value::from("operation"),
+                            Value::from("proposal_stage"),
+                            Value::from("split"),
+                        ]),
+                    ),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
+                Value::Object(Map::from([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from([
+                            (
+                                "operation".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("string")),
+                                    ("const".into(), Value::from("verify")),
+                                ])),
+                            ),
+                            (
+                                "evaluation_stage".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "required".into(),
+                        Value::Array(vec![Value::from("operation"), Value::from("evaluation_stage")]),
+                    ),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
+                Value::Object(Map::from([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from([
+                            (
+                                "operation".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("string")),
+                                    ("const".into(), Value::from("development_probe")),
+                                ])),
+                            ),
+                            (
+                                "proposal_stage".into(),
+                                Value::Object(Map::from([(
+                                    "anyOf".into(),
+                                    Value::Array(vec![
+                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                        Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                                    ]),
+                                )])),
+                            ),
+                        ])),
+                    ),
+                    ("required".into(), Value::Array(vec![Value::from("operation")])),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
+                Value::Object(Map::from([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from([
+                            (
+                                "operation".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("string")),
+                                    ("const".into(), Value::from("development_proposal")),
+                                ])),
+                            ),
+                            (
+                                "role".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("string")),
+                                    (
+                                        "enum".into(),
+                                        Value::Array(vec![
+                                            Value::from("general"),
+                                            Value::from("domain"),
+                                            Value::from("compose"),
+                                        ]),
+                                    ),
+                                ])),
+                            ),
+                            (
+                                "patterns".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("array")),
+                                    (
+                                        "items".into(),
+                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/PatternId"))])),
+                                    ),
+                                    ("minItems".into(), Value::from(1_u64)),
+                                    ("maxItems".into(), Value::from(8_u64)),
+                                ])),
+                            ),
+                            (
+                                "probe_stages".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("array")),
+                                    (
+                                        "items".into(),
+                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                    ),
+                                ])),
+                            ),
+                            (
+                                "parent_selection".into(),
+                                Value::Object(Map::from([(
+                                    "anyOf".into(),
+                                    Value::Array(vec![
+                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                        Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                                    ]),
+                                )])),
+                            ),
+                            (
+                                "lesson_context_sha256".into(),
+                                Value::Object(Map::from([(
+                                    "anyOf".into(),
+                                    Value::Array(vec![
+                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                                        Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                                    ]),
+                                )])),
+                            ),
+                            (
+                                "max_input_bytes".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("integer")),
+                                    ("minimum".into(), Value::from(1_u64)),
+                                    ("maximum".into(), Value::from(262144_u64)),
+                                ])),
+                            ),
+                            (
+                                "max_output_bytes".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("integer")),
+                                    ("minimum".into(), Value::from(1_u64)),
+                                    ("maximum".into(), Value::from(65536_u64)),
+                                ])),
+                            ),
+                            (
+                                "timeout_ms".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("integer")),
+                                    ("minimum".into(), Value::from(1_u64)),
+                                    ("maximum".into(), Value::from(600000_u64)),
+                                ])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "required".into(),
+                        Value::Array(vec![
+                            Value::from("operation"),
+                            Value::from("role"),
+                            Value::from("patterns"),
+                            Value::from("probe_stages"),
+                            Value::from("max_input_bytes"),
+                            Value::from("max_output_bytes"),
+                            Value::from("timeout_ms"),
+                        ]),
+                    ),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
+                Value::Object(Map::from([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from([
+                            (
+                                "operation".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("string")),
+                                    ("const".into(), Value::from("development_selection")),
+                                ])),
+                            ),
+                            (
+                                "probe_stages".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("array")),
+                                    (
+                                        "items".into(),
+                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                    ),
+                                ])),
+                            ),
+                            (
+                                "parent_selections".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("array")),
+                                    (
+                                        "items".into(),
+                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                    ),
+                                ])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "required".into(),
+                        Value::Array(vec![Value::from("operation"), Value::from("probe_stages")]),
+                    ),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
+                Value::Object(Map::from([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from([
+                            (
+                                "operation".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("string")),
+                                    ("const".into(), Value::from("selected_evaluation")),
+                                ])),
+                            ),
+                            (
+                                "selection_stage".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                            ),
+                            (
+                                "split".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Split"))])),
+                            ),
+                            (
+                                "validation_stage".into(),
+                                Value::Object(Map::from([(
+                                    "anyOf".into(),
+                                    Value::Array(vec![
+                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                        Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                                    ]),
+                                )])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "required".into(),
+                        Value::Array(vec![
+                            Value::from("operation"),
+                            Value::from("selection_stage"),
+                            Value::from("split"),
+                        ]),
+                    ),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
+                Value::Object(Map::from([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from([
+                            (
+                                "operation".into(),
+                                Value::Object(Map::from([
+                                    ("type".into(), Value::from("string")),
+                                    ("const".into(), Value::from("gate_review")),
+                                ])),
+                            ),
+                            (
+                                "selection_stage".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                            ),
+                            (
+                                "validation_stage".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                            ),
+                            (
+                                "validation_verifier".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                            ),
+                            (
+                                "holdout_stage".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                            ),
+                            (
+                                "holdout_verifier".into(),
+                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "required".into(),
+                        Value::Array(vec![
+                            Value::from("operation"),
+                            Value::from("selection_stage"),
+                            Value::from("validation_stage"),
+                            Value::from("validation_verifier"),
+                            Value::from("holdout_stage"),
+                            Value::from("holdout_verifier"),
+                        ]),
+                    ),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
+            ]),
+        ),
+        (
+            "description".into(),
+            Value::from(
+                "Copy only operations returned by plan; operation hashes and dependency graph are frozen. No StudyTrial action or operation is exposed on this model surface.",
+            ),
+        ),
+    ]))
+}
+
+fn definition_issued_plan() -> Value {
+    Value::Object(Map::from([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from([
+                (
+                    "spec".into(),
+                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Spec"))])),
+                ),
+                (
+                    "operations".into(),
+                    Value::Object(Map::from([
+                        ("type".into(), Value::from("object")),
+                        (
+                            "additionalProperties".into(),
+                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Operation"))])),
+                        ),
+                        ("minProperties".into(), Value::from(1_u64)),
+                        ("maxProperties".into(), Value::from(64_u64)),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![Value::from("spec"), Value::from("operations")]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+        (
+            "description".into(),
+            Value::from(
+                "The exact complete object returned by lifecycle_experiment_plan. Copy both spec and operations unchanged to admit/run. This is verifiable data, not runtime authority; do not regenerate any nested owner/MAC/pin/source fields.",
+            ),
+        ),
+    ]))
 }
