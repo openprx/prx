@@ -11,12 +11,18 @@
 //!
 //! The copy is immutable and replaced as a whole: the new tree is written and
 //! fsynced under `skills/.openprx-projection/`, which is on the same file
-//! system as `skills/`, then renamed into place. On Linux the swap is one
-//! `renameat2(RENAME_EXCHANGE)`, so a reader sees the old tree or the new one.
-//! Elsewhere the old tree is renamed away first, which leaves a short window
-//! in which the skill is absent (never half-written); the sweep restores a
-//! projection that is absent and keeps the `.old` tree of any skill whose
-//! repair failed. No symlink is created or followed.
+//! system as `skills/`, then renamed into place. Linux and macOS exchange the
+//! directories in one call (`renameat2(RENAME_EXCHANGE)` or `renameatx_np`
+//! with `RENAME_SWAP`), so a reader sees the old tree or the new one. On macOS
+//! an unsupported exchange (`EINVAL`, `ENOSYS`, `ENOTSUP`) refuses before the
+//! old tree is moved or removed; there is no two-rename fallback for an
+//! existing target, and the caller reports `CommittedRepairRequired` after the
+//! binding commit. Other platforms rename the old tree away first when exchange
+//! is unavailable, which leaves a short window in which the skill is absent
+//! (never half-written); the sweep restores a projection that is absent and
+//! keeps the `.old` tree of any skill whose repair failed. A first publication
+//! into an absent directory is one rename on every platform. No symlink is
+//! created or followed.
 //!
 //! A first publication refuses to replace an existing `skills/<dir>/` that is
 //! not its own revision (an unmanaged tree). After that the bound directory
@@ -472,8 +478,13 @@ fn write_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(), Lifecyc
     file.sync_all().map_err(|e| LifecycleError::io(path, e))
 }
 
-/// Moves the staged tree onto `target`, replacing what is there. The previous
-/// tree ends up under `staging_root` as `.old` and is removed best-effort.
+/// Moves the staged tree onto `target`, replacing what is there.
+///
+/// An absent target is one rename. A symlink or a non-directory is refused
+/// before any rename. On macOS an existing directory is exchanged in place;
+/// `EINVAL`, `ENOSYS` and `ENOTSUP` refuse before the old tree is moved.
+/// Other platforms exchange where the operating system supports it and
+/// otherwise rename the previous tree under `staging_root` as `.old`.
 fn swap_in(stage: &Path, target: &Path, staging_root: &Path, skill: &SkillId) -> Result<(), LifecycleError> {
     match fs::symlink_metadata(target) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -488,26 +499,84 @@ fn swap_in(stage: &Path, target: &Path, staging_root: &Path, skill: &SkillId) ->
         }
         Ok(_) => {}
     }
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     {
-        use rustix::fs::{CWD, RenameFlags, renameat_with};
-        use rustix::io::Errno;
+        // The two-rename fallback is not part of macOS replacement. These
+        // arguments belong to that fallback on other platforms.
+        let _ = (staging_root, skill);
+        exchange_or_refuse(stage, target)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        exchange_or_two_step(stage, target, staging_root, skill)
+    }
+}
+
+/// macOS replacement of an existing directory: native exchange, or a refusal
+/// that leaves `target` where it is. Never renames the old tree aside.
+#[cfg(target_os = "macos")]
+fn exchange_or_refuse(stage: &Path, target: &Path) -> Result<(), LifecycleError> {
+    // The test seam that used to select the two-rename fallback now selects
+    // the refusal. Production never sets it.
+    if two_step_forced() {
+        return Err(exchange_unsupported(target));
+    }
+    match attempt_exchange(stage, target) {
+        ExchangeAttempt::Exchanged => {
+            // `stage` now names the previous tree.
+            remove_tree(stage);
+            Ok(())
+        }
+        ExchangeAttempt::Unsupported => Err(exchange_unsupported(target)),
+        ExchangeAttempt::Failed(error) => Err(LifecycleError::io(target, error)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn exchange_unsupported(target: &Path) -> LifecycleError {
+    LifecycleError::io(
+        target,
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic directory exchange is unsupported; the existing macOS projection was not moved",
+        ),
+    )
+}
+
+/// Linux, Android and platforms without exchange: exchange when the call is
+/// available, otherwise the two-rename fallback.
+#[cfg(not(target_os = "macos"))]
+fn exchange_or_two_step(
+    stage: &Path,
+    target: &Path,
+    staging_root: &Path,
+    skill: &SkillId,
+) -> Result<(), LifecycleError> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
         if !two_step_forced() {
-            match renameat_with(CWD, stage, CWD, target, RenameFlags::EXCHANGE) {
-                Ok(()) => {
-                    // `stage` now names the previous tree.
+            match attempt_exchange(stage, target) {
+                ExchangeAttempt::Exchanged => {
                     remove_tree(stage);
                     return Ok(());
                 }
-                Err(Errno::INVAL | Errno::NOSYS | Errno::NOTSUP) => {
+                ExchangeAttempt::Unsupported => {
                     tracing::warn!(
                         "atomic directory exchange is unsupported here; replacing the skill projection in two steps"
                     );
                 }
-                Err(errno) => return Err(LifecycleError::io(target, std::io::Error::from(errno))),
+                ExchangeAttempt::Failed(error) => return Err(LifecycleError::io(target, error)),
             }
         }
     }
+    two_step_replace(stage, target, staging_root, skill)
+}
+
+/// Renames `target` aside, then renames `stage` onto `target`. A crash between
+/// the two renames leaves the skill absent; a failed second rename puts the
+/// previous tree back.
+#[cfg(not(target_os = "macos"))]
+fn two_step_replace(stage: &Path, target: &Path, staging_root: &Path, skill: &SkillId) -> Result<(), LifecycleError> {
     let old = staging_root.join(format!("{skill}.{}{OLD_SUFFIX}", uuid::Uuid::new_v4()));
     fs::rename(target, &old).map_err(|e| LifecycleError::io(target, e))?;
     crash_point!("projection_swapped_out");
@@ -522,7 +591,49 @@ fn swap_in(stage: &Path, target: &Path, staging_root: &Path, skill: &SkillId) ->
     Ok(())
 }
 
-/// Test seam: forces the two-rename fallback on platforms supporting atomic exchange.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+enum ExchangeAttempt {
+    Exchanged,
+    Unsupported,
+    Failed(std::io::Error),
+}
+
+/// Exchanges `stage` and `target`. A test errno is applied before the syscall,
+/// so the old tree is not moved when the seam says exchange is unsupported.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn attempt_exchange(stage: &Path, target: &Path) -> ExchangeAttempt {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    use rustix::io::Errno;
+    if let Some(raw) = injected_exchange_errno() {
+        return classify_exchange_errno(Errno::from_raw_os_error(raw));
+    }
+    match renameat_with(CWD, stage, CWD, target, RenameFlags::EXCHANGE) {
+        Ok(()) => ExchangeAttempt::Exchanged,
+        Err(errno) => classify_exchange_errno(errno),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn classify_exchange_errno(errno: rustix::io::Errno) -> ExchangeAttempt {
+    use rustix::io::Errno;
+    match errno {
+        Errno::INVAL | Errno::NOSYS | Errno::NOTSUP => ExchangeAttempt::Unsupported,
+        other => ExchangeAttempt::Failed(std::io::Error::from(other)),
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn injected_exchange_errno() -> Option<i32> {
+    super::publish::crash_hooks::injected_exchange_errno()
+}
+
+#[cfg(all(not(test), any(target_os = "linux", target_os = "android", target_os = "macos")))]
+const fn injected_exchange_errno() -> Option<i32> {
+    None
+}
+
+/// Test seam. On Linux and Android this selects the two-rename fallback.
+/// On macOS it selects the refusal that leaves the existing projection in place.
 #[cfg(all(test, any(target_os = "linux", target_os = "android", target_os = "macos")))]
 fn two_step_forced() -> bool {
     super::publish::crash_hooks::two_step_forced()

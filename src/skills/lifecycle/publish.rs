@@ -102,11 +102,28 @@ pub(super) mod crash_hooks {
         static ARMED: RefCell<Option<&'static str>> = const { RefCell::new(None) };
         static ACTION: RefCell<Option<(&'static str, Box<dyn FnOnce()>)>> = const { RefCell::new(None) };
         static TWO_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static EXCHANGE_ERRNO: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     }
 
-    /// Forces the projection swap onto its two-rename fallback on this thread.
+    /// On Linux and Android, forces the projection swap onto its two-rename
+    /// fallback on this thread. On macOS the same flag skips exchange and the
+    /// replacement is refused before the old tree moves. macOS has no
+    /// two-rename fallback for an existing projection.
     pub(in crate::skills::lifecycle) fn force_two_step(on: bool) {
         TWO_STEP.with(|f| f.set(on));
+    }
+
+    /// Makes directory exchange fail with this raw errno before `renameat` and
+    /// before any rename of an existing projection. `0` clears the seam. The
+    /// unsupported classes are `EINVAL`, `ENOSYS` and `ENOTSUP`: macOS refuses
+    /// in place, and other platforms keep their existing fallback.
+    pub(in crate::skills::lifecycle) fn inject_exchange_errno(raw_os_error: i32) {
+        EXCHANGE_ERRNO.with(|cell| cell.set(raw_os_error));
+    }
+
+    pub(in crate::skills::lifecycle) fn injected_exchange_errno() -> Option<i32> {
+        let raw = EXCHANGE_ERRNO.with(std::cell::Cell::get);
+        (raw != 0).then_some(raw)
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]

@@ -277,19 +277,40 @@ For a lifecycle-managed skill, `active/<skill-id>.json` is the authority and
 `skills/<dir>/` is a plain directory copy of the active revision, kept for
 existing consumers such as discovery. Publish and rollback replace the copy
 after the binding commits, using a staged write under
-`skills/.openprx-projection/`. Linux and macOS use a native atomic directory exchange where supported
-(`renameat2` with `RENAME_EXCHANGE`, or `renameatx_np` with `RENAME_SWAP`).
-Filesystems without exchange support fall back to two renames and emit a
-warning: the skill may then be briefly absent, but the replacement tree is
-never half-written. Other errors are returned without entering the fallback.
-The existing recovery protocol also covers this fallback. Reverting this
-change restores the previous macOS two-rename behavior; store formats do not change.
+`skills/.openprx-projection/`. Linux and macOS use a native atomic directory
+exchange where the filesystem supports it (`renameat2` with `RENAME_EXCHANGE`,
+or `renameatx_np` with `RENAME_SWAP`). A reader then sees the previous tree or
+the new one, not a mix of the two.
+
+On macOS, replacement of an existing projection never moves or deletes that
+tree first. When exchange returns `EINVAL`, `ENOSYS`, or `ENOTSUP`, the
+publication refuses before the old tree is touched and the old projection stays
+readable for the whole attempt. There is no two-rename fallback for an existing
+macOS target. The binding and journal stay committed. The result is
+`CommittedRepairRequired`: the new binding is live and the projection is still
+the previous tree. This is not a rollback and not a successful projection.
+Repeating recovery on that filesystem is bounded and idempotent. It does not
+remove the retained tree, leave the target absent, advance the generation, or
+republish. Replaying the same committed request keeps that transaction id and
+the same repair status. An operator who wants the previous revision uses the
+existing rollback, which commits a new generation; it does not undo the
+refused publication in place.
+
+A first publication into an absent directory is still one rename, on macOS and
+everywhere else. A symlink, a non-directory, or a path that points outside the
+skill directory is still refused and is not followed. Linux, Android, and
+other platforms keep the previous rule: unsupported exchange warns and
+replaces the tree with two renames. That window can leave the directory
+briefly absent, and the replacement is never half-written. Other exchange
+errors return without entering the fallback. Recovery still restores an absent
+projection and keeps the `.old` tree when a repair fails. Store formats do not
+change.
 
 Refresh invalidates the catalog snapshots containing metadata and embeddings.
 The separate process embedding cache is keyed by description text, so a changed
 description cannot reuse the old description's vector.
 
-- A failure after the commit is reported as `CommittedRepairRequired`: the new binding is already live, so this is not an aborted publication. Retrying the same transaction, or the startup recovery sweep, repairs the projection.
+- A failure after the commit is reported as `CommittedRepairRequired`: the new binding is already live, so this is not an aborted publication. Retrying the same transaction, or the startup recovery sweep, repairs the projection when the filesystem can accept the replacement. On macOS, an unsupported exchange keeps reporting repair required and keeps the previous tree.
 - Only the first publication refuses an unmanaged directory; after that the bound `skills/<dir>/` belongs to the lifecycle, and later generations, rollbacks and recovery overwrite it (a hand edit of a bound directory does not survive).
 - A first publication refuses, before anything is committed, to replace an existing `skills/<dir>/` that is not its own revision. A symlinked `skills/` or `skills/.openprx-projection/` is refused too.
 - Recovery resets the `skills/.openprx-disabled/<dir>` marker of every bound skill to the binding's `enabled` state. A gateway toggle of a bound skill therefore does not survive a recovery pass; change the state with a lifecycle publication or rollback.
