@@ -193,7 +193,14 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/runtime/pools", get(runtime::get_pools))
         // Phase 4: WASM plugins
         .route("/plugins", get(plugins::list_plugins))
+        .route("/plugins/refresh", post(plugins::refresh_plugins))
+        .route("/plugins/install", post(plugins::install_plugin))
+        .route("/plugins/update", post(plugins::update_plugin))
         .route("/plugins/{name}/reload", post(plugins::reload_plugin))
+        .route("/plugins/{name}/enable", post(plugins::enable_plugin))
+        .route("/plugins/{name}/disable", post(plugins::disable_plugin))
+        .route("/plugins/{name}/remove", post(plugins::remove_plugin_post))
+        .route("/plugins/{name}", delete(plugins::remove_plugin))
         // The decision plane (CDP-15, SP-CDP-A 5.14).
         .merge(causal_routes)
         .merge(management_routes)
