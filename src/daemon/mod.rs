@@ -1766,6 +1766,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         nextcloud_talk,
         qq,
         wacli,
+        ramflux,
         ..
     } = &config.channels_config;
 
@@ -1799,6 +1800,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         || nextcloud_talk.is_some()
         || qq.is_some()
         || wacli.is_some()
+        || ramflux.is_some()
 }
 
 mod systemd_notify {

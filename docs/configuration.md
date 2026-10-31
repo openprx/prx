@@ -458,6 +458,24 @@ store_dir = "/path/to/wacli-store" # required for group-title fallback and inbou
 # Set to true to confine them to the workspace again (see docs/channels.md).
 outbound_media_workspace_only = false
 
+# Local ramflux agent-host bridge. prx holds no ramflux keys.
+# authorization_mode: follow_rf (default) | supervised | full
+# full is effective only when bridge.hello also declares authorization = "full".
+[channels_config.ramflux]
+authorization_mode = "follow_rf"
+max_in_flight_per_conversation = 1
+on_new_message = "queue" # queue | interrupt
+turn_wall_clock_secs = 120
+encrypt_at_rest = true
+# socket_path = "/path/to/ramflux.sock"
+
+[channels_config.ramflux.accounts.agent_a]
+# system_prompt_file = "personas/agent_a.md"
+# model = "example-model"
+# provider = "example-provider"
+# scope_profile = "default"
+# cross_conversation_retrieval = false
+
 [heartbeat]
 interval_minutes = 30
 active_hours = [8, 23]

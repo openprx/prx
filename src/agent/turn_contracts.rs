@@ -456,7 +456,7 @@ impl ToolLoopOutcome {
 /// Decision returned by an [`ApprovalResolver`] for a pending tool call:
 /// chat's approval path and its `/approve` / `/deny` handler construct it.
 #[derive(Debug, Clone)]
-pub(crate) enum ApprovalDecision {
+pub enum ApprovalDecision {
     /// Deny the call; the loop substitutes a denial result.
     Deny,
     /// Allow the call and inject a runtime approval grant, mirroring the
@@ -476,7 +476,7 @@ pub(crate) enum ApprovalDecision {
 /// `/bg` background path supplies a resolver (to suspend on the approval gate);
 /// channels / gateway keep `None`.
 #[async_trait::async_trait]
-pub(crate) trait ApprovalResolver: Send + Sync {
+pub trait ApprovalResolver: Send + Sync {
     /// Resolve an approval decision for a tool call after the authoritative
     /// `SecurityPolicy::decide` returned `Ask`.
     ///

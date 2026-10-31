@@ -63,7 +63,26 @@ pub(super) async fn process_channel_message(
         &turn_run_id,
         Some(cancellation_token.clone()),
     );
-    crate::runtime::registry::scoped(guard, boxed_channel_work(ctx, msg, cancellation_token, turn_run_id)).await;
+    let rich_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+    let conversation_id = msg.reply_target.clone();
+    let _rich_turn = rich_channel.as_ref().and_then(|channel| {
+        crate::channels::rich_turn::TurnGuard::bind(
+            Arc::clone(channel),
+            &conversation_id,
+            &turn_run_id,
+            cancellation_token.clone(),
+        )
+    });
+    crate::channels::rich_turn::scope_if_rich(
+        rich_channel.as_ref(),
+        &conversation_id,
+        &turn_run_id,
+        crate::runtime::registry::scoped(
+            guard,
+            boxed_channel_work(ctx, msg, cancellation_token, turn_run_id.clone()),
+        ),
+    )
+    .await;
 }
 
 // Construct the large channel-work future outside the caller's async poll
@@ -997,7 +1016,9 @@ pub(super) async fn run_channel_turn(
                                     observer: ctx.observer.as_ref(),
                                     hooks: ctx.hooks.as_ref(),
                                     approval: None,
-                                    approval_resolver: None,
+                                    approval_resolver: target_channel
+                                        .as_ref()
+                                        .and_then(|channel| crate::channels::rich_turn::resolver_for(channel.as_ref())),
                                     runtime_adapter: Some(decision_turn.adapter()),
                                     memory: crate::agent::turn_request::ToolLoopMemory::new(
                                             &ctx.memory,
