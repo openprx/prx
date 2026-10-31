@@ -1845,6 +1845,11 @@ request. Success reports the gateway's new plugin generation. Trust/revoke
 alone does not reload a running owner; this command calls its existing reload
 endpoint and does not restart it or change configuration.
 
+`prx plugin enable NAME` previews a disabled-enable. Add `--yes` to move that
+disabled plugin into the active directory and refresh the process that ran the
+command. The command does not write trust and does not change `[plugins] enabled`.
+Read-only autonomy refuses the write.
+
 ### Bounded instruction experiments
 
 The current experiment product surface is the explicit local CLI/service. Bounded recursion and adopted-result service mechanics do not provide conversational experiment actions or Gateway experiment control. Native Chat file-tool regression evidence is separate from a complete Chat experiment workflow; shared infrastructure does not establish entrypoint parity or measured learning benefit.
