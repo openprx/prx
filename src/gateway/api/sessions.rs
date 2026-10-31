@@ -1062,7 +1062,7 @@ pub(super) async fn get_session_approvals(
         }
         Err(error) => {
             tracing::warn!(error = %error, "approval inbox failed");
-            json_error(StatusCode::CONFLICT, "Decision approval is unavailable or expired")
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "Approval inbox is unavailable")
         }
     }
 }
@@ -3579,6 +3579,7 @@ mod tests {
             .list_owned_message_events_by_type(&workspace, "api:owner-a", "approval.decision.pending", 0, 20)
             .await
             .expect("test: owner query");
+        assert_eq!(rows.len(), 1);
         let row = rows.first().expect("test: owner row");
         assert_eq!(row.owner_id.as_deref(), Some("api:owner-a"));
         assert_eq!(row.session_key.as_deref(), Some("session-a"));
@@ -3586,6 +3587,7 @@ mod tests {
             .list_owned_message_events_by_type(&workspace, "api:owner-b", "approval.decision.pending", 0, 20)
             .await
             .expect("test: foreign query");
+        assert_eq!(foreign.len(), 1);
         let foreign_row = foreign.first().expect("test: foreign row");
         assert_eq!(foreign_row.session_key.as_deref(), Some("session-b"));
     }
@@ -3723,5 +3725,32 @@ mod tests {
             .cleanup
             .drain(tokio::time::Instant::now() + Duration::from_secs(5))
             .await;
+    }
+
+    #[tokio::test]
+    async fn approval_inbox_fail_closed_memory_is_not_conflict() {
+        let temp = tempfile::tempdir().expect("test: inbox scratch");
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_owned();
+        config.config_path = temp.path().join("config.toml");
+        config.causal_tree.enabled = true;
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config.default_provider = Some("ollama".to_owned());
+        config.default_model = Some("prx-local-model".to_owned());
+        let state = test_app_state_with_config(config, Arc::new(CapturingProvider::default()));
+        let response = super::get_session_approvals(
+            State(state),
+            Query(ApprovalInboxQuery {
+                limit: None,
+                cursor: None,
+            }),
+            axum::Extension(super::super::ApiPrincipal::of_token("prx-owner-token")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        let error = body.get("error").and_then(serde_json::Value::as_str).unwrap_or("");
+        assert_ne!(error, "Decision approvals are disabled", "{body}");
+        assert!(!error.to_ascii_lowercase().contains("disabled"), "{body}");
     }
 }

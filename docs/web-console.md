@@ -167,7 +167,10 @@ redacted projection as the per-session inspect route: `decision_id`, `tool`,
 `arguments`, `arguments_redacted`, `original_call_available`, `effect`,
 `call_digest`, `pending_expires_at` and `single_use`. `limit` defaults to 50
 and is capped at 100. `cursor` is opaque; pass the previous response's
-`next_cursor` to continue. A fully resolved approval is omitted. Review,
+`next_cursor` to continue. A denied review (`approved` false on the
+`decision-approval:{id}:review` row) is omitted. A row whose operations are
+all resolved is omitted. An approved call that is still waiting to resume
+stays listed. A storage or service failure returns 503, not 409. Review,
 revocation and resume stay on the per-session routes.
 
 An authenticated owner can inspect one pending call with

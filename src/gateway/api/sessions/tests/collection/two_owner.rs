@@ -183,6 +183,93 @@ async fn settled_owner_events(
     .context("owner terminal events did not settle")?
 }
 
+async fn inbox_decision_ids(app: &axum::Router, token: &str) -> anyhow::Result<Vec<String>> {
+    use axum::http::Method;
+    let (status, inbox) = routed(
+        app,
+        Method::GET,
+        "/sessions/approvals?limit=20",
+        Some(token),
+        serde_json::json!({}),
+    )
+    .await?;
+    anyhow::ensure!(status == StatusCode::OK, "{inbox}");
+    let rows = inbox
+        .get("approvals")
+        .and_then(serde_json::Value::as_array)
+        .context("approval inbox")?;
+    Ok(rows
+        .iter()
+        .filter_map(|item| {
+            item.get("decision_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect())
+}
+
+/// Owner A denies a new pending call. Owner B keeps a different pending call.
+/// A's inbox omits the denial. B's inbox keeps only B's still-pending call.
+async fn assert_denied_approval_leaves_only_that_owner(app: &axum::Router) -> anyhow::Result<()> {
+    use axum::http::Method;
+    let mut denied_id = String::new();
+    let mut open_id = String::new();
+    for (index, (token, session, content)) in OWNERS.iter().enumerate() {
+        let uri = format!("/sessions/{session}/message");
+        let input = serde_json::json!({"message":format!("file_write: Create {TARGET} containing {content}.")});
+        let (status, value) = routed(app, Method::POST, &uri, Some(token), input).await?;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(
+            value.get("status").and_then(serde_json::Value::as_str),
+            Some("awaiting_approval"),
+            "{value}"
+        );
+        let id = value
+            .get("decision_id")
+            .and_then(serde_json::Value::as_str)
+            .context("denied-case decision id")?
+            .to_owned();
+        if index == 0 {
+            let approval = format!("/sessions/{session}/approvals/{id}");
+            let (status, receipt) = routed(
+                app,
+                Method::POST,
+                &approval,
+                Some(token),
+                serde_json::json!({"approved": false}),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{receipt}");
+            assert_eq!(receipt.get("approved"), Some(&serde_json::json!(false)), "{receipt}");
+            denied_id = id;
+        } else {
+            open_id = id;
+        }
+    }
+    let owner_a = OWNERS.first().context("owner a")?.0;
+    let owner_b = OWNERS.get(1).context("owner b")?.0;
+    let owner_a_rows = inbox_decision_ids(app, owner_a).await?;
+    let owner_b_rows = inbox_decision_ids(app, owner_b).await?;
+    assert!(
+        !owner_a_rows.iter().any(|id| id == &denied_id),
+        "a denied approval stays in the owner's inbox: {owner_a_rows:?}"
+    );
+    assert!(
+        !owner_a_rows.iter().any(|id| id == &open_id),
+        "owner A sees owner B's pending approval: {owner_a_rows:?}"
+    );
+    assert!(
+        owner_b_rows.iter().any(|id| id == &open_id),
+        "owner B's still-pending approval left the inbox: {owner_b_rows:?}"
+    );
+    assert!(
+        !owner_b_rows.iter().any(|id| id == &denied_id),
+        "owner B sees owner A's denied approval: {owner_b_rows:?}"
+    );
+    assert!(!denied_id.is_empty() && !open_id.is_empty() && denied_id != open_id);
+    Ok(())
+}
+
 async fn exercise_owners(
     state: &AppState,
     provider: &OwnerCollectionProvider,
@@ -487,8 +574,28 @@ async fn exercise_owners(
             .context("pending collection")?;
         assert_ne!(pending.run_id, resume_source.run_id);
         private_paths.push(target);
-        decision_ids.push(id);
+        decision_ids.push(id.clone());
+        let (closed_status, closed_inbox) = routed(
+            &app,
+            Method::GET,
+            "/sessions/approvals?limit=20",
+            Some(token),
+            serde_json::json!({}),
+        )
+        .await?;
+        assert_eq!(closed_status, StatusCode::OK, "{closed_inbox}");
+        let closed_rows = closed_inbox
+            .get("approvals")
+            .and_then(serde_json::Value::as_array)
+            .context("inbox after resume")?;
+        assert!(
+            closed_rows
+                .iter()
+                .all(|item| { item.get("decision_id").and_then(serde_json::Value::as_str) != Some(id.as_str()) }),
+            "a consumed approval leaves its owner's inbox: {closed_inbox}"
+        );
     }
+    assert_denied_approval_leaves_only_that_owner(&app).await?;
     assert_eq!(private_paths.len(), 2);
     assert_ne!(private_paths.first(), private_paths.get(1));
     assert_ne!(decision_ids.first(), decision_ids.get(1));
@@ -499,7 +606,7 @@ async fn exercise_owners(
             "second owner must not overwrite first owner bytes"
         );
     }
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
     assert_eq!(provider.context_calls.load(Ordering::SeqCst), 2);
     assert_eq!(writes.load(Ordering::SeqCst), 2);
     Ok(())
@@ -647,7 +754,7 @@ async fn run_two_owner_work(endpoint: &str, calls: &AtomicUsize, scratch: &std::
     let runtime = state.pin_turn_runtime();
     let service = Arc::clone(runtime.decision_slot.publish(&runtime, &state).await?);
     let result = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         std::panic::AssertUnwindSafe(Box::pin(exercise_owners(&state, &provider, &writes, &workspace))).catch_unwind(),
     )
     .await;
@@ -666,7 +773,8 @@ async fn run_two_owner_work(endpoint: &str, calls: &AtomicUsize, scratch: &std::
         4,
         "one controlled decision request per direct probe and fresh approved resume"
     );
-    // All six whole turns remain durable after owned cleanup drains.
+    // The original three turns per owner, plus the later pending file_write.
+    // Denial does not add a second finalized turn.
     for (token, session, _) in OWNERS {
         let scope = console_runtime_envelope_for_workspace(
             workspace.to_string_lossy().as_ref(),
@@ -683,7 +791,8 @@ async fn run_two_owner_work(endpoint: &str, calls: &AtomicUsize, scratch: &std::
                 .iter()
                 .filter(|event| event.event_type == "turn.finalized")
                 .count(),
-            3
+            4,
+            "finalized turns for {session}"
         );
     }
     Ok(())

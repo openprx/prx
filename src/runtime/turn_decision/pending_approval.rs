@@ -194,12 +194,19 @@ impl TurnDecisionService {
         decision_id: DecisionId,
     ) -> anyhow::Result<DecisionApprovalView> {
         let pending = self.load_pending_decision_approval(owner, session, decision_id).await?;
-        self.verify_pending_console_file_operation(&pending).await?;
+        self.inspect_verified_pending(&pending).await
+    }
+
+    async fn inspect_verified_pending(
+        &self,
+        pending: &VerifiedPendingDecisionApproval,
+    ) -> anyhow::Result<DecisionApprovalView> {
+        self.verify_pending_console_file_operation(pending).await?;
         let call = pending
             .record
             .sealed_call
             .as_ref()
-            .map(|_| self.open_pending_call(&pending))
+            .map(|_| self.open_pending_call(pending))
             .transpose()?;
         let arguments = call
             .as_ref()
@@ -211,12 +218,12 @@ impl TurnDecisionService {
         self.check_live_parity()?;
         anyhow::ensure!(Utc::now() < pending.record.expires_at, "pending approval expired");
         Ok(DecisionApprovalView {
-            decision_id: pending.record.binding.decision_id,
+            decision_id: pending.record.binding.decision_id.clone(),
             tool: call.as_ref().map(|call| call.name.clone()),
             arguments,
             arguments_redacted,
             original_call_available: call.is_some(),
-            effect: pending.record.effect,
+            effect: pending.record.effect.clone(),
             call_digest: hex::encode(pending.record.binding.call_digest),
             pending_expires_at: pending.record.expires_at,
             single_use: true,
@@ -225,9 +232,11 @@ impl TurnDecisionService {
 
     /// Pending approvals for one owner, from the same ledger `inspect` reads.
     ///
-    /// Foreign rows are not returned. A row that fails inspection, or whose
-    /// operations are all already resolved, is omitted. `next_cursor` is the
-    /// last durable id examined when the page stopped before the ledger ended.
+    /// Foreign rows are not returned. A row that fails inspection, whose
+    /// authenticated review denies the call, or whose operations are all
+    /// already resolved, is omitted. An approved call that is still waiting
+    /// to resume stays listed. `next_cursor` is the last durable id examined
+    /// when the page stopped before the ledger ended.
     pub(crate) async fn list_pending_decision_approvals(
         &self,
         owner: &str,
@@ -309,19 +318,68 @@ impl TurnDecisionService {
                 return Ok(None);
             }
         };
-        if self.pending_operations_resolved(&pending).await? {
+        if self.pending_review_denies(&pending).await? || self.pending_operations_resolved(&pending).await? {
             return Ok(None);
         }
-        match self
-            .inspect_pending_decision_approval(owner, &session_id, decision_id)
-            .await
-        {
+        match self.inspect_verified_pending(&pending).await {
             Ok(view) => Ok(Some(PendingApprovalListItem { session_id, view })),
             Err(error) => {
                 tracing::debug!(%error, "pending approval omitted from inbox");
                 Ok(None)
             }
         }
+    }
+
+    /// A denial writes `decision-approval:{id}:review` with `approved: false`
+    /// and no resolution rows. Only an authenticated denial closes the item.
+    /// A missing, mismatched, or unauthenticated review leaves it listed.
+    async fn pending_review_denies(&self, pending: &VerifiedPendingDecisionApproval) -> anyhow::Result<bool> {
+        let record = &pending.record;
+        let review_key = format!("decision-approval:{}:review", record.binding.decision_id);
+        let Some(event) = self
+            .memory
+            .find_message_event_by_idempotency_key(&record.subject.workspace_id, &review_key)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let session = record.subject.session_key.as_deref().unwrap_or("");
+        let lineage_matches = event.id > 0
+            && event.workspace_id == record.subject.workspace_id
+            && event.owner_id.as_deref() == Some(record.subject.owner_id.as_str())
+            && event.session_key.as_deref() == Some(session)
+            && event.run_id == pending.source.run_id
+            && event.causation_event_id.as_deref() == Some(record.source_event_id.as_str())
+            && event.idempotency_key.as_deref() == Some(review_key.as_str())
+            && event.event_type == "approval.decision.reviewed";
+        if !lineage_matches {
+            tracing::debug!("pending review lineage did not match; inbox keeps the item");
+            return Ok(false);
+        }
+        let Some(payload) = event.raw_payload_json.as_deref() else {
+            tracing::debug!("pending review payload missing; inbox keeps the item");
+            return Ok(false);
+        };
+        let review: SignedReview = match serde_json::from_str(payload) {
+            Ok(review) => review,
+            Err(error) => {
+                tracing::debug!(%error, "pending review payload is not a signed review");
+                return Ok(false);
+            }
+        };
+        let pending_mac = self
+            .state_key
+            .hmac(KeyDomain::ApprovalState, &[b"pending", &serde_json::to_vec(record)?]);
+        let authentic = self.state_key.verify_hmac(
+            KeyDomain::ApprovalState,
+            &[b"review", &serde_json::to_vec(&review.record)?],
+            &review.mac,
+        ) && review.record.pending_mac == pending_mac;
+        if !authentic {
+            tracing::debug!("pending review mac did not authenticate; inbox keeps the item");
+            return Ok(false);
+        }
+        Ok(!review.record.approved)
     }
 
     async fn pending_operations_resolved(&self, pending: &VerifiedPendingDecisionApproval) -> anyhow::Result<bool> {
