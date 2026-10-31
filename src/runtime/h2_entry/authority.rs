@@ -238,6 +238,8 @@ impl RunContinuation {
         );
         Ok(())
     }
+    /// Pure validation also used by existing product/stage observers.
+    /// It never reserves launch ceilings or installs source authority.
     pub(crate) fn ensure_store_admission(
         &self,
         pin: &ControlledAdmissionPin,
@@ -255,6 +257,20 @@ impl RunContinuation {
             self.admission.as_ref() == Some(pin),
             "store admission differs from held source authority"
         );
+        Ok(())
+    }
+    /// Only the original admission owner calls this under its existing locks,
+    /// after authenticated spec identity/digest conflicts have been excluded.
+    pub(crate) fn claim_store_admission(
+        &self,
+        pin: &ControlledAdmissionPin,
+        plan: &crate::skills::lifecycle::experiment::FrozenExperiment,
+        workspace: &std::path::Path,
+        owner: &str,
+    ) -> Result<()> {
+        // Recheck held live authority at the actual mutation boundary; an
+        // earlier pure check does not authorize a later counter reservation.
+        self.ensure_store_admission(pin, plan, workspace, owner)?;
         self.profile()?.claim_experiment(plan)?;
         Ok(())
     }
