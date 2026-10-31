@@ -4,6 +4,8 @@
   import { riskReasonText } from '../lib/change-flow.svelte.js';
   import ErrorNotice from '../lib/ErrorNotice.svelte';
   import { t } from '../lib/i18n';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
 
   // The confirmations a rollback's 428 can ask for, each a body flag of
   // the retry; `if_match` is answered by the revision the 428 reports.
@@ -102,7 +104,7 @@
 
 <section class="space-y-6">
   <div class="flex items-center justify-between">
-    <h2 class="text-2xl font-semibold">{t('changes.title')}</h2>
+    <PageHeader title={t('changes.title')} />
     <button
       type="button"
       onclick={loadRecords}
@@ -167,13 +169,11 @@
   {/if}
 
   {#if loading}
-    <p class="text-sm text-gray-500 dark:text-gray-400">{t('common.loading')}</p>
+    <StateBlock variant="loading" message={t('common.loading')} />
   {:else if loadError}
     <ErrorNotice error={loadError} />
   {:else if records.length === 0}
-    <p class="rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
-      {t('changes.none')}
-    </p>
+    <StateBlock variant="empty" message={t('changes.none')} />
   {:else}
     <div class="space-y-3">
       {#each records as record (record.id)}

@@ -5,6 +5,7 @@
   import ErrorNotice from '../lib/ErrorNotice.svelte';
   import PlanReview from '../lib/PlanReview.svelte';
   import { t } from '../lib/i18n';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
 
   const SELECTION_OPERATIONS = ['chat', 'embedding'];
 
@@ -142,7 +143,7 @@
 
 <section class="space-y-6">
   <div class="flex items-center justify-between">
-    <h2 class="text-2xl font-semibold">{t('routing.title')}</h2>
+    <PageHeader title={t('routing.title')} />
     <button
       type="button"
       onclick={loadAll}

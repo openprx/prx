@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
 
   let from = $state(new Date(Date.now() - 86400000).toISOString().slice(0, 16));
   let to = $state(new Date().toISOString().slice(0, 16));
@@ -103,7 +104,7 @@
 
 <section class="space-y-5">
   <header>
-    <h2 class="text-2xl font-semibold">{t('decisionInspect.title')}</h2>
+    <PageHeader title={t('decisionInspect.title')} />
     <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">{t('decisionInspect.scope')}</p>
   </header>
   <form onsubmit={load} class="flex flex-wrap items-end gap-3 rounded-xl border border-gray-200 p-4 dark:border-gray-700">

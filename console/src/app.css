@@ -37,6 +37,39 @@
   --warning: #d4a106;
   --error: #dc2626;
   --info: #0891b2;
+  --console-space-1: 0.25rem;
+  --console-space-2: 0.5rem;
+  --console-space-3: 0.75rem;
+  --console-space-4: 1rem;
+  --console-space-5: 1.5rem;
+  --console-space-6: 2rem;
+  --console-space-7: 2.5rem;
+  --console-space-8: 3rem;
+  --console-type-xs: 0.75rem;
+  --console-type-sm: 0.875rem;
+  --console-type-md: 1rem;
+  --console-type-lg: 1.125rem;
+  --console-type-xl: 1.25rem;
+  --console-type-2xl: 1.5rem;
+  --console-leading-tight: 1.25;
+  --console-leading-body: 1.5;
+  --console-radius-sm: 0.375rem;
+  --console-radius-md: 0.5rem;
+  --console-radius-lg: 0.75rem;
+  --console-radius-full: 999px;
+  --console-role-bg: var(--bg-base);
+  --console-role-surface: var(--bg-card);
+  --console-role-elevated: var(--bg-elevated);
+  --console-role-sidebar: var(--bg-sidebar);
+  --console-role-border: var(--border);
+  --console-role-text: var(--text-primary);
+  --console-role-muted: var(--text-muted);
+  --console-role-accent: var(--accent);
+  --console-role-success: var(--success);
+  --console-role-warning: var(--warning);
+  --console-role-danger: var(--error);
+  --console-role-info: var(--info);
+  --console-focus-ring: var(--accent);
 }
 
 :root.dark {
@@ -106,8 +139,10 @@ html.dark {
 }
 
 .console-shell {
-  background: var(--bg-base);
-  color: var(--text-primary);
+  position: relative;
+  max-width: 100%;
+  background: var(--console-role-bg);
+  color: var(--console-role-text);
 }
 
 .console-sidebar {
@@ -116,6 +151,8 @@ html.dark {
 }
 
 .console-header {
+  min-width: 0;
+  max-width: 100%;
   background: color-mix(in srgb, var(--bg-card) 92%, transparent) !important;
   border-color: var(--border) !important;
 }
@@ -211,4 +248,297 @@ textarea::placeholder {
 
 :where(input:focus, select:focus, textarea:focus) {
   outline: none;
+}
+
+:where(a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, [tabindex]:focus-visible) {
+  outline: 2px solid var(--console-focus-ring);
+  outline-offset: 2px;
+}
+
+.ui-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.ui-skip-link {
+  position: absolute;
+  left: var(--console-space-3);
+  top: var(--console-space-3);
+  z-index: 70;
+  transform: translateY(-150%);
+  border-radius: var(--console-radius-md);
+  background: var(--console-role-accent);
+  color: #fff;
+  padding: var(--console-space-2) var(--console-space-3);
+  font-size: var(--console-type-sm);
+}
+
+.ui-skip-link:focus {
+  transform: none;
+}
+
+.ui-new-conversation {
+  border: 0;
+  border-radius: var(--console-radius-md);
+  background: var(--console-role-accent);
+  color: #fff;
+  padding: var(--console-space-2) var(--console-space-3);
+  font-size: var(--console-type-sm);
+  font-weight: 600;
+}
+
+.ui-new-conversation:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.ui-nav-group.is-current > .ui-nav-group-toggle {
+  color: var(--console-role-accent);
+}
+
+.ui-page-description {
+  margin: var(--console-space-1) 0 0;
+  color: var(--console-role-muted);
+  font-size: var(--console-type-sm);
+  line-height: var(--console-leading-body);
+}
+
+.ui-context dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 9.5rem), 1fr));
+  gap: var(--console-space-2) var(--console-space-3);
+  margin: var(--console-space-2) 0 0;
+}
+
+.ui-context dt,
+.ui-context dd {
+  margin: 0;
+  min-width: 0;
+}
+
+.ui-context dt {
+  color: var(--console-role-muted);
+  font-size: var(--console-type-xs);
+}
+
+.ui-context dd {
+  font-size: var(--console-type-sm);
+  line-height: var(--console-leading-tight);
+}
+
+.ui-state {
+  border: 1px solid var(--console-role-border);
+  border-radius: var(--console-radius-lg);
+  background: var(--console-role-surface);
+  padding: var(--console-space-3) var(--console-space-4);
+  color: var(--console-role-text);
+  font-size: var(--console-type-sm);
+}
+
+.ui-state p {
+  margin: 0;
+}
+
+.ui-state-loading,
+.ui-state-empty {
+  color: var(--console-role-muted);
+}
+
+.ui-state-error,
+.ui-state-denied {
+  border-color: color-mix(in srgb, var(--console-role-danger) 35%, transparent);
+  background: color-mix(in srgb, var(--console-role-danger) 10%, transparent);
+  color: var(--console-role-danger);
+}
+
+.ui-state-unavailable,
+.ui-state-disconnected-stale {
+  border-color: color-mix(in srgb, var(--console-role-warning) 40%, transparent);
+  background: color-mix(in srgb, var(--console-role-warning) 12%, transparent);
+}
+
+.ui-data-table-scroll {
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid var(--console-role-border);
+  border-radius: var(--console-radius-lg);
+}
+
+.ui-data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--console-type-sm);
+}
+
+.ui-data-table-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--console-role-elevated);
+  text-align: left;
+  padding: var(--console-space-2) var(--console-space-3);
+}
+
+.ui-data-table td {
+  padding: var(--console-space-2) var(--console-space-3);
+  border-top: 1px solid var(--console-role-border);
+}
+
+.ui-data-cards {
+  display: none;
+}
+
+.ui-data-card {
+  display: grid;
+  gap: var(--console-space-2);
+  border: 1px solid var(--console-role-border);
+  border-radius: var(--console-radius-lg);
+  background: var(--console-role-surface);
+  padding: var(--console-space-3);
+}
+
+.ui-data-card-label {
+  margin: 0;
+  color: var(--console-role-muted);
+  font-size: var(--console-type-xs);
+}
+
+.ui-truncate-id {
+  display: inline-block;
+  max-width: 12rem;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
+  padding: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.ui-truncate-id:focus {
+  max-width: 100%;
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.ui-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: var(--console-space-4);
+  background: color-mix(in srgb, #000 45%, transparent);
+}
+
+.ui-dialog {
+  width: min(100%, 32rem);
+  border-radius: var(--console-radius-lg);
+  background: var(--console-role-surface);
+  color: var(--console-role-text);
+  padding: var(--console-space-5);
+}
+
+.ui-dialog-body {
+  display: grid;
+  gap: var(--console-space-2);
+  margin: var(--console-space-3) 0 0;
+}
+
+.ui-dialog-object {
+  font-weight: 600;
+}
+
+.ui-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--console-space-2);
+  margin-top: var(--console-space-4);
+}
+
+.ui-dialog-cancel,
+.ui-dialog-confirm {
+  border-radius: var(--console-radius-md);
+  padding: var(--console-space-2) var(--console-space-3);
+  font-size: var(--console-type-sm);
+}
+
+.ui-dialog-cancel {
+  border: 1px solid var(--console-role-border);
+  background: var(--console-role-surface);
+}
+
+.ui-dialog-confirm {
+  border: 0;
+  background: var(--console-role-accent);
+  color: #fff;
+}
+
+.ui-form {
+  display: grid;
+  gap: var(--console-space-3);
+}
+
+.ui-field {
+  display: grid;
+  gap: var(--console-space-1);
+}
+
+.ui-field-error,
+.ui-form-summary {
+  margin: 0;
+  color: var(--console-role-danger);
+  font-size: var(--console-type-sm);
+}
+
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--console-role-border);
+  border-radius: var(--console-radius-full);
+  padding: 0.125rem var(--console-space-2);
+  font-size: var(--console-type-xs);
+}
+
+.ui-badge-success { color: var(--console-role-success); }
+.ui-badge-warning { color: var(--console-role-warning); }
+.ui-badge-danger { color: var(--console-role-danger); }
+.ui-badge-info { color: var(--console-role-info); }
+
+.ui-toast {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--console-space-2);
+}
+
+@media (max-width: 767px) {
+  .ui-data-table-scroll { display: none; }
+  .ui-data-cards {
+    display: grid;
+    gap: var(--console-space-3);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

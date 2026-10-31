@@ -1,6 +1,7 @@
 <script>
   import { apiBaseUrl } from '../lib/api';
   import { t } from '../lib/i18n';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
 
   const MAX_LINES = 1000;
   const RECONNECT_BASE_MS = 500;
@@ -169,7 +170,7 @@
 
 <section class="space-y-4">
   <div class="flex flex-wrap items-center justify-between gap-3">
-    <h2 class="text-2xl font-semibold">{t('logs.title')}</h2>
+    <PageHeader title={t('logs.title')} />
     <div class="flex items-center gap-2">
       <span class={`rounded-full border px-2 py-1 text-xs font-medium uppercase tracking-wide ${statusTone}`}>
         {statusLabel}

@@ -2,6 +2,8 @@
   import { api } from '../lib/api';
   import ErrorNotice from '../lib/ErrorNotice.svelte';
   import { t } from '../lib/i18n';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
 
   const HOOK_EVENTS = [
     'agent_start',
@@ -166,7 +168,7 @@
 
 <section class="space-y-6">
   <div class="flex items-center justify-between">
-    <h2 class="text-2xl font-semibold">{t('hooks.title')}</h2>
+    <PageHeader title={t('hooks.title')} />
     <button
       type="button"
       onclick={() => {
@@ -242,13 +244,11 @@
   {/if}
 
   {#if loading}
-    <p class="text-sm text-gray-500 dark:text-gray-400">{t('hooks.loading')}</p>
+    <StateBlock variant="loading" message={t('hooks.loading')} />
   {:else if loadError}
     <ErrorNotice error={loadError} />
   {:else if hooks.length === 0}
-    <p class="rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
-      {t('hooks.noHooks')}
-    </p>
+    <StateBlock variant="empty" message={t('hooks.noHooks')} />
   {:else}
     <ErrorNotice error={actionError} />
 

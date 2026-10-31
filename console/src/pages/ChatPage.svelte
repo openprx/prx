@@ -2,6 +2,8 @@
   import { onDestroy, tick } from 'svelte';
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
   import { navigate } from '../lib/router';
   import { Paperclip } from '@lucide/svelte';
   import DecisionApprovalPanel from '../components/DecisionApprovalPanel.svelte';
@@ -420,7 +422,7 @@
   {/key}
   <div class="flex items-center justify-between">
     <div class="min-w-0">
-      <h2 class="text-2xl font-semibold">{t('chat.title')}</h2>
+      <PageHeader title={t('chat.title')} />
       <p class="truncate font-mono text-xs text-gray-500 dark:text-gray-400">{t('chat.session')}: {sessionId}</p>
     </div>
     <button
@@ -433,9 +435,7 @@
   </div>
 
   {#if errorMessage}
-    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
-      {errorMessage}
-    </p>
+    <StateBlock variant="error" message={errorMessage} />
   {/if}
 
   <div
@@ -458,9 +458,9 @@
         </p>
       {/if}
       {#if loading}
-        <p class="text-sm text-gray-500 dark:text-gray-400">{t('chat.loading')}</p>
+        <StateBlock variant="loading" message={t('chat.loading')} />
       {:else if messages.length === 0}
-        <p class="text-sm text-gray-500 dark:text-gray-400">{t('chat.empty')}</p>
+        <StateBlock variant="empty" message={t('chat.empty')} />
       {:else}
         <div class="space-y-3">
           {#if hasMore}

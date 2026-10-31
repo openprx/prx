@@ -8,6 +8,7 @@
   import PlanReview from '../lib/PlanReview.svelte';
   import ErrorNotice from '../lib/ErrorNotice.svelte';
   import { t } from '../lib/i18n';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
 
   let status = $state(null);
   let loading = $state(false);
@@ -70,7 +71,7 @@
 
 <section class="space-y-5">
   <header class="flex flex-wrap items-center justify-between gap-3">
-    <h2 class="text-2xl font-semibold">{t('decisionPlane.title')}</h2>
+    <PageHeader title={t('decisionPlane.title')} />
     <button disabled={busy} onclick={load} class="rounded-lg border border-gray-400 px-3 py-2 disabled:opacity-50">{t('decisionPlane.refresh')}</button>
   </header>
   <ErrorNotice {error} />

@@ -1,8 +1,9 @@
 <script>
-  import { api } from './lib/api';
+  import { Sun, Moon } from '@lucide/svelte';
+  import { api, apiBaseUrl } from './lib/api';
   import { clearToken, getToken, syncTokenCookie } from './lib/auth';
-  // config-nav imports removed (ConfigPage is now a standalone file editor)
-  import { NAV_ITEMS } from './lib/constants';
+  import { gatewayOrigin } from './lib/context-status';
+  import { NAV_GROUPS, activeNavTarget, resolveRedirect } from './lib/constants';
   import {
     LANG_STORAGE_KEY,
     SUPPORTED_LANGUAGES,
@@ -12,7 +13,8 @@
     t
   } from './lib/i18n';
   import { currentPath, initRouter, navigate } from './lib/router';
-  import { Sun, Moon } from '@lucide/svelte';
+  import ContextHeader from './lib/ui/ContextHeader.svelte';
+  import PageHeader from './lib/ui/PageHeader.svelte';
 
   import LoginPage from './pages/LoginPage.svelte';
   import OverviewPage from './pages/OverviewPage.svelte';
@@ -38,11 +40,18 @@
   const THEME_STORAGE_KEY = 'prx-console-theme';
   let themePreference = $state('system');
   let isDark = $state(true);
-
+  let gatewayStatus = $state(null);
+  let groupOpen = $state({
+    work: true,
+    capabilities: true,
+    automation: true,
+    operations: true
+  });
 
   const isAuthenticated = $derived(token.length > 0);
   const activePath = $derived(isAuthenticated && path === '/' ? '/overview' : path);
-  const activeNavPath = $derived(activePath.startsWith('/chat/') ? '/sessions' : activePath);
+  const navTarget = $derived(activeNavTarget(activePath));
+  const gatewayAddress = $derived(gatewayOrigin(apiBaseUrl));
   const languageOptions = $derived(
     SUPPORTED_LANGUAGES.map((lang) => ({
       value: lang,
@@ -111,6 +120,9 @@
     navigate(targetPath);
   }
 
+  function toggleGroup(groupId) {
+    groupOpen[groupId] = groupOpen[groupId] === false;
+  }
 
   $effect(() => {
     initTheme();
@@ -139,13 +151,20 @@
         applyTheme();
       }
     };
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape' && mobileSidebarOpen) {
+        mobileSidebarOpen = false;
+      }
+    };
 
     window.addEventListener('storage', onStorage);
+    window.addEventListener('keydown', onKeyDown);
     mediaQuery.addEventListener('change', onThemeMediaChange);
 
     return () => {
       stopRouter();
       window.removeEventListener('storage', onStorage);
+      window.removeEventListener('keydown', onKeyDown);
       mediaQuery.removeEventListener('change', onThemeMediaChange);
     };
   });
@@ -158,17 +177,54 @@
 
     if (!isAuthenticated && path !== '/') {
       navigate('/', true);
+      return;
+    }
+
+    if (isAuthenticated) {
+      const redirected = resolveRedirect(path);
+      if (redirected) {
+        navigate(redirected, true);
+      }
     }
   });
 
+  $effect(() => {
+    if (!isAuthenticated) {
+      gatewayStatus = null;
+      return undefined;
+    }
 
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const next = await api.getStatus();
+        if (!cancelled) {
+          gatewayStatus = next && typeof next === 'object' ? next : null;
+        }
+      } catch {
+        if (!cancelled) {
+          gatewayStatus = null;
+        }
+      }
+    };
+
+    refresh();
+    const timer = setInterval(refresh, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  });
 </script>
 
 <div class="console-shell min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
+  <a class="ui-skip-link" href="#console-main">{t('shell.skipToContent')}</a>
   {#if !isAuthenticated}
-    <LoginPage onLogin={onLogin} />
+    <main id="console-main" class="min-h-screen" tabindex="-1">
+      <LoginPage onLogin={onLogin} />
+    </main>
   {:else}
-    <div class="flex min-h-screen">
+    <div class="flex min-h-screen max-w-full">
       {#if mobileSidebarOpen}
         <button
           type="button"
@@ -179,7 +235,8 @@
       {/if}
 
       <aside
-        class={`console-sidebar fixed inset-y-0 left-0 z-40 w-64 border-r border-gray-200 bg-white p-4 transition-transform dark:border-gray-700 dark:bg-gray-800 lg:static lg:translate-x-0 ${
+        id="console-sidebar"
+        class={`console-sidebar fixed inset-y-0 left-0 z-40 w-64 overflow-y-auto border-r border-gray-200 bg-white p-4 transition-transform dark:border-gray-700 dark:bg-gray-800 lg:static lg:translate-x-0 ${
           mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
@@ -187,39 +244,76 @@
           <p class="text-lg font-semibold">{t('app.title')}</p>
         </div>
 
-        <nav class="space-y-1">
-          {#each NAV_ITEMS as item}
-            <button
-              type="button"
-              onclick={() => goTo(item.path)}
-              class={`w-full rounded-lg px-3 py-2 text-left text-sm transition ${
-                activeNavPath === item.path
-                  ? 'bg-sky-600 text-white'
-                  : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-gray-700 dark:hover:text-gray-100'
-              }`}
-            >
-              {t(item.labelKey)}
-            </button>
-
-
+        <nav class="space-y-3" aria-label={t('shell.navLabel')}>
+          {#each NAV_GROUPS as group (group.id)}
+            <section class={`ui-nav-group ${navTarget?.groupId === group.id ? 'is-current' : ''}`}>
+              <button
+                type="button"
+                class="ui-nav-group-toggle flex w-full items-center justify-between rounded-md px-2 py-1 text-left text-xs font-semibold uppercase tracking-wide text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100"
+                aria-expanded={groupOpen[group.id] !== false}
+                aria-controls={`nav-group-${group.id}`}
+                aria-current={navTarget?.groupId === group.id ? 'true' : undefined}
+                onclick={() => toggleGroup(group.id)}
+              >
+                {t(group.labelKey)}
+              </button>
+              {#if groupOpen[group.id] !== false}
+                <ul id={`nav-group-${group.id}`} class="mt-1 space-y-1">
+                  {#each group.items as item (item.path)}
+                    <li>
+                      <button
+                        type="button"
+                        onclick={() => goTo(item.path)}
+                        aria-current={navTarget?.path === item.path ? 'page' : undefined}
+                        class={`w-full rounded-lg px-3 py-2 text-left text-sm transition ${
+                          navTarget?.path === item.path
+                            ? 'bg-sky-600 text-white'
+                            : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-gray-700 dark:hover:text-gray-100'
+                        }`}
+                      >
+                        {t(item.labelKey)}
+                      </button>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            </section>
           {/each}
         </nav>
       </aside>
 
-      <div class="flex min-w-0 flex-1 flex-col">
-        <header class="console-header sticky top-0 z-20 flex items-center justify-between border-b border-gray-200 bg-white/95 px-4 py-3 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95">
-          <div class="flex items-center gap-3">
+      <div class="flex min-w-0 max-w-full flex-1 flex-col">
+        <header class="console-header sticky top-0 z-20 flex max-w-full flex-wrap items-center justify-between gap-2 border-b border-gray-200 bg-white/95 px-4 py-3 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95">
+          <div class="flex min-w-0 flex-1 flex-wrap items-center gap-2">
             <button
               type="button"
               class="rounded-lg border border-gray-300 px-2 py-1 text-sm text-gray-700 dark:border-gray-700 dark:text-gray-200 lg:hidden"
+              aria-expanded={mobileSidebarOpen}
+              aria-controls="console-sidebar"
               onclick={() => (mobileSidebarOpen = !mobileSidebarOpen)}
             >
               {t('app.menu')}
             </button>
-            <h1 class="text-lg font-semibold">{t('app.title')}</h1>
+            <h1 class="min-w-0 truncate text-lg font-semibold">{t('app.title')}</h1>
+            <!--
+              Pending for C2 (D-M5-01): this control will call POST /api/sessions
+              with an empty body and open the returned conversation. It stays
+              disabled until that wiring exists. It is the only disabled control
+              the shell adds.
+            -->
+            <button
+              type="button"
+              class="ui-new-conversation"
+              disabled
+              title={t('shell.newConversationPending')}
+              aria-describedby="new-conversation-pending"
+            >
+              {t('shell.newConversation')}
+            </button>
+            <span id="new-conversation-pending" class="ui-visually-hidden">{t('shell.newConversationPending')}</span>
           </div>
 
-          <div class="flex items-center gap-2">
+          <div class="flex max-w-full flex-wrap items-center gap-2">
             <button
               type="button"
               aria-label={t('app.theme')}
@@ -238,7 +332,7 @@
               bind:value={i18n.lang}
               aria-label={t('app.language')}
               onchange={(event) => setLanguage(event.currentTarget.value)}
-              class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
+              class="max-w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
             >
               {#each languageOptions as option}
                 <option value={option.value}>{option.label}</option>
@@ -252,9 +346,10 @@
               {t('common.logout')}
             </button>
           </div>
+          <ContextHeader status={gatewayStatus} origin={gatewayAddress} />
         </header>
 
-        <main class="flex-1 p-4 sm:p-6">
+        <main id="console-main" class="min-w-0 max-w-full flex-1 p-4 sm:p-6" tabindex="-1">
           {#if activePath === '/overview'}
             <OverviewPage />
           {:else if activePath === '/decision-plane'}
@@ -289,7 +384,7 @@
             <LogsPage />
           {:else}
             <section class="space-y-4">
-              <h2 class="text-2xl font-semibold">{t('app.notFound')}</h2>
+              <PageHeader title={t('app.notFound')} />
               <button
                 type="button"
                 onclick={() => goTo('/overview')}

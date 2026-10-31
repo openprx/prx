@@ -27,7 +27,13 @@
     "providers": "提供商",
     "models": "模型",
     "routing": "默认与路由",
-    "changes": "变更"
+    "changes": "变更",
+    "groups": {
+      "work": "工作",
+      "capabilities": "能力",
+      "automation": "自动化与学习",
+      "operations": "运维"
+    }
   },
   "common": {
     "logout": "退出登录",
@@ -677,5 +683,52 @@
     "samples": "样本数",
     "brier": "布里尔分数",
     "ece": "预期校准误差"
+  },
+  "shell": {
+    "skipToContent": "跳到主要内容",
+    "newConversation": "新对话",
+    "newConversationPending": "新对话将在后续更新中提供。",
+    "contextLabel": "网关",
+    "navLabel": "主导航",
+    "origin": "网关地址",
+    "generation": "配置代",
+    "activeRevision": "当前修订",
+    "desiredRevision": "目标修订",
+    "reload": "重新加载",
+    "reloadIdle": "空闲",
+    "reloadFailed": "重新加载失败",
+    "reloadUnchanged": "无变更",
+    "reloadApplied": "已应用",
+    "reloadAppliedRestart": "已应用，需要重启",
+    "reloadRestartRequired": "等待重启",
+    "reloadInProgress": "正在重新加载",
+    "restartRequired": "重启",
+    "restartNeeded": "需要",
+    "restartNotNeeded": "不需要",
+    "providerDegradation": "提供方",
+    "degraded": "部分不可用",
+    "notDegraded": "可用"
+  },
+  "state": {
+    "empty": "暂无内容。",
+    "error": "无法加载。",
+    "denied": "你没有查看此内容的权限。",
+    "unavailable": "此部署中不可用。",
+    "disconnected": "连接已断开，或数据已过期。"
+  },
+  "dialog": {
+    "title": "确认此操作",
+    "confirm": "确认",
+    "cancel": "取消"
+  },
+  "form": {
+    "kept": "请修正标出的字段。已填写的内容会保留。"
+  },
+  "toast": {
+    "dismiss": "关闭通知",
+    "region": "通知"
+  },
+  "table": {
+    "empty": "没有可显示的行。"
   }
 }

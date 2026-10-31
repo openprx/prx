@@ -1,6 +1,8 @@
 <script>
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
   import { navigate } from '../lib/router';
 
   const PAGE_SIZE = 20;
@@ -127,7 +129,7 @@
 <section class="space-y-6">
   <div class="flex flex-wrap items-center justify-between gap-3">
     <div class="flex items-center gap-3">
-      <h2 class="text-2xl font-semibold">{t('sessions.title')}</h2>
+      <PageHeader title={t('sessions.title')} />
       {#if refreshing && !loading}
         <span class="text-xs text-gray-500 dark:text-gray-400">{t('common.loading')}</span>
       {/if}
@@ -176,15 +178,11 @@
   </div>
 
   {#if loading}
-    <p class="text-sm text-gray-500 dark:text-gray-400">{t('sessions.loading')}</p>
+    <StateBlock variant="loading" message={t('sessions.loading')} />
   {:else if errorMessage}
-    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
-      {errorMessage}
-    </p>
+    <StateBlock variant="error" message={errorMessage} />
   {:else if sessions.length === 0}
-    <p class="rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
-      {t('sessions.none')}
-    </p>
+    <StateBlock variant="empty" message={t('sessions.none')} />
   {:else}
     <div class="overflow-x-auto rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800">
       <table class="min-w-full divide-y divide-gray-200 text-sm dark:divide-gray-700">

@@ -5,6 +5,8 @@
   import ErrorNotice from '../lib/ErrorNotice.svelte';
   import PlanReview from '../lib/PlanReview.svelte';
   import { t } from '../lib/i18n';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
 
   const REFERENCE_PREFIX = 'cred-';
 
@@ -224,7 +226,7 @@
 
 <section class="space-y-6">
   <div class="flex items-center justify-between">
-    <h2 class="text-2xl font-semibold">{t('providers.title')}</h2>
+    <PageHeader title={t('providers.title')} />
     <button
       type="button"
       onclick={reloadAll}
@@ -260,13 +262,11 @@
   <PlanReview {flow} />
 
   {#if loading}
-    <p class="text-sm text-gray-500 dark:text-gray-400">{t('common.loading')}</p>
+    <StateBlock variant="loading" message={t('common.loading')} />
   {:else if loadError}
     <ErrorNotice error={loadError} />
   {:else if providers.length === 0}
-    <p class="rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
-      {t('providers.none')}
-    </p>
+    <StateBlock variant="empty" message={t('providers.none')} />
   {:else}
     <div class="space-y-3">
       {#each providers as entry (entry.identity)}

@@ -1,6 +1,8 @@
 <script>
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
 
   let activeTab = $state('installed');
   let skills = $state([]);
@@ -118,7 +120,7 @@
 <section class="space-y-6">
   <div class="flex items-center justify-between">
     <div class="flex items-center gap-3">
-      <h2 class="text-2xl font-semibold">{t('skills.title')}</h2>
+      <PageHeader title={t('skills.title')} />
       {#if !loading && skills.length > 0}
         <span class="text-sm text-gray-500 dark:text-gray-400">
           {enabledCount}/{skills.length} {t('skills.active')}
@@ -166,15 +168,11 @@
 
   {#if activeTab === 'installed'}
     {#if loading}
-      <p class="text-sm text-gray-500 dark:text-gray-400">{t('skills.loading')}</p>
+      <StateBlock variant="loading" message={t('skills.loading')} />
     {:else if errorMessage}
-      <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
-        {errorMessage}
-      </p>
+      <StateBlock variant="error" message={errorMessage} />
     {:else if skills.length === 0}
-      <p class="rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
-        {t('skills.noSkills')}
-      </p>
+      <StateBlock variant="empty" message={t('skills.noSkills')} />
     {:else}
       <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {#each sortedSkills as skill}

@@ -1,6 +1,8 @@
 <script>
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
   import { Blocks, RefreshCw, CheckCircle, AlertCircle, Loader } from '@lucide/svelte';
 
   let plugins = $state([]);
@@ -74,7 +76,7 @@
   <div class="flex items-center justify-between">
     <div class="flex items-center gap-2">
       <Blocks size={24} />
-      <h2 class="text-2xl font-semibold">{t('plugins.title')}</h2>
+      <PageHeader title={t('plugins.title')} />
     </div>
     <button
       type="button"
@@ -86,11 +88,9 @@
   </div>
 
   {#if loading}
-    <p class="text-sm text-gray-500 dark:text-gray-400">{t('plugins.loading')}</p>
+    <StateBlock variant="loading" message={t('plugins.loading')} />
   {:else if errorMessage}
-    <div class="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-600 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
-      {errorMessage}
-    </div>
+    <StateBlock variant="error" message={errorMessage} />
   {:else if plugins.length === 0}
     <div class="rounded-lg border border-gray-200 bg-gray-50 p-8 text-center dark:border-gray-700 dark:bg-gray-800">
       <Blocks size={40} class="mx-auto mb-3 text-gray-400 dark:text-gray-500" />

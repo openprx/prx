@@ -27,7 +27,13 @@
     "providers": "Провайдеры",
     "models": "Модели",
     "routing": "Умолчания и маршруты",
-    "changes": "Изменения"
+    "changes": "Изменения",
+    "groups": {
+      "work": "Работа",
+      "capabilities": "Возможности",
+      "automation": "Автоматизация и обучение",
+      "operations": "Эксплуатация"
+    }
   },
   "common": {
     "logout": "Выйти",
@@ -677,5 +683,52 @@
     "samples": "Выборка",
     "brier": "Оценка Брайера",
     "ece": "Ожидаемая ошибка калибровки"
+  },
+  "shell": {
+    "skipToContent": "Перейти к содержимому",
+    "newConversation": "Новый разговор",
+    "newConversationPending": "Новый разговор появится в следующем обновлении.",
+    "contextLabel": "Шлюз",
+    "navLabel": "Основная навигация",
+    "origin": "Адрес шлюза",
+    "generation": "Поколение конфигурации",
+    "activeRevision": "Действующая ревизия",
+    "desiredRevision": "Целевая ревизия",
+    "reload": "Обновление",
+    "reloadIdle": "Ожидание",
+    "reloadFailed": "Обновление не удалось",
+    "reloadUnchanged": "Без изменений",
+    "reloadApplied": "Применено",
+    "reloadAppliedRestart": "Применено, нужен перезапуск",
+    "reloadRestartRequired": "Ожидается перезапуск",
+    "reloadInProgress": "Обновление выполняется",
+    "restartRequired": "Перезапуск",
+    "restartNeeded": "Требуется",
+    "restartNotNeeded": "Не требуется",
+    "providerDegradation": "Поставщики",
+    "degraded": "Ограничены",
+    "notDegraded": "Доступны"
+  },
+  "state": {
+    "empty": "Нет данных для показа.",
+    "error": "Не удалось загрузить.",
+    "denied": "Недостаточно прав для просмотра.",
+    "unavailable": "Недоступно в этом развёртывании.",
+    "disconnected": "Соединение потеряно или данные устарели."
+  },
+  "dialog": {
+    "title": "Подтвердите действие",
+    "confirm": "Подтвердить",
+    "cancel": "Отмена"
+  },
+  "form": {
+    "kept": "Исправьте отмеченные поля. Введённые данные сохранены."
+  },
+  "toast": {
+    "dismiss": "Закрыть уведомление",
+    "region": "Уведомления"
+  },
+  "table": {
+    "empty": "Нет строк для показа."
   }
 }

@@ -27,7 +27,13 @@
     "providers": "Providers",
     "models": "Models",
     "routing": "Defaults & routes",
-    "changes": "Changes"
+    "changes": "Changes",
+    "groups": {
+      "work": "Work",
+      "capabilities": "Capabilities",
+      "automation": "Automation and learning",
+      "operations": "Operations"
+    }
   },
   "common": {
     "logout": "Logout",
@@ -677,5 +683,52 @@
     "samples": "Samples",
     "brier": "Brier score",
     "ece": "Expected calibration error"
+  },
+  "shell": {
+    "skipToContent": "Skip to content",
+    "newConversation": "New conversation",
+    "newConversationPending": "New conversation will be available in a later update.",
+    "contextLabel": "Gateway",
+    "navLabel": "Primary navigation",
+    "origin": "Gateway address",
+    "generation": "Generation",
+    "activeRevision": "Active revision",
+    "desiredRevision": "Desired revision",
+    "reload": "Reload",
+    "reloadIdle": "Idle",
+    "reloadFailed": "Reload failed",
+    "reloadUnchanged": "Unchanged",
+    "reloadApplied": "Applied",
+    "reloadAppliedRestart": "Applied, restart required",
+    "reloadRestartRequired": "Waiting for restart",
+    "reloadInProgress": "Reload in progress",
+    "restartRequired": "Restart",
+    "restartNeeded": "Required",
+    "restartNotNeeded": "Not required",
+    "providerDegradation": "Providers",
+    "degraded": "Degraded",
+    "notDegraded": "Available"
+  },
+  "state": {
+    "empty": "Nothing to show.",
+    "error": "Could not load this.",
+    "denied": "You do not have permission to view this.",
+    "unavailable": "Unavailable in this deployment.",
+    "disconnected": "Connection lost or the data is out of date."
+  },
+  "dialog": {
+    "title": "Confirm this action",
+    "confirm": "Confirm",
+    "cancel": "Cancel"
+  },
+  "form": {
+    "kept": "Correct the highlighted fields. Your entries were kept."
+  },
+  "toast": {
+    "dismiss": "Dismiss notification",
+    "region": "Notifications"
+  },
+  "table": {
+    "empty": "No rows to show."
   }
 }
