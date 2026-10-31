@@ -5,12 +5,13 @@ use crate::runtime::h2_entry::{self, EntryAction};
 use crate::skills::lifecycle::*;
 use serde::de::DeserializeOwned;
 
-pub(super) const DESCRIPTION: &str = "Run the controlled instruction lifecycle using twelve typed actions. Plan accepts business intent (existing skill/pattern IDs and explicit budgets), then admit/run copy its complete returned plan. Inspect returns handle/final_selection/publication/adoption observations used by later actions. Review/publish/annotate use the exact observed final selection; rollback/retire/lessons use real history, never invented evidence. Required approval and explicit resume remain separate from execution. No create/install/import/legacy mutation or Study action exists in this controlled profile. See the request DTO mapping, field schemas and copy-source rules; never invent runtime owner, workspace, MAC, pins or proof.";
+pub(super) const DESCRIPTION: &str = "Run the controlled instruction lifecycle using twelve typed lifecycle actions plus bounded read-only catalog discovery. Start with catalog to select actual managed skill/pattern IDs; candidate IDs are not eligibility or authority. Plan accepts business intent (existing skill/pattern IDs and explicit budgets), then admit/run copy its complete returned plan. Inspect returns handle/final_selection/publication/adoption observations used by later actions. Review/publish/annotate use the exact observed final selection; rollback/retire/lessons use real history, never invented evidence. Required approval and explicit resume remain separate from execution. No create/install/import/legacy mutation or Study action exists in this controlled profile. See the request DTO mapping, field schemas and copy-source rules; never invent runtime owner, workspace, MAC, pins or proof.";
 pub(super) fn parameters_schema() -> serde_json::Value {
     schema::parameters_schema()
 }
 
-pub(super) const ACTIONS: [&str; 12] = [
+pub(super) const ACTIONS: [&str; 13] = [
+    "lifecycle_experiment_catalog",
     "lifecycle_experiment_plan",
     "lifecycle_experiment_admit",
     "lifecycle_experiment_run",
@@ -65,6 +66,7 @@ impl SkillsManageTool {
             };
             let dispatch = async {
                 Ok::<serde_json::Value, anyhow::Error>(match action_kind {
+                    EntryAction::Catalog => json!(service.catalog_product(&request(args)?, &self.config)?),
                     EntryAction::Plan => json!(service.plan_product(request(args)?, &self.config)?),
                     EntryAction::Admit => {
                         let plan: experiment::InstructionExperimentPlan = request(args)?;

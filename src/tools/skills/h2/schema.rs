@@ -11,6 +11,7 @@ pub(super) fn parameters_schema()->Value {
     "action": {
       "type": "string",
       "enum": [
+        "lifecycle_experiment_catalog",
         "lifecycle_experiment_plan",
         "lifecycle_experiment_admit",
         "lifecycle_experiment_run",
@@ -24,10 +25,13 @@ pub(super) fn parameters_schema()->Value {
         "lifecycle_experiment_retire",
         "lifecycle_experiment_lessons"
       ],
-      "description": "Choose exactly one action. Request DTO mapping: plan=Draft; admit=IssuedPlan; run=IssuedPlan; inspect=Handle; cancel=Handle; recover=Handle; review=Final; publish=Publish; annotate=Annotation; rollback=Rollback; retire=Retirement; lessons=Lessons."
+      "description": "Choose exactly one action. Request DTO mapping: catalog=Catalog; plan=Draft; admit=IssuedPlan; run=IssuedPlan; inspect=Handle; cancel=Handle; recover=Handle; review=Final; publish=Publish; annotate=Annotation; rollback=Rollback; retire=Retirement; lessons=Lessons."
     },
     "request": {
       "oneOf": [
+        {
+          "$ref": "#/$defs/Catalog"
+        },
         {
           "$ref": "#/$defs/Draft"
         },
@@ -64,8 +68,29 @@ pub(super) fn parameters_schema()->Value {
     "request"
   ],
   "additionalProperties": false,
-  "description": "Controlled instruction lifecycle. Start with plan using a real skill and verified pattern IDs plus explicit user budgets; then admit and run the returned immutable plan. Inspect the actual snapshot. If final_selection exists, review it, publish {expected:final_selection}, then annotate the actual committed transaction. Approval is separate from execution: use the original terminal/Console review and explicit resume. Cancel persists a request; recover reconciles original facts; neither proves termination or retries Unknown. Historical inspect/query/replay and fresh authorized maintenance do not resume an old root. Study is local CLI only.",
+  "description": "Controlled instruction lifecycle. Start with catalog using {} to discover real candidate skill/pattern IDs, then plan with selected IDs and explicit user budgets. Catalog is bounded read-only discovery, not eligibility or authority; Plan revalidates candidates. Then admit and run the returned immutable plan. Inspect the actual snapshot. If final_selection exists, review it, publish {expected:final_selection}, then annotate the actual committed transaction. Approval is separate from execution: use the original terminal/Console review and explicit resume. Cancel persists a request; recover reconciles original facts; neither proves termination or retries Unknown. Historical inspect/query/replay and fresh authorized maintenance do not resume an old root. Study is local CLI only.",
   "$defs": {
+    "Catalog": {
+      "type": "object",
+      "properties": {
+        "after_skill": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional advisory cursor copied from actual catalog next_after_skill; omit or null for the first page."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Bounded candidate discovery: no plan/root/owner or MAC fields. Returns state complete|partial|unavailable, skills[{skill_id,display_name,description,patterns[{pattern_id,statement}]}], next_after_skill, observations, scanned_entries and input_bytes. At most 16 skills/8 patterns each/32KiB output; partial/unavailable is not an empty-store proof. Cursor pages skills, not exhaustive patterns. Plan revalidates every selected ID.",
+      "examples": [
+        {}
+      ]
+    },
     "Digest": {
       "type": "string",
       "description": "Lowercase SHA256 copied from the actual service result; never guess or recompute owner evidence.",
@@ -1519,6 +1544,25 @@ pub(super) fn parameters_schema()->Value {
       "if": {
         "properties": {
           "action": {
+            "const": "lifecycle_experiment_catalog"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "$ref": "#/$defs/Catalog"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
             "const": "lifecycle_experiment_plan"
           }
         },
@@ -1745,6 +1789,10 @@ pub(super) fn parameters_schema()->Value {
     }
   ],
   "examples": [
+    {
+      "action": "lifecycle_experiment_catalog",
+      "request": {}
+    },
     {
       "action": "lifecycle_experiment_inspect",
       "request": {

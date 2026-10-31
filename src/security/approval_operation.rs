@@ -215,7 +215,8 @@ fn skills_manage_lifecycle_action(args: &serde_json::Value) -> Option<LifecycleA
     if let Ok(action) = crate::runtime::h2_entry::EntryAction::parse(name) {
         let read_only = matches!(
             action,
-            crate::runtime::h2_entry::EntryAction::Plan
+            crate::runtime::h2_entry::EntryAction::Catalog
+                | crate::runtime::h2_entry::EntryAction::Plan
                 | crate::runtime::h2_entry::EntryAction::Inspect
                 | crate::runtime::h2_entry::EntryAction::Lessons
         );

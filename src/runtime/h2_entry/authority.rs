@@ -10,6 +10,7 @@ use std::sync::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EntryAction {
+    Catalog,
     Plan,
     Admit,
     Run,
@@ -26,6 +27,7 @@ pub(crate) enum EntryAction {
 impl EntryAction {
     pub(crate) fn parse(action: &str) -> Result<Self> {
         Ok(match action.strip_prefix("lifecycle_experiment_") {
+            Some("catalog") => Self::Catalog,
             Some("plan") => Self::Plan,
             Some("admit") => Self::Admit,
             Some("run") => Self::Run,
