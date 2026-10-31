@@ -196,7 +196,15 @@ async fn v01_loopback_keeps_original_owner_denominator_private_oracles_and_seale
                 "spec": generic.plan.spec(),
                 "plan_sha256": generic.plan.digest(),
                 "entries": &generic.entries,
-                "state": &generic.state,
+                // Match the existing CLI public projection and also scan
+                // every in-memory state field without adding production serde.
+                "state_debug": format!("{:?}", generic.state),
+                "committed": generic.state.committed(&generic.plan)?,
+                "cancelled": generic.state.cancelled,
+                "qualified": service.experiment_qualified(&generic)?,
+                "published": false,
+                "physical_observations": service.experiment_physical_observations(&generic, &cfg)?,
+                "development_probes": service.experiment_development_probes(&generic)?,
                 "head_sha256": &generic.head_sha256,
             }),
             &calibration,

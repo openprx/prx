@@ -222,7 +222,7 @@ async fn product_plan_revalidates_discovered_candidate_after_record_loss_corrupt
         let f = fixture();
         let original = usable_pattern(&f);
         let server = Server::start(false).await?;
-        let result = async {
+        let result: Result<()> = async {
             let (cfg, service) = configured_service(&f, &server)?;
             let discovered = service.catalog_product(&ExperimentCatalogRequest::default(), &cfg)?;
             assert!(
