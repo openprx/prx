@@ -2,7 +2,9 @@ pub mod anthropic_token;
 pub mod codex_auth;
 pub mod discovery;
 pub mod openai_oauth;
+pub mod openrouter_oauth;
 pub mod profiles;
+pub mod terms;
 pub mod xai_oauth;
 
 use crate::auth::codex_auth::{default_codex_auth_json_path, load_openai_codex_profile_from_auth_json};
@@ -49,7 +51,7 @@ impl AuthService {
     }
 
     pub fn new(state_dir: &Path, encrypt_secrets: bool) -> Self {
-        Self::new_with_codex_import(state_dir, encrypt_secrets, Some(default_codex_auth_json_path()), true)
+        Self::new_with_codex_import(state_dir, encrypt_secrets, Some(default_codex_auth_json_path()), false)
     }
 
     pub fn new_with_codex_import(
@@ -60,7 +62,7 @@ impl AuthService {
     ) -> Self {
         Self {
             store: AuthProfilesStore::new(state_dir, encrypt_secrets),
-            client: reqwest::Client::new(),
+            client: crate::prx_http_client(),
             codex_auth_json_path: codex_auth_json_path.unwrap_or_else(default_codex_auth_json_path),
             codex_auth_json_auto_import,
             #[cfg(test)]
@@ -89,6 +91,25 @@ impl AuthService {
     ) -> Result<AuthProfile> {
         let mut profile = AuthProfile::new_oauth(OPENAI_CODEX_PROVIDER, profile_name, token_set);
         profile.account_id = account_id;
+        self.store.upsert_profile(profile.clone(), set_active)?;
+        Ok(profile)
+    }
+
+    /// Store Sign in with ChatGPT tokens and the issued `oaiapp_` client id.
+    pub fn store_openai_siwc_tokens(
+        &self,
+        profile_name: &str,
+        token_set: crate::auth::profiles::TokenSet,
+        account_id: Option<String>,
+        client_id: &str,
+        set_active: bool,
+    ) -> Result<AuthProfile> {
+        let mut profile = AuthProfile::new_oauth(OPENAI_CODEX_PROVIDER, profile_name, token_set);
+        profile.account_id = account_id;
+        profile.metadata.insert(
+            openai_oauth::OPENAI_CLIENT_ID_METADATA.to_string(),
+            client_id.to_string(),
+        );
         self.store.upsert_profile(profile.clone(), set_active)?;
         Ok(profile)
     }
@@ -226,7 +247,18 @@ impl AuthService {
             anyhow::bail!("OpenAI token refresh is in backoff for {remaining}s due to previous failures");
         }
 
-        let mut refreshed = match refresh_access_token(&self.client, &refresh_token).await {
+        let client_id = latest_profile
+            .metadata
+            .get(openai_oauth::OPENAI_CLIENT_ID_METADATA)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| value.starts_with("oaiapp_"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "This OpenAI profile has no Sign in with ChatGPT client id. Run `prx auth login --provider openai-codex`. Codex CLI client ids are not used for refresh."
+                )
+            })?;
+        let mut refreshed = match refresh_access_token(&self.client, &refresh_token, client_id).await {
             Ok(tokens) => {
                 clear_refresh_backoff(&profile_id);
                 tokens

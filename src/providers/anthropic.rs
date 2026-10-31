@@ -23,7 +23,6 @@ const STREAM_DECODER_LABEL: &str = "Anthropic";
 struct OAuthState {
     credential: Option<String>,
     refresh_token: Option<String>,
-    expires_at: Option<i64>,
 }
 
 pub struct AnthropicProvider {
@@ -258,14 +257,13 @@ impl AnthropicProvider {
                     .filter(|k| !k.is_empty())
                     .map(ToString::to_string),
                 refresh_token: None,
-                expires_at: None,
             }),
             base_url,
             parameter_provider: super::ProviderId::of("anthropic"),
         }
     }
 
-    pub fn with_oauth(credential: Option<&str>, refresh_token: Option<String>, expires_at: Option<i64>) -> Self {
+    pub fn with_oauth(credential: Option<&str>, refresh_token: Option<String>, _expires_at: Option<i64>) -> Self {
         Self {
             oauth: Mutex::new(OAuthState {
                 credential: credential
@@ -273,7 +271,6 @@ impl AnthropicProvider {
                     .filter(|k| !k.is_empty())
                     .map(ToString::to_string),
                 refresh_token,
-                expires_at,
             }),
             base_url: "https://api.anthropic.com".to_string(),
             parameter_provider: super::ProviderId::of("anthropic"),
@@ -285,67 +282,18 @@ impl AnthropicProvider {
         self
     }
 
-    /// 90-second buffer before expiry to proactively refresh.
-    const REFRESH_BUFFER_MS: i64 = 90_000;
-
-    /// Returns a fresh credential, refreshing the OAuth token if needed.
+    /// Returns a fresh credential. Subscription setup-tokens and refresh tokens are refused.
     /// For plain API keys (no refresh_token), returns the credential as-is.
     fn ensure_fresh_credential(&self) -> anyhow::Result<String> {
-        let mut state = self.oauth.lock();
+        let state = self.oauth.lock();
 
-        // If no refresh_token, this is a plain API key — just return it.
-        if state.refresh_token.is_none() {
-            return state.credential.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Anthropic credentials not set. Set `api_key` in config.toml, or store a key or setup-token with `prx auth paste-token --provider anthropic`."
-                )
-            });
-        }
-
-        // Check whether the token is expired or within the buffer.
-        let needs_refresh = state.expires_at.map_or_else(
-            || state.credential.is_none(),
-            |expires_at| {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .and_then(|d| i64::try_from(d.as_millis()).ok())
-                    .unwrap_or(i64::MAX);
-                expires_at <= now_ms.saturating_add(Self::REFRESH_BUFFER_MS)
-            },
-        );
-
-        if needs_refresh {
-            let refresh_token = state
-                .refresh_token
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("OAuth token expired but no refresh_token available"))?;
-            tracing::info!("Proactively refreshing Claude Code OAuth token");
-            let refreshed = super::refresh_claude_code_access_token(&refresh_token)?;
-
-            state.credential = refreshed.access_token.clone();
-            if let Some(new_expires) = refreshed.expires_at {
-                state.expires_at = Some(new_expires);
-            }
-            if let Some(new_refresh) = refreshed.refresh_token.as_ref() {
-                state.refresh_token = Some(new_refresh.clone());
-            }
-
-            // Persist refreshed credentials to the cached file.
-            let write_creds = super::ClaudeCodeCredentials {
-                access_token: refreshed.access_token,
-                refresh_token: Some(refreshed.refresh_token.unwrap_or_else(|| refresh_token.clone())),
-                expires_at: refreshed.expires_at,
-                subscription_type: None,
-            };
-            if let Err(e) = super::write_claude_code_cached_credentials(&write_creds) {
-                tracing::warn!(error = %e, "Failed to write refreshed Claude Code credentials");
-            }
+        if state.refresh_token.is_some() || state.credential.as_deref().is_some_and(Self::is_setup_token) {
+            anyhow::bail!("{}", crate::auth::terms::ANTHROPIC_SUBSCRIPTION_REMOVED);
         }
 
         state.credential.clone().ok_or_else(|| {
             anyhow::anyhow!(
-                "Anthropic credentials not set. Set `api_key` in config.toml, or store a key or setup-token with `prx auth paste-token --provider anthropic`."
+                "Anthropic credentials not set. Set `api_key` in config.toml or store a Console API key with `prx auth paste-token --provider anthropic`."
             )
         })
     }
@@ -353,37 +301,7 @@ impl AnthropicProvider {
     /// Try to refresh the token after a 401 response. Returns Ok(new_credential) if
     /// refresh succeeded, Err if no refresh possible (plain API key or no refresh_token).
     fn try_refresh_after_401(&self) -> anyhow::Result<String> {
-        let mut state = self.oauth.lock();
-
-        let refresh_token = state
-            .refresh_token
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("No refresh_token available for 401 retry"))?;
-
-        tracing::info!("Refreshing Claude Code OAuth token after 401");
-        let refreshed = super::refresh_claude_code_access_token(&refresh_token)?;
-
-        state.credential = refreshed.access_token.clone();
-        if let Some(new_expires) = refreshed.expires_at {
-            state.expires_at = Some(new_expires);
-        }
-        if let Some(new_refresh) = refreshed.refresh_token.as_ref() {
-            state.refresh_token = Some(new_refresh.clone());
-        }
-
-        let write_creds = super::ClaudeCodeCredentials {
-            access_token: refreshed.access_token.clone(),
-            refresh_token: Some(refreshed.refresh_token.unwrap_or_else(|| refresh_token.clone())),
-            expires_at: refreshed.expires_at,
-            subscription_type: None,
-        };
-        if let Err(e) = super::write_claude_code_cached_credentials(&write_creds) {
-            tracing::warn!(error = %e, "Failed to write refreshed Claude Code credentials");
-        }
-
-        refreshed
-            .access_token
-            .ok_or_else(|| anyhow::anyhow!("OAuth refresh succeeded but returned no access_token"))
+        anyhow::bail!("{}", crate::auth::terms::ANTHROPIC_SUBSCRIPTION_REMOVED)
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -393,8 +311,6 @@ impl AnthropicProvider {
     fn apply_auth(&self, request: reqwest::RequestBuilder, credential: &str) -> reqwest::RequestBuilder {
         if Self::is_setup_token(credential) {
             request
-                .header("Authorization", format!("Bearer {credential}"))
-                .header("anthropic-beta", "oauth-2025-04-20")
         } else {
             request.header("x-api-key", credential)
         }
@@ -849,7 +765,7 @@ impl AnthropicProvider {
                 tracing::error!("proxy build failed for provider.anthropic, using direct: {e}");
                 e
             })
-            .unwrap_or_else(|_| Client::new())
+            .unwrap_or_else(|_| crate::prx_http_client())
     }
 
     /// Client for streaming requests: a connect timeout, but no whole-request
@@ -867,9 +783,10 @@ impl AnthropicProvider {
             })
             .unwrap_or_else(|_| {
                 Client::builder()
+                    .user_agent(crate::PRX_USER_AGENT)
                     .connect_timeout(std::time::Duration::from_secs(10))
                     .build()
-                    .unwrap_or_else(|_| Client::new())
+                    .unwrap_or_else(|_| crate::prx_http_client())
             })
     }
 }
@@ -1915,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_auth_uses_bearer_and_beta_for_setup_tokens() {
+    fn apply_auth_does_not_send_setup_tokens() {
         let provider = AnthropicProvider::new(None);
         let request = provider
             .apply_auth(
@@ -1925,15 +1842,12 @@ mod tests {
             .build()
             .expect("request should build");
 
-        assert_eq!(
-            request.headers().get("authorization").and_then(|v| v.to_str().ok()),
-            Some("Bearer sk-ant-oat01-test-token")
-        );
-        assert_eq!(
-            request.headers().get("anthropic-beta").and_then(|v| v.to_str().ok()),
-            Some("oauth-2025-04-20")
-        );
+        assert!(request.headers().get("authorization").is_none());
+        assert!(request.headers().get("anthropic-beta").is_none());
         assert!(request.headers().get("x-api-key").is_none());
+        let refused = AnthropicProvider::new(Some("sk-ant-oat01-test-token"));
+        let error = refused.ensure_fresh_credential().expect_err("setup tokens are refused");
+        assert!(error.to_string().contains("17154008"), "{error}");
     }
 
     #[test]

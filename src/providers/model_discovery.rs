@@ -249,6 +249,7 @@ pub(crate) fn build_model_fetch_client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(8))
         .connect_timeout(Duration::from_secs(4))
+        .user_agent(crate::PRX_USER_AGENT)
         .build()
         .context("failed to build model-fetch HTTP client")
 }
@@ -302,18 +303,14 @@ pub(crate) fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<Discov
         bail!("Anthropic model fetch requires API key or OAuth token");
     };
 
-    let client = build_model_fetch_client()?;
-    let mut request = client
-        .get("https://api.anthropic.com/v1/models")
-        .header("anthropic-version", "2023-06-01");
-
     if is_claude_code_oauth_setup_token(api_key) {
-        request = request
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("anthropic-beta", "oauth-2025-04-20");
-    } else {
-        request = request.header("x-api-key", api_key);
+        bail!("{}", crate::auth::terms::ANTHROPIC_SUBSCRIPTION_REMOVED);
     }
+    let client = build_model_fetch_client()?;
+    let request = client
+        .get("https://api.anthropic.com/v1/models")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-api-key", api_key);
 
     let response = request
         .send()
@@ -892,10 +889,6 @@ pub fn run_models_probe_read_only(config: &Config, provider_override: Option<&st
 /// The environment variable that holds `name`'s own credential, if the
 /// provider has one. Model discovery reads only this.
 pub(crate) fn provider_credential_env_var(name: &str) -> Option<&'static str> {
-    if canonical_provider_name(name) == "qwen-code" {
-        return Some("QWEN_OAUTH_TOKEN");
-    }
-
     Some(match canonical_provider_name(name) {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",

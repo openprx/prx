@@ -712,9 +712,9 @@ default_temperature = 0.7
 }
 
 #[test]
-async fn auth_config_defaults_enable_codex_import() {
+async fn auth_config_defaults_disable_codex_import() {
     let auth = AuthConfig::default();
-    assert!(auth.codex_auth_json_auto_import);
+    assert!(!auth.codex_auth_json_auto_import);
     assert!(!auth.codex_auth_json_path.as_os_str().is_empty());
 }
 

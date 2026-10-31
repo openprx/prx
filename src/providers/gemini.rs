@@ -14,8 +14,6 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-
 /// Provider name attached to byte-level UTF-8 decode failures on the
 /// streaming path.
 const STREAM_DECODER_LABEL: &str = "Gemini";
@@ -60,30 +58,6 @@ impl GeminiAuth {
 
 #[derive(Debug, Serialize, Clone)]
 struct GenerateContentRequest {
-    contents: Vec<Content>,
-    #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
-    system_instruction: Option<Content>,
-    #[serde(rename = "generationConfig")]
-    generation_config: GenerationConfig,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<GeminiToolGroup>>,
-}
-
-/// Request envelope for the internal cloudcode-pa API.
-/// OAuth tokens from Gemini CLI are scoped for this endpoint.
-#[derive(Debug, Serialize)]
-struct InternalGenerateContentEnvelope {
-    model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    project: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user_prompt_id: Option<String>,
-    request: InternalGenerateContentRequest,
-}
-
-/// Nested request payload for cloudcode-pa's code assist APIs.
-#[derive(Debug, Serialize)]
-struct InternalGenerateContentRequest {
     contents: Vec<Content>,
     #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
     system_instruction: Option<Content>,
@@ -229,17 +203,6 @@ impl GenerateContentResponse {
 // GEMINI CLI TOKEN STRUCTURES
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// OAuth token stored by Gemini CLI in `~/.gemini/oauth_creds.json`
-#[derive(Debug, Deserialize)]
-struct GeminiCliOAuthCreds {
-    access_token: Option<String>,
-    expiry: Option<String>,
-}
-
-/// Internal API endpoint used by Gemini CLI for OAuth users.
-/// See: https://github.com/google-gemini/gemini-cli/issues/19200
-const CLOUDCODE_PA_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal";
-
 /// Public API endpoint for API key users.
 const PUBLIC_API_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -297,40 +260,14 @@ impl GeminiProvider {
         }
     }
 
-    /// Try to load OAuth access token from Gemini CLI's cached credentials.
-    /// Location: `~/.gemini/oauth_creds.json`
-    fn try_load_gemini_cli_token() -> Option<String> {
-        let gemini_dir = Self::gemini_cli_dir()?;
-        let creds_path = gemini_dir.join("oauth_creds.json");
-
-        if !creds_path.exists() {
-            return None;
-        }
-
-        let content = std::fs::read_to_string(&creds_path).ok()?;
-        let creds: GeminiCliOAuthCreds = serde_json::from_str(&content).ok()?;
-
-        // Check if token is expired (basic check)
-        if let Some(ref expiry) = creds.expiry {
-            if let Ok(expiry_time) = chrono::DateTime::parse_from_rfc3339(expiry) {
-                if expiry_time < chrono::Utc::now() {
-                    tracing::warn!("Gemini CLI OAuth token expired — re-run `gemini` to refresh");
-                    return None;
-                }
-            }
-        }
-
-        creds.access_token.and_then(|token| Self::normalize_non_empty(&token))
-    }
-
-    /// Get the Gemini CLI config directory (~/.gemini)
-    fn gemini_cli_dir() -> Option<PathBuf> {
-        crate::config::user_home_dir().map(|home| home.join(".gemini"))
+    /// Gemini CLI OAuth (`~/.gemini/oauth_creds.json`) is not loaded.
+    const fn try_load_gemini_cli_token() -> Option<String> {
+        None
     }
 
     /// Check if Gemini CLI is configured and has valid credentials
-    pub fn has_cli_credentials() -> bool {
-        Self::try_load_gemini_cli_token().is_some()
+    pub const fn has_cli_credentials() -> bool {
+        false
     }
 
     /// Check if any Gemini authentication is available (env vars or file-based).
@@ -368,24 +305,16 @@ impl GeminiProvider {
     /// not the public API. Sending them to the public endpoint results in
     /// "400 Bad Request: API key not valid" errors.
     /// See: https://github.com/google-gemini/gemini-cli/issues/19200
-    fn build_generate_content_url(model: &str, auth: &GeminiAuth) -> String {
-        match auth {
-            GeminiAuth::OAuthToken(_) => {
-                // OAuth tokens from Gemini CLI are scoped for the internal
-                // Code Assist API. The model is passed in the request body,
-                // not the URL path.
-                format!("{CLOUDCODE_PA_ENDPOINT}:generateContent")
-            }
-            _ => {
-                let model_name = Self::format_model_name(model);
-                let base_url = format!("{PUBLIC_API_ENDPOINT}/{model_name}:generateContent");
-
-                if auth.is_api_key() {
-                    format!("{base_url}?key={}", auth.credential())
-                } else {
-                    base_url
-                }
-            }
+    fn build_generate_content_url(model: &str, auth: &GeminiAuth) -> anyhow::Result<String> {
+        if auth.is_oauth() {
+            anyhow::bail!("{}", crate::auth::terms::GEMINI_CLI_OAUTH_REMOVED);
+        }
+        let model_name = Self::format_model_name(model);
+        let base_url = format!("{PUBLIC_API_ENDPOINT}/{model_name}:generateContent");
+        if auth.is_api_key() {
+            Ok(format!("{base_url}?key={}", auth.credential()))
+        } else {
+            Ok(base_url)
         }
     }
 
@@ -395,21 +324,16 @@ impl GeminiProvider {
     /// records rather than a streamed JSON array; the SSE shape is much
     /// easier to parse incrementally and matches the OpenAI / Anthropic
     /// parsing approach already used in this crate.
-    fn build_stream_url(model: &str, auth: &GeminiAuth) -> String {
-        match auth {
-            GeminiAuth::OAuthToken(_) => {
-                // cloudcode-pa internal endpoint — model goes in the body.
-                format!("{CLOUDCODE_PA_ENDPOINT}:streamGenerateContent?alt=sse")
-            }
-            _ => {
-                let model_name = Self::format_model_name(model);
-                let base = format!("{PUBLIC_API_ENDPOINT}/{model_name}:streamGenerateContent");
-                if auth.is_api_key() {
-                    format!("{base}?alt=sse&key={}", auth.credential())
-                } else {
-                    format!("{base}?alt=sse")
-                }
-            }
+    fn build_stream_url(model: &str, auth: &GeminiAuth) -> anyhow::Result<String> {
+        if auth.is_oauth() {
+            anyhow::bail!("{}", crate::auth::terms::GEMINI_CLI_OAUTH_REMOVED);
+        }
+        let model_name = Self::format_model_name(model);
+        let base = format!("{PUBLIC_API_ENDPOINT}/{model_name}:streamGenerateContent");
+        if auth.is_api_key() {
+            Ok(format!("{base}?alt=sse&key={}", auth.credential()))
+        } else {
+            Ok(format!("{base}?alt=sse"))
         }
     }
 
@@ -419,7 +343,7 @@ impl GeminiProvider {
                 tracing::error!("proxy build failed for provider.gemini, using direct: {e}");
                 e
             })
-            .unwrap_or_else(|_| Client::new())
+            .unwrap_or_else(|_| crate::prx_http_client())
     }
 
     fn build_generate_content_request(
@@ -428,45 +352,20 @@ impl GeminiProvider {
         url: &str,
         request: &GenerateContentRequest,
         model: &str,
-    ) -> reqwest::RequestBuilder {
-        let parameter_model = model.strip_prefix("models/").unwrap_or(model);
-        match auth {
-            GeminiAuth::OAuthToken(token) => {
-                // cloudcode-pa expects an outer envelope with `request`.
-                let internal_request = InternalGenerateContentEnvelope {
-                    model: Self::format_internal_model_name(model),
-                    project: None,
-                    user_prompt_id: None,
-                    request: InternalGenerateContentRequest {
-                        contents: request.contents.clone(),
-                        system_instruction: request.system_instruction.clone(),
-                        generation_config: request.generation_config.clone(),
-                        tools: request.tools.clone(),
-                    },
-                };
-                self.http_client()
-                    .post(url)
-                    .json(
-                        &super::parameter_wire::request(
-                            "gemini",
-                            super::parameter_wire::Format::Gemini,
-                            parameter_model,
-                            &internal_request,
-                        )
-                        .with_default_output_limit(),
-                    )
-                    .bearer_auth(token)
-            }
-            _ => self.http_client().post(url).json(
-                &super::parameter_wire::request(
-                    "gemini",
-                    super::parameter_wire::Format::Gemini,
-                    parameter_model,
-                    request,
-                )
-                .with_default_output_limit(),
-            ),
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        if auth.is_oauth() {
+            anyhow::bail!("{}", crate::auth::terms::GEMINI_CLI_OAUTH_REMOVED);
         }
+        let parameter_model = model.strip_prefix("models/").unwrap_or(model);
+        Ok(self.http_client().post(url).json(
+            &super::parameter_wire::request(
+                "gemini",
+                super::parameter_wire::Format::Gemini,
+                parameter_model,
+                request,
+            )
+            .with_default_output_limit(),
+        ))
     }
 }
 
@@ -746,9 +645,8 @@ impl GeminiProvider {
                 "Gemini API key not found. Options:\n\
                  1. Add api_key to your Gemini provider config\n\
                  2. Set GEMINI_API_KEY or GOOGLE_API_KEY env var\n\
-                 3. Run `gemini` CLI to authenticate (tokens will be reused)\n\
-                 4. Get an API key from https://aistudio.google.com/app/apikey\n\
-                 5. Run `prx init` to configure"
+                 3. Get an API key from https://aistudio.google.com/app/apikey\n\
+                 4. Run `prx init` to configure"
             )
         })?;
 
@@ -762,10 +660,10 @@ impl GeminiProvider {
             tools: self.native_tools(tools)?,
         };
 
-        let url = Self::build_generate_content_url(model, auth);
+        let url = Self::build_generate_content_url(model, auth)?;
 
         let response = self
-            .build_generate_content_request(auth, &url, &request, model)
+            .build_generate_content_request(auth, &url, &request, model)?
             .send()
             .await?;
 
@@ -1089,7 +987,7 @@ impl Provider for GeminiProvider {
             // cloudcode-pa does not expose a lightweight model-list probe like the public API.
             // Avoid false negatives for valid Gemini CLI OAuth credentials.
             if auth.is_oauth() {
-                return Ok(());
+                anyhow::bail!("{}", crate::auth::terms::GEMINI_CLI_OAUTH_REMOVED);
             }
 
             let url = if auth.is_api_key() {
@@ -1127,11 +1025,15 @@ impl Provider for GeminiProvider {
         let Some(auth) = self.auth.as_ref() else {
             return stream::once(async {
                 Err(StreamError::Provider(
-                    "Gemini API key not found — set GEMINI_API_KEY / GOOGLE_API_KEY or run `gemini` CLI".into(),
+                    "Gemini API key not found — set GEMINI_API_KEY or GOOGLE_API_KEY".into(),
                 ))
             })
             .boxed();
         };
+        if auth.is_oauth() {
+            let message = crate::auth::terms::GEMINI_CLI_OAUTH_REMOVED.to_string();
+            return stream::once(async move { Err(StreamError::Provider(message)) }).boxed();
+        }
 
         let (system_instruction, contents) = Self::convert_messages(messages);
         // Lowered before the connection is opened, so a tool this endpoint
@@ -1153,59 +1055,29 @@ impl Provider for GeminiProvider {
             tools,
         };
 
-        let url = Self::build_stream_url(model, auth);
+        let url = match Self::build_stream_url(model, auth) {
+            Ok(url) => url,
+            Err(error) => {
+                let message = error.to_string();
+                return stream::once(async move { Err(StreamError::Provider(message)) }).boxed();
+            }
+        };
         let client = self.http_client();
         let model_owned = Self::format_internal_model_name(model);
-        let auth_kind = match auth {
-            GeminiAuth::OAuthToken(token) => OwnedGeminiAuth::OAuthToken(token.clone()),
-            // The explicit API key is already embedded in `url` as the
-            // `?key=` query parameter, so we don't need to carry the
-            // value across the await boundary — we only need the variant
-            // to choose the right request shape.
-            GeminiAuth::ExplicitKey(_) => OwnedGeminiAuth::ExplicitKey,
-        };
         let count_tokens = options.count_tokens;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(64);
 
         super::parameter_capture::spawn(async move {
-            let request_builder = match &auth_kind {
-                OwnedGeminiAuth::OAuthToken(token) => {
-                    let envelope = InternalGenerateContentEnvelope {
-                        model: Self::format_internal_model_name(&model_owned),
-                        project: None,
-                        user_prompt_id: None,
-                        request: InternalGenerateContentRequest {
-                            contents: request_body.contents.clone(),
-                            system_instruction: request_body.system_instruction.clone(),
-                            generation_config: request_body.generation_config.clone(),
-                            tools: request_body.tools.clone(),
-                        },
-                    };
-                    client
-                        .post(&url)
-                        .header("accept", "text/event-stream")
-                        .json(
-                            &super::parameter_wire::request(
-                                "gemini",
-                                super::parameter_wire::Format::Gemini,
-                                &model_owned,
-                                &envelope,
-                            )
-                            .with_default_output_limit(),
-                        )
-                        .bearer_auth(token)
-                }
-                OwnedGeminiAuth::ExplicitKey => client.post(&url).header("accept", "text/event-stream").json(
-                    &super::parameter_wire::request(
-                        "gemini",
-                        super::parameter_wire::Format::Gemini,
-                        &model_owned,
-                        &request_body,
-                    )
-                    .with_default_output_limit(),
-                ),
-            };
+            let request_builder = client.post(&url).header("accept", "text/event-stream").json(
+                &super::parameter_wire::request(
+                    "gemini",
+                    super::parameter_wire::Format::Gemini,
+                    &model_owned,
+                    &request_body,
+                )
+                .with_default_output_limit(),
+            );
 
             let response = match request_builder.send().await {
                 Ok(r) => r,
@@ -1281,19 +1153,6 @@ impl Provider for GeminiProvider {
 
         stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
     }
-}
-
-/// Owned variant of [`GeminiAuth`] usable from a `'static` `tokio::spawn`
-/// future. Mirrors the borrowed enum so we can take ownership of the
-/// credential before crossing the await boundary.
-///
-/// `ExplicitKey` carries no payload because the API key is already encoded
-/// into the URL `?key=` query parameter before the future is spawned —
-/// the variant exists only to select the request-shape branch.
-#[derive(Debug)]
-enum OwnedGeminiAuth {
-    ExplicitKey,
-    OAuthToken(String),
 }
 
 #[allow(clippy::indexing_slicing)]
@@ -1549,16 +1408,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_cli_dir_returns_path() {
-        let dir = GeminiProvider::gemini_cli_dir();
-        // Should return Some on systems with home dir
-        if crate::config::user_home_dir().is_some() {
-            assert!(dir.is_some());
-            assert!(dir.unwrap().ends_with(".gemini"));
-        }
-    }
-
-    #[test]
     fn auth_source_explicit_key() {
         let provider = GeminiProvider {
             auth: Some(GeminiAuth::ExplicitKey("key".into())),
@@ -1603,24 +1452,22 @@ mod tests {
     #[test]
     fn api_key_url_includes_key_query_param() {
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth).expect("api key url");
         assert!(url.contains(":generateContent?key=api-key-123"));
     }
 
     #[test]
     fn oauth_url_uses_internal_endpoint() {
         let auth = GeminiAuth::OAuthToken("ya29.test-token".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
-        assert!(url.starts_with("https://cloudcode-pa.googleapis.com/v1internal"));
-        assert!(url.ends_with(":generateContent"));
-        assert!(!url.contains("generativelanguage.googleapis.com"));
-        assert!(!url.contains("?key="));
+        let error =
+            GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth).expect_err("cli oauth refused");
+        assert!(error.to_string().contains("not permitted"), "{error}");
     }
 
     #[test]
     fn api_key_url_uses_public_endpoint() {
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth).expect("api key url");
         assert!(url.contains("generativelanguage.googleapis.com/v1beta"));
         assert!(url.contains("models/gemini-2.0-flash"));
     }
@@ -1631,29 +1478,26 @@ mod tests {
             auth: Some(GeminiAuth::OAuthToken("ya29.mock-token".into())),
         };
         let auth = GeminiAuth::OAuthToken("ya29.mock-token".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
-        let body = GenerateContentRequest {
-            contents: vec![Content {
-                role: Some("user".into()),
-                parts: vec![RequestPart::Text { text: "hello".into() }],
-            }],
-            system_instruction: None,
-            generation_config: GenerationConfig {
-                temperature: 0.7,
-                max_output_tokens: 8192,
-            },
-            tools: None,
-        };
-
-        let request = provider
-            .build_generate_content_request(&auth, &url, &body, "gemini-2.0-flash")
-            .build()
-            .unwrap();
-
-        assert_eq!(
-            request.headers().get(AUTHORIZATION).and_then(|h| h.to_str().ok()),
-            Some("Bearer ya29.mock-token")
-        );
+        let error = provider
+            .build_generate_content_request(
+                &auth,
+                "http://127.0.0.1:9/unused",
+                &GenerateContentRequest {
+                    contents: vec![Content {
+                        role: Some("user".into()),
+                        parts: vec![RequestPart::Text { text: "hello".into() }],
+                    }],
+                    system_instruction: None,
+                    generation_config: GenerationConfig {
+                        temperature: 0.7,
+                        max_output_tokens: 8192,
+                    },
+                    tools: None,
+                },
+                "gemini-2.0-flash",
+            )
+            .expect_err("cli oauth request refused");
+        assert!(error.to_string().contains("not permitted"), "{error}");
     }
 
     #[test]
@@ -1662,35 +1506,26 @@ mod tests {
             auth: Some(GeminiAuth::OAuthToken("ya29.mock-token".into())),
         };
         let auth = GeminiAuth::OAuthToken("ya29.mock-token".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
-        let body = GenerateContentRequest {
-            contents: vec![Content {
-                role: Some("user".into()),
-                parts: vec![RequestPart::Text { text: "hello".into() }],
-            }],
-            system_instruction: None,
-            generation_config: GenerationConfig {
-                temperature: 0.7,
-                max_output_tokens: 8192,
-            },
-            tools: None,
-        };
-
-        let request = provider
-            .build_generate_content_request(&auth, &url, &body, "models/gemini-2.0-flash")
-            .build()
-            .unwrap();
-
-        let payload = request
-            .body()
-            .and_then(|b| b.as_bytes())
-            .expect("json request body should be bytes");
-        let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
-
-        assert_eq!(json["model"], "gemini-2.0-flash");
-        assert!(json.get("generationConfig").is_none());
-        assert!(json.get("request").is_some());
-        assert!(json["request"].get("generationConfig").is_some());
+        let error = provider
+            .build_generate_content_request(
+                &auth,
+                "http://127.0.0.1:9/unused",
+                &GenerateContentRequest {
+                    contents: vec![Content {
+                        role: Some("user".into()),
+                        parts: vec![RequestPart::Text { text: "hello".into() }],
+                    }],
+                    system_instruction: None,
+                    generation_config: GenerationConfig {
+                        temperature: 0.7,
+                        max_output_tokens: 8192,
+                    },
+                    tools: None,
+                },
+                "models/gemini-2.0-flash",
+            )
+            .expect_err("cli oauth envelope refused");
+        assert!(error.to_string().contains("not permitted"), "{error}");
     }
 
     #[tokio::test]
@@ -1707,33 +1542,10 @@ mod tests {
             tools: None,
         };
         for selected in ["gemini-2.0-flash", "models/gemini-2.0-flash"] {
-            let capture = super::super::parameter_capture::Capture::new(true);
-            let request = capture
-                .scope(async {
-                    provider
-                        .build_generate_content_request(&auth, "http://localhost", &body, selected)
-                        .build()
-                        .unwrap()
-                })
-                .await;
-            let payload: serde_json::Value =
-                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
-            assert!(payload.get("generationConfig").is_none());
-            assert_eq!(
-                payload.pointer("/request/generationConfig/temperature"),
-                Some(&serde_json::json!(2.0))
-            );
-            let records = capture.take();
-            assert_eq!(records.len(), 1);
-            assert_eq!(records.first().unwrap().model, "gemini/gemini-2.0-flash");
-            assert_eq!(
-                records
-                    .first()
-                    .unwrap()
-                    .values
-                    .get(&super::super::catalog::ModelParameter::Temperature),
-                payload.pointer("/request/generationConfig/temperature")
-            );
+            let error = provider
+                .build_generate_content_request(&auth, "http://localhost", &body, selected)
+                .expect_err("cli oauth preparation refused");
+            assert!(error.to_string().contains("not permitted"), "{error} {selected}");
         }
     }
 
@@ -1743,7 +1555,7 @@ mod tests {
             auth: Some(GeminiAuth::ExplicitKey("api-key-123".into())),
         };
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth).expect("api key url");
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -1759,6 +1571,7 @@ mod tests {
 
         let request = provider
             .build_generate_content_request(&auth, &url, &body, "gemini-2.0-flash")
+            .expect("api key request")
             .build()
             .unwrap();
 
@@ -1798,31 +1611,10 @@ mod tests {
 
     #[test]
     fn internal_request_includes_model() {
-        let request = InternalGenerateContentEnvelope {
-            model: "gemini-test-model".to_string(),
-            project: None,
-            user_prompt_id: None,
-            request: InternalGenerateContentRequest {
-                contents: vec![Content {
-                    role: Some("user".to_string()),
-                    parts: vec![RequestPart::Text {
-                        text: "Hello".to_string(),
-                    }],
-                }],
-                system_instruction: None,
-                generation_config: GenerationConfig {
-                    temperature: 0.7,
-                    max_output_tokens: 8192,
-                },
-                tools: None,
-            },
-        };
-
-        let json: serde_json::Value = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["model"], "gemini-test-model");
-        assert!(json.get("generationConfig").is_none());
-        assert!(json["request"].get("generationConfig").is_some());
-        assert_eq!(json["request"]["contents"][0]["role"], "user");
+        let auth = GeminiAuth::OAuthToken("ya29.mock".into());
+        let error = GeminiProvider::build_generate_content_url("gemini-test-model", &auth)
+            .expect_err("cli oauth model request refused");
+        assert!(error.to_string().contains("not permitted"), "{error}");
     }
 
     #[test]
@@ -1955,7 +1747,8 @@ mod tests {
             auth: Some(GeminiAuth::OAuthToken("ya29.mock-token".into())),
         };
         let result = provider.warmup().await;
-        assert!(result.is_ok());
+        let error = result.expect_err("cli oauth warmup is refused");
+        assert!(error.to_string().contains("not permitted"), "{error}");
     }
 
     // ─── S3 T3-2-C streaming protocol tests ────────────────────────────────
@@ -1963,7 +1756,7 @@ mod tests {
     #[test]
     fn stream_url_for_api_key_uses_sse_and_public_endpoint() {
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiProvider::build_stream_url("gemini-2.0-flash", &auth);
+        let url = GeminiProvider::build_stream_url("gemini-2.0-flash", &auth).expect("api key stream url");
         assert!(url.contains("generativelanguage.googleapis.com/v1beta"));
         assert!(url.contains(":streamGenerateContent"));
         assert!(url.contains("alt=sse"));
@@ -1973,11 +1766,8 @@ mod tests {
     #[test]
     fn stream_url_for_oauth_uses_internal_endpoint() {
         let auth = GeminiAuth::OAuthToken("ya29.mock".into());
-        let url = GeminiProvider::build_stream_url("gemini-2.5-pro", &auth);
-        assert!(url.starts_with("https://cloudcode-pa.googleapis.com/v1internal"));
-        assert!(url.contains(":streamGenerateContent"));
-        assert!(url.contains("alt=sse"));
-        assert!(!url.contains("?key="));
+        let error = GeminiProvider::build_stream_url("gemini-2.5-pro", &auth).expect_err("cli oauth stream refused");
+        assert!(error.to_string().contains("not permitted"), "{error}");
     }
 
     #[test]

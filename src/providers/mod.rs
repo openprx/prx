@@ -91,7 +91,7 @@ use crate::auth::discovery::is_claude_code_oauth_setup_token;
 use crate::auth::{profiles::AuthProfilesStore, select_profile_id};
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::path::PathBuf;
 
 const MAX_API_ERROR_CHARS: usize = 200;
@@ -361,41 +361,22 @@ fn create_provider_with_url_and_options(
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => {
-            if resolved.claude_refresh_token.is_some() {
-                return Ok(Box::new(anthropic::AnthropicProvider::with_oauth(
-                    key,
-                    resolved.claude_refresh_token.clone(),
-                    resolved.claude_expires_at,
-                )));
+            if resolved.claude_refresh_token.is_some()
+                || resolved.claude_expires_at.is_some()
+                || key.is_some_and(is_claude_code_oauth_setup_token)
+            {
+                anyhow::bail!("{}", crate::auth::terms::ANTHROPIC_SUBSCRIPTION_REMOVED);
             }
-            // OAuth setup tokens (sk-ant-oat01-) require Bearer auth + refresh_token.
-            // Without a refresh_token they cannot be used as plain x-api-key credentials.
-            let effective_key = key.filter(|k| !is_claude_code_oauth_setup_token(k));
-            if key.is_some() && effective_key.is_none() {
-                tracing::warn!(
-                    "Ignoring Claude Code OAuth setup token for anthropic provider \
-                     (no refresh_token available; token cannot be used as plain API key)"
-                );
-            }
-            Ok(Box::new(anthropic::AnthropicProvider::new(effective_key)))
+            Ok(Box::new(anthropic::AnthropicProvider::new(key)))
         }
         name if is_claude_code_alias(name) => {
-            if resolved.claude_refresh_token.is_some() {
-                return Ok(Box::new(anthropic::AnthropicProvider::with_oauth(
-                    key,
-                    resolved.claude_refresh_token.clone(),
-                    resolved.claude_expires_at,
-                )));
+            if resolved.claude_refresh_token.is_some()
+                || resolved.claude_expires_at.is_some()
+                || key.is_some_and(is_claude_code_oauth_setup_token)
+            {
+                anyhow::bail!("{}", crate::auth::terms::ANTHROPIC_SUBSCRIPTION_REMOVED);
             }
-            // Same guard as the "anthropic" arm above.
-            let effective_key = key.filter(|k| !is_claude_code_oauth_setup_token(k));
-            if key.is_some() && effective_key.is_none() {
-                tracing::warn!(
-                    "Ignoring Claude Code OAuth setup token for claude-code provider \
-                     (no refresh_token available; token cannot be used as plain API key)"
-                );
-            }
-            Ok(Box::new(anthropic::AnthropicProvider::new(effective_key)))
+            Ok(Box::new(anthropic::AnthropicProvider::new(key)))
         }
         "openai" => Ok(Box::new(
             openai::OpenAiProvider::with_base_url(api_url, key).with_parameter_provider(name),
@@ -440,7 +421,7 @@ fn create_provider_with_url_and_options(
                 "https://api.kimi.com/coding/v1",
                 key,
                 AuthStyle::Bearer,
-                "KimiCLI/0.77",
+                crate::PRX_USER_AGENT,
             )
             .with_declared_tool_dialects(name, options),
         )),
@@ -454,6 +435,7 @@ fn create_provider_with_url_and_options(
         )),
         name if zai_base_url(name).is_some() => {
             let url = zai_base_url(name).ok_or_else(|| anyhow::anyhow!("Z.AI URL resolved to None"))?;
+            tracing::warn!("{}", crate::auth::terms::GLM_CODING_PLAN_WARNING);
             Ok(Box::new(
                 OpenAiCompatibleProvider::new("Z.AI", url, key, AuthStyle::Bearer).with_parameter_provider(name),
             ))
@@ -474,23 +456,8 @@ fn create_provider_with_url_and_options(
         }
         "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
         name if is_qwen_oauth_alias(name) => {
-            let base_url = api_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-                .or_else(|| resolved.qwen_base_url.clone())
-                .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
-
-            Ok(Box::new(
-                OpenAiCompatibleProvider::new_with_user_agent(
-                    "Qwen Code",
-                    &base_url,
-                    key,
-                    AuthStyle::Bearer,
-                    "QwenCode/1.0",
-                )
-                .with_parameter_provider(name),
-            ))
+            let _ = resolved.qwen_base_url.as_deref();
+            anyhow::bail!("{}", crate::auth::terms::QWEN_OAUTH_REMOVED);
         }
         name if is_qianfan_alias(name) => Ok(Box::new(
             OpenAiCompatibleProvider::new("Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer)
@@ -498,6 +465,7 @@ fn create_provider_with_url_and_options(
         )),
         name if qwen_coding_base_url(name).is_some() => {
             let url = qwen_coding_base_url(name).ok_or_else(|| anyhow::anyhow!("Qwen Coding URL resolved to None"))?;
+            tracing::warn!("{}", crate::auth::terms::BAILIAN_CODING_PLAN_WARNING);
             Ok(Box::new(
                 OpenAiCompatibleProvider::new("Qwen Coding Plan Pro", url, key, AuthStyle::Bearer)
                     .with_parameter_provider(name),

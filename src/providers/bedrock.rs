@@ -829,7 +829,7 @@ impl BedrockProvider {
                 tracing::error!("proxy build failed for provider.bedrock, using direct: {e}");
                 e
             })
-            .unwrap_or_else(|_| Client::new())
+            .unwrap_or_else(|_| crate::prx_http_client())
     }
 
     /// Percent-encode the model ID for URL path: only encode `:` to `%3A`.

@@ -4,7 +4,9 @@ See [provider management](provider-management.md) for inspection, configuration
 transactions, credential references and recovery.
 
 OpenPRX supports native and OpenAI-compatible LLM providers with model routing,
-ordered fallback, token refresh, streaming, tools, and usage attribution. Each
+ordered fallback, token refresh, streaming, tools, and usage attribution. Every
+outbound provider auth and API request sends `User-Agent: prx/<package version>`
+from the Cargo package version. Each
 binary embeds a validated [release model catalog](model-catalog.md) for offline
 defaults, listings, and model evidence. `prx doctor models` (read-only) or
 `prx models refresh --provider <id>` (cache-updating) adds current provider
@@ -15,6 +17,38 @@ adapter serialization. Codex effort constraints and Kimi Code's fixed
 temperature follow the selected provider/model, including streaming requests;
 a matching endpoint URL supplies no model facts. See the
 [parameter resolution contract](model-catalog.md#format-and-validation).
+
+## Login methods
+
+Anthropic accepts a Console API key only. Subscription credentials, including
+setup-tokens (`sk-ant-oat01`) and Claude Code's `~/.claude/.credentials.json`,
+are refused. Max, Ultra, and Team plans include monthly API credits:
+<https://support.claude.com/en/articles/17154008>. Stored profiles are not
+deleted; `prx auth logout --provider anthropic` removes one.
+
+Gemini uses an API key (`GEMINI_API_KEY` or `GOOGLE_API_KEY`). Gemini CLI
+OAuth is not loaded.
+
+OpenAI Codex uses [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
+loopback PKCE (`prx auth login --provider openai-codex`). Device code is not
+part of that flow. If the callback is missed, paste it with
+`prx auth paste-redirect --provider openai-codex`. Importing `~/.codex/auth.json`
+is off unless `[auth] codex_auth_json_auto_import = true`.
+
+OpenRouter PKCE is `prx auth login --provider openrouter`. On a headless
+machine, add `--device-code` and paste the code the browser shows.
+
+GitHub Copilot login is disabled. PRX does not borrow VS Code's OAuth client
+or call the private Copilot token endpoint. Saved cache files are left on disk
+and are not sent.
+
+Qwen Code OAuth is removed. Use DashScope (`qwen`) or a Bailian Coding Plan key
+(`qwen-coding`). `prx init` warns that GLM Coding Plan and Bailian Coding Plan
+keys are outside their terms when used from cron, webhooks, or the daemon.
+
+MiniMax OAuth refresh uses the account host `/oauth2/token` endpoints. Set
+`MINIMAX_OAUTH_CLIENT_ID` to a client MiniMax issued for prx; the built-in
+default logs a warning.
 
 Known Codex models default to `medium` reasoning effort, a behavior change from
 `xhigh`; an explicit configured effort takes precedence. Unknown Codex models
@@ -37,7 +71,7 @@ setting remains adapter-owned.
 | `xai` | `grok-4.20`; `grok-4.20-non-reasoning-latest` | `https://api.x.ai/v1`; [Grok 4.20](https://docs.x.ai/developers/models/grok-4.20-experimental-beta-0304) | `GET /models`, API key or Grok subscription OAuth bearer |
 | `glm` / `zai` | global `glm-5`; China `glm-5.2` | global `api.z.ai`, China `open.bigmodel.cn`; [GLM-5](https://docs.z.ai/guides/llm/glm-5), [GLM-5.2](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.2) | regional `GET /models` |
 | `bedrock` | `anthropic.claude-sonnet-5`; `anthropic.claude-opus-4-8`; Haiku 4.5 regional ID | AWS Converse; [model/API compatibility](https://docs.aws.amazon.com/bedrock/latest/userguide/models-api-compatibility.html) | AWS regional catalog; invocation uses Converse/ConverseStream |
-| `copilot` | `gpt-5.4`; `gpt-5.3-codex`; `claude-sonnet-4.6` | GitHub Copilot service; [supported models](https://docs.github.com/en/copilot/reference/ai-models/supported-models) | service-managed; OAuth token auto-refresh |
+| `copilot` | `gpt-5.4`; `gpt-5.3-codex`; `claude-sonnet-4.6` | GitHub Copilot service; [supported models](https://docs.github.com/en/copilot/reference/ai-models/supported-models) | login disabled; see Login methods |
 | `ollama` | installed model tags | default `http://localhost:11434`; [list models](https://docs.ollama.com/api/tags) | unauthenticated `GET /api/tags` locally |
 | `llamacpp` | server-loaded model ID | default `http://localhost:8080/v1`; [llama.cpp server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) | `GET /v1/models`; capabilities depend on template/server flags |
 | `vllm` | server-loaded model ID | default `http://localhost:8000/v1`; [vLLM OpenAI server](https://docs.vllm.ai/en/stable/serving/openai_compatible_server/) | `GET /v1/models`; tools depend on served model/parser |

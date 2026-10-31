@@ -441,7 +441,7 @@ pub fn runtime_proxy_config() -> ProxyConfig {
 }
 
 pub fn apply_runtime_proxy_to_builder(builder: reqwest::ClientBuilder, service_key: &str) -> reqwest::ClientBuilder {
-    runtime_proxy_config().apply_to_reqwest_builder(builder, service_key)
+    runtime_proxy_config().apply_to_reqwest_builder(builder.user_agent(crate::PRX_USER_AGENT), service_key)
 }
 
 pub fn build_runtime_proxy_client(service_key: &str) -> Result<reqwest::Client> {

@@ -63,11 +63,9 @@ fn onboarding_credential_hints_name_only_what_the_daemon_reads() {
             "{provider}: {hint}"
         );
     }
-    for (provider, variable) in [("gemini", "GEMINI_API_KEY"), ("qwen-code", "QWEN_OAUTH_TOKEN")] {
-        let hint = credential_setup_hint(provider);
-        assert!(hint.contains(variable), "{provider}: {hint}");
-        assert!(hint.contains("`api_key` in config.toml"), "{provider}: {hint}");
-    }
+    let hint = credential_setup_hint("gemini");
+    assert!(hint.contains("GEMINI_API_KEY"), "{hint}");
+    assert!(hint.contains("`api_key` in config.toml"), "{hint}");
 
     // No production text of the wizard suggests exporting a variable the
     // daemon does not read (the needles are split so this test does not
@@ -137,8 +135,8 @@ fn provider_credential_env_var_known_providers() {
     assert_eq!(provider_credential_env_var("qwen"), Some("DASHSCOPE_API_KEY"));
     assert_eq!(provider_credential_env_var("qwen-intl"), Some("DASHSCOPE_API_KEY"));
     assert_eq!(provider_credential_env_var("dashscope-us"), Some("DASHSCOPE_API_KEY"));
-    assert_eq!(provider_credential_env_var("qwen-code"), Some("QWEN_OAUTH_TOKEN"));
-    assert_eq!(provider_credential_env_var("qwen-oauth"), Some("QWEN_OAUTH_TOKEN"));
+    assert_eq!(provider_credential_env_var("qwen-code"), None);
+    assert_eq!(provider_credential_env_var("qwen-oauth"), None);
     assert_eq!(provider_credential_env_var("glm-cn"), Some("GLM_API_KEY"));
     assert_eq!(provider_credential_env_var("minimax-cn"), Some("MINIMAX_API_KEY"));
     assert_eq!(provider_credential_env_var("kimi-code"), Some("KIMI_CODE_API_KEY"));

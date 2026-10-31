@@ -125,9 +125,10 @@ impl OpenAiCodexProvider {
             auth,
             auth_profile_override: options.auth_profile_override.clone(),
             client: Client::builder()
+                .user_agent(crate::PRX_USER_AGENT)
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
-                .unwrap_or_else(|_| Client::new()),
+                .unwrap_or_else(|_| crate::prx_http_client()),
             stream_idle_timeout: resolve_stream_idle_timeout(options.codex_stream_idle_timeout_secs),
             reasoning_effort_override: options.codex_reasoning_effort.clone(),
         }

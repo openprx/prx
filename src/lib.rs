@@ -85,6 +85,25 @@
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
+/// Identifying user agent on provider auth and API requests.
+pub const PRX_USER_AGENT: &str = concat!("prx/", env!("CARGO_PKG_VERSION"));
+
+/// HTTP client that sends [`PRX_USER_AGENT`] on every request.
+pub fn prx_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(PRX_USER_AGENT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Blocking HTTP client that sends [`PRX_USER_AGENT`] on every request.
+pub fn prx_blocking_http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .user_agent(PRX_USER_AGENT)
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
 pub mod acl;
 pub mod agent;
 pub mod approval;

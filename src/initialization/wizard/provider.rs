@@ -36,12 +36,18 @@ pub(super) async fn setup_provider(
             ("venice", "Venice AI — privacy-first (Llama, Opus)"),
             ("anthropic", "Anthropic — Claude Sonnet & Opus (direct)"),
             ("openai", "OpenAI — GPT-4o, o1, GPT-5 (direct)"),
-            ("openai-codex", "OpenAI Codex (ChatGPT subscription OAuth, no API key)"),
+            (
+                "openai-codex",
+                "OpenAI Codex — Sign in with ChatGPT (loopback PKCE, no API key)",
+            ),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
-            ("mistral", "Mistral — Large & Codestral"),
+            (
+                "mistral",
+                "Mistral — API key (Le Chat Pro includes monthly API credits)",
+            ),
             ("xai", "xAI — Grok 3 & 4"),
             ("perplexity", "Perplexity — search-augmented AI"),
-            ("gemini", "Google Gemini — Gemini 2.0 Flash & Pro (supports CLI auth)"),
+            ("gemini", "Google Gemini — Gemini API key"),
         ],
         1 => vec![
             ("groq", "Groq — ultra-fast LPU inference"),
@@ -59,10 +65,10 @@ pub(super) async fn setup_provider(
             ("bedrock", "Amazon Bedrock — AWS managed models"),
         ],
         3 => vec![
-            ("kimi-code", "Kimi Code — coding-optimized Kimi API (KimiCLI)"),
+            ("kimi-code", "Kimi Code — coding-plan API key"),
             (
-                "qwen-code",
-                "Qwen Code — OAuth tokens reused from ~/.qwen/oauth_creds.json",
+                "qwen-coding",
+                "Bailian Coding Plan — API key (interactive use; cron/webhook/daemon are outside the terms)",
             ),
             ("moonshot", "Moonshot — Kimi API (China endpoint)"),
             ("moonshot-intl", "Moonshot — Kimi API (international endpoint)"),
@@ -136,6 +142,25 @@ pub(super) async fn setup_provider(
     // SAFETY: dialoguer Select guarantees provider_idx < providers.len()
     #[allow(clippy::indexing_slicing)]
     let provider_name = providers[provider_idx].0;
+
+    if is_zai_alias(provider_name) {
+        print_bullet(crate::auth::terms::GLM_CODING_PLAN_WARNING);
+    }
+    if matches!(
+        provider_name,
+        "qwen-coding" | "qwen-coding-intl" | "dashscope-coding" | "dashscope-coding-intl"
+    ) {
+        print_bullet(crate::auth::terms::BAILIAN_CODING_PLAN_WARNING);
+    }
+    if provider_name == "openrouter" {
+        print_bullet(
+            "Or sign in with `prx auth login --provider openrouter`. Add `--device-code` and paste the code on a headless machine.",
+        );
+    }
+    if provider_name == "minimax" || provider_name == "minimax-cn" {
+        print_bullet("MiniMax M Plan uses a console API key. OAuth is experimental.");
+        print_bullet(crate::auth::terms::MINIMAX_OAUTH_WARNING);
+    }
 
     // ── API key / endpoint ──
     let mut provider_api_url: Option<String> = None;
@@ -220,31 +245,7 @@ pub(super) async fn setup_provider(
 
         key
     } else if canonical_provider_name(provider_name) == "gemini" {
-        // Special handling for Gemini: check for CLI auth first
-        if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
-            print_bullet(&format!(
-                "{} Gemini CLI credentials detected! You can skip the API key.",
-                style("✓").green().bold()
-            ));
-            print_bullet("OpenPRX will reuse your existing Gemini CLI authentication.");
-            println!();
-
-            let use_cli: bool = dialoguer::Confirm::new()
-                .with_prompt("  Use existing Gemini CLI authentication?")
-                .default(true)
-                .interact()?;
-
-            if use_cli {
-                println!("  {} Using Gemini CLI OAuth tokens", style("✓").green().bold());
-                String::new() // Empty key = will use CLI tokens
-            } else {
-                print_bullet("Get your API key at: https://aistudio.google.com/app/apikey");
-                Input::new()
-                    .with_prompt("  Paste your Gemini API key")
-                    .allow_empty(true)
-                    .interact_text()?
-            }
-        } else if std::env::var("GEMINI_API_KEY").is_ok() {
+        if std::env::var("GEMINI_API_KEY").is_ok() {
             print_bullet(&format!(
                 "{} GEMINI_API_KEY environment variable detected!",
                 style("✓").green().bold()
@@ -252,7 +253,7 @@ pub(super) async fn setup_provider(
             String::new()
         } else {
             print_bullet("Get your API key at: https://aistudio.google.com/app/apikey");
-            print_bullet("Or run `gemini` CLI to authenticate (tokens will be reused).");
+            print_bullet(crate::auth::terms::GEMINI_CLI_OAUTH_REMOVED);
             println!();
 
             Input::new()
@@ -280,11 +281,13 @@ pub(super) async fn setup_provider(
             "Get your API key at: {}",
             style("https://console.anthropic.com/settings/keys").cyan().underlined()
         ));
-        print_bullet("Or run `claude setup-token` to get an OAuth setup-token.");
+        print_bullet(
+            "Max, Ultra, and Team plans include monthly API credits: https://support.claude.com/en/articles/17154008",
+        );
         println!();
 
         let key: String = Input::new()
-            .with_prompt("  Paste your API key or setup-token (or press Enter to skip)")
+            .with_prompt("  Paste your Console API key (or press Enter to skip)")
             .allow_empty(true)
             .interact_text()?;
 
@@ -296,35 +299,6 @@ pub(super) async fn setup_provider(
         }
 
         key
-    } else if canonical_provider_name(provider_name) == "qwen-code" {
-        if std::env::var("QWEN_OAUTH_TOKEN").is_ok() {
-            print_bullet(&format!(
-                "{} QWEN_OAUTH_TOKEN environment variable detected!",
-                style("✓").green().bold()
-            ));
-            "qwen-oauth".to_string()
-        } else {
-            print_bullet("Qwen Code OAuth credentials are usually stored in ~/.qwen/oauth_creds.json.");
-            print_bullet("Run `qwen` once and complete OAuth login to populate cached credentials.");
-            print_bullet("You can also set QWEN_OAUTH_TOKEN directly.");
-            println!();
-
-            let key: String = Input::new()
-                .with_prompt("  Paste your Qwen OAuth token (or press Enter to auto-detect cached OAuth)")
-                .allow_empty(true)
-                .interact_text()?;
-
-            if key.trim().is_empty() {
-                print_bullet(&format!(
-                    "Using OAuth auto-detection. Set {} and optional {} if needed.",
-                    style("QWEN_OAUTH_TOKEN").yellow(),
-                    style("QWEN_OAUTH_RESOURCE_URL").yellow()
-                ));
-                "qwen-oauth".to_string()
-            } else {
-                key
-            }
-        }
     } else {
         let key_url = if is_moonshot_alias(provider_name) || canonical_provider_name(provider_name) == "kimi-code" {
             "https://platform.moonshot.cn/console/api-keys"
@@ -336,7 +310,7 @@ pub(super) async fn setup_provider(
             "https://platform.z.ai/"
         } else if is_minimax_alias(provider_name) {
             "https://www.minimaxi.com/user-center/basic-information"
-        } else if is_qwen_alias(provider_name) {
+        } else if is_qwen_alias(provider_name) || matches!(provider_name, "qwen-coding" | "qwen-coding-intl") {
             "https://help.aliyun.com/zh/model-studio/developer-reference/get-api-key"
         } else if is_qianfan_alias(provider_name) {
             "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/7lm0vxo78"
@@ -667,17 +641,15 @@ async fn sign_in_xai(state_dir: &Path, device_code: bool) -> Result<String> {
 /// The environment variable the daemon itself reads for `name`'s credential,
 /// if there is one (ONBOARD-HINT, D-062).
 ///
-/// Provider construction reads no other API-key variable: `GEMINI_API_KEY`
-/// (or `GOOGLE_API_KEY`) for Gemini and `QWEN_OAUTH_TOKEN` for Qwen Code are
-/// the only ones (Bedrock reads the AWS variables, which its own step
-/// explains). Exporting `OPENROUTER_API_KEY` or the like changes nothing for
-/// the daemon, the gateway or a channel, so onboarding never suggests one; it
-/// points at the configuration or the auth store instead. Model discovery
-/// during onboarding reads more ([`provider_credential_env_var`]).
+/// Provider construction reads `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) for
+/// Gemini. Bedrock reads the AWS variables, which its own step explains.
+/// Exporting `OPENROUTER_API_KEY` or the like changes nothing for the daemon,
+/// the gateway or a channel, so onboarding never suggests one; it points at
+/// the configuration or the auth store instead. Model discovery during
+/// onboarding reads more ([`provider_credential_env_var`]).
 pub(super) fn daemon_credential_env_var(name: &str) -> Option<&'static str> {
     match canonical_provider_name(name) {
         "gemini" => Some("GEMINI_API_KEY"),
-        "qwen-code" => Some("QWEN_OAUTH_TOKEN"),
         _ => None,
     }
 }

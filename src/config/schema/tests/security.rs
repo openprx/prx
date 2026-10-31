@@ -128,7 +128,7 @@ default_temperature = 0.7
 async fn config_default_has_composio_and_secrets() {
     let c = Config::default();
     assert!(!c.composio.configured());
-    assert!(c.auth.codex_auth_json_auto_import);
+    assert!(!c.auth.codex_auth_json_auto_import);
     assert!(c.composio.api_key.is_none());
     assert!(c.secrets.encrypt);
     assert!(c.browser.allowed_domains.is_empty(), "expected an empty value");
