@@ -741,7 +741,7 @@ The catalog records both tiers; these are not Router ranking costs.
 Sol's published promotional tariff runs at least through 2026-11-21, so a later
 release must recheck it rather than treating it as permanent. The catalog
 stores that promotional input, cached-input, and output rate today. Bare
-`gpt-5.6` is deprecated in revision `2026-10-31.1`: the public model list has
+`gpt-5.6` is deprecated in revision `2026-10-31.2`: the public model list has
 no separate id, the historical row keeps the Sol input, cached-input, and
 output rates with cache write 0, and its replacement is `openai/gpt-5.6-sol`.
 It is not an alias. An alias cannot repeat another row's API model.
@@ -772,7 +772,9 @@ write fee.
 Qwen prices are the Singapore list. Hong Kong and the US list 1.65 input and
 4.951 output for Qwen3.8-Max; those regions need an operator override. Cached
 input on the new Qwen rows is the published 10% of input. DeepSeek Flash and
-V4 Pro store peak rates. The off-peak half rate is not a catalog tier. Kimi
+V4 Pro store peak rates. The off-peak half rate is not a catalog tier. The
+`openrouter/minimax/minimax-m3.1-flash` row stores the peak band of
+OpenRouter's time-of-day tariff. Kimi
 batch traffic at 60% of the token rate is the same kind of separate product.
 Anthropic one-hour cache writes are the higher write rate on the pricing page
 and are not the catalog's five-minute `cache_write`. Claude Fable 5 is active
@@ -1050,7 +1052,7 @@ accounting field. All values are USD per million tokens.
 rates checked on 2026-10-20, cited from the
 [Sol model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
 Revision `2026-10-31.2` stores cache write 0 because OpenAI does not bill cache
-writes. Revision `2026-10-31.1` deprecates that id. The public model list does
+writes. Revision `2026-10-31.2` deprecates that id. The public model list does
 not publish a separate bare id, and a catalog alias cannot collide with Sol's
 API model, so the replacement is `openai/gpt-5.6-sol`. OpenAI documentation
 links in this file use `developers.openai.com`.
