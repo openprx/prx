@@ -26,6 +26,11 @@
   import ChannelsPage from './pages/ChannelsPage.svelte';
   import ConfigPage from './pages/ConfigPage.svelte';
   import LogsPage from './pages/LogsPage.svelte';
+  import SchedulesPage from './pages/SchedulesPage.svelte';
+  import MemoryPage from './pages/MemoryPage.svelte';
+  import CostPage from './pages/CostPage.svelte';
+  import SkillLifecyclePage from './pages/SkillLifecyclePage.svelte';
+  import SkillLifecycleH2Page from './pages/SkillLifecycleH2Page.svelte';
   import HooksPage from './pages/HooksPage.svelte';
   import McpPage from './pages/McpPage.svelte';
   import SkillsPage from './pages/SkillsPage.svelte';
@@ -441,6 +446,16 @@
             <McpPage />
           {:else if activePath === '/skills'}
             <SkillsPage />
+          {:else if activePath === '/skills/lifecycle'}
+            <SkillLifecyclePage />
+          {:else if activePath === '/skills/h2'}
+            <SkillLifecycleH2Page />
+          {:else if activePath === '/schedules' || activePath.startsWith('/schedules/')}
+            <SchedulesPage path={activePath} />
+          {:else if activePath === '/memory'}
+            <MemoryPage />
+          {:else if activePath === '/cost'}
+            <CostPage />
           {:else if activePath === '/plugins'}
             <PluginsPage />
           {:else if activePath === '/providers'}

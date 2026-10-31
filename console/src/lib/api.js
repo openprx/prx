@@ -432,6 +432,86 @@ export const api = {
   removePlugin: (name) =>
     request(`/api/plugins/${encodeURIComponent(name)}${confirmSuffix(true)}`, {
       method: 'DELETE'
+    }),
+  listCronJobs: () => request('/api/cron/jobs'),
+  getCronJob: (id) => request(`/api/cron/jobs/${encodeURIComponent(id)}`),
+  listCronRuns: (id) => request(`/api/cron/jobs/${encodeURIComponent(id)}/runs`),
+  getCronStatus: () => request('/api/cron/status'),
+  createCronJob: (body) =>
+    request('/api/cron/jobs', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    }),
+  updateCronJob: (id, body) =>
+    request(`/api/cron/jobs/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body)
+    }),
+  pauseCronJob: (id) =>
+    request(`/api/cron/jobs/${encodeURIComponent(id)}/pause`, {
+      method: 'POST'
+    }),
+  resumeCronJob: (id) =>
+    request(`/api/cron/jobs/${encodeURIComponent(id)}/resume`, {
+      method: 'POST'
+    }),
+  deleteCronJob: (id) =>
+    request(`/api/cron/jobs/${encodeURIComponent(id)}`, {
+      method: 'DELETE'
+    }),
+  runCronJob: (id) =>
+    request(`/api/cron/jobs/${encodeURIComponent(id)}/run`, {
+      method: 'POST'
+    }),
+  searchMemory: (body) =>
+    request('/api/memory/search', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    }),
+  recallMemory: (body) =>
+    request('/api/memory/recall', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    }),
+  storeMemory: (body) =>
+    request('/api/memory/store', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    }),
+  forgetMemory: (body) =>
+    request('/api/memory/forget', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    }),
+  getCost: (windowName) => request(`/api/cost?window=${encodeURIComponent(windowName)}`),
+  getLifecycleStatus: () => request('/api/skills/lifecycle/status'),
+  listLifecycleProposals: (skillId = '') => {
+    const params = new URLSearchParams();
+    if (typeof skillId === 'string' && skillId.trim().length > 0) {
+      params.set('skill_id', skillId.trim());
+    }
+    const query = params.toString();
+    return request(`/api/skills/lifecycle/proposals${query ? `?${query}` : ''}`);
+  },
+  getLifecycleProposal: (id) => request(`/api/skills/lifecycle/proposals/${encodeURIComponent(id)}`),
+  publishLifecycleProposal: (id) =>
+    request(`/api/skills/lifecycle/proposals/${encodeURIComponent(id)}/publish`, {
+      method: 'POST'
+    }),
+  cancelLifecycleProposal: (id, reason = '') =>
+    request(`/api/skills/lifecycle/proposals/${encodeURIComponent(id)}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify(reason ? { reason } : {})
+    }),
+  rollbackLifecycle: (body) =>
+    request('/api/skills/lifecycle/rollback', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    }),
+  postLifecycleExperiment: (action, requestBody) =>
+    request('/api/skills/lifecycle/h2', {
+      method: 'POST',
+      body: JSON.stringify({ action, request: requestBody })
     })
 };
 

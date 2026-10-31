@@ -1,7 +1,9 @@
 <script>
   import { apiBaseUrl } from '../lib/api';
   import { t } from '../lib/i18n';
+  import { exportRedactedLogs } from '../lib/log-redaction';
   import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
 
   const MAX_LINES = 1000;
   const RECONNECT_BASE_MS = 500;
@@ -141,6 +143,17 @@
     lines = [];
   }
 
+  function exportLines() {
+    const text = exportRedactedLogs(lines);
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = 'process-logs.txt';
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
   $effect(() => {
     shouldReconnect = true;
     connectSocket();
@@ -170,7 +183,7 @@
 
 <section class="space-y-4">
   <div class="flex flex-wrap items-center justify-between gap-3">
-    <PageHeader title={t('logs.title')} />
+    <PageHeader title={t('logs.title')} description={t('operations.logs.process')} />
     <div class="flex items-center gap-2">
       <span class={`rounded-full border px-2 py-1 text-xs font-medium uppercase tracking-wide ${statusTone}`}>
         {statusLabel}
@@ -189,8 +202,19 @@
       >
         {t('logs.clear')}
       </button>
+      <button
+        type="button"
+        onclick={exportLines}
+        class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
+      >
+        {t('operations.logs.export')}
+      </button>
     </div>
   </div>
+
+  {#if connectionStatus !== 'connected'}
+    <StateBlock variant="disconnected-stale" message={t('operations.logs.stale')} />
+  {/if}
 
   <div
     bind:this={logViewport}

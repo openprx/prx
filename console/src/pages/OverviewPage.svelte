@@ -1,5 +1,6 @@
 <script>
   import { api } from '../lib/api';
+  import { presentContext } from '../lib/context-status';
   import { formatUptime } from '../lib/format';
   import { t } from '../lib/i18n';
   import PageHeader from '../lib/ui/PageHeader.svelte';
@@ -46,6 +47,15 @@
   ]);
 
   const channels = $derived(Array.isArray(status?.channels) ? status.channels : []);
+  const health = $derived(presentContext(status, '').filter((fact) => fact.id !== 'origin' && fact.id !== 'version'));
+
+  function namedList(value) {
+    if (!Array.isArray(value)) {
+      return t('common.unknown');
+    }
+    const names = value.filter((item) => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim());
+    return names.length > 0 ? names.join(', ') : t('operations.overview.none');
+  }
 
   async function loadStatus() {
     try {
@@ -99,6 +109,28 @@
           <p class="mt-2 text-lg font-semibold text-gray-900 dark:text-gray-100">{card.value}</p>
         </div>
       {/each}
+    </div>
+
+    <div class="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
+      <h3 class="text-sm font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300">
+        {t('operations.overview.health')}
+      </h3>
+      <dl class="mt-3 grid gap-3 sm:grid-cols-2">
+        {#each health as fact (fact.id)}
+          <div>
+            <dt class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">{fact.label}</dt>
+            <dd class="mt-1 text-sm text-gray-900 dark:text-gray-100">{fact.value}</dd>
+          </div>
+        {/each}
+        <div>
+          <dt class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">{t('operations.overview.participants')}</dt>
+          <dd class="mt-1 text-sm text-gray-900 dark:text-gray-100">{namedList(status?.config_generation_participants)}</dd>
+        </div>
+        <div>
+          <dt class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">{t('operations.overview.unavailableProviders')}</dt>
+          <dd class="mt-1 text-sm text-gray-900 dark:text-gray-100">{namedList(status?.provider_unavailable)}</dd>
+        </div>
+      </dl>
     </div>
 
     <div class="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">

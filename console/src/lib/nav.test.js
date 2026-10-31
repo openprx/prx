@@ -19,7 +19,10 @@ const CURRENT_PATHS = [
   '/routing',
   '/changes',
   '/config',
-  '/logs'
+  '/logs',
+  '/schedules',
+  '/memory',
+  '/cost'
 ];
 
 test('group table covers every current nav path once and chat counts as sessions', () => {
