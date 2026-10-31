@@ -34,9 +34,10 @@ async fn unauthenticated_identity_has_no_evidence_sideeffect_and_response_has_no
     let (status, body) = served.call(reqwest::Method::GET, "/api/identity", None).await;
     assert_eq!(status, 200, "{body}");
     let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let expected_principal = ApiPrincipal::of_token(TOKEN);
     assert_eq!(
-        value.get("principal_id").unwrap(),
-        ApiPrincipal::of_token(TOKEN).owner_id
+        value.get("principal_id").and_then(serde_json::Value::as_str),
+        Some(expected_principal.owner_id.as_str())
     );
     assert!(!body.contains(TOKEN));
     assert!(!body.contains(&crate::security::pairing::hash_token(TOKEN)));

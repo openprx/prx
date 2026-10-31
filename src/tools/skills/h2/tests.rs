@@ -1,5 +1,6 @@
 //! Invoke the actual adapter with its original signed resource grant, no model.
 use super::*;
+use std::sync::Arc;
 impl SkillsManageTool {
     pub(crate) async fn test_controlled_admit(
         plan: experiment::InstructionExperimentPlan,
