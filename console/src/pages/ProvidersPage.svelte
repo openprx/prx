@@ -5,6 +5,7 @@
   import ErrorNotice from '../lib/ErrorNotice.svelte';
   import PlanReview from '../lib/PlanReview.svelte';
   import { t } from '../lib/i18n';
+  import { loadFailureVariant } from '../lib/load-state';
   import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
 
@@ -264,7 +265,7 @@
   {#if loading}
     <StateBlock variant="loading" message={t('common.loading')} />
   {:else if loadError}
-    <ErrorNotice error={loadError} />
+    <StateBlock variant={loadFailureVariant(loadError)} message={loadError?.message || ''} />
   {:else if providers.length === 0}
     <StateBlock variant="empty" message={t('providers.none')} />
   {:else}

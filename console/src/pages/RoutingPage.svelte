@@ -2,10 +2,11 @@
   import { onDestroy, untrack } from 'svelte';
   import { api } from '../lib/api';
   import { ChangeFlow, isMasked, unmasked } from '../lib/change-flow.svelte.js';
-  import ErrorNotice from '../lib/ErrorNotice.svelte';
   import PlanReview from '../lib/PlanReview.svelte';
   import { t } from '../lib/i18n';
+  import { loadFailureVariant } from '../lib/load-state';
   import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
 
   const SELECTION_OPERATIONS = ['chat', 'embedding'];
 
@@ -153,7 +154,11 @@
     </button>
   </div>
 
-  <ErrorNotice error={loadError} />
+  {#if loadError}
+    <StateBlock variant={loadFailureVariant(loadError)} message={loadError?.message || ''} />
+  {:else if !defaults}
+    <StateBlock variant="loading" message={t('common.loading')} />
+  {:else}
   <PlanReview {flow} />
 
   <div class="space-y-3 rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
@@ -409,4 +414,5 @@
       </button>
     </div>
   </div>
+  {/if}
 </section>

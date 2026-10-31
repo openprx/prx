@@ -183,7 +183,22 @@
       "qq": "QQ",
       "cli": "CLI",
       "configured": "Configured"
-    }
+    },
+    "configuredLabel": "Configured state",
+    "statusHint": "This value says the channel is configured. It is not a live health check.",
+    "sendTitle": "Send a message",
+    "recipient": "Recipient",
+    "message": "Message",
+    "asVoice": "Send as voice",
+    "send": "Send",
+    "sending": "Sending...",
+    "denied": "Sending is not allowed for this operator.",
+    "uncertain": "Delivery is uncertain. The message was not sent again.",
+    "resultChannel": "Channel",
+    "resultDelivered": "Delivered",
+    "resultDetail": "Detail",
+    "resultMissing": "The response did not include this field.",
+    "loadDenied": "Channel status is not available to this operator."
   },
   "config": {
     "title": "Config",
@@ -271,7 +286,8 @@
     "save": "Save",
     "readOnly": "This file is read-only here.",
     "readOnlyRedacted": "This file holds a secret: it is shown redacted and is read-only here. Set credentials on the Providers page.",
-    "readOnlyBadge": "read-only"
+    "readOnlyBadge": "read-only",
+    "noFiles": "No configuration files are loaded."
   },
   "logs": {
     "title": "Logs",
@@ -326,7 +342,9 @@
     "disconnected": "Disconnected",
     "tools": "tools",
     "availableTools": "Available Tools",
-    "noTools": "No tools available."
+    "noTools": "No tools available.",
+    "lifecycleUnavailable": "Connect, restart and delete are not available in this deployment.",
+    "loadDenied": "MCP servers are not available to this operator."
   },
   "skills": {
     "title": "Skills",
@@ -358,8 +376,17 @@
     "uninstallSuccess": "Skill uninstalled",
     "uninstallFailed": "Failed to uninstall skill",
     "sources": {
-      "github": "GitHub"
-    }
+      "github": "GitHub",
+      "clawhub": "ClawHub",
+      "huggingface": "Hugging Face"
+    },
+    "toggle": "Toggle",
+    "toggling": "Toggling...",
+    "toggleNote": "This switches the enable flag. It does not publish a skill lifecycle.",
+    "toggleDenied": "Toggling this skill is not allowed.",
+    "toggleResult": "Status {status}, id {id}, enabled {enabled}.",
+    "sourceUnavailable": "This source is not available. An empty catalog is not a search result.",
+    "loadDenied": "Skills are not available to this operator."
   },
   "plugins": {
     "title": "Plugins",
@@ -371,7 +398,38 @@
     "statusActive": "Active",
     "reload": "Reload",
     "reloadSuccess": "Plugin \"{name}\" reloaded",
-    "reloadFailed": "Failed to reload plugin"
+    "reloadFailed": "Failed to reload plugin",
+    "exactArtifact": "This list does not include the component hash, the manifest hash, or the trust record. Trust is separate from enable.",
+    "notFirstDiscoverable": "A name that is absent from this generation is not first-discoverable by reload.",
+    "contractGap": "This list does not report healthy or listening. Registry status is not a health check.",
+    "registryStatus": "Registry status",
+    "granted": "Granted permissions",
+    "required": "Required permissions",
+    "loadedFact": "Present in the loaded list",
+    "enable": "Enable",
+    "enableName": "Disabled plugin name",
+    "disable": "Disable",
+    "refreshAll": "Refresh all plugins",
+    "refreshNote": "Refresh rebuilds every eligible plugin. It is not first discovery of one new name.",
+    "install": "Install",
+    "update": "Update",
+    "source": "Source directory",
+    "sha256": "Component SHA-256",
+    "manifestSha256": "Manifest SHA-256",
+    "remove": "Remove",
+    "removeTitle": "Remove plugin",
+    "removeConsequence": "Removes the plugin, revokes its trust record, and leaves a recoverable backup. This does not undo itself.",
+    "installConsequence": "Installs the reviewed artifact and records trust for these hashes and permissions.",
+    "updateConsequence": "Replaces the installed artifact and records trust for these hashes and permissions.",
+    "actionResult": "Action result",
+    "denied": "This plugin action is not allowed.",
+    "confirmRequired": "This high-risk plugin change needs confirmation. Nothing was written.",
+    "conflict": "The plugin is already in that state.",
+    "absent": "That plugin is not in the disabled or installed set.",
+    "featureOff": "The WASM plugin system is not available.",
+    "loadDenied": "Plugins are not available to this operator.",
+    "noBytes": "Install and update take a workspace directory and the reviewed hashes. They do not accept raw bytes.",
+    "generation": "Generation"
   },
   "login": {
     "title": "PRX Console Login",
@@ -518,7 +576,23 @@
     "confirmRollback": "Confirm rollback",
     "rolledBack": "Restored the configuration from before {record} ({status}).",
     "restores": "Restores the configuration from before {record}",
-    "showPlan": "Show plan"
+    "showPlan": "Show plan",
+    "reload": "Reload configuration",
+    "reloading": "Reloading...",
+    "reloadResult": "Reload response",
+    "reloadSuccess": "Success",
+    "reloadMessage": "Message",
+    "reloadNotEveryone": "HTTP 200 does not mean every participant reloaded.",
+    "reloadStatus": "Reload status",
+    "reloadInProgress": "Reload in progress",
+    "activeGeneration": "Active generation",
+    "activeRevision": "Active revision",
+    "desiredRevision": "Desired revision",
+    "restartRequired": "Restart required",
+    "participants": "Participants",
+    "lastFailure": "Last reload failure",
+    "fieldMissing": "The status response did not include this field.",
+    "loadDenied": "Change history is not available to this operator."
   },
   "decisionApproval": {
     "refreshFailed": "The execution response was received, but the conversation could not be refreshed. Refresh the conversation to inspect it; do not repeat the operation.",

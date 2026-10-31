@@ -1,9 +1,10 @@
 <script>
-  import { untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { api } from '../lib/api';
   import { riskReasonText } from '../lib/change-flow.svelte.js';
   import ErrorNotice from '../lib/ErrorNotice.svelte';
   import { t } from '../lib/i18n';
+  import { loadFailureVariant } from '../lib/load-state';
   import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
 
@@ -22,6 +23,28 @@
   let busy = $state(false);
   let actionError = $state(null);
   let result = $state(null);
+  let reloading = $state(false);
+  let reloadResponse = $state(null);
+  let reloadError = $state(null);
+  let reloadStatus = $state(null);
+  // Bumped when a newer reload starts or the page is destroyed, so a poll
+  // does not write state after the operator has left.
+  let reloadGeneration = 0;
+
+  onDestroy(() => {
+    reloadGeneration += 1;
+  });
+
+  const RELOAD_FIELDS = [
+    ['config_reload_status', 'changes.reloadStatus'],
+    ['config_reload_in_progress', 'changes.reloadInProgress'],
+    ['active_config_generation', 'changes.activeGeneration'],
+    ['active_config_source_revision', 'changes.activeRevision'],
+    ['desired_config_source_revision', 'changes.desiredRevision'],
+    ['restart_required', 'changes.restartRequired'],
+    ['config_generation_participants', 'changes.participants'],
+    ['last_config_reload_failure', 'changes.lastFailure']
+  ];
 
   async function loadRecords() {
     loading = true;
@@ -78,6 +101,43 @@
     }
   }
 
+  function statusField(payload, key) {
+    if (!payload || typeof payload !== 'object' || !Object.hasOwn(payload, key)) {
+      return t('changes.fieldMissing');
+    }
+    const value = payload[key];
+    if (typeof value === 'boolean') return value ? 'true' : 'false';
+    if (value === null || value === undefined) return 'null';
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+  }
+
+  async function reloadConfiguration() {
+    if (reloading) return;
+    const generation = reloadGeneration + 1;
+    reloadGeneration = generation;
+    reloading = true;
+    reloadError = null;
+    reloadResponse = null;
+    try {
+      const response = await api.reloadConfig();
+      if (generation !== reloadGeneration) return;
+      reloadResponse = response && typeof response === 'object' ? response : {};
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const status = await api.getStatus();
+        if (generation !== reloadGeneration) return;
+        reloadStatus = status && typeof status === 'object' ? status : {};
+        if (!reloadStatus.config_reload_in_progress) break;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    } catch (error) {
+      if (generation !== reloadGeneration) return;
+      reloadError = error;
+    } finally {
+      if (generation === reloadGeneration) reloading = false;
+    }
+  }
+
   function startRollback(record) {
     result = null;
     sendRollback(record, {}, revision);
@@ -114,6 +174,36 @@
     </button>
   </div>
   <p class="text-sm text-gray-600 dark:text-gray-300">{t('changes.intro')}</p>
+
+  <div class="space-y-3 rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
+    <button
+      type="button"
+      onclick={reloadConfiguration}
+      disabled={reloading}
+      class="rounded-lg bg-sky-600 px-3 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+    >
+      {reloading ? t('changes.reloading') : t('changes.reload')}
+    </button>
+    <p class="text-xs text-gray-500 dark:text-gray-400">{t('changes.reloadNotEveryone')}</p>
+    {#if reloadError}
+      <StateBlock variant={loadFailureVariant(reloadError)} message={reloadError?.message || t('changes.loadDenied')} />
+    {:else if reloadResponse}
+      <div class="space-y-1 text-sm">
+        <p class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">{t('changes.reloadResult')}</p>
+        <p>{t('changes.reloadSuccess')}: {statusField(reloadResponse, 'success')}</p>
+        <p>{t('changes.reloadMessage')}</p>
+        <pre class="max-h-48 overflow-auto rounded-lg bg-gray-100 p-3 text-xs dark:bg-gray-900">{statusField(reloadResponse, 'message')}</pre>
+      </div>
+    {/if}
+    {#if reloadStatus}
+      <dl class="grid gap-1 text-sm sm:grid-cols-2">
+        {#each RELOAD_FIELDS as [key, labelKey]}
+          <dt class="text-gray-500 dark:text-gray-400">{t(labelKey)}</dt>
+          <dd class="font-mono text-xs">{statusField(reloadStatus, key)}</dd>
+        {/each}
+      </dl>
+    {/if}
+  </div>
 
   <ErrorNotice error={actionError} />
 
@@ -171,7 +261,7 @@
   {#if loading}
     <StateBlock variant="loading" message={t('common.loading')} />
   {:else if loadError}
-    <ErrorNotice error={loadError} />
+    <StateBlock variant={loadFailureVariant(loadError)} message={loadError?.message || t('changes.loadDenied')} />
   {:else if records.length === 0}
     <StateBlock variant="empty" message={t('changes.none')} />
   {:else}
