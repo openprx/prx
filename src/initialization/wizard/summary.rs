@@ -161,10 +161,7 @@ pub(super) fn print_summary(config: &Config) {
                 "    {} Authenticate OpenAI Codex:",
                 style(format!("{step}.")).cyan().bold()
             );
-            println!(
-                "       {}",
-                style("prx auth login --provider openai-codex --device-code").yellow()
-            );
+            println!("       {}", style("prx auth login --provider openai-codex").yellow());
         } else if matches!(provider, "xai" | "grok") {
             if xai_subscription_saved(config) {
                 println!(

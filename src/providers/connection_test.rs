@@ -421,8 +421,7 @@ fn anthropic_headers(credential: Option<&str>) -> Vec<(&'static str, String)> {
     let mut headers = vec![("anthropic-version", "2023-06-01".to_string())];
     match credential {
         Some(token) if crate::auth::discovery::is_claude_code_oauth_setup_token(token) => {
-            headers.push(("authorization", format!("Bearer {token}")));
-            headers.push(("anthropic-beta", "oauth-2025-04-20".to_string()));
+            let _ = token;
         }
         Some(key) => headers.push(("x-api-key", key.to_string())),
         None => {}

@@ -2149,6 +2149,8 @@ struct PendingOpenAiLogin {
     code_verifier: String,
     state: String,
     created_at: String,
+    host_id: String,
+    client_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2160,6 +2162,10 @@ struct PendingOpenAiLoginFile {
     encrypted_code_verifier: Option<String>,
     state: String,
     created_at: String,
+    #[serde(default)]
+    host_id: String,
+    #[serde(default)]
+    client_id: String,
 }
 
 fn pending_openai_login_path(config: &Config) -> std::path::PathBuf {
@@ -2195,6 +2201,8 @@ fn save_pending_openai_login(config: &Config, pending: &PendingOpenAiLogin) -> R
         encrypted_code_verifier: Some(encrypted_code_verifier),
         state: pending.state.clone(),
         created_at: pending.created_at.clone(),
+        host_id: pending.host_id.clone(),
+        client_id: pending.client_id.clone(),
     };
     let tmp = path.with_extension(format!(
         "tmp.{}.{}",
@@ -2232,6 +2240,8 @@ fn load_pending_openai_login(config: &Config) -> Result<Option<PendingOpenAiLogi
         code_verifier,
         state: persisted.state,
         created_at: persisted.created_at,
+        host_id: persisted.host_id,
+        client_id: persisted.client_id,
     }))
 }
 
@@ -3158,8 +3168,29 @@ fn open_approval_ledger(config: &Config) -> Result<Connection> {
     Ok(conn)
 }
 
+async fn login_openrouter(auth_service: &auth::AuthService, profile: &str, headless: bool) -> Result<()> {
+    let pkce = auth::openrouter_oauth::generate_pkce();
+    let client = openprx::prx_http_client();
+    let code = if headless {
+        println!("Open this URL. It shows a code to paste back (no browser callback):");
+        println!("{}", auth::openrouter_oauth::headless_authorize_url(&pkce));
+        read_plain_input("Paste OpenRouter code")?
+    } else {
+        let (listener, callback) = auth::openrouter_oauth::bind_loopback().await?;
+        println!("Open this URL in your browser and authorize access:");
+        println!("{}", auth::openrouter_oauth::browser_authorize_url(&callback, &pkce));
+        println!("Waiting for the loopback callback...");
+        auth::openrouter_oauth::receive_loopback_code(listener, std::time::Duration::from_mins(3)).await?
+    };
+    let key = auth::openrouter_oauth::exchange_code(&client, &code, &pkce.verifier).await?;
+    auth_service.store_provider_token("openrouter", profile, &key, std::collections::HashMap::new(), true)?;
+    println!("Saved profile {profile}");
+    println!("Active profile for openrouter: {profile}");
+    Ok(())
+}
+
 async fn login_xai(auth_service: &auth::AuthService, config: &Config, profile: &str, device_code: bool) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = openprx::prx_http_client();
     let state_dir = auth::state_dir_from_config(config);
 
     if device_code {
@@ -3231,7 +3262,7 @@ async fn paste_xai_redirect(
         None => read_plain_input("Paste redirect URL or OAuth code")?,
     };
     let code = auth::xai_oauth::parse_code_from_redirect(&redirect_input, Some(&pending.state))?;
-    let client = reqwest::Client::new();
+    let client = openprx::prx_http_client();
     let token_set = auth::xai_oauth::exchange_code_for_tokens(&client, &code, &pending.code_verifier).await?;
     auth_service.store_xai_tokens(profile, token_set, true)?;
     auth::xai_oauth::clear_pending_login(&state_dir);
@@ -3254,76 +3285,79 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             if provider == "xai" {
                 return login_xai(&auth_service, config, &profile, device_code).await;
             }
+            if provider == "openrouter" {
+                return login_openrouter(&auth_service, &profile, device_code).await;
+            }
             if provider != "openai-codex" {
-                bail!("`auth login` supports --provider openai-codex and --provider xai");
+                bail!("`auth login` supports --provider openai-codex, --provider openrouter, and --provider xai");
             }
 
-            let client = reqwest::Client::new();
+            let client = openprx::prx_http_client();
 
             if device_code {
-                match auth::openai_oauth::start_device_code_flow(&client).await {
-                    Ok(device) => {
-                        println!("OpenAI device-code login started.");
-                        println!("Visit: {}", device.verification_uri);
-                        println!("Code:  {}", device.user_code);
-                        if let Some(uri_complete) = &device.verification_uri_complete {
-                            println!("Fast link: {uri_complete}");
-                        }
-                        if let Some(message) = &device.message {
-                            println!("{message}");
-                        }
-
-                        let token_set = auth::openai_oauth::poll_device_code_tokens(&client, &device).await?;
-                        let account_id = extract_openai_account_id_for_profile(
-                            &token_set.access_token,
-                            token_set.id_token.as_deref(),
-                        );
-
-                        auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
-                        clear_pending_openai_login(config);
-
-                        println!("Saved profile {profile}");
-                        println!("Active profile for openai-codex: {profile}");
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        bail!(
-                            "OpenAI device-code flow failed: {error}. Retry with --device-code, or run `prx auth login --provider openai-codex` for the browser flow."
-                        );
-                    }
-                }
+                auth::openai_oauth::start_device_code_flow(&client).await?;
             }
 
+            let state_dir = auth::state_dir_from_config(config);
+            let host_id = auth::openai_oauth::load_or_create_host_id(&state_dir)?;
+            let saved_client_id = auth_service
+                .get_profile("openai-codex", Some(&profile))?
+                .and_then(|profile| {
+                    profile
+                        .metadata
+                        .get(auth::openai_oauth::OPENAI_CLIENT_ID_METADATA)
+                        .cloned()
+                });
             let pkce = auth::openai_oauth::generate_pkce_state();
+            let client_id_sent = saved_client_id
+                .as_deref()
+                .filter(|value| value.starts_with("oaiapp_"))
+                .unwrap_or(auth::openai_oauth::OPENAI_OAUTH_DYNAMIC_CLIENT_ID)
+                .to_string();
             let pending = PendingOpenAiLogin {
                 profile: profile.clone(),
                 code_verifier: pkce.code_verifier.clone(),
                 state: pkce.state.clone(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                host_id: host_id.clone(),
+                client_id: client_id_sent.clone(),
             };
             save_pending_openai_login(config, &pending)?;
 
-            let authorize_url = auth::openai_oauth::build_authorize_url(&pkce);
+            let authorize_url =
+                auth::openai_oauth::build_authorize_url(&pkce, &host_id, saved_client_id.as_deref(), None);
             println!("Open this URL in your browser and authorize access:");
             println!("{authorize_url}");
             println!();
-            println!("Waiting for callback at http://localhost:1455/auth/callback ...");
+            println!(
+                "Waiting for callback at {} ...",
+                auth::openai_oauth::OPENAI_OAUTH_REDIRECT_URI
+            );
 
-            let code =
+            let callback =
                 match auth::openai_oauth::receive_loopback_code(&pkce.state, std::time::Duration::from_mins(3)).await {
-                    Ok(code) => code,
+                    Ok(callback) => callback,
                     Err(e) => {
                         println!("Callback capture failed: {e}");
                         println!("Run `prx auth paste-redirect --provider openai-codex --profile {profile}`");
                         return Ok(());
                     }
                 };
+            let code = auth::openai_oauth::parse_code_from_redirect(&callback, Some(&pkce.state))?;
 
-            let token_set = auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+            let issued = auth::openai_oauth::issued_client_id_from_callback(&callback)
+                .or_else(|| client_id_sent.starts_with("oaiapp_").then(|| client_id_sent.clone()));
+            let Some(exchange_client_id) = issued else {
+                bail!(
+                    "Sign in with ChatGPT did not return an issued oaiapp_ client id. Run `prx auth login --provider openai-codex` again."
+                );
+            };
+            let token_set =
+                auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce, &exchange_client_id).await?;
             let account_id =
                 extract_openai_account_id_for_profile(&token_set.access_token, token_set.id_token.as_deref());
 
-            auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
+            auth_service.store_openai_siwc_tokens(&profile, token_set, account_id, &exchange_client_id, true)?;
             clear_pending_openai_login(config);
 
             println!("Saved profile {profile}");
@@ -3362,19 +3396,32 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             };
 
             let code = auth::openai_oauth::parse_code_from_redirect(&redirect_input, Some(&pending.state))?;
+            let issued = auth::openai_oauth::issued_client_id_from_callback(&redirect_input).or_else(|| {
+                pending
+                    .client_id
+                    .starts_with("oaiapp_")
+                    .then(|| pending.client_id.clone())
+            });
+            let Some(exchange_client_id) = issued else {
+                bail!(
+                    "Sign in with ChatGPT did not return an issued oaiapp_ client id. Run `prx auth login --provider openai-codex` again."
+                );
+            };
 
             let pkce = auth::openai_oauth::PkceState {
                 code_verifier: pending.code_verifier.clone(),
                 code_challenge: String::new(),
                 state: pending.state.clone(),
+                nonce: String::new(),
             };
 
-            let client = reqwest::Client::new();
-            let token_set = auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+            let client = openprx::prx_http_client();
+            let token_set =
+                auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce, &exchange_client_id).await?;
             let account_id =
                 extract_openai_account_id_for_profile(&token_set.access_token, token_set.id_token.as_deref());
 
-            auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
+            auth_service.store_openai_siwc_tokens(&profile, token_set, account_id, &exchange_client_id, true)?;
             clear_pending_openai_login(config);
 
             println!("Saved profile {profile}");
@@ -3399,6 +3446,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             if token.is_empty() {
                 bail!("Token cannot be empty");
             }
+            if auth::discovery::is_claude_code_oauth_setup_token(&token) {
+                bail!("{}", auth::terms::ANTHROPIC_SUBSCRIPTION_REMOVED);
+            }
 
             let kind = auth::anthropic_token::detect_auth_kind(&token, auth_kind.as_deref());
             let mut metadata = std::collections::HashMap::new();
@@ -3415,6 +3465,9 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             let token = read_auth_input("Paste token")?;
             if token.is_empty() {
                 bail!("Token cannot be empty");
+            }
+            if auth::discovery::is_claude_code_oauth_setup_token(&token) {
+                bail!("{}", auth::terms::ANTHROPIC_SUBSCRIPTION_REMOVED);
             }
 
             let kind = auth::anthropic_token::detect_auth_kind(&token, Some("authorization"));
