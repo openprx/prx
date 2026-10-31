@@ -67,6 +67,7 @@ const fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         dingtalk,
         linq,
         qq,
+        ramflux,
         ..
     } = channels;
 
@@ -84,6 +85,7 @@ const fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         || dingtalk.is_some()
         || linq.is_some()
         || qq.is_some()
+        || ramflux.is_some()
 }
 
 // ── Main wizard entry point ──────────────────────────────────────

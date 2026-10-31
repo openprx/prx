@@ -19,7 +19,7 @@ use super::{
     DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS, DEFAULT_CHANNEL_MAX_BACKOFF_SECS, DingTalkChannel, DiscordChannel,
     EmailChannel, HashMap, HookManager, IMessageChannel, InboundPolicyConfig, IrcChannel, LarkChannel, LinqChannel,
     MattermostChannel, Memory, Mutex, NextcloudTalkChannel, Observer, Provider, ProviderCacheKey, ProviderCacheMap,
-    QQChannel, Result, SignalChannel, SignalNativeChannel, SlackChannel, TelegramChannel, WacliChannel,
+    QQChannel, RamfluxChannel, Result, SignalChannel, SignalNativeChannel, SlackChannel, TelegramChannel, WacliChannel,
     WhatsAppChannel, decision_runtime, irc, memory, observability, outbound_registry, providers, runtime, tools,
     traits, wacli,
 };
@@ -327,6 +327,15 @@ pub async fn start_channels_with_config(
             lq.from_phone.clone(),
             lq.allowed_senders.clone(),
         )));
+    }
+
+    if let Some(ref rf) = config.channels_config.ramflux {
+        match RamfluxChannel::new(rf.clone(), &config.workspace_dir) {
+            Ok(channel) => channels.push(Arc::new(channel)),
+            Err(error) => {
+                tracing::warn!(error = %error, "ramflux channel was not started");
+            }
+        }
     }
 
     if let Some(ref wc) = config.channels_config.wacli {

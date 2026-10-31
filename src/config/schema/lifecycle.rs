@@ -570,6 +570,9 @@ impl Config {
         if let Some(lark) = &self.channels_config.lark {
             lark.validate()?;
         }
+        if let Some(ramflux) = &self.channels_config.ramflux {
+            ramflux.validate()?;
+        }
         validate_credential_references(self)?;
         for (index, policy) in self.user_policies.iter().enumerate() {
             anyhow::ensure!(

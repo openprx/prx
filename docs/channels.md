@@ -5,7 +5,7 @@ configured with DM/group policies.
 
 ## Supported Channels
 
-Signal · WhatsApp (whatsmeow) · WhatsApp CLI (wacli) · Telegram · Discord · Slack · iMessage · Matrix · IRC · Email · DingTalk · Lark/Feishu · QQ · Mattermost · Nextcloud Talk · LinQ · CLI
+Signal · WhatsApp (whatsmeow) · WhatsApp CLI (wacli) · Telegram · Discord · Slack · iMessage · Matrix · IRC · Email · DingTalk · Lark/Feishu · QQ · Mattermost · Nextcloud Talk · LinQ · Ramflux · CLI
 
 Matrix is an opt-in source-build channel and is not included in default or
 release binaries. Build it with
@@ -13,6 +13,25 @@ release binaries. Build it with
 onboarding wizard offers Matrix only in that build. If a default binary loads
 an existing `[channels_config.matrix]` section, `prx doctor` and channel startup
 report that Matrix is unavailable instead of silently ignoring it.
+
+## Ramflux
+
+The ramflux channel is a same-user Unix socket bridge to a local
+`ramflux-agent-host`. prx does not hold ramflux keys, does not sign, and does
+not open nodes or gateways. Socket mode is `0600`. `authorization_mode` is
+`follow_rf` (default), `supervised`, or `full`; effective `full` autonomy
+requires the host to declare `authorization = "full"` in `bridge.hello`.
+`prx channel doctor` prints the socket path, the permission check, and the
+effective mode (`follow_rf→supervised` or `follow_rf→full`).
+
+Protocol, config keys, encryption, and erase behavior are in
+[ramflux-channel.md](ramflux-channel.md).
+
+```toml
+[channels_config.ramflux]
+authorization_mode = "follow_rf"
+# socket_path = "/tmp/prx/ramflux.sock"  # default: $XDG_RUNTIME_DIR/prx/ramflux.sock
+```
 
 ## Policies
 

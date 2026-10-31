@@ -1,0 +1,71 @@
+use super::{Host, config_at};
+use crate::channels::rich::RichChannel;
+use crate::channels::traits::Channel;
+use crate::config::RamfluxConfig;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
+#[tokio::test]
+async fn refuses_symlink() {
+    let dir = tempfile::tempdir().expect("test: temp");
+    super::tighten_dir(dir.path());
+    let path = dir.path().join("ramflux.sock");
+    std::os::unix::fs::symlink("/tmp/not-a-socket", &path).expect("test: symlink");
+    let channel = super::super::RamfluxChannel::new(config_at(&path), dir.path()).expect("test: channel");
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let error = channel
+        .listen_rich(tx)
+        .await
+        .expect_err("test: symlink must be refused");
+    assert!(error.to_string().contains("symlink"), "{error}");
+}
+
+#[tokio::test]
+async fn refuses_loose_permissions() {
+    let dir = tempfile::tempdir().expect("test: temp");
+    super::tighten_dir(dir.path());
+    let path = dir.path().join("ramflux.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).expect("test: bind");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("test: chmod");
+    let channel = super::super::RamfluxChannel::new(config_at(&path), dir.path()).expect("test: channel");
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let error = channel.listen_rich(tx).await.expect_err("test: 0644 must be refused");
+    assert!(error.to_string().contains("0600"), "{error}");
+}
+
+#[tokio::test]
+async fn created_socket_is_0600_and_rejects_a_second_connection() {
+    let mut host = Host::connect(RamfluxConfig::default()).await;
+    let meta = std::fs::symlink_metadata(&host.path).expect("test: metadata");
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    let mut second = UnixStream::connect(&host.path).await.expect("test: second connect");
+    second.write_all(b"\n").await.expect("test: poke");
+    let mut reader = BufReader::new(second);
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(2), reader.read_until(b'\n', &mut buf))
+        .await
+        .expect("test: second connection timed out")
+        .expect("test: read");
+    assert!(read > 0, "test: expected a rejection frame");
+    let value: serde_json::Value = serde_json::from_slice(&buf).expect("test: rejection json");
+    assert!(value["error"]["message"].as_str().unwrap_or("").contains("second"));
+    let ack = host.hello("supervised").await;
+    assert_eq!(ack["result"]["ok"], true);
+    assert_eq!(ack["result"]["effective_autonomy"], "supervised");
+}
+
+#[tokio::test]
+async fn health_requires_a_recent_ping() {
+    let mut host = Host::connect(RamfluxConfig::default()).await;
+    assert!(!host.channel.health_check().await);
+    host.hello("full").await;
+    assert!(!host.channel.health_check().await);
+    host.ping().await;
+    assert!(host.channel.health_check().await);
+    let report = host.channel.doctor_report();
+    assert_eq!(report.authorization, "follow_rf→full");
+    assert!(report.permission.contains("0600"));
+}

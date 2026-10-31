@@ -279,6 +279,14 @@ pub trait Channel: Send + Sync {
     async fn send_thread_reply(&self, _channel_id: &str, _thread_id: &str, _message: &str) -> anyhow::Result<()> {
         Err(anyhow::anyhow!("thread reply not supported on this channel"))
     }
+
+    /// Rich extension, when this channel implements it.
+    ///
+    /// `Arc<dyn Channel>` uses this instead of a concrete downcast. The only
+    /// caller is the channel turn loop.
+    fn as_rich(&self) -> Option<&dyn crate::channels::rich::RichChannel> {
+        None
+    }
 }
 
 // ── Channel capabilities ─────────────────────────────────────────────────────

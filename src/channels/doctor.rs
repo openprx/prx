@@ -7,8 +7,8 @@ use super::WhatsAppWebChannel;
 use super::service::bind_telegram_identity;
 use super::{
     Arc, Channel, Config, DingTalkChannel, DiscordChannel, Duration, EmailChannel, IMessageChannel, IrcChannel,
-    LarkChannel, LinqChannel, NextcloudTalkChannel, QQChannel, Result, SignalChannel, SignalNativeChannel,
-    SlackChannel, TelegramChannel, WacliChannel, WhatsAppChannel, irc, wacli,
+    LarkChannel, LinqChannel, NextcloudTalkChannel, QQChannel, RamfluxChannel, Result, SignalChannel,
+    SignalNativeChannel, SlackChannel, TelegramChannel, WacliChannel, WhatsAppChannel, irc, wacli,
 };
 
 /// Return the configured state of every real-time channel supported by this build.
@@ -37,6 +37,7 @@ pub fn channel_configuration_statuses(config: &Config) -> Vec<(&'static str, boo
         ("Lark", config.channels_config.lark.is_some()),
         ("DingTalk", config.channels_config.dingtalk.is_some()),
         ("QQ", config.channels_config.qq.is_some()),
+        ("Ramflux", config.channels_config.ramflux.is_some()),
     ]
 }
 
@@ -260,6 +261,21 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 tracing::warn!(
                     "WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set"
                 );
+            }
+        }
+    }
+
+    if let Some(ref rf) = config.channels_config.ramflux {
+        match RamfluxChannel::new(rf.clone(), &config.workspace_dir) {
+            Ok(channel) => {
+                let report = channel.doctor_report();
+                println!("  Ramflux socket: {}", report.socket_path.display());
+                println!("  Ramflux permission: {}", report.permission);
+                println!("  Ramflux authorization: {}", report.authorization);
+                channels.push(("Ramflux", Arc::new(channel)));
+            }
+            Err(error) => {
+                println!("  ❌ Ramflux   invalid config: {error}");
             }
         }
     }

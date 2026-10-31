@@ -222,10 +222,7 @@ impl crate::tools::ApprovalStrategy for AgentToolApprovalStrategy {
             };
         }
 
-        let approval_request = ApprovalRequest {
-            tool_name: tool_name.to_string(),
-            arguments: request.command.arguments.clone(),
-        };
+        let approval_request = ApprovalRequest::new(tool_name, request.command.arguments.clone());
         let (decision, grant) = if let Some(resolver) = self.resolver.as_ref() {
             let resolved = if let Some(token) = self.cancellation.as_ref() {
                 tokio::select! {

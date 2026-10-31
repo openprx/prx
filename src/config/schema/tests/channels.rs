@@ -326,6 +326,7 @@ async fn channels_config_with_imessage_and_matrix() {
         lark: None,
         dingtalk: None,
         qq: None,
+        ramflux: None,
     };
     let toml_str = toml::to_string_pretty(&c).unwrap();
     let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -602,6 +603,7 @@ async fn channels_config_with_whatsapp() {
         lark: None,
         dingtalk: None,
         qq: None,
+        ramflux: None,
     };
     let toml_str = toml::to_string_pretty(&c).unwrap();
     let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

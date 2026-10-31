@@ -421,10 +421,7 @@ mod tests {
     }
 
     fn request() -> ApprovalRequest {
-        ApprovalRequest {
-            tool_name: "shell".into(),
-            arguments: json!({"command": "rm -rf /tmp/x"}),
-        }
+        ApprovalRequest::new("shell", json!({"command": "rm -rf /tmp/x"}))
     }
 
     fn resolver(
@@ -688,14 +685,8 @@ mod tests {
             pending: pending.clone(),
             timeout: Duration::from_secs(30),
         };
-        let old = ApprovalRequest {
-            tool_name: "file_write".into(),
-            arguments: json!({"path":"old"}),
-        };
-        let new = ApprovalRequest {
-            tool_name: "file_write".into(),
-            arguments: json!({"path":"new"}),
-        };
+        let old = ApprovalRequest::new("file_write", json!({"path":"old"}));
+        let new = ApprovalRequest::new("file_write", json!({"path":"new"}));
         let mut old_future = Box::pin(resolver.resolve(&old, "cli"));
         assert!(futures::poll!(old_future.as_mut()).is_pending());
         assert!(matches!(rx_events.try_recv().unwrap(), SessionEvent::NeedsInput { .. }));
@@ -727,10 +718,7 @@ mod tests {
 
     #[test]
     fn summarize_truncates_long_args() {
-        let req = ApprovalRequest {
-            tool_name: "http_request".into(),
-            arguments: json!({"url": "x".repeat(500)}),
-        };
+        let req = ApprovalRequest::new("http_request", json!({"url": "x".repeat(500)}));
         let s = summarize_request(&req);
         assert!(s.starts_with("http_request("));
         // The argument digest is truncated with an ellipsis, then wrapped in the
