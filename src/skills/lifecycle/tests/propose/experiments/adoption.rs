@@ -3,7 +3,9 @@
 //! constructor, publication bypass or production profile exception is used.
 use super::*;
 use crate::skills::lifecycle::adoption::{LessonLimits, LessonQuery, LessonSnapshot, LessonSnapshotEntry};
-use crate::skills::lifecycle::{LessonRef, RecordAdoptionRequest};
+use crate::skills::lifecycle::{
+    ExperimentProductHandle, ExperimentPublishRequest, GateError, LessonRef, RecordAdoptionRequest, ServiceError,
+};
 use sha2::Digest as _;
 use std::collections::BTreeSet;
 
@@ -78,6 +80,83 @@ async fn donor(
         expires_at: Utc::now() + chrono::Duration::hours(1),
     };
     Ok((service, draft, journal, request))
+}
+/// Resolve the actual durable successful final; caller JSON never substitutes
+/// for the original owner journal/witness. All old crash/adoption assertions
+/// below continue through the exact product authorizer/publisher.
+fn final_request(f: &Fixture, journal: &ExperimentJournal) -> Result<ExperimentPublishRequest> {
+    let handle = ExperimentProductHandle {
+        experiment_id: journal.plan.spec().id.clone(),
+        plan_sha256: journal.plan.digest().into(),
+    };
+    Ok(ExperimentPublishRequest {
+        expected: f.store.resolve_experiment_final(&handle, "gate-review")?,
+    })
+}
+fn assert_missing_exact_intent(f: &Fixture, service: &SkillsLifecycleService, request: &ExperimentPublishRequest) {
+    let expected = &request.expected;
+    assert!(
+        matches!(
+            service.publish(&expected.proposal_id),
+            Err(ServiceError::Gate(GateError::Unbound(ref why)))
+                if why.contains("require exact product publication")
+        ),
+        "the generic service must reject specifically for missing exact-final intent"
+    );
+    assert!(
+        matches!(
+            f.store.authorize_publication(&expected.proposal_id, &expected.gate_sha256,
+                &service.settings().gate_policy, &expected.suite_sha256),
+            Err(GateError::Unbound(ref why)) if why.contains("require exact product publication")
+        ),
+        "the original authorization owner must close the same generic bypass"
+    );
+}
+fn assert_binding_removal_does_not_downgrade(
+    f: &Fixture,
+    service: &SkillsLifecycleService,
+    request: &ExperimentPublishRequest,
+) -> Result<()> {
+    assert_missing_exact_intent(f, service, request);
+    let expected = &request.expected;
+    let path = f.store.root().join("gates").join(format!("{}.json", expected.gate_id));
+    let original = std::fs::read(&path)?;
+    let before = f.store.active_binding(&expected.skill_id)?;
+    // Recompute the ordinary plain-SHA receipt seal: this checks a genuine
+    // missing-binding downgrade, rather than failing an earlier bad JSON/hash.
+    crate::skills::lifecycle::gate::rewrite_gate_for_test(&f.store, &expected.gate_id, |gate| {
+        gate.experiment = None;
+    });
+    let proposal = f
+        .store
+        .read_proposal(&expected.proposal_id)?
+        .context("final proposal missing")?;
+    assert!(
+        f.store
+            .recorded_gate_for(&proposal)?
+            .context("modified gate missing")?
+            .decision
+            .experiment
+            .is_none()
+    );
+    assert_missing_exact_intent(f, service, request);
+    assert!(
+        service.publish_final_product(request).is_err(),
+        "typed final must also refuse the removed sealed binding"
+    );
+    assert_eq!(f.store.active_binding(&expected.skill_id)?, before);
+    std::fs::write(&path, original)?;
+    assert_eq!(
+        final_request(
+            f,
+            &f.store
+                .read_experiment(&expected.handle.experiment_id, &expected.handle.plan_sha256)?
+        )?
+        .expected,
+        *expected,
+        "restoring only the deliberately removed binding restores the original exact final"
+    );
+    Ok(())
 }
 fn fresh_suite(f: &Fixture) -> crate::skills::lifecycle::FrozenSuite {
     let mut next = suite(f).suite().clone();
@@ -197,6 +276,9 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         let _profile = f.store.register_lesson_fixture_profile(&binding(&config))?;
         let (origin, draft, journal, mut request) = donor(&f, &config).await?;
         let before_publish = server.count.load(Ordering::SeqCst);
+        let exact_publication = final_request(&f, &journal)?;
+        assert_binding_removal_does_not_downgrade(&f, &origin, &exact_publication)?;
+        assert_eq!(server.count.load(Ordering::SeqCst), before_publish, "refusals cannot dispatch a judge or editor");
         assert!(
             origin.record_adoption(&request, &config).is_err(),
             "eligible/Shadow qualification cannot mint adopted guidance"
@@ -205,7 +287,7 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         // A real PREPARED crash is not adoption. Annotation must leave that
         // exact journal untouched; only an explicit publisher retry may settle it.
         crate::skills::lifecycle::publish::crash_hooks::arm("after_prepared");
-        let interrupted = origin.publish(&request.proposal_id);
+        let interrupted = origin.publish_final_product(&exact_publication);
         crate::skills::lifecycle::publish::crash_hooks::disarm();
         assert!(interrupted.is_err());
         let first_tx = TransactionId::parse(&request.publication_tx)?;
@@ -222,21 +304,17 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         );
         assert!(!f.store.root().join("adoptions").exists());
         assert!(
-            origin.publish(&request.proposal_id).is_err(),
+            origin.publish_final_product(&exact_publication).is_err(),
             "explicit retry closes the unswapped attempt as aborted"
         );
         assert_eq!(
             f.store.journal_entry(&first_tx)?.unwrap().state,
             crate::skills::lifecycle::TransactionState::Aborted
         );
-        let publication = origin.publish(&request.proposal_id)?;
-        request.publication_tx = publication
-            .proposal
-            .publication
-            .as_ref()
-            .unwrap()
-            .transaction_id
-            .clone();
+        let publication = origin.publish_final_product(&exact_publication)?;
+        request.publication_tx = publication.transaction.transaction_id.to_string();
+        assert!(publication.proposal_committed);
+        let committed_proposal = f.store.read_proposal(&request.proposal_id)?.context("published proposal missing")?;
         let review = f.store.proposal_file(&request.proposal_id, "source_review.json");
         let detached = review.with_file_name("source_review.temporarily-absent");
         std::fs::rename(&review, &detached)?;
@@ -247,9 +325,9 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
             "missing immutable source review must not be silently reconstructed"
         );
         assert!(!f.store.root().join("adoptions").exists());
-        assert_eq!(publication.proposal.status, Status::Committed);
+        assert_eq!(committed_proposal.status, Status::Committed);
         assert_eq!(
-            publication.proposal.publication.as_ref().unwrap().transaction_id,
+            committed_proposal.publication.as_ref().unwrap().transaction_id,
             request.publication_tx
         );
         let reference = retention_barrier_faults_then_record(&f, &origin, &request, &config)?;
@@ -550,11 +628,11 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         assert!(f.store.read_experience_by_id(&control)?.is_none(),
             "same-API expired terminal capture with no retained run reference must be deleted");
         let next_witness = gate_review::witness(&f, &completed)?;
-        let published = next.publish(&next_witness.subject.proposal_id)?;
+        let published = next.publish_final_product(&final_request(&f, &completed)?)?;
         let next_digest = next_witness.digest()?;
         let next_request = RecordAdoptionRequest {
             proposal_id: next_witness.subject.proposal_id,
-            publication_tx: published.proposal.publication.as_ref().unwrap().transaction_id.clone(),
+            publication_tx: published.transaction.transaction_id.to_string(),
             experiment_id: completed.plan.spec().id.as_str().into(),
             experiment_sha256: completed.plan.digest().into(),
             gate_stage: "gate-review".into(),
