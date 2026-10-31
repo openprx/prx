@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Refresh the embedded release catalog to revision `2026-10-31.1`, including
+  current provider defaults, published tariffs, and lifecycle replacements.
+
 ## [0.8.171] - 2026-10-31
 
 ### Added

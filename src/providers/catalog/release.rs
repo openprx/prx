@@ -971,7 +971,7 @@ mod tests {
             return;
         };
         assert_eq!(catalog.schema_version, "1.0");
-        assert_eq!(catalog.revision, "2026-10-20.1");
+        assert_eq!(catalog.revision, "2026-10-31.1");
         assert_eq!(catalog.schema.as_deref(), Some("./models.schema.json"));
         assert!(catalog.content_sha256().starts_with("sha256:"));
         assert!(catalog.models.len() >= 100);
@@ -1250,7 +1250,7 @@ mod tests {
         );
         assert_eq!(
             anthropic.len(),
-            3,
+            12,
             "retired price/context rows stay out of new selections"
         );
         assert!(

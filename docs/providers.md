@@ -23,19 +23,19 @@ Models with no declared parameters preserve the adapter's base request.
 Anthropic effort alone does not enable thinking, and Ollama's boolean `think`
 setting remains adapter-owned.
 
-## Embedded release catalog baseline (2026-07-18)
+## Embedded release catalog baseline (2026-10-31)
 
 | PRX provider | Curated default / current IDs | Endpoint and authoritative source | Live discovery |
 |---|---|---|---|
-| `kimi-code` | `k3`; `kimi-for-coding`; `kimi-for-coding-highspeed` | `https://api.kimi.com/coding/v1`; [Kimi Code models](https://www.kimi.com/code/docs/en/kimi-code/models.html) | `GET /models`, bearer token |
-| `openai` | `gpt-5.6`; `gpt-5.6-terra`; `gpt-5.6-luna` | `https://api.openai.com/v1`; [OpenAI models](https://developers.openai.com/api/docs/models) | `GET /models`, bearer token |
+| `kimi-code` | `k3`; `k3-256k`; `k3.1-pro`; `k3.1-pro-highspeed`; `kimi-for-coding`; `kimi-for-coding-highspeed` | `https://api.kimi.com/coding/v1`; [Kimi Code models](https://www.kimi.com/code/docs/en/kimi-code/models.html) | `GET /models`, bearer token |
+| `openai` | `gpt-5.6-sol` (default); `gpt-5.6` (deprecated); `gpt-6.1-sol`; `gpt-6-astra` | `https://api.openai.com/v1`; [OpenAI models](https://developers.openai.com/api/docs/models) | `GET /models`, bearer token |
 | `openai-codex` | `gpt-5.2-codex`; `gpt-5-codex` | Responses API; [GPT-5.2 Codex](https://developers.openai.com/api/docs/models/gpt-5.2-codex) | OAuth catalog is service-managed |
-| `anthropic` | `claude-sonnet-5`; `claude-opus-4-8`; `claude-haiku-4-5-20251001` | `https://api.anthropic.com`; [Claude models](https://platform.claude.com/docs/en/about-claude/models/overview) | Anthropic models API, `x-api-key` |
-| `gemini` | `gemini-3.5-flash`; `gemini-3.1-pro-preview`; `gemini-3.1-flash-lite` | Google Generative Language API; [Gemini models](https://ai.google.dev/gemini-api/docs/models) | `v1beta/models?key=...` |
-| `qwen` | `qwen3.7-max`; `qwen3.7-plus`; `qwen3.6-flash` | China `dashscope.aliyuncs.com`, international `dashscope-intl.aliyuncs.com`, US `dashscope-us.aliyuncs.com`; [Model Studio models](https://help.aliyun.com/en/model-studio/models) | regional `GET /compatible-mode/v1/models` |
+| `anthropic` | `claude-sonnet-5`; `claude-sonnet-5-5`; `claude-opus-5-5`; `claude-haiku-4-5-20251001` | `https://api.anthropic.com`; [Claude models](https://platform.claude.com/docs/en/about-claude/models/overview) | Anthropic models API, `x-api-key` |
+| `gemini` | `gemini-3.5-flash`; `gemini-4-argon`; `gemini-3.1-pro-preview`; `gemini-3.1-flash-lite` | Google Generative Language API; [Gemini models](https://ai.google.dev/gemini-api/docs/models) | `v1beta/models?key=...` |
+| `qwen` | `qwen3.7-plus`; `qwen3.8-max`; `qwen3.7-max`; `qwen3.6-flash` | China `dashscope.aliyuncs.com`, international `dashscope-intl.aliyuncs.com`, US `dashscope-us.aliyuncs.com`; [Model Studio models](https://help.aliyun.com/en/model-studio/models) | regional `GET /compatible-mode/v1/models` |
 | `openrouter` | dynamic `vendor/model` IDs | `https://openrouter.ai/api/v1`; [model catalog](https://openrouter.ai/docs/guides/overview/models) | public `GET /models`; response `model` identifies router-selected model |
-| `xai` | `grok-4.20`; `grok-4.20-non-reasoning-latest` | `https://api.x.ai/v1`; [Grok 4.20](https://docs.x.ai/developers/models/grok-4.20-experimental-beta-0304) | `GET /models`, bearer token |
-| `glm` / `zai` | global `glm-5`; China `glm-5.2` | global `api.z.ai`, China `open.bigmodel.cn`; [GLM-5](https://docs.z.ai/guides/llm/glm-5), [GLM-5.2](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.2) | regional `GET /models` |
+| `xai` | `grok-4.20-0309-reasoning`; `grok-4.20-0309-non-reasoning`; `grok-4.7` | `https://api.x.ai/v1`; [xAI models](https://docs.x.ai/developers/models) | `GET /models`, bearer token |
+| `glm` / `zai` | `glm-5` (default); `glm-5.3`; `glm-5.2` | global `api.z.ai`, China `open.bigmodel.cn`; [GLM-5](https://docs.z.ai/guides/llm/glm-5), [GLM-5.2](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.2) | regional `GET /models` |
 | `bedrock` | `anthropic.claude-sonnet-5`; `anthropic.claude-opus-4-8`; Haiku 4.5 regional ID | AWS Converse; [model/API compatibility](https://docs.aws.amazon.com/bedrock/latest/userguide/models-api-compatibility.html) | AWS regional catalog; invocation uses Converse/ConverseStream |
 | `copilot` | `gpt-5.4`; `gpt-5.3-codex`; `claude-sonnet-4.6` | GitHub Copilot service; [supported models](https://docs.github.com/en/copilot/reference/ai-models/supported-models) | service-managed; OAuth token auto-refresh |
 | `ollama` | installed model tags | default `http://localhost:11434`; [list models](https://docs.ollama.com/api/tags) | unauthenticated `GET /api/tags` locally |
@@ -49,8 +49,10 @@ Release entries are onboarding defaults and model evidence within the adapter
 ceiling; they do not grant credentials or transport support. Live discovery
 also reads the active auth profile when `api_key` is absent, and custom
 llama.cpp/vLLM/LiteLLM/Hugging Face/compatible base URLs are honored for model
-discovery. Kimi Code rejects model strings outside its three documented IDs
-because that endpoint can silently accept or remap a mistyped model.
+discovery. Kimi Code rejects model strings outside its six documented IDs
+(`k3`, `k3-256k`, `k3.1-pro`, `k3.1-pro-highspeed`, `kimi-for-coding`, and
+`kimi-for-coding-highspeed`) because that endpoint can silently accept or
+remap a mistyped model.
 
 Catalog lifecycle controls new selections: active and deprecated chat rows are
 listed, with deprecated rows labeled with their replacement when one exists;
@@ -735,7 +737,38 @@ tokens at twice the input/cached-input rate and 1.5 times the output rate for
 the whole request. Cache writes cost 1.25 times the applicable uncached input
 rate. The catalog records both tiers; these are not Router ranking costs.
 Sol's published promotional tariff runs at least through 2026-11-21, so a later
-release must recheck it rather than treating it as permanent.
+release must recheck it rather than treating it as permanent. The catalog
+stores that promotional rate today. Bare `gpt-5.6` is deprecated in revision
+`2026-10-31.1`: the public model list has no separate id, the historical row
+keeps its Sol tariff (including cache write 5.00, which is 1.25 times input),
+and its replacement is `openai/gpt-5.6-sol`. It is not an alias. An alias
+cannot repeat another row's API model.
+
+Gemini 4 Argon is 2.00 input, 0.10 cached input and 10.00 output per million
+tokens through 2026-11-30. From 2026-12-01 the published rate is 4.00/0.20/20.00.
+The catalog stores today's rate. Its output limit is 1,048,576 tokens.
+OpenRouter's completion cap for the same id is 943,718; the direct row follows
+the vendor's 1M figure. Gemini 3.8 Flash and Gemini 3.6 Flash are
+0.75/0.075/3.75 until 2027-01-01, when those rates double. The catalog stores
+today's rate for both.
+
+xAI long-context prices apply once the prompt is at least 200,000 tokens. The
+catalog tier uses `above_input_tokens` 200000. Billing compares with a strict
+greater-than, so the 200,000th token stays on the base rate. Direct Grok 4.20
+rows use a 1,000,000-token context. OpenRouter's public metadata lists
+2,000,000 for `x-ai/grok-4.20`; the direct row follows the vendor figure.
+Grok 4.7 encrypted reasoning and unsupported logprobs are request features,
+not extra catalog prices. Cache write is 0 where the vendor publishes no
+write fee.
+
+Qwen prices are the Singapore list. Hong Kong and the US list 1.65 input and
+4.951 output for Qwen3.8-Max; those regions need an operator override. Cached
+input on the new Qwen rows is the published 10% of input. DeepSeek Flash and
+V4 Pro store peak rates. The off-peak half rate is not a catalog tier. Kimi
+batch traffic at 60% of the token rate is the same kind of separate product.
+Anthropic one-hour cache writes are the higher write rate on the pricing page
+and are not the catalog's five-minute `cache_write`. Claude Fable 5 is active
+and unpriced: the page publishes cache read 1.00 and does not publish output.
 
 The same 2026-10-17 check pins Gemini 3.1 Flash-Lite text/image/video input,
 cached input and text output at 0.25/0.025/1.50. Gemini 3.1 Pro Preview uses
@@ -989,22 +1022,28 @@ for replacement conflicts, credential ownership and binary rollback.
 ## Catalog tariff citation coverage
 
 Each priced release row maps to a published tariff below. The six legacy-row
-citations were checked on 2026-10-20; existing active-row rates retain their
-2026-10-17 snapshot. Retirement preserves historical billing facts while
+citations were checked on 2026-10-20. Rates that revision `2026-10-31.1` did
+not reprice keep that snapshot. Rows added or repriced on 2026-10-31 cite the
+vendor pages in the table. Retirement preserves historical billing facts while
 excluding those rows from new selections.
 
-The retired Haiku 4.5 alias uses the same 1/5 input/output and 1.25/0.1
-five-minute-cache-write/cache-read tariff as the dated Haiku 4.5 row. Opus 4
-uses 15/75/18.75/1.5; Sonnet 4 and 4.6 use 3/15/3.75/0.3, from the cited
-Anthropic table. Gemini 2.5 Pro uses 1.25/10 input/output and 0.125 cached input
+Haiku 4.5 and its dated alias stay active at 1/5 input/output and 1.25/0.1
+five-minute cache write/cache read. The retired dated Opus 4 row keeps
+15/75/18.75/1.5. Opus 4.6, Opus 4.7 and Opus 4.8 are active legacy rows at
+5/25/6.25/0.50 input/output/cache-write/cache-read. Sonnet 4 (retired) and
+Sonnet 4.6 use 3/15/3.75/0.3, from the cited Anthropic table. Gemini 2.5 Pro
+uses 1.25/10 input/output and 0.125 cached input
 through 200,000 input tokens, then 2.5/15/0.25; cache storage is separately
 billed. Kimi K2.6's public model card lists 0.95 input, 4 output and 0.16 cache
 hit. K2 cache misses use the input rate, including the catalog's cache-write
 accounting field. All values are USD per million tokens.
 
-OpenAI documents `gpt-5.6` as an alias routing to GPT-5.6 Sol, so the alias row
-uses the [Sol model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
-This alias relationship was checked on 2026-10-20; the catalog prices are unchanged.
+`openai/gpt-5.6` keeps the historical Sol tariff checked on 2026-10-20, cited
+from the [Sol model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol).
+Revision `2026-10-31.1` deprecates that id. The public model list does not
+publish a separate bare id, and a catalog alias cannot collide with Sol's
+API model, so the replacement is `openai/gpt-5.6-sol`. OpenAI documentation
+links in this file use `developers.openai.com`.
 
 <!-- catalog-tariff-citations:start -->
 | Exact catalog row or zero-rule scope | Published source or documented zero rule |
@@ -1023,13 +1062,71 @@ This alias relationship was checked on 2026-10-20; the catalog prices are unchan
 | `openai/gpt-4o` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-4o) |
 | `openai/gpt-4o-mini` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-4o-mini) |
 | `openai/gpt-5.2-codex` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.2-codex) |
-| `openai/gpt-5.6` | [GPT-5.6 alias of GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
+| `openai/gpt-5.6` | [GPT-5.6 historical Sol tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
 | `openai/gpt-5.6-luna` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-luna) |
 | `openai/gpt-5.6-sol` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
 | `openai/gpt-5.6-terra` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/gpt-5.6-terra) |
 | `openai/o1-preview` | [OpenAI model tariff](https://developers.openai.com/api/docs/models/o1-preview) |
 | `openrouter/anthropic/claude-sonnet-5` | [OpenRouter model tariff](https://openrouter.ai/anthropic/claude-sonnet-5) |
 | `openrouter/typesafe/jev-1.13` | [OpenRouter model tariff](https://openrouter.ai/typesafe/jev-1.13) |
+| `anthropic/claude-opus-4-6` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `anthropic/claude-opus-4-7` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `anthropic/claude-fable-5-1` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `anthropic/claude-opus-5-5` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `anthropic/claude-sonnet-5-5` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `anthropic/claude-haiku-5-5` | [Anthropic model and prompt-cache tariffs](https://platform.claude.com/docs/en/about-claude/pricing) |
+| `deepseek/deepseek-flash` | [DeepSeek peak token tariff](https://api-docs.deepseek.com/quick_start/pricing) |
+| `deepseek/deepseek-v4-pro` | [DeepSeek peak token tariff](https://api-docs.deepseek.com/quick_start/pricing) |
+| `gemini/gemini-4-argon` | [Gemini API paid-tier tariffs](https://ai.google.dev/gemini-api/docs/pricing) |
+| `gemini/gemini-3.8-flash` | [Gemini API paid-tier tariffs](https://ai.google.dev/gemini-api/docs/pricing) |
+| `gemini/gemini-3.6-flash` | [Gemini API paid-tier tariffs](https://ai.google.dev/gemini-api/docs/pricing) |
+| `gemini/gemini-3.5-flash-lite` | [Gemini API paid-tier tariffs](https://ai.google.dev/gemini-api/docs/pricing) |
+| `glm/glm-4.5-air` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `glm/glm-4.7` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `glm/glm-5` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `glm/glm-5.3` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `glm/glm-5.3-flash` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `glm/glm-5.3-flashx` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `glm/glm-5.2` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `glm/glm-5.1` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `minimax/MiniMax-M3.1-Flash` | [MiniMax token tariff](https://platform.minimax.io/docs/pricing/overview) |
+| `minimax/MiniMax-M3` | [MiniMax token tariff](https://platform.minimax.io/docs/pricing/overview) |
+| `mistral/codestral-2508` | [Mistral inference tariff](https://docs.mistral.ai/inference/pricing) |
+| `mistral/mistral-small-2603` | [Mistral inference tariff](https://docs.mistral.ai/inference/pricing) |
+| `moonshot/kimi-k3.1-pro` | [Kimi chat tariff](https://platform.kimi.ai/docs/pricing/chat) |
+| `moonshot/kimi-k3.1-pro-highspeed` | [Kimi chat tariff](https://platform.kimi.ai/docs/pricing/chat) |
+| `moonshot/kimi-k3` | [Kimi chat tariff](https://platform.kimi.ai/docs/pricing/chat) |
+| `openai/gpt-6-astra` | [OpenAI model tariff](https://developers.openai.com/api/docs/pricing) |
+| `openai/gpt-6.1-sol` | [OpenAI model tariff](https://developers.openai.com/api/docs/pricing) |
+| `openai/gpt-6.1-terra` | [OpenAI model tariff](https://developers.openai.com/api/docs/pricing) |
+| `openai/gpt-6-luna` | [OpenAI model tariff](https://developers.openai.com/api/docs/pricing) |
+| `openai/gpt-6-sol` | [OpenAI model tariff](https://developers.openai.com/api/docs/pricing) |
+| `openai/gpt-5.5` | [OpenAI model tariff](https://developers.openai.com/api/docs/pricing) |
+| `openrouter/deepseek/deepseek-v4.1-flash` | [OpenRouter model tariff](https://openrouter.ai/deepseek/deepseek-v4.1-flash) |
+| `openrouter/deepseek/deepseek-v4-pro` | [OpenRouter model tariff](https://openrouter.ai/deepseek/deepseek-v4-pro) |
+| `openrouter/minimax/minimax-m3` | [OpenRouter model tariff](https://openrouter.ai/minimax/minimax-m3) |
+| `openrouter/minimax/minimax-m3.1-flash` | [OpenRouter model tariff](https://openrouter.ai/minimax/minimax-m3.1-flash) |
+| `qwen/qwen3.6-flash` | [Model Studio Singapore list price](https://www.alibabacloud.com/help/en/model-studio/model-pricing) |
+| `qwen/qwen3.7-max` | [Model Studio Singapore list price](https://www.alibabacloud.com/help/en/model-studio/model-pricing) |
+| `qwen/qwen3.7-plus` | [Model Studio Singapore list price](https://www.alibabacloud.com/help/en/model-studio/model-pricing) |
+| `qwen/qwen3.8-max` | [Model Studio Singapore list price](https://www.alibabacloud.com/help/en/model-studio/model-pricing) |
+| `qwen/qwen3.8-flash` | [Model Studio Singapore list price](https://www.alibabacloud.com/help/en/model-studio/model-pricing) |
+| `xai/grok-4.20-0309-reasoning` | [xAI model tariffs](https://docs.x.ai/developers/models) |
+| `xai/grok-4.20-0309-non-reasoning` | [xAI model tariffs](https://docs.x.ai/developers/models) |
+| `xai/grok-4.7` | [xAI model tariffs](https://docs.x.ai/developers/models) |
+| `xai/grok-4.6` | [xAI model tariffs](https://docs.x.ai/developers/models) |
+| `xai/grok-4.5` | [xAI model tariffs](https://docs.x.ai/developers/models) |
+| `xai/grok-4.3` | [xAI model tariffs](https://docs.x.ai/developers/models) |
+| `xai/grok-4.20-multi-agent-0309` | [xAI model tariffs](https://docs.x.ai/developers/models) |
+| `xai/grok-build-0.1` | [xAI model tariffs](https://docs.x.ai/developers/models) |
+| `zai/glm-4.5-air` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `zai/glm-4.7` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `zai/glm-5` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `zai/glm-5.3` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `zai/glm-5.3-flash` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `zai/glm-5.3-flashx` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `zai/glm-5.2` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
+| `zai/glm-5.1` | [Z.ai model tariffs](https://docs.z.ai/guides/overview/pricing) |
 | `ollama/*` | [Documented Ollama zero rule](#ollama-zero-cost-rule) |
 <!-- catalog-tariff-citations:end -->
 
@@ -1054,16 +1151,19 @@ candidate's reachability.
 
 ### Moonshot release default and lifecycle
 
-Moonshot's release default is now `moonshot/kimi-k2.6`, the existing catalog row
-with a published current K2 tariff. Its stale retirement marker is corrected
-to active using the provider's current [model list](https://platform.kimi.ai/docs/models)
-and [pricing table](https://platform.kimi.ai/docs/pricing/chat). The explicit
+Moonshot's release default is now `moonshot/kimi-k3`. K2.6 stays listed as
+deprecated through 2026-12-31, with replacement `moonshot/kimi-k3`, and keeps
+its published 0.95 input, 4.00 output and 0.16 cache-hit tariff. The explicit
 `kimi-k2.5` selection keeps its existing unpriced state. K2.5 is retired on
 2026-08-31 and the older K2 Preview/Thinking rows on 2026-05-25, matching the
-published discontinuation dates. Their published release replacement is the
-existing priced K2.6 row; stored selections load with warnings, and
-`prx models migrate-retired` previews their replacement through PMM. No new
-model is added.
+published discontinuation dates. Their published replacement is now
+`moonshot/kimi-k3`. K3, K3.1 Pro and K3.1 Pro Highspeed use the 2026-10-31
+[Kimi chat tariff](https://platform.kimi.ai/docs/pricing/chat). Batch requests
+at 60% of the token rate are a separate product and are not a catalog tier.
+`kimi-k3.1-pro-highspeed` context is 1,048,576 tokens from the Kimi Code model
+list. The Moonshot platform list was not available for that id. K2.7 Code and
+K2.7 Code Highspeed are active and unpriced. Their token price was not on the
+fetched pages.
 
 ### Anthropic tool schema restrictions
 
