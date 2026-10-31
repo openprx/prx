@@ -1409,7 +1409,8 @@ mod tests {
     #[tokio::test]
     async fn a_batch_is_acknowledged_only_after_it_reaches_the_local_queue() {
         let client = client_for_tests();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::channels::traits::ChannelMessage>(4);
+        let tx: crate::runtime::h2_entry::ChatInputSender = tx.into();
         let outcome = take_batch(
             client.as_ref(),
             vec![assignment("a-1", "summarise the repo", "queue")],
@@ -1428,7 +1429,8 @@ mod tests {
         // The same call with nowhere to deliver must acknowledge nothing: work
         // this chat cannot run has to stay the daemon's.
         let client2 = client_for_tests();
-        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel::<crate::channels::traits::ChannelMessage>(1);
+        let closed_tx: crate::runtime::h2_entry::ChatInputSender = closed_tx.into();
         drop(closed_rx);
         let refused = take_batch(
             client2.as_ref(),
@@ -1448,7 +1450,8 @@ mod tests {
     #[tokio::test]
     async fn a_redelivered_assignment_is_acknowledged_but_never_run_twice() {
         let client = client_for_tests();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::channels::traits::ChannelMessage>(8);
+        let tx: crate::runtime::h2_entry::ChatInputSender = tx.into();
         let first = take_batch(
             client.as_ref(),
             vec![assignment("dup", "work", "queue")],
@@ -1483,7 +1486,8 @@ mod tests {
     async fn the_first_pull_acknowledges_nothing_and_the_second_acknowledges_the_first_batch() {
         let mailbox = RecordingMailbox::new(vec![vec![assignment("a-1", "one", "queue")], vec![]]);
         let client = client_for_tests();
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::channels::traits::ChannelMessage>(8);
+        let tx: crate::runtime::h2_entry::ChatInputSender = tx.into();
 
         // Drive the same two steps the loop drives, without its sleep.
         let mut pending: Vec<String> = Vec::new();
@@ -1637,7 +1641,8 @@ mod tests {
         let pulls_scripted = mailbox.script.lock().len();
         let (notify, lines) = recording_notifier();
         let registry = super::super::daemon::new_in_flight_registry();
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::channels::traits::ChannelMessage>(8);
+        let tx: crate::runtime::h2_entry::ChatInputSender = tx.into();
         let cancel = CancellationToken::new();
         let handle = tokio::spawn(run_poller(
             Arc::clone(&mailbox) as Arc<dyn AssignmentMailbox>,
@@ -1947,7 +1952,8 @@ mod tests {
     async fn the_poller_is_listed_while_it_runs_and_a_kill_ends_it() {
         let registry = super::super::daemon::new_in_flight_registry();
         let client = client_for_tests();
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::channels::traits::ChannelMessage>(8);
+        let tx: crate::runtime::h2_entry::ChatInputSender = tx.into();
         let cancel = CancellationToken::new();
         let handle = tokio::spawn(run_poller(
             Arc::clone(&client) as Arc<dyn AssignmentMailbox>,

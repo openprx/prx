@@ -64,6 +64,10 @@ pub(super) async fn start_local_control(
                         break;
                     }
                     for byte in bytes {
+                        if matches!(byte, 8 | 127) {
+                            crate::runtime::h2_entry::erase_terminal_character(&mut line);
+                            continue;
+                        }
                         if byte == b'\n' {
                             let text = std::str::from_utf8(&line).context("local review input is not UTF-8")?;
                             let fields: Vec<_> = text.split_whitespace().collect();

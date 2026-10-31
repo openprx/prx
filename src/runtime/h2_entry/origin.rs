@@ -48,6 +48,10 @@ impl TerminalInputProducer {
                 };
                 ensure!(!bytes.is_empty(), "original terminal closed before confirmation");
                 for byte in bytes {
+                    if matches!(byte, 8 | 127) {
+                        super::input::erase_terminal_character(&mut line);
+                        continue;
+                    }
                     if byte == b'\n' {
                         ensure!(
                             std::str::from_utf8(&line)?.trim() == confirmation,
@@ -79,7 +83,7 @@ impl TerminalInputProducer {
         );
         let sequence = self
             .sequence
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
             .map_err(|_| anyhow::anyhow!("terminal input sequence exhausted"))?;
         Ok(TerminalInputProof(Arc::new(InputProof {
             profile: Arc::clone(&self.profile),

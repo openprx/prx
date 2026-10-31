@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use tokio::sync::mpsc;
 
 const DEFAULT_DELAY_SECONDS: u64 = 60;
@@ -165,9 +166,9 @@ impl ScheduledInputTool {
             if let Some(job) = state.jobs.iter_mut().find(|job| job.id == id) {
                 match result {
                     Ok(()) => job.status = ScheduledInputStatus::Delivered,
-                    Err(error) => {
+                    Err(()) => {
                         job.status = ScheduledInputStatus::Failed;
-                        job.error = Some(error.to_string());
+                        job.error = Some("chat input queue is closed".into());
                     }
                 }
             }

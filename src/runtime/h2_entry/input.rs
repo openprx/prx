@@ -7,44 +7,46 @@ use tokio::sync::mpsc;
 /// survives cancellation or borrows a reloadable input file.
 #[cfg(unix)]
 pub(crate) fn poll_original_terminal() -> anyhow::Result<Option<Vec<u8>>> {
-    let mut descriptor = libc::pollfd {
-        fd: libc::STDIN_FILENO,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: the descriptor remains live; controlled launch installs only one
-    // foreground reader, and this syscall has a finite 100ms timeout.
-    let ready = unsafe { libc::poll(&mut descriptor, 1, 100) };
-    if ready < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            return Ok(None);
-        }
-        return Err(error.into());
-    }
-    if ready == 0 {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    // The existing safe event reader borrows stdin when it is a TTY. Launch
+    // already verifies that condition. Poll and read stay on the sole reader
+    // thread, so no other consumer can steal the event after readiness.
+    if !event::poll(std::time::Duration::from_millis(100))? {
         return Ok(None);
     }
-    anyhow::ensure!(
-        descriptor.revents & (libc::POLLERR | libc::POLLNVAL) == 0,
-        "original terminal descriptor failed"
-    );
-    let mut bytes = vec![0_u8; 4096];
-    // SAFETY: writable slice of the stated length; sole reader after readiness.
-    let count = unsafe { libc::read(libc::STDIN_FILENO, bytes.as_mut_ptr().cast(), bytes.len()) };
-    if count < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            return Ok(None);
+    Ok(match event::read()? {
+        Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+            KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Vec::new()),
+            KeyCode::Char(character) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                let mut bytes = [0_u8; 4];
+                Some(character.encode_utf8(&mut bytes).as_bytes().to_vec())
+            }
+            KeyCode::Enter => Some(vec![b'\n']),
+            KeyCode::Tab => Some(vec![b'\t']),
+            KeyCode::Backspace => Some(vec![8]),
+            _ => None,
+        },
+        Event::Paste(text) => {
+            anyhow::ensure!(
+                text.len() <= 256 * 1024,
+                "original terminal paste exceeds its input bound"
+            );
+            Some(text.into_bytes())
         }
-        return Err(error.into());
-    }
-    bytes.truncate(usize::try_from(count)?);
-    Ok(Some(bytes))
+        _ => None,
+    })
 }
 #[cfg(not(unix))]
 pub(crate) fn poll_original_terminal() -> anyhow::Result<Option<Vec<u8>>> {
     anyhow::bail!("controlled launch requires the supported Unix foreground terminal profile")
+}
+/// Decode the existing terminal backspace event without splitting UTF-8.
+pub(crate) fn erase_terminal_character(line: &mut Vec<u8>) {
+    while let Some(byte) = line.pop() {
+        if byte & 0b1100_0000 != 0b1000_0000 {
+            break;
+        }
+    }
 }
 
 #[derive(Debug)]

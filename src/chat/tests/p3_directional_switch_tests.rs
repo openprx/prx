@@ -625,7 +625,7 @@ async fn dispatch_assignment_during_a_turn(
     crate::chat::turn_scheduler::TurnTaskState,
 ) {
     let msg = assigned_msg("assign-1", "count the crates", disposition);
-    let (tx, mut input_rx) = mpsc::channel(4);
+    let (tx, mut input_rx) = mpsc::channel::<crate::channels::traits::ChannelMessage>(4);
     drop(tx);
     // The output sink is read back: an assignment must never emit a local
     // command answer, which is what it would mean for it to be handled as

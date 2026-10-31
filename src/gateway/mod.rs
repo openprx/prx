@@ -2010,7 +2010,7 @@ async fn run_gateway_inner(
         state.hooks.set_plugin_runtime(Arc::clone(runtime)).await;
     }
 
-    if let Some(profile) = &controlled {
+    if controlled.is_some() {
         let producer = producer
             .take()
             .ok_or_else(|| anyhow::anyhow!("local control producer missing"))?;

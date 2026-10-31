@@ -690,7 +690,7 @@ fn assignment_notifier(
 pub(super) fn start_assignment_enrolment(
     config: &Config,
     chat_sessions: &crate::chat::sessions::ChatSessionsHandle,
-    input_tx: &mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    input_tx: &crate::runtime::h2_entry::ChatInputSender,
     dispatcher: &dispatcher::ChatDispatcher,
     redraw_tx: Option<&mpsc::Sender<()>>,
 ) -> Option<AssignmentEnrolment> {

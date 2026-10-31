@@ -14,7 +14,9 @@ pub(crate) use authority::{
     current_admission_pin, current_invocation, current_run_continuation, retain_run_continuation, scope_invocation,
 };
 pub(crate) use case::ControlledCaseScope;
-pub(crate) use input::{ChatInput, ChatInputSender, TerminalInputSink, poll_original_terminal};
+pub(crate) use input::{
+    ChatInput, ChatInputSender, TerminalInputSink, erase_terminal_character, poll_original_terminal,
+};
 pub use origin::EntryOriginRecord;
 pub(crate) use origin::{TerminalInputProducer, TerminalInputProof, VerifiedEntryOrigin};
 pub(crate) use profile::{ControlledH2Profile, ControlledReaderLifetime, EntryKind, EntryLimits};
