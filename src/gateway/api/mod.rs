@@ -14,6 +14,8 @@ mod causal;
 mod channels;
 mod chat_sessions;
 mod config;
+mod cost;
+mod cron_jobs;
 mod hooks;
 mod identity;
 pub(in crate::gateway) use identity::verify_startup_identity;
@@ -21,12 +23,15 @@ mod jobs;
 mod logs;
 mod manage;
 mod mcp;
+mod memory;
 mod models;
 mod plugins;
 mod providers;
 mod runtime;
 mod sessions;
 mod skills;
+mod skills_h2;
+mod skills_lifecycle;
 mod status;
 #[cfg(test)]
 mod test_support;
@@ -201,6 +206,31 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/plugins/{name}/disable", post(plugins::disable_plugin))
         .route("/plugins/{name}/remove", post(plugins::remove_plugin_post))
         .route("/plugins/{name}", delete(plugins::remove_plugin))
+        .route("/cron/jobs", get(cron_jobs::list_jobs).post(cron_jobs::create_job))
+        .route(
+            "/cron/jobs/{id}",
+            get(cron_jobs::get_job).patch(cron_jobs::patch_job).delete(cron_jobs::delete_job),
+        )
+        .route("/cron/jobs/{id}/runs", get(cron_jobs::list_runs))
+        .route("/cron/jobs/{id}/pause", post(cron_jobs::pause_job))
+        .route("/cron/jobs/{id}/resume", post(cron_jobs::resume_job))
+        .route("/cron/jobs/{id}/run", post(cron_jobs::run_job))
+        .route("/cron/status", get(cron_jobs::status))
+        .route("/memory/search", post(memory::search))
+        .route("/memory/recall", post(memory::recall))
+        .route("/memory/store", post(memory::store))
+        .route("/memory/forget", post(memory::forget))
+        .route("/cost", get(cost::get_cost))
+        .route("/skills/lifecycle/status", get(skills_lifecycle::status))
+        .route("/skills/lifecycle/proposals", get(skills_lifecycle::list_proposals))
+        .route("/skills/lifecycle/proposals/{id}", get(skills_lifecycle::get_proposal))
+        .route(
+            "/skills/lifecycle/proposals/{id}/publish",
+            post(skills_lifecycle::publish),
+        )
+        .route("/skills/lifecycle/proposals/{id}/cancel", post(skills_lifecycle::cancel))
+        .route("/skills/lifecycle/rollback", post(skills_lifecycle::rollback))
+        .route("/skills/lifecycle/h2", post(skills_h2::post_h2))
         // The decision plane (CDP-15, SP-CDP-A 5.14).
         .merge(causal_routes)
         .merge(management_routes)
@@ -355,7 +385,7 @@ const API_OWNER_DIGEST_DOMAIN: &str = "prx-api-owner-v1";
 
 impl ApiPrincipal {
     /// The principal of a request that presented `token`.
-    fn of_token(token: &str) -> Self {
+    pub(super) fn of_token(token: &str) -> Self {
         use sha2::{Digest, Sha256};
         if token.is_empty() {
             return Self {
