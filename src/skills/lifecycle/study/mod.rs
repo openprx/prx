@@ -4,6 +4,8 @@ mod analysis;
 mod grading;
 mod record;
 mod report;
+#[cfg(test)]
+mod tests;
 mod types;
 
 pub(in crate::skills::lifecycle) use analysis::{interval_half_width, summarize};
