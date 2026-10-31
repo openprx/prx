@@ -133,7 +133,7 @@ impl Default for ProviderRuntimeOptions {
             openprx_dir: None,
             secrets_encrypt: true,
             codex_auth_json_path: None,
-            codex_auth_json_auto_import: true,
+            codex_auth_json_auto_import: false,
             reasoning_enabled: None,
             codex_stream_idle_timeout_secs: None,
             codex_reasoning_effort: None,

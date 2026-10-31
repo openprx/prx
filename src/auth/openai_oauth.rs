@@ -1,26 +1,31 @@
 use crate::auth::profiles::TokenSet;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-pub const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-pub const OPENAI_OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
-pub const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-pub const OPENAI_OAUTH_DEVICE_CODE_URL: &str = "https://auth.openai.com/oauth/device/code";
-pub const OPENAI_OAUTH_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+/// First-time Sign in with ChatGPT registration entrypoint. Not a client id to store.
+pub const OPENAI_OAUTH_DYNAMIC_CLIENT_ID: &str = "dynamic_agent_client";
+pub const OPENAI_OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/api/accounts/authorize";
+pub const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/oauth/token";
+pub const OPENAI_OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:1455/auth/callback";
+pub const OPENAI_OAUTH_SCOPE: &str = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
+pub const OPENAI_OAUTH_RESOURCE: &str = "https://api.openai.com/v1";
+pub const OPENAI_AGENT_NAME_HINT: &str = "prx";
+pub const OPENAI_CLIENT_ID_METADATA: &str = "oai_client_id";
 
 #[derive(Debug, Clone)]
 pub struct PkceState {
     pub code_verifier: String,
     pub code_challenge: String,
     pub state: String,
+    pub nonce: String,
 }
 
 #[derive(Debug, Clone)]
@@ -49,27 +54,6 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DeviceCodeResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    #[serde(default)]
-    verification_uri_complete: Option<String>,
-    expires_in: u64,
-    #[serde(default)]
-    interval: Option<u64>,
-    #[serde(default)]
-    message: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OAuthErrorResponse {
-    error: String,
-    #[serde(default)]
-    error_description: Option<String>,
-}
-
 pub fn generate_pkce_state() -> PkceState {
     let code_verifier = random_base64url(64);
     let digest = Sha256::digest(code_verifier.as_bytes());
@@ -79,20 +63,37 @@ pub fn generate_pkce_state() -> PkceState {
         code_verifier,
         code_challenge,
         state: random_base64url(24),
+        nonce: random_base64url(24),
     }
 }
 
-pub fn build_authorize_url(pkce: &PkceState) -> String {
+pub fn build_authorize_url(
+    pkce: &PkceState,
+    host_id: &str,
+    issued_client_id: Option<&str>,
+    id_token_hint: Option<&str>,
+) -> String {
+    let client_id = issued_client_id
+        .map(str::trim)
+        .filter(|value| value.starts_with("oaiapp_"))
+        .unwrap_or(OPENAI_OAUTH_DYNAMIC_CLIENT_ID);
     let mut params = BTreeMap::new();
     params.insert("response_type", "code");
-    params.insert("client_id", OPENAI_OAUTH_CLIENT_ID);
+    params.insert("client_id", client_id);
     params.insert("redirect_uri", OPENAI_OAUTH_REDIRECT_URI);
-    params.insert("scope", "openid profile email offline_access");
+    params.insert("scope", OPENAI_OAUTH_SCOPE);
+    params.insert("resource", OPENAI_OAUTH_RESOURCE);
     params.insert("code_challenge", pkce.code_challenge.as_str());
     params.insert("code_challenge_method", "S256");
     params.insert("state", pkce.state.as_str());
-    params.insert("codex_cli_simplified_flow", "true");
-    params.insert("id_token_add_organizations", "true");
+    params.insert("nonce", pkce.nonce.as_str());
+    params.insert("ext_agent_host_id", host_id);
+    if client_id == OPENAI_OAUTH_DYNAMIC_CLIENT_ID {
+        params.insert("agent_name_hint", OPENAI_AGENT_NAME_HINT);
+    }
+    if let Some(hint) = id_token_hint.map(str::trim).filter(|value| !value.is_empty()) {
+        params.insert("id_token_hint", hint);
+    }
 
     let mut encoded: Vec<String> = Vec::with_capacity(params.len());
     for (k, v) in params {
@@ -102,13 +103,19 @@ pub fn build_authorize_url(pkce: &PkceState) -> String {
     format!("{OPENAI_OAUTH_AUTHORIZE_URL}?{}", encoded.join("&"))
 }
 
-pub async fn exchange_code_for_tokens(client: &Client, code: &str, pkce: &PkceState) -> Result<TokenSet> {
+pub async fn exchange_code_for_tokens(
+    client: &Client,
+    code: &str,
+    pkce: &PkceState,
+    client_id: &str,
+) -> Result<TokenSet> {
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),
-        ("client_id", OPENAI_OAUTH_CLIENT_ID),
+        ("client_id", client_id),
         ("redirect_uri", OPENAI_OAUTH_REDIRECT_URI),
         ("code_verifier", pkce.code_verifier.as_str()),
+        ("resource", OPENAI_OAUTH_RESOURCE),
     ];
 
     let response = client
@@ -121,11 +128,12 @@ pub async fn exchange_code_for_tokens(client: &Client, code: &str, pkce: &PkceSt
     parse_token_response(response).await
 }
 
-pub async fn refresh_access_token(client: &Client, refresh_token: &str) -> Result<TokenSet> {
+pub async fn refresh_access_token(client: &Client, refresh_token: &str, client_id: &str) -> Result<TokenSet> {
     let form = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
-        ("client_id", OPENAI_OAUTH_CLIENT_ID),
+        ("client_id", client_id),
+        ("resource", OPENAI_OAUTH_RESOURCE),
     ];
 
     let response = client
@@ -138,98 +146,12 @@ pub async fn refresh_access_token(client: &Client, refresh_token: &str) -> Resul
     parse_token_response(response).await
 }
 
-pub async fn start_device_code_flow(client: &Client) -> Result<DeviceCodeStart> {
-    let form = [
-        ("client_id", OPENAI_OAUTH_CLIENT_ID),
-        ("scope", "openid profile email offline_access"),
-    ];
-
-    let response = client
-        .post(crate::providers::token_host(OPENAI_OAUTH_DEVICE_CODE_URL))
-        .form(&form)
-        .send()
-        .await
-        .context("Failed to start OpenAI OAuth device-code flow")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("OpenAI device-code start failed ({status}): {body}");
-    }
-
-    let parsed: DeviceCodeResponse = response
-        .json()
-        .await
-        .context("Failed to parse OpenAI device-code response")?;
-
-    Ok(DeviceCodeStart {
-        device_code: parsed.device_code,
-        user_code: parsed.user_code,
-        verification_uri: parsed.verification_uri,
-        verification_uri_complete: parsed.verification_uri_complete,
-        expires_in: parsed.expires_in,
-        interval: parsed.interval.unwrap_or(5).max(1),
-        message: parsed.message,
-    })
+pub async fn start_device_code_flow(_client: &Client) -> Result<DeviceCodeStart> {
+    bail!("{}", crate::auth::terms::OPENAI_DEVICE_CODE_UNSUPPORTED)
 }
 
-pub async fn poll_device_code_tokens(client: &Client, device: &DeviceCodeStart) -> Result<TokenSet> {
-    let started = Instant::now();
-    let mut interval_secs = device.interval.max(1);
-
-    loop {
-        if started.elapsed() > Duration::from_secs(device.expires_in) {
-            anyhow::bail!("Device-code flow timed out before authorization completed");
-        }
-
-        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
-
-        let form = [
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ("device_code", device.device_code.as_str()),
-            ("client_id", OPENAI_OAUTH_CLIENT_ID),
-        ];
-
-        let response = client
-            .post(crate::providers::token_host(OPENAI_OAUTH_TOKEN_URL))
-            .form(&form)
-            .send()
-            .await
-            .context("Failed polling OpenAI device-code token endpoint")?;
-
-        if response.status().is_success() {
-            return parse_token_response(response).await;
-        }
-
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-
-        if let Ok(err) = serde_json::from_str::<OAuthErrorResponse>(&text) {
-            match err.error.as_str() {
-                "authorization_pending" => {
-                    continue;
-                }
-                "slow_down" => {
-                    interval_secs = interval_secs.saturating_add(5);
-                    continue;
-                }
-                "access_denied" => {
-                    anyhow::bail!("OpenAI device-code authorization was denied")
-                }
-                "expired_token" => {
-                    anyhow::bail!("OpenAI device-code expired")
-                }
-                _ => {
-                    anyhow::bail!(
-                        "OpenAI device-code polling failed ({status}): {}",
-                        err.error_description.unwrap_or(err.error)
-                    )
-                }
-            }
-        }
-
-        anyhow::bail!("OpenAI device-code polling failed ({status}): {text}");
-    }
+pub async fn poll_device_code_tokens(_client: &Client, _device: &DeviceCodeStart) -> Result<TokenSet> {
+    bail!("{}", crate::auth::terms::OPENAI_DEVICE_CODE_UNSUPPORTED)
 }
 
 pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> Result<String> {
@@ -262,7 +184,8 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("Callback request missing path"))?;
 
-    let code = parse_code_from_redirect(path, Some(expected_state))?;
+    let path = path.to_string();
+    let _code = parse_code_from_redirect(&path, Some(expected_state))?;
 
     let body = "<html><body><h2>OpenPRX login complete</h2><p>You can close this tab.</p></body></html>";
     let response = format!(
@@ -272,7 +195,36 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
     );
     let _ = stream.write_all(response.as_bytes()).await;
 
-    Ok(code)
+    Ok(path)
+}
+
+pub fn load_or_create_host_id(state_dir: &std::path::Path) -> Result<String> {
+    let path = state_dir.join("openai-host-id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let host_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+    std::fs::write(&path, &host_id)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(host_id)
+}
+
+pub fn issued_client_id_from_callback(input: &str) -> Option<String> {
+    let query = input.split_once('?').map_or(input, |(_, right)| right);
+    parse_query_params(query)
+        .get("client_id")
+        .map(|value| value.trim().to_string())
+        .filter(|value| value.starts_with("oaiapp_"))
 }
 
 pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Result<String> {

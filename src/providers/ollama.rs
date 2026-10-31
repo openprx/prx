@@ -200,7 +200,7 @@ impl OllamaProvider {
                 tracing::error!("proxy build failed for provider.ollama, using direct: {e}");
                 e
             })
-            .unwrap_or_else(|_| Client::new())
+            .unwrap_or_else(|_| crate::prx_http_client())
     }
 
     fn resolve_request_details(&self, model: &str) -> anyhow::Result<(String, bool)> {

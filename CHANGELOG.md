@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** provider auth and API requests identify as `User-Agent: prx/<version>`.
+  Provider-specific user agents (`OpenPRX/0.1`, `KimiCLI/0.77`, `QwenCode/1.0`,
+  `GithubCopilot/…`) are no longer sent.
+- **Breaking:** Anthropic subscription credentials are removed. Setup-tokens
+  (`sk-ant-oat01`) and Claude Code OAuth in `~/.claude/.credentials.json` are
+  not read, refreshed, or sent. Use an Anthropic Console API key. Max, Ultra,
+  and Team plans include monthly API credits:
+  <https://support.claude.com/en/articles/17154008>. Stored profiles are not
+  deleted; remove one with `prx auth logout --provider anthropic`.
+- **Breaking:** Gemini CLI OAuth (`~/.gemini/oauth_creds.json`, `cloudcode-pa`)
+  is not loaded. Use a Gemini API key.
+- **Breaking:** Qwen Code OAuth (`~/.qwen/oauth_creds.json`, the free tier that
+  ended 2026-04-15) is removed. Use a DashScope API key (`qwen`) or a Bailian
+  Coding Plan key (`qwen-coding`).
+- **Breaking:** GitHub Copilot login is disabled. PRX does not use VS Code's
+  OAuth client, `copilot_internal`, or `Editor-Version: vscode`. Saved Copilot
+  cache files are not deleted and are not sent. A compliant path needs an
+  OAuth App you register for prx plus the Copilot SDK, which this build does
+  not embed.
+- **Breaking:** OpenAI Codex login uses Sign in with ChatGPT for open-source
+  local apps (loopback PKCE on `http://127.0.0.1:1455/auth/callback`). The
+  issued `oaiapp_…` client id is stored and reused. Device code is not part of
+  that flow; if the callback is missed, use `prx auth paste-redirect`. Profiles
+  without an issued client id must sign in again. `~/.codex/auth.json` import
+  is opt-in (`[auth] codex_auth_json_auto_import = true`).
+- MiniMax OAuth refresh uses `https://account.minimax.io/oauth2/token` and
+  `https://account.minimaxi.com/oauth2/token`. The default client id is
+  OpenClaw's and logs a warning; set `MINIMAX_OAUTH_CLIENT_ID` for a prx client.
+- `prx init` warns when a GLM Coding Plan (`zai`) or Bailian Coding Plan
+  (`qwen-coding`) key is chosen: cron, webhook, and daemon use are outside
+  those terms. OpenRouter PKCE login is `prx auth login --provider openrouter`
+  (`--device-code` pastes the headless code).
+
 ## [0.8.171] - 2026-10-31
 
 ### Added

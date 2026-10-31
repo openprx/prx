@@ -1,5 +1,9 @@
 use super::{Deserialize, JsonSchema, PathBuf, Serialize, default_codex_auth_json_path, default_true};
 
+const fn default_false() -> bool {
+    false
+}
+
 // ── Secrets (encrypted credential store) ────────────────────────
 
 /// Secrets encryption configuration (`[secrets]` section).
@@ -20,7 +24,9 @@ impl Default for SecretsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AuthConfig {
     /// Automatically import `openai-codex` OAuth credentials from Codex CLI auth.json.
-    #[serde(default = "default_true")]
+    /// Off unless the operator opts in. Imported Codex CLI tokens are not refreshed
+    /// with Codex's client id; run `prx auth login --provider openai-codex`.
+    #[serde(default = "default_false")]
     pub codex_auth_json_auto_import: bool,
     /// Source path for Codex CLI auth.json import.
     #[serde(default = "default_codex_auth_json_path")]
@@ -30,7 +36,7 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            codex_auth_json_auto_import: true,
+            codex_auth_json_auto_import: false,
             codex_auth_json_path: default_codex_auth_json_path(),
         }
     }

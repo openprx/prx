@@ -301,11 +301,8 @@ fn resolve_qwen_oauth_context_uses_env_token_and_resource_url() {
 
     let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER), OauthRefresh::Allowed);
 
-    assert_eq!(context.credential.as_deref(), Some("oauth-token"));
-    assert_eq!(
-        context.base_url.as_deref(),
-        Some("https://coding-intl.dashscope.aliyuncs.com/v1")
-    );
+    assert!(context.credential.is_none());
+    assert!(context.base_url.is_none());
 }
 
 #[test]
@@ -329,8 +326,12 @@ fn resolve_qwen_oauth_context_reads_cached_credentials_file() {
 
     let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER), OauthRefresh::Allowed);
 
-    assert_eq!(context.credential.as_deref(), Some("cached-token"));
-    assert_eq!(context.base_url.as_deref(), Some("https://resource.example.com/v1"));
+    assert!(context.credential.is_none());
+    assert!(context.base_url.is_none());
+    assert_eq!(
+        std::fs::read_to_string(&creds_path).expect("test: file remains"),
+        r#"{"access_token":"cached-token","refresh_token":"cached-refresh","resource_url":"https://resource.example.com","expiry_date":4102444800000}"#
+    );
 }
 
 #[test]
@@ -371,7 +372,10 @@ fn resolve_claude_code_context_reads_cached_credentials_file() {
 
     let context = resolve_claude_code_context(Some("claude-code"), OauthRefresh::Allowed);
 
-    assert_eq!(context.credential.as_deref(), Some("cached-token"));
+    assert!(context.credential.is_none());
+    assert!(context.refresh_token.is_none());
+    let raw = std::fs::read_to_string(&creds_path).expect("test: file remains");
+    assert!(raw.contains("cached-token"));
 }
 
 #[test]
@@ -503,30 +507,9 @@ fn the_live_probe_never_refreshes_an_oauth_token() {
     assert!(
         matches!(
             probe_credential("anthropic", None, &provider_runtime_options_from_config(&config)),
-            ProbeCredential::RefreshDue
+            ProbeCredential::Ready(None)
         ),
-        "precondition: the lookup must see the expired token in the test home"
-    );
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("test: runtime");
-
-    let outcome = runtime.block_on(async move {
-        tokio::spawn(async move {
-            super::connection_test::test_connection(&config, None, None, super::connection_test::ProbeMode::Live).await
-        })
-        .await
-    });
-
-    let report = outcome.expect("the live probe must not panic");
-    assert!(report.local.resolved, "{report}");
-    let live = report.live.expect("test: a live result");
-    assert!(!live.reachable, "nothing may be sent: {live:?}");
-    assert!(
-        live.error.as_deref().is_some_and(|error| error.contains("refresh")),
-        "{live:?}"
+        "the Claude Code credential file is not a credential source"
     );
     assert_eq!(token_endpoint.connections(), 0, "the probe must not refresh the token");
     assert_eq!(
@@ -537,7 +520,11 @@ fn the_live_probe_never_refreshes_an_oauth_token() {
     // The listener does stand in for the refresh host: construction's
     // own lookup refreshes through it (and, refused, writes nothing).
     let _ = resolve_claude_code_context(Some("claude-code"), OauthRefresh::Allowed);
-    assert_eq!(token_endpoint.connections(), 1, "the loopback endpoint was not used");
+    assert_eq!(
+        token_endpoint.connections(),
+        0,
+        "claude credential files are not refreshed"
+    );
     assert_eq!(std::fs::read(&creds_path).expect("test: read back"), creds);
 }
 
@@ -569,13 +556,13 @@ fn the_probe_lookup_never_refreshes_a_qwen_token() {
     );
 
     assert!(
-        matches!(probed, ProbeCredential::RefreshDue),
-        "a due refresh must be reported"
+        matches!(probed, ProbeCredential::Ready(None)),
+        "qwen oauth credentials are not loaded"
     );
     assert_eq!(token_endpoint.connections(), 0, "the probe must not refresh the token");
     assert_eq!(std::fs::read(&creds_path).expect("test: read back"), creds);
     let _ = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER), OauthRefresh::Allowed);
-    assert_eq!(token_endpoint.connections(), 1, "the loopback endpoint was not used");
+    assert_eq!(token_endpoint.connections(), 0, "qwen oauth is not refreshed");
 }
 
 /// D-081: the connection test's lookup never exchanges a MiniMax OAuth
@@ -608,8 +595,6 @@ fn the_probe_lookup_never_refreshes_a_minimax_token() {
 fn a_test_build_never_targets_a_real_token_endpoint() {
     let _env_lock = env_lock();
     for endpoint in [
-        OauthTokenEndpoint::ClaudeCode,
-        OauthTokenEndpoint::Qwen,
         OauthTokenEndpoint::Minimax(MinimaxOauthRegion::Global),
         OauthTokenEndpoint::Minimax(MinimaxOauthRegion::Cn),
     ] {
@@ -1291,8 +1276,13 @@ fn factory_qwen() {
     assert!(create_provider("qwen-coding", Some("key")).is_ok());
     assert!(create_provider("dashscope-coding-intl", Some("key")).is_ok());
     assert!(create_provider("qwen-coding-intl", Some("key")).is_ok());
-    assert!(create_provider("qwen-code", Some("key")).is_ok());
-    assert!(create_provider("qwen-oauth", Some("key")).is_ok());
+    let removed = create_provider("qwen-code", Some("key"));
+    assert!(removed.is_err(), "qwen-code oauth is removed");
+    assert!(
+        removed.unwrap_err().to_string().contains("2026-04-15"),
+        "the error names the shutdown"
+    );
+    assert!(create_provider("qwen-oauth", Some("key")).is_err());
 }
 
 #[test]
@@ -2006,7 +1996,6 @@ fn factory_all_providers_create_successfully() {
         "qwen-intl",
         "qwen-cn",
         "qwen-us",
-        "qwen-code",
         "lmstudio",
         "llamacpp",
         "litellm",
