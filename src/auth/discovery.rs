@@ -346,45 +346,8 @@ fn try_config_toml_with_decryption(config_dir: &Path, config_path: &Path) -> Opt
 /// Those tokens are handled separately by `resolve_claude_code_context` in the
 /// provider layer when the provider is explicitly set to "claude-code".
 fn try_claude_code_oauth() -> Option<String> {
-    let cred_path = claude_code_credentials_path()?;
-    if !cred_path.exists() {
-        return None;
-    }
-
-    let bytes = std::fs::read(&cred_path).ok()?;
-    let file: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-
-    let oauth = file.get("claudeAiOauth")?;
-    let access_token = oauth
-        .get("accessToken")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|t| !t.is_empty())?;
-
-    // OAuth setup tokens (sk-ant-oat01-) cannot be used as plain API keys.
-    // They require Bearer auth + refresh_token flow, which is only supported
-    // via the claude-code provider path (resolve_claude_code_context).
-    // Passing them as a plain credential to the anthropic provider would send
-    // them via x-api-key header, resulting in 400/401 errors.
-    if is_claude_code_oauth_setup_token(access_token) {
-        tracing::debug!(
-            "Skipping Claude Code OAuth setup token from credentials.json \
-             (not usable as plain API key)"
-        );
-        return None;
-    }
-
-    Some(access_token.to_string())
-}
-
-/// Where Claude Code keeps its OAuth credentials:
-/// `~/.claude/.credentials.json`, or the test seam's file under `cfg(test)`.
-fn claude_code_credentials_path() -> Option<PathBuf> {
-    #[cfg(test)]
-    if let Some(path) = claude_credentials_for_tests::current() {
-        return Some(path);
-    }
-    crate::config::user_home_dir().map(|home| home.join(".claude").join(".credentials.json"))
+    // Subscription credentials in ~/.claude/.credentials.json are not read.
+    None
 }
 
 /// Test seam for the Claude Code credentials file (R-C1f G-3). `HOME` is
@@ -397,10 +360,6 @@ mod claude_credentials_for_tests {
 
     thread_local! {
         static PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-    }
-
-    pub(super) fn current() -> Option<PathBuf> {
-        PATH.with(|path| path.borrow().clone())
     }
 
     pub(super) fn swap(path: Option<PathBuf>) -> Option<PathBuf> {
@@ -483,9 +442,12 @@ mod tests {
             },
             || detect_credentials(Some("  "), None, None),
         );
-        let (provider, key, _) = outcome.expect("test: the sentinel Claude Code credential is found");
-        assert_eq!(provider, "anthropic");
-        assert_eq!(key, CLAUDE_SENTINEL, "only the test's own Claude Code file may be read");
+        let error = outcome.expect_err("test: Claude Code credential files are not a credential source");
+        let message = format!("{error:#}");
+        assert!(
+            !message.contains(CLAUDE_SENTINEL),
+            "the Claude Code file must not be read: {message}"
+        );
     }
 
     #[test]

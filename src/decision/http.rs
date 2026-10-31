@@ -110,6 +110,7 @@ impl DecisionHttp {
         localhost_port: Option<u16>,
     ) -> Result<reqwest::Client, DecisionError> {
         let builder = reqwest::Client::builder()
+            .user_agent(crate::PRX_USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT));

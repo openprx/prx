@@ -25,6 +25,13 @@ prx init --interactive
 prx config show
 ```
 
+Codex CLI `auth.json` import is off unless you set
+`[auth] codex_auth_json_auto_import = true`. Sign in with
+`prx auth login --provider openai-codex` instead of reusing a Codex client id.
+Anthropic setup-tokens are not accepted; use a Console API key. Max, Ultra,
+and Team plans include monthly API credits:
+<https://support.claude.com/en/articles/17154008>.
+
 ## Choosing the Configuration Directory
 
 `init` is the sole persistent setup entry point. The former `onboard` command

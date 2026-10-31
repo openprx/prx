@@ -443,7 +443,7 @@ impl OpenAiProvider {
                 tracing::error!("proxy build failed for provider.openai, using direct: {e}");
                 e
             })
-            .unwrap_or_else(|_| Client::new())
+            .unwrap_or_else(|_| crate::prx_http_client())
     }
 
     /// Client for streaming requests: a connect timeout, but no whole-request
@@ -461,9 +461,10 @@ impl OpenAiProvider {
             })
             .unwrap_or_else(|_| {
                 Client::builder()
+                    .user_agent(crate::PRX_USER_AGENT)
                     .connect_timeout(std::time::Duration::from_secs(10))
                     .build()
-                    .unwrap_or_else(|_| Client::new())
+                    .unwrap_or_else(|_| crate::prx_http_client())
             })
     }
 }

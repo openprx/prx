@@ -345,7 +345,7 @@ impl OpenRouterProvider {
                 tracing::error!("proxy build failed for provider.openrouter, using direct: {e}");
                 e
             })
-            .unwrap_or_else(|_| Client::new())
+            .unwrap_or_else(|_| crate::prx_http_client())
     }
 }
 

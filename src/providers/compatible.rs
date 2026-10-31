@@ -116,7 +116,7 @@ impl OpenAiCompatibleProvider {
     fn base_http_client_builder(&self) -> reqwest::ClientBuilder {
         let builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .user_agent("OpenPRX/0.1");
+            .user_agent(crate::PRX_USER_AGENT);
         let builder = if self.requires_http1_only() {
             builder.http1_only()
         } else {
@@ -489,7 +489,7 @@ impl OpenAiCompatibleProvider {
                     tracing::error!("proxy build failed for provider.compatible (user-agent), using direct: {error}");
                     error
                 })
-                .unwrap_or_else(|_| Client::new());
+                .unwrap_or_else(|_| crate::prx_http_client());
         }
 
         builder
@@ -498,7 +498,7 @@ impl OpenAiCompatibleProvider {
                 tracing::error!("proxy build failed for provider.compatible, using direct: {error}");
                 error
             })
-            .unwrap_or_else(|_| Client::new())
+            .unwrap_or_else(|_| crate::prx_http_client())
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
