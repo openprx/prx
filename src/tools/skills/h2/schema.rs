@@ -41,14 +41,14 @@ pub(super) fn parameters_schema() -> Value {
     definitions.insert("Spec".into(), definition_spec());
     definitions.insert("Operation".into(), definition_operation());
     definitions.insert("IssuedPlan".into(), definition_issued_plan());
-    let mut root = Map::from([
+    let mut root = Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "action".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         (
                             "enum".into(),
@@ -78,20 +78,20 @@ pub(super) fn parameters_schema() -> Value {
                 ),
                 (
                     "request".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         (
                             "oneOf".into(),
                             Value::Array(vec![
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Catalog"))])),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Draft"))])),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/IssuedPlan"))])),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Final"))])),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Publish"))])),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Annotation"))])),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Rollback"))])),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Retirement"))])),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Lessons"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Catalog"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Draft"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/IssuedPlan"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Final"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Publish"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Annotation"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Rollback"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Retirement"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Lessons"))])),
                             ]),
                         ),
                         (
@@ -118,15 +118,15 @@ pub(super) fn parameters_schema() -> Value {
         (
             "allOf".into(),
             Value::Array(vec![
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_catalog"),
                                     )])),
@@ -137,24 +137,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Catalog"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Catalog"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_plan"),
                                     )])),
@@ -165,24 +165,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Draft"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Draft"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_admit"),
                                     )])),
@@ -193,24 +193,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/IssuedPlan"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/IssuedPlan"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_run"),
                                     )])),
@@ -221,24 +221,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/IssuedPlan"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/IssuedPlan"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_inspect"),
                                     )])),
@@ -249,24 +249,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Handle"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_cancel"),
                                     )])),
@@ -277,24 +277,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Handle"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_recover"),
                                     )])),
@@ -305,24 +305,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Handle"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_review"),
                                     )])),
@@ -333,24 +333,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Final"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Final"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_publish"),
                                     )])),
@@ -361,24 +361,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Publish"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Publish"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_annotate"),
                                     )])),
@@ -389,24 +389,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Annotation"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Annotation"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_rollback"),
                                     )])),
@@ -417,24 +417,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Rollback"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Rollback"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_retire"),
                                     )])),
@@ -445,24 +445,24 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Retirement"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Retirement"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "action".into(),
-                                    Value::Object(Map::from([(
+                                    Value::Object(Map::from_iter([(
                                         "const".into(),
                                         Value::from("lifecycle_experiment_lessons"),
                                     )])),
@@ -473,11 +473,11 @@ pub(super) fn parameters_schema() -> Value {
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "request".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Lessons"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Lessons"))])),
                             )])),
                         )])),
                     ),
@@ -487,15 +487,15 @@ pub(super) fn parameters_schema() -> Value {
         (
             "examples".into(),
             Value::Array(vec![
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     ("action".into(), Value::from("lifecycle_experiment_catalog")),
                     ("request".into(), Value::Object(Map::new())),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     ("action".into(), Value::from("lifecycle_experiment_inspect")),
                     (
                         "request".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "experiment_id".into(),
                                 Value::from("h2c-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -515,18 +515,18 @@ pub(super) fn parameters_schema() -> Value {
 }
 
 fn definition_catalog() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([(
+            Value::Object(Map::from_iter([(
                 "after_skill".into(),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "anyOf".into(),
                         Value::Array(vec![
-                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/SkillId"))])),
-                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                            Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/SkillId"))])),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("null"))])),
                         ]),
                     ),
                     (
@@ -550,7 +550,7 @@ fn definition_catalog() -> Value {
 }
 
 fn definition_digest() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("string")),
         (
             "description".into(),
@@ -565,7 +565,7 @@ fn definition_digest() -> Value {
 }
 
 fn definition_id() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("string")),
         (
             "description".into(),
@@ -578,7 +578,7 @@ fn definition_id() -> Value {
 }
 
 fn definition_stage_id() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("string")),
         (
             "description".into(),
@@ -591,7 +591,7 @@ fn definition_stage_id() -> Value {
 }
 
 fn definition_skill_id() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("string")),
         (
             "description".into(),
@@ -604,7 +604,7 @@ fn definition_skill_id() -> Value {
 }
 
 fn definition_pattern_id() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("string")),
         (
             "description".into(),
@@ -619,7 +619,7 @@ fn definition_pattern_id() -> Value {
 }
 
 fn definition_revision_id() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("string")),
         (
             "description".into(),
@@ -632,7 +632,7 @@ fn definition_revision_id() -> Value {
 }
 
 fn definition_timestamp() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("string")),
         (
             "description".into(),
@@ -645,7 +645,7 @@ fn definition_timestamp() -> Value {
 }
 
 fn definition_owner() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("string")),
         (
             "description".into(),
@@ -659,7 +659,7 @@ fn definition_owner() -> Value {
 }
 
 fn definition_family() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("string")),
         (
             "description".into(),
@@ -671,7 +671,7 @@ fn definition_family() -> Value {
 }
 
 fn definition_split() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("string")),
         (
             "enum".into(),
@@ -685,7 +685,7 @@ fn definition_split() -> Value {
 }
 
 fn definition_independent_split() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("string")),
         (
             "enum".into(),
@@ -701,14 +701,14 @@ fn definition_independent_split() -> Value {
 }
 
 fn definition_resources() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "calls".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -717,7 +717,7 @@ fn definition_resources() -> Value {
                 ),
                 (
                     "tokens".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -726,7 +726,7 @@ fn definition_resources() -> Value {
                 ),
                 (
                     "micro_usd".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -735,7 +735,7 @@ fn definition_resources() -> Value {
                 ),
                 (
                     "tool_calls".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -744,7 +744,7 @@ fn definition_resources() -> Value {
                 ),
                 (
                     "output_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -753,7 +753,7 @@ fn definition_resources() -> Value {
                 ),
                 (
                     "scratch_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -784,14 +784,14 @@ fn definition_resources() -> Value {
 }
 
 fn definition_active_resources() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "calls".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -800,7 +800,7 @@ fn definition_active_resources() -> Value {
                 ),
                 (
                     "tokens".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -809,7 +809,7 @@ fn definition_active_resources() -> Value {
                 ),
                 (
                     "micro_usd".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -818,7 +818,7 @@ fn definition_active_resources() -> Value {
                 ),
                 (
                     "tool_calls".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -827,7 +827,7 @@ fn definition_active_resources() -> Value {
                 ),
                 (
                     "output_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -836,7 +836,7 @@ fn definition_active_resources() -> Value {
                 ),
                 (
                     "scratch_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -867,13 +867,13 @@ fn definition_active_resources() -> Value {
 }
 
 fn definition_lesson_query_intent() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([(
+            Value::Object(Map::from_iter([(
                 "task_family".into(),
-                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Family"))])),
+                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Family"))])),
             )])),
         ),
         ("required".into(), Value::Array(vec![Value::from("task_family")])),
@@ -888,14 +888,14 @@ fn definition_lesson_query_intent() -> Value {
 }
 
 fn definition_draft() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "id".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("$ref".into(), Value::from("#/$defs/Id")),
                         (
                             "description".into(),
@@ -907,15 +907,15 @@ fn definition_draft() -> Value {
                 ),
                 (
                     "skill_id".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/SkillId"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/SkillId"))])),
                 ),
                 (
                     "patterns".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("array")),
                         (
                             "items".into(),
-                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/PatternId"))])),
+                            Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/PatternId"))])),
                         ),
                         ("minItems".into(), Value::from(1_u64)),
                         ("maxItems".into(), Value::from(8_u64)),
@@ -923,7 +923,7 @@ fn definition_draft() -> Value {
                 ),
                 (
                     "schedule".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         (
                             "enum".into(),
@@ -942,30 +942,45 @@ fn definition_draft() -> Value {
                 ),
                 (
                     "verification_split".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/IndependentSplit"))])),
+                    Value::Object(Map::from_iter([(
+                        "$ref".into(),
+                        Value::from("#/$defs/IndependentSplit"),
+                    )])),
                 ),
                 (
                     "resources".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ActiveResources"))])),
+                    Value::Object(Map::from_iter([(
+                        "$ref".into(),
+                        Value::from("#/$defs/ActiveResources"),
+                    )])),
                 ),
                 (
                     "proposal_allocation".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ActiveResources"))])),
+                    Value::Object(Map::from_iter([(
+                        "$ref".into(),
+                        Value::from("#/$defs/ActiveResources"),
+                    )])),
                 ),
                 (
                     "probe_allocation".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ActiveResources"))])),
+                    Value::Object(Map::from_iter([(
+                        "$ref".into(),
+                        Value::from("#/$defs/ActiveResources"),
+                    )])),
                 ),
                 (
                     "evaluation_allocation".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ActiveResources"))])),
+                    Value::Object(Map::from_iter([(
+                        "$ref".into(),
+                        Value::from("#/$defs/ActiveResources"),
+                    )])),
                 ),
                 (
                     "gate_allocation".into(),
-                    Value::Object(Map::from([(
+                    Value::Object(Map::from_iter([(
                         "anyOf".into(),
                         Value::Array(vec![
-                            Value::Object(Map::from([
+                            Value::Object(Map::from_iter([
                                 ("$ref".into(), Value::from("#/$defs/ActiveResources")),
                                 (
                                     "description".into(),
@@ -974,16 +989,16 @@ fn definition_draft() -> Value {
                                     ),
                                 ),
                             ])),
-                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("null"))])),
                         ]),
                     )])),
                 ),
                 (
                     "holdout_allocation".into(),
-                    Value::Object(Map::from([(
+                    Value::Object(Map::from_iter([(
                         "anyOf".into(),
                         Value::Array(vec![
-                            Value::Object(Map::from([
+                            Value::Object(Map::from_iter([
                                 ("$ref".into(), Value::from("#/$defs/ActiveResources")),
                                 (
                                     "description".into(),
@@ -992,23 +1007,26 @@ fn definition_draft() -> Value {
                                     ),
                                 ),
                             ])),
-                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("null"))])),
                         ]),
                     )])),
                 ),
                 (
                     "lesson_query".into(),
-                    Value::Object(Map::from([(
+                    Value::Object(Map::from_iter([(
                         "anyOf".into(),
                         Value::Array(vec![
-                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonQueryIntent"))])),
-                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                            Value::Object(Map::from_iter([(
+                                "$ref".into(),
+                                Value::from("#/$defs/LessonQueryIntent"),
+                            )])),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("null"))])),
                         ]),
                     )])),
                 ),
                 (
                     "elapsed_ms".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1022,7 +1040,7 @@ fn definition_draft() -> Value {
                 ),
                 (
                     "max_input_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
                         ("maximum".into(), Value::from(262144_u64)),
@@ -1030,7 +1048,7 @@ fn definition_draft() -> Value {
                 ),
                 (
                     "max_output_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
                         ("maximum".into(), Value::from(65536_u64)),
@@ -1038,7 +1056,7 @@ fn definition_draft() -> Value {
                 ),
                 (
                     "proposal_timeout_ms".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
                         ("maximum".into(), Value::from(600000_u64)),
@@ -1073,59 +1091,59 @@ fn definition_draft() -> Value {
         (
             "allOf".into(),
             Value::Array(vec![
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             ("required".into(), Value::Array(vec![Value::from("holdout_allocation")])),
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "holdout_allocation".into(),
-                                    Value::Object(Map::from([("type".into(), Value::from("object"))])),
+                                    Value::Object(Map::from_iter([("type".into(), Value::from("object"))])),
                                 )])),
                             ),
                         ])),
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([(
+                        Value::Object(Map::from_iter([(
                             "properties".into(),
-                            Value::Object(Map::from([(
+                            Value::Object(Map::from_iter([(
                                 "verification_split".into(),
-                                Value::Object(Map::from([("const".into(), Value::from("validation"))])),
+                                Value::Object(Map::from_iter([("const".into(), Value::from("validation"))])),
                             )])),
                         )])),
                     ),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     (
                         "if".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             ("required".into(), Value::Array(vec![Value::from("gate_allocation")])),
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "gate_allocation".into(),
-                                    Value::Object(Map::from([("type".into(), Value::from("object"))])),
+                                    Value::Object(Map::from_iter([("type".into(), Value::from("object"))])),
                                 )])),
                             ),
                         ])),
                     ),
                     (
                         "then".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             ("required".into(), Value::Array(vec![Value::from("holdout_allocation")])),
                             (
                                 "properties".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     (
                                         "verification_split".into(),
-                                        Value::Object(Map::from([("const".into(), Value::from("validation"))])),
+                                        Value::Object(Map::from_iter([("const".into(), Value::from("validation"))])),
                                     ),
                                     (
                                         "holdout_allocation".into(),
-                                        Value::Object(Map::from([("type".into(), Value::from("object"))])),
+                                        Value::Object(Map::from_iter([("type".into(), Value::from("object"))])),
                                     ),
                                 ])),
                             ),
@@ -1138,18 +1156,18 @@ fn definition_draft() -> Value {
 }
 
 fn definition_handle() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "experiment_id".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Id"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Id"))])),
                 ),
                 (
                     "plan_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
             ])),
         ),
@@ -1168,41 +1186,41 @@ fn definition_handle() -> Value {
 }
 
 fn definition_final() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "handle".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Handle"))])),
                 ),
                 (
                     "proposal_id".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "proposal_stage".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                 ),
                 (
                     "skill_id".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/SkillId"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/SkillId"))])),
                 ),
                 (
                     "baseline_revision".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
                 ),
                 (
                     "baseline_record_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "baseline_generation".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1210,15 +1228,15 @@ fn definition_final() -> Value {
                 ),
                 (
                     "candidate_revision".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
                 ),
                 (
                     "candidate_record_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "evaluation_epoch".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u32::MAX)),
@@ -1226,30 +1244,30 @@ fn definition_final() -> Value {
                 ),
                 (
                     "evaluating_since".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
                 ),
                 (
                     "suite_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "gate_stage".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                 ),
                 (
                     "gate_witness_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "gate_id".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "gate_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
             ])),
         ),
@@ -1285,13 +1303,13 @@ fn definition_final() -> Value {
 }
 
 fn definition_publish() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([(
+            Value::Object(Map::from_iter([(
                 "expected".into(),
-                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Final"))])),
+                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Final"))])),
             )])),
         ),
         ("required".into(), Value::Array(vec![Value::from("expected")])),
@@ -1306,18 +1324,18 @@ fn definition_publish() -> Value {
 }
 
 fn definition_annotation() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "expected".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Final"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Final"))])),
                 ),
                 (
                     "publication_tx".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         (
                             "description".into(),
@@ -1330,11 +1348,11 @@ fn definition_annotation() -> Value {
                 ),
                 (
                     "task_family".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Family"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Family"))])),
                 ),
                 (
                     "expires_at".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
                 ),
             ])),
         ),
@@ -1358,18 +1376,18 @@ fn definition_annotation() -> Value {
 }
 
 fn definition_rollback() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "handle".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Handle"))])),
                 ),
                 (
                     "prior_revision".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("$ref".into(), Value::from("#/$defs/RevisionId")),
                         (
                             "description".into(),
@@ -1381,7 +1399,7 @@ fn definition_rollback() -> Value {
                 ),
                 (
                     "observed_generation".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1414,36 +1432,36 @@ fn definition_rollback() -> Value {
 }
 
 fn definition_lesson_ref() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "adoption_id".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "adoption_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "publication_tx".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "adopted_revision".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
                 ),
                 (
                     "adopted_record_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
             ])),
         ),
@@ -1468,22 +1486,22 @@ fn definition_lesson_ref() -> Value {
 }
 
 fn definition_retirement() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "handle".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Handle"))])),
                 ),
                 (
                     "reference".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonRef"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/LessonRef"))])),
                 ),
                 (
                     "retired".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("boolean")),
                         (
                             "description".into(),
@@ -1493,7 +1511,7 @@ fn definition_retirement() -> Value {
                 ),
                 (
                     "invalidated".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("boolean")),
                         (
                             "description".into(),
@@ -1523,22 +1541,22 @@ fn definition_retirement() -> Value {
 }
 
 fn definition_lessons() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "handle".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Handle"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Handle"))])),
                 ),
                 (
                     "task_family".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Family"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Family"))])),
                 ),
                 (
                     "lifetime_ms".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1571,28 +1589,28 @@ fn definition_lessons() -> Value {
 }
 
 fn definition_model_binding() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "provider_label".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "model".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "temperature_milli".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u32::MAX)),
@@ -1617,25 +1635,25 @@ fn definition_model_binding() -> Value {
 }
 
 fn definition_origin_data() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "version".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("const".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "authority_expires_at".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
                 ),
                 (
                     "kind".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         (
                             "enum".into(),
@@ -1645,73 +1663,73 @@ fn definition_origin_data() -> Value {
                 ),
                 (
                     "boot".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "profile".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "actor".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "target_owner".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Owner"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Owner"))])),
                 ),
                 (
                     "workspace".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "session".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "run".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "event".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         ("minLength".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "input".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "routing".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "sequence".into(),
-                    Value::Object(Map::from([(
+                    Value::Object(Map::from_iter([(
                         "anyOf".into(),
                         Value::Array(vec![
-                            Value::Object(Map::from([
+                            Value::Object(Map::from_iter([
                                 ("type".into(), Value::from("integer")),
                                 ("minimum".into(), Value::from(0_u64)),
                                 ("maximum".into(), Value::from(u64::MAX)),
                             ])),
-                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("null"))])),
                         ]),
                     )])),
                 ),
@@ -1746,28 +1764,28 @@ fn definition_origin_data() -> Value {
 }
 
 fn definition_admission() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "pin".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("object")),
                         (
                             "properties".into(),
-                            Value::Object(Map::from([
+                            Value::Object(Map::from_iter([
                                 (
                                     "version".into(),
-                                    Value::Object(Map::from([
+                                    Value::Object(Map::from_iter([
                                         ("type".into(), Value::from("integer")),
                                         ("const".into(), Value::from(1_u64)),
                                     ])),
                                 ),
                                 (
                                     "source".into(),
-                                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/OriginData"))])),
+                                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/OriginData"))])),
                                 ),
                             ])),
                         ),
@@ -1780,7 +1798,7 @@ fn definition_admission() -> Value {
                 ),
                 (
                     "owner_mac".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
             ])),
         ),
@@ -1799,26 +1817,26 @@ fn definition_admission() -> Value {
 }
 
 fn definition_lesson_compatibility() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "model_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "policy_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "source_profile_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "tokenizer_profile_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
             ])),
         ),
@@ -1836,14 +1854,14 @@ fn definition_lesson_compatibility() -> Value {
 }
 
 fn definition_lesson_limits() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "examined".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u32::MAX)),
@@ -1851,7 +1869,7 @@ fn definition_lesson_limits() -> Value {
                 ),
                 (
                     "index_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1859,7 +1877,7 @@ fn definition_lesson_limits() -> Value {
                 ),
                 (
                     "record_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1867,7 +1885,7 @@ fn definition_lesson_limits() -> Value {
                 ),
                 (
                     "decoded_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1875,7 +1893,7 @@ fn definition_lesson_limits() -> Value {
                 ),
                 (
                     "lessons".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u32::MAX)),
@@ -1883,7 +1901,7 @@ fn definition_lesson_limits() -> Value {
                 ),
                 (
                     "item_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1891,7 +1909,7 @@ fn definition_lesson_limits() -> Value {
                 ),
                 (
                     "context_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1899,7 +1917,7 @@ fn definition_lesson_limits() -> Value {
                 ),
                 (
                     "context_token_upper_bound".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1907,7 +1925,7 @@ fn definition_lesson_limits() -> Value {
                 ),
                 (
                     "elapsed_ms".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1934,14 +1952,14 @@ fn definition_lesson_limits() -> Value {
 }
 
 fn definition_lesson_stats() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "examined".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u32::MAX)),
@@ -1949,7 +1967,7 @@ fn definition_lesson_stats() -> Value {
                 ),
                 (
                     "index_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1957,7 +1975,7 @@ fn definition_lesson_stats() -> Value {
                 ),
                 (
                     "decoded_bytes".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1965,7 +1983,7 @@ fn definition_lesson_stats() -> Value {
                 ),
                 (
                     "excluded".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u32::MAX)),
@@ -1973,7 +1991,7 @@ fn definition_lesson_stats() -> Value {
                 ),
                 (
                     "elapsed_ms".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -1996,30 +2014,30 @@ fn definition_lesson_stats() -> Value {
 }
 
 fn definition_lesson_snapshot_entry() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "reference".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonRef"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/LessonRef"))])),
                 ),
                 (
                     "evidence_pin_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "sanitized_guidance".into(),
-                    Value::Object(Map::from([("type".into(), Value::from("string"))])),
+                    Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
                 ),
                 (
                     "guidance_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "expires_at".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
                 ),
             ])),
         ),
@@ -2038,14 +2056,14 @@ fn definition_lesson_snapshot_entry() -> Value {
 }
 
 fn definition_lesson_snapshot() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "schema_version".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u32::MAX)),
@@ -2053,64 +2071,70 @@ fn definition_lesson_snapshot() -> Value {
                 ),
                 (
                     "owner_scope".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Owner"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Owner"))])),
                 ),
                 (
                     "task_family".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Family"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Family"))])),
                 ),
                 (
                     "query_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "index_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "compatibility".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonCompatibility"))])),
+                    Value::Object(Map::from_iter([(
+                        "$ref".into(),
+                        Value::from("#/$defs/LessonCompatibility"),
+                    )])),
                 ),
                 (
                     "exclusions".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("array")),
                         (
                             "items".into(),
-                            Value::Object(Map::from([("type".into(), Value::from("string"))])),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
                         ),
                     ])),
                 ),
                 (
                     "limits".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonLimits"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/LessonLimits"))])),
                 ),
                 (
                     "stats".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonStats"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/LessonStats"))])),
                 ),
                 (
                     "entries".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("array")),
                         (
                             "items".into(),
-                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonSnapshotEntry"))])),
+                            Value::Object(Map::from_iter([(
+                                "$ref".into(),
+                                Value::from("#/$defs/LessonSnapshotEntry"),
+                            )])),
                         ),
                         ("maxItems".into(), Value::from(2_u64)),
                     ])),
                 ),
                 (
                     "formatter_version".into(),
-                    Value::Object(Map::from([("type".into(), Value::from("string"))])),
+                    Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
                 ),
                 (
                     "planned_at".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
                 ),
                 (
                     "expires_at".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
                 ),
             ])),
         ),
@@ -2143,26 +2167,26 @@ fn definition_lesson_snapshot() -> Value {
 }
 
 fn definition_pins() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "skill_id".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/SkillId"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/SkillId"))])),
                 ),
                 (
                     "baseline_revision".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/RevisionId"))])),
                 ),
                 (
                     "baseline_record_digest".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "baseline_generation".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(0_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -2170,65 +2194,68 @@ fn definition_pins() -> Value {
                 ),
                 (
                     "binary_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "config_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "policy_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "catalog_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "environment_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "edit_scope_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "model".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ModelBinding"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/ModelBinding"))])),
                 ),
                 (
                     "suite_digest".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "development_split_digest".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "verification_split".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/IndependentSplit"))])),
+                    Value::Object(Map::from_iter([(
+                        "$ref".into(),
+                        Value::from("#/$defs/IndependentSplit"),
+                    )])),
                 ),
                 (
                     "verification_split_digest".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "holdout_split_digest".into(),
-                    Value::Object(Map::from([(
+                    Value::Object(Map::from_iter([(
                         "anyOf".into(),
                         Value::Array(vec![
-                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
-                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                            Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("null"))])),
                         ]),
                     )])),
                 ),
                 (
                     "lesson_snapshot".into(),
-                    Value::Object(Map::from([(
+                    Value::Object(Map::from_iter([(
                         "anyOf".into(),
                         Value::Array(vec![
-                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/LessonSnapshot"))])),
-                            Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                            Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/LessonSnapshot"))])),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("null"))])),
                         ]),
                     )])),
                 ),
@@ -2265,18 +2292,18 @@ fn definition_pins() -> Value {
 }
 
 fn definition_stage() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "id".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                 ),
                 (
                     "kind".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         (
                             "enum".into(),
@@ -2292,11 +2319,11 @@ fn definition_stage() -> Value {
                 ),
                 (
                     "dependencies".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("array")),
                         (
                             "items".into(),
-                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                            Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                         ),
                         ("uniqueItems".into(), Value::from(true)),
                         ("maxItems".into(), Value::from(64_u64)),
@@ -2304,11 +2331,11 @@ fn definition_stage() -> Value {
                 ),
                 (
                     "input_sha256".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
                 ),
                 (
                     "allocation".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Resources"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Resources"))])),
                 ),
             ])),
         ),
@@ -2327,25 +2354,25 @@ fn definition_stage() -> Value {
 }
 
 fn definition_spec() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "controlled_admission".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Admission"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Admission"))])),
                 ),
                 (
                     "schema_version".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("const".into(), Value::from(1_u64)),
                     ])),
                 ),
                 (
                     "id".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("string")),
                         (
                             "description".into(),
@@ -2358,19 +2385,22 @@ fn definition_spec() -> Value {
                 ),
                 (
                     "owner_scope".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Owner"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Owner"))])),
                 ),
                 (
                     "pins".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Pins"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Pins"))])),
                 ),
                 (
                     "resources".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/ActiveResources"))])),
+                    Value::Object(Map::from_iter([(
+                        "$ref".into(),
+                        Value::from("#/$defs/ActiveResources"),
+                    )])),
                 ),
                 (
                     "max_concurrent".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
                         ("maximum".into(), Value::from(64_u64)),
@@ -2378,7 +2408,7 @@ fn definition_spec() -> Value {
                 ),
                 (
                     "elapsed_ms".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
                         ("maximum".into(), Value::from(u64::MAX)),
@@ -2386,19 +2416,19 @@ fn definition_spec() -> Value {
                 ),
                 (
                     "created_at".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
                 ),
                 (
                     "expires_at".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Timestamp"))])),
                 ),
                 (
                     "stages".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("array")),
                         (
                             "items".into(),
-                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Stage"))])),
+                            Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Stage"))])),
                         ),
                         ("minItems".into(), Value::from(1_u64)),
                         ("maxItems".into(), Value::from(64_u64)),
@@ -2433,29 +2463,32 @@ fn definition_spec() -> Value {
 }
 
 fn definition_operation() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         (
             "oneOf".into(),
             Value::Array(vec![
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     ("type".into(), Value::from("object")),
                     (
                         "properties".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "operation".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("string")),
                                     ("const".into(), Value::from("proposal")),
                                 ])),
                             ),
                             (
                                 "patterns".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("array")),
                                     (
                                         "items".into(),
-                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/PatternId"))])),
+                                        Value::Object(Map::from_iter([(
+                                            "$ref".into(),
+                                            Value::from("#/$defs/PatternId"),
+                                        )])),
                                     ),
                                     ("minItems".into(), Value::from(1_u64)),
                                     ("maxItems".into(), Value::from(8_u64)),
@@ -2463,7 +2496,7 @@ fn definition_operation() -> Value {
                             ),
                             (
                                 "max_input_bytes".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("integer")),
                                     ("minimum".into(), Value::from(1_u64)),
                                     ("maximum".into(), Value::from(262144_u64)),
@@ -2471,7 +2504,7 @@ fn definition_operation() -> Value {
                             ),
                             (
                                 "max_output_bytes".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("integer")),
                                     ("minimum".into(), Value::from(1_u64)),
                                     ("maximum".into(), Value::from(65536_u64)),
@@ -2479,7 +2512,7 @@ fn definition_operation() -> Value {
                             ),
                             (
                                 "timeout_ms".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("integer")),
                                     ("minimum".into(), Value::from(1_u64)),
                                     ("maximum".into(), Value::from(600000_u64)),
@@ -2499,25 +2532,25 @@ fn definition_operation() -> Value {
                     ),
                     ("additionalProperties".into(), Value::from(false)),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     ("type".into(), Value::from("object")),
                     (
                         "properties".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "operation".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("string")),
                                     ("const".into(), Value::from("evaluation")),
                                 ])),
                             ),
                             (
                                 "proposal_stage".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                             ),
                             (
                                 "split".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Split"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Split"))])),
                             ),
                         ])),
                     ),
@@ -2531,21 +2564,21 @@ fn definition_operation() -> Value {
                     ),
                     ("additionalProperties".into(), Value::from(false)),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     ("type".into(), Value::from("object")),
                     (
                         "properties".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "operation".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("string")),
                                     ("const".into(), Value::from("verify")),
                                 ])),
                             ),
                             (
                                 "evaluation_stage".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                             ),
                         ])),
                     ),
@@ -2555,25 +2588,28 @@ fn definition_operation() -> Value {
                     ),
                     ("additionalProperties".into(), Value::from(false)),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     ("type".into(), Value::from("object")),
                     (
                         "properties".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "operation".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("string")),
                                     ("const".into(), Value::from("development_probe")),
                                 ])),
                             ),
                             (
                                 "proposal_stage".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "anyOf".into(),
                                     Value::Array(vec![
-                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
-                                        Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                                        Value::Object(Map::from_iter([(
+                                            "$ref".into(),
+                                            Value::from("#/$defs/StageId"),
+                                        )])),
+                                        Value::Object(Map::from_iter([("type".into(), Value::from("null"))])),
                                     ]),
                                 )])),
                             ),
@@ -2582,21 +2618,21 @@ fn definition_operation() -> Value {
                     ("required".into(), Value::Array(vec![Value::from("operation")])),
                     ("additionalProperties".into(), Value::from(false)),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     ("type".into(), Value::from("object")),
                     (
                         "properties".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "operation".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("string")),
                                     ("const".into(), Value::from("development_proposal")),
                                 ])),
                             ),
                             (
                                 "role".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("string")),
                                     (
                                         "enum".into(),
@@ -2610,11 +2646,14 @@ fn definition_operation() -> Value {
                             ),
                             (
                                 "patterns".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("array")),
                                     (
                                         "items".into(),
-                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/PatternId"))])),
+                                        Value::Object(Map::from_iter([(
+                                            "$ref".into(),
+                                            Value::from("#/$defs/PatternId"),
+                                        )])),
                                     ),
                                     ("minItems".into(), Value::from(1_u64)),
                                     ("maxItems".into(), Value::from(8_u64)),
@@ -2622,37 +2661,43 @@ fn definition_operation() -> Value {
                             ),
                             (
                                 "probe_stages".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("array")),
                                     (
                                         "items".into(),
-                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                        Value::Object(Map::from_iter([(
+                                            "$ref".into(),
+                                            Value::from("#/$defs/StageId"),
+                                        )])),
                                     ),
                                 ])),
                             ),
                             (
                                 "parent_selection".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "anyOf".into(),
                                     Value::Array(vec![
-                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
-                                        Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                                        Value::Object(Map::from_iter([(
+                                            "$ref".into(),
+                                            Value::from("#/$defs/StageId"),
+                                        )])),
+                                        Value::Object(Map::from_iter([("type".into(), Value::from("null"))])),
                                     ]),
                                 )])),
                             ),
                             (
                                 "lesson_context_sha256".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "anyOf".into(),
                                     Value::Array(vec![
-                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Digest"))])),
-                                        Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                                        Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Digest"))])),
+                                        Value::Object(Map::from_iter([("type".into(), Value::from("null"))])),
                                     ]),
                                 )])),
                             ),
                             (
                                 "max_input_bytes".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("integer")),
                                     ("minimum".into(), Value::from(1_u64)),
                                     ("maximum".into(), Value::from(262144_u64)),
@@ -2660,7 +2705,7 @@ fn definition_operation() -> Value {
                             ),
                             (
                                 "max_output_bytes".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("integer")),
                                     ("minimum".into(), Value::from(1_u64)),
                                     ("maximum".into(), Value::from(65536_u64)),
@@ -2668,7 +2713,7 @@ fn definition_operation() -> Value {
                             ),
                             (
                                 "timeout_ms".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("integer")),
                                     ("minimum".into(), Value::from(1_u64)),
                                     ("maximum".into(), Value::from(600000_u64)),
@@ -2690,35 +2735,41 @@ fn definition_operation() -> Value {
                     ),
                     ("additionalProperties".into(), Value::from(false)),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     ("type".into(), Value::from("object")),
                     (
                         "properties".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "operation".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("string")),
                                     ("const".into(), Value::from("development_selection")),
                                 ])),
                             ),
                             (
                                 "probe_stages".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("array")),
                                     (
                                         "items".into(),
-                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                        Value::Object(Map::from_iter([(
+                                            "$ref".into(),
+                                            Value::from("#/$defs/StageId"),
+                                        )])),
                                     ),
                                 ])),
                             ),
                             (
                                 "parent_selections".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("array")),
                                     (
                                         "items".into(),
-                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                        Value::Object(Map::from_iter([(
+                                            "$ref".into(),
+                                            Value::from("#/$defs/StageId"),
+                                        )])),
                                     ),
                                 ])),
                             ),
@@ -2730,33 +2781,36 @@ fn definition_operation() -> Value {
                     ),
                     ("additionalProperties".into(), Value::from(false)),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     ("type".into(), Value::from("object")),
                     (
                         "properties".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "operation".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("string")),
                                     ("const".into(), Value::from("selected_evaluation")),
                                 ])),
                             ),
                             (
                                 "selection_stage".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                             ),
                             (
                                 "split".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Split"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Split"))])),
                             ),
                             (
                                 "validation_stage".into(),
-                                Value::Object(Map::from([(
+                                Value::Object(Map::from_iter([(
                                     "anyOf".into(),
                                     Value::Array(vec![
-                                        Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
-                                        Value::Object(Map::from([("type".into(), Value::from("null"))])),
+                                        Value::Object(Map::from_iter([(
+                                            "$ref".into(),
+                                            Value::from("#/$defs/StageId"),
+                                        )])),
+                                        Value::Object(Map::from_iter([("type".into(), Value::from("null"))])),
                                     ]),
                                 )])),
                             ),
@@ -2772,37 +2826,37 @@ fn definition_operation() -> Value {
                     ),
                     ("additionalProperties".into(), Value::from(false)),
                 ])),
-                Value::Object(Map::from([
+                Value::Object(Map::from_iter([
                     ("type".into(), Value::from("object")),
                     (
                         "properties".into(),
-                        Value::Object(Map::from([
+                        Value::Object(Map::from_iter([
                             (
                                 "operation".into(),
-                                Value::Object(Map::from([
+                                Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("string")),
                                     ("const".into(), Value::from("gate_review")),
                                 ])),
                             ),
                             (
                                 "selection_stage".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                             ),
                             (
                                 "validation_stage".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                             ),
                             (
                                 "validation_verifier".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                             ),
                             (
                                 "holdout_stage".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                             ),
                             (
                                 "holdout_verifier".into(),
-                                Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/StageId"))])),
+                                Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/StageId"))])),
                             ),
                         ])),
                     ),
@@ -2831,22 +2885,22 @@ fn definition_operation() -> Value {
 }
 
 fn definition_issued_plan() -> Value {
-    Value::Object(Map::from([
+    Value::Object(Map::from_iter([
         ("type".into(), Value::from("object")),
         (
             "properties".into(),
-            Value::Object(Map::from([
+            Value::Object(Map::from_iter([
                 (
                     "spec".into(),
-                    Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Spec"))])),
+                    Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Spec"))])),
                 ),
                 (
                     "operations".into(),
-                    Value::Object(Map::from([
+                    Value::Object(Map::from_iter([
                         ("type".into(), Value::from("object")),
                         (
                             "additionalProperties".into(),
-                            Value::Object(Map::from([("$ref".into(), Value::from("#/$defs/Operation"))])),
+                            Value::Object(Map::from_iter([("$ref".into(), Value::from("#/$defs/Operation"))])),
                         ),
                         ("minProperties".into(), Value::from(1_u64)),
                         ("maxProperties".into(), Value::from(64_u64)),
