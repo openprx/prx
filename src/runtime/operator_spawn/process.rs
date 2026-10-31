@@ -300,8 +300,8 @@ impl OperatorProcessLaunch {
 }
 
 pub(crate) enum ProcessSourceLaunch {
-    Ordinary(crate::runtime::turn_decision::OrdinaryProcessLaunch),
-    Operator(OperatorProcessLaunch),
+    Ordinary(Box<crate::runtime::turn_decision::OrdinaryProcessLaunch>),
+    Operator(Box<OperatorProcessLaunch>),
 }
 impl ProcessSourceLaunch {
     pub(crate) const fn is_ordinary(&self) -> bool {
@@ -331,8 +331,8 @@ impl ProcessSourceLaunch {
         worker: &mut crate::session_worker::protocol::WorkerManifest,
     ) -> anyhow::Result<()> {
         match self {
-            Self::Ordinary(launch) => launch.bind_worker_manifest(key, worker),
-            Self::Operator(launch) => launch.bind_worker_manifest(key, worker),
+            Self::Ordinary(launch) => (*launch).bind_worker_manifest(key, worker),
+            Self::Operator(launch) => (*launch).bind_worker_manifest(key, worker),
         }
     }
 }

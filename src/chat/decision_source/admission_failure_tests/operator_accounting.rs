@@ -427,7 +427,7 @@ async fn restore_operator_process(
     // This exercises the real process-launch binding producer. The fixture
     // does not claim outer worker-channel authentication or an OS spawn.
     let channel_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx_operator_process_fixture_channel");
-    ProcessSourceLaunch::Operator(launch).bind_worker_manifest(&channel_key, &mut manifest)?;
+    ProcessSourceLaunch::Operator(Box::new(launch)).bind_worker_manifest(&channel_key, &mut manifest)?;
     let key = crate::decision::key::DecisionKey::from_worker_channel(
         &channel_key,
         source.proof().workspace_id(),

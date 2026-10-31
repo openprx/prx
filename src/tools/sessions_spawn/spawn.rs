@@ -775,15 +775,15 @@ impl SessionsSpawnTool {
                     )
                 })
                 .transpose()?
-                .map(crate::runtime::operator_spawn::process::ProcessSourceLaunch::Ordinary);
+                .map(|launch| crate::runtime::operator_spawn::process::ProcessSourceLaunch::Ordinary(Box::new(launch)));
             let process_source_launch = match &operator_source {
                 Some(source) => Some(crate::runtime::operator_spawn::process::ProcessSourceLaunch::Operator(
-                    source.capture_process(
+                    Box::new(source.capture_process(
                         &spawn_scope_for_event,
                         task,
                         source_receipt.clone(),
                         process_config_generation.clone(),
-                    )?,
+                    )?),
                 )),
                 None => process_source_launch,
             };
