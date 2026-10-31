@@ -1,8 +1,8 @@
 {
   "$schema": "./models.schema.json",
   "schema_version": "1.0",
-  "revision": "2026-10-20.1",
-  "published_at": "2026-10-20T06:07:31Z",
+  "revision": "2026-10-31.1",
+  "published_at": "2026-10-31T12:58:10Z",
   "providers": {
     "anthropic": {
       "default_model": "anthropic/claude-sonnet-5",
@@ -29,7 +29,7 @@
       "display_name": "Copilot"
     },
     "deepseek": {
-      "default_model": "deepseek/deepseek-chat",
+      "default_model": "deepseek/deepseek-flash",
       "display_name": "Deepseek"
     },
     "fireworks": {
@@ -65,15 +65,15 @@
       "display_name": "llama.cpp"
     },
     "minimax": {
-      "default_model": "minimax/MiniMax-M2.5",
+      "default_model": "minimax/MiniMax-M3",
       "display_name": "Minimax"
     },
     "mistral": {
-      "default_model": "mistral/mistral-large-latest",
+      "default_model": "mistral/mistral-medium-latest",
       "display_name": "Mistral"
     },
     "moonshot": {
-      "default_model": "moonshot/kimi-k2.6",
+      "default_model": "moonshot/kimi-k3",
       "display_name": "Moonshot"
     },
     "nvidia": {
@@ -85,7 +85,7 @@
       "display_name": "Ollama"
     },
     "openai": {
-      "default_model": "openai/gpt-5.6",
+      "default_model": "openai/gpt-5.6-sol",
       "display_name": "OpenAI"
     },
     "openai-codex": {
@@ -121,7 +121,7 @@
       "display_name": "vLLM"
     },
     "xai": {
-      "default_model": "xai/grok-4.20",
+      "default_model": "xai/grok-4.20-0309-reasoning",
       "display_name": "xAI"
     },
     "zai": {
@@ -244,13 +244,10 @@
       "id": "anthropic/claude-fable-5",
       "provider": "anthropic",
       "api_model": "claude-fable-5",
-      "display_name": "claude-fable-5",
+      "display_name": "claude-fable-5 (legacy)",
       "aliases": [],
       "lifecycle": {
-        "status": "retired",
-        "deprecated_at": "2026-10-16T00:00:00Z",
-        "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "anthropic/claude-sonnet-5"
+        "status": "active"
       },
       "operations": [
         "chat"
@@ -373,13 +370,10 @@
       "id": "anthropic/claude-haiku-4-5",
       "provider": "anthropic",
       "api_model": "claude-haiku-4-5",
-      "display_name": "claude-haiku-4-5",
+      "display_name": "claude-haiku-4-5 (legacy)",
       "aliases": [],
       "lifecycle": {
-        "status": "retired",
-        "deprecated_at": "2026-10-16T00:00:00Z",
-        "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "anthropic/claude-sonnet-5"
+        "status": "active"
       },
       "operations": [
         "chat"
@@ -445,7 +439,7 @@
       "id": "anthropic/claude-haiku-4-5-20251001",
       "provider": "anthropic",
       "api_model": "claude-haiku-4-5-20251001",
-      "display_name": "Claude Haiku 4.5 (fastest, cheapest)",
+      "display_name": "Claude Haiku 4.5 (fastest, cheapest) (legacy)",
       "aliases": [],
       "lifecycle": {
         "status": "active"
@@ -574,13 +568,10 @@
       "id": "anthropic/claude-opus-4-6",
       "provider": "anthropic",
       "api_model": "claude-opus-4-6",
-      "display_name": "claude-opus-4-6",
+      "display_name": "claude-opus-4-6 (legacy)",
       "aliases": [],
       "lifecycle": {
-        "status": "retired",
-        "deprecated_at": "2026-10-16T00:00:00Z",
-        "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "anthropic/claude-sonnet-5"
+        "status": "active"
       },
       "operations": [
         "chat"
@@ -625,7 +616,7 @@
       },
       "default_level": "medium",
       "router": {
-        "cost_per_million_tokens": 15.0,
+        "cost_per_million_tokens": 5,
         "categories": [
           "conversation",
           "analysis",
@@ -634,19 +625,23 @@
         ],
         "latency_ms": 3000,
         "quality_rank": 1000
+      },
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 5,
+        "output": 25,
+        "cache_write": 6.25,
+        "cache_read": 0.5
       }
     },
     {
       "id": "anthropic/claude-opus-4-7",
       "provider": "anthropic",
       "api_model": "claude-opus-4-7",
-      "display_name": "claude-opus-4-7",
+      "display_name": "claude-opus-4-7 (legacy)",
       "aliases": [],
       "lifecycle": {
-        "status": "retired",
-        "deprecated_at": "2026-10-16T00:00:00Z",
-        "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "anthropic/claude-sonnet-5"
+        "status": "active"
       },
       "operations": [
         "chat"
@@ -689,7 +684,7 @@
       },
       "default_level": "medium",
       "router": {
-        "cost_per_million_tokens": 5.0,
+        "cost_per_million_tokens": 5,
         "categories": [
           "conversation",
           "analysis",
@@ -698,13 +693,20 @@
         ],
         "latency_ms": 3000,
         "quality_rank": 1000
+      },
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 5,
+        "output": 25,
+        "cache_write": 6.25,
+        "cache_read": 0.5
       }
     },
     {
       "id": "anthropic/claude-opus-4-8",
       "provider": "anthropic",
       "api_model": "claude-opus-4-8",
-      "display_name": "Claude Opus 4.8 (best quality)",
+      "display_name": "Claude Opus 4.8 (best quality) (legacy)",
       "aliases": [],
       "lifecycle": {
         "status": "active"
@@ -832,13 +834,10 @@
       "id": "anthropic/claude-sonnet-4-6",
       "provider": "anthropic",
       "api_model": "claude-sonnet-4-6",
-      "display_name": "claude-sonnet-4-6",
+      "display_name": "claude-sonnet-4-6 (legacy)",
       "aliases": [],
       "lifecycle": {
-        "status": "retired",
-        "deprecated_at": "2026-10-16T00:00:00Z",
-        "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "anthropic/claude-sonnet-5"
+        "status": "active"
       },
       "operations": [
         "chat"
@@ -968,6 +967,311 @@
         "output": 10,
         "cache_write": 2.5,
         "cache_read": 0.2
+      }
+    },
+    {
+      "id": "anthropic/claude-fable-5-1",
+      "provider": "anthropic",
+      "api_model": "claude-fable-5-1",
+      "display_name": "Claude Fable 5.1",
+      "aliases": [
+        "claude-fable-5.1"
+      ],
+      "lifecycle": {
+        "status": "active",
+        "retire_at": "2027-09-01T00:00:00Z"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "high"
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 2048,
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "max_output_tokens": 4096,
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "max_output_tokens": 8192,
+          "reasoning_effort": "high"
+        }
+      },
+      "default_level": "high",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 10,
+        "output": 50,
+        "cache_write": 12.5,
+        "cache_read": 0.25
+      }
+    },
+    {
+      "id": "anthropic/claude-opus-5-5",
+      "provider": "anthropic",
+      "api_model": "claude-opus-5-5",
+      "display_name": "Claude Opus 5.5",
+      "aliases": [
+        "claude-opus-5.5"
+      ],
+      "lifecycle": {
+        "status": "active",
+        "retire_at": "2027-09-22T00:00:00Z"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "medium"
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 2048,
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "max_output_tokens": 4096,
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "max_output_tokens": 8192,
+          "reasoning_effort": "high"
+        }
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 4,
+        "output": 20,
+        "cache_write": 5,
+        "cache_read": 0.2
+      }
+    },
+    {
+      "id": "anthropic/claude-sonnet-5-5",
+      "provider": "anthropic",
+      "api_model": "claude-sonnet-5-5",
+      "display_name": "Claude Sonnet 5.5",
+      "aliases": [
+        "claude-sonnet-5.5"
+      ],
+      "lifecycle": {
+        "status": "active",
+        "retire_at": "2027-09-28T00:00:00Z"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "high"
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 2048,
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "max_output_tokens": 4096,
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "max_output_tokens": 8192,
+          "reasoning_effort": "high"
+        }
+      },
+      "default_level": "high",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 2,
+        "output": 10,
+        "cache_write": 2.5,
+        "cache_read": 0.1
+      }
+    },
+    {
+      "id": "anthropic/claude-haiku-5-5",
+      "provider": "anthropic",
+      "api_model": "claude-haiku-5-5",
+      "display_name": "Claude Haiku 5.5",
+      "aliases": [
+        "claude-haiku-5.5"
+      ],
+      "lifecycle": {
+        "status": "active",
+        "retire_at": "2027-10-07T00:00:00Z"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "medium"
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 2048,
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "max_output_tokens": 4096,
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "max_output_tokens": 8192,
+          "reasoning_effort": "high"
+        }
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.1,
+        "output": 0.5,
+        "cache_write": 0.125,
+        "cache_read": 0.01,
+        "tiers": [
+          {
+            "above_input_tokens": 100000,
+            "input": 0.5,
+            "output": 2.5,
+            "cache_write": 0.625,
+            "cache_read": 0.05
+          }
+        ]
       }
     },
     {
@@ -1271,6 +1575,262 @@
       "default_level": "medium"
     },
     {
+      "id": "bedrock/anthropic.claude-opus-5-5",
+      "provider": "bedrock",
+      "api_model": "anthropic.claude-opus-5-5",
+      "display_name": "Claude Opus 5.5",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "medium"
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 2048,
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "max_output_tokens": 4096,
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "max_output_tokens": 8192,
+          "reasoning_effort": "high"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "bedrock/anthropic.claude-sonnet-5-5",
+      "provider": "bedrock",
+      "api_model": "anthropic.claude-sonnet-5-5",
+      "display_name": "Claude Sonnet 5.5",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "medium"
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 2048,
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "max_output_tokens": 4096,
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "max_output_tokens": 8192,
+          "reasoning_effort": "high"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "bedrock/anthropic.claude-haiku-5-5",
+      "provider": "bedrock",
+      "api_model": "anthropic.claude-haiku-5-5",
+      "display_name": "Claude Haiku 5.5",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "medium"
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 2048,
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "max_output_tokens": 4096,
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "max_output_tokens": 8192,
+          "reasoning_effort": "high"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "bedrock/anthropic.claude-fable-5-1",
+      "provider": "bedrock",
+      "api_model": "anthropic.claude-fable-5-1",
+      "display_name": "Claude Fable 5.1",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000,
+          "default": 4096
+        },
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "top_p": {
+          "kind": "unsupported"
+        },
+        "thinking_budget": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "medium"
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 2048,
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "max_output_tokens": 4096,
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "max_output_tokens": 8192,
+          "reasoning_effort": "high"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
       "id": "cohere/command-a-03-2025",
       "provider": "cohere",
       "api_model": "command-a-03-2025",
@@ -1459,7 +2019,10 @@
       "display_name": "DeepSeek Chat (mapped to V3.2 non-thinking)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "retire_at": "2026-10-31T00:00:00Z",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "replacement": "deepseek/deepseek-flash"
       },
       "operations": [
         "chat"
@@ -1485,7 +2048,10 @@
       "display_name": "DeepSeek Reasoner (mapped to V3.2 thinking)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "retire_at": "2026-10-31T00:00:00Z",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "replacement": "deepseek/deepseek-flash"
       },
       "operations": [
         "chat"
@@ -1503,6 +2069,79 @@
         "high": {}
       },
       "default_level": "medium"
+    },
+    {
+      "id": "deepseek/deepseek-flash",
+      "provider": "deepseek",
+      "api_model": "deepseek-flash",
+      "display_name": "DeepSeek Flash",
+      "aliases": [
+        "deepseek-v4-flash"
+      ],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 384000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.3,
+        "output": 1.2,
+        "cache_write": 0,
+        "cache_read": 0.006
+      }
+    },
+    {
+      "id": "deepseek/deepseek-v4-pro",
+      "provider": "deepseek",
+      "api_model": "deepseek-v4-pro",
+      "display_name": "DeepSeek V4 Pro",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.32,
+        "output": 3.96,
+        "cache_write": 0,
+        "cache_read": 0.044
+      }
     },
     {
       "id": "fireworks/accounts/fireworks/models/llama-v3p3-70b-instruct",
@@ -1678,13 +2317,10 @@
       "id": "gemini/gemini-2.5-pro",
       "provider": "gemini",
       "api_model": "gemini-2.5-pro",
-      "display_name": "gemini-2.5-pro",
+      "display_name": "Gemini 2.5 Pro (limited access)",
       "aliases": [],
       "lifecycle": {
-        "status": "retired",
-        "deprecated_at": "2026-10-16T00:00:00Z",
-        "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "gemini/gemini-3.5-flash"
+        "status": "active"
       },
       "operations": [
         "chat"
@@ -1920,7 +2556,10 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 65536
+      },
       "parameters": {
         "max_output_tokens": {
           "kind": "range",
@@ -1954,6 +2593,246 @@
       "default_level": "medium"
     },
     {
+      "id": "gemini/gemini-4-argon",
+      "provider": "gemini",
+      "api_model": "gemini-4-argon",
+      "display_name": "Gemini 4 Argon",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 1048576
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 1048576,
+          "default": 8192
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 4096
+        },
+        "medium": {
+          "max_output_tokens": 8192
+        },
+        "high": {
+          "max_output_tokens": 8192
+        }
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 2,
+        "output": 10,
+        "cache_write": 0,
+        "cache_read": 0.1
+      }
+    },
+    {
+      "id": "gemini/gemini-3.8-flash",
+      "provider": "gemini",
+      "api_model": "gemini-3.8-flash",
+      "display_name": "Gemini 3.8 Flash",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 65536
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 65536,
+          "default": 8192
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 4096
+        },
+        "medium": {
+          "max_output_tokens": 8192
+        },
+        "high": {
+          "max_output_tokens": 8192
+        }
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.75,
+        "output": 3.75,
+        "cache_write": 0,
+        "cache_read": 0.075
+      }
+    },
+    {
+      "id": "gemini/gemini-3.6-flash",
+      "provider": "gemini",
+      "api_model": "gemini-3.6-flash",
+      "display_name": "Gemini 3.6 Flash",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 65536
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 65536,
+          "default": 8192
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 4096
+        },
+        "medium": {
+          "max_output_tokens": 8192
+        },
+        "high": {
+          "max_output_tokens": 8192
+        }
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.75,
+        "output": 3.75,
+        "cache_write": 0,
+        "cache_read": 0.075
+      }
+    },
+    {
+      "id": "gemini/gemini-3.5-flash-lite",
+      "provider": "gemini",
+      "api_model": "gemini-3.5-flash-lite",
+      "display_name": "Gemini 3.5 Flash-Lite",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 65536
+      },
+      "parameters": {
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 65536,
+          "default": 8192
+        },
+        "temperature": {
+          "kind": "range",
+          "min": 0,
+          "max": 2,
+          "default": 0.7
+        },
+        "top_p": {
+          "kind": "range",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "levels": {
+        "low": {
+          "max_output_tokens": 4096
+        },
+        "medium": {
+          "max_output_tokens": 8192
+        },
+        "high": {
+          "max_output_tokens": 8192
+        }
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.3,
+        "output": 2.5,
+        "cache_write": 0,
+        "cache_read": 0.03
+      }
+    },
+    {
       "id": "glm/glm-4.5-air",
       "provider": "glm",
       "api_model": "glm-4.5-air",
@@ -1977,7 +2856,14 @@
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.2,
+        "output": 1.1,
+        "cache_write": 0,
+        "cache_read": 0.03
+      }
     },
     {
       "id": "glm/glm-4.7",
@@ -2003,7 +2889,14 @@
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.6,
+        "output": 2.2,
+        "cache_write": 0,
+        "cache_read": 0.11
+      }
     },
     {
       "id": "glm/glm-5",
@@ -2029,7 +2922,206 @@
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1,
+        "output": 3.2,
+        "cache_write": 0,
+        "cache_read": 0.2
+      }
+    },
+    {
+      "id": "glm/glm-5.3",
+      "provider": "glm",
+      "api_model": "glm-5.3",
+      "display_name": "GLM-5.3",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "high",
+            "max"
+          ],
+          "default": "max"
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "reasoning_effort": "high"
+        },
+        "high": {
+          "reasoning_effort": "max"
+        }
+      },
+      "default_level": "high",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.4,
+        "output": 4.4,
+        "cache_write": 0,
+        "cache_read": 0.26
+      }
+    },
+    {
+      "id": "glm/glm-5.3-flash",
+      "provider": "glm",
+      "api_model": "glm-5.3-flash",
+      "display_name": "GLM-5.3 Flash",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.15,
+        "output": 0.5,
+        "cache_write": 0,
+        "cache_read": 0.03
+      }
+    },
+    {
+      "id": "glm/glm-5.3-flashx",
+      "provider": "glm",
+      "api_model": "glm-5.3-flashx",
+      "display_name": "GLM-5.3 FlashX",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.37,
+        "output": 1.25,
+        "cache_write": 0,
+        "cache_read": 0.075
+      }
+    },
+    {
+      "id": "glm/glm-5.2",
+      "provider": "glm",
+      "api_model": "glm-5.2",
+      "display_name": "GLM-5.2",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.4,
+        "output": 4.4,
+        "cache_write": 0,
+        "cache_read": 0.26
+      }
+    },
+    {
+      "id": "glm/glm-5.1",
+      "provider": "glm",
+      "api_model": "glm-5.1",
+      "display_name": "GLM-5.1",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 204800
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.4,
+        "output": 4.4,
+        "cache_write": 0,
+        "cache_read": 0.26
+      }
     },
     {
       "id": "groq/llama-3.3-70b-versatile",
@@ -2139,7 +3231,7 @@
       "id": "kimi-code/k3",
       "provider": "kimi-code",
       "api_model": "k3",
-      "display_name": "Kimi K3 (latest, live-verified default)",
+      "display_name": "Kimi K3",
       "aliases": [],
       "lifecycle": {
         "status": "active"
@@ -2152,7 +3244,9 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1048576
+      },
       "parameters": {
         "temperature": {
           "kind": "range",
@@ -2172,7 +3266,7 @@
       "id": "kimi-code/kimi-for-coding-highspeed",
       "provider": "kimi-code",
       "api_model": "kimi-for-coding-highspeed",
-      "display_name": "Kimi for Coding Highspeed (K2.7, faster inference)",
+      "display_name": "Kimi for Coding Highspeed (K2.7 Code)",
       "aliases": [],
       "lifecycle": {
         "status": "active"
@@ -2185,7 +3279,9 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 262144
+      },
       "parameters": {
         "temperature": {
           "kind": "range",
@@ -2205,7 +3301,7 @@
       "id": "kimi-code/kimi-for-coding",
       "provider": "kimi-code",
       "api_model": "kimi-for-coding",
-      "display_name": "Kimi for Coding (official coding-agent model)",
+      "display_name": "Kimi for Coding (K2.8 Preview)",
       "aliases": [],
       "lifecycle": {
         "status": "active"
@@ -2218,7 +3314,114 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 1,
+          "max": 1,
+          "default": 1
+        }
+      },
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "kimi-code/k3.1-pro",
+      "provider": "kimi-code",
+      "api_model": "k3.1-pro",
+      "display_name": "Kimi K3.1 Pro",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 1,
+          "max": 1,
+          "default": 1
+        }
+      },
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "kimi-code/k3.1-pro-highspeed",
+      "provider": "kimi-code",
+      "api_model": "k3.1-pro-highspeed",
+      "display_name": "Kimi K3.1 Pro Highspeed",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "range",
+          "min": 1,
+          "max": 1,
+          "default": 1
+        }
+      },
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "kimi-code/k3-256k",
+      "provider": "kimi-code",
+      "api_model": "k3-256k",
+      "display_name": "Kimi K3 256K",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 262144
+      },
       "parameters": {
         "temperature": {
           "kind": "range",
@@ -2345,7 +3548,9 @@
       "display_name": "MiniMax M2.1 (strong coding/reasoning)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "deprecated",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "replacement": "minimax/MiniMax-M3"
       },
       "operations": [
         "chat"
@@ -2371,7 +3576,9 @@
       "display_name": "MiniMax M2.5 (latest flagship)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "deprecated",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "replacement": "minimax/MiniMax-M3"
       },
       "operations": [
         "chat"
@@ -2397,7 +3604,9 @@
       "display_name": "MiniMax M2.5 High-Speed (fast)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "deprecated",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "replacement": "minimax/MiniMax-M3"
       },
       "operations": [
         "chat"
@@ -2417,10 +3626,45 @@
       "default_level": "medium"
     },
     {
-      "id": "mistral/codestral-latest",
-      "provider": "mistral",
-      "api_model": "codestral-latest",
-      "display_name": "Codestral (code-focused)",
+      "id": "minimax/MiniMax-M3.1-Flash",
+      "provider": "minimax",
+      "api_model": "MiniMax-M3.1-Flash",
+      "display_name": "MiniMax M3.1 Flash",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.15,
+        "output": 0.6,
+        "cache_write": 0,
+        "cache_read": 0.015
+      }
+    },
+    {
+      "id": "minimax/MiniMax-M3",
+      "provider": "minimax",
+      "api_model": "MiniMax-M3",
+      "display_name": "MiniMax M3",
       "aliases": [],
       "lifecycle": {
         "status": "active"
@@ -2433,14 +3677,69 @@
         "vision_input": false,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1048576
+      },
       "parameters": {},
       "levels": {
         "low": {},
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.3,
+        "output": 1.2,
+        "cache_write": 0,
+        "cache_read": 0.06,
+        "tiers": [
+          {
+            "above_input_tokens": 512000,
+            "input": 0.6,
+            "output": 2.4,
+            "cache_write": 0,
+            "cache_read": 0.12
+          }
+        ]
+      }
+    },
+    {
+      "id": "mistral/codestral-2508",
+      "provider": "mistral",
+      "api_model": "codestral-2508",
+      "display_name": "Codestral 2508",
+      "aliases": [
+        "codestral-latest"
+      ],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 128000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.3,
+        "output": 0.9,
+        "cache_write": 0,
+        "cache_read": 0.03
+      }
     },
     {
       "id": "mistral/devstral-latest",
@@ -2449,7 +3748,9 @@
       "display_name": "Devstral (software engineering specialist)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "retire_at": "2026-07-31T00:00:00Z",
+        "deprecated_at": "2026-05-22T00:00:00Z"
       },
       "operations": [
         "chat"
@@ -2472,10 +3773,14 @@
       "id": "mistral/mistral-large-latest",
       "provider": "mistral",
       "api_model": "mistral-large-latest",
-      "display_name": "Mistral Large (latest flagship)",
-      "aliases": [],
+      "display_name": "Mistral Large 3 (deprecated)",
+      "aliases": [
+        "mistral-large-2512"
+      ],
       "lifecycle": {
-        "status": "active"
+        "status": "deprecated",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "retire_at": "2027-04-30T00:00:00Z"
       },
       "operations": [
         "chat"
@@ -2485,7 +3790,9 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 262144
+      },
       "parameters": {},
       "levels": {
         "low": {},
@@ -2521,6 +3828,43 @@
       "default_level": "medium"
     },
     {
+      "id": "mistral/mistral-small-2603",
+      "provider": "mistral",
+      "api_model": "mistral-small-2603",
+      "display_name": "Mistral Small 4",
+      "aliases": [
+        "mistral-small-latest"
+      ],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 262144
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.15,
+        "output": 0.6,
+        "cache_write": 0,
+        "cache_read": 0.015
+      }
+    },
+    {
       "id": "moonshot/kimi-k2-0905-preview",
       "provider": "moonshot",
       "api_model": "kimi-k2-0905-preview",
@@ -2530,7 +3874,7 @@
         "status": "retired",
         "deprecated_at": "2026-05-25T00:00:00Z",
         "retire_at": "2026-05-25T00:00:00Z",
-        "replacement": "moonshot/kimi-k2.6"
+        "replacement": "moonshot/kimi-k3"
       },
       "operations": [
         "chat"
@@ -2559,7 +3903,7 @@
         "status": "retired",
         "deprecated_at": "2026-05-25T00:00:00Z",
         "retire_at": "2026-05-25T00:00:00Z",
-        "replacement": "moonshot/kimi-k2.6"
+        "replacement": "moonshot/kimi-k3"
       },
       "operations": [
         "chat"
@@ -2588,7 +3932,7 @@
         "status": "retired",
         "deprecated_at": "2026-08-31T00:00:00Z",
         "retire_at": "2026-08-31T00:00:00Z",
-        "replacement": "moonshot/kimi-k2.6"
+        "replacement": "moonshot/kimi-k3"
       },
       "operations": [
         "chat"
@@ -2614,7 +3958,10 @@
       "display_name": "kimi-k2.6",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "deprecated",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "retire_at": "2026-12-31T23:59:59Z",
+        "replacement": "moonshot/kimi-k3"
       },
       "operations": [
         "chat"
@@ -2624,7 +3971,9 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 262144
+      },
       "parameters": {},
       "levels": {
         "low": {},
@@ -2639,6 +3988,167 @@
         "cache_write": 0.95,
         "cache_read": 0.16
       }
+    },
+    {
+      "id": "moonshot/kimi-k3.1-pro",
+      "provider": "moonshot",
+      "api_model": "kimi-k3.1-pro",
+      "display_name": "Kimi K3.1 Pro",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 2,
+        "output": 10,
+        "cache_write": 2,
+        "cache_read": 0.2
+      }
+    },
+    {
+      "id": "moonshot/kimi-k3.1-pro-highspeed",
+      "provider": "moonshot",
+      "api_model": "kimi-k3.1-pro-highspeed",
+      "display_name": "Kimi K3.1 Pro Highspeed",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 4,
+        "output": 20,
+        "cache_write": 4,
+        "cache_read": 0.2
+      }
+    },
+    {
+      "id": "moonshot/kimi-k3",
+      "provider": "moonshot",
+      "api_model": "kimi-k3",
+      "display_name": "Kimi K3",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 3,
+        "output": 15,
+        "cache_write": 3,
+        "cache_read": 0.3
+      }
+    },
+    {
+      "id": "moonshot/kimi-k2.7-code",
+      "provider": "moonshot",
+      "api_model": "kimi-k2.7-code",
+      "display_name": "Kimi K2.7 Code",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 262144
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "moonshot/kimi-k2.7-code-highspeed",
+      "provider": "moonshot",
+      "api_model": "kimi-k2.7-code-highspeed",
+      "display_name": "Kimi K2.7 Code Highspeed",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 262144
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
     },
     {
       "id": "nvidia/deepseek-ai/deepseek-v3.2",
@@ -3175,7 +4685,7 @@
         "status": "retired",
         "deprecated_at": "2026-10-16T00:00:00Z",
         "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "openai/gpt-5.6"
+        "replacement": "openai/gpt-5.6-sol"
       },
       "operations": [
         "chat"
@@ -3240,7 +4750,7 @@
         "status": "retired",
         "deprecated_at": "2026-10-16T00:00:00Z",
         "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "openai/gpt-5.6"
+        "replacement": "openai/gpt-5.6-sol"
       },
       "operations": [
         "chat"
@@ -3338,7 +4848,9 @@
       "display_name": "GPT-5.6 (latest agentic flagship)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "deprecated",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "replacement": "openai/gpt-5.6-sol"
       },
       "operations": [
         "chat"
@@ -3499,13 +5011,10 @@
       "id": "openai/gpt-5.6-sol",
       "provider": "openai",
       "api_model": "gpt-5.6-sol",
-      "display_name": "gpt-5.6-sol",
+      "display_name": "GPT-5.6 Sol",
       "aliases": [],
       "lifecycle": {
-        "status": "retired",
-        "deprecated_at": "2026-10-16T00:00:00Z",
-        "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "openai/gpt-5.6"
+        "status": "active"
       },
       "operations": [
         "chat"
@@ -3515,7 +5024,10 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
       "parameters": {
         "temperature": {
           "kind": "unsupported"
@@ -3664,7 +5176,7 @@
         "status": "retired",
         "deprecated_at": "2026-10-16T00:00:00Z",
         "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "openai/gpt-5.6"
+        "replacement": "openai/gpt-5.6-sol"
       },
       "operations": [
         "chat"
@@ -3688,6 +5200,422 @@
         "output": 60,
         "cache_write": 0,
         "cache_read": 7.5
+      }
+    },
+    {
+      "id": "openai/gpt-6-astra",
+      "provider": "openai",
+      "api_model": "gpt-6-astra",
+      "display_name": "GPT-6 Astra",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 10,
+        "output": 50,
+        "cache_write": 0,
+        "cache_read": 1,
+        "tiers": [
+          {
+            "above_input_tokens": 272000,
+            "input": 20,
+            "output": 75,
+            "cache_write": 0,
+            "cache_read": 2
+          }
+        ]
+      }
+    },
+    {
+      "id": "openai/gpt-6.1-sol",
+      "provider": "openai",
+      "api_model": "gpt-6.1-sol",
+      "display_name": "GPT-6.1 Sol",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 2,
+        "output": 10,
+        "cache_write": 0,
+        "cache_read": 0.1,
+        "tiers": [
+          {
+            "above_input_tokens": 272000,
+            "input": 4,
+            "output": 15,
+            "cache_write": 0,
+            "cache_read": 0.2
+          }
+        ]
+      }
+    },
+    {
+      "id": "openai/gpt-6.1-terra",
+      "provider": "openai",
+      "api_model": "gpt-6.1-terra",
+      "display_name": "GPT-6.1 Terra",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1,
+        "output": 5,
+        "cache_write": 0,
+        "cache_read": 0.05,
+        "tiers": [
+          {
+            "above_input_tokens": 272000,
+            "input": 2,
+            "output": 7.5,
+            "cache_write": 0,
+            "cache_read": 0.1
+          }
+        ]
+      }
+    },
+    {
+      "id": "openai/gpt-6-luna",
+      "provider": "openai",
+      "api_model": "gpt-6-luna",
+      "display_name": "GPT-6 Luna",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.1,
+        "output": 0.5,
+        "cache_write": 0,
+        "cache_read": 0.01,
+        "tiers": [
+          {
+            "above_input_tokens": 272000,
+            "input": 0.2,
+            "output": 0.75,
+            "cache_write": 0,
+            "cache_read": 0.02
+          }
+        ]
+      }
+    },
+    {
+      "id": "openai/gpt-6-sol",
+      "provider": "openai",
+      "api_model": "gpt-6-sol",
+      "display_name": "GPT-6 Sol",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 2,
+        "output": 10,
+        "cache_write": 0,
+        "cache_read": 0.2,
+        "tiers": [
+          {
+            "above_input_tokens": 272000,
+            "input": 4,
+            "output": 15,
+            "cache_write": 0,
+            "cache_read": 0.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "openai/gpt-5.5",
+      "provider": "openai",
+      "api_model": "gpt-5.5",
+      "display_name": "GPT-5.5",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 5,
+        "output": 30,
+        "cache_write": 0,
+        "cache_read": 0.5,
+        "tiers": [
+          {
+            "above_input_tokens": 272000,
+            "input": 10,
+            "output": 45,
+            "cache_write": 0,
+            "cache_read": 1
+          }
+        ]
       }
     },
     {
@@ -3779,7 +5707,9 @@
       "display_name": "DeepSeek V3.2 (agentic + affordable)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "deprecated",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "replacement": "openrouter/deepseek/deepseek-v4.1-flash"
       },
       "operations": [
         "chat"
@@ -4204,6 +6134,839 @@
       "default_level": "medium"
     },
     {
+      "id": "openrouter/anthropic/claude-opus-5.5",
+      "provider": "openrouter",
+      "api_model": "anthropic/claude-opus-5.5",
+      "display_name": "Claude Opus 5.5",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/anthropic/claude-sonnet-5.5",
+      "provider": "openrouter",
+      "api_model": "anthropic/claude-sonnet-5.5",
+      "display_name": "Claude Sonnet 5.5",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/anthropic/claude-haiku-5.5",
+      "provider": "openrouter",
+      "api_model": "anthropic/claude-haiku-5.5",
+      "display_name": "Claude Haiku 5.5",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/anthropic/claude-fable-5.1",
+      "provider": "openrouter",
+      "api_model": "anthropic/claude-fable-5.1",
+      "display_name": "Claude Fable 5.1",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/openai/gpt-6-astra",
+      "provider": "openrouter",
+      "api_model": "openai/gpt-6-astra",
+      "display_name": "GPT-6 Astra",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/openai/gpt-6.1-sol",
+      "provider": "openrouter",
+      "api_model": "openai/gpt-6.1-sol",
+      "display_name": "GPT-6.1 Sol",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/openai/gpt-6.1-terra",
+      "provider": "openrouter",
+      "api_model": "openai/gpt-6.1-terra",
+      "display_name": "GPT-6.1 Terra",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/openai/gpt-6-luna",
+      "provider": "openrouter",
+      "api_model": "openai/gpt-6-luna",
+      "display_name": "GPT-6 Luna",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/openai/gpt-5.6-sol",
+      "provider": "openrouter",
+      "api_model": "openai/gpt-5.6-sol",
+      "display_name": "GPT-5.6 Sol",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/openai/gpt-5.6-terra",
+      "provider": "openrouter",
+      "api_model": "openai/gpt-5.6-terra",
+      "display_name": "GPT-5.6 Terra",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/openai/gpt-5.6-luna",
+      "provider": "openrouter",
+      "api_model": "openai/gpt-5.6-luna",
+      "display_name": "GPT-5.6 Luna",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "temperature": {
+          "kind": "unsupported"
+        },
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        "verbosity": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        "max_output_tokens": {
+          "kind": "range",
+          "min": 1,
+          "max": 128000
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low",
+          "verbosity": "low"
+        },
+        "medium": {
+          "reasoning_effort": "medium"
+        },
+        "high": {
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/google/gemini-4-argon",
+      "provider": "openrouter",
+      "api_model": "google/gemini-4-argon",
+      "display_name": "Gemini 4 Argon",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/google/gemini-3.8-flash",
+      "provider": "openrouter",
+      "api_model": "google/gemini-3.8-flash",
+      "display_name": "Gemini 3.8 Flash",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 65536
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/moonshotai/kimi-k3.1-pro",
+      "provider": "openrouter",
+      "api_model": "moonshotai/kimi-k3.1-pro",
+      "display_name": "Kimi K3.1 Pro",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/moonshotai/kimi-k3",
+      "provider": "openrouter",
+      "api_model": "moonshotai/kimi-k3",
+      "display_name": "Kimi K3",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium"
+    },
+    {
+      "id": "openrouter/deepseek/deepseek-v4.1-flash",
+      "provider": "openrouter",
+      "api_model": "deepseek/deepseek-v4.1-flash",
+      "display_name": "DeepSeek V4.1 Flash",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 384000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.045,
+        "output": 0.5,
+        "cache_write": 0,
+        "cache_read": 0
+      }
+    },
+    {
+      "id": "openrouter/deepseek/deepseek-v4-pro",
+      "provider": "openrouter",
+      "api_model": "deepseek/deepseek-v4-pro",
+      "display_name": "DeepSeek V4 Pro",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.6,
+        "output": 3.2,
+        "cache_write": 0,
+        "cache_read": 0
+      }
+    },
+    {
+      "id": "openrouter/minimax/minimax-m3",
+      "provider": "openrouter",
+      "api_model": "minimax/minimax-m3",
+      "display_name": "MiniMax M3",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.3,
+        "output": 1.2,
+        "cache_write": 0,
+        "cache_read": 0
+      }
+    },
+    {
+      "id": "openrouter/minimax/minimax-m3.1-flash",
+      "provider": "openrouter",
+      "api_model": "minimax/minimax-m3.1-flash",
+      "display_name": "MiniMax M3.1 Flash",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.15,
+        "output": 0.6,
+        "cache_write": 0,
+        "cache_read": 0
+      }
+    },
+    {
       "id": "perplexity/sonar",
       "provider": "perplexity",
       "api_model": "sonar",
@@ -4402,14 +7165,32 @@
         "vision_input": false,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1000000
+      },
       "parameters": {},
       "levels": {
         "low": {},
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.25,
+        "output": 1.5,
+        "cache_write": 0,
+        "cache_read": 0.025,
+        "tiers": [
+          {
+            "above_input_tokens": 256000,
+            "input": 1,
+            "output": 4,
+            "cache_write": 0,
+            "cache_read": 0.1
+          }
+        ]
+      }
     },
     {
       "id": "qwen/qwen3.7-max",
@@ -4428,14 +7209,23 @@
         "vision_input": false,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1000000
+      },
       "parameters": {},
       "levels": {
         "low": {},
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 2.5,
+        "output": 7.5,
+        "cache_write": 0,
+        "cache_read": 0.25
+      }
     },
     {
       "id": "qwen/qwen3.7-plus",
@@ -4454,14 +7244,102 @@
         "vision_input": false,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1000000
+      },
       "parameters": {},
       "levels": {
         "low": {},
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.4,
+        "output": 1.6,
+        "cache_write": 0,
+        "cache_read": 0.04,
+        "tiers": [
+          {
+            "above_input_tokens": 256000,
+            "input": 1.2,
+            "output": 4.8,
+            "cache_write": 0,
+            "cache_read": 0.12
+          }
+        ]
+      }
+    },
+    {
+      "id": "qwen/qwen3.8-max",
+      "provider": "qwen",
+      "api_model": "qwen3.8-max",
+      "display_name": "Qwen 3.8 Max",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 2,
+        "output": 6,
+        "cache_write": 0,
+        "cache_read": 0.2
+      }
+    },
+    {
+      "id": "qwen/qwen3.8-flash",
+      "provider": "qwen",
+      "api_model": "qwen3.8-flash",
+      "display_name": "Qwen 3.8 Flash",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.15,
+        "output": 0.47,
+        "cache_write": 0,
+        "cache_read": 0.015
+      }
     },
     {
       "id": "together-ai/deepseek-ai/DeepSeek-V3.1",
@@ -4681,7 +7559,7 @@
         "status": "retired",
         "deprecated_at": "2026-10-16T00:00:00Z",
         "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "xai/grok-4.20"
+        "replacement": "xai/grok-4.20-0309-reasoning"
       },
       "operations": [
         "chat"
@@ -4719,7 +7597,10 @@
       "display_name": "Grok 4 (max quality)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "retired",
+        "retire_at": "2026-10-31T00:00:00Z",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "replacement": "xai/grok-4.20-0309-reasoning"
       },
       "operations": [
         "chat"
@@ -4739,11 +7620,13 @@
       "default_level": "medium"
     },
     {
-      "id": "xai/grok-4.20",
+      "id": "xai/grok-4.20-0309-reasoning",
       "provider": "xai",
-      "api_model": "grok-4.20",
-      "display_name": "Grok 4.20 (recommended reasoning alias)",
-      "aliases": [],
+      "api_model": "grok-4.20-0309-reasoning",
+      "display_name": "Grok 4.20 Reasoning",
+      "aliases": [
+        "grok-4.20"
+      ],
       "lifecycle": {
         "status": "active"
       },
@@ -4755,21 +7638,41 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1000000
+      },
       "parameters": {},
       "levels": {
         "low": {},
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.25,
+        "output": 2.5,
+        "cache_write": 0,
+        "cache_read": 0.2,
+        "tiers": [
+          {
+            "above_input_tokens": 200000,
+            "input": 2.5,
+            "output": 5,
+            "cache_write": 0,
+            "cache_read": 0.4
+          }
+        ]
+      }
     },
     {
-      "id": "xai/grok-4.20-non-reasoning-latest",
+      "id": "xai/grok-4.20-0309-non-reasoning",
       "provider": "xai",
-      "api_model": "grok-4.20-non-reasoning-latest",
-      "display_name": "Grok 4.20 Non-Reasoning (low latency)",
-      "aliases": [],
+      "api_model": "grok-4.20-0309-non-reasoning",
+      "display_name": "Grok 4.20 Non-Reasoning",
+      "aliases": [
+        "grok-4.20-non-reasoning-latest"
+      ],
       "lifecycle": {
         "status": "active"
       },
@@ -4781,14 +7684,32 @@
         "vision_input": true,
         "streaming": true
       },
-      "limits": {},
+      "limits": {
+        "context_window": 1000000
+      },
       "parameters": {},
       "levels": {
         "low": {},
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.25,
+        "output": 2.5,
+        "cache_write": 0,
+        "cache_read": 0.2,
+        "tiers": [
+          {
+            "above_input_tokens": 200000,
+            "input": 2.5,
+            "output": 5,
+            "cache_write": 0,
+            "cache_read": 0.4
+          }
+        ]
+      }
     },
     {
       "id": "xai/grok-code-fast-1",
@@ -4797,7 +7718,9 @@
       "display_name": "Grok Code Fast 1 (coding specialist)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "deprecated",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "replacement": "xai/grok-build-0.1"
       },
       "operations": [
         "chat"
@@ -4815,6 +7738,272 @@
         "high": {}
       },
       "default_level": "medium"
+    },
+    {
+      "id": "xai/grok-4.7",
+      "provider": "xai",
+      "api_model": "grok-4.7",
+      "display_name": "Grok 4.7",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 500000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 2,
+        "output": 6,
+        "cache_write": 0,
+        "cache_read": 0.5,
+        "tiers": [
+          {
+            "above_input_tokens": 200000,
+            "input": 4,
+            "output": 12,
+            "cache_write": 0,
+            "cache_read": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "xai/grok-4.6",
+      "provider": "xai",
+      "api_model": "grok-4.6",
+      "display_name": "Grok 4.6",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 500000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 2,
+        "output": 6,
+        "cache_write": 0,
+        "cache_read": 0.5,
+        "tiers": [
+          {
+            "above_input_tokens": 200000,
+            "input": 4,
+            "output": 12,
+            "cache_write": 0,
+            "cache_read": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "xai/grok-4.5",
+      "provider": "xai",
+      "api_model": "grok-4.5",
+      "display_name": "Grok 4.5",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 500000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 2,
+        "output": 6,
+        "cache_write": 0,
+        "cache_read": 0.3,
+        "tiers": [
+          {
+            "above_input_tokens": 200000,
+            "input": 4,
+            "output": 12,
+            "cache_write": 0,
+            "cache_read": 0.6
+          }
+        ]
+      }
+    },
+    {
+      "id": "xai/grok-4.3",
+      "provider": "xai",
+      "api_model": "grok-4.3",
+      "display_name": "Grok 4.3",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.25,
+        "output": 2.5,
+        "cache_write": 0,
+        "cache_read": 0.2,
+        "tiers": [
+          {
+            "above_input_tokens": 200000,
+            "input": 2.5,
+            "output": 5,
+            "cache_write": 0,
+            "cache_read": 0.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "xai/grok-4.20-multi-agent-0309",
+      "provider": "xai",
+      "api_model": "grok-4.20-multi-agent-0309",
+      "display_name": "Grok 4.20 Multi-Agent",
+      "aliases": [
+        "grok-4.20-multi-agent"
+      ],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1000000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.25,
+        "output": 2.5,
+        "cache_write": 0,
+        "cache_read": 0.2,
+        "tiers": [
+          {
+            "above_input_tokens": 200000,
+            "input": 2.5,
+            "output": 5,
+            "cache_write": 0,
+            "cache_read": 0.4
+          }
+        ]
+      }
+    },
+    {
+      "id": "xai/grok-build-0.1",
+      "provider": "xai",
+      "api_model": "grok-build-0.1",
+      "display_name": "Grok Build 0.1",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 256000
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1,
+        "output": 2,
+        "cache_write": 0,
+        "cache_read": 0.2,
+        "tiers": [
+          {
+            "above_input_tokens": 200000,
+            "input": 2,
+            "output": 4,
+            "cache_write": 0,
+            "cache_read": 0.4
+          }
+        ]
+      }
     },
     {
       "id": "zai/glm-4.5-air",
@@ -4840,7 +8029,14 @@
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.2,
+        "output": 1.1,
+        "cache_write": 0,
+        "cache_read": 0.03
+      }
     },
     {
       "id": "zai/glm-4.7",
@@ -4866,7 +8062,14 @@
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.6,
+        "output": 2.2,
+        "cache_write": 0,
+        "cache_read": 0.11
+      }
     },
     {
       "id": "zai/glm-5",
@@ -4892,7 +8095,206 @@
         "medium": {},
         "high": {}
       },
-      "default_level": "medium"
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1,
+        "output": 3.2,
+        "cache_write": 0,
+        "cache_read": 0.2
+      }
+    },
+    {
+      "id": "zai/glm-5.3",
+      "provider": "zai",
+      "api_model": "glm-5.3",
+      "display_name": "GLM-5.3",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576,
+        "max_output_tokens": 128000
+      },
+      "parameters": {
+        "reasoning_effort": {
+          "kind": "levels",
+          "levels": [
+            "low",
+            "high",
+            "max"
+          ],
+          "default": "max"
+        }
+      },
+      "levels": {
+        "low": {
+          "reasoning_effort": "low"
+        },
+        "medium": {
+          "reasoning_effort": "high"
+        },
+        "high": {
+          "reasoning_effort": "max"
+        }
+      },
+      "default_level": "high",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.4,
+        "output": 4.4,
+        "cache_write": 0,
+        "cache_read": 0.26
+      }
+    },
+    {
+      "id": "zai/glm-5.3-flash",
+      "provider": "zai",
+      "api_model": "glm-5.3-flash",
+      "display_name": "GLM-5.3 Flash",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": true,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.15,
+        "output": 0.5,
+        "cache_write": 0,
+        "cache_read": 0.03
+      }
+    },
+    {
+      "id": "zai/glm-5.3-flashx",
+      "provider": "zai",
+      "api_model": "glm-5.3-flashx",
+      "display_name": "GLM-5.3 FlashX",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 0.37,
+        "output": 1.25,
+        "cache_write": 0,
+        "cache_read": 0.075
+      }
+    },
+    {
+      "id": "zai/glm-5.2",
+      "provider": "zai",
+      "api_model": "glm-5.2",
+      "display_name": "GLM-5.2",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 1048576
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.4,
+        "output": 4.4,
+        "cache_write": 0,
+        "cache_read": 0.26
+      }
+    },
+    {
+      "id": "zai/glm-5.1",
+      "provider": "zai",
+      "api_model": "glm-5.1",
+      "display_name": "GLM-5.1",
+      "aliases": [],
+      "lifecycle": {
+        "status": "active"
+      },
+      "operations": [
+        "chat"
+      ],
+      "features": {
+        "native_tools": true,
+        "vision_input": false,
+        "streaming": true
+      },
+      "limits": {
+        "context_window": 204800
+      },
+      "parameters": {},
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {}
+      },
+      "default_level": "medium",
+      "pricing": {
+        "unit": "usd_per_1m_tokens",
+        "input": 1.4,
+        "output": 4.4,
+        "cache_write": 0,
+        "cache_read": 0.26
+      }
     },
     {
       "id": "ollama/deepseek-v3.1:cloud",

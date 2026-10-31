@@ -390,10 +390,10 @@ mod tests {
             warnings(&config)
                 .unwrap()
                 .iter()
-                .any(|note| note.contains("moonshot/kimi-k2.6"))
+                .any(|note| note.contains("moonshot/kimi-k3"))
         );
         let next = candidate(&config).unwrap();
-        assert_eq!(next.default_model.as_deref(), Some("kimi-k2.6"));
+        assert_eq!(next.default_model.as_deref(), Some("kimi-k3"));
         assert_eq!(next.default_provider, config.default_provider);
         assert_eq!(config.default_model.as_deref(), Some("kimi-k2.5"));
     }
@@ -497,14 +497,14 @@ level = "high"
             settings: Default::default(),
         });
         let next = candidate(&config).unwrap();
-        assert_eq!(next.default_model.as_deref(), Some("gpt-5.6"));
-        assert_eq!(next.model_routes.first().unwrap().model, "gpt-5.6");
+        assert_eq!(next.default_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(next.model_routes.first().unwrap().model, "gpt-5.6-sol");
         assert_eq!(
-            next.reliability.model_fallbacks.get("gpt-5.6").unwrap(),
+            next.reliability.model_fallbacks.get("gpt-5.6-sol").unwrap(),
             &vec!["prx-custom-fallback"]
         );
         assert_eq!(
-            next.model_settings.get("openai/gpt-5.6").unwrap(),
+            next.model_settings.get("openai/gpt-5.6-sol").unwrap(),
             config.model_settings.get("openai/gpt-4o").unwrap()
         );
         assert!(!next.model_settings.contains_key("openai/gpt-4o"));

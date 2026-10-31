@@ -7,14 +7,14 @@ use super::*;
 #[test]
 fn default_model_for_provider_uses_latest_defaults() {
     assert_eq!(default_model_for_provider("openrouter"), "anthropic/claude-sonnet-5");
-    assert_eq!(default_model_for_provider("openai"), "gpt-5.6");
+    assert_eq!(default_model_for_provider("openai"), "gpt-5.6-sol");
     assert_eq!(default_model_for_provider("openai-codex"), "gpt-5.2-codex");
     assert_eq!(default_model_for_provider("anthropic"), "claude-sonnet-5");
     assert_eq!(default_model_for_provider("qwen"), "qwen3.7-plus");
     assert_eq!(default_model_for_provider("qwen-intl"), "qwen3.7-plus");
     assert_eq!(default_model_for_provider("qwen-code"), "qwen3-coder-plus");
     assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
-    assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.5");
+    assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M3");
     assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
     assert_eq!(default_model_for_provider("gemini"), "gemini-3.5-flash");
     assert_eq!(default_model_for_provider("google"), "gemini-3.5-flash");
@@ -22,7 +22,7 @@ fn default_model_for_provider_uses_latest_defaults() {
     assert_eq!(default_model_for_provider("bedrock"), "anthropic.claude-sonnet-5");
     assert_eq!(default_model_for_provider("google-gemini"), "gemini-3.5-flash");
     assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
-    assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.6");
+    assert_eq!(default_model_for_provider("moonshot"), "kimi-k3");
     assert_eq!(default_model_for_provider("nvidia"), "meta/llama-3.3-70b-instruct");
     assert_eq!(default_model_for_provider("nvidia-nim"), "meta/llama-3.3-70b-instruct");
     assert_eq!(default_model_for_provider("llamacpp"), "ggml-org/gpt-oss-20b-GGUF");
@@ -153,7 +153,10 @@ fn catalog_models_for_kimi_code_include_official_agent_model() {
         vec![
             "k3".to_string(),
             "kimi-for-coding-highspeed".to_string(),
-            "kimi-for-coding".to_string()
+            "kimi-for-coding".to_string(),
+            "k3.1-pro".to_string(),
+            "k3.1-pro-highspeed".to_string(),
+            "k3-256k".to_string()
         ]
     );
 }
@@ -373,10 +376,10 @@ fn catalog_provider_aliases_share_the_same_release_rows() {
 fn catalog_and_live_options_preselect_the_release_default() {
     for (provider, expected) in [
         ("anthropic", "claude-sonnet-5"),
-        ("openai", "gpt-5.6"),
+        ("openai", "gpt-5.6-sol"),
         ("gemini", "gemini-3.5-flash"),
-        ("xai", "grok-4.20"),
-        ("mistral", "mistral-large-latest"),
+        ("xai", "grok-4.20-0309-reasoning"),
+        ("mistral", "mistral-medium-latest"),
         ("ollama", "llama3.2"),
     ] {
         let catalog = catalog_models_for_provider(provider);
@@ -428,9 +431,7 @@ fn onboarding_labels_catalog_rows_that_have_no_billing_tariff() {
         ("openrouter", "google/gemini-3.5-flash"),
         ("openrouter", "meta-llama/llama-4-maverick"),
         ("openrouter", "openai/gpt-5-mini"),
-        ("openrouter", "x-ai/grok-4.20"),
         ("gemini", "gemini-3.5-flash"),
-        ("xai", "grok-4.20"),
     ] {
         let option = catalog_models_for_provider(provider)
             .into_iter()
@@ -439,7 +440,7 @@ fn onboarding_labels_catalog_rows_that_have_no_billing_tariff() {
         assert!(option.1.contains("pricing unavailable"), "{}: {}", option.0, option.1);
     }
 
-    for model in ["anthropic/claude-sonnet-5", "openai/gpt-5.6"] {
+    for model in ["anthropic/claude-sonnet-5", "openai/gpt-5.6", "x-ai/grok-4.20"] {
         let option = catalog_models_for_provider("openrouter")
             .into_iter()
             .find(|(id, _)| id == model)
