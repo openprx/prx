@@ -340,7 +340,7 @@ mod tests {
                 policy,
             )
             .expect_err("test: retired selection refused");
-            assert!(error.to_string().contains("openai/gpt-5.6"));
+            assert!(error.to_string().contains("openai/gpt-5.6-sol"));
         }
         assert!(
             crate::providers::catalog::resolver::resolve_model(
@@ -422,7 +422,7 @@ mod tests {
             next.reliability.model_fallbacks.get("claude-sonnet-5").unwrap(),
             &vec!["claude-opus-4-8"]
         );
-        assert_eq!(next.default_model, config.default_model);
+        assert_eq!(next.default_model.as_deref(), Some("gpt-5.6-sol"));
         config.reliability.fallback_providers.push("openai".into());
         assert!(
             candidate(&config)

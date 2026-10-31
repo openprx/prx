@@ -2386,13 +2386,13 @@ mod tests {
         );
         let (result, text) = run_cli(&["models", "migrate-retired"], config.clone(), "", &[]).await;
         result.unwrap();
-        assert!(text.contains("gpt-5.6"), "{text}");
+        assert!(text.contains("gpt-5.6-sol"), "{text}");
         assert_eq!(stored(&dir), before);
         let (result, text) = run_cli(&["models", "migrate-retired", "--yes"], config, "", &[]).await;
         result.unwrap();
         assert!(text.contains("history record"), "{text}");
         assert_ne!(stored(&dir), before);
-        assert!(String::from_utf8(stored(&dir)).unwrap().contains("gpt-5.6"));
+        assert!(String::from_utf8(stored(&dir)).unwrap().contains("gpt-5.6-sol"));
     }
 
     /// D-085 F-6: `prx models list --operation` and `prx models show` print

@@ -645,7 +645,10 @@ async fn retired_model_load_keeps_selection_and_logs_published_replacement() {
     std::fs::write(&path, "default_temperature = 0.7\ndefault_provider = \"openai\"\ndefault_model = \"gpt-4o\"\n[auth]\ncodex_auth_json_auto_import = false\n").unwrap();
     let (config, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
     assert_eq!(config.unwrap().default_model.as_deref(), Some("gpt-4o"));
-    assert!(logs.contains("retired") && logs.contains("openai/gpt-5.6"), "{logs}");
+    assert!(
+        logs.contains("retired") && logs.contains("openai/gpt-5.6-sol"),
+        "{logs}"
+    );
 }
 
 /// INT-2B AUDIT-SIGN (D-056 DC-2), RED before: `security.audit.sign_events`
