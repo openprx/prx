@@ -305,22 +305,7 @@ impl FrozenSuite {
     pub(crate) fn lesson_root_digests(&self) -> Vec<String> {
         let mut roots = BTreeSet::new();
         for case in &self.suite.cases {
-            let prompt = normalized_prompt(&case.prompt);
-            let mut task = Sha256::new();
-            task.update(b"prx-lesson-task-root-v1\0");
-            task.update(prompt.as_bytes());
-            roots.insert(hex::encode(task.finalize()));
-            for fixture in &case.fixtures {
-                let mut source = Sha256::new();
-                source.update(b"prx-lesson-task-fixture-source-root-v1\0");
-                // A common/empty fixture is not an identity shared by every
-                // real task. Bind its source bytes to the actual task content.
-                source.update(u64::try_from(prompt.len()).unwrap_or(u64::MAX).to_be_bytes());
-                source.update(prompt.as_bytes());
-                source.update(u64::try_from(fixture.content.len()).unwrap_or(u64::MAX).to_be_bytes());
-                source.update(fixture.content.as_bytes());
-                roots.insert(hex::encode(source.finalize()));
-            }
+            roots.extend(case_lesson_root_digests(case));
         }
         roots.into_iter().collect()
     }
@@ -333,6 +318,27 @@ impl FrozenSuite {
             EvalSplit::Holdout => Some(self.suite.holdout_attempts),
         }
     }
+}
+
+/// Exactly the original case/split-independent source normalization, shared by
+/// study exclusion checks and adopted-guidance suite roots.
+pub(super) fn case_lesson_root_digests(case: &EvalCase) -> Vec<String> {
+    let mut roots = BTreeSet::new();
+    let prompt = normalized_prompt(&case.prompt);
+    let mut task = Sha256::new();
+    task.update(b"prx-lesson-task-root-v1\0");
+    task.update(prompt.as_bytes());
+    roots.insert(hex::encode(task.finalize()));
+    for fixture in &case.fixtures {
+        let mut source = Sha256::new();
+        source.update(b"prx-lesson-task-fixture-source-root-v1\0");
+        source.update(u64::try_from(prompt.len()).unwrap_or(u64::MAX).to_be_bytes());
+        source.update(prompt.as_bytes());
+        source.update(u64::try_from(fixture.content.len()).unwrap_or(u64::MAX).to_be_bytes());
+        source.update(fixture.content.as_bytes());
+        roots.insert(hex::encode(source.finalize()));
+    }
+    roots.into_iter().collect()
 }
 
 fn invalid(reason: impl Into<String>) -> EvaluationError {

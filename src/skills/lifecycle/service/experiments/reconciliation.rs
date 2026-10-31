@@ -6,12 +6,31 @@ impl SkillsLifecycleService {
         journal: &ExperimentJournal,
         config: &Config,
     ) -> Result<serde_json::Value> {
+        self.observe_experiment_physical(journal, config, |scope| {
+            crate::cost::tracker::CostTracker::for_workspace(config.cost.clone(), &config.workspace_dir)?
+                .physical_scope_usage(scope)
+        })
+    }
+    pub(in crate::skills::lifecycle) fn experiment_physical_observations_read_only(
+        &self,
+        journal: &ExperimentJournal,
+        config: &Config,
+    ) -> Result<serde_json::Value> {
+        self.observe_experiment_physical(journal, config, |scope| {
+            crate::cost::tracker::CostTracker::physical_scope_usage_read_only(&config.workspace_dir, scope)
+        })
+    }
+    fn observe_experiment_physical(
+        &self,
+        journal: &ExperimentJournal,
+        config: &Config,
+        read: impl Fn(&str) -> Result<crate::cost::reservation::ScopeUsage>,
+    ) -> Result<serde_json::Value> {
         ensure!(
             journal.plan.spec().owner_scope == *self.owner_scope(),
             "experiment owner mismatch"
         );
         let key = crate::decision::DecisionKey::load_existing(&config.workspace_dir)?;
-        let tracker = crate::cost::tracker::CostTracker::for_workspace(config.cost.clone(), &config.workspace_dir)?;
         let mut stages = serde_json::Map::new();
         for stage in &journal.plan.spec().stages {
             let scope = hex::encode(ExperimentStageRuntime::physical_identity(
@@ -19,7 +38,7 @@ impl SkillsLifecycleService {
                 journal.plan.digest(),
                 &stage.id,
             ));
-            let physical = tracker.physical_scope_usage(&scope)?;
+            let physical = read(&scope)?;
             let needs_reconciliation = matches!(
                 journal.state.stages.get(&stage.id),
                 Some(StageState::Dispatched | StageState::DispatchUnknown)

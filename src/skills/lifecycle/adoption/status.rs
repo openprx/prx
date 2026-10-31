@@ -6,6 +6,64 @@ use crate::skills::lifecycle::{LifecycleError, SkillLifecycleStore};
 use std::time::Duration;
 
 impl SkillLifecycleStore {
+    /// Read historical source exclusions for a frozen optimizer pool. This does
+    /// not re-query lessons, test present eligibility or construct guidance.
+    /// Both source exclusions and parent experiment pins from the same bounded
+    /// authenticated reads; callers must still verify each historical root.
+    pub(in crate::skills::lifecycle) fn study_snapshot_provenance(
+        &self,
+        snapshot: &super::context::LessonSnapshot,
+    ) -> Result<(Vec<String>, Vec<(String, String)>), LifecycleError> {
+        let mut budget = super::lookup::LookupBudget::new(snapshot.limits)?;
+        let root_cap =
+            crate::skills::lifecycle::suite::MAX_SUITE_CASES * (crate::skills::lifecycle::suite::MAX_CASE_FIXTURES + 1);
+        if snapshot.schema_version != 1
+            || snapshot.owner_scope != *self.owner_scope()
+            || snapshot.entries.len() > usize::try_from(snapshot.limits.lessons).unwrap_or(usize::MAX)
+            || snapshot.exclusions.len() > root_cap
+            || snapshot
+                .exclusions
+                .iter()
+                .any(|root| !super::record::valid_digest(root))
+            || snapshot.exclusions.windows(2).any(|pair| pair.first() >= pair.get(1))
+        {
+            return Err(refusal("study lesson snapshot owner or source bounds differ"));
+        }
+        let _store = self.lock_store(true, Duration::from_millis(snapshot.limits.elapsed_ms))?;
+        let mut roots: std::collections::BTreeSet<_> = snapshot.exclusions.iter().cloned().collect();
+        let mut experiments = std::collections::BTreeSet::new();
+        for entry in &snapshot.entries {
+            budget.examine()?;
+            let path = self.adoption_record_path(&entry.reference.adoption_id)?;
+            let bytes = read_bounded_bytes(&path, snapshot.limits.record_bytes.min(RECORD_CAP))?;
+            budget.charge(u64::try_from(bytes.len()).map_err(|_| refusal("source record size overflow"))?)?;
+            let record = self.decode_adoption(&bytes, &entry.reference)?;
+            let barrier = read_bounded_bytes(&self.adoption_retention_barrier_path(&record)?, RECORD_CAP)?;
+            budget.charge(u64::try_from(barrier.len()).map_err(|_| refusal("source barrier size overflow"))?)?;
+            self.check_adoption_retention_barrier(&record, &barrier)?;
+            if record.task_family != snapshot.task_family
+                || record.evidence_pin_sha256 != entry.evidence_pin_sha256
+                || record.excluded_roots.len() > root_cap
+                || record
+                    .excluded_roots
+                    .iter()
+                    .any(|root| !super::record::valid_digest(root))
+            {
+                return Err(refusal(
+                    "study lesson source differs from authenticated adopted history",
+                ));
+            }
+            crate::skills::lifecycle::experiment::ExperimentId::parse(&record.experiment_id)
+                .map_err(|error| refusal(&error.to_string()))?;
+            if !super::record::valid_digest(&record.experiment_sha256) {
+                return Err(refusal("historical adoption source experiment digest is invalid"));
+            }
+            experiments.insert((record.experiment_id, record.experiment_sha256));
+            roots.extend(record.excluded_roots);
+        }
+        budget.check()?;
+        Ok((roots.into_iter().collect(), experiments.into_iter().collect()))
+    }
     /// Inspect only the finite families of the immutable origin suite. One
     /// shared-store -> skill lock protects existing sealed indices and records;
     /// no directory scan, new registry, proof construction or status mutation.

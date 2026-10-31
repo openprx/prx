@@ -35,6 +35,8 @@ mod evaluate;
 mod evaluator;
 mod executable;
 pub mod experiment;
+pub mod study;
+pub use study::{StudyArm, StudyDraft, StudyPlan, StudyReport, StudyStatus, StudyTrialInput};
 mod facts;
 mod gate;
 mod gate_judge;

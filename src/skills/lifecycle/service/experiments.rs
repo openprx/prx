@@ -12,6 +12,7 @@ mod probes;
 mod reconciliation;
 mod runner;
 mod selection;
+mod study;
 use super::SkillsLifecycleService;
 use crate::config::Config;
 use crate::runtime::{
@@ -53,6 +54,7 @@ impl SkillsLifecycleService {
             .map(|stage| (stage.id.clone(), stage.operation.clone()))
             .collect();
         let spec = ExperimentSpec {
+            controlled_admission: None,
             schema_version: crate::skills::lifecycle::experiment::EXPERIMENT_SCHEMA_VERSION,
             id: draft.id,
             owner_scope: self.owner_scope().clone(),
@@ -76,8 +78,10 @@ impl SkillsLifecycleService {
                 })
                 .collect::<Result<Vec<_>>>()?,
         };
+        let spec = self.store.freeze_experiment_admission(spec, config)?.spec().clone();
         let plan = crate::skills::lifecycle::experiment::InstructionExperimentPlan { spec, operations };
         plan.validate()?;
+        self.validate_study_instruction_plan(&plan, config)?;
         Ok(plan.spec.freeze()?)
     }
     /// Resolves actual owner/baseline/suite/model/runtime pins without a model
@@ -97,8 +101,14 @@ impl SkillsLifecycleService {
     pub(crate) fn admit_experiment(&self, spec: ExperimentSpec, config: &Config) -> Result<ExperimentJournal> {
         self.require_evaluation("admitting an instruction experiment")?;
         let plan = spec.freeze()?;
+        self.validate_study_spec(plan.spec(), config)?;
         self.check_experiment_pins(&plan, config)?;
-        Ok(self.store.admit_experiment(&plan, Utc::now())?)
+        let continuation = self.controlled_experiment_continuation(&plan, config)?;
+        let admit = || self.store.admit_experiment(&plan, Utc::now());
+        Ok(match continuation {
+            Some(continuation) => continuation.sync_scope(admit),
+            None => admit(),
+        }?)
     }
     pub(crate) fn inspect_experiment(&self, id: &ExperimentId, digest: &str) -> Result<ExperimentJournal> {
         self.require_enabled()?;
@@ -201,6 +211,21 @@ impl SkillsLifecycleService {
         self.check_lesson_pins(plan)?;
         Ok(())
     }
+    fn controlled_experiment_continuation(
+        &self,
+        plan: &FrozenExperiment,
+        config: &Config,
+    ) -> Result<Option<crate::runtime::h2_entry::RunContinuation>> {
+        self.store.verify_experiment_admission(plan)?;
+        match (
+            plan.spec().controlled_admission.as_ref(),
+            crate::runtime::h2_entry::current_run_continuation(),
+        ) {
+            (None, None) => Ok(None),
+            (Some(envelope), Some(current)) => Ok(Some(current.for_admitted_plan(plan, &envelope.pin, config)?)),
+            _ => anyhow::bail!("controlled experiment requires its original live source; no legacy fallback"),
+        }
+    }
     /// Recovery never dispatches work. Dispatched stages become unknown, and
     /// never-dispatched reservations can be cleaned up without consuming spend.
     pub(crate) fn recover_experiment(&self, id: &ExperimentId, digest: &str) -> Result<ExperimentJournal> {
@@ -238,6 +263,8 @@ impl SkillsLifecycleService {
         operation: ExperimentOperation,
         cancel: &CancellationToken,
     ) -> Result<ExperimentJournal> {
+        let admitted = self.inspect_experiment(&id, &digest)?;
+        let continuation = self.controlled_experiment_continuation(&admitted.plan, config)?;
         let owner = current_tracker().context("experiment stage has no cleanup owner")?;
         let child = cancel.child_token();
         let _cancel_on_drop = child.clone().drop_guard();
@@ -245,9 +272,11 @@ impl SkillsLifecycleService {
         let service = Arc::clone(self);
         let config = config.clone();
         tokio::spawn(async move {
-            let outcome = owner
-                .scope(service.run_experiment_stage_owned(config, id, digest, stage, operation, child))
-                .await;
+            let outcome = crate::runtime::h2_entry::retain_run_continuation(
+                continuation,
+                owner.scope(service.run_experiment_stage_owned(config, id, digest, stage, operation, child)),
+            )
+            .await;
             ticket.finish(
                 !outcome
                     .as_ref()
@@ -268,6 +297,8 @@ impl SkillsLifecycleService {
         cancel: CancellationToken,
     ) -> Result<ExperimentJournal> {
         let mut journal = self.inspect_experiment(&id, &digest)?;
+        self.controlled_experiment_continuation(&journal.plan, &config)?;
+        self.validate_study_spec(journal.plan.spec(), &config)?;
         self.check_experiment_pins(&journal.plan, &config)?;
         ensure!(
             matches!(journal.state.stages.get(&stage), Some(StageState::Planned)),

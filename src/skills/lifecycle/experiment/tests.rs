@@ -17,6 +17,7 @@ pub(crate) fn specification() -> ExperimentSpec {
         scratch_bytes: 65536,
     };
     ExperimentSpec {
+        controlled_admission: None,
         schema_version: EXPERIMENT_SCHEMA_VERSION,
         id: ExperimentId::parse("prx-experiment").unwrap(),
         owner_scope: OwnerScope::new("owner:prx:terminal:local-user").unwrap(),

@@ -59,6 +59,7 @@ impl SkillLifecycleStore {
         plan.ensure_live(now)?;
         let _store_lock = self.lock_store(true, LOCK_TIMEOUT)?;
         let _skill_lock = self.lock_skill(&plan.spec().pins.skill_id, LOCK_TIMEOUT)?;
+        self.require_live_experiment_admission(plan)?;
         let parent = self.root().join("experiments");
         ensure_dir_synced(self.root(), &parent)?;
         let directory = self.experiment_dir(&plan.spec().id);
@@ -68,7 +69,9 @@ impl SkillLifecycleStore {
             Ok(_) => {
                 check_private(&path)?;
                 let stored: ExperimentSpec = read_record(&path)?;
-                if stored.freeze()?.digest() != plan.digest() {
+                let stored = stored.freeze()?;
+                self.verify_experiment_admission(&stored)?;
+                if stored.digest() != plan.digest() {
                     return Err(ExperimentError::Conflict);
                 }
             }
@@ -94,6 +97,7 @@ impl SkillLifecycleStore {
         check_private(&path)?;
         let plan = read_record::<ExperimentSpec>(&path)?.freeze()?;
         self.check_owner_scope(&plan.spec().owner_scope)?;
+        self.verify_experiment_admission(&plan)?;
         if plan.spec().id != *id || plan.digest() != expected_digest {
             return Err(ExperimentError::Conflict);
         }

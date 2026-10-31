@@ -77,6 +77,45 @@ pub fn workspace_cost_report(workspace: &Path) -> Result<WorkspaceCostReport> {
     )
 }
 
+impl super::CostTracker {
+    /// Advisory historical projection over the existing original ledgers. No
+    /// tracker creation, migration, directory creation or writer lock occurs.
+    /// Missing/unstable state refuses rather than proving an unsent request.
+    pub(crate) fn physical_scope_usage_read_only(
+        workspace: &Path,
+        scope: &str,
+    ) -> Result<crate::cost::reservation::ScopeUsage> {
+        ensure!(
+            scope.len() == 64
+                && scope
+                    .bytes()
+                    .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) }),
+            "invalid physical scope identity"
+        );
+        let workspace = workspace.canonicalize().context("cost workspace cannot be resolved")?;
+        let ledger = super::read_state_ledger_bounded(&workspace, "costs.jsonl")?;
+        ensure!(
+            ledger.is_some() || !super::legacy_cost_ledger_present(&workspace)?,
+            "legacy cost state requires its original migration owner"
+        );
+        let journal = super::read_state_ledger_bounded(&workspace, crate::cost::reservation::JOURNAL)?;
+        ensure!(
+            ledger.is_some() && journal.is_some(),
+            "physical observation is unavailable; missing ledgers do not prove unsent work"
+        );
+        let reservations = crate::cost::reservation::Reservations::load(&workspace)?;
+        let previous = std::collections::BTreeSet::new();
+        let mut usage = reservations.scope_usage_since(scope, &previous)?;
+        usage.models = reservations.scope_models(&workspace, scope, &previous)?;
+        ensure!(
+            ledger == super::read_state_ledger_bounded(&workspace, "costs.jsonl")?
+                && journal == super::read_state_ledger_bounded(&workspace, crate::cost::reservation::JOURNAL)?,
+            "physical ledgers changed during observation; retry the snapshot"
+        );
+        Ok(usage)
+    }
+}
+
 fn summarize(
     ledger: &str,
     now: DateTime<Utc>,

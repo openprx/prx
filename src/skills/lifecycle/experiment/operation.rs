@@ -13,6 +13,9 @@ pub enum DevelopmentRole {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExperimentOperation {
+    StudyTrial {
+        input: crate::skills::lifecycle::study::StudyTrialInput,
+    },
     Proposal {
         patterns: Vec<PatternId>,
         max_input_bytes: usize,
@@ -77,6 +80,7 @@ impl ExperimentOperation {
     }
     pub const fn kind(&self) -> ExperimentStageKind {
         match self {
+            Self::StudyTrial { .. } => ExperimentStageKind::StudyTrial,
             Self::Proposal { .. } | Self::DevelopmentProposal { .. } => ExperimentStageKind::ModelProposal,
             Self::Evaluation { .. } | Self::DevelopmentProbe { .. } | Self::SelectedEvaluation { .. } => {
                 ExperimentStageKind::SolverTrial

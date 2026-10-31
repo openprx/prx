@@ -147,6 +147,7 @@ impl SkillsLifecycleService {
             .find(|value| value.id == stage)
             .context("unknown stage")?;
         match operation {
+            ExperimentOperation::StudyTrial { input } => self.validate_study_trial(journal, stage, input)?,
             ExperimentOperation::Proposal {
                 max_input_bytes,
                 max_output_bytes,
@@ -431,6 +432,10 @@ impl SkillsLifecycleService {
         runtime.ensure_active()?;
         runtime.watch()?;
         match operation {
+            ExperimentOperation::StudyTrial { input } => {
+                self.execute_study_trial(config, journal, stage, input, cancel).await
+            }
+
             ExperimentOperation::Proposal {
                 patterns,
                 max_input_bytes,

@@ -71,7 +71,7 @@ impl SkillsLifecycleService {
                 provenance: "no_exact_committed_publication_observed; absence_not_proved",
             },
         };
-        let physical_observations = match self.experiment_physical_observations(journal, config) {
+        let physical_observations = match self.experiment_physical_observations_read_only(journal, config) {
             Ok(value) => Some(value),
             Err(error) => {
                 issues.push(error.to_string());
@@ -92,25 +92,25 @@ impl SkillsLifecycleService {
                     "missing stage state",
                 )
             })?;
-            let (label, usage, cleanup_confirmed) = match state {
-                StageState::Planned => (ExperimentStageStatus::Planned, None, false),
+            let (label, successful, usage, cleanup_confirmed) = match state {
+                StageState::Planned => (ExperimentStageStatus::Planned, None, None, false),
                 StageState::Reserved => {
                     started = true;
                     active = true;
                     cleaned = false;
-                    (ExperimentStageStatus::Reserved, None, false)
+                    (ExperimentStageStatus::Reserved, None, None, false)
                 }
                 StageState::Dispatched => {
                     started = true;
                     active = true;
                     cleaned = false;
-                    (ExperimentStageStatus::Dispatched, None, false)
+                    (ExperimentStageStatus::Dispatched, None, None, false)
                 }
                 StageState::DispatchUnknown => {
                     started = true;
                     unknown = true;
                     cleaned = false;
-                    (ExperimentStageStatus::DispatchUnknown, None, false)
+                    (ExperimentStageStatus::DispatchUnknown, None, None, false)
                 }
                 StageState::Settled {
                     usage,
@@ -122,12 +122,18 @@ impl SkillsLifecycleService {
                     failed |= !successful;
                     cleaned &= *cleanup_confirmed;
                     settled_usage = settled_usage.checked_add(*usage)?;
-                    (ExperimentStageStatus::Settled, Some(*usage), *cleanup_confirmed)
+                    (
+                        ExperimentStageStatus::Settled,
+                        Some(*successful),
+                        Some(*usage),
+                        *cleanup_confirmed,
+                    )
                 }
             };
             stages.push(ExperimentStageObservation {
                 stage: declared.id.clone(),
                 state: label,
+                successful,
                 settled_usage: usage,
                 cleanup_confirmed,
                 allocation: declared.allocation,

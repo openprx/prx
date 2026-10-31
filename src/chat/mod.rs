@@ -110,7 +110,7 @@ pub use self::compaction::print_embedding_upgrade_notice_to_stderr;
 use self::compaction::{estimate_chat_history_tokens, format_compact_feedback};
 use self::input_queue::is_local_operator_input;
 pub(crate) use self::output::print_fallback_chat_output;
-pub use self::run::run;
+pub use self::run::{run, run_controlled};
 pub use self::terminal::TerminalGuard;
 pub use self::terminal::TracingChatGuard;
 pub use self::terminal::setup_chat_tracing_to_file;

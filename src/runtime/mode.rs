@@ -70,6 +70,8 @@ pub trait ModeRunner: Send {
 
 /// Interactive or single-shot chat session (graceful, ctrl_c-sensitive).
 pub struct ChatRunner {
+    pub h2_limits: Option<String>,
+    pub h2_authority_seconds: Option<u64>,
     pub config: Config,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -84,6 +86,29 @@ pub struct ChatRunner {
 impl ModeRunner for ChatRunner {
     async fn run(self: Box<Self>, shutdown: CancellationToken) -> Result<()> {
         let me = *self;
+        match (me.h2_limits, me.h2_authority_seconds) {
+            (Some(limits), Some(seconds)) => {
+                anyhow::ensure!(
+                    !me.plain && !me.list_sessions && me.provider.is_none() && me.model.is_none(),
+                    "controlled H2 chat requires the configured fullscreen runtime"
+                );
+                let temperature = me.config.default_temperature;
+                return chat::run_controlled(
+                    me.config,
+                    None,
+                    None,
+                    temperature,
+                    false,
+                    me.session.or_else(|| me.continue_last.then(|| "last".to_string())),
+                    shutdown,
+                    limits,
+                    seconds,
+                )
+                .await;
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("controlled H2 chat requires both explicit ceilings and authority lifetime"),
+        }
         chat::run(
             me.config,
             me.provider,
@@ -119,6 +144,9 @@ impl ModeRunner for AgentRunner {
 
 /// HTTP gateway server (graceful drain on shutdown).
 pub struct GatewayRunner {
+    pub h2_principal: Option<String>,
+    pub h2_limits: Option<String>,
+    pub h2_authority_seconds: Option<u64>,
     pub host: String,
     pub port: u16,
     pub config: Config,
@@ -128,6 +156,16 @@ pub struct GatewayRunner {
 impl ModeRunner for GatewayRunner {
     async fn run(self: Box<Self>, shutdown: CancellationToken) -> Result<()> {
         let me = *self;
+        match (me.h2_principal, me.h2_limits, me.h2_authority_seconds) {
+            (Some(principal), Some(limits), Some(seconds)) => {
+                return gateway::run_gateway_controlled(
+                    &me.host, me.port, me.config, shutdown, principal, limits, seconds,
+                )
+                .await;
+            }
+            (None, None, None) => {}
+            _ => anyhow::bail!("controlled H2 gateway requires principal, ceilings and authority lifetime"),
+        }
         // Direct `prx gateway` CLI path: no daemon-owned hot-reload watcher exists,
         // so pass `None` and let run_gateway build its own SharedConfig fallback.
         gateway::run_gateway(&me.host, me.port, me.config, None, shutdown).await
@@ -320,6 +358,8 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
         }
 
         Commands::Chat {
+            h2_limits,
+            h2_authority_seconds,
             provider,
             model,
             temperature,
@@ -334,6 +374,8 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             // cancels this same root token. Passing it here keeps the plumbing
             // uniform without introducing a competing external signal source.
             Box::new(ChatRunner {
+                h2_limits,
+                h2_authority_seconds,
                 config,
                 provider,
                 model,
@@ -347,7 +389,13 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             .await
         }
 
-        Commands::Gateway { port, host } => {
+        Commands::Gateway {
+            port,
+            host,
+            h2_principal,
+            h2_limits,
+            h2_authority_seconds,
+        } => {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -357,9 +405,16 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             }
             // D5/D9 (A6): whitelisted — dispatch installs a SIGINT+SIGTERM signal
             // task that cancels the root token; run_gateway drains gracefully.
-            Box::new(GatewayRunner { host, port, config })
-                .run(root_shutdown.clone())
-                .await
+            Box::new(GatewayRunner {
+                host,
+                port,
+                config,
+                h2_principal,
+                h2_limits,
+                h2_authority_seconds,
+            })
+            .run(root_shutdown.clone())
+            .await
         }
 
         Commands::Daemon { port, host } => {
@@ -709,7 +764,13 @@ mod tests {
 
     #[test]
     fn whitelist_binds_gateway_daemon_channel_start() {
-        assert!(should_bind_signal(&Commands::Gateway { port: None, host: None }));
+        assert!(should_bind_signal(&Commands::Gateway {
+            port: None,
+            host: None,
+            h2_principal: None,
+            h2_limits: None,
+            h2_authority_seconds: None
+        }));
         assert!(should_bind_signal(&Commands::Daemon { port: None, host: None }));
         assert!(should_bind_signal(&Commands::Channel {
             channel_command: ChannelCommands::Start
@@ -728,6 +789,8 @@ mod tests {
 
     fn chat_command() -> Commands {
         Commands::Chat {
+            h2_limits: None,
+            h2_authority_seconds: None,
             provider: None,
             model: None,
             temperature: 0.7,
@@ -743,6 +806,8 @@ mod tests {
         // chat owns ctrl_c internally (single-press cancel / double-press exit);
         // a dispatch signal task would steal the first ctrl_c and break that.
         assert!(!should_bind_signal(&Commands::Chat {
+            h2_limits: None,
+            h2_authority_seconds: None,
             provider: None,
             model: None,
             temperature: 0.7,
@@ -773,7 +838,13 @@ mod tests {
     #[test]
     fn long_running_runtimes_announce_the_inherited_embedding_default() {
         assert!(starts_agent_runtime(&chat_command()));
-        assert!(starts_agent_runtime(&Commands::Gateway { port: None, host: None }));
+        assert!(starts_agent_runtime(&Commands::Gateway {
+            port: None,
+            host: None,
+            h2_principal: None,
+            h2_limits: None,
+            h2_authority_seconds: None
+        }));
         assert!(starts_agent_runtime(&Commands::Daemon { port: None, host: None }));
         assert!(starts_agent_runtime(&Commands::Channel {
             channel_command: ChannelCommands::Start

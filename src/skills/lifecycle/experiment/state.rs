@@ -87,6 +87,11 @@ impl ExperimentState {
     /// independently verified stage can qualify the complete experiment.
     pub fn qualified(&self, plan: &FrozenExperiment) -> bool {
         !self.cancelled
+            && !plan
+                .spec()
+                .stages
+                .iter()
+                .any(|stage| stage.kind == super::ExperimentStageKind::StudyTrial)
             && self
                 .committed(plan)
                 .is_ok_and(|value| value.within(plan.spec().resources))

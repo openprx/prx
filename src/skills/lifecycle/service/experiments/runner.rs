@@ -33,8 +33,26 @@ impl SkillsLifecycleService {
         cancel: &CancellationToken,
     ) -> Result<ExperimentJournal> {
         plan.validate()?;
+        self.validate_study_instruction_plan(plan, config)?;
         let frozen = plan.spec.clone().freeze()?;
-        let mut journal = self.inspect_experiment(&plan.spec.id, frozen.digest())?;
+        let journal = self.inspect_experiment(&plan.spec.id, frozen.digest())?;
+        match self.controlled_experiment_continuation(&journal.plan, config)? {
+            Some(continuation) => {
+                continuation
+                    .scope(self.run_instruction_plan_owned(config, plan, journal, cancel))
+                    .await
+            }
+            None => self.run_instruction_plan_owned(config, plan, journal, cancel).await,
+        }
+    }
+    async fn run_instruction_plan_owned(
+        self: &Arc<Self>,
+        config: &Config,
+        plan: &InstructionExperimentPlan,
+        mut journal: ExperimentJournal,
+        cancel: &CancellationToken,
+    ) -> Result<ExperimentJournal> {
+        let frozen = journal.plan.clone();
         // Refuse any active/uncertain stage before starting unrelated work.
         for state in journal.state.stages.values() {
             match state {

@@ -79,6 +79,8 @@ impl ExperimentResources {
 pub enum ExperimentStageKind {
     ModelProposal,
     SolverTrial,
+    /// Controlled nonqualifying V01 trial; no proposal or gate authority.
+    StudyTrial,
     IndependentVerification,
     Selection,
     /// A privately judged decision; never publication authority.
@@ -157,6 +159,9 @@ pub struct ExperimentPins {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExperimentSpec {
+    /// Owner-authenticated data; None is omitted to preserve legacy digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controlled_admission: Option<super::ControlledAdmissionEnvelope>,
     pub schema_version: u32,
     pub id: ExperimentId,
     pub owner_scope: OwnerScope,
@@ -282,11 +287,25 @@ impl ExperimentSpec {
             }
             if matches!(
                 stage.kind,
-                ExperimentStageKind::ModelProposal | ExperimentStageKind::SolverTrial | ExperimentStageKind::GateReview
+                ExperimentStageKind::ModelProposal
+                    | ExperimentStageKind::SolverTrial
+                    | ExperimentStageKind::StudyTrial
+                    | ExperimentStageKind::GateReview
             ) && (stage.allocation.calls == 0 || stage.allocation.tokens == 0 || stage.allocation.output_bytes == 0)
             {
                 return Err(refuse("model stage has no admitted call/token allocation"));
             }
+        }
+        if self
+            .stages
+            .iter()
+            .any(|stage| stage.kind == ExperimentStageKind::StudyTrial)
+            && !self
+                .stages
+                .iter()
+                .all(|stage| stage.kind == ExperimentStageKind::StudyTrial)
+        {
+            return Err(refuse("a study specification cannot mix qualifying or proposal stages"));
         }
         let mut hash = Sha256::new();
         hash.update(b"prx-instruction-experiment-spec-v1\0");

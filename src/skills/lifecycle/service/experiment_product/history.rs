@@ -58,7 +58,12 @@ impl SkillsLifecycleService {
                 "product publication requires one unique final gate",
             ));
         }
-        let stage = stages[0];
+        let stage = stages.first().copied().ok_or_else(|| {
+            ExperimentProductError::refused(
+                ExperimentProductFailureKind::EvidenceUnavailable,
+                "final gate stage is missing",
+            )
+        })?;
         if !journal
             .state
             .stages

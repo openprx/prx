@@ -117,10 +117,10 @@ impl SkillLifecycleStore {
             .iter()
             .filter(|stage| stage.kind == ExperimentStageKind::GateReview)
             .collect();
-        require(
-            gates.len() == 1 && gates[0].id == gate_stage,
-            "experiment has no unique final gate stage",
-        )?;
+        let [gate] = gates.as_slice() else {
+            return Err(GateError::Unbound("experiment has no unique final gate stage".into()));
+        };
+        require(gate.id == gate_stage, "experiment final gate stage differs")?;
         require(
             journal.state.stages.values().all(StageState::successful),
             "the experiment has incomplete, failed or uncleaned stages",
@@ -147,7 +147,7 @@ impl SkillLifecycleStore {
             witness.binding.owner_scope == *self.owner_scope()
                 && witness.binding.experiment.experiment_sha256 == handle.plan_sha256
                 && witness.binding.experiment.stage == gate_stage
-                && witness.binding.experiment.input_sha256 == gates[0].input_sha256
+                && witness.binding.experiment.input_sha256 == gate.input_sha256
                 && witness.gate_id == gate_id
                 && witness.subject.skill_id == pins.skill_id
                 && witness.subject.baseline_revision.as_ref() == Some(&pins.baseline_revision)

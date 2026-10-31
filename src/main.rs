@@ -522,6 +522,15 @@ Examples:
   prx chat --session abc123             # resume specific session
   prx chat --list-sessions              # list saved sessions")]
     Chat {
+        /// Controlled H2 root ceilings JSON (aggregate resources, per-root time/concurrency).
+        #[arg(long = "h2-controlled-limits", requires = "h2_authority_seconds",
+            conflicts_with_all = ["plain", "list_sessions", "provider", "model", "temperature"])]
+        h2_limits: Option<String>,
+
+        /// Lifetime of this foreground OS-launched H2 authority, in seconds.
+        #[arg(long, requires = "h2_limits")]
+        h2_authority_seconds: Option<u64>,
+
         /// Provider to use (openrouter, anthropic, openai, ollama, etc.)
         #[arg(short, long)]
         provider: Option<String>,
@@ -565,6 +574,18 @@ Examples:
   prx gateway --host 0.0.0.0   # bind to all interfaces
   prx gateway -p 0             # random available port")]
     Gateway {
+        /// Delegate only this exact authenticated principal to the existing owner.
+        #[arg(long, requires_all = ["h2_limits", "h2_authority_seconds"])]
+        h2_principal: Option<String>,
+
+        /// Controlled H2 root ceilings JSON; excludes ordinary conversational spending.
+        #[arg(long = "h2-controlled-limits", requires_all = ["h2_principal", "h2_authority_seconds"])]
+        h2_limits: Option<String>,
+
+        /// Lifetime of the foreground local-review authority, in seconds.
+        #[arg(long, requires_all = ["h2_principal", "h2_limits"])]
+        h2_authority_seconds: Option<u64>,
+
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
         port: Option<u16>,

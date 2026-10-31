@@ -144,6 +144,7 @@ pub enum ExperimentStageStatus {
 pub struct ExperimentStageObservation {
     pub stage: String,
     pub state: ExperimentStageStatus,
+    pub successful: Option<bool>,
     pub settled_usage: Option<ExperimentResources>,
     pub cleanup_confirmed: bool,
     pub allocation: ExperimentResources,
@@ -252,7 +253,7 @@ impl ExperimentProductError {
 
 /// Only identifies candidate historical lineage; actual journal/authentication
 /// must still be checked by the original publisher under its proposal lock.
-pub(in crate::skills::lifecycle) fn recorded_publication_status(status: super::ProposalStatus) -> bool {
+pub(in crate::skills::lifecycle) const fn recorded_publication_status(status: super::ProposalStatus) -> bool {
     matches!(
         status,
         super::ProposalStatus::Committed

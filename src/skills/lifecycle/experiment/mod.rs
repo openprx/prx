@@ -1,5 +1,8 @@
 //! Owner-scoped bounded experiment records and state contracts.
 //! Execution, accounting, verification and publication retain their existing owners.
+mod admission;
+pub use crate::runtime::h2_entry::{ControlledAdmissionPin, EntryOriginRecord};
+pub use admission::ControlledAdmissionEnvelope;
 mod cycle;
 mod gate_review;
 pub(in crate::skills::lifecycle) use gate_review::{GateReviewPhysical, GateReviewWitness, GateVerificationWindow};

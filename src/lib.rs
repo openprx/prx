@@ -252,6 +252,11 @@ pub enum SkillCommands {
 /// Individual bounded experiment operations, under the existing lifecycle policy.
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillExperimentCommands {
+    /// Crate-controlled preregistered V01 trials; no qualification or publication.
+    Study {
+        #[command(subcommand)]
+        command: SkillExperimentStudyCommands,
+    },
     /// Typed product flow: exact final publication, annotation and honest status.
     Product {
         #[command(subcommand)]
@@ -277,6 +282,37 @@ pub enum SkillExperimentCommands {
         digest: String,
         stage: String,
         source: String,
+    },
+}
+
+/// Local V01 transport over the admitted study owner, never a direct executor.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillExperimentStudyCommands {
+    Plan {
+        source: String,
+    },
+    Admit {
+        source: String,
+    },
+    Run {
+        id: String,
+        digest: String,
+        study_digest: String,
+    },
+    Inspect {
+        id: String,
+        digest: String,
+        study_digest: String,
+    },
+    Report {
+        id: String,
+        digest: String,
+        study_digest: String,
+    },
+    Export {
+        id: String,
+        digest: String,
+        study_digest: String,
     },
 }
 
