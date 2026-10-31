@@ -47,7 +47,7 @@ impl SkillsManageTool {
         if let Err(result) = self.authorize_h2(action, args) {
             return Ok(result);
         }
-        let work = async {
+        let work = Box::pin(async {
             let bound = if matches!(action_kind, EntryAction::Admit | EntryAction::Run) {
                 let plan = request::<experiment::InstructionExperimentPlan>(args)?.spec.freeze()?;
                 let envelope =
@@ -71,7 +71,7 @@ impl SkillsManageTool {
                     }
                     EntryAction::Run => {
                         let plan: experiment::InstructionExperimentPlan = request(args)?;
-                        json!(service.run_product(&plan, &self.config, &cancel).await?)
+                        json!(Box::pin(service.run_product(&plan, &self.config, &cancel)).await?)
                     }
                     EntryAction::Inspect => json!(service.inspect_product(&request(args)?, &self.config)?),
                     EntryAction::Cancel => json!(service.cancel_product(&request(args)?, &self.config)?),
@@ -94,7 +94,7 @@ impl SkillsManageTool {
                 Some(owner) => owner.scope(dispatch).await,
                 None => dispatch.await,
             }
-        };
+        });
         // The owning service validates and authenticates the durable pin before
         // dispatch. A fresh call may name an earlier plan from this same launch.
         let output = command.continuation_scope(work).await?;
