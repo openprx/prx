@@ -175,6 +175,29 @@ impl PluginRuntime {
         self.generation.load().id
     }
 
+    /// Canonical plugin source directory inside this runtime's workspace.
+    ///
+    /// Install and update review hashes on this path, then the manage tool
+    /// resolves the operator's original source string with the same rules.
+    pub fn resolve_install_source(&self, raw: &str) -> anyhow::Result<PathBuf> {
+        let workspace = self
+            .plugins_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("WASM plugins directory has no workspace parent"))?;
+        let workspace = std::fs::canonicalize(workspace)?;
+        let requested = Path::new(raw);
+        let joined = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            workspace.join(requested)
+        };
+        let source = std::fs::canonicalize(joined)?;
+        if !source.starts_with(&workspace) || !source.is_dir() {
+            anyhow::bail!("plugin source must be a directory inside the workspace");
+        }
+        Ok(source)
+    }
+
     /// Stable event bus shared by every generation for this workspace.
     pub fn event_bus(&self) -> Arc<EventBus> {
         Arc::clone(&self.event_bus)
@@ -925,18 +948,7 @@ impl PluginManageTool {
     }
 
     fn source_path(&self, raw: &str) -> anyhow::Result<PathBuf> {
-        let workspace = std::fs::canonicalize(self.workspace_dir()?)?;
-        let requested = Path::new(raw);
-        let joined = if requested.is_absolute() {
-            requested.to_path_buf()
-        } else {
-            workspace.join(requested)
-        };
-        let source = std::fs::canonicalize(joined)?;
-        if !source.starts_with(&workspace) || !source.is_dir() {
-            anyhow::bail!("plugin source must be a directory inside the workspace");
-        }
-        Ok(source)
+        self.runtime.resolve_install_source(raw)
     }
 
     /// Copy the approved source into a staging directory, prove the staged

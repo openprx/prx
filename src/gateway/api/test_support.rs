@@ -46,7 +46,7 @@ impl Provider for UnusedProvider {
     }
 }
 
-fn app_state(config: Config) -> AppState {
+pub(super) fn app_state(config: Config) -> AppState {
     let workspace = config.workspace_dir.clone();
     std::fs::create_dir_all(&workspace).expect("test: workspace dir");
     let memory = SqliteMemory::new(&workspace).expect("test: sqlite memory");
@@ -163,7 +163,12 @@ pub(super) async fn serve_config(edit: impl FnOnce(&mut Config)) -> Served {
     config.save().await.expect("test: save initial config");
     let loaded =
         Config::load_from_path(&config.config_path, config.workspace_dir.clone()).expect("test: load initial config");
-    let state = app_state(loaded);
+    serve_state(dir, app_state(loaded)).await
+}
+
+/// Serve an already-built state. Callers that need a plugin runtime set it
+/// before this, because the router copies `plugin_runtime` at bind time.
+pub(super) async fn serve_state(dir: tempfile::TempDir, state: AppState) -> Served {
     // Axum serves connections on independent tasks. Bind the test dispatcher
     // on every request poll rather than relying on a thread-local default.
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
