@@ -388,6 +388,22 @@ impl SkillLifecycleStore {
                         )
                     })
                 })
+        } else if let Some(expected) = expected {
+            let recheck = || {
+                self.require_experiment_publication_binding(&proposal, Some(expected))
+                    .map_err(|error| LifecycleError::ProposalRefused(error.to_string()))?;
+                self.require_experiment_fresh_publication(expected)
+                    .map_err(|error| LifecycleError::ProposalRefused(error.to_string()))?;
+                self.require_controlled_proposal_source(&proposal, Some(expected))?;
+                let verified = self
+                    .verify_gate(&auth.gate_id, &auth.gate_digest, policy, suite_digest)
+                    .map_err(|error| LifecycleError::ProposalRefused(error.to_string()))?;
+                check_bound(&proposal, &expected_gate, &verified)
+                    .map_err(|error| LifecycleError::ProposalRefused(error.to_string()))?;
+                self.require_source_review(&proposal)?;
+                Ok(())
+            };
+            self.publish_pinned_from_proposal(&lock, &request, &pin, &recheck)
         } else {
             self.publish_pinned(&request, &pin)
         };

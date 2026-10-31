@@ -9,6 +9,14 @@ impl SkillsLifecycleService {
         journal: &ExperimentJournal,
         config: &Config,
     ) -> ProductResult<ExperimentProductSnapshot> {
+        self.product_snapshot_with_drain(journal, config, false)
+    }
+    pub(super) fn product_snapshot_with_drain(
+        &self,
+        journal: &ExperimentJournal,
+        config: &Config,
+        root_drained: bool,
+    ) -> ProductResult<ExperimentProductSnapshot> {
         let mut issues = Vec::new();
         let qualification = match self.experiment_qualified(journal) {
             Ok(true) => ExperimentQualification::QualifiedHistorical,
@@ -160,6 +168,12 @@ impl SkillsLifecycleService {
         } else {
             ExperimentCleanupStatus::Unconfirmed
         };
+        let remaining_planned = journal
+            .state
+            .stages
+            .values()
+            .any(|state| matches!(state, StageState::Planned));
+        let no_future_dispatch = journal.state.cancelled || !remaining_planned;
         let mut baseline_retained = false;
         if let Some(selection) = journal.plan.spec().stages.iter().rev().find(|stage| {
             stage.kind == ExperimentStageKind::Selection
@@ -183,6 +197,8 @@ impl SkillsLifecycleService {
             ExperimentExecutionStatus::BaselineRetained
         } else if journal.state.stages.values().all(StageState::successful) {
             ExperimentExecutionStatus::Completed
+        } else if started {
+            ExperimentExecutionStatus::Incomplete
         } else {
             ExperimentExecutionStatus::Planned
         };
@@ -203,7 +219,18 @@ impl SkillsLifecycleService {
             committed_or_reserved: journal.state.committed(&journal.plan)?,
             settled_usage,
             cleanup,
-            termination_confirmed: started && cleaned && !unknown && !active && !physical_uncertain,
+            termination_confirmed: root_drained
+                && no_future_dispatch
+                && started
+                && cleaned
+                && !unknown
+                && !active
+                && !physical_uncertain,
+            root_worker_drain: if root_drained {
+                ExperimentRootDrainStatus::Confirmed
+            } else {
+                ExperimentRootDrainStatus::Unconfirmed
+            },
             observation_provenance: "durable_owner_events_and_read_only_physical_observations; no_live_draining_claim",
             physical_observations,
             evidence_issues: issues,

@@ -69,8 +69,10 @@ impl TurnDecisionService {
         stamp: Option<&LocalOwnerReviewStamp>,
     ) -> anyhow::Result<()> {
         let Some(_) = pending.record.sealed_call else {
-            anyhow::ensure!(!approved || pending.record.h2_origin.is_none(),
-                "controlled approval requires the original authenticated sealed call");
+            anyhow::ensure!(
+                !approved || pending.record.h2_origin.is_none(),
+                "controlled approval requires the original authenticated sealed call"
+            );
             return Ok(());
         };
         let call = self.open_pending_call(pending)?;
@@ -163,8 +165,10 @@ impl TurnDecisionService {
         // This iteration intentionally has no source/binary/budget authority
         // reconstruction across boots. A new exact current request can perform
         // permitted historical maintenance; old pending execution stays closed.
-        anyhow::ensure!(current.boot==original.boot,
-            "old-boot pending execution requires a fresh exact current request");
+        anyhow::ensure!(
+            current.boot == original.boot,
+            "old-boot pending execution requires a fresh exact current request"
+        );
         match &approval.local_owner {
             Some(stamp) => Ok(Some(LocalOwnerReview::from_signed(origin, stamp.clone())?)),
             None => {

@@ -192,9 +192,16 @@ impl ApprovalCollectionLease {
                 ),
             "collection source differs from admitted input"
         );
-        if call.name=="skills_manage" && arguments.get("action").and_then(serde_json::Value::as_str)
-            .is_some_and(|action|action.starts_with("lifecycle_experiment_")) {
-            self.source.h2_entry_origin().context("experiment collection lacks actual controlled input")?.ensure_live()?;
+        if call.name == "skills_manage"
+            && arguments
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|action| action.starts_with("lifecycle_experiment_"))
+        {
+            self.source
+                .h2_entry_origin()
+                .context("experiment collection lacks actual controlled input")?
+                .ensure_live()?;
         }
         let digest = decision_call_digest(
             &self.context.decision_id().to_string(),

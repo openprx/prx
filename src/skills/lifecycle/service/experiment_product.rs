@@ -47,8 +47,19 @@ impl SkillsLifecycleService {
             cancel.clone(),
         )?;
         match cleanup.run(self.run_instruction_plan(config, plan, cancel)).await {
-            Ok(journal) => self.product_snapshot(&journal, config),
-            Err(error) => Err(self.product_failure_with_snapshot(error.into(), &handle, config)),
+            Ok(journal) => self.product_snapshot_with_drain(&journal, config, true),
+            Err(error) => {
+                // The original CleanupScope attaches this marker exactly when
+                // its owned drain failed, independently of work failure.
+                let drained = !error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>();
+                let mut failure: ExperimentProductError = error.into();
+                failure.snapshot = self
+                    .inspect_experiment(&handle.experiment_id, &handle.plan_sha256)
+                    .ok()
+                    .and_then(|journal| self.product_snapshot_with_drain(&journal, config, drained).ok())
+                    .map(Box::new);
+                Err(failure)
+            }
         }
     }
 

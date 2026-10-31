@@ -88,6 +88,7 @@ pub struct ExperimentLessonQueryRequest {
 pub enum ExperimentExecutionStatus {
     Planned,
     ActiveUnconfirmed,
+    Incomplete,
     CancelRequested,
     Unknown,
     Failed,
@@ -149,6 +150,12 @@ pub struct ExperimentStageObservation {
     pub cleanup_confirmed: bool,
     pub allocation: ExperimentResources,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentRootDrainStatus {
+    Confirmed,
+    Unconfirmed,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct ExperimentProductSnapshot {
     pub handle: ExperimentProductHandle,
@@ -167,6 +174,9 @@ pub struct ExperimentProductSnapshot {
     pub cleanup: ExperimentCleanupStatus,
     /// No live-process claim is inferred from a journal row or watcher interval.
     pub termination_confirmed: bool,
+    /// Confirmed only by this run call's successful original CleanupScope drain.
+    /// Historical stage records cannot prove that a root runner has exited.
+    pub root_worker_drain: ExperimentRootDrainStatus,
     pub observation_provenance: &'static str,
     pub physical_observations: Option<serde_json::Value>,
     pub evidence_issues: Vec<String>,

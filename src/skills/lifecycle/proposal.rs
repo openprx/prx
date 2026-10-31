@@ -492,7 +492,7 @@ pub(super) struct ProposalLock {
 
 impl ProposalLock {
     pub(super) fn belongs_to(&self, store: &SkillLifecycleStore) -> bool {
-        self.store_root == store.root()
+        self.store_root.as_path() == store.root()
     }
 }
 

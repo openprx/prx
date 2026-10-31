@@ -110,13 +110,10 @@ impl SkillsLifecycleService {
             .context("study case tools absent")?;
         let run_id = format!("v01-{}-{stage}", manifest.id.as_str());
         let denied = [self.store.root().to_path_buf()];
-        let scratch = tempfile::Builder::new()
-            .prefix("prx-v01-owned-")
-            .tempdir_in(&config.workspace_dir)?
-            .keep();
+        let mut scratch = super::scratch::OwnedStudyScratch::new(&config.workspace_dir, cancel)?;
         let executor = AgentCaseExecutor::new_controlled(
             config.clone(),
-            scratch.clone(),
+            scratch.path().to_path_buf(),
             f64::from(manifest.runtime.model.temperature_milli) / 1000.0,
             AccountingOwner::new(config.workspace_dir.clone()),
         )
@@ -137,18 +134,19 @@ impl SkillsLifecycleService {
         };
         // Oracle and other-arm observations are deliberately absent from the
         // request. Error text can echo provider/tool data, so keep only class.
+        scratch.start()?;
         let observation = executor
             .run_case(&request, cancel)
             .await
             .map_err(|_| anyhow::anyhow!("controlled study case execution or cleanup was not confirmed"))?;
+        // This removes only a confirmed quiescent empty parent. Every later
+        // flush/grade/retained-write error therefore leaves no orphan parent.
+        scratch.confirm_case_removed(observation.cleanup)?;
         runtime.flush().await?;
         // No case DATA/runtime-state tree is concurrently retained while the
         // private result copy is made. Native-write admission below remains
         // conservative/nonrefundable and charges both work and durable copy.
-        ensure!(
-            std::fs::read_dir(&scratch)?.next().is_none(),
-            "study case cleanup is unconfirmed; owned scratch retained"
-        );
+
         let _durable_output = runtime.register_scratch(&self.store.study_output_directory(&manifest.id)?, 0)?;
         let physical = self.study_physical(config, journal.plan.digest(), stage)?;
         let mut receipt = StudyTrialReceipt {
@@ -192,11 +190,7 @@ impl SkillsLifecycleService {
         self.store
             .write_study_artifacts(journal, &receipt.binding, &observation.artifacts)?;
         let sha256 = self.store.write_study_trial(journal, &receipt, config)?;
-        ensure!(
-            std::fs::read_dir(&scratch)?.next().is_none(),
-            "study case cleanup is unconfirmed; owned scratch retained"
-        );
-        std::fs::remove_dir(&scratch)?;
+
         Ok(super::super::operations::StageEvidence {
             pending_gate: None,
             record_id: format!("study:{stage}"),

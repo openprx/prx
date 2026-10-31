@@ -177,14 +177,4 @@ impl SkillsLifecycleService {
             guidance_delivery_or_utility_proved: false,
         })
     }
-
-    pub(super) fn product_failure_with_snapshot(
-        &self,
-        mut failure: ExperimentProductError,
-        handle: &ExperimentProductHandle,
-        config: &Config,
-    ) -> ExperimentProductError {
-        failure.snapshot = self.inspect_product(handle, config).ok().map(Box::new);
-        failure
-    }
 }

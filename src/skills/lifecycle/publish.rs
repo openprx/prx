@@ -250,6 +250,26 @@ impl SkillLifecycleStore {
         self.resolve_existing(&lock, &request.transaction_id, &fingerprint)
     }
 
+    /// Fresh typed proposal publication uses its already-held shared store
+    /// owner. Preconditions execute under the actual skill lock and cannot
+    /// be deserialized or issue a second publication transaction.
+    pub(super) fn publish_pinned_from_proposal(
+        &self,
+        owner: &super::proposal::ProposalLock,
+        request: &PublishRequest,
+        authorization_digest: &str,
+        precondition: &dyn Fn() -> Result<(), LifecycleError>,
+    ) -> Result<TransactionOutcome, LifecycleError> {
+        if !owner.belongs_to(self) || !request.transaction_id.as_str().starts_with(PROPOSAL_TX_PREFIX) {
+            return Err(LifecycleError::ReservedTransactionId {
+                transaction_id: request.transaction_id.to_string(),
+            });
+        }
+        self.ensure_publication_dirs()?;
+        let lock = self.lock_skill(&request.skill_id, PUBLICATION_LOCK_TIMEOUT)?;
+        self.publish_locked(&lock, request, Some(authorization_digest), Some(precondition))
+    }
+
     /// Legacy import publication: the id must be `mig-...`.
     pub(super) fn publish_migration(&self, request: &PublishRequest) -> Result<TransactionOutcome, LifecycleError> {
         if !request.transaction_id.as_str().starts_with(MIGRATION_TX_PREFIX) {
@@ -268,6 +288,15 @@ impl SkillLifecycleStore {
         self.ensure_publication_dirs()?;
         let _store_lock = self.lock_store(true, PUBLICATION_LOCK_TIMEOUT)?;
         let lock = self.lock_skill(&request.skill_id, PUBLICATION_LOCK_TIMEOUT)?;
+        self.publish_locked(&lock, request, authorization_digest, None)
+    }
+    fn publish_locked(
+        &self,
+        lock: &SkillLock,
+        request: &PublishRequest,
+        authorization_digest: Option<&str>,
+        precondition: Option<&dyn Fn() -> Result<(), LifecycleError>>,
+    ) -> Result<TransactionOutcome, LifecycleError> {
         let fingerprint = Fingerprint {
             kind: TransactionKind::Publish,
             skill: &request.skill_id,
@@ -277,11 +306,11 @@ impl SkillLifecycleStore {
             enabled: Some(request.enabled),
             authorization_digest,
         };
-        if let Some(outcome) = self.resolve_existing(&lock, &request.transaction_id, &fingerprint)? {
+        if let Some(outcome) = self.resolve_existing(lock, &request.transaction_id, &fingerprint)? {
             return Ok(outcome);
         }
         self.run_transition(
-            &lock,
+            lock,
             &request.transaction_id,
             TransactionKind::Publish,
             &request.candidate,
@@ -289,6 +318,7 @@ impl SkillLifecycleStore {
             request.expected_generation,
             request.enabled,
             authorization_digest,
+            precondition,
         )
     }
 
@@ -331,6 +361,7 @@ impl SkillLifecycleStore {
             &anchor.candidate_record_digest,
             request.expected_generation,
             anchor.enabled,
+            None,
             None,
         )
     }
@@ -424,6 +455,7 @@ impl SkillLifecycleStore {
         expected_generation: u64,
         enabled: bool,
         authorization_digest: Option<&str>,
+        precondition: Option<&dyn Fn() -> Result<(), LifecycleError>>,
     ) -> Result<TransactionOutcome, LifecycleError> {
         let skill = lock.skill();
         // A PREPARED entry of this skill whose swap went live must be settled
@@ -473,8 +505,16 @@ impl SkillLifecycleStore {
             prepared_at: Utc::now(),
             finished_at: None,
         };
+        if let Some(check) = precondition {
+            check()?;
+        }
         self.create_journal(&entry)?;
         crash_point!("after_prepared");
+        // Failure here deliberately retains PREPARED for the original factual
+        // reconcile; that path can commit/abort facts but never newly swap.
+        if let Some(check) = precondition {
+            check()?;
+        }
 
         let binding = ActiveBinding {
             schema_version: SCHEMA_VERSION,

@@ -2,6 +2,7 @@
 //! No stage, executor, store record or report grants publication eligibility.
 mod origin;
 mod reporting;
+mod scratch;
 mod trials;
 
 use super::{

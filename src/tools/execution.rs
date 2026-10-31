@@ -2473,10 +2473,13 @@ impl ToolExecutionService {
                     || (context.envelope.owner_isolated
                         && context.envelope.source == crate::runtime::envelope::RuntimeSource::Console))
                     && (if context.controlled_case.is_some() {
-                        scope.matches(&context.envelope.workspace_id,&context.envelope.resolved_owner_id())
-                    }else {
-                        context.envelope.owner_id.as_deref()
-                            .is_some_and(|owner|scope.matches(&context.envelope.workspace_id,owner))
+                        scope.matches(&context.envelope.workspace_id, &context.envelope.resolved_owner_id())
+                    } else {
+                        context
+                            .envelope
+                            .owner_id
+                            .as_deref()
+                            .is_some_and(|owner| scope.matches(&context.envelope.workspace_id, owner))
                     })
                     && descriptor.adapter == ToolAdapterKind::Native
                     && descriptor.backend_name == descriptor.public_name

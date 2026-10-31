@@ -10,9 +10,8 @@ pub(crate) use review::{LocalControlAuthority, LocalOwnerReview, LocalOwnerRevie
 
 pub use authority::ControlledAdmissionPin;
 pub(crate) use authority::{
-    EntryAction, EntryCall, EntryInvocation, RunContinuation, ValidatedLifecycleCommand,
-    arguments_digest, current_admission_pin, current_invocation, current_run_continuation, retain_run_continuation,
-    scope_invocation,
+    EntryAction, EntryCall, EntryInvocation, RunContinuation, ValidatedLifecycleCommand, arguments_digest,
+    current_admission_pin, current_invocation, current_run_continuation, retain_run_continuation, scope_invocation,
 };
 pub(crate) use case::ControlledCaseScope;
 pub(crate) use input::{ChatInput, ChatInputSender, TerminalInputSink, poll_original_terminal};
