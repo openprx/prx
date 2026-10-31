@@ -406,12 +406,12 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             // D5/D9 (A6): whitelisted — dispatch installs a SIGINT+SIGTERM signal
             // task that cancels the root token; run_gateway drains gracefully.
             Box::new(GatewayRunner {
-                host,
-                port,
-                config,
                 h2_principal,
                 h2_limits,
                 h2_authority_seconds,
+                host,
+                port,
+                config,
             })
             .run(root_shutdown.clone())
             .await
