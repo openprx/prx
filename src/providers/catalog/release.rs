@@ -600,8 +600,8 @@ impl ReleaseCatalog {
         let mut canonical_ids = BTreeSet::new();
         for model in &self.models {
             validate_model_shape(model)?;
-            let canonical = format!("{}/{}", model.provider, model.api_model);
-            if model.id != canonical {
+            let wire_id = format!("{}/{}", model.provider, model.api_model);
+            if model.id != wire_id && !stable_settings_id(model) {
                 return Err(ReleaseCatalogError::new(format!(
                     "catalog model '{}' is not the canonical provider/api_model id",
                     model.id
@@ -623,7 +623,17 @@ impl ReleaseCatalog {
             }
             for alias in &model.aliases {
                 let alias = alias.trim().to_ascii_lowercase();
-                if alias.is_empty() || !identities.insert(alias) {
+                if alias.is_empty() {
+                    return Err(ReleaseCatalogError::new(
+                        "the embedded model catalog has a colliding alias",
+                    ));
+                }
+                // The wire name is already this row's identity. Listing it again
+                // records the dated spelling without creating a second key.
+                if alias == model.api_model.to_ascii_lowercase() {
+                    continue;
+                }
+                if !identities.insert(alias) {
                     return Err(ReleaseCatalogError::new(
                         "the embedded model catalog has a colliding alias",
                     ));
@@ -673,6 +683,18 @@ impl ReleaseCatalog {
         }
         Ok(())
     }
+}
+
+/// A saved settings key may keep its historical id after the wire name changes.
+/// The id tail has to be an alias so the previous short name still resolves.
+fn stable_settings_id(model: &ReleaseModel) -> bool {
+    let prefix = format!("{}/", model.provider);
+    let Some(tail) = model.id.strip_prefix(&prefix) else {
+        return false;
+    };
+    !tail.is_empty()
+        && !tail.eq_ignore_ascii_case(&model.api_model)
+        && model.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(tail))
 }
 
 fn validate_model_parameters(model: &ReleaseModel, warnings: &mut Vec<String>) -> Result<(), ReleaseCatalogError> {
@@ -971,7 +993,7 @@ mod tests {
             return;
         };
         assert_eq!(catalog.schema_version, "1.0");
-        assert_eq!(catalog.revision, "2026-10-31.1");
+        assert_eq!(catalog.revision, "2026-10-31.2");
         assert_eq!(catalog.schema.as_deref(), Some("./models.schema.json"));
         assert!(catalog.content_sha256().starts_with("sha256:"));
         assert!(catalog.models.len() >= 100);
@@ -1073,6 +1095,62 @@ mod tests {
     }
 
     #[test]
+    fn stable_catalog_ids_keep_settings_keys_when_the_wire_name_changes() {
+        let catalog = ReleaseCatalog::embedded().expect("test: release catalog");
+        for (provider, stable_id, wire, short) in [
+            ("xai", "xai/grok-4.20", "grok-4.20-0309-reasoning", "grok-4.20"),
+            (
+                "xai",
+                "xai/grok-4.20-non-reasoning-latest",
+                "grok-4.20-0309-non-reasoning",
+                "grok-4.20-non-reasoning-latest",
+            ),
+            (
+                "mistral",
+                "mistral/codestral-latest",
+                "codestral-2508",
+                "codestral-latest",
+            ),
+        ] {
+            let provider_id = ProviderId::of(provider);
+            let by_id = catalog
+                .model(&provider_id, stable_id)
+                .expect("test: stable settings id");
+            let by_wire = catalog.model(&provider_id, wire).expect("test: dated wire name");
+            let by_short = catalog.model(&provider_id, short).expect("test: short alias");
+            assert_eq!(by_id.id, stable_id);
+            assert_eq!(by_id.api_model, wire);
+            assert_eq!(by_wire.id, stable_id);
+            assert_eq!(by_short.id, stable_id);
+            assert!(by_id.aliases.iter().any(|alias| alias == wire));
+            assert!(by_id.aliases.iter().any(|alias| alias == short));
+        }
+        assert_eq!(
+            catalog.providers.get("xai").expect("test: xai provider").default_model,
+            "xai/grok-4.20"
+        );
+        assert_eq!(catalog.default_model("xai"), Some("grok-4.20-0309-reasoning"));
+        assert_eq!(
+            catalog
+                .model(&ProviderId::of("xai"), "grok-4")
+                .expect("test: retired grok-4")
+                .lifecycle
+                .replacement
+                .as_deref(),
+            Some("xai/grok-4.20")
+        );
+        assert_eq!(
+            catalog
+                .model(&ProviderId::of("gemini"), "gemini-3.5-flash")
+                .expect("test: deprecated gemini flash")
+                .lifecycle
+                .replacement
+                .as_deref(),
+            Some("gemini/gemini-3.8-flash")
+        );
+    }
+
+    #[test]
     fn openai_release_tariffs_include_published_cached_and_long_context_rates() {
         let catalog = ReleaseCatalog::embedded().expect("test: embedded release catalog");
         let provider = ProviderId::of("openai");
@@ -1080,10 +1158,10 @@ mod tests {
             ("gpt-4o", 2.5_f64, 10.0, 0.0, 1.25),
             ("gpt-4o-mini", 0.15, 0.6, 0.0, 0.075),
             ("gpt-5.2-codex", 1.75, 14.0, 0.0, 0.175),
-            ("gpt-5.6", 4.0, 20.0, 5.0, 0.4),
-            ("gpt-5.6-sol", 4.0, 20.0, 5.0, 0.4),
-            ("gpt-5.6-luna", 0.2, 1.2, 0.25, 0.02),
-            ("gpt-5.6-terra", 2.0, 12.0, 2.5, 0.2),
+            ("gpt-5.6", 4.0, 20.0, 0.0, 0.4),
+            ("gpt-5.6-sol", 4.0, 20.0, 0.0, 0.4),
+            ("gpt-5.6-luna", 0.2, 1.2, 0.0, 0.02),
+            ("gpt-5.6-terra", 2.0, 12.0, 0.0, 0.2),
             ("o1-preview", 15.0, 60.0, 0.0, 7.5),
         ] {
             let pricing = catalog

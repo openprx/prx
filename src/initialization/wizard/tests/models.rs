@@ -16,11 +16,11 @@ fn default_model_for_provider_uses_latest_defaults() {
     assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
     assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M3");
     assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
-    assert_eq!(default_model_for_provider("gemini"), "gemini-3.5-flash");
-    assert_eq!(default_model_for_provider("google"), "gemini-3.5-flash");
+    assert_eq!(default_model_for_provider("gemini"), "gemini-3.8-flash");
+    assert_eq!(default_model_for_provider("google"), "gemini-3.8-flash");
     assert_eq!(default_model_for_provider("kimi-code"), "k3");
     assert_eq!(default_model_for_provider("bedrock"), "anthropic.claude-sonnet-5");
-    assert_eq!(default_model_for_provider("google-gemini"), "gemini-3.5-flash");
+    assert_eq!(default_model_for_provider("google-gemini"), "gemini-3.8-flash");
     assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
     assert_eq!(default_model_for_provider("moonshot"), "kimi-k3");
     assert_eq!(default_model_for_provider("nvidia"), "meta/llama-3.3-70b-instruct");
@@ -377,7 +377,7 @@ fn catalog_and_live_options_preselect_the_release_default() {
     for (provider, expected) in [
         ("anthropic", "claude-sonnet-5"),
         ("openai", "gpt-5.6-sol"),
-        ("gemini", "gemini-3.5-flash"),
+        ("gemini", "gemini-3.8-flash"),
         ("xai", "grok-4.20-0309-reasoning"),
         ("mistral", "mistral-medium-latest"),
         ("ollama", "llama3.2"),

@@ -161,7 +161,7 @@ mod tests {
         let limits = template.limits.clone();
         // Only metadata needed to exercise the filter is added. This is not
         // evidence that either endpoint is available or transport-admitted.
-        for id in ["openrouter/openai/gpt-5.6", "openrouter/google/gemini-3.5-flash"] {
+        for id in ["openrouter/openai/gpt-5.6-sol", "openrouter/google/gemini-3.5-flash"] {
             let row = catalog
                 .models
                 .iter_mut()
@@ -175,7 +175,7 @@ mod tests {
         assert!(
             models
                 .iter()
-                .any(|model| model.provider == "openrouter" && model.model_id == "openai/gpt-5.6"),
+                .any(|model| model.provider == "openrouter" && model.model_id == "openai/gpt-5.6-sol"),
             "a published upstream tariff must satisfy the same pricing rule as onboarding"
         );
         assert!(

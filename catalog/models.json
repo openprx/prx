@@ -1,8 +1,8 @@
 {
   "$schema": "./models.schema.json",
   "schema_version": "1.0",
-  "revision": "2026-10-31.1",
-  "published_at": "2026-10-31T12:58:10Z",
+  "revision": "2026-10-31.2",
+  "published_at": "2026-10-31T14:15:36Z",
   "providers": {
     "anthropic": {
       "default_model": "anthropic/claude-sonnet-5",
@@ -37,7 +37,7 @@
       "display_name": "Fireworks"
     },
     "gemini": {
-      "default_model": "gemini/gemini-3.5-flash",
+      "default_model": "gemini/gemini-3.8-flash",
       "display_name": "Gemini"
     },
     "glm": {
@@ -121,7 +121,7 @@
       "display_name": "vLLM"
     },
     "xai": {
-      "default_model": "xai/grok-4.20-0309-reasoning",
+      "default_model": "xai/grok-4.20",
       "display_name": "xAI"
     },
     "zai": {
@@ -2543,10 +2543,12 @@
       "id": "gemini/gemini-3.5-flash",
       "provider": "gemini",
       "api_model": "gemini-3.5-flash",
-      "display_name": "Gemini 3.5 Flash (stable, recommended)",
+      "display_name": "Gemini 3.5 Flash",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "deprecated",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "replacement": "gemini/gemini-3.8-flash"
       },
       "operations": [
         "chat"
@@ -3705,12 +3707,13 @@
       }
     },
     {
-      "id": "mistral/codestral-2508",
+      "id": "mistral/codestral-latest",
       "provider": "mistral",
       "api_model": "codestral-2508",
       "display_name": "Codestral 2508",
       "aliases": [
-        "codestral-latest"
+        "codestral-latest",
+        "codestral-2508"
       ],
       "lifecycle": {
         "status": "active"
@@ -4912,14 +4915,14 @@
         "unit": "usd_per_1m_tokens",
         "input": 4,
         "output": 20,
-        "cache_write": 5,
+        "cache_write": 0,
         "cache_read": 0.4,
         "tiers": [
           {
             "above_input_tokens": 272000,
             "input": 8,
             "output": 30,
-            "cache_write": 10,
+            "cache_write": 0,
             "cache_read": 0.8
           }
         ]
@@ -4994,14 +4997,14 @@
         "unit": "usd_per_1m_tokens",
         "input": 0.2,
         "output": 1.2,
-        "cache_write": 0.25,
+        "cache_write": 0,
         "cache_read": 0.02,
         "tiers": [
           {
             "above_input_tokens": 272000,
             "input": 0.4,
             "output": 1.8,
-            "cache_write": 0.5,
+            "cache_write": 0,
             "cache_read": 0.04
           }
         ]
@@ -5071,14 +5074,14 @@
         "unit": "usd_per_1m_tokens",
         "input": 4,
         "output": 20,
-        "cache_write": 5,
+        "cache_write": 0,
         "cache_read": 0.4,
         "tiers": [
           {
             "above_input_tokens": 272000,
             "input": 8,
             "output": 30,
-            "cache_write": 10,
+            "cache_write": 0,
             "cache_read": 0.8
           }
         ]
@@ -5153,14 +5156,14 @@
         "unit": "usd_per_1m_tokens",
         "input": 2,
         "output": 12,
-        "cache_write": 2.5,
+        "cache_write": 0,
         "cache_read": 0.2,
         "tiers": [
           {
             "above_input_tokens": 272000,
             "input": 4,
             "output": 18,
-            "cache_write": 5,
+            "cache_write": 0,
             "cache_read": 0.4
           }
         ]
@@ -5895,7 +5898,9 @@
       "display_name": "GPT-5.6 (latest flagship)",
       "aliases": [],
       "lifecycle": {
-        "status": "active"
+        "status": "deprecated",
+        "deprecated_at": "2026-10-31T00:00:00Z",
+        "replacement": "openrouter/openai/gpt-5.6-sol"
       },
       "operations": [
         "chat"
@@ -6843,8 +6848,7 @@
         "streaming": true
       },
       "limits": {
-        "context_window": 1048576,
-        "max_output_tokens": 384000
+        "context_window": 1048576
       },
       "parameters": {},
       "levels": {
@@ -6858,7 +6862,7 @@
         "input": 0.045,
         "output": 0.5,
         "cache_write": 0,
-        "cache_read": 0
+        "cache_read": 0.006
       }
     },
     {
@@ -6893,7 +6897,7 @@
         "input": 1.6,
         "output": 3.2,
         "cache_write": 0,
-        "cache_read": 0
+        "cache_read": 0.135
       }
     },
     {
@@ -6928,7 +6932,7 @@
         "input": 0.3,
         "output": 1.2,
         "cache_write": 0,
-        "cache_read": 0
+        "cache_read": 0.06
       }
     },
     {
@@ -6963,7 +6967,7 @@
         "input": 0.15,
         "output": 0.6,
         "cache_write": 0,
-        "cache_read": 0
+        "cache_read": 0.015
       }
     },
     {
@@ -7559,7 +7563,7 @@
         "status": "retired",
         "deprecated_at": "2026-10-16T00:00:00Z",
         "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "xai/grok-4.20-0309-reasoning"
+        "replacement": "xai/grok-4.20"
       },
       "operations": [
         "chat"
@@ -7600,7 +7604,7 @@
         "status": "retired",
         "retire_at": "2026-10-31T00:00:00Z",
         "deprecated_at": "2026-10-31T00:00:00Z",
-        "replacement": "xai/grok-4.20-0309-reasoning"
+        "replacement": "xai/grok-4.20"
       },
       "operations": [
         "chat"
@@ -7620,12 +7624,13 @@
       "default_level": "medium"
     },
     {
-      "id": "xai/grok-4.20-0309-reasoning",
+      "id": "xai/grok-4.20",
       "provider": "xai",
       "api_model": "grok-4.20-0309-reasoning",
       "display_name": "Grok 4.20 Reasoning",
       "aliases": [
-        "grok-4.20"
+        "grok-4.20",
+        "grok-4.20-0309-reasoning"
       ],
       "lifecycle": {
         "status": "active"
@@ -7666,12 +7671,13 @@
       }
     },
     {
-      "id": "xai/grok-4.20-0309-non-reasoning",
+      "id": "xai/grok-4.20-non-reasoning-latest",
       "provider": "xai",
       "api_model": "grok-4.20-0309-non-reasoning",
       "display_name": "Grok 4.20 Non-Reasoning",
       "aliases": [
-        "grok-4.20-non-reasoning-latest"
+        "grok-4.20-non-reasoning-latest",
+        "grok-4.20-0309-non-reasoning"
       ],
       "lifecycle": {
         "status": "active"
