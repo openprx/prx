@@ -677,9 +677,13 @@ mod tests {
     #[test]
     fn test_builds_do_not_target_the_real_xai_token_host() {
         for url in [production_token_url(), production_device_url()] {
-            assert!(url.starts_with("http://127.0.0.1:"), "{url}");
-            assert!(!url.contains("auth.x.ai"), "{url}");
-            assert!(!url.contains("api.x.ai"), "{url}");
+            // Test builds rewrite the endpoint to a closed loopback port. The
+            // original host stays in the path so the request is identifiable,
+            // but it is not the connection target (D-081).
+            let parsed = reqwest::Url::parse(&url).expect("test: token url");
+            assert_eq!(parsed.scheme(), "http", "{url}");
+            assert_eq!(parsed.host_str(), Some("127.0.0.1"), "{url}");
+            assert_eq!(parsed.port(), Some(9), "{url}");
         }
     }
 
