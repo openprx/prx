@@ -193,13 +193,8 @@ mod tests {
 
         for (provider, model_id, expected_context) in [
             ("anthropic", "claude-fable-5", 1_000_000),
-            ("anthropic", "claude-opus-4-7", 1_000_000),
-            ("anthropic", "claude-opus-4-6", 1_000_000),
-            ("anthropic", "claude-sonnet-4-6", 1_000_000),
             ("openrouter", "google/gemini-3-flash", 1_000_000),
-            ("gemini", "gemini-2.5-pro", 1_000_000),
             ("gemini", "gemini-2.0-flash", 1_000_000),
-            ("anthropic", "claude-haiku-4-5", 200_000),
             ("anthropic", "claude-haiku-3", 200_000),
             ("openai", "gpt-4o", 128_000),
             ("openai", "gpt-4o-mini", 128_000),
@@ -226,6 +221,19 @@ mod tests {
             1_000_000,
             "Claude Opus 4.8 is a current 1M model and must not fall back to 128K"
         );
+        for (provider, model_id, expected_context) in [
+            ("anthropic", "claude-opus-4-7", 1_000_000),
+            ("anthropic", "claude-opus-4-6", 1_000_000),
+            ("anthropic", "claude-sonnet-4-6", 1_000_000),
+            ("anthropic", "claude-haiku-4-5", 200_000),
+            ("gemini", "gemini-2.5-pro", 1_000_000),
+        ] {
+            assert_eq!(
+                context_for(&models, provider, model_id),
+                expected_context,
+                "reactivated priced router row {provider}/{model_id}"
+            );
+        }
         assert_eq!(
             context_for(&models, "anthropic", "claude-haiku-4-5-20251001"),
             200_000,

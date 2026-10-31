@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`qwen-coding`) key is chosen: cron, webhook, and daemon use are outside
   those terms. OpenRouter PKCE login is `prx auth login --provider openrouter`
   (`--device-code` pastes the headless code).
+- Refresh the embedded release catalog to revision `2026-10-31.1`, including
+  current provider defaults, published tariffs, and lifecycle replacements.
 
 ## [0.8.171] - 2026-10-31
 

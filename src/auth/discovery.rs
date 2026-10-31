@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn default_models_match_expected() {
         assert_eq!(default_model_for_provider("anthropic"), "claude-sonnet-5");
-        assert_eq!(default_model_for_provider("openai"), "gpt-5.6");
+        assert_eq!(default_model_for_provider("openai"), "gpt-5.6-sol");
         assert_eq!(default_model_for_provider("openrouter"), "anthropic/claude-sonnet-5");
     }
 
