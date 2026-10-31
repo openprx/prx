@@ -12,6 +12,17 @@ const props = {
   cancelLabel: 'Cancel'
 };
 
+test('uses a distinct id for each open dialog', async () => {
+  render(ConfirmDialog, { props });
+  render(ConfirmDialog, { props: { ...props, objectName: 'hook:other' } });
+  await tick();
+
+  const dialogs = screen.getAllByRole('dialog');
+  expect(dialogs).toHaveLength(2);
+  expect(dialogs[0].getAttribute('aria-labelledby')).not.toBe(dialogs[1].getAttribute('aria-labelledby'));
+  expect(dialogs[0].getAttribute('aria-describedby')).not.toBe(dialogs[1].getAttribute('aria-describedby'));
+});
+
 test('names the object and the consequence', async () => {
   render(ConfirmDialog, { props });
   await tick();

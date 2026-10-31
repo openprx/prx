@@ -13,10 +13,6 @@ function unknown() {
   return t('common.unknown');
 }
 
-function filled(value) {
-  return typeof value === 'string' && value.trim().length > 0 ? value : unknown();
-}
-
 function textValue(value) {
   if (typeof value !== 'string') {
     return unknown();
@@ -108,9 +104,5 @@ export function presentContext(status, origin) {
     { id: 'degradation', label: t('shell.providerDegradation'), value: degradationValue(record) }
   ];
 
-  return facts.map((fact) => ({
-    id: fact.id,
-    label: fact.label,
-    value: filled(fact.value)
-  }));
+  return facts;
 }

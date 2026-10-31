@@ -1,8 +1,18 @@
+<script module>
+  let nextFieldInstance = 0;
+
+  function allocateFieldInstance() {
+    nextFieldInstance += 1;
+    return nextFieldInstance;
+  }
+</script>
+
 <script>
   let { name, label, type = 'text', value = '', error = '', onValue } = $props();
 
-  const fieldId = $derived(`field-${name}`);
-  const errorId = $derived(`field-${name}-error`);
+  const instanceId = allocateFieldInstance();
+  const fieldId = $derived(`field-${name}-${instanceId}`);
+  const errorId = $derived(`field-${name}-${instanceId}-error`);
 </script>
 
 <div class="ui-field">

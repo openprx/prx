@@ -37,6 +37,9 @@
   let path = $state(currentPath());
   let token = $state(getToken());
   let mobileSidebarOpen = $state(false);
+  let narrowLayout = $state(false);
+  let menuButton = $state(null);
+  let sidebar = $state(null);
   const THEME_STORAGE_KEY = 'prx-console-theme';
   let themePreference = $state('system');
   let isDark = $state(true);
@@ -100,9 +103,27 @@
     syncTokenCookie();
   }
 
-  function onRouteChange(nextPath) {
-    path = nextPath;
+  function closeSidebar() {
     mobileSidebarOpen = false;
+    if (menuButton instanceof HTMLElement) {
+      menuButton.focus();
+    }
+  }
+
+  function toggleSidebar() {
+    if (mobileSidebarOpen) {
+      closeSidebar();
+      return;
+    }
+    mobileSidebarOpen = true;
+  }
+
+  function onRouteChange(nextPath) {
+    const changed = nextPath !== path;
+    path = nextPath;
+    if (changed && mobileSidebarOpen) {
+      closeSidebar();
+    }
   }
 
   function onLogin(nextToken) {
@@ -151,22 +172,46 @@
         applyTheme();
       }
     };
-    const onKeyDown = (event) => {
-      if (event.key === 'Escape' && mobileSidebarOpen) {
-        mobileSidebarOpen = false;
-      }
-    };
-
     window.addEventListener('storage', onStorage);
-    window.addEventListener('keydown', onKeyDown);
     mediaQuery.addEventListener('change', onThemeMediaChange);
 
     return () => {
       stopRouter();
       window.removeEventListener('storage', onStorage);
-      window.removeEventListener('keydown', onKeyDown);
       mediaQuery.removeEventListener('change', onThemeMediaChange);
     };
+  });
+
+  $effect(() => {
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape' && mobileSidebarOpen) {
+        event.preventDefault();
+        closeSidebar();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
+
+  $effect(() => {
+    const query = window.matchMedia('(max-width: 1023px)');
+    const apply = () => {
+      narrowLayout = query.matches;
+    };
+    apply();
+    query.addEventListener('change', apply);
+    return () => query.removeEventListener('change', apply);
+  });
+
+  $effect(() => {
+    if (!mobileSidebarOpen || !sidebar) {
+      return undefined;
+    }
+    const first = sidebar.querySelector('button, [href], input, select, textarea');
+    if (first instanceof HTMLElement) {
+      first.focus();
+    }
+    return undefined;
   });
 
   $effect(() => {
@@ -230,14 +275,16 @@
           type="button"
           aria-label={t('app.closeSidebar')}
           class="fixed inset-0 z-30 bg-black/30 dark:bg-black/60 lg:hidden"
-          onclick={() => (mobileSidebarOpen = false)}
+          onclick={closeSidebar}
         ></button>
       {/if}
 
       <aside
+        bind:this={sidebar}
         id="console-sidebar"
+        inert={narrowLayout && !mobileSidebarOpen}
         class={`console-sidebar fixed inset-y-0 left-0 z-40 w-64 overflow-y-auto border-r border-gray-200 bg-white p-4 transition-transform dark:border-gray-700 dark:bg-gray-800 lg:static lg:translate-x-0 ${
-          mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full'
+          mobileSidebarOpen ? 'is-open translate-x-0' : '-translate-x-full'
         }`}
       >
         <div class="mb-4 border-b border-gray-200 pb-4 dark:border-gray-700">
@@ -286,11 +333,12 @@
         <header class="console-header sticky top-0 z-20 flex max-w-full flex-wrap items-center justify-between gap-2 border-b border-gray-200 bg-white/95 px-4 py-3 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95">
           <div class="flex min-w-0 flex-1 flex-wrap items-center gap-2">
             <button
+              bind:this={menuButton}
               type="button"
               class="rounded-lg border border-gray-300 px-2 py-1 text-sm text-gray-700 dark:border-gray-700 dark:text-gray-200 lg:hidden"
               aria-expanded={mobileSidebarOpen}
               aria-controls="console-sidebar"
-              onclick={() => (mobileSidebarOpen = !mobileSidebarOpen)}
+              onclick={toggleSidebar}
             >
               {t('app.menu')}
             </button>

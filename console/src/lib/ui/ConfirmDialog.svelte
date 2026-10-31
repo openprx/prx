@@ -1,3 +1,12 @@
+<script module>
+  let nextDialogInstance = 0;
+
+  function allocateDialogInstance() {
+    nextDialogInstance += 1;
+    return nextDialogInstance;
+  }
+</script>
+
 <script>
   import { untrack } from 'svelte';
   import { t } from '../i18n';
@@ -14,6 +23,9 @@
   } = $props();
 
   let dialog = $state(null);
+  const instanceId = allocateDialogInstance();
+  const titleId = `confirm-dialog-title-${instanceId}`;
+  const bodyId = `confirm-dialog-body-${instanceId}`;
 
   const heading = $derived(title.trim().length > 0 ? title : t('dialog.title'));
   const objectText = $derived(objectName.trim().length > 0 ? objectName.trim() : t('common.unknown'));
@@ -84,12 +96,12 @@
       class="ui-dialog"
       role="dialog"
       aria-modal="true"
-      aria-labelledby="confirm-dialog-title"
-      aria-describedby="confirm-dialog-body"
+      aria-labelledby={titleId}
+      aria-describedby={bodyId}
       tabindex="-1"
     >
-      <h2 id="confirm-dialog-title" class="text-lg font-semibold">{heading}</h2>
-      <p id="confirm-dialog-body" class="ui-dialog-body">
+      <h2 id={titleId} class="text-lg font-semibold">{heading}</h2>
+      <p id={bodyId} class="ui-dialog-body">
         <span class="ui-dialog-object">{objectText}</span>
         <span class="ui-dialog-consequence">{consequenceText}</span>
       </p>

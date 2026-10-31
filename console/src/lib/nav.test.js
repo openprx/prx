@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { NAV_GROUPS, NAV_ITEMS, ROUTE_REDIRECTS, activeNavTarget, resolveRedirect } from './constants.js';
+import { NAV_GROUPS, ROUTE_REDIRECTS, activeNavTarget, resolveRedirect } from './constants.js';
 
 const CURRENT_PATHS = [
   '/overview',
@@ -21,7 +21,7 @@ const CURRENT_PATHS = [
 
 test('group table covers every current nav path once and chat counts as sessions', () => {
   const grouped = NAV_GROUPS.flatMap((group) => group.items.map((item) => item.path));
-  expect(NAV_ITEMS.map((item) => item.path).sort()).toEqual([...CURRENT_PATHS].sort());
+  expect([...grouped].sort()).toEqual([...CURRENT_PATHS].sort());
   expect(NAV_GROUPS.map((group) => group.id)).toEqual([
     'work',
     'capabilities',
@@ -29,10 +29,10 @@ test('group table covers every current nav path once and chat counts as sessions
     'operations'
   ]);
 
-  for (const item of NAV_ITEMS) {
-    expect(grouped.filter((path) => path === item.path)).toHaveLength(1);
-    expect(ROUTE_REDIRECTS[item.path]).toBeUndefined();
-    expect(resolveRedirect(item.path)).toBeNull();
+  for (const path of CURRENT_PATHS) {
+    expect(grouped.filter((item) => item === path)).toHaveLength(1);
+    expect(ROUTE_REDIRECTS[path]).toBeUndefined();
+    expect(resolveRedirect(path)).toBeNull();
   }
 
   expect(activeNavTarget('/chat/example')).toEqual({ groupId: 'work', path: '/sessions' });

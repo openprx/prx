@@ -150,6 +150,12 @@ html.dark {
   border-color: var(--border) !important;
 }
 
+@media (max-width: 1023px) {
+  .console-sidebar:not(.is-open) {
+    visibility: hidden;
+  }
+}
+
 .console-header {
   min-width: 0;
   max-width: 100%;
@@ -366,6 +372,7 @@ textarea::placeholder {
 
 .ui-data-table-scroll {
   max-width: 100%;
+  max-height: min(70vh, 40rem);
   overflow: auto;
   border: 1px solid var(--console-role-border);
   border-radius: var(--console-radius-lg);
@@ -373,7 +380,8 @@ textarea::placeholder {
 
 .ui-data-table {
   width: 100%;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
   font-size: var(--console-type-sm);
 }
 

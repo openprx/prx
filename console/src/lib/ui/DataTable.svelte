@@ -39,7 +39,7 @@
         </tr>
       </thead>
       <tbody>
-        {#each safeRows as row, index (`${row?.id ?? index}`)}
+        {#each safeRows as row, index (index)}
           <tr>
             {#each safeColumns as column (column.key)}
               <td>
@@ -56,7 +56,7 @@
     </table>
   </div>
   <div class="ui-data-cards">
-    {#each safeRows as row, index (`${row?.id ?? index}`)}
+    {#each safeRows as row, index (index)}
       <article class="ui-data-card">
         {#each safeColumns as column (column.key)}
           <div>
