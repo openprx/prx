@@ -118,7 +118,7 @@ impl LocalOwnerReviewStamp {
     fn verify_live(&self, origin: &VerifiedEntryOrigin) -> Result<()> {
         origin.ensure_live()?;
         let profile = origin.profile();
-        let key = crate::decision::DecisionKey::load_or_create(profile.workspace())?;
+        let key = crate::decision::DecisionKey::load_existing(profile.workspace())?;
         ensure!(
             key.verify_hmac(
                 crate::decision::KeyDomain::ApprovalState,

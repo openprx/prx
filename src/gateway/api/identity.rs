@@ -89,7 +89,7 @@ pub(in crate::gateway) async fn verify_startup_identity(config: &Config, princip
     let value = tokio::task::spawn_blocking(move || store.read_authenticated_identity_evidence(&selector)).await??;
     let signed: SignedIdentity = serde_json::from_value(value)?;
     let workspace = config.workspace_dir.canonicalize()?.to_string_lossy().into_owned();
-    let key = DecisionKey::load_or_create(&config.workspace_dir)?;
+    let key = DecisionKey::load_existing(&config.workspace_dir)?;
     ensure!(
         signed.body.version == 1
             && signed.body.workspace == workspace
