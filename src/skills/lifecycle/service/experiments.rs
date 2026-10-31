@@ -226,6 +226,33 @@ impl SkillsLifecycleService {
             _ => anyhow::bail!("controlled experiment requires its original live source; no legacy fallback"),
         }
     }
+    fn experiment_case_executor(
+        &self,
+        config: &Config,
+        journal: &ExperimentJournal,
+        scratch: std::path::PathBuf,
+    ) -> Result<crate::skills::lifecycle::AgentCaseExecutor> {
+        use crate::skills::lifecycle::{AccountingOwner, AgentCaseExecutor};
+        let current = crate::runtime::h2_entry::current_run_continuation();
+        match (journal.plan.spec().controlled_admission.is_some(), current.is_some()) {
+            (true, true) => {
+                self.controlled_experiment_continuation(&journal.plan, config)?;
+                Ok(AgentCaseExecutor::new_controlled(
+                    config.clone(),
+                    scratch,
+                    0.0,
+                    AccountingOwner::new(config.workspace_dir.clone()),
+                )?)
+            }
+            (false, false) => Ok(AgentCaseExecutor::new(
+                config.clone(),
+                scratch,
+                0.0,
+                AccountingOwner::new(config.workspace_dir.clone()),
+            )),
+            _ => anyhow::bail!("controlled case cannot fall back to a legacy executor"),
+        }
+    }
     /// Recovery never dispatches work. Dispatched stages become unknown, and
     /// never-dispatched reservations can be cleaned up without consuming spend.
     pub(crate) fn recover_experiment(&self, id: &ExperimentId, digest: &str) -> Result<ExperimentJournal> {

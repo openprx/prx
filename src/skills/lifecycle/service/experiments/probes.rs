@@ -2,7 +2,7 @@
 //! Source review and execution reuse their existing owners; no candidate install.
 use super::operations::StageEvidence;
 use super::{CancellationToken, Config, Context, ExperimentJournal, Result, SkillsLifecycleService, ensure};
-use crate::skills::lifecycle::{AccountingOwner, AgentCaseExecutor, Bundle, EvalSplit};
+use crate::skills::lifecycle::{Bundle, EvalSplit};
 
 impl SkillsLifecycleService {
     pub(crate) fn experiment_development_probes(&self, journal: &ExperimentJournal) -> Result<serde_json::Value> {
@@ -99,12 +99,7 @@ impl SkillsLifecycleService {
             .prefix("prx-development-probe-")
             .tempdir_in(&config.workspace_dir)?
             .keep();
-        let executor = AgentCaseExecutor::new(
-            config.clone(),
-            scratch.clone(),
-            0.0,
-            AccountingOwner::new(config.workspace_dir.clone()),
-        );
+        let executor = self.experiment_case_executor(config, journal, scratch.clone())?;
         let receipt = self
             .store
             .run_development_probe(

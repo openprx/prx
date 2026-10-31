@@ -4,9 +4,7 @@ use super::{
     SkillsLifecycleService, ensure,
 };
 use crate::skills::lifecycle::experiment::{ExperimentRunBinding, ExperimentStageKind};
-use crate::skills::lifecycle::{
-    AccountingOwner, AgentCaseExecutor, EvalSplit, ProposeOutcome, ProposeRequest, ProposerBudget, ProposerModel,
-};
+use crate::skills::lifecycle::{EvalSplit, ProposeOutcome, ProposeRequest, ProposerBudget, ProposerModel};
 
 pub(super) struct StageEvidence {
     pub pending_gate: Option<Box<super::gate_review::GateReviewPending>>,
@@ -608,12 +606,7 @@ impl SkillsLifecycleService {
         // The evaluator owns child workers that can outlive a dropped
         // waiter. Preserve their parent directory on every error.
         let scratch = scratch.keep();
-        let executor = AgentCaseExecutor::new(
-            config.clone(),
-            scratch.clone(),
-            0.0,
-            AccountingOwner::new(config.workspace_dir.clone()),
-        );
+        let executor = self.experiment_case_executor(config, journal, scratch.clone())?;
         let evaluation = self
             .evaluate_in_epoch(&proposal.proposal_id, split, expected, &executor, cancel)
             .await?;
