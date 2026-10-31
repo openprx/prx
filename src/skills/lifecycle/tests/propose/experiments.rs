@@ -824,3 +824,5 @@ async fn experiment_competing_service_callers_dispatch_once() -> Result<()> {
     server.finish().await?;
     result
 }
+
+mod product;
