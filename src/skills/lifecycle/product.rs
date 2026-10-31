@@ -1,7 +1,9 @@
 //! Product intents and truthful observations. Deserializable pins grant no authority.
 mod binding;
+mod catalog;
 mod errors;
 pub(in crate::skills::lifecycle) use binding::experiment_proposal_request_id;
+pub use catalog::*;
 
 use super::experiment::{ExperimentId, ExperimentResources, InstructionExperimentPlan};
 use super::{JournalEntry, LessonRef, RevisionId, SkillId};

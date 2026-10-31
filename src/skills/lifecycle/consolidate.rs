@@ -325,7 +325,7 @@ pub(super) const fn is_unusable(error: &LifecycleError) -> bool {
 }
 
 /// Whether the loaded pattern content is internally consistent.
-fn verify_content(pattern: &KnowledgePattern) -> Result<(), LifecycleError> {
+pub(super) fn verify_content(pattern: &KnowledgePattern) -> Result<(), LifecycleError> {
     check_ident("task family", &pattern.task_family, MAX_NAME_BYTES)?;
     check_text("statement", &pattern.statement, MAX_STATEMENT_BYTES)?;
     check_ident("environment", &pattern.scope.environment, MAX_NAME_BYTES)?;

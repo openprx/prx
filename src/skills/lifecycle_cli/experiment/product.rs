@@ -54,6 +54,13 @@ fn observed_error(
 
 async fn execute(command: Command, service: Arc<SkillsLifecycleService>, config: &Config) -> ProductResult<Value> {
     match command {
+        Command::Catalog { after_skill } => {
+            let request = ExperimentCatalogRequest {
+                after_skill: after_skill.as_deref().map(SkillId::parse).transpose()?,
+            };
+            let config = config.clone();
+            value(blocking(&service, move |service| service.catalog_product(&request, &config)).await)
+        }
         Command::Plan { source } => {
             let draft: InstructionCycleDraft = input(&source).await?;
             let config = config.clone();

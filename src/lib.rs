@@ -319,6 +319,11 @@ pub enum SkillExperimentStudyCommands {
 /// Explicit local operator inputs; files contain intent and pins, never grants.
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillExperimentProductCommands {
+    /// Discover bounded candidate skill/pattern IDs; does not grant eligibility.
+    Catalog {
+        #[arg(long)]
+        after_skill: Option<String>,
+    },
     /// Plan one complete cycle without model/tool execution.
     Plan { source: String },
     /// Admit the complete typed plan, including all exact operation hashes.

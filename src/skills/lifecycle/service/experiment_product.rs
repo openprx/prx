@@ -13,6 +13,16 @@ use tokio_util::sync::CancellationToken;
 type ProductResult<T> = Result<T, ExperimentProductError>;
 
 impl SkillsLifecycleService {
+    /// Candidate discovery only; the planner revalidates every returned ID.
+    pub fn catalog_product(
+        &self,
+        request: &ExperimentCatalogRequest,
+        config: &Config,
+    ) -> ProductResult<ExperimentCatalog> {
+        self.check_product_config(config)?;
+        Ok(self.store.experiment_catalog(request))
+    }
+
     pub fn plan_product(
         &self,
         draft: InstructionCycleDraft,

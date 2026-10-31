@@ -30,6 +30,7 @@ mod bundle;
 mod candidate;
 mod capability;
 mod capture;
+mod catalog;
 mod consolidate;
 mod evaluate;
 mod evaluator;
