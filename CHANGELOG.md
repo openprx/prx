@@ -9,8 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Refresh the embedded release catalog to revision `2026-10-31.1`, including
+- Refresh the embedded release catalog to revision `2026-10-31.2`, including
   current provider defaults, published tariffs, and lifecycle replacements.
+  Previous defaults `gpt-5.6`, `kimi-k2.6`, and `mistral-large-latest` are
+  deprecated; dated price changes are in the embedded catalog baseline in
+  `docs/providers.md`.
 
 ## [0.8.171] - 2026-10-31
 

@@ -224,9 +224,13 @@ Edit `catalog/models.json`; do not add a second built-in model table in Rust.
 Keep provider defaults pointed at active chat rows, keep aliases unambiguous
 within their provider, and keep prices non-negative. Model IDs and model facts,
 including the Ollama Cloud fallback set, belong in this JSON; adapter code
-retains only protocol wire mapping and transport limits. Increment `revision`
-for every content change; process snapshots bind the digest as an independent
-check against a missed revision bump.
+retains only protocol wire mapping and transport limits. A catalog id is a
+stable settings key. When the provider wire name changes, keep the existing
+id, set `api_model` to the new wire name, and keep the old short name as an
+alias. The dated wire name may also be listed as an alias; it is the same
+identity as `api_model`, not a second model. Do not rename the id in place.
+Increment `revision` for every content change; process snapshots bind the
+digest as an independent check against a missed revision bump.
 
 Run the semantic and real-path checks through the repository guard:
 
