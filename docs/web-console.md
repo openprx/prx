@@ -7,14 +7,16 @@ Browser-based management interface for OpenPRX. Located at `console/` in the rep
 
 ## Features
 
-- Real-time conversation monitoring
 - Configuration editor
-- Memory browser and search
-- Cron job management
-- Evolution dashboard and analytics
-- Remote node status
-- Provider/channel health overview
-- Session and subagent management
+- Overview health from `GET /api/status` (generation, revisions, reload, restart, provider degradation)
+- Process log stream (`/api/logs/stream`), labeled separately from the job state machine
+- Schedules for the authenticated API owner (`/api/cron/*`)
+- Workspace usage and cost (`GET /api/cost`)
+- Skill lifecycle and the controlled experiment catalogue, inside Skills
+- Decision plane, hooks, providers, channels, and configuration changes
+- Session list
+
+Memory search, recall, store, and forget are not offered. Evolution, fitness, doctor, and the other non-browser rows stay on the CLI. Engineering green on the lifecycle and experiment screens is not live or benefit acceptance.
 
 ## Where conversations come from
 
@@ -528,3 +530,39 @@ already contains.
 `GET /api/plugins` lists the loaded generation only. It does not report separate
 trusted, enabled, healthy, or listening facts, and it does not include artifact
 hashes.
+
+## Operations surfaces
+
+These routes sit behind the same paired-token middleware as the rest of `/api`. The browser does not send `owner_id`, a trusted scope, or an approval grant. A missing or foreign cron id both return `404` with `Job '{id}' not found`. Event rows omit `payload_json`.
+
+### Overview
+
+Overview reads the existing status payload. Generation, the active and desired config revisions, reload status, restart-required participants, and provider degradation render from that payload. A missing value renders as unknown. An empty restart list is "not required". This screen does not add a health route.
+
+### Process logs
+
+`/logs` is the process log socket, not the job state machine. The page keeps a connected marker and a disconnected-stale marker, bounds the on-screen buffer, and exports only the redacted lines currently on screen. The socket stays outside the bearer middleware and uses the paired cookie, as before.
+
+### Schedules
+
+`GET /api/cron/jobs`, `GET /api/cron/jobs/{id}` (with events), `GET /api/cron/jobs/{id}/runs`, and `GET /api/cron/status` list the jobs whose stored owner is the API token owner. `POST /api/cron/jobs` accepts exactly one of `expression`, `at`, `every_ms`, or `delay`, plus `command`. `tz` is only valid with `expression`. `PATCH`, pause, resume, and `DELETE` use the same owner filter. `POST /api/cron/jobs/{id}/run` claims the existing job and runs it through the scheduler's preauthorized manual path. The response is `{job_id, status, duration_ms, output}` and does not include a run id. The page then reloads the run list once. There is no cron-disabled flag: status reports `enabled: true` and `disabled_state: "not_configured"`. A store that cannot be opened is `503`, not an empty list. Read-only autonomy refuses mutations. `command` is stored as a shell payload behind the cron policy. `prx cron mark-operator` stays on the CLI.
+
+### Memory
+
+`POST /api/memory/search`, `/recall`, `/store`, and `/forget` authenticate and reject `owner_id` or any unknown field. They do not call the memory tools. A well-formed authenticated body returns `503` `{success:false, error}` because those tools take a service-authored scope, not `ApiPrincipal`. The Memory page shows that unavailable state and does not offer store, recall, or forget. `prx memory reindex` and `prx migrate` stay on the CLI. Forget does not look up the key, so it cannot reveal whether a key exists.
+
+### Cost
+
+`GET /api/cost?window=today|month|all` reads `workspace_cost_report` for the gateway workspace. The scope is `workspace`; the report is not isolated per token. `estimates: true` applies to reservation amounts, which are not settled charges. `unpriced_usage` is the text `omitted`. A settled `cost_usd` of 0 is a real zero. A missing price is not filled in as zero. `as_of_utc` is the ledger snapshot time, not a config revision. A bad window is `400`. A report error is `503`, not an empty zero report.
+
+### Skill lifecycle
+
+`GET /api/skills/lifecycle/status`, `GET /api/skills/lifecycle/proposals`, and `GET /api/skills/lifecycle/proposals/{id}` call `skills_manage` after the server installs a trusted scope whose `owner_id` is only the API principal. Publish, cancel, and rollback use the same tool path, including its approval check. The page does not send a grant, so publish and rollback return `403` with `explicit approval grant required` until a grant exists. Cancel can reach the service when autonomy allows it. An owner mismatch is `403` and the body does not echo the configured owner scope. Unknown proposals and revisions are `404` `{"error":"not found"}`. A stale generation is `409`. `CommittedRepairRequired` is `409` `{"error":"committed with repair required","committed_repair_required":true}` and is not described as rolled back. `replayed: true` is a replay, not a new generation. A disabled lifecycle is `503`. Import and the operator lifecycle commands stay on the CLI. The screen states that engineering green is not live or benefit acceptance.
+
+### Lifecycle experiments
+
+`POST /api/skills/lifecycle/h2` accepts `{action, request}`. `action` must be one of the thirteen `lifecycle_experiment_*` catalogue actions. Study actions and any other action are `409`. Request keys that would set an owner, workspace, MAC, pins, grant, or proof are `400`. The handler does not mint an H2 invocation and does not submit `lifecycle_experiment_run` as a console job: the job cleanup owner does not fit an existing job kind. With no controlled profile the route is `403`. With a profile attached it is `503` describing that mint gap. `ControlledH2Profile` route allowlist is unchanged, so a controlled gateway still refuses this path in middleware before the handler. The page does not offer study actions and does not poll a job. Engineering green on this screen is not live or benefit acceptance.
+
+### Still on the CLI
+
+Identity, health, metrics, pairing, CLI evaluate, skill import, operator lifecycle, the skill-file tool, H2 study, xin, evolution, fitness, approval grants, EU audit, doctor, and OS service install are not console CRUD screens. A deployment that lacks a route shows an explicit unavailable state rather than a control that pretends to succeed.
