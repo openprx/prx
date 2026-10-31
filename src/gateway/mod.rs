@@ -1109,6 +1109,14 @@ impl GatewayTurnRuntimeOwner {
         self.current.load_full()
     }
 
+    /// Whether the active generation was launched with a controlled H2 profile.
+    ///
+    /// The lifecycle experiment HTTP adapter uses this to refuse when the
+    /// process has no profile. It does not mint an invocation.
+    pub(crate) fn has_controlled_profile(&self) -> bool {
+        self.current.load().decision_slot.controlled.is_some()
+    }
+
     fn build(&self, generation: Arc<crate::config::ConfigGeneration>) -> anyhow::Result<TurnRuntimeGeneration> {
         if let Some(profile) = &self.current.load().decision_slot.controlled {
             profile.revoke();
