@@ -188,7 +188,7 @@ async fn on_message(inner: &Inner, params: &Value) -> Result<Value, InboundError
         chat: message.chat,
         text: message.text,
         attachments: message.attachments,
-        reply_to: message.reply_to,
+        reply_target: message.reply_target,
         timestamp_ms: message.timestamp_ms,
     };
     *inner.hint.lock() = Some(super::TurnHint {

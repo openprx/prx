@@ -23,7 +23,7 @@ fn message(id: &str) -> RichMessage {
         },
         text: id.into(),
         attachments: Vec::new(),
-        reply_to: None,
+        reply_target: None,
         timestamp_ms: 1,
     }
 }

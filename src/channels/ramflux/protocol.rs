@@ -262,8 +262,8 @@ pub struct InboundMessageParams {
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
-    #[serde(default)]
-    pub reply_to: Option<String>,
+    #[serde(default, rename = "reply_to")]
+    pub reply_target: Option<String>,
     pub timestamp_ms: u64,
     #[serde(default)]
     pub turn_id: Option<String>,
@@ -368,8 +368,8 @@ pub struct ReplyTextParams<'a> {
     pub text: &'a str,
     #[serde(rename = "final")]
     pub is_final: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<&'a str>,
+    #[serde(rename = "reply_to", skip_serializing_if = "Option::is_none")]
+    pub reply_target: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize)]

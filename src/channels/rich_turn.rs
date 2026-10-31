@@ -150,7 +150,7 @@ pub async fn finish_stream(channel: &dyn Channel, conversation_id: &str, turn_id
         turn_id: turn_id.to_string(),
         text: text.to_string(),
         is_final: true,
-        reply_to: None,
+        reply_target: None,
     });
     if let Err(error) = rich.send_rich(&final_text).await {
         tracing::debug!(error = %error, "ramflux final text was not sent");

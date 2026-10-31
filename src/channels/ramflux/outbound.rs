@@ -170,7 +170,7 @@ pub async fn send_text(rpc: &RpcHub, text: &TextReply) -> anyhow::Result<()> {
         turn_id: &text.turn_id,
         text: &text.text,
         is_final: text.is_final,
-        reply_to: text.reply_to.as_deref(),
+        reply_target: text.reply_target.as_deref(),
     };
     request(rpc, protocol::METHOD_REPLY_TEXT, &params).await
 }
