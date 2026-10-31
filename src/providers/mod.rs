@@ -91,6 +91,9 @@ use crate::auth::discovery::is_claude_code_oauth_setup_token;
 use crate::auth::{profiles::AuthProfilesStore, select_profile_id};
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
+use serde::Deserialize;
+use std::path::PathBuf;
+
 const MAX_API_ERROR_CHARS: usize = 200;
 
 /// How many characters of a refused, model-supplied provider string the
