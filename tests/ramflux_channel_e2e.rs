@@ -172,7 +172,7 @@ async fn scripted_turn_approval_cancel_and_erase() {
                 turn_id: "turn-m1".into(),
                 text: "Hello".into(),
                 is_final: true,
-                reply_to: None,
+                reply_target: None,
             }))
             .await
     });

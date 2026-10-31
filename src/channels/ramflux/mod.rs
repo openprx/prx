@@ -429,7 +429,7 @@ impl Channel for RamfluxChannel {
             turn_id,
             text: message.content.clone(),
             is_final: true,
-            reply_to: None,
+            reply_target: None,
         }))
         .await
     }

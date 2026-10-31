@@ -158,7 +158,7 @@ pub struct RichMessage {
     pub chat: Chat,
     pub text: String,
     pub attachments: Vec<AttachmentRef>,
-    pub reply_to: Option<String>,
+    pub reply_target: Option<String>,
     pub timestamp_ms: u64,
 }
 
@@ -260,7 +260,7 @@ pub struct TextReply {
     pub turn_id: String,
     pub text: String,
     pub is_final: bool,
-    pub reply_to: Option<String>,
+    pub reply_target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
