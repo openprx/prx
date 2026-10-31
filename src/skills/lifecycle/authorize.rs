@@ -205,6 +205,7 @@ impl SkillLifecycleStore {
         {
             return Ok(current);
         }
+        let _controlled_source = self.require_controlled_proposal_source(&current, expected)?;
         if let Some(expected) = expected {
             self.require_experiment_fresh_publication(expected)?;
         }
@@ -348,7 +349,13 @@ impl SkillLifecycleStore {
                 transaction: TransactionOutcome { entry, replayed: true },
             });
         }
-        if proposal.status == ProposalStatus::PublicationAuthorized && self.journal_entry(&transaction_id)?.is_none() {
+        let existing = self.journal_entry(&transaction_id)?.is_some();
+        let _controlled_source = if !existing {
+            self.require_controlled_proposal_source(&proposal, expected)?
+        } else {
+            None
+        };
+        if proposal.status == ProposalStatus::PublicationAuthorized && !existing {
             if let Some(expected) = expected {
                 self.require_experiment_fresh_publication(expected)?;
             }
@@ -372,7 +379,19 @@ impl SkillLifecycleStore {
             }
         }
         crash_point!("publish_before_store");
-        let outcome = match self.publish_pinned(&request, &pin) {
+        let publication = if existing {
+            self.reconcile_existing_publication(&lock, &request, &pin)
+                .and_then(|outcome| {
+                    outcome.ok_or_else(|| {
+                        LifecycleError::ProposalRefused(
+                            "observed publication disappeared; no fresh effect is allowed".into(),
+                        )
+                    })
+                })
+        } else {
+            self.publish_pinned(&request, &pin)
+        };
+        let outcome = match publication {
             Ok(outcome) => outcome,
             Err(e @ (LifecycleError::StaleGeneration { .. } | LifecycleError::RevisionAlreadyActive(_))) => {
                 if proposal.status == ProposalStatus::PublicationAuthorized {
@@ -495,11 +514,12 @@ impl SkillLifecycleStore {
             return Ok(Settlement::NotPublished);
         }
         let pin = authorization_pin(&proposal.proposal_id, &auth);
-        match self.publish_pinned(&publish_request(proposal, &auth)?, &pin) {
-            Ok(outcome) => {
+        match self.reconcile_existing_publication(lock, &publish_request(proposal, &auth)?, &pin) {
+            Ok(Some(outcome)) => {
                 self.finish_commit(lock, proposal, &outcome)?;
                 Ok(Settlement::Committed)
             }
+            Ok(None) => Ok(Settlement::NotPublished),
             Err(LifecycleError::TransactionNotCommitted { state: "aborted", .. }) => Ok(Settlement::Aborted),
             Err(e) => Err(e),
         }
@@ -586,6 +606,9 @@ impl SkillLifecycleStore {
         };
         if let Err(error) = self.require_experiment_publication_binding(&proposal, Some(expected)) {
             return error;
+        }
+        if let Err(error) = self.require_controlled_proposal_source(&proposal, Some(expected)) {
+            return error.into();
         }
         self.stale_locked(&lock, &mut proposal, error)
     }

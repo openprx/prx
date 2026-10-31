@@ -4,12 +4,17 @@ use crate::skills::lifecycle::experiment::{ExperimentEvent, ExperimentStageKind,
 use crate::skills::lifecycle::{GateError, SkillLifecycleStore, SkillProposal};
 use sha2::{Digest, Sha256};
 
-pub(in crate::skills::lifecycle) fn experiment_proposal_request_id(plan: &str, stage: &str) -> String {
+pub(in crate::skills::lifecycle) fn experiment_proposal_request_id(
+    plan: &str,
+    stage: &str,
+    controlled: bool,
+) -> String {
     let mut hash = Sha256::new();
     hash.update(plan);
     hash.update(b"\0");
     hash.update(stage);
-    format!("experiment-{}", hex::encode(hash.finalize()))
+    let prefix = if controlled { "h2c-experiment-" } else { "experiment-" };
+    format!("{prefix}{}", hex::encode(hash.finalize()))
 }
 fn require(condition: bool, message: &str) -> Result<(), GateError> {
     if condition {
@@ -19,6 +24,73 @@ fn require(condition: bool, message: &str) -> Result<(), GateError> {
     }
 }
 impl SkillLifecycleStore {
+    /// Called under the original proposal owner. Serialized pins do not supply
+    /// the live source; only a real admitted stage or typed exact command does.
+    pub(in crate::skills::lifecycle) fn require_controlled_proposal_source(
+        &self,
+        proposal: &SkillProposal,
+        expected: Option<&ExperimentFinalExpectation>,
+    ) -> Result<Option<crate::runtime::h2_entry::RunContinuation>, crate::skills::lifecycle::LifecycleError> {
+        use crate::skills::lifecycle::LifecycleError;
+        let refusal = |message: &str| LifecycleError::ProposalRefused(message.into());
+        if !proposal.request_id.starts_with("h2c-experiment-") {
+            return Ok(None);
+        }
+        let (id, digest) = if let Some(expected) = expected {
+            self.require_experiment_publication_binding(proposal, Some(expected))
+                .map_err(|error| refusal(&error.to_string()))?;
+            (
+                expected.handle.experiment_id.clone(),
+                expected.handle.plan_sha256.clone(),
+            )
+        } else {
+            crate::runtime::experiment_stage::current()
+                .ok_or_else(|| refusal("controlled proposal review requires its real admitted stage or exact final"))?
+                .verified_experiment_origin(self.owner_scope())
+                .map_err(|error| refusal(&error.to_string()))?
+        };
+        let journal = self
+            .read_experiment(&id, &digest)
+            .map_err(|error| refusal(&error.to_string()))?;
+        let envelope = journal
+            .plan
+            .spec()
+            .controlled_admission
+            .as_ref()
+            .ok_or_else(|| refusal("controlled proposal has no authenticated original admission"))?;
+        if proposal.owner_scope != *self.owner_scope()
+            || proposal.skill_id != journal.plan.spec().pins.skill_id
+            || !journal.plan.spec().stages.iter().any(|stage| {
+                stage.kind == ExperimentStageKind::ModelProposal
+                    && experiment_proposal_request_id(journal.plan.digest(), &stage.id, true) == proposal.request_id
+            })
+        {
+            return Err(refusal(
+                "controlled proposal is not an original stage of this exact root",
+            ));
+        }
+        let current = crate::runtime::h2_entry::current_run_continuation()
+            .ok_or_else(|| refusal("controlled proposal requires a live original-root command"))?;
+        let bound = current
+            .for_store_plan(
+                &journal.plan,
+                &envelope.pin,
+                self.admission_workspace()
+                    .map_err(|error| refusal(&error.to_string()))?,
+                self.owner_scope().as_str(),
+            )
+            .map_err(|error| refusal(&error.to_string()))?;
+        bound
+            .ensure_store_admission(
+                &envelope.pin,
+                &journal.plan,
+                self.admission_workspace()
+                    .map_err(|error| refusal(&error.to_string()))?,
+                self.owner_scope().as_str(),
+            )
+            .map_err(|error| refusal(&error.to_string()))?;
+        Ok(Some(bound))
+    }
     pub(in crate::skills::lifecycle) fn require_experiment_fresh_publication(
         &self,
         expected: &ExperimentFinalExpectation,
@@ -41,6 +113,7 @@ impl SkillLifecycleStore {
     ) -> Result<(), GateError> {
         let gate = self.recorded_gate_for(proposal)?;
         let marked = proposal.request_id.starts_with("experiment-")
+            || proposal.request_id.starts_with("h2c-experiment-")
             || proposal.author.system_prompt_version == "h2-development-proposer-v1"
             || gate.as_ref().is_some_and(|gate| gate.decision.experiment.is_some());
         if marked && expected.is_none() {
@@ -73,7 +146,11 @@ impl SkillLifecycleStore {
             proposal.owner_scope == *self.owner_scope()
                 && proposal.proposal_id == expected.proposal_id
                 && proposal.request_id
-                    == experiment_proposal_request_id(&expected.handle.plan_sha256, &expected.proposal_stage)
+                    == experiment_proposal_request_id(
+                        &expected.handle.plan_sha256,
+                        &expected.proposal_stage,
+                        proposal.request_id.starts_with("h2c-experiment-"),
+                    )
                 && proposal.skill_id == expected.skill_id
                 && proposal.baseline_revision.as_ref() == Some(&expected.baseline_revision)
                 && proposal.expected_generation == expected.baseline_generation
@@ -159,7 +236,12 @@ impl SkillLifecycleStore {
             .read_proposal(&witness.subject.proposal_id)?
             .ok_or_else(|| GateError::Unbound("final proposal is missing".into()))?;
         require(
-            proposal.request_id == experiment_proposal_request_id(&handle.plan_sha256, &witness.proposal_stage),
+            proposal.request_id
+                == experiment_proposal_request_id(
+                    &handle.plan_sha256,
+                    &witness.proposal_stage,
+                    journal.plan.spec().controlled_admission.is_some(),
+                ),
             "the final proposal is not the immutable admitted proposal stage",
         )?;
         let gate = self

@@ -484,9 +484,16 @@ pub(super) fn bounded(text: &str) -> String {
 
 /// Guards of the proposal lock; released on drop.
 pub(super) struct ProposalLock {
+    store_root: std::path::PathBuf,
     _store: StoreLock,
     _skill: SkillLock,
     pub(super) lock_id: SkillId,
+}
+
+impl ProposalLock {
+    pub(super) fn belongs_to(&self, store: &SkillLifecycleStore) -> bool {
+        self.store_root == store.root()
+    }
 }
 
 impl SkillLifecycleStore {
@@ -540,6 +547,7 @@ impl SkillLifecycleStore {
         let store = self.lock_store(true, LOCK_TIMEOUT)?;
         let skill = self.lock_skill(&lock_id, LOCK_TIMEOUT)?;
         Ok(ProposalLock {
+            store_root: self.root().to_path_buf(),
             _store: store,
             _skill: skill,
             lock_id,

@@ -27,7 +27,7 @@ fn unsigned_digest(spec: &ExperimentSpec) -> Result<String, ExperimentError> {
     Ok(unsigned.freeze()?.digest().into())
 }
 impl SkillLifecycleStore {
-    fn admission_workspace(&self) -> Result<&Path, ExperimentError> {
+    pub(in crate::skills::lifecycle) fn admission_workspace(&self) -> Result<&Path, ExperimentError> {
         self.root()
             .parent()
             .and_then(Path::parent)

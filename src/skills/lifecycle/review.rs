@@ -357,6 +357,21 @@ impl SkillLifecycleStore {
         proposal_id: &str,
         reviewer: &str,
     ) -> Result<SourceReviewOutcome, LifecycleError> {
+        self.review_source_inner(proposal_id, reviewer, None)
+    }
+    pub(in crate::skills::lifecycle) fn review_experiment_final(
+        &self,
+        expected: &super::ExperimentFinalExpectation,
+        reviewer: &str,
+    ) -> Result<SourceReviewOutcome, LifecycleError> {
+        self.review_source_inner(&expected.proposal_id, reviewer, Some(expected))
+    }
+    fn review_source_inner(
+        &self,
+        proposal_id: &str,
+        reviewer: &str,
+        expected: Option<&super::ExperimentFinalExpectation>,
+    ) -> Result<SourceReviewOutcome, LifecycleError> {
         if reviewer.trim().is_empty() || reviewer.len() > MAX_REVIEWER_BYTES || reviewer.chars().any(char::is_control) {
             return Err(LifecycleError::ProposalRefused(
                 "a reviewer name of 1..=128 bytes without control characters is required".to_string(),
@@ -378,6 +393,7 @@ impl SkillLifecycleStore {
         let mut current = self
             .read_proposal_record(proposal_id)?
             .ok_or_else(|| LifecycleError::ProposalRefused(format!("no such proposal {proposal_id}")))?;
+        let _controlled_source = self.require_controlled_proposal_source(&current, expected)?;
         if current.status != ProposalStatus::Draft {
             // Already reviewed (a retry, or a crash after the record was written).
             if self.read_source_review(proposal_id)?.is_some() {

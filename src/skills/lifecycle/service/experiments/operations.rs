@@ -14,8 +14,12 @@ pub(super) struct StageEvidence {
     pub scratch_bytes: u64,
 }
 pub(super) fn proposal_request_id(journal: &ExperimentJournal, stage: &str) -> String {
-    // Same historical bytes; one constructor is shared by publication binding.
-    crate::skills::lifecycle::product::experiment_proposal_request_id(journal.plan.digest(), stage)
+    // Legacy bytes are unchanged; controlled identity is immutable and distinct.
+    crate::skills::lifecycle::product::experiment_proposal_request_id(
+        journal.plan.digest(),
+        stage,
+        journal.plan.spec().controlled_admission.is_some(),
+    )
 }
 pub(super) fn proposal_evidence(proposal: &crate::skills::lifecycle::SkillProposal) -> Result<String> {
     use sha2::{Digest, Sha256};

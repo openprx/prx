@@ -223,6 +223,33 @@ impl SkillLifecycleStore {
         self.publish_inner(request, Some(authorization_digest))
     }
 
+    /// The original proposal owner already holds this store shared. Reconcile
+    /// only an actual transaction under the skill lock; absence cannot reach
+    /// run_transition or acquire/upgrade the store lock again.
+    pub(super) fn reconcile_existing_publication(
+        &self,
+        owner: &super::proposal::ProposalLock,
+        request: &PublishRequest,
+        authorization_digest: &str,
+    ) -> Result<Option<TransactionOutcome>, LifecycleError> {
+        if !owner.belongs_to(self) || !request.transaction_id.as_str().starts_with(PROPOSAL_TX_PREFIX) {
+            return Err(LifecycleError::ReservedTransactionId {
+                transaction_id: request.transaction_id.to_string(),
+            });
+        }
+        let lock = self.lock_skill(&request.skill_id, PUBLICATION_LOCK_TIMEOUT)?;
+        let fingerprint = Fingerprint {
+            kind: TransactionKind::Publish,
+            skill: &request.skill_id,
+            candidate: &request.candidate,
+            digest: Some(&request.candidate_record_digest),
+            expected_generation: request.expected_generation,
+            enabled: Some(request.enabled),
+            authorization_digest: Some(authorization_digest),
+        };
+        self.resolve_existing(&lock, &request.transaction_id, &fingerprint)
+    }
+
     /// Legacy import publication: the id must be `mig-...`.
     pub(super) fn publish_migration(&self, request: &PublishRequest) -> Result<TransactionOutcome, LifecycleError> {
         if !request.transaction_id.as_str().starts_with(MIGRATION_TX_PREFIX) {

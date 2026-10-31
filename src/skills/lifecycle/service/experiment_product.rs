@@ -85,7 +85,7 @@ impl SkillsLifecycleService {
     pub fn review_final_product(&self, expected: &ExperimentFinalExpectation) -> ProductResult<SourceReviewOutcome> {
         self.require_enabled()?;
         self.verify_product_final(expected)?;
-        Ok(self.review_source(&expected.proposal_id, "PRXOperator")?)
+        Ok(self.store.review_experiment_final(expected, "PRXOperator")?)
     }
 
     pub fn publish_final_product(
