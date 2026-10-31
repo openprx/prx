@@ -1351,6 +1351,38 @@ fn factory_xai() {
 }
 
 #[test]
+fn xai_subscription_profile_is_not_an_api_key_and_refuses_another_host() {
+    let dir = tempfile::TempDir::new().expect("test: temp dir");
+    let auth = crate::auth::AuthService::new(dir.path(), false);
+    auth.store_xai_tokens(
+        "default",
+        crate::auth::profiles::TokenSet {
+            access_token: "access-sentinel".into(),
+            refresh_token: Some("refresh-sentinel".into()),
+            id_token: None,
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            token_type: Some("Bearer".into()),
+            scope: None,
+        },
+        true,
+    )
+    .expect("test: store xai oauth");
+    let options = ProviderRuntimeOptions {
+        openprx_dir: Some(dir.path().to_path_buf()),
+        secrets_encrypt: false,
+        ..ProviderRuntimeOptions::default()
+    };
+    let resolved = resolve_provider_credentials_with("xai", None, &options, OauthRefresh::Allowed);
+    assert!(resolved.xai_subscription);
+    assert_eq!(resolved.credential.as_deref(), Some("access-sentinel"));
+    let explicit = resolve_provider_credentials_with("grok", Some("api-key-sentinel"), &options, OauthRefresh::Allowed);
+    assert!(!explicit.xai_subscription);
+    assert_eq!(explicit.credential.as_deref(), Some("api-key-sentinel"));
+    assert!(create_provider_with_options("xai", None, &options).is_ok());
+    assert!(crate::auth::xai_oauth::subscription_base_url(Some("https://evil.example/v1")).is_err());
+}
+
+#[test]
 fn factory_deepseek() {
     assert!(create_provider("deepseek", Some("key")).is_ok());
 }

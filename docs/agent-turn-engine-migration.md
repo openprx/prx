@@ -67,7 +67,7 @@ why its current contents remain cohesive. Future growth still requires review.
 | 8,881 | `src/runtime/turn_decision.rs` | Owns decision-service integration and its policy matrix; routing and supporting decision concerns are already factored into child modules. |
 | 7,493 | `src/providers/mod.rs` | Owns provider factory, route/credential resolution, dialect selection, and factory tests while concrete provider protocols remain separate. |
 | 7,470 | `src/gateway/compat.rs` | Owns compatibility and MCP HTTP surfaces with the cross-boundary authorization tests that pin their route behavior. |
-| 6,482 | `src/onboard/wizard.rs` | Owns the interactive onboarding state machine, discovery, configuration writes, fallback/cancellation behavior, and their workflow tests. |
+| 6,482 | `src/initialization/wizard.rs` | Owns the interactive onboarding state machine, discovery, configuration writes, fallback/cancellation behavior, and their workflow tests. |
 | 6,239 | `src/providers/reliable.rs` | Owns the resilient provider wrapper, failover, retry, trace/usage attribution, streaming, and the tests for that single policy boundary. |
 | 6,115 | `src/tools/execution.rs` | Owns canonical tool dispatch, approval, idempotency, preparation, reservation, and security-boundary tests. |
 | 5,584 | `src/session_worker/runner/` (directory) | Owns the worker wire protocol, manifest/source admission, segment runtime, cleanup, and process-boundary tests. |
@@ -96,7 +96,7 @@ and the corresponding schema description.
 
 The onboarding wizard keeps its public entry points through re-exports while
 models, provider setup, workspace setup, preferences, channels, tunnels,
-summaries, and persistence live in `src/onboard/wizard/`. Its root is 397
+summaries, and persistence live in `src/initialization/wizard/`. Its root is 397
 lines; the largest production child is 1,416 lines and the largest test child
 is 943 lines. All 77 original tests remain. Source guards cover the root and
 production children; moved test files retain explicit test-only scope.
@@ -132,7 +132,7 @@ follow these module roots and responsibility-specific files after the splits:
 | --- | --- |
 | Config schema | `src/config/schema.rs` re-exports domain types from `src/config/schema/`; loading and validation are in `lifecycle.rs`, deprecated keys in `legacy.rs`, launch policy and channel exclusions in `security.rs`, persistence in `atomic.rs`, tests in `tests/` |
 | Config schema contract | `tests/fixtures/config-schema.json` is the golden schema used by `tests/config_persistence.rs` |
-| Onboarding | `src/onboard/wizard.rs` retains entrypoints; `src/onboard/wizard/` owns models, provider, workspace, preferences, channels, tunnel, summary and persistence |
+| Onboarding | `src/initialization/wizard.rs` retains entrypoints; `src/initialization/wizard/` owns models, provider, workspace, preferences, channels, tunnel, summary and persistence |
 | Chat startup | `src/chat/run.rs` owns the event loop; `src/chat/run/startup.rs` owns extracted startup and teardown helpers |
 | Providers | `src/providers/mod.rs` retains factory wiring; `aliases.rs`, `credential_resolution.rs`, `errors.rs`, `info.rs`, `oauth.rs`, `redaction.rs` and `runtime_options.rs` own supporting concerns |
 | Reliable provider | `src/providers/reliable.rs` owns retry/fallback execution; `src/providers/reliable/tests.rs` and `src/providers/reliable/tests/` own its tests |

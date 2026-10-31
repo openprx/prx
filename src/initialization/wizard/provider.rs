@@ -10,7 +10,10 @@ use super::{
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-pub(super) async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
+pub(super) async fn setup_provider(
+    workspace_dir: &Path,
+    state_dir: &Path,
+) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
@@ -136,6 +139,10 @@ pub(super) async fn setup_provider(workspace_dir: &Path) -> Result<(String, Stri
 
     // ── API key / endpoint ──
     let mut provider_api_url: Option<String> = None;
+    // OAuth sign-in stores the refreshable token in the auth profile. The
+    // access token is kept only long enough to list models, and is not written
+    // into config.toml.
+    let mut discovery_key: Option<String> = None;
     let api_key = if provider_name == "ollama" {
         let use_remote_ollama = Confirm::new()
             .with_prompt("  Use a remote Ollama endpoint (for example Ollama Cloud)?")
@@ -253,6 +260,10 @@ pub(super) async fn setup_provider(workspace_dir: &Path) -> Result<(String, Stri
                 .allow_empty(true)
                 .interact_text()?
         }
+    } else if canonical_provider_name(provider_name) == "xai" {
+        let (stored, discovered) = prompt_xai_credential(state_dir).await?;
+        discovery_key = discovered;
+        stored
     } else if canonical_provider_name(provider_name) == "anthropic" {
         // PRX reads no Anthropic credential from the environment, so a
         // variable set in this shell is not "detected" as configured: the
@@ -400,6 +411,7 @@ pub(super) async fn setup_provider(workspace_dir: &Path) -> Result<(String, Stri
     };
 
     // ── Model selection ──
+    let discovery_key = discovery_key.unwrap_or_else(|| api_key.clone());
     let canonical_provider = canonical_provider_name(provider_name);
     let mut model_options: Vec<(String, String)> = catalog_models_for_provider(canonical_provider);
 
@@ -407,7 +419,7 @@ pub(super) async fn setup_provider(workspace_dir: &Path) -> Result<(String, Stri
 
     if supports_live_model_fetch(provider_name) {
         let can_fetch_without_key = allows_unauthenticated_model_fetch(provider_name);
-        let has_api_key = !api_key.trim().is_empty()
+        let has_api_key = !discovery_key.trim().is_empty()
             || provider_credential_env_var(provider_name)
                 .and_then(|variable| std::env::var(variable).ok())
                 .is_some_and(|value| !value.trim().is_empty())
@@ -441,7 +453,7 @@ pub(super) async fn setup_provider(workspace_dir: &Path) -> Result<(String, Stri
             if should_fetch_now {
                 let fetch = fetch_live_models_for_provider_off_runtime(
                     provider_name.to_string(),
-                    api_key.clone(),
+                    discovery_key.clone(),
                     provider_api_url.clone(),
                 )
                 .await;
@@ -566,6 +578,92 @@ pub(super) fn quick_summary_provider_line(config: &Config) -> String {
     )
 }
 
+async fn prompt_xai_credential(state_dir: &Path) -> Result<(String, Option<String>)> {
+    let choices = [
+        "Grok subscription — browser sign-in (SuperGrok / X Premium)",
+        "Grok subscription — device code (SSH / headless)",
+        "xAI API key",
+    ];
+    println!();
+    print_bullet("Grok subscribers can sign in without an API key.");
+    print_bullet("An API key from https://console.x.ai still works.");
+    let index = Select::new()
+        .with_prompt("  How should xAI authenticate?")
+        .items(&choices)
+        .default(0)
+        .interact()?;
+    match index {
+        0 => Ok(finish_xai_sign_in(state_dir, false).await),
+        1 => Ok(finish_xai_sign_in(state_dir, true).await),
+        _ => {
+            print_bullet("Get your API key at: https://console.x.ai");
+            print_bullet(&format!("You can also add it later: {}.", credential_setup_hint("xai")));
+            let key: String = Input::new()
+                .with_prompt("  Paste your API key (or press Enter to skip)")
+                .allow_empty(true)
+                .interact_text()?;
+            if key.is_empty() {
+                print_bullet(&format!(
+                    "Skipped. Later, {}.",
+                    style(credential_setup_hint("xai")).yellow()
+                ));
+            }
+            Ok((key, None))
+        }
+    }
+}
+
+async fn finish_xai_sign_in(state_dir: &Path, device_code: bool) -> (String, Option<String>) {
+    match sign_in_xai(state_dir, device_code).await {
+        Ok(access_token) => {
+            println!("  {} Grok subscription saved", style("✓").green().bold());
+            (String::new(), Some(access_token))
+        }
+        Err(error) => {
+            print_bullet(&format!("Sign-in did not finish ({error})."));
+            print_bullet("Finish later with `prx auth login --provider xai`, or add `--device-code` on a remote host.");
+            (String::new(), None)
+        }
+    }
+}
+
+async fn sign_in_xai(state_dir: &Path, device_code: bool) -> Result<String> {
+    let encrypt = crate::config::Config::load_from_path(&state_dir.join("config.toml"), state_dir.join("workspace"))
+        .map(|config| config.secrets.encrypt)
+        .unwrap_or(true);
+    let auth = crate::auth::AuthService::new(state_dir, encrypt);
+    let client = reqwest::Client::new();
+    if device_code {
+        let device = crate::auth::xai_oauth::start_device_code_flow(&client).await?;
+        println!("  Visit: {}", device.verification_uri);
+        println!("  Code:  {}", device.user_code);
+        if let Some(link) = &device.verification_uri_complete {
+            println!("  Fast link: {link}");
+        }
+        let tokens = crate::auth::xai_oauth::poll_device_code_tokens(&client, &device).await?;
+        let access = tokens.access_token.clone();
+        auth.store_xai_tokens("default", tokens, true)?;
+        return Ok(access);
+    }
+
+    let pkce = crate::auth::xai_oauth::generate_pkce();
+    let pending = crate::auth::xai_oauth::PendingXaiLogin {
+        profile: "default".into(),
+        code_verifier: pkce.code_verifier.clone(),
+        state: pkce.state.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    crate::auth::xai_oauth::save_pending_login(state_dir, encrypt, &pending)?;
+    println!("  Open this URL and approve access:");
+    println!("  {}", crate::auth::xai_oauth::build_authorize_url(&pkce));
+    let code = crate::auth::xai_oauth::receive_loopback_code(&pkce.state, std::time::Duration::from_secs(180)).await?;
+    let tokens = crate::auth::xai_oauth::exchange_code_for_tokens(&client, &code, &pkce.code_verifier).await?;
+    let access = tokens.access_token.clone();
+    auth.store_xai_tokens("default", tokens, true)?;
+    crate::auth::xai_oauth::clear_pending_login(state_dir);
+    Ok(access)
+}
+
 /// The environment variable the daemon itself reads for `name`'s credential,
 /// if there is one (ONBOARD-HINT, D-062).
 ///
@@ -588,6 +686,12 @@ pub(super) fn daemon_credential_env_var(name: &str) -> Option<&'static str> {
 /// only a variable the daemon reads, and always the supported mechanism
 /// (`api_key` in config.toml or `prx auth paste-token`).
 pub(super) fn credential_setup_hint(name: &str) -> String {
+    if canonical_provider_name(name) == "xai" {
+        let provider = canonical_provider_name(name);
+        return format!(
+            "run `prx auth login --provider {provider}` or `prx auth login --provider {provider} --device-code`, or set `api_key` in config.toml (or run `prx auth paste-token --provider {provider}`)"
+        );
+    }
     daemon_credential_env_var(name).map_or_else(
         || keyless_provider_hint(name),
         |variable| format!("export {variable} for the daemon, or {}", keyless_provider_hint(name)),

@@ -1322,9 +1322,9 @@ enum ConfigShowFormat {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OpenAI Codex OAuth
+    /// Login with a subscription OAuth provider (`openai-codex` or `xai`)
     Login {
-        /// Provider (`openai-codex`)
+        /// Provider (`openai-codex` or `xai`)
         #[arg(long)]
         provider: String,
         /// Profile name (default: default)
@@ -1334,9 +1334,9 @@ enum AuthCommands {
         #[arg(long)]
         device_code: bool,
     },
-    /// Complete OAuth by pasting redirect URL or auth code
+    /// Complete OAuth by pasting redirect URL or auth code (`openai-codex` or `xai`)
     PasteRedirect {
-        /// Provider (`openai-codex`)
+        /// Provider (`openai-codex` or `xai`)
         #[arg(long)]
         provider: String,
         /// Profile name (default: default)
@@ -1374,9 +1374,9 @@ enum AuthCommands {
         #[arg(long, default_value = "default")]
         profile: String,
     },
-    /// Refresh OpenAI Codex access token using refresh token
+    /// Refresh a subscription access token (`openai-codex` or `xai`)
     Refresh {
-        /// Provider (`openai-codex`)
+        /// Provider (`openai-codex` or `xai`)
         #[arg(long)]
         provider: String,
         /// Profile name or profile id
@@ -2278,8 +2278,8 @@ fn read_plain_input(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-fn extract_openai_account_id_for_profile(access_token: &str) -> Option<String> {
-    let account_id = auth::openai_oauth::extract_account_id_from_jwt(access_token);
+fn extract_openai_account_id_for_profile(access_token: &str, id_token: Option<&str>) -> Option<String> {
+    let account_id = auth::openai_oauth::extract_account_id(access_token, id_token);
     if account_id.is_none() {
         warn!(
             "Could not extract OpenAI account id from OAuth access token; \
@@ -3179,6 +3179,88 @@ fn open_approval_ledger(config: &Config) -> Result<Connection> {
     Ok(conn)
 }
 
+async fn login_xai(auth_service: &auth::AuthService, config: &Config, profile: &str, device_code: bool) -> Result<()> {
+    let client = reqwest::Client::new();
+    let state_dir = auth::state_dir_from_config(config);
+
+    if device_code {
+        let device = auth::xai_oauth::start_device_code_flow(&client).await?;
+        println!("xAI device-code login started.");
+        println!("Visit: {}", device.verification_uri);
+        println!("Code:  {}", device.user_code);
+        if let Some(uri_complete) = &device.verification_uri_complete {
+            println!("Fast link: {uri_complete}");
+        }
+        let token_set = auth::xai_oauth::poll_device_code_tokens(&client, &device).await?;
+        auth_service.store_xai_tokens(profile, token_set, true)?;
+        println!("Saved profile {profile}");
+        println!("Active profile for xai: {profile}");
+        return Ok(());
+    }
+
+    let pkce = auth::xai_oauth::generate_pkce();
+    let pending = auth::xai_oauth::PendingXaiLogin {
+        profile: profile.to_string(),
+        code_verifier: pkce.code_verifier.clone(),
+        state: pkce.state.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    auth::xai_oauth::save_pending_login(&state_dir, config.secrets.encrypt, &pending)?;
+    let authorize_url = auth::xai_oauth::build_authorize_url(&pkce);
+    println!("Open this URL in your browser and authorize access:");
+    println!("{authorize_url}");
+    println!();
+    println!(
+        "Waiting for callback at {} ...",
+        auth::xai_oauth::XAI_OAUTH_REDIRECT_URI
+    );
+
+    let code = match auth::xai_oauth::receive_loopback_code(&pkce.state, std::time::Duration::from_secs(180)).await {
+        Ok(code) => code,
+        Err(error) => {
+            println!("Callback capture failed: {error}");
+            println!("Run `prx auth paste-redirect --provider xai --profile {profile}`");
+            return Ok(());
+        }
+    };
+    let token_set = auth::xai_oauth::exchange_code_for_tokens(&client, &code, &pkce.code_verifier).await?;
+    auth_service.store_xai_tokens(profile, token_set, true)?;
+    auth::xai_oauth::clear_pending_login(&state_dir);
+    println!("Saved profile {profile}");
+    println!("Active profile for xai: {profile}");
+    Ok(())
+}
+
+async fn paste_xai_redirect(
+    auth_service: &auth::AuthService,
+    config: &Config,
+    profile: &str,
+    input: Option<String>,
+) -> Result<()> {
+    let state_dir = auth::state_dir_from_config(config);
+    let pending = auth::xai_oauth::load_pending_login(&state_dir, config.secrets.encrypt)?
+        .ok_or_else(|| anyhow::anyhow!("No pending xAI login found. Run `prx auth login --provider xai` first."))?;
+    if pending.profile != profile {
+        bail!(
+            "Pending login profile mismatch: pending={}, requested={}",
+            pending.profile,
+            profile
+        );
+    }
+    let redirect_input = match input {
+        Some(value) => value,
+        None => read_plain_input("Paste redirect URL or OAuth code")?,
+    };
+    let code = auth::xai_oauth::parse_code_from_redirect(&redirect_input, Some(&pending.state))?;
+    let client = reqwest::Client::new();
+    let token_set = auth::xai_oauth::exchange_code_for_tokens(&client, &code, &pending.code_verifier).await?;
+    auth_service.store_xai_tokens(profile, token_set, true)?;
+    auth::xai_oauth::clear_pending_login(&state_dir);
+    println!("Saved profile {profile}");
+    println!("Active profile for xai: {profile}");
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
@@ -3190,8 +3272,11 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             device_code,
         } => {
             let provider = auth::normalize_provider(&provider)?;
+            if provider == "xai" {
+                return login_xai(&auth_service, config, &profile, device_code).await;
+            }
             if provider != "openai-codex" {
-                bail!("`auth login` currently supports only --provider openai-codex");
+                bail!("`auth login` supports --provider openai-codex and --provider xai");
             }
 
             let client = reqwest::Client::new();
@@ -3210,7 +3295,10 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         }
 
                         let token_set = auth::openai_oauth::poll_device_code_tokens(&client, &device).await?;
-                        let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
+                        let account_id = extract_openai_account_id_for_profile(
+                            &token_set.access_token,
+                            token_set.id_token.as_deref(),
+                        );
 
                         auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
                         clear_pending_openai_login(config);
@@ -3219,8 +3307,10 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         println!("Active profile for openai-codex: {profile}");
                         return Ok(());
                     }
-                    Err(e) => {
-                        println!("Device-code flow unavailable: {e}. Falling back to browser/paste flow.");
+                    Err(error) => {
+                        bail!(
+                            "OpenAI device-code flow failed: {error}. Retry with --device-code, or run `prx auth login --provider openai-codex` for the browser flow."
+                        );
                     }
                 }
             }
@@ -3251,7 +3341,8 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 };
 
             let token_set = auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
-            let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
+            let account_id =
+                extract_openai_account_id_for_profile(&token_set.access_token, token_set.id_token.as_deref());
 
             auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
             clear_pending_openai_login(config);
@@ -3267,8 +3358,11 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             input,
         } => {
             let provider = auth::normalize_provider(&provider)?;
+            if provider == "xai" {
+                return paste_xai_redirect(&auth_service, config, &profile, input).await;
+            }
             if provider != "openai-codex" {
-                bail!("`auth paste-redirect` currently supports only --provider openai-codex");
+                bail!("`auth paste-redirect` supports --provider openai-codex and --provider xai");
             }
 
             let pending = load_pending_openai_login(config)?.ok_or_else(|| {
@@ -3298,7 +3392,8 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             let client = reqwest::Client::new();
             let token_set = auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
-            let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
+            let account_id =
+                extract_openai_account_id_for_profile(&token_set.access_token, token_set.id_token.as_deref());
 
             auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
             clear_pending_openai_login(config);
@@ -3355,8 +3450,19 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
         AuthCommands::Refresh { provider, profile } => {
             let provider = auth::normalize_provider(&provider)?;
+            if provider == "xai" {
+                return match auth_service.get_valid_xai_access_token(profile.as_deref()).await? {
+                    Some(_) => {
+                        println!("xAI Grok token is valid (refresh completed if needed).");
+                        Ok(())
+                    }
+                    None => {
+                        bail!("No xAI auth profile found. Run `prx auth login --provider xai`.")
+                    }
+                };
+            }
             if provider != "openai-codex" {
-                bail!("`auth refresh` currently supports only --provider openai-codex");
+                bail!("`auth refresh` supports --provider openai-codex and --provider xai");
             }
 
             match auth_service.get_valid_openai_access_token(profile.as_deref()).await? {

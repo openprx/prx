@@ -105,9 +105,10 @@ pub async fn run_wizard(config_dir: Option<&str>, spec: Spec, force: bool) -> Re
 
     print_step(1, 9, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace(config_dir)?;
+    let state_dir = config_path.parent().context("Config path has no parent")?;
 
     print_step(2, 9, "AI Provider & API Key");
-    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
+    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir, state_dir).await?;
     let model_settings = choose_model_level(&provider, &model)?;
 
     print_step(3, 9, "Channels (How You Talk to OpenPRX)");
