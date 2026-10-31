@@ -34,6 +34,10 @@
   import ModelsPage from './pages/ModelsPage.svelte';
   import RoutingPage from './pages/RoutingPage.svelte';
   import ChangesPage from './pages/ChangesPage.svelte';
+  import ActivityPage from './pages/ActivityPage.svelte';
+  import ApprovalsPage from './pages/ApprovalsPage.svelte';
+  import TerminalSessionsPage from './pages/TerminalSessionsPage.svelte';
+  import NewConversationButton from './components/NewConversationButton.svelte';
 
   let path = $state(currentPath());
   let token = $state(getToken());
@@ -373,22 +377,7 @@
               {t('app.menu')}
             </button>
             <h1 class="min-w-0 truncate text-lg font-semibold">{t('app.title')}</h1>
-            <!--
-              Pending for C2 (D-M5-01): this control will call POST /api/sessions
-              with an empty body and open the returned conversation. It stays
-              disabled until that wiring exists. It is the only disabled control
-              the shell adds.
-            -->
-            <button
-              type="button"
-              class="ui-new-conversation"
-              disabled
-              title={t('shell.newConversationPending')}
-              aria-describedby="new-conversation-pending"
-            >
-              {t('shell.newConversation')}
-            </button>
-            <span id="new-conversation-pending" class="ui-visually-hidden">{t('shell.newConversationPending')}</span>
+            <NewConversationButton placement="header" />
           </div>
 
           <div class="flex max-w-full flex-wrap items-center gap-2">
@@ -407,7 +396,7 @@
             <label class="sr-only" for="app-language-select">{t('app.language')}</label>
             <select
               id="app-language-select"
-              bind:value={i18n.lang}
+              value={i18n.lang}
               aria-label={t('app.language')}
               onchange={(event) => setLanguage(event.currentTarget.value)}
               class="max-w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
@@ -436,6 +425,12 @@
             <DecisionInspectPage />
           {:else if activePath === '/sessions'}
             <SessionsPage />
+          {:else if activePath === '/activity'}
+            <ActivityPage />
+          {:else if activePath === '/approvals'}
+            <ApprovalsPage />
+          {:else if activePath === '/terminals'}
+            <TerminalSessionsPage />
           {:else if activePath.startsWith('/chat/')}
             <ChatPage sessionId={chatSessionId} />
           {:else if activePath === '/channels'}

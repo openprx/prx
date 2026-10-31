@@ -1,12 +1,16 @@
 <script>
   import { onDestroy, tick } from 'svelte';
-  import { api } from '../lib/api';
+  import { ApiError, api } from '../lib/api';
+  import { createJobWatch } from '../lib/job-watch';
   import { t } from '../lib/i18n';
   import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
+  import ConfirmDialog from '../lib/ui/ConfirmDialog.svelte';
   import { navigate } from '../lib/router';
+  import { PIN_GAP_PX, isTerminalPhase, sameOriginApiPath } from '../lib/transport';
   import { Paperclip } from '@lucide/svelte';
   import DecisionApprovalPanel from '../components/DecisionApprovalPanel.svelte';
+  import TurnProgress from '../components/TurnProgress.svelte';
 
   const MAX_FILES = 10;
   const MESSAGES_PAGE_SIZE = 40;
@@ -29,6 +33,83 @@
   let selectedFiles = $state([]);
   let dragActive = $state(false);
   let dragDepth = 0;
+  let turn = $state(null);
+  let turnUncertain = $state(false);
+  let cancelOpen = $state(false);
+  let watchHandle = null;
+
+  function pinnedToBottom() {
+    if (!scrollContainer) {
+      return true;
+    }
+    const gap = scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+    return gap < PIN_GAP_PX;
+  }
+
+  async function followIfPinned(wasPinned) {
+    await tick();
+    if (wasPinned && scrollContainer) {
+      scrollContainer.scrollTop = scrollContainer.scrollHeight;
+    }
+  }
+
+  function applyReply(body) {
+    const reply = body && typeof body.reply === 'string' ? body.reply : '';
+    if (reply.length === 0) {
+      return;
+    }
+    const wasPinned = pinnedToBottom();
+    messages = [...messages, { role: 'assistant', content: reply }];
+    followIfPinned(wasPinned);
+  }
+
+  function stopWatch() {
+    watchHandle?.stop();
+    watchHandle = null;
+  }
+
+  function startWatch(accepted, originSession) {
+    stopWatch();
+    const pollPath = sameOriginApiPath(accepted.poll_url) || `/api/jobs/${encodeURIComponent(accepted.job_id)}`;
+    const cancelPath = sameOriginApiPath(accepted.cancel_url) || `/api/jobs/${encodeURIComponent(accepted.job_id)}/cancel`;
+    turn = {
+      sessionId: originSession,
+      phase: 'accepted',
+      elapsedMs: 0,
+      jobId: accepted.job_id,
+      workId: typeof accepted.work_id === 'string' ? accepted.work_id : '',
+      cancelPath,
+      stillRunning: false,
+      pollStale: false,
+      ack: ''
+    };
+    watchHandle = createJobWatch({
+      poll: () => api.getJobByPath(pollPath),
+      onUpdate(update) {
+        if (!turn || turn.sessionId !== originSession || sessionId !== originSession) {
+          return;
+        }
+        if (update.error) {
+          turn = { ...turn, pollStale: true };
+          return;
+        }
+        const snapshot = update.snapshot || {};
+        const phase = typeof snapshot.status === 'string' ? snapshot.status : turn.phase;
+        turn = {
+          ...turn,
+          phase,
+          elapsedMs: Number.isFinite(snapshot.elapsed_ms) ? snapshot.elapsed_ms : turn.elapsedMs,
+          stillRunning: update.stillRunning === true,
+          pollStale: false
+        };
+        if (phase === 'succeeded') {
+          applyReply(snapshot.result);
+        } else if (phase === 'failed') {
+          errorMessage = typeof snapshot.error === 'string' && snapshot.error.length > 0 ? snapshot.error : t('chat.failed');
+        }
+      }
+    });
+  }
 
   function messageIdentity(message) {
     if (message?.message_id) {
@@ -340,6 +421,13 @@
     }
   }
 
+  async function refreshPreservingPin() {
+    const wasPinned = pinnedToBottom();
+    await loadMessagesPage(0);
+    errorMessage = '';
+    await followIfPinned(wasPinned);
+  }
+
   async function refreshMessages() {
     try {
       await loadMessagesPage(0);
@@ -350,39 +438,88 @@
     }
   }
 
+  function turnActive() {
+    return turn && !isTerminalPhase(turn.phase);
+  }
+
+  async function confirmCancel() {
+    const current = turn;
+    cancelOpen = false;
+    if (!current?.cancelPath) {
+      return;
+    }
+    try {
+      const receipt = await api.postByApiPath(current.cancelPath);
+      const targets = Array.isArray(receipt?.targets) ? receipt.targets.join(', ') : '';
+      if (turn && turn.jobId === current.jobId) {
+        turn = {
+          ...turn,
+          ack: `${t('chat.cancelAck')} ${receipt?.job_id || current.jobId} ${receipt?.work_id || current.workId} ${targets}`.trim()
+        };
+      }
+    } catch (error) {
+      if (error instanceof ApiError) {
+        errorMessage = error.message;
+      } else if (turn && turn.jobId === current.jobId) {
+        turnUncertain = true;
+      }
+    }
+  }
+
   async function sendMessage() {
     const message = draftMessage.trim();
     const files = selectedFiles.map((record) => record.file);
-    if ((message.length === 0 && files.length === 0) || sending) {
+    if ((message.length === 0 && files.length === 0) || sending || turnActive()) {
       return;
     }
 
     sending = true;
-    draftMessage = '';
     errorMessage = '';
-
-    const hasMedia = files.length > 0;
-    if (!hasMedia) {
-      messages = [...messages, { role: 'user', content: message }];
-      await scrollToBottom();
-    }
+    turnUncertain = false;
+    const originSession = sessionId;
 
     try {
-      const response = hasMedia
-        ? await api.sendMessageWithMedia(sessionId, message, files)
-        : await api.sendMessage(sessionId, message);
-      if (hasMedia) {
-        await refreshMessages();
-      } else if (response && typeof response.reply === 'string' && response.reply.length > 0) {
-        messages = [...messages, { role: 'assistant', content: response.reply }];
+      const response = files.length > 0
+        ? await api.sendTurnWithMedia(originSession, message, files)
+        : await api.sendTurn(originSession, message);
+      if (sessionId !== originSession) {
+        return;
       }
+      const status = response?.status;
+      const body = response?.body;
+      const accepted = status === 202 && body?.status === 'accepted' && typeof body.job_id === 'string' && body.job_id.length > 0;
+      const synchronous = Number.isInteger(status) && status >= 200 && status < 300 && !accepted && body && typeof body.reply === 'string';
+      if (!accepted && !synchronous) {
+        turnUncertain = true;
+        return;
+      }
+      draftMessage = '';
       clearSelectedFiles();
+      if (message.length > 0 && files.length === 0) {
+        const wasPinned = pinnedToBottom();
+        messages = [...messages, { role: 'user', content: message }];
+        await followIfPinned(wasPinned);
+      } else if (files.length > 0) {
+        const wasPinned = pinnedToBottom();
+        await loadMessagesPage(0);
+        await followIfPinned(wasPinned);
+      }
+      if (accepted) {
+        startWatch(body, originSession);
+        return;
+      }
+      applyReply(body);
     } catch (error) {
-      errorMessage = error instanceof Error ? error.message : t('chat.sendFailed');
-      await refreshMessages();
+      if (sessionId !== originSession) {
+        return;
+      }
+      if (error instanceof ApiError) {
+        errorMessage = error.message;
+      } else {
+        turnUncertain = true;
+      }
     } finally {
       sending = false;
-      await scrollToBottom();
     }
   }
 
@@ -406,10 +543,13 @@
 
     return () => {
       cancelled = true;
+      stopWatch();
+      turn = null;
     };
   });
 
   onDestroy(() => {
+    stopWatch();
     for (const record of selectedFiles) {
       revokePreview(record);
     }
@@ -418,7 +558,7 @@
 
 <section class="flex h-[calc(100vh-10rem)] flex-col gap-4">
   {#key sessionId}
-    <DecisionApprovalPanel {sessionId} onsettled={loadInitialMessages} />
+    <DecisionApprovalPanel {sessionId} onsettled={refreshPreservingPin} />
   {/key}
   <div class="flex items-center justify-between">
     <div class="min-w-0">
@@ -437,6 +577,22 @@
   {#if errorMessage}
     <StateBlock variant="error" message={errorMessage} />
   {/if}
+  {#if turnUncertain}
+    <StateBlock variant="disconnected-stale" message={t('chat.uncertainSend')} />
+  {/if}
+  {#if turn}
+    <TurnProgress
+      phase={turn.phase}
+      elapsedMs={turn.elapsedMs}
+      jobId={turn.jobId}
+      workId={turn.workId}
+      stillRunning={turn.stillRunning}
+      pollStale={turn.pollStale}
+      ack={turn.ack}
+      onCancel={() => { cancelOpen = true; }}
+      onCheckAgain={() => watchHandle?.checkAgain()}
+    />
+  {/if}
 
   <div
     class="flex min-h-0 flex-1 flex-col rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800"
@@ -448,7 +604,7 @@
     ondrop={handleDrop}
   >
     <div
-      class={`flex-1 overflow-y-auto p-4 ${dragActive ? 'bg-blue-500/10 ring-1 ring-inset ring-blue-500/40' : ''}`}
+      class={`ui-chat-scroll flex-1 overflow-y-auto p-4 ${dragActive ? 'bg-blue-500/10 ring-1 ring-inset ring-blue-500/40' : ''}`}
       bind:this={scrollContainer}
       onscroll={handleScroll}
     >
@@ -569,14 +725,14 @@
           title={t('chat.attachFiles')}
           class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-600 hover:border-gray-400 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:border-gray-500 dark:hover:bg-gray-700"
           onclick={openFilePicker}
-          disabled={sending || selectedFiles.length >= MAX_FILES}
+          disabled={sending || turnActive() || selectedFiles.length >= MAX_FILES}
         >
           <Paperclip size={16} />
         </button>
         <button
           type="submit"
           class="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
-          disabled={sending || (!draftMessage.trim() && selectedFiles.length === 0)}
+          disabled={sending || turnActive() || (!draftMessage.trim() && selectedFiles.length === 0)}
         >
           {sending ? t('chat.sending') : t('chat.send')}
         </button>
@@ -584,3 +740,12 @@
     </form>
   </div>
 </section>
+
+<ConfirmDialog
+  open={cancelOpen}
+  title={t('chat.cancelTitle')}
+  objectName={turn?.jobId || ''}
+  consequence={t('chat.cancelConsequence')}
+  onCancel={() => { cancelOpen = false; }}
+  onConfirm={confirmCancel}
+/>

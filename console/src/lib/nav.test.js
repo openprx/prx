@@ -4,6 +4,9 @@ import { NAV_GROUPS, ROUTE_REDIRECTS, activeNavTarget, resolveRedirect } from '.
 const CURRENT_PATHS = [
   '/overview',
   '/sessions',
+  '/activity',
+  '/approvals',
+  '/terminals',
   '/decision-plane',
   '/decisions',
   '/channels',

@@ -9,6 +9,9 @@ export const NAV_GROUPS = [
     labelKey: 'nav.groups.work',
     items: [
       { labelKey: 'nav.sessions', path: '/sessions', activePrefix: '/chat/' },
+      { labelKey: 'nav.activity', path: '/activity' },
+      { labelKey: 'nav.approvals', path: '/approvals' },
+      { labelKey: 'nav.terminals', path: '/terminals' },
       { labelKey: 'decisionInspect.title', path: '/decisions' }
     ]
   },

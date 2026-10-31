@@ -4,6 +4,8 @@
   import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
   import { navigate } from '../lib/router';
+  import NewConversationButton from '../components/NewConversationButton.svelte';
+  import { subscribeListRefresh, subscribeSessionCreated } from '../lib/new-conversation.svelte.js';
 
   const PAGE_SIZE = 20;
   const STATUS_OPTIONS = ['all', 'active', 'pending', 'empty'];
@@ -118,18 +120,23 @@
 
     refresh();
     const timer = setInterval(refresh, 15_000);
+    const unsubscribeCreated = subscribeSessionCreated(() => loadSessions({ reset: true }));
+    const unsubscribeRefresh = subscribeListRefresh(() => loadSessions({ reset: true }));
 
     return () => {
       cancelled = true;
       clearInterval(timer);
+      unsubscribeCreated();
+      unsubscribeRefresh();
     };
   });
 </script>
 
 <section class="space-y-6">
   <div class="flex flex-wrap items-center justify-between gap-3">
-    <div class="flex items-center gap-3">
+    <div class="flex min-w-0 flex-wrap items-center gap-3">
       <PageHeader title={t('sessions.title')} />
+      <NewConversationButton placement="sessions" />
       {#if refreshing && !loading}
         <span class="text-xs text-gray-500 dark:text-gray-400">{t('common.loading')}</span>
       {/if}
@@ -183,6 +190,7 @@
     <StateBlock variant="error" message={errorMessage} />
   {:else if sessions.length === 0}
     <StateBlock variant="empty" message={t('sessions.none')} />
+    <NewConversationButton placement="empty" />
   {:else}
     <div class="overflow-x-auto rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800">
       <table class="min-w-full divide-y divide-gray-200 text-sm dark:divide-gray-700">

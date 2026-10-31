@@ -35,7 +35,7 @@
       <label class="sr-only" for="login-language-select">{t('app.language')}</label>
       <select
         id="login-language-select"
-        bind:value={i18n.lang}
+        value={i18n.lang}
         aria-label={t('app.language')}
         onchange={(event) => setLanguage(event.currentTarget.value)}
         class="rounded-lg border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-700"

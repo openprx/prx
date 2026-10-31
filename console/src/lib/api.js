@@ -1,6 +1,7 @@
 import { clearToken, getToken } from './auth';
 import { t } from './i18n';
 import { navigate } from './router';
+import { sameOriginApiPath } from './transport';
 
 const configuredUrl = (import.meta.env.VITE_API_URL ?? '').trim();
 const apiBaseUrl = configuredUrl.endsWith('/') ? configuredUrl.slice(0, -1) : configuredUrl;
@@ -37,7 +38,7 @@ function resolveErrorMessage(body, status) {
   return t('common.requestFailed', { status });
 }
 
-async function request(path, init = {}, { withEtag = false } = {}) {
+async function request(path, init = {}, { withEtag = false, withStatus = false } = {}) {
   const token = getToken();
   const headers = {
     Accept: 'application/json',
@@ -71,9 +72,20 @@ async function request(path, init = {}, { withEtag = false } = {}) {
   }
 
   if (withEtag) {
-    return { body, etag: response.headers.get('etag') };
+    return { body, etag: response.headers.get('etag'), status: response.status };
+  }
+  if (withStatus) {
+    return { status: response.status, body };
   }
   return body;
+}
+
+function guardedPath(path) {
+  const safe = sameOriginApiPath(path);
+  if (!safe) {
+    throw new ApiError(400, t('common.requestFailed', { status: 400 }));
+  }
+  return safe;
 }
 
 // A write bound to a revision: `If-Match` names it (quoted), so the write
@@ -104,6 +116,8 @@ function managementQuery(entries) {
 
 export const api = {
   getStatus: () => request('/api/status'),
+  createSession: () =>
+    request('/api/sessions', { method: 'POST', body: '{}' }, { withStatus: true }),
   getSessions: ({ limit, offset, channel, status, search } = {}) => {
     const params = new URLSearchParams();
     if (limit) params.set('limit', String(limit));
@@ -156,6 +170,19 @@ export const api = {
     request(`/api/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(decisionId)}/resume`, {
       method: 'POST', body: JSON.stringify({})
     }),
+  resumeDecisionApprovalAsync: (sessionId, decisionId) =>
+    request(`/api/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(decisionId)}/resume`, {
+      method: 'POST',
+      headers: { Prefer: 'respond-async' },
+      body: JSON.stringify({})
+    }, { withStatus: true }),
+  listApprovals: ({ limit, cursor } = {}) => {
+    const params = new URLSearchParams();
+    if (limit) params.set('limit', String(limit));
+    if (cursor) params.set('cursor', String(cursor));
+    const suffix = params.size > 0 ? `?${params.toString()}` : '';
+    return request(`/api/sessions/approvals${suffix}`);
+  },
   sendMessage: (sessionId, message) =>
     request(`/api/sessions/${encodeURIComponent(sessionId)}/message`, {
       method: 'POST',
@@ -176,6 +203,61 @@ export const api = {
       method: 'POST',
       body: formData
     });
+  },
+  sendTurn: (sessionId, message) =>
+    request(`/api/sessions/${encodeURIComponent(sessionId)}/message`, {
+      method: 'POST',
+      headers: { Prefer: 'respond-async' },
+      body: JSON.stringify({ message })
+    }, { withStatus: true }),
+  sendTurnWithMedia: (sessionId, message, files = []) => {
+    if (!Array.isArray(files) || files.length === 0) {
+      return api.sendTurn(sessionId, message);
+    }
+    const formData = new FormData();
+    formData.append('message', message);
+    for (const file of files) {
+      formData.append('files', file);
+    }
+    return request(`/api/sessions/${encodeURIComponent(sessionId)}/message`, {
+      method: 'POST',
+      headers: { Prefer: 'respond-async' },
+      body: formData
+    }, { withStatus: true });
+  },
+  listJobs: () => request('/api/jobs'),
+  getJob: (jobId) => request(`/api/jobs/${encodeURIComponent(jobId)}`),
+  getJobByPath: async (path) => request(guardedPath(path)),
+  cancelJob: (jobId) =>
+    request(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' }),
+  postByApiPath: async (path) => request(guardedPath(path), { method: 'POST' }),
+  listTasks: () => request('/api/runtime/tasks'),
+  killTask: (id, cascade = true) =>
+    request(`/api/runtime/tasks/${encodeURIComponent(id)}/kill?cascade=${cascade ? 'true' : 'false'}`, {
+      method: 'POST'
+    }),
+  steerTask: (id, message) =>
+    request(`/api/runtime/tasks/${encodeURIComponent(id)}/message`, {
+      method: 'POST',
+      body: JSON.stringify({ message })
+    }),
+  getPools: () => request('/api/runtime/pools'),
+  listChatSessions: () => request('/api/chat-sessions'),
+  listChatResults: ({ afterSeq = 0, limit } = {}) => {
+    const params = new URLSearchParams();
+    params.set('after_seq', String(afterSeq));
+    if (limit) params.set('limit', String(limit));
+    return request(`/api/chat-sessions/results?${params.toString()}`);
+  },
+  assignChatSession: (sessionId, { task, disposition } = {}) => {
+    const body = { task };
+    if (typeof disposition === 'string' && disposition.length > 0) {
+      body.disposition = disposition;
+    }
+    return request(`/api/chat-sessions/${encodeURIComponent(sessionId)}/assign`, {
+      method: 'POST',
+      body: JSON.stringify(body)
+    }, { withStatus: true });
   },
   getSessionMediaUrl: (path) => {
     const params = new URLSearchParams({ path });
