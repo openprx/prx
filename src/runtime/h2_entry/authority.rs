@@ -43,7 +43,7 @@ impl EntryAction {
             _ => anyhow::bail!("unsupported controlled experiment action"),
         })
     }
-    pub(crate) fn requires_local_review(self) -> bool {
+    pub(crate) const fn requires_local_review(self) -> bool {
         matches!(self, Self::Publish | Self::Annotate | Self::Rollback | Self::Retire)
     }
 }

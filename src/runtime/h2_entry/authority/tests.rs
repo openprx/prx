@@ -196,16 +196,14 @@ async fn invocation_scope_is_not_inherited_by_spawn_and_one_port_cannot_execute_
     .await;
     assert!(current_invocation().is_err());
     let barrier = Arc::new(std::sync::Barrier::new(3));
-    let threads: Vec<_> = (0..2)
-        .map(|_| {
-            let invocation = invocation.clone();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                invocation.consume(EntryAction::Catalog, &"a".repeat(64)).is_ok()
-            })
+    let threads = [(); 2].map(|()| {
+        let invocation = invocation.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            invocation.consume(EntryAction::Catalog, &"a".repeat(64)).is_ok()
         })
-        .collect();
+    });
     barrier.wait();
     assert_eq!(
         threads

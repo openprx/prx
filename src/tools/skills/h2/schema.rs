@@ -111,9 +111,13 @@ pub(super) fn parameters_schema() -> Value {
         ("additionalProperties".into(), Value::from(false)),
         (
             "description".into(),
-            Value::from(
-                "Controlled instruction lifecycle. Start with catalog using {} to discover real candidate skill/pattern IDs, then plan with selected IDs and explicit user budgets. Catalog is bounded read-only discovery, not eligibility or authority; Plan revalidates candidates. Then admit and run the returned immutable plan. Inspect the actual snapshot. If final_selection exists, review it, publish {expected:final_selection}, then annotate the actual committed transaction. Approval is separate from execution: use the original terminal/Console review and explicit resume. Cancel persists a request; recover reconciles original facts; neither proves termination or retries Unknown. Historical inspect/query/replay and fresh authorized maintenance do not resume an old root. Study is local CLI only.",
-            ),
+            Value::from(concat!(
+                "Controlled instruction lifecycle. Start with catalog using {} to discover real candidate skill/pattern IDs, then plan with selected IDs and explicit user budgets. Catalog is bounded read-only discovery, not eligibility or authority; Plan revalidates candidates. Then admit and run the returned immutable plan. Inspect the actual snapshot. If final_selection exists, review it, publish ",
+                "{",
+                "expected:final_selection",
+                "}",
+                ", then annotate the actual committed transaction. Approval is separate from execution: use the original terminal/Console review and explicit resume. Cancel persists a request; recover reconciles original facts; neither proves termination or retries Unknown. Historical inspect/query/replay and fresh authorized maintenance do not resume an old root. Study is local CLI only."
+            )),
         ),
         (
             "allOf".into(),
@@ -1043,7 +1047,7 @@ fn definition_draft() -> Value {
                     Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
-                        ("maximum".into(), Value::from(262144_u64)),
+                        ("maximum".into(), Value::from(262_144_u64)),
                     ])),
                 ),
                 (
@@ -1059,7 +1063,7 @@ fn definition_draft() -> Value {
                     Value::Object(Map::from_iter([
                         ("type".into(), Value::from("integer")),
                         ("minimum".into(), Value::from(1_u64)),
-                        ("maximum".into(), Value::from(600000_u64)),
+                        ("maximum".into(), Value::from(600_000_u64)),
                     ])),
                 ),
             ])),
@@ -2499,7 +2503,7 @@ fn definition_operation() -> Value {
                                 Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("integer")),
                                     ("minimum".into(), Value::from(1_u64)),
-                                    ("maximum".into(), Value::from(262144_u64)),
+                                    ("maximum".into(), Value::from(262_144_u64)),
                                 ])),
                             ),
                             (
@@ -2515,7 +2519,7 @@ fn definition_operation() -> Value {
                                 Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("integer")),
                                     ("minimum".into(), Value::from(1_u64)),
-                                    ("maximum".into(), Value::from(600000_u64)),
+                                    ("maximum".into(), Value::from(600_000_u64)),
                                 ])),
                             ),
                         ])),
@@ -2700,7 +2704,7 @@ fn definition_operation() -> Value {
                                 Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("integer")),
                                     ("minimum".into(), Value::from(1_u64)),
-                                    ("maximum".into(), Value::from(262144_u64)),
+                                    ("maximum".into(), Value::from(262_144_u64)),
                                 ])),
                             ),
                             (
@@ -2716,7 +2720,7 @@ fn definition_operation() -> Value {
                                 Value::Object(Map::from_iter([
                                     ("type".into(), Value::from("integer")),
                                     ("minimum".into(), Value::from(1_u64)),
-                                    ("maximum".into(), Value::from(600000_u64)),
+                                    ("maximum".into(), Value::from(600_000_u64)),
                                 ])),
                             ),
                         ])),

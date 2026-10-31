@@ -16,7 +16,7 @@ impl SkillsManageTool {
             autonomy: crate::security::AutonomyLevel::Full,
             ..Default::default()
         });
-        let tool = SkillsManageTool::new(config.workspace_dir.clone(), config.clone(), security)
+        let tool = Self::new(config.workspace_dir.clone(), config.clone(), security)
             .with_lifecycle(service)
             .with_controlled_profile(current.profile()?);
         let mut args = json!({"action":"lifecycle_experiment_admit","request":plan});

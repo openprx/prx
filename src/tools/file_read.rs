@@ -24,7 +24,7 @@ impl FileReadTool {
         }
     }
 
-    pub(crate) fn new_controlled(
+    pub(crate) const fn new_controlled(
         security: Arc<SecurityPolicy>,
         acl_enabled: bool,
         filesystem: Arc<super::owner_filesystem::OwnerFilesystem>,

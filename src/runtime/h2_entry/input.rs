@@ -132,7 +132,7 @@ impl TerminalInputSink {
             producer: None,
         }
     }
-    pub(crate) fn controlled(sender: ChatInputSender, producer: TerminalInputProducer) -> Self {
+    pub(crate) const fn controlled(sender: ChatInputSender, producer: TerminalInputProducer) -> Self {
         Self {
             sender,
             producer: Some(producer),

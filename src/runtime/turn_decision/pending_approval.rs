@@ -1062,12 +1062,15 @@ impl TurnDecisionService {
             risk: Some(call.risk()),
             schema_dialect: Some(call.schema_dialect()),
             sealed_call: None,
-            expires_at: h2_origin.map_or(Utc::now() + chrono::Duration::minutes(5), |origin| {
-                origin
-                    .record()
-                    .authority_expires_at
-                    .min(Utc::now() + chrono::Duration::minutes(5))
-            }),
+            expires_at: h2_origin.map_or_else(
+                || Utc::now() + chrono::Duration::minutes(5),
+                |origin| {
+                    origin
+                        .record()
+                        .authority_expires_at
+                        .min(Utc::now() + chrono::Duration::minutes(5))
+                },
+            ),
         };
         record.sealed_call = Some(self.seal_pending_call(&record, call.command())?);
         let expires_at = record.expires_at;

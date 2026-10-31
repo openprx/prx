@@ -19,7 +19,7 @@ impl LocalControlAuthority {
     pub(crate) fn principal(&self) -> &str {
         self.profile.principal.as_deref().unwrap_or_default()
     }
-    pub(crate) fn profile(&self) -> &Arc<ControlledH2Profile> {
+    pub(crate) const fn profile(&self) -> &Arc<ControlledH2Profile> {
         &self.profile
     }
     #[allow(clippy::too_many_arguments)]

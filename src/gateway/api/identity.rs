@@ -1,6 +1,6 @@
 //! Authenticated identity evidence uses the existing private lifecycle store.
 //! It never enters semantic memory, message events, an outbox or remote sync.
-use super::*;
+use super::{ApiPrincipal, AppState, Config, HeaderMap, Json, State, StatusCode, extract_resource_auth_token};
 use crate::decision::{DecisionKey, KeyDomain};
 use crate::skills::lifecycle::SkillLifecycleStore;
 use anyhow::{Context, ensure};

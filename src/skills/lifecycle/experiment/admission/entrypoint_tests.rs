@@ -97,20 +97,18 @@ async fn invalid_owner_mac_and_operation_map_never_consume_declared_root_ceiling
         let store = std::sync::Arc::new(store);
         let plan = std::sync::Arc::new(plan);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let threads: Vec<_> = (0..2)
-            .map(|_| {
-                let store = store.clone();
-                let plan = plan.clone();
-                let bound = bound.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    bound
-                        .sync_scope(|| store.admit_experiment(&plan, chrono::Utc::now()))
-                        .is_ok()
-                })
+        let threads = [(); 2].map(|()| {
+            let store = store.clone();
+            let plan = plan.clone();
+            let bound = bound.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                bound
+                    .sync_scope(|| store.admit_experiment(&plan, chrono::Utc::now()))
+                    .is_ok()
             })
-            .collect();
+        });
         barrier.wait();
         assert!(threads.into_iter().all(|thread| thread.join().unwrap()));
         assert_eq!(crate::runtime::h2_entry::test_scope_root_claims(), 1);

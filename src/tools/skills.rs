@@ -938,7 +938,7 @@ impl SkillsManageTool {
                         properties.retain(|key,_|matches!(key.as_str(),"action"|"request"));
                     }
                     requirements=h2::ACTIONS.iter().map(|action|crate::tools::schema::ActionRequirement {
-                        action:*action,required:&["request"],
+                        action,required:&["request"],
                     }).collect();
                 }
                 crate::tools::schema::with_action_requirements(schema, "action", &requirements)

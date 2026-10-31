@@ -158,17 +158,14 @@ fn aggregate_claim_is_idempotent_and_racing_roots_cannot_overallocate() {
     let a = plan(&fixture, "a");
     let b = plan(&fixture, "b");
     let barrier = Arc::new(std::sync::Barrier::new(3));
-    let threads: Vec<_> = [a, b]
-        .into_iter()
-        .map(|plan| {
-            let profile = fixture.profile.clone();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                profile.claim_experiment(&plan).is_ok()
-            })
+    let threads = [a, b].map(|plan| {
+        let profile = fixture.profile.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            profile.claim_experiment(&plan).is_ok()
         })
-        .collect();
+    });
     barrier.wait();
     assert_eq!(
         threads

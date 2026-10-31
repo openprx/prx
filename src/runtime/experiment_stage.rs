@@ -62,7 +62,7 @@ impl ExperimentStageRuntime {
         );
         Ok((self.id.clone(), self.binding.experiment_sha256.clone()))
     }
-    pub(crate) fn kind(&self) -> crate::skills::lifecycle::experiment::ExperimentStageKind {
+    pub(crate) const fn kind(&self) -> crate::skills::lifecycle::experiment::ExperimentStageKind {
         self.kind
     }
     pub(crate) fn physical_identity(key: &DecisionKey, digest: &str, stage: &str) -> [u8; 32] {

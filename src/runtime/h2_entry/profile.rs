@@ -322,7 +322,7 @@ impl ControlledH2Profile {
     pub(crate) fn fingerprint(&self) -> &str {
         &self.digest
     }
-    pub(crate) fn target_owner(&self) -> &OwnerScope {
+    pub(crate) const fn target_owner(&self) -> &OwnerScope {
         &self.owner
     }
     pub(crate) fn workspace(&self) -> &Path {
@@ -405,7 +405,7 @@ pub(crate) struct ControlledReaderLifetime {
     shutdown: tokio_util::sync::CancellationToken,
 }
 impl ControlledReaderLifetime {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         profile: Option<Arc<ControlledH2Profile>>,
         shutdown: tokio_util::sync::CancellationToken,
     ) -> Self {

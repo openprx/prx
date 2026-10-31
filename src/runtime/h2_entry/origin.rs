@@ -3,10 +3,7 @@ use crate::{config::Config, runtime::turn_source::TurnSourceProof};
 use anyhow::{Result, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::{Arc, OnceLock, atomic::AtomicU64};
 
 /// Intent is parsed elsewhere; only this OS-reader owner mints fresh input proof.
 pub(crate) struct TerminalInputProducer {
@@ -81,10 +78,13 @@ impl TerminalInputProducer {
             !message_id.is_empty() && text.len() <= 256 * 1024,
             "terminal input exceeds its bound"
         );
-        let sequence = self
-            .sequence
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
-            .map_err(|_| anyhow::anyhow!("terminal input sequence exhausted"))?;
+        // The private OS producer is exclusively borrowed while issuing input.
+        // Keep overflow fail-closed without relaxing that mutable-owner API.
+        let next = self.sequence.get_mut();
+        let sequence = *next;
+        *next = sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("terminal input sequence exhausted"))?;
         Ok(TerminalInputProof(Arc::new(InputProof {
             profile: Arc::clone(&self.profile),
             sequence,
@@ -142,8 +142,9 @@ impl TerminalInputProof {
             .ok_or_else(|| anyhow::anyhow!("resume did not originate from the explicit local command"))?
             .trim();
         let parsed = uuid::Uuid::parse_str(id)?;
+        let expected = serde_json::to_string(&serde_json::json!({"decision_id":id}))?;
         ensure!(
-            parsed.hyphenated().to_string() == id && routed == serde_json::json!({"decision_id":id}).to_string(),
+            parsed.hyphenated().to_string() == id && routed == expected,
             "resume normalization differs from the exact local decision command"
         );
         Ok(Self(Arc::new(InputProof {
@@ -241,10 +242,10 @@ impl PartialEq for VerifiedEntryOrigin {
 }
 impl Eq for VerifiedEntryOrigin {}
 impl VerifiedEntryOrigin {
-    pub(crate) fn record(&self) -> &EntryOriginRecord {
+    pub(crate) const fn record(&self) -> &EntryOriginRecord {
         &self.record
     }
-    pub(crate) fn profile(&self) -> &Arc<ControlledH2Profile> {
+    pub(crate) const fn profile(&self) -> &Arc<ControlledH2Profile> {
         &self.profile
     }
     pub(crate) fn ensure_live(&self) -> Result<()> {

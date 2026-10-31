@@ -280,8 +280,8 @@ impl ApprovalCollectionLease {
             risk: Some(risk),
             schema_dialect: Some(dialect),
             sealed_call: None,
-            expires_at: self.source.h2_entry_origin().map_or(
-                chrono::Utc::now() + chrono::Duration::minutes(5),
+            expires_at: self.source.h2_entry_origin().map_or_else(
+                || chrono::Utc::now() + chrono::Duration::minutes(5),
                 |origin| {
                     origin
                         .record()

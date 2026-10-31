@@ -488,10 +488,10 @@ pub(super) fn run_tui_unified_loop(
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
     let controlled = producer.as_ref().map(|producer| producer.profile());
-    let mut terminal_input = match producer {
-        Some(producer) => crate::runtime::h2_entry::TerminalInputSink::controlled(input_tx.clone(), producer),
-        None => crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx.clone()),
-    };
+    let mut terminal_input = producer.map_or_else(
+        || crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx.clone()),
+        |producer| crate::runtime::h2_entry::TerminalInputSink::controlled(input_tx.clone(), producer),
+    );
     use crate::chat::action::Action;
     use crossterm::event::{Event, KeyEventKind};
 

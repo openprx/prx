@@ -34,7 +34,10 @@ async fn unauthenticated_identity_has_no_evidence_sideeffect_and_response_has_no
     let (status, body) = served.call(reqwest::Method::GET, "/api/identity", None).await;
     assert_eq!(status, 200, "{body}");
     let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(value["principal_id"], ApiPrincipal::of_token(TOKEN).owner_id);
+    assert_eq!(
+        value.get("principal_id").unwrap(),
+        ApiPrincipal::of_token(TOKEN).owner_id
+    );
     assert!(!body.contains(TOKEN));
     assert!(!body.contains(&crate::security::pairing::hash_token(TOKEN)));
     for forbidden in ["credential_verifier", "owner_mac", "mac", "key"] {
@@ -79,7 +82,7 @@ async fn tampered_descriptor_cannot_select_another_owner_or_principal() {
         .join(format!("{}.json", hex::encode(Sha256::digest(principal.as_bytes()))));
     let original = std::fs::read(&path).unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
-    value["body"]["store_owner"] = serde_json::json!("owner:other");
+    *value.get_mut("body").unwrap().get_mut("store_owner").unwrap() = serde_json::json!("owner:other");
     std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     assert!(verify_startup_identity(&config, &principal).await.is_err());
     assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_vec(&value).unwrap());
