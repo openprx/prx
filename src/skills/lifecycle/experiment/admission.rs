@@ -159,3 +159,6 @@ impl SkillLifecycleStore {
         }
     }
 }
+
+#[cfg(test)]
+mod entrypoint_tests;
