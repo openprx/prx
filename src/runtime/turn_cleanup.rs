@@ -434,11 +434,7 @@ impl CleanupScope {
 }
 
 fn cleanup_deadline() -> tokio::time::Instant {
-    // Production keeps a short bound. The full guarded suite runs this drain
-    // under heavy load, and a 15s wait has failed an otherwise successful
-    // two-hop router session with an unconfirmed cleanup acknowledgement.
-    let secs = if cfg!(test) { 60 } else { 15 };
-    tokio::time::Instant::now() + std::time::Duration::from_secs(secs)
+    tokio::time::Instant::now() + std::time::Duration::from_secs(15)
 }
 
 impl Drop for CleanupScope {
