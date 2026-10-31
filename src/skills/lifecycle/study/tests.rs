@@ -222,7 +222,10 @@ fn observed_receipt(
 ) -> Result<(StudyTrialReceipt, BTreeMap<String, Option<Vec<u8>>>)> {
     let artifacts = BTreeMap::from([("result.txt".into(), bytes.map(<[u8]>::to_vec))]);
     let stage = pair.stage_id(arm);
-    let model = plan.manifest.runtime.model.model.clone();
+    let model = format!(
+        "{}/{}",
+        plan.manifest.runtime.model.provider_label, plan.manifest.runtime.model.model
+    );
     let physical = StudyPhysicalObservation {
         scope_id: hash(format!("{stage}-scope").as_bytes()),
         attempt_ids: vec![format!("unverified-fixture-{stage}")],

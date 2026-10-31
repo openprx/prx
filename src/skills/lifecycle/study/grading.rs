@@ -76,16 +76,17 @@ impl StudyTrialReceipt {
         {
             invalid.push("physical_usage_unresolved_or_mismatched".into());
         }
+        // The original cost ledger records the provider/model pair, including
+        // a redacted custom endpoint, rather than the bare requested model.
+        let expected_model = format!(
+            "{}/{}",
+            crate::providers::redact_endpoint_userinfo(&manifest.runtime.model.provider_label),
+            manifest.runtime.model.model
+        );
         if !super::valid_digest(&run.environment_hash)
             || run.models_used.is_empty()
-            || run
-                .models_used
-                .iter()
-                .any(|model| model != &manifest.runtime.model.model)
-            || physical
-                .models
-                .iter()
-                .any(|model| model != &manifest.runtime.model.model)
+            || run.models_used.iter().any(|model| model != &expected_model)
+            || physical.models.iter().any(|model| model != &expected_model)
             || run.models_used != physical.models
         {
             invalid.push("model_or_environment_mismatch".into());

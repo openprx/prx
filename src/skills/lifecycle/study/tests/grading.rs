@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+fn measured_model_identity_requires_the_exact_ledger_provider_and_model_pair() -> Result<()> {
+    let (mut plan, baseline, _) = plan_fixture(2, 1)?;
+    plan.manifest.runtime.model.provider_label = "custom:http://127.0.0.1:18080/v1".into();
+    plan.manifest.runtime.model.model = "prx/model".into();
+    plan.experiment.spec.pins.model = plan.manifest.runtime.model.clone();
+    let pair = plan.manifest.pairs.first().context("pair")?;
+    let (receipt, artifacts) = observed_receipt(&plan, &baseline, pair, StudyArm::Baseline, Some(b"VERIFIED\n"))?;
+    let valid = receipt.compute_grade(&plan.manifest, &baseline, &artifacts, &receipt.physical)?;
+    assert!(valid.measured_and_valid && valid.success);
+    for model in [
+        "prx/model",
+        "other-provider/prx/model",
+        "custom:http://127.0.0.1:18081/v1/prx/model",
+        "custom:http://127.0.0.1:18080/v1/other-model",
+    ] {
+        let mut changed = receipt.clone();
+        changed.run.models_used = vec![model.into()];
+        changed.physical.models = vec![model.into()];
+        let grade = changed.compute_grade(&plan.manifest, &baseline, &artifacts, &changed.physical)?;
+        assert!(
+            !grade.measured_and_valid && !grade.success,
+            "accepted model identity {model}"
+        );
+        assert_eq!(grade.invalid_reasons, ["model_or_environment_mismatch"]);
+    }
+    for change_run in [false, true] {
+        let mut changed = receipt.clone();
+        let models = if change_run {
+            &mut changed.run.models_used
+        } else {
+            &mut changed.physical.models
+        };
+        *models = vec!["other-provider/prx/model".into()];
+        let grade = changed.compute_grade(&plan.manifest, &baseline, &artifacts, &changed.physical)?;
+        assert!(!grade.measured_and_valid && !grade.success);
+        assert_eq!(grade.invalid_reasons, ["model_or_environment_mismatch"]);
+    }
+    Ok(())
+}
+
+#[test]
 fn correct_prose_and_requested_arguments_without_an_actual_file_are_failure() -> Result<()> {
     let (plan, baseline, _) = plan_fixture(2, 1)?;
     let pair = plan.manifest.pairs.first().context("pair")?;
