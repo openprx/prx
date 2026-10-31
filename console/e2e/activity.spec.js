@@ -27,7 +27,7 @@ test('shows denial, a stale jobs load, and a runtime steer refusal', async ({ pa
   await stubStatus(page);
   await page.route(/\/api\/jobs$/, (route) => route.abort('failed'));
   await page.goto('/activity');
-  await expect(page.getByText('The progress check lost contact.')).toBeVisible();
+  await expect(page.getByText('The connection was lost. Refresh before trying again.')).toBeVisible();
   await page.unroute(/\/api\/jobs$/);
   await page.route(/\/api\/jobs$/, (route) => fulfillJson(route, 403, { error: 'denied' }));
   await page.reload();

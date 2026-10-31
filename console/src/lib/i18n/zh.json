@@ -50,6 +50,7 @@
     "yes": "是",
     "no": "否",
     "unknown": "未知",
+    "connectionLost": "连接已中断。请刷新后再试。",
     "clipboardUnavailable": "当前环境不支持剪贴板。",
     "copied": "已复制",
     "copyFailed": "复制失败",
@@ -152,7 +153,8 @@
     "cancelled": "已取消",
     "stillRunning": "此回合仍在运行。再次检查以继续观察。",
     "checkAgain": "再次检查",
-    "pollStale": "进度检查失去联系。回合没有再次发送。"
+    "pollStale": "进度检查失去联系。回合没有再次发送。",
+    "jobUnknown": "网关已不再知道此作业；请查看历史记录。"
   },
   "channels": {
     "title": "通道",
@@ -810,6 +812,7 @@
     "pools": "连接池",
     "empty": "没有运行中或未回收的任务。",
     "loadFailed": "无法加载运行时任务。",
+    "outcomeUnknown": "结果未知。请刷新后再试。",
     "denied": "你没有查看运行时任务的权限。",
     "steerTitle": "向此任务发送消息",
     "steerConsequence": "消息被放入任务队列。排队结果并不表示已送达。",

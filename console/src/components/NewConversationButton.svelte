@@ -4,8 +4,9 @@
 
   let { placement = 'header' } = $props();
 
+  const showsCreateState = $derived(placement === 'header');
   const describedBy = $derived(
-    sessionCreate.uncertain ? `new-conversation-uncertain-${placement}` : undefined
+    showsCreateState && sessionCreate.uncertain ? `new-conversation-uncertain-${placement}` : undefined
   );
 </script>
 
@@ -20,10 +21,10 @@
   >
     {sessionCreate.pending ? t('sessions.creating') : t('shell.newConversation')}
   </button>
-  {#if sessionCreate.error}
+  {#if showsCreateState && sessionCreate.error}
     <p role="alert" class="max-w-full text-sm text-red-700 dark:text-red-300">{sessionCreate.error}</p>
   {/if}
-  {#if sessionCreate.uncertain}
+  {#if showsCreateState && sessionCreate.uncertain}
     <p id={`new-conversation-uncertain-${placement}`} role="status" class="max-w-full text-sm text-amber-800 dark:text-amber-200">
       {t('sessions.uncertain')}
     </p>

@@ -34,6 +34,7 @@
       workId: typeof accepted.work_id === 'string' ? accepted.work_id : '',
       stillRunning: false,
       pollStale: false,
+      jobMissing: false,
       ack: ''
     };
     watchHandle = createJobWatch({
@@ -42,8 +43,12 @@
         if (!alive || sessionId !== origin || !turn) {
           return;
         }
+        if (update.terminalUnknown) {
+          turn = { ...turn, pollStale: false, jobMissing: true, stillRunning: false };
+          return;
+        }
         if (update.error) {
-          turn = { ...turn, pollStale: true };
+          turn = { ...turn, pollStale: true, jobMissing: false };
           return;
         }
         const snapshot = update.snapshot || {};
@@ -53,7 +58,8 @@
           phase,
           elapsedMs: Number.isFinite(snapshot.elapsed_ms) ? snapshot.elapsed_ms : turn.elapsedMs,
           stillRunning: update.stillRunning === true,
-          pollStale: false
+          pollStale: false,
+          jobMissing: false
         };
         if (!isTerminalPhase(phase)) {
           return;
@@ -196,7 +202,7 @@
   {/if}
   {#if turn}
     <div class="mt-3">
-      <TurnProgress phase={turn.phase} elapsedMs={turn.elapsedMs} jobId={turn.jobId} workId={turn.workId} stillRunning={turn.stillRunning} pollStale={turn.pollStale} ack={turn.ack} onCheckAgain={() => watchHandle?.checkAgain()} />
+      <TurnProgress phase={turn.phase} elapsedMs={turn.elapsedMs} jobId={turn.jobId} workId={turn.workId} stillRunning={turn.stillRunning} pollStale={turn.pollStale} jobMissing={turn.jobMissing} ack={turn.ack} onCheckAgain={() => watchHandle?.checkAgain()} />
     </div>
   {/if}
   <div aria-live="polite" class="mt-2 text-gray-700 dark:text-gray-200">{busy ? t('common.loading') : notice}</div>

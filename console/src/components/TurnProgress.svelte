@@ -13,7 +13,8 @@
     ack = '',
     uncertain = false,
     onCancel,
-    onCheckAgain
+    onCheckAgain,
+    jobMissing = false
   } = $props();
 
   const tones = {
@@ -56,11 +57,14 @@
   {#if ack}
     <p role="status" class="break-all">{ack}</p>
   {/if}
-  {#if active}
+  {#if jobMissing}
+    <StateBlock variant="error" message={t('chat.jobUnknown')} />
+  {/if}
+  {#if active && onCancel && !jobMissing}
     <button
       type="button"
       class="rounded-lg border border-amber-700 px-3 py-2 text-sm text-amber-900 dark:text-amber-200"
-      onclick={() => onCancel?.()}
+      onclick={() => onCancel()}
     >
       {t('chat.cancelTurn')}
     </button>

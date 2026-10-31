@@ -19,6 +19,19 @@ test('shows the phase, elapsed time, and cancel action', async () => {
   expect(onCancel).toHaveBeenCalledOnce();
 });
 
+test('hides cancel when the caller does not provide onCancel', () => {
+  render(TurnProgress, {
+    props: {
+      phase: 'running',
+      elapsedMs: 40,
+      jobId: 'job-1',
+      workId: 'work-1'
+    }
+  });
+  expect(screen.getByText('Running')).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Cancel turn' })).not.toBeInTheDocument();
+});
+
 test('a stale poll offers check again without a cancel on a finished phase', async () => {
   const onCheckAgain = vi.fn();
   render(TurnProgress, {

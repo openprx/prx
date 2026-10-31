@@ -49,10 +49,10 @@
         failure = t('approvals.unavailable');
       } else if (isAmbiguous(error)) {
         variant = 'disconnected-stale';
-        failure = t('chat.pollStale');
+        failure = t('common.connectionLost');
       } else {
         variant = 'error';
-        failure = error instanceof Error ? error.message : t('approvals.loadFailed');
+        failure = t('approvals.loadFailed');
       }
     } finally {
       loading = false;

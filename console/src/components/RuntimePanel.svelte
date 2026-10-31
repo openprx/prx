@@ -49,7 +49,7 @@
         failure = t('runtime.denied');
       } else if (!(error instanceof ApiError)) {
         variant = 'disconnected-stale';
-        failure = t('chat.pollStale');
+        failure = t('common.connectionLost');
       } else {
         variant = 'error';
         failure = error.message || t('runtime.loadFailed');
@@ -86,7 +86,7 @@
       }
       rowNote = {
         ...rowNote,
-        [item.id]: error instanceof ApiError ? error.message : t('chat.pollStale')
+        [item.id]: error instanceof ApiError ? error.message : t('runtime.outcomeUnknown')
       };
     }
   }
@@ -127,7 +127,7 @@
       }
       rowNote = {
         ...rowNote,
-        [item.id]: error instanceof ApiError ? error.message : t('chat.pollStale')
+        [item.id]: error instanceof ApiError ? error.message : t('runtime.outcomeUnknown')
       };
     }
   }

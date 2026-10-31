@@ -35,4 +35,9 @@ test('distinguishes an empty inbox, a disabled plane, and a denial', async ({ pa
   await page.route('**/api/sessions/approvals**', (route) => fulfillJson(route, 403, { error: 'denied' }));
   await page.reload();
   await expect(page.getByText('You do not have permission to view approvals.')).toBeVisible();
+  await page.unroute('**/api/sessions/approvals**');
+  await page.route('**/api/sessions/approvals**', (route) => fulfillJson(route, 503, { error: 'Approval inbox is unavailable' }));
+  await page.reload();
+  await expect(page.getByText('Could not load approvals.')).toBeVisible();
+  await expect(page.getByText('Decision approvals are disabled.')).toHaveCount(0);
 });

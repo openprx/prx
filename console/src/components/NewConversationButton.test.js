@@ -36,20 +36,27 @@ test('one click posts once and a second click waits on the same request', async 
   resolveCreate({ status: 201, body: { session_id: 'session-1' } });
 });
 
-test('a denied create shows the error and does not claim uncertainty', async () => {
+test('a denied create shows the error once, on the header', async () => {
   const { ApiError } = await import('../lib/api');
   api.createSession.mockRejectedValue(new ApiError(403, 'denied'));
-  render(NewConversationButton, { props: { placement: 'sessions' } });
-  await fireEvent.click(screen.getByRole('button', { name: 'New conversation' }));
+  render(NewConversationButton, { props: { placement: 'header' } });
+  render(NewConversationButton, { props: { placement: 'empty' } });
+  const buttons = screen.getAllByRole('button', { name: 'New conversation' });
+  await fireEvent.click(buttons[1]);
   expect(await screen.findByRole('alert')).toHaveTextContent('denied');
+  expect(screen.getAllByRole('alert')).toHaveLength(1);
   expect(screen.queryByRole('button', { name: 'Refresh list' })).not.toBeInTheDocument();
 });
 
-test('an uncertain create offers refresh and does not post again', async () => {
+test('an uncertain create offers refresh once and does not post again', async () => {
   api.createSession.mockRejectedValue(new TypeError('failed'));
+  render(NewConversationButton, { props: { placement: 'header' } });
+  render(NewConversationButton, { props: { placement: 'sessions' } });
   render(NewConversationButton, { props: { placement: 'empty' } });
-  await fireEvent.click(screen.getByRole('button', { name: 'New conversation' }));
+  const buttons = screen.getAllByRole('button', { name: 'New conversation' });
+  await fireEvent.click(buttons[2]);
   expect(await screen.findByRole('status')).toHaveTextContent('uncertain');
+  expect(screen.getAllByRole('status')).toHaveLength(1);
   await fireEvent.click(screen.getByRole('button', { name: 'Refresh list' }));
   expect(api.createSession).toHaveBeenCalledTimes(1);
 });

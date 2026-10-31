@@ -6,8 +6,8 @@ async function openTerminals(page) {
   await stubStatus(page);
   await page.route('**/api/chat-sessions/results**', (route) => fulfillJson(route, 200, {
     results: [],
-    next_seq: 0,
-    oldest_seq: 2
+    next_seq: 1,
+    oldest_seq: 1
   }));
   await page.route('**/api/chat-sessions', (route) => fulfillJson(route, 200, {
     sessions: [{
@@ -23,12 +23,46 @@ async function openTerminals(page) {
   await page.goto('/terminals');
 }
 
-test('does not render a session token and reports missed results', async ({ page }) => {
+test('does not render a session token on a fresh results feed', async ({ page }) => {
   await openTerminals(page);
   await expect(page.getByText('mailbox-1')).toBeVisible();
   await expect(page.getByText('hidden-token')).toHaveCount(0);
-  await expect(page.getByText('Some older results are no longer retained.')).toBeVisible();
+  await expect(page.getByText('Some older results are no longer retained.')).toHaveCount(0);
   await expect(page.getByText('not the conversations stored by this console')).toBeVisible();
+});
+
+test('a later cursor behind oldest_seq reports missed results', async ({ page }) => {
+  let reads = 0;
+  await signIn(page);
+  await stubStatus(page);
+  await page.route('**/api/chat-sessions/results**', (route) => {
+    reads += 1;
+    if (reads === 1) {
+      return fulfillJson(route, 200, { results: [], next_seq: 5, oldest_seq: 1 });
+    }
+    return fulfillJson(route, 200, { results: [], next_seq: 5, oldest_seq: 6 });
+  });
+  await page.route('**/api/chat-sessions', (route) => {
+    if (route.request().method() !== 'GET') {
+      return route.fallback();
+    }
+    return fulfillJson(route, 200, {
+      sessions: [{ session_id: 'mailbox-1', label: 'prx_node', pid: 9, liveness: 'polling', queued: 0 }]
+    });
+  });
+  await page.route('**/api/chat-sessions/*/assign', (route) => fulfillJson(route, 200, {
+    assignment_id: 'asg-1',
+    work_id: 'work-1',
+    disposition: 'queue'
+  }));
+  await page.goto('/terminals');
+  await expect(page.getByText('mailbox-1')).toBeVisible();
+  await expect(page.getByText('Some older results are no longer retained.')).toHaveCount(0);
+  await page.getByLabel('Terminal session').selectOption('mailbox-1');
+  await page.getByLabel('Task').fill('inspect logs');
+  await page.getByRole('button', { name: 'Assign task' }).click();
+  await page.locator('.ui-dialog-confirm').click();
+  await expect(page.getByText('Some older results are no longer retained.')).toBeVisible();
 });
 
 test('shows a rate limit and does not retry the assignment', async ({ page }) => {
@@ -52,7 +86,7 @@ test('shows a rate limit and does not retry the assignment', async ({ page }) =>
 test('a denied terminal list is distinct from an uncertain assignment', async ({ page }) => {
   await signIn(page);
   await stubStatus(page);
-  await page.route('**/api/chat-sessions/results**', (route) => fulfillJson(route, 200, { results: [], next_seq: 0, oldest_seq: 0 }));
+  await page.route('**/api/chat-sessions/results**', (route) => fulfillJson(route, 200, { results: [], next_seq: 1, oldest_seq: 1 }));
   await page.route('**/api/chat-sessions', (route) => fulfillJson(route, 403, { error: 'denied' }));
   await page.goto('/terminals');
   await expect(page.getByText('You do not have permission to view terminal sessions.')).toBeVisible();

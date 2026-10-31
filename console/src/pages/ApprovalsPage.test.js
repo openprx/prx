@@ -27,6 +27,13 @@ test('shows an empty inbox separately from a disabled plane', async () => {
   expect(await screen.findByText('Decision approvals are disabled.')).toBeInTheDocument();
 });
 
+test('a service failure is a load failure, not a disabled plane', async () => {
+  api.listApprovals.mockRejectedValueOnce(new ApiError(503, 'Approval inbox is unavailable'));
+  render(ApprovalsPage);
+  expect(await screen.findByText('Could not load approvals.')).toBeInTheDocument();
+  expect(screen.queryByText('Decision approvals are disabled.')).not.toBeInTheDocument();
+});
+
 test('shows a denied inbox and a pending row link', async () => {
   api.listApprovals.mockRejectedValueOnce(new ApiError(403, 'no'));
   const denied = render(ApprovalsPage);

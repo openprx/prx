@@ -81,6 +81,7 @@
       cancelPath,
       stillRunning: false,
       pollStale: false,
+      jobMissing: false,
       ack: ''
     };
     watchHandle = createJobWatch({
@@ -89,8 +90,12 @@
         if (!turn || turn.sessionId !== originSession || sessionId !== originSession) {
           return;
         }
+        if (update.terminalUnknown) {
+          turn = { ...turn, pollStale: false, jobMissing: true, stillRunning: false };
+          return;
+        }
         if (update.error) {
-          turn = { ...turn, pollStale: true };
+          turn = { ...turn, pollStale: true, jobMissing: false };
           return;
         }
         const snapshot = update.snapshot || {};
@@ -100,7 +105,8 @@
           phase,
           elapsedMs: Number.isFinite(snapshot.elapsed_ms) ? snapshot.elapsed_ms : turn.elapsedMs,
           stillRunning: update.stillRunning === true,
-          pollStale: false
+          pollStale: false,
+          jobMissing: false
         };
         if (phase === 'succeeded') {
           applyReply(snapshot.result);
@@ -423,9 +429,24 @@
 
   async function refreshPreservingPin() {
     const wasPinned = pinnedToBottom();
-    await loadMessagesPage(0);
-    errorMessage = '';
-    await followIfPinned(wasPinned);
+    const kept = loadedCount;
+    const limit = Math.max(kept, MESSAGES_PAGE_SIZE);
+    try {
+      const response = await api.getSessionMessages(sessionId, {
+        limit: limit + 1,
+        offset: 0
+      });
+      const rawMessages = Array.isArray(response) ? response : [];
+      const nextHasMore = rawMessages.length > limit;
+      const pageMessages = nextHasMore ? rawMessages.slice(0, limit) : rawMessages;
+      messages = mergeMessages(pageMessages);
+      loadedCount = messages.length;
+      hasMore = nextHasMore;
+      errorMessage = '';
+      await followIfPinned(wasPinned);
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : t('chat.loadFailed');
+    }
   }
 
   async function refreshMessages() {
@@ -495,17 +516,26 @@
       }
       draftMessage = '';
       clearSelectedFiles();
-      if (message.length > 0 && files.length === 0) {
-        const wasPinned = pinnedToBottom();
-        messages = [...messages, { role: 'user', content: message }];
-        await followIfPinned(wasPinned);
-      } else if (files.length > 0) {
-        const wasPinned = pinnedToBottom();
-        await loadMessagesPage(0);
-        await followIfPinned(wasPinned);
-      }
       if (accepted) {
         startWatch(body, originSession);
+      }
+      try {
+        if (message.length > 0 && files.length === 0) {
+          const wasPinned = pinnedToBottom();
+          messages = [...messages, { role: 'user', content: message }];
+          await followIfPinned(wasPinned);
+        } else if (files.length > 0) {
+          const wasPinned = pinnedToBottom();
+          await loadMessagesPage(0);
+          await followIfPinned(wasPinned);
+        }
+      } catch (refreshError) {
+        if (!accepted) {
+          throw refreshError;
+        }
+        errorMessage = refreshError instanceof Error ? refreshError.message : t('chat.loadFailed');
+      }
+      if (accepted) {
         return;
       }
       applyReply(body);
@@ -588,6 +618,7 @@
       workId={turn.workId}
       stillRunning={turn.stillRunning}
       pollStale={turn.pollStale}
+      jobMissing={turn.jobMissing}
       ack={turn.ack}
       onCancel={() => { cancelOpen = true; }}
       onCheckAgain={() => watchHandle?.checkAgain()}

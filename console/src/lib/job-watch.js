@@ -1,3 +1,4 @@
+import { ApiError } from './api';
 import { STILL_RUNNING_MS, isTerminalPhase, pollDelayMs } from './transport';
 
 // Poll a job that the server has already accepted. The POST that created the
@@ -24,10 +25,13 @@ export function createJobWatch({ poll, onUpdate }) {
       onUpdate({
         snapshot,
         error: null,
-        stillRunning: !terminal && watchMs >= STILL_RUNNING_MS
+        stillRunning: !terminal && watchMs >= STILL_RUNNING_MS,
+        terminalUnknown: false
       });
     } catch (error) {
-      onUpdate({ snapshot: null, error, stillRunning: false });
+      const terminalUnknown = error instanceof ApiError && error.status === 404;
+      terminal = terminalUnknown;
+      onUpdate({ snapshot: null, error, stillRunning: false, terminalUnknown });
     } finally {
       running = false;
     }

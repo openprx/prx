@@ -48,6 +48,43 @@ test('a background reply does not pull the reader away from older messages', asy
   expect(scrollTop).toBeLessThan(30);
 });
 
+test('a media send that is accepted still shows progress when history refresh fails', async ({ page }) => {
+  let messageReads = 0;
+  await signIn(page);
+  await stubStatus(page);
+  await page.route('**/api/sessions/*/messages**', (route) => {
+    messageReads += 1;
+    if (messageReads === 1) {
+      return fulfillJson(route, 200, []);
+    }
+    return fulfillJson(route, 500, { error: 'history unavailable' });
+  });
+  await page.route('**/api/sessions/*/message', (route) => fulfillJson(route, 202, {
+    status: 'accepted',
+    job_id: 'job-media',
+    work_id: 'work-media',
+    poll_url: '/api/jobs/job-media',
+    cancel_url: '/api/jobs/job-media/cancel'
+  }));
+  await page.route(/\/api\/jobs\/job-media$/, (route) => fulfillJson(route, 200, {
+    job_id: 'job-media',
+    status: 'running',
+    elapsed_ms: 20,
+    work_id: 'work-media'
+  }));
+  await page.goto('/chat/session-1');
+  await page.locator('input[type="file"]').setInputFiles({
+    name: 'note.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('hello')
+  });
+  await page.locator('textarea').fill('with a file');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect(page.getByText('Running')).toBeVisible();
+  await expect(page.getByText('job-media')).toBeVisible();
+  await expect(page.getByText('The send may have reached the gateway.')).toHaveCount(0);
+});
+
 test('an uncertain send is not repeated and the draft stays', async ({ page }) => {
   let posts = 0;
   await signIn(page);

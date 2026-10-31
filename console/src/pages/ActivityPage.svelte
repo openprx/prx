@@ -1,5 +1,6 @@
 <script>
   import { ApiError, api } from '../lib/api';
+  import { formatUptime } from '../lib/format';
   import { t } from '../lib/i18n';
   import ConfirmDialog from '../lib/ui/ConfirmDialog.svelte';
   import DataTable from '../lib/ui/DataTable.svelte';
@@ -22,6 +23,31 @@
   let cancelAck = $state('');
   let detailTicket = 0;
 
+  const phaseTones = {
+    accepted: 'info',
+    running: 'info',
+    succeeded: 'success',
+    failed: 'danger',
+    cancelled: 'warning'
+  };
+
+  function phaseLabel(status) {
+    if (typeof status !== 'string' || status.length === 0) {
+      return t('common.unknown');
+    }
+    const key = `chat.${status}`;
+    const translated = t(key);
+    return translated === key ? status : translated;
+  }
+
+  function elapsedLabel(ms) {
+    const value = Number(ms);
+    if (!Number.isFinite(value) || value < 0) {
+      return t('common.unknown');
+    }
+    return formatUptime(value / 1000);
+  }
+
   const columns = $derived([
     { key: 'job_id', label: t('chat.job'), truncate: true },
     { key: 'status', label: t('activity.status') },
@@ -33,10 +59,10 @@
   const visible = $derived(
     jobs.filter((job) => phase === 'all' || job.status === phase).map((job) => ({
       job_id: job.job_id,
-      status: job.status,
+      status: phaseLabel(job.status),
       label: job.label || '',
       work_id: job.work_id || '',
-      elapsed_ms: Number.isFinite(job.elapsed_ms) ? String(job.elapsed_ms) : ''
+      elapsed_ms: elapsedLabel(job.elapsed_ms)
     }))
   );
 
@@ -63,7 +89,7 @@
         failure = t('activity.denied');
       } else if (!(error instanceof ApiError)) {
         variant = 'disconnected-stale';
-        failure = t('chat.pollStale');
+        failure = t('common.connectionLost');
       } else {
         variant = 'error';
         failure = error.message || t('activity.loadFailed');
@@ -87,7 +113,7 @@
         return;
       }
       detail = null;
-      detailError = error instanceof ApiError ? error.message : t('chat.pollStale');
+      detailError = error instanceof ApiError ? error.message : t('common.connectionLost');
     }
   }
 
@@ -119,7 +145,7 @@
       if (ticket !== detailTicket) {
         return;
       }
-      detailError = error instanceof ApiError ? error.message : t('chat.pollStale');
+      detailError = error instanceof ApiError ? error.message : t('runtime.outcomeUnknown');
     }
   }
 
@@ -209,7 +235,8 @@
         {#if detail}
           <article class="min-w-0 space-y-2 rounded-xl border border-gray-200 p-4 dark:border-gray-700">
             <h3 class="text-lg font-semibold">{t('activity.detail')}</h3>
-            <StatusBadge label={detail.status || t('common.unknown')} tone={detail.status === 'failed' ? 'danger' : 'info'} />
+            <StatusBadge label={phaseLabel(detail.status)} tone={phaseTones[detail.status] || 'neutral'} />
+            <p class="text-sm">{t('activity.elapsed')}: {elapsedLabel(detail.elapsed_ms)}</p>
             <p class="break-all text-sm">{t('activity.httpStatus')}: {detail.http_status ?? t('common.unknown')}</p>
             <p class="break-all font-mono text-xs">{t('activity.workId')}: {detail.work_id || t('common.unknown')}</p>
             <p class="text-sm">{t('activity.result')}</p>

@@ -1,6 +1,7 @@
 <script>
   import { ApiError, api } from '../lib/api';
   import { t } from '../lib/i18n';
+  import { resultsWereTrimmed } from '../lib/terminal-results';
   import ConfirmDialog from '../lib/ui/ConfirmDialog.svelte';
   import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
@@ -58,7 +59,7 @@
         failure = t('terminals.denied');
       } else if (!(error instanceof ApiError)) {
         variant = 'disconnected-stale';
-        failure = t('chat.pollStale');
+        failure = t('common.connectionLost');
       } else {
         variant = 'error';
         failure = error.message || t('terminals.loadFailed');
@@ -75,7 +76,7 @@
     try {
       const response = await api.listChatResults({ afterSeq: requested, limit: 50 });
       const rows = Array.isArray(response?.results) ? response.results : [];
-      if (typeof response?.oldest_seq === 'number' && requested < response.oldest_seq) {
+      if (resultsWereTrimmed(requested, response?.oldest_seq)) {
         missed = true;
       }
       results = [...results, ...rows];

@@ -50,6 +50,7 @@
     "yes": "Yes",
     "no": "No",
     "unknown": "Unknown",
+    "connectionLost": "The connection was lost. Refresh before trying again.",
     "clipboardUnavailable": "Clipboard not available.",
     "copied": "Copied",
     "copyFailed": "Copy failed",
@@ -152,7 +153,8 @@
     "cancelled": "Cancelled",
     "stillRunning": "This turn is still running. Check again to keep watching.",
     "checkAgain": "Check again",
-    "pollStale": "The progress check lost contact. The turn was not sent again."
+    "pollStale": "The progress check lost contact. The turn was not sent again.",
+    "jobUnknown": "The gateway no longer knows this job; check history."
   },
   "channels": {
     "title": "Channels",
@@ -810,6 +812,7 @@
     "pools": "Pools",
     "empty": "No running or unreaped tasks.",
     "loadFailed": "Could not load runtime tasks.",
+    "outcomeUnknown": "The result is unknown. Refresh before trying again.",
     "denied": "You do not have permission to view runtime tasks.",
     "steerTitle": "Send a message to this task",
     "steerConsequence": "The message is placed on the task queue. A queued outcome is not delivery.",

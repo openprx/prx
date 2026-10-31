@@ -41,7 +41,8 @@ test('a denied create keeps the list and shows the error', async ({ page }) => {
     return route.fallback();
   });
   await page.locator('.ui-new-conversation-sessions').click();
-  await expect(page.locator('#console-main').getByRole('alert').filter({ hasText: 'denied' })).toBeVisible();
+  await expect(page.locator('.console-header').getByRole('alert').filter({ hasText: 'denied' })).toBeVisible();
+  await expect(page.locator('#console-main').getByRole('alert')).toHaveCount(0);
   await expect(page.getByText('kept')).toBeVisible();
 });
 
@@ -56,7 +57,9 @@ test('an uncertain create is not sent again', async ({ page }) => {
     return fulfillJson(route, 200, []);
   });
   await page.locator('.ui-new-conversation-empty').click();
-  await expect(page.locator('#new-conversation-uncertain-empty')).toBeVisible();
-  await page.getByRole('button', { name: 'Refresh list' }).first().click();
+  await expect(page.locator('#new-conversation-uncertain-header')).toBeVisible();
+  await expect(page.locator('#new-conversation-uncertain-empty')).toHaveCount(0);
+  await expect(page.locator('#new-conversation-uncertain-sessions')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Refresh list' }).click();
   await expect.poll(() => posts).toBe(1);
 });

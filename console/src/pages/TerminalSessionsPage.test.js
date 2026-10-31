@@ -22,7 +22,7 @@ beforeEach(() => {
   api.listChatResults.mockReset();
 });
 
-test('lists a mailbox without a token and warns when older results were dropped', async () => {
+test('lists a mailbox without a token and does not warn on a fresh results cursor', async () => {
   api.listChatSessions.mockResolvedValue({
     sessions: [{
       session_id: 'mailbox-1',
@@ -36,12 +36,12 @@ test('lists a mailbox without a token and warns when older results were dropped'
   api.listChatResults.mockResolvedValue({
     results: [{ seq: 4, session_id: 'mailbox-1', session_label: 'prx_node', disposition: 'queue', status: 'completed', summary: 'done' }],
     next_seq: 5,
-    oldest_seq: 4
+    oldest_seq: 1
   });
   render(TerminalSessionsPage);
   expect(await screen.findByText('mailbox-1')).toBeInTheDocument();
   expect(screen.getByText(/not the conversations stored by this console/)).toBeInTheDocument();
   expect(screen.queryByText('must-not-render')).not.toBeInTheDocument();
-  expect(await screen.findByText('Some older results are no longer retained.')).toBeInTheDocument();
+  expect(screen.queryByText('Some older results are no longer retained.')).not.toBeInTheDocument();
   expect(screen.getByText(/done/)).toBeInTheDocument();
 });
