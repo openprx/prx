@@ -123,6 +123,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/status", get(status::get_status))
         .route("/identity",get(identity::get_identity))
         .route("/sessions", get(sessions::get_sessions).post(sessions::post_session))
+        .route("/sessions/approvals", get(sessions::get_session_approvals))
         .route(
             "/sessions/{id}/messages",
             get(sessions::get_session_messages),

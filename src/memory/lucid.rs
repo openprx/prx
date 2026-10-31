@@ -699,6 +699,19 @@ impl Memory for LucidMemory {
             .await
     }
 
+    async fn list_owned_message_events_by_type(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        event_type: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.local
+            .list_owned_message_events_by_type(workspace_id, owner_id, event_type, after_id, limit)
+            .await
+    }
+
     async fn find_owned_message_event_by_idempotency_key(
         &self,
         workspace_id: &str,

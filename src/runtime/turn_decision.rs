@@ -38,6 +38,7 @@ mod execution;
 pub(crate) use execution::{OperatorChildPublication, OrdinaryChildPublication, OrdinaryProcessLaunch};
 mod owner_filesystem;
 mod pending_approval;
+pub(crate) use pending_approval::DecisionApprovalView;
 pub(crate) use pending_approval::collection::ApprovalCollectionLease;
 pub(crate) use pending_approval::collection::DECLINED_REPLY as DECLINED_COLLECTION_REPLY;
 #[path = "turn_decision/routing/replay_facts.rs"]

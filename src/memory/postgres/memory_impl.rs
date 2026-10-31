@@ -1709,6 +1709,50 @@ impl Memory for PostgresMemory {
         .await?
     }
 
+    async fn list_owned_message_events_by_type(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        event_type: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<MessageEvent>> {
+        anyhow::ensure!(
+            !workspace_id.is_empty()
+                && !owner_id.is_empty()
+                && !event_type.is_empty()
+                && after_id >= 0
+                && (1..=100).contains(&limit),
+            "owned event listing requires workspace, owner, type, nonnegative cursor and limit 1..=100"
+        );
+        let workspace_id = workspace_id.to_owned();
+        let owner_id = owner_id.to_owned();
+        let event_type = event_type.to_owned();
+        let limit = i64::try_from(limit)?;
+        let client = self.client.clone();
+        let table = self.qualified_message_events_table.clone();
+        tokio::task::spawn_blocking(move || {
+            client.with_client(|client| {
+                let query = format!(
+                    "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                     FROM {table}
+                     WHERE workspace_id = $1 AND owner_id = $2 AND event_type = $3 AND id > $4
+                     ORDER BY id ASC LIMIT $5"
+                );
+                client
+                    .query(&query, &[&workspace_id, &owner_id, &event_type, &after_id, &limit])?
+                    .iter()
+                    .map(Self::row_to_message_event)
+                    .collect()
+            })
+        })
+        .await?
+    }
+
     async fn list_message_events_since(
         &self,
         principal: &MemoryPrincipal,

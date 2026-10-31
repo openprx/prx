@@ -756,6 +756,50 @@ impl SqliteMemory {
         .await?
     }
 
+    pub(super) async fn list_owned_message_events_by_type_impl(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        event_type: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        anyhow::ensure!(
+            !workspace_id.is_empty()
+                && !owner_id.is_empty()
+                && !event_type.is_empty()
+                && after_id >= 0
+                && (1..=100).contains(&limit),
+            "owned event listing requires workspace, owner, type, nonnegative cursor and limit 1..=100"
+        );
+        let workspace_id = workspace_id.to_owned();
+        let owner_id = owner_id.to_owned();
+        let event_type = event_type.to_owned();
+        let limit = i64::try_from(limit)?;
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || {
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
+            let mut stmt = conn.prepare(
+                "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                 FROM message_events
+                 WHERE workspace_id = ?1 AND owner_id = ?2 AND event_type = ?3 AND id > ?4
+                 ORDER BY id ASC LIMIT ?5",
+            )?;
+            stmt.query_map(
+                params![workspace_id, owner_id, event_type, after_id, limit],
+                Self::message_event_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+        })
+        .await?
+    }
+
     pub(super) async fn find_owned_message_event_impl(
         &self,
         workspace_id: &str,

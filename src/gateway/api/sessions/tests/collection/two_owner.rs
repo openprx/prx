@@ -194,7 +194,7 @@ async fn exercise_owners(
     let config = state.config.pin();
     let config_parent = config.effective.config_path.parent().context("fixture config root")?;
     let mut private_paths = Vec::new();
-    let mut decision_ids = Vec::new();
+    let mut decision_ids: Vec<String> = Vec::new();
     for (index, (token, session, content)) in OWNERS.iter().enumerate() {
         let principal = crate::gateway::api::ApiPrincipal::of_token(token);
         let scope = console_runtime_envelope_for_workspace(
@@ -252,16 +252,63 @@ async fn exercise_owners(
             .and_then(serde_json::Value::as_str)
             .context("actual owner collection ID")?
             .to_owned();
-        assert_eq!(provider.calls.load(Ordering::SeqCst), index + 1);
-        assert_eq!(writes.load(Ordering::SeqCst), index);
-        assert!(!target.exists());
-        let approval = format!("/sessions/{session}/approvals/{id}");
-        let resume = format!("{approval}/resume");
         let foreign = OWNERS
             .iter()
             .find(|(other, _, _)| other != token)
             .context("other paired owner")?
             .0;
+        let (inbox_status, inbox) = routed(
+            &app,
+            Method::GET,
+            "/sessions/approvals?limit=20",
+            Some(token),
+            serde_json::json!({}),
+        )
+        .await?;
+        assert_eq!(inbox_status, StatusCode::OK, "{inbox}");
+        let own_rows = inbox
+            .get("approvals")
+            .and_then(serde_json::Value::as_array)
+            .context("approval inbox")?;
+        assert!(
+            own_rows.iter().any(|item| {
+                item.get("decision_id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                    && item.get("session_id").and_then(serde_json::Value::as_str) == Some(*session)
+            }),
+            "owner inbox must list this pending approval: {inbox}"
+        );
+        assert!(
+            own_rows.iter().all(|item| {
+                decision_ids.iter().all(|previous| {
+                    item.get("decision_id").and_then(serde_json::Value::as_str) != Some(previous.as_str())
+                })
+            }),
+            "resolved approvals from earlier owners stay out of this inbox: {inbox}"
+        );
+        let (foreign_status, foreign_inbox) = routed(
+            &app,
+            Method::GET,
+            "/sessions/approvals?limit=20",
+            Some(foreign),
+            serde_json::json!({}),
+        )
+        .await?;
+        assert_eq!(foreign_status, StatusCode::OK, "{foreign_inbox}");
+        let foreign_rows = foreign_inbox
+            .get("approvals")
+            .and_then(serde_json::Value::as_array)
+            .context("foreign approval inbox")?;
+        assert!(
+            foreign_rows
+                .iter()
+                .all(|item| { item.get("decision_id").and_then(serde_json::Value::as_str) != Some(id.as_str()) }),
+            "foreign owner must not see this pending approval: {foreign_inbox}"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), index + 1);
+        assert_eq!(writes.load(Ordering::SeqCst), index);
+        assert!(!target.exists());
+        let approval = format!("/sessions/{session}/approvals/{id}");
+        let resume = format!("{approval}/resume");
         for (method, path, payload) in [
             (Method::GET, approval.as_str(), serde_json::json!({})),
             (Method::POST, approval.as_str(), serde_json::json!({"approved":true})),

@@ -158,8 +158,20 @@ conversation-refresh failure after an execution response is distinguished from
 an unknown execution result. A failed execution request is shown as an unknown result and is never retried
 automatically. Check conversation history before another attempt.
 
-When the decision plane is enabled, an authenticated owner can inspect a
-pending call with `GET /api/sessions/{id}/approvals/{decision_id}`. The response
+When the decision plane is enabled, an authenticated owner can list pending
+calls with `GET /api/sessions/approvals?limit=&cursor=`. The list contains only
+rows whose owner is the authenticated token. A disabled decision plane returns
+409. An owner with no pending calls receives an empty `approvals` array. Rows
+owned by anyone else are omitted. Each item has `session_id` plus the same
+redacted projection as the per-session inspect route: `decision_id`, `tool`,
+`arguments`, `arguments_redacted`, `original_call_available`, `effect`,
+`call_digest`, `pending_expires_at` and `single_use`. `limit` defaults to 50
+and is capped at 100. `cursor` is opaque; pass the previous response's
+`next_cursor` to continue. A fully resolved approval is omitted. Review,
+revocation and resume stay on the per-session routes.
+
+An authenticated owner can inspect one pending call with
+`GET /api/sessions/{id}/approvals/{decision_id}`. The response
 contains the tool, redacted arguments, call digest and pending expiration;
 `arguments_redacted` identifies a changed display and `original_call_available`
 indicates whether an authenticated encrypted snapshot exists. This projection

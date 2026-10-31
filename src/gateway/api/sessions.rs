@@ -62,6 +62,12 @@ pub(super) struct SessionMessagesQuery {
     offset: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct ApprovalInboxQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub(super) struct SendMessageRequest {
     message: String,
@@ -972,6 +978,93 @@ pub(super) async fn get_decision_approval(
         |_| json_error(StatusCode::CONFLICT, "Decision approval is unavailable or expired"),
         |view| Json(view).into_response(),
     )
+}
+
+const INBOX_DEFAULT_LIMIT: usize = 50;
+const INBOX_MAX_LIMIT: usize = 100;
+
+fn normalize_inbox_limit(limit: Option<usize>) -> usize {
+    match limit {
+        Some(0) | None => INBOX_DEFAULT_LIMIT,
+        Some(value) => value.min(INBOX_MAX_LIMIT),
+    }
+}
+
+#[allow(clippy::result_large_err)] // the axum `Response` is the error contract of this parser
+fn parse_inbox_cursor(cursor: Option<&str>) -> Result<i64, Response> {
+    let Some(cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(0);
+    };
+    cursor
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id >= 0)
+        .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "Invalid approval cursor"))
+}
+
+#[derive(Serialize)]
+struct ApprovalInboxItem {
+    session_id: String,
+    #[serde(flatten)]
+    view: crate::runtime::turn_decision::DecisionApprovalView,
+}
+
+#[derive(Serialize)]
+struct ApprovalInboxResponse {
+    approvals: Vec<ApprovalInboxItem>,
+    next_cursor: Option<String>,
+}
+
+/// Owner-scoped pending approval inbox. Foreign rows are omitted.
+pub(super) async fn get_session_approvals(
+    State(state): State<AppState>,
+    Query(query): Query<ApprovalInboxQuery>,
+    axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
+) -> Response {
+    let runtime = state.pin_turn_runtime();
+    if !runtime.config_generation.effective.causal_tree.enabled {
+        return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
+    }
+    let after_id = match parse_inbox_cursor(query.cursor.as_deref()) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let limit = normalize_inbox_limit(query.limit);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let cleanup =
+        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
+            Ok(cleanup) => cleanup,
+            Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining"),
+        };
+    let result = cleanup
+        .run(Box::pin(async {
+            let service = runtime.decision_slot.publish(&runtime, &state).await?;
+            service
+                .list_pending_decision_approvals(&principal.owner_id, after_id, limit)
+                .await
+        }))
+        .await;
+    match result {
+        Ok(page) => {
+            let approvals = page
+                .items
+                .into_iter()
+                .map(|item| ApprovalInboxItem {
+                    session_id: item.session_id,
+                    view: item.view,
+                })
+                .collect();
+            Json(ApprovalInboxResponse {
+                approvals,
+                next_cursor: page.next_cursor.map(|id| id.to_string()),
+            })
+            .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "approval inbox failed");
+            json_error(StatusCode::CONFLICT, "Decision approval is unavailable or expired")
+        }
+    }
 }
 
 pub(super) async fn post_decision_approval(
@@ -3395,5 +3488,240 @@ mod tests {
             !error_text.contains("Failed to load merged config") && !error_text.contains("Config path is not set"),
             "denial must NOT be an IO/load failure, got: {error_text}"
         );
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("test: approval inbox body");
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }))
+    }
+
+    #[tokio::test]
+    async fn approval_inbox_disabled_plane_is_conflict() {
+        let mut config = Config::default();
+        config.workspace_dir = std::env::temp_dir();
+        let state = test_app_state(config, Arc::new(CapturingProvider::default()));
+        let response = super::get_session_approvals(
+            State(state),
+            Query(ApprovalInboxQuery {
+                limit: None,
+                cursor: None,
+            }),
+            axum::Extension(super::super::ApiPrincipal::of_token("prx-owner-token")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("Decision approvals are disabled")
+        );
+    }
+
+    fn pending_event(workspace: &str, owner: &str, session: &str, decision: &str) -> crate::memory::MessageEventInput {
+        crate::memory::MessageEventInput {
+            event_id: None,
+            idempotency_key: Some(format!("decision-approval:{decision}:pending")),
+            workspace_id: workspace.to_owned(),
+            owner_id: Some(owner.to_owned()),
+            source: crate::memory::MessageEventSource::Console,
+            channel: Some("console".to_owned()),
+            session_key: Some(session.to_owned()),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: None,
+            recipient: None,
+            role: "system".to_owned(),
+            event_type: "approval.decision.pending".to_owned(),
+            subject: None,
+            goal_id: None,
+            causation_event_id: None,
+            correlation_id: None,
+            attempt_id: None,
+            lease_epoch: None,
+            config_generation_id: None,
+            config_source_revision: None,
+            content: "pending".to_owned(),
+            raw_payload_json: None,
+            visibility: crate::memory::MemoryVisibility::Session,
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_inbox_query_returns_only_the_requested_owner() {
+        let temp = tempfile::tempdir().expect("test: inbox scratch");
+        let memory = crate::memory::SqliteMemory::new(temp.path()).expect("test: sqlite");
+        let workspace = temp.path().to_string_lossy().to_string();
+        memory
+            .append_message_event(pending_event(
+                &workspace,
+                "api:owner-a",
+                "session-a",
+                "11111111-1111-4111-8111-111111111111",
+            ))
+            .await
+            .expect("test: owner a event");
+        memory
+            .append_message_event(pending_event(
+                &workspace,
+                "api:owner-b",
+                "session-b",
+                "22222222-2222-4222-8222-222222222222",
+            ))
+            .await
+            .expect("test: owner b event");
+        let rows = memory
+            .list_owned_message_events_by_type(&workspace, "api:owner-a", "approval.decision.pending", 0, 20)
+            .await
+            .expect("test: owner query");
+        let row = rows.first().expect("test: owner row");
+        assert_eq!(row.owner_id.as_deref(), Some("api:owner-a"));
+        assert_eq!(row.session_key.as_deref(), Some("session-a"));
+        let foreign = memory
+            .list_owned_message_events_by_type(&workspace, "api:owner-b", "approval.decision.pending", 0, 20)
+            .await
+            .expect("test: foreign query");
+        let foreign_row = foreign.first().expect("test: foreign row");
+        assert_eq!(foreign_row.session_key.as_deref(), Some("session-b"));
+    }
+
+    #[tokio::test]
+    async fn approval_inbox_empty_when_the_owner_has_none() {
+        let temp = tempfile::tempdir().expect("test: inbox scratch");
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().to_owned();
+        config.config_path = temp.path().join("config.toml");
+        config.causal_tree.enabled = true;
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config.default_provider = Some("ollama".to_owned());
+        config.default_model = Some("prx-local-model".to_owned());
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\ncontext_window = 65536\n",
+            )
+            .expect("test: model catalog"),
+        );
+        crate::providers::selection::check(
+            &config,
+            "ollama",
+            "prx-local-model",
+            &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
+            crate::providers::catalog::UnknownPolicy::Invocation,
+        )
+        .expect("test: model resolves");
+        let mut state = test_app_state_with_config(config, Arc::new(CapturingProvider::default()));
+        let memory = Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("test: sqlite"));
+        state.mem = memory.clone();
+        let mut runtime = state.pin_turn_runtime();
+        {
+            let security = Arc::new(crate::security::SecurityPolicy::from_config(
+                &runtime.config_generation.effective.autonomy,
+                &runtime.config_generation.effective.workspace_dir,
+            ));
+            let mutable = Arc::get_mut(&mut runtime).expect("test: runtime uniquely owned");
+            mutable.decision_slot = Arc::new(crate::gateway::decision_runtime::GatewayDecisionSlot::new(security, 0));
+        }
+        let current = Arc::try_unwrap(runtime).unwrap_or_else(|_| panic!("test: runtime uniquely owned"));
+        state.turn_runtime = Some(Arc::new(crate::gateway::GatewayTurnRuntimeOwner::new(
+            current,
+            Arc::clone(&state.config),
+            Arc::clone(&state.mem),
+            None,
+            None,
+            None,
+            None,
+            Arc::clone(&state.hooks),
+            #[cfg(feature = "wasm-plugins")]
+            None,
+        )));
+        let runtime = state.pin_turn_runtime();
+        let service = runtime
+            .decision_slot
+            .publish(&runtime, &state)
+            .await
+            .expect("test: decision plane publishes");
+        let principal = super::super::ApiPrincipal::of_token("prx-owner-token");
+        let response = super::get_session_approvals(
+            State(state.clone()),
+            Query(ApprovalInboxQuery {
+                limit: Some(0),
+                cursor: None,
+            }),
+            axum::Extension(principal.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{}", response_json(response).await);
+        let response = super::get_session_approvals(
+            State(state.clone()),
+            Query(ApprovalInboxQuery {
+                limit: None,
+                cursor: None,
+            }),
+            axum::Extension(principal.clone()),
+        )
+        .await;
+        let body = response_json(response).await;
+        assert_eq!(
+            body.get("approvals")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "{body}"
+        );
+        assert!(
+            body.get("next_cursor").is_some_and(serde_json::Value::is_null),
+            "{body}"
+        );
+        let workspace = state.config.pin().effective.workspace_dir.to_string_lossy().to_string();
+        memory
+            .append_message_event(pending_event(
+                &workspace,
+                &principal.owner_id,
+                "session-own",
+                "33333333-3333-4333-8333-333333333333",
+            ))
+            .await
+            .expect("test: unsigned own event");
+        memory
+            .append_message_event(pending_event(
+                &workspace,
+                "api:someone-else",
+                "session-foreign",
+                "44444444-4444-4444-8444-444444444444",
+            ))
+            .await
+            .expect("test: unsigned foreign event");
+        let response = super::get_session_approvals(
+            State(state.clone()),
+            Query(ApprovalInboxQuery {
+                limit: None,
+                cursor: None,
+            }),
+            axum::Extension(principal),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let rendered = body.to_string();
+        assert!(!rendered.contains("session-own"), "{body}");
+        assert!(!rendered.contains("session-foreign"), "{body}");
+        assert_eq!(
+            body.get("approvals")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "{body}"
+        );
+        let _ = service.drain_writes(Instant::now() + Duration::from_secs(5)).await;
+        let _ = runtime
+            .decision_slot
+            .cleanup
+            .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
     }
 }

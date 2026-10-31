@@ -1929,6 +1929,26 @@ pub trait Memory: Send + Sync {
         ))
     }
 
+    /// Owner-scoped rows of one event type, ordered by durable id.
+    ///
+    /// The default fails closed. A backend that cannot filter by owner must
+    /// not answer with an empty page, because an empty page means this owner
+    /// has no rows.
+    async fn list_owned_message_events_by_type(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        event_type: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let _ = (workspace_id, owner_id, event_type, after_id, limit);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "list_owned_message_events_by_type",
+        ))
+    }
+
     /// Indexed recovery lookup with owner isolation. Unsupported backends must
     /// not turn an unavailable ledger into evidence that no segment existed.
     async fn find_owned_message_event_by_idempotency_key(

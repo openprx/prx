@@ -142,6 +142,22 @@ pub(crate) struct DecisionApprovalView {
     single_use: bool,
 }
 
+pub(crate) struct PendingApprovalListItem {
+    pub(crate) session_id: String,
+    pub(crate) view: DecisionApprovalView,
+}
+
+pub(crate) struct PendingApprovalPage {
+    pub(crate) items: Vec<PendingApprovalListItem>,
+    pub(crate) next_cursor: Option<i64>,
+}
+
+fn pending_decision_id(idempotency_key: Option<&str>) -> Option<DecisionId> {
+    let key = idempotency_key?;
+    let rest = key.strip_prefix("decision-approval:")?.strip_suffix(":pending")?;
+    DecisionId::parse(rest).ok()
+}
+
 impl TurnDecisionService {
     async fn verify_pending_console_file_operation(
         &self,
@@ -205,6 +221,126 @@ impl TurnDecisionService {
             pending_expires_at: pending.record.expires_at,
             single_use: true,
         })
+    }
+
+    /// Pending approvals for one owner, from the same ledger `inspect` reads.
+    ///
+    /// Foreign rows are not returned. A row that fails inspection, or whose
+    /// operations are all already resolved, is omitted. `next_cursor` is the
+    /// last durable id examined when the page stopped before the ledger ended.
+    pub(crate) async fn list_pending_decision_approvals(
+        &self,
+        owner: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<PendingApprovalPage> {
+        const MAX_SCAN: usize = 256;
+        anyhow::ensure!(
+            self.recordable && self.durable_key && self.generation.effective.causal_tree.enabled,
+            "pending approval requires enabled durable service"
+        );
+        anyhow::ensure!(
+            !owner.is_empty() && after_id >= 0 && (1..=100).contains(&limit),
+            "invalid approval inbox page"
+        );
+        let workspace = self.generation.effective.workspace_dir.to_string_lossy();
+        anyhow::ensure!(!workspace.is_empty(), "approval inbox workspace missing");
+        let mut cursor = after_id;
+        let mut scanned = 0usize;
+        let mut items = Vec::new();
+        let mut exhausted = false;
+        while items.len() < limit && scanned < MAX_SCAN {
+            let batch_limit = (limit - items.len()).clamp(1, 100);
+            let batch = self
+                .memory
+                .list_owned_message_events_by_type(&workspace, owner, "approval.decision.pending", cursor, batch_limit)
+                .await?;
+            if batch.is_empty() {
+                exhausted = true;
+                break;
+            }
+            let batch_len = batch.len();
+            let mut examined_batch = true;
+            for event in batch {
+                scanned = scanned.saturating_add(1);
+                cursor = event.id;
+                if let Some(item) = self.inbox_item_for_event(owner, &workspace, &event).await? {
+                    items.push(item);
+                }
+                if items.len() == limit || scanned >= MAX_SCAN {
+                    examined_batch = false;
+                    break;
+                }
+            }
+            if examined_batch && batch_len < batch_limit {
+                exhausted = true;
+                break;
+            }
+            if !examined_batch || items.len() == limit || scanned >= MAX_SCAN {
+                break;
+            }
+        }
+        let next_cursor = if exhausted { None } else { Some(cursor) };
+        Ok(PendingApprovalPage { items, next_cursor })
+    }
+
+    async fn inbox_item_for_event(
+        &self,
+        owner: &str,
+        workspace: &str,
+        event: &MessageEvent,
+    ) -> anyhow::Result<Option<PendingApprovalListItem>> {
+        if event.owner_id.as_deref() != Some(owner) || event.workspace_id != workspace {
+            return Ok(None);
+        }
+        let Some(session_id) = event.session_key.clone().filter(|session| !session.is_empty()) else {
+            return Ok(None);
+        };
+        let Some(decision_id) = pending_decision_id(event.idempotency_key.as_deref()) else {
+            return Ok(None);
+        };
+        let pending = match self
+            .load_pending_decision_approval(owner, &session_id, decision_id)
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::debug!(%error, "pending approval omitted from inbox");
+                return Ok(None);
+            }
+        };
+        if self.pending_operations_resolved(&pending).await? {
+            return Ok(None);
+        }
+        match self
+            .inspect_pending_decision_approval(owner, &session_id, decision_id)
+            .await
+        {
+            Ok(view) => Ok(Some(PendingApprovalListItem { session_id, view })),
+            Err(error) => {
+                tracing::debug!(%error, "pending approval omitted from inbox");
+                Ok(None)
+            }
+        }
+    }
+
+    async fn pending_operations_resolved(&self, pending: &VerifiedPendingDecisionApproval) -> anyhow::Result<bool> {
+        if pending.record.op_ids.is_empty() {
+            return Ok(false);
+        }
+        let workspace = pending.record.subject.workspace_id.as_str();
+        for op_id in &pending.record.op_ids {
+            let key = super::approval::decision_resolution_key(&pending.record.binding, op_id);
+            if self
+                .memory
+                .find_message_event_by_idempotency_key(workspace, &key)
+                .await?
+                .is_none()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(super) async fn record_pending_decision_approval(
