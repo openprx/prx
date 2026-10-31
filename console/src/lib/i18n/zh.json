@@ -183,7 +183,22 @@
       "qq": "QQ",
       "cli": "命令行",
       "configured": "已配置"
-    }
+    },
+    "configuredLabel": "配置状态",
+    "statusHint": "这个值表示通道已配置，不是实时健康检查。",
+    "sendTitle": "发送消息",
+    "recipient": "收件人",
+    "message": "消息",
+    "asVoice": "以语音发送",
+    "send": "发送",
+    "sending": "正在发送...",
+    "denied": "此操作员不允许发送。",
+    "uncertain": "是否送达不确定。消息没有再次发送。",
+    "resultChannel": "通道",
+    "resultDelivered": "已送达",
+    "resultDetail": "详情",
+    "resultMissing": "响应未包含此字段。",
+    "loadDenied": "此操作员无法查看通道状态。"
   },
   "config": {
     "title": "配置",
@@ -271,7 +286,8 @@
     "save": "保存",
     "readOnly": "此文件在这里是只读的。",
     "readOnlyRedacted": "此文件包含密钥：在这里以脱敏方式显示且为只读。请在提供商页面设置凭据。",
-    "readOnlyBadge": "只读"
+    "readOnlyBadge": "只读",
+    "noFiles": "没有加载配置文件。"
   },
   "logs": {
     "title": "日志",
@@ -326,7 +342,9 @@
     "disconnected": "已断开",
     "tools": "个工具",
     "availableTools": "可用工具",
-    "noTools": "无可用工具。"
+    "noTools": "无可用工具。",
+    "lifecycleUnavailable": "此部署不提供连接、重启和删除。",
+    "loadDenied": "此操作员无法查看 MCP 服务器。"
   },
   "skills": {
     "title": "Skills",
@@ -358,8 +376,17 @@
     "uninstallSuccess": "Skill 已卸载",
     "uninstallFailed": "Skill 卸载失败",
     "sources": {
-      "github": "GitHub"
-    }
+      "github": "GitHub",
+      "clawhub": "ClawHub",
+      "huggingface": "Hugging Face"
+    },
+    "toggle": "切换",
+    "toggling": "正在切换...",
+    "toggleNote": "这只切换启用标志，不会发布技能生命周期。",
+    "toggleDenied": "不允许切换此技能。",
+    "toggleResult": "状态 {status}，标识 {id}，启用 {enabled}。",
+    "sourceUnavailable": "此来源不可用。空目录不是搜索结果。",
+    "loadDenied": "此操作员无法查看技能。"
   },
   "plugins": {
     "title": "插件",
@@ -371,7 +398,38 @@
     "statusActive": "运行中",
     "reload": "重载",
     "reloadSuccess": "插件 \"{name}\" 已重载",
-    "reloadFailed": "插件重载失败"
+    "reloadFailed": "插件重载失败",
+    "exactArtifact": "此列表不含组件哈希、清单哈希或信任记录。信任与启用是分开的。",
+    "notFirstDiscoverable": "不在这一代中的名称不能靠重新加载第一次发现。",
+    "contractGap": "此列表不报告健康或监听。注册表状态不是健康检查。",
+    "registryStatus": "注册表状态",
+    "granted": "已授予权限",
+    "required": "所需权限",
+    "loadedFact": "出现在已加载列表中",
+    "enable": "启用",
+    "enableName": "已禁用插件名称",
+    "disable": "禁用",
+    "refreshAll": "刷新全部插件",
+    "refreshNote": "刷新会重建每个符合条件的插件。它不是某个新名称的首次发现。",
+    "install": "安装",
+    "update": "更新",
+    "source": "源目录",
+    "sha256": "组件 SHA-256",
+    "manifestSha256": "清单 SHA-256",
+    "remove": "移除",
+    "removeTitle": "移除插件",
+    "removeConsequence": "移除插件、撤销其信任记录，并留下可恢复的备份。此操作不会自行撤销。",
+    "installConsequence": "安装已核对的构件，并按这些哈希和权限记录信任。",
+    "updateConsequence": "替换已安装的构件，并按这些哈希和权限记录信任。",
+    "actionResult": "操作结果",
+    "denied": "不允许此插件操作。",
+    "confirmRequired": "此高风险插件变更需要确认。没有写入任何内容。",
+    "conflict": "插件已经处于该状态。",
+    "absent": "该插件不在已禁用或已安装集合中。",
+    "featureOff": "WASM 插件系统不可用。",
+    "loadDenied": "此操作员无法查看插件。",
+    "noBytes": "安装和更新接受工作区目录以及已核对的哈希，不接受原始字节。",
+    "generation": "代"
   },
   "login": {
     "title": "PRX 控制台登录",
@@ -518,7 +576,23 @@
     "confirmRollback": "确认回滚",
     "rolledBack": "已将配置恢复到 {record} 之前（{status}）。",
     "restores": "恢复到 {record} 之前的配置",
-    "showPlan": "显示计划"
+    "showPlan": "显示计划",
+    "reload": "重新加载配置",
+    "reloading": "正在重新加载...",
+    "reloadResult": "重新加载响应",
+    "reloadSuccess": "成功",
+    "reloadMessage": "消息",
+    "reloadNotEveryone": "HTTP 200 并不表示每个参与者都已重新加载。",
+    "reloadStatus": "重新加载状态",
+    "reloadInProgress": "重新加载进行中",
+    "activeGeneration": "当前代",
+    "activeRevision": "当前修订",
+    "desiredRevision": "期望修订",
+    "restartRequired": "需要重启",
+    "participants": "参与者",
+    "lastFailure": "上次重新加载失败",
+    "fieldMissing": "状态响应未包含此字段。",
+    "loadDenied": "此操作员无法查看变更历史。"
   },
   "decisionApproval": {
     "refreshFailed": "已收到执行响应，但会话刷新失败。请刷新会话核查结果，不要重复执行操作。",

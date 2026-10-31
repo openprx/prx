@@ -2,7 +2,10 @@
   import { t } from '../lib/i18n/index.svelte.js';
   import { api } from '../lib/api.js';
   import { confirmationText } from '../lib/change-flow.svelte.js';
+  import { loadFailureVariant } from '../lib/load-state';
   import ErrorNotice from '../lib/ErrorNotice.svelte';
+  import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
 
   let files = $state([]);
   let activeFile = $state('');
@@ -119,7 +122,7 @@
 
 <div class="config-page">
   <div class="config-header">
-    <h2>{t('config.advancedTitle')}</h2>
+    <PageHeader title={t('config.advancedTitle')} />
     <div class="view-tabs">
       <button
         class="tab-btn" class:active={viewMode === 'files'}
@@ -135,9 +138,11 @@
   <p class="advanced-hint">{t('config.advancedHint')}</p>
 
   {#if loading}
-    <div class="state-msg">{t('common.loading')}</div>
+    <StateBlock variant="loading" message={t('common.loading')} />
   {:else if error}
-    <ErrorNotice {error} />
+    <StateBlock variant={loadFailureVariant(error)} message={error?.message || t('config.loadFailed')} />
+  {:else if files.length === 0}
+    <StateBlock variant="empty" message={t('config.noFiles')} />
   {:else if viewMode === 'files'}
     <div class="editor-layout">
       <div class="file-list">
@@ -201,12 +206,6 @@
     padding: 16px 24px;
     border-bottom: 1px solid var(--border, #27272a);
   }
-  .config-header h2 {
-    margin: 0;
-    font-size: 18px;
-    font-weight: 600;
-    color: var(--text-primary, #fafafa);
-  }
   .view-tabs {
     display: flex;
     gap: 4px;
@@ -226,11 +225,6 @@
   .tab-btn.active {
     background: var(--bg-elevated, #18181b);
     color: var(--text-primary, #fafafa);
-  }
-  .state-msg {
-    padding: 40px;
-    text-align: center;
-    color: var(--text-secondary, #a1a1aa);
   }
   .editor-layout {
     display: flex;

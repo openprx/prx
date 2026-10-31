@@ -1,6 +1,7 @@
 <script>
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
+  import { loadFailureVariant } from '../lib/load-state';
   import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
 
@@ -8,6 +9,7 @@
   let skills = $state([]);
   let loading = $state(true);
   let errorMessage = $state('');
+  let errorStatus = $state(0);
   let toast = $state('');
   let toastType = $state('success');
 
@@ -21,6 +23,11 @@
   let installingUrl = $state('');
   let uninstallingName = $state('');
   let confirmUninstall = $state('');
+  let togglingId = $state('');
+  let toggleError = $state(null);
+  let toggleResult = $state(null);
+
+  const unavailableSources = new Set(['clawhub', 'huggingface']);
 
   function showToast(message, type = 'success') {
     toast = message;
@@ -35,8 +42,10 @@
       const response = await api.getSkills();
       skills = Array.isArray(response?.skills) ? response.skills : [];
       errorMessage = '';
+      errorStatus = 0;
     } catch (error) {
       skills = [];
+      errorStatus = error?.status ?? 0;
       errorMessage = error instanceof Error ? error.message : t('skills.loadFailed');
     } finally {
       loading = false;
@@ -68,7 +77,45 @@
   );
   const enabledCount = $derived(skills.filter((skill) => skill.enabled).length);
 
+  function shownToggle(key) {
+    if (!toggleResult || !Object.hasOwn(toggleResult, key)) {
+      return t('channels.resultMissing');
+    }
+    const value = toggleResult[key];
+    if (typeof value === 'boolean') return value ? 'true' : 'false';
+    return String(value ?? 'null');
+  }
+
+  function skillId(skill) {
+    return typeof skill?.id === 'string' && skill.id.length > 0 ? skill.id : skill?.name;
+  }
+
+  async function toggleSkill(skill) {
+    const id = skillId(skill);
+    if (!id || togglingId) return;
+    togglingId = id;
+    toggleError = null;
+    toggleResult = null;
+    try {
+      const response = await api.toggleSkill(id);
+      toggleResult = response && typeof response === 'object' ? response : {};
+      if (typeof toggleResult.enabled === 'boolean') {
+        skills = skills.map((item) => (skillId(item) === (toggleResult.id ?? id) ? { ...item, enabled: toggleResult.enabled } : item));
+      }
+    } catch (error) {
+      toggleError = error;
+    } finally {
+      togglingId = '';
+    }
+  }
+
   async function searchSkills() {
+    if (unavailableSources.has(discoverSource)) {
+      discoverResults = [];
+      discoverSearched = false;
+      discoverError = '';
+      return;
+    }
     if (!discoverQuery.trim() && discoverSource === 'github') {
       discoverQuery = 'agent skill';
     }
@@ -170,7 +217,7 @@
     {#if loading}
       <StateBlock variant="loading" message={t('skills.loading')} />
     {:else if errorMessage}
-      <StateBlock variant="error" message={errorMessage} />
+      <StateBlock variant={loadFailureVariant({ message: errorMessage, status: errorStatus })} message={errorMessage} />
     {:else if skills.length === 0}
       <StateBlock variant="empty" message={t('skills.noSkills')} />
     {:else}
@@ -193,7 +240,14 @@
                 >
                   {skill.enabled ? t('common.enabled') : t('common.disabled')}
                 </span>
-                <span class="text-xs text-gray-400 dark:text-gray-500">{t('skills.readOnlyState')}</span>
+                <button
+                  type="button"
+                  onclick={() => toggleSkill(skill)}
+                  disabled={togglingId === skillId(skill)}
+                  class="rounded px-2 py-1 text-xs text-sky-700 transition hover:bg-sky-500/10 disabled:opacity-50 dark:text-sky-300"
+                >
+                  {togglingId === skillId(skill) ? t('skills.toggling') : t('skills.toggle')}
+                </button>
               </div>
               {#if confirmUninstall === skill.name}
                 <div class="flex items-center gap-2">
@@ -229,6 +283,18 @@
           </article>
         {/each}
       </div>
+      <p class="text-xs text-gray-500 dark:text-gray-400">{t('skills.toggleNote')}</p>
+      {#if toggleError}
+        <StateBlock variant={loadFailureVariant(toggleError)} message={toggleError?.message || t('skills.toggleDenied')} />
+      {:else if toggleResult}
+        <p class="text-sm text-gray-700 dark:text-gray-200">
+          {t('skills.toggleResult', {
+            status: shownToggle('status'),
+            id: shownToggle('id'),
+            enabled: shownToggle('enabled')
+          })}
+        </p>
+      {/if}
     {/if}
   {/if}
 
@@ -236,9 +302,16 @@
     <div class="flex flex-col gap-3 sm:flex-row">
       <select
         bind:value={discoverSource}
+        onchange={() => {
+          discoverResults = [];
+          discoverSearched = false;
+          discoverError = '';
+        }}
         class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200"
       >
         <option value="github">{t('skills.sources.github')}</option>
+        <option value="clawhub">{t('skills.sources.clawhub')}</option>
+        <option value="huggingface">{t('skills.sources.huggingface')}</option>
       </select>
       <input
         type="text"
@@ -250,14 +323,16 @@
       <button
         type="button"
         onclick={searchSkills}
-        disabled={discoverLoading}
+        disabled={discoverLoading || unavailableSources.has(discoverSource)}
         class="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-500 disabled:opacity-50"
       >
         {discoverLoading ? t('skills.searching') : t('skills.searchBtn')}
       </button>
     </div>
 
-    {#if discoverLoading}
+    {#if unavailableSources.has(discoverSource)}
+      <StateBlock variant="unavailable" message={t('skills.sourceUnavailable')} />
+    {:else if discoverLoading}
       <p class="text-sm text-gray-500 dark:text-gray-400">{t('skills.searching')}</p>
     {:else if discoverError}
       <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
