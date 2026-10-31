@@ -41,6 +41,7 @@ pub mod router;
 pub mod selection;
 pub mod traits;
 pub mod utf8_stream;
+pub mod xai;
 
 mod aliases;
 mod credential_resolution;
@@ -518,10 +519,21 @@ fn create_provider_with_url_and_options(
             OpenAiCompatibleProvider::new("Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer)
                 .with_parameter_provider(name),
         )),
-        "xai" | "grok" => Ok(Box::new(
-            OpenAiCompatibleProvider::new("xAI", "https://api.x.ai/v1", key, AuthStyle::Bearer)
-                .with_parameter_provider(name),
-        )),
+        "xai" | "grok" => {
+            if resolved.xai_subscription {
+                // Validate before construction. A custom URL on another host
+                // must not receive the OAuth bearer; inference stays on
+                // https://api.x.ai/v1 even when the custom URL is that host.
+                crate::auth::xai_oauth::subscription_base_url(api_url)?;
+                return Ok(Box::new(xai::XaiSubscriptionProvider::from_provider_options(
+                    options, name,
+                )));
+            }
+            Ok(Box::new(
+                OpenAiCompatibleProvider::new("xAI", "https://api.x.ai/v1", key, AuthStyle::Bearer)
+                    .with_parameter_provider(name),
+            ))
+        }
         "deepseek" => Ok(Box::new(
             OpenAiCompatibleProvider::new("DeepSeek", "https://api.deepseek.com", key, AuthStyle::Bearer)
                 .with_parameter_provider(name),

@@ -1,5 +1,5 @@
 use crate::auth::AuthService;
-use crate::auth::openai_oauth::extract_account_id_from_jwt;
+use crate::auth::openai_oauth::extract_account_id;
 use crate::providers::ProviderRuntimeOptions;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
@@ -905,6 +905,19 @@ async fn decode_responses_body(
     decode_responses_payload(&body, content_type.as_deref())
 }
 
+fn codex_account_id(profile: Option<&crate::auth::profiles::AuthProfile>, access_token: &str) -> Option<String> {
+    if let Some(account_id) = profile.and_then(|profile| profile.account_id.clone()) {
+        let trimmed = account_id.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let id_token = profile
+        .and_then(|profile| profile.token_set.as_ref())
+        .and_then(|tokens| tokens.id_token.as_deref());
+    extract_account_id(access_token, id_token)
+}
+
 impl OpenAiCodexProvider {
     async fn send_and_decode_full_response(
         &self,
@@ -923,10 +936,7 @@ impl OpenAiCodexProvider {
         let profile = self
             .auth
             .get_profile("openai-codex", self.auth_profile_override.as_deref())?;
-        let account_id = profile
-            .and_then(|profile| profile.account_id)
-            .or_else(|| extract_account_id_from_jwt(&access_token))
-            .ok_or_else(|| {
+        let account_id = codex_account_id(profile.as_ref(), &access_token).ok_or_else(|| {
                 anyhow::anyhow!(
                     "OpenAI Codex account id not found in auth profile/token. Run `prx auth login --provider openai-codex` again."
                 )
@@ -1031,10 +1041,7 @@ impl OpenAiCodexProvider {
                     return;
                 }
             };
-            let account_id = match profile
-                .and_then(|profile| profile.account_id)
-                .or_else(|| extract_account_id_from_jwt(&access_token))
-            {
+            let account_id = match codex_account_id(profile.as_ref(), &access_token) {
                 Some(account_id) => account_id,
                 None => {
                     let _ = tx

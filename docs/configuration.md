@@ -36,6 +36,10 @@ prx init --spec full --dir /path/to/config
 prx init --interactive
 prx init --provider openrouter --model openai/gpt-5-mini --from-env PRX_SETUP_KEY
 prx init --channels-only
+
+# Grok subscription (SuperGrok / X Premium). Headless hosts use --device-code.
+prx auth login --provider xai
+prx auth login --provider xai --device-code
 ```
 
 Full setup over existing configuration requires `--force`. This repairs the

@@ -157,6 +157,10 @@ pub(crate) fn endpoint_url(base: &str, suffix: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+pub(crate) fn is_xai_alias(name: &str) -> bool {
+    matches!(name.trim().to_ascii_lowercase().as_str(), "xai" | "grok")
+}
+
 pub(crate) fn is_huggingface_alias(name: &str) -> bool {
     matches!(name, "huggingface" | "hf" | "hf-inference")
 }

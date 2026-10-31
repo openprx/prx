@@ -6,9 +6,11 @@ use super::{
     AuthProfilesStore, MINIMAX_OAUTH_REFRESH_TOKEN_ENV, ProviderId, ProviderNamespace, ProviderRuntimeOptions,
     canonical_auth_profile_provider, gemini, is_claude_code_alias, is_claude_code_oauth_placeholder,
     is_claude_code_oauth_setup_token, is_minimax_alias, is_minimax_oauth_placeholder, is_qwen_oauth_alias,
-    read_non_empty_env, resolve_claude_code_context, resolve_minimax_oauth_refresh_token, resolve_qwen_oauth_context,
-    select_profile_id,
+    is_xai_alias, read_non_empty_env, resolve_claude_code_context, resolve_minimax_oauth_refresh_token,
+    resolve_qwen_oauth_context, select_profile_id,
 };
+use crate::auth::profiles::{AuthProfile, AuthProfileKind};
+use crate::auth::xai_oauth;
 
 /// Resolve API key for a provider from explicit config only.
 ///
@@ -62,6 +64,9 @@ pub(super) struct ResolvedProviderCredentials {
     pub(super) claude_expires_at: Option<i64>,
     /// An OAuth refresh was due and [`OauthRefresh::Never`] withheld it.
     pub(super) refresh_withheld: bool,
+    /// Grok subscription OAuth is signed in. Inference refreshes the access
+    /// token itself and does not bake it into a static API-key client.
+    pub(super) xai_subscription: bool,
 }
 
 impl ResolvedProviderCredentials {
@@ -71,6 +76,9 @@ impl ResolvedProviderCredentials {
         }
         if matches!(provider, "gemini" | "google" | "google-gemini") {
             return self.credential.is_some() || gemini::GeminiProvider::has_any_auth();
+        }
+        if self.xai_subscription && is_xai_alias(provider) {
+            return true;
         }
         self.credential.as_deref().is_some_and(|credential| {
             !is_claude_code_oauth_setup_token(credential) || self.claude_refresh_token.is_some()
@@ -151,10 +159,59 @@ pub(super) fn resolve_provider_credentials_with(
         };
     }
 
+    if is_xai_alias(name) {
+        if let Some(explicit) = credential_override.map(str::trim).filter(|value| !value.is_empty()) {
+            return ResolvedProviderCredentials {
+                credential: Some(explicit.to_string()),
+                ..ResolvedProviderCredentials::default()
+            };
+        }
+        if let Some(profile) = xai_subscription_profile(name, options) {
+            let Some(tokens) = profile.token_set.as_ref() else {
+                return ResolvedProviderCredentials::default();
+            };
+            let needs_refresh = xai_oauth::access_needs_refresh(tokens);
+            if refresh == OauthRefresh::Never && needs_refresh {
+                return ResolvedProviderCredentials {
+                    xai_subscription: true,
+                    refresh_withheld: true,
+                    ..ResolvedProviderCredentials::default()
+                };
+            }
+            let fresh = (!needs_refresh).then(|| tokens.access_token.clone());
+            return ResolvedProviderCredentials {
+                credential: fresh.filter(|token| !token.trim().is_empty()),
+                xai_subscription: true,
+                ..ResolvedProviderCredentials::default()
+            };
+        }
+    }
+
     ResolvedProviderCredentials {
         credential: resolve_provider_credential_with_options(name, credential_override, options),
         ..ResolvedProviderCredentials::default()
     }
+}
+
+fn xai_subscription_profile(name: &str, options: &ProviderRuntimeOptions) -> Option<AuthProfile> {
+    let openprx_dir = options.openprx_dir.as_ref()?;
+    let store = AuthProfilesStore::new(openprx_dir, options.secrets_encrypt);
+    let data = store.load_read_only().ok()?;
+    let profile_id = auth_profile_keys(name)
+        .iter()
+        .find_map(|provider| select_profile_id(&data, provider, options.auth_profile_override.as_deref()))?;
+    let profile = data.profiles.get(&profile_id)?;
+    if profile.kind != AuthProfileKind::OAuth {
+        return None;
+    }
+    profile
+        .token_set
+        .as_ref()?
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())?;
+    Some(profile.clone())
 }
 
 /// What a connection test may present for a provider.

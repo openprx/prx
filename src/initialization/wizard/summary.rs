@@ -19,6 +19,19 @@ pub(super) fn print_bullet(text: &str) {
     println!("  {} {}", style("›").cyan(), text);
 }
 
+fn xai_subscription_saved(config: &Config) -> bool {
+    let auth = crate::auth::AuthService::from_config(config);
+    auth.get_profile("xai", None).ok().flatten().is_some_and(|profile| {
+        profile.kind == crate::auth::profiles::AuthProfileKind::OAuth
+            && profile.token_set.as_ref().is_some_and(|tokens| {
+                tokens
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(|token| !token.trim().is_empty())
+            })
+    })
+}
+
 // ── Final summary ────────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -152,6 +165,24 @@ pub(super) fn print_summary(config: &Config) {
                 "       {}",
                 style("prx auth login --provider openai-codex --device-code").yellow()
             );
+        } else if matches!(provider, "xai" | "grok") {
+            if xai_subscription_saved(config) {
+                println!(
+                    "    {} Grok subscription is saved. Pick a model with `prx models` if you want a different one.",
+                    style(format!("{step}.")).cyan().bold()
+                );
+            } else {
+                println!(
+                    "    {} Sign in to Grok (SuperGrok / X Premium), or add an API key:",
+                    style(format!("{step}.")).cyan().bold()
+                );
+                println!("       {}", style("prx auth login --provider xai").yellow());
+                println!(
+                    "       {}",
+                    style("prx auth login --provider xai --device-code").yellow()
+                );
+                println!("       {}", style(credential_setup_hint(provider)).yellow());
+            }
         } else if provider == "anthropic" {
             println!(
                 "    {} Configure Anthropic auth:",

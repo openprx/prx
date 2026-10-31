@@ -1,6 +1,7 @@
 use super::{
-    Config, MemoryConfig, MemoryEventsConfig, MemorySemanticConfig, Result, Spec, check_onboarding_selection,
-    default_memory_backend_key, default_model_for_provider, memory_backend_profile, selectable_memory_backends,
+    Config, MemoryConfig, MemoryEventsConfig, MemorySemanticConfig, Result, Spec, canonical_provider_name,
+    check_onboarding_selection, default_memory_backend_key, default_model_for_provider, memory_backend_profile,
+    selectable_memory_backends,
 };
 #[cfg(test)]
 use super::{Path, PathBuf, default_user_config_dir, persist_workspace_selection_at};
@@ -102,6 +103,14 @@ pub async fn run_quick_setup(
     let report = spec.generate_customized(&target, force, Some(&customize), None).await?;
     report.print();
     report.into_result()?;
+    if provider.is_some_and(|name| canonical_provider_name(name) == "xai")
+        && credential_override.is_none_or(|key| key.trim().is_empty())
+    {
+        println!("Sign in to Grok (SuperGrok / X Premium) with:");
+        println!("  prx auth login --provider xai");
+        println!("  prx auth login --provider xai --device-code");
+        println!("An xAI API key still works via --from-stdin or `api_key` in config.toml.");
+    }
     Config::load_from_path(&target.join("config.toml"), target.join("workspace"))
 }
 
