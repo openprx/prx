@@ -61,6 +61,7 @@ use super::providers::{
     provider_construction_outside_the_provider_module_is_pinned,
     session_worker_credentials_are_decided_in_one_scoped_place,
 };
+use super::tool_tables::both_gateway_launch_paths_register_their_tools_from_one_body;
 use super::tool_tests::{
     direct_tool_invocation_allowlist_counts_match_the_tree,
     direct_tool_invocations_outside_the_execution_service_are_allowlisted,
@@ -678,6 +679,7 @@ source_mutation_probes! {
     embedded_user_input_cannot_bypass_reserved_marker_neutralization => mutation_proof_embedded_input_guard,
     every_non_tool_execute_call_site_shows_its_type_evidence => mutation_proof_execution_binding_guard,
     forwarded_compaction_values_are_produced_from_the_effective_window => mutation_proof_compaction_producer_guard,
+    both_gateway_launch_paths_register_their_tools_from_one_body => mutation_proof_gateway_registration_guard,
     ordinary_worker_credential_comparison_rejects_unscoped_neighbors_and_duplicates => mutation_proof_credential_comparison_guard,
 }
 
@@ -729,12 +731,58 @@ fn mutation_proof_compaction_producer_guard() {
             CompactionSource::Effective
         );
     }
+    for (path, old, new) in [
+        (
+            "src/chat/run/entry.rs",
+            "        list,\n        shutdown,\n        None,",
+            "        false,\n        shutdown,\n        None,",
+        ),
+        ("src/chat/run/entry.rs", "        Some(producer),", "        None,"),
+        (
+            "src/chat/run.rs",
+            "compaction_config: Some(effective_compaction.config.clone())",
+            "compaction_config: Some(config.agent.compaction.clone())",
+        ),
+    ] {
+        assert_reviewed_source_mutation(
+            forwarded_compaction_values_are_produced_from_the_effective_window,
+            path,
+            old,
+            new,
+        );
+    }
     assert_reviewed_source_mutation(
         forwarded_compaction_values_are_produced_from_the_effective_window,
         "src/runtime/turn_decision.rs",
         "let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;",
         "let main_compaction = config.agent.compaction.clone();",
     );
+}
+fn mutation_proof_gateway_registration_guard() {
+    for (path, old, new) in [
+        (
+            "src/gateway/mod.rs",
+            "run_gateway_inner(host, port, config, shared_config, shutdown, None).await",
+            "Ok(())",
+        ),
+        (
+            "src/gateway/mod.rs",
+            "let (channels_registry, spawn_tools_handle) = register_gateway_turn_tools(",
+            "let (channels_registry, spawn_tools_handle) = unreviewed_gateway_turn_tools(",
+        ),
+        (
+            "src/gateway/h2_control.rs",
+            "config, None, shutdown, Some(producer)",
+            "config, None, shutdown, None",
+        ),
+    ] {
+        assert_reviewed_source_mutation(
+            both_gateway_launch_paths_register_their_tools_from_one_body,
+            path,
+            old,
+            new,
+        );
+    }
 }
 fn mutation_proof_credential_comparison_guard() {
     assert_reviewed_source_mutation(
@@ -743,4 +791,49 @@ fn mutation_proof_credential_comparison_guard() {
         "resolved.credential().api_key() == credentials.sealed_key",
         "resolved.credential().api_key() == manifest.api_key.as_deref()",
     );
+}
+
+/// Module classification must suppress only compiler-excluded fixtures, and
+/// both production guards must still report the same text through a live load.
+#[test]
+fn out_of_line_test_ancestry_preserves_production_violation_probes() {
+    for (scanner, violation) in [
+        (
+            causal_policy_is_written_only_by_the_mutation_service as fn(),
+            "fn forbidden() { config.causal_tree.enabled = true; }",
+        ),
+        (
+            direct_tool_invocations_outside_the_execution_service_are_allowlisted as fn(),
+            "fn forbidden() { tool.execute(args); }",
+        ),
+    ] {
+        for (parent, child) in [
+            ("#[cfg(test)] mod cases { mod child; }", "src/d0_fixture/cases/child.rs"),
+            ("#[cfg(test)] mod cases;", "src/d0_fixture/cases/child.rs"),
+        ] {
+            let mut planted = vec![
+                ("src/d0_fixture.rs".into(), parent.into()),
+                (child.into(), violation.into()),
+            ];
+            if parent.ends_with(';') {
+                planted.push(("src/d0_fixture/cases.rs".into(), "mod child;".into()));
+            }
+            assert!(
+                !scanner_fails_with(scanner, planted.clone()),
+                "test-only descendant reported: {child}"
+            );
+            planted.push((
+                "src/d0_live.rs".into(),
+                "#[path = \"d0_fixture/cases/child.rs\"] mod live;".into(),
+            ));
+            assert!(
+                scanner_fails_with(scanner, planted),
+                "production loader hidden: {child}"
+            );
+        }
+        assert!(
+            scanner_fails_with(scanner, vec![("src/d0_orphan/tests.rs".into(), violation.into())]),
+            "an undeclared file called tests.rs must remain production"
+        );
+    }
 }

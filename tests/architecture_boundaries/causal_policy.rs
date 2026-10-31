@@ -2,6 +2,7 @@ use super::causal_domain::crate_rooted_paths;
 use super::helpers::{
     blank_comments_and_literals, is_ident_char, read_source, relative_path, rust_source_files, strip_cfg_test_items,
 };
+use super::loop_requests::{is_test_code_file, test_module_files};
 use super::tool_scanner::contains_identifier;
 /// The only production files that may write the decision-plane
 /// configuration (CDP-04, SP-CDP-A 5.4): its own module, for the legacy
@@ -75,12 +76,17 @@ const CAUSAL_CONFIG_TYPES: [&str; 9] = [
 #[test]
 pub(super) fn causal_policy_is_written_only_by_the_mutation_service() {
     let mut violations = Vec::new();
+    let test_modules = test_module_files();
     for path in rust_source_files() {
         let relative = relative_path(&path);
         if CAUSAL_POLICY_WRITERS.contains(&relative.as_str()) {
             continue;
         }
-        let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&path)));
+        let source = read_source(&path);
+        if is_test_code_file(&relative, &source, &test_modules) {
+            continue;
+        }
+        let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
         // Whitespace-normalized, with a method or field chain split over
         // lines (`config\n    .causal_tree\n    .backend`) joined back.
         let compact = production

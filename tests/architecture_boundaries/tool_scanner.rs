@@ -2,6 +2,7 @@ use super::helpers::{
     blank_comments_and_literals, enclosing_function, is_ident_char, normalize_line, read_source, relative_path,
     rust_source_files, strip_cfg_test_items,
 };
+use super::loop_requests::{is_test_code_file, test_module_files};
 use super::tool_tables::{
     NON_TOOL_CLOSURE_PROVIDERS, NON_TOOL_RECEIVER_PRODUCERS, NON_TOOL_RECEIVER_TYPES, NonToolCallSite,
     PRODUCER_INERT_TAIL_METHODS, TOOL_EXECUTION_METHODS,
@@ -858,9 +859,13 @@ pub(super) fn direct_tool_execution_sites<'a>(
 
 pub(super) fn scan_repository_tool_executions() -> ToolExecutionScan {
     let mut combined = ToolExecutionScan::default();
+    let test_modules = test_module_files();
     for path in rust_source_files() {
         let relative = relative_path(&path);
         let source = read_source(&path);
+        if is_test_code_file(&relative, &source, &test_modules) {
+            continue;
+        }
         let scan = scan_tool_executions(&relative, &source);
         combined.sites.extend(scan.sites);
     }

@@ -701,6 +701,31 @@ async fn owned_attempts_then_retire(
     reference: &LessonRef,
 ) -> Result<()> {
     draft.id = ExperimentId::parse("prepared-owned-attempts")?;
+    // This is a fresh experiment after a second publication, not a replay of
+    // either Committed origin. The prior pattern only covers the old baseline.
+    let sends = server.count.load(Ordering::SeqCst);
+    let stale = target.plan_instruction_cycle(draft.clone(), config);
+    assert!(matches!(
+        stale.as_ref().err().and_then(|error| {
+            error.downcast_ref::<crate::skills::lifecycle::LifecycleError>()
+        }),
+        Some(crate::skills::lifecycle::LifecycleError::ProposalRefused(why))
+            if why.contains("has no stored failure") && why.contains(f.pin.revision_id.as_str())
+    ));
+    assert_eq!(server.count.load(Ordering::SeqCst), sends);
+    assert!(!f.store.root().join("experiments").join(draft.id.as_str()).exists());
+    // Deterministic test capture through the original experience owner; these
+    // new task identities must not rewrite the earlier baseline's evidence.
+    let first = failing(f, "owned-attempts-current-failure-1");
+    let second = failing(f, "owned-attempts-current-failure-2");
+    let pattern = consolidate(
+        f,
+        "The deploy skill omits post-release package signing and rollback readiness.",
+        FailureClass::MissingGuidance,
+        &[&first, &second],
+    );
+    assert!(pattern.usable_for_proposal());
+    draft.patterns = vec![pattern.pattern_id];
     let plan = target.plan_instruction_cycle(draft, config)?;
     let frozen = plan.spec.clone().freeze()?;
     server.h2_mode.store(9, Ordering::SeqCst);

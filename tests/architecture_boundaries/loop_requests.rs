@@ -261,12 +261,15 @@ pub(super) fn test_module_files() -> BTreeSet<String> {
 /// the raw text (for the `#[path]` literal), the masked text and the
 /// production text are read at the same character index (INT-2B B4f L-4).
 fn test_module_files_of(files: &[(String, String)]) -> BTreeSet<String> {
-    const fn is_identifier_char(character: char) -> bool {
-        character.is_ascii_alphanumeric() || character == '_'
-    }
-    let mut production_loaded = BTreeSet::new();
-    let mut test_loaded = BTreeSet::new();
+    // Keep loader edges until classification: an ordinary declaration in a
+    // test-only parent cannot turn its child into production. Conversely, a
+    // second production loader must keep a shared child in the inventory.
+    let mut edges = Vec::new();
+    let mut test_only = BTreeSet::new();
     for (relative, raw_text) in files {
+        if is_test_only_file(raw_text) {
+            test_only.insert(relative.clone());
+        }
         let raw: Vec<char> = raw_text.chars().collect();
         let masked_text = blank_comments_and_literals(raw_text);
         let masked: Vec<char> = masked_text.chars().collect();
@@ -278,55 +281,210 @@ fn test_module_files_of(files: &[(String, String)]) -> BTreeSet<String> {
         } else {
             format!("{dir}/{}", file.trim_end_matches(".rs"))
         };
-        let keyword = ['m', 'o', 'd', ' '];
-        for start in 0..masked.len() {
-            if !masked[start..].starts_with(&keyword) || (start > 0 && is_identifier_char(masked[start - 1])) {
-                continue;
-            }
-            let mut cursor = start + keyword.len();
-            while masked.get(cursor).is_some_and(|character| character.is_whitespace()) {
-                cursor += 1;
-            }
-            let name_start = cursor;
-            while masked.get(cursor).copied().is_some_and(is_identifier_char) {
-                cursor += 1;
-            }
-            let name: String = masked[name_start..cursor].iter().collect();
-            while masked.get(cursor).is_some_and(|character| character.is_whitespace()) {
-                cursor += 1;
-            }
-            if name.is_empty() || masked.get(cursor) != Some(&';') {
-                continue;
-            }
-            // The attributes right above the declaration, delimited on the
-            // masked text; the `#[path]` literal is read from the raw text
-            // at the same character positions.
-            let attributes_start = masked[..start]
-                .iter()
-                .rposition(|character| matches!(character, ';' | '}' | '{'))
-                .map_or(0, |index| index + 1);
-            let attributes: String = raw[attributes_start..start].iter().collect();
-            let target = attributes
-                .find("#[path = \"")
-                .and_then(|at| {
-                    let value = &attributes[at + "#[path = \"".len()..];
-                    value.find('"').map(|end| format!("{dir}/{}", &value[..end]))
-                })
-                .map_or_else(
-                    || vec![format!("{module_dir}/{name}.rs"), format!("{module_dir}/{name}/mod.rs")],
-                    |path| vec![path],
-                );
-            let in_production = production.get(start..start + keyword.len()) == Some(&keyword[..]);
-            for candidate in target {
-                if in_production {
-                    production_loaded.insert(candidate);
-                } else {
-                    test_loaded.insert(candidate);
-                }
+        collect_module_loaders(
+            relative,
+            &raw,
+            &masked,
+            &production,
+            0,
+            masked.len(),
+            &module_dir,
+            dir,
+            &mut edges,
+        );
+    }
+    loop {
+        let before = test_only.clone();
+        let mut production_loaded = BTreeSet::new();
+        let mut test_loaded = BTreeSet::new();
+        for (parent, child, locally_test_only) in &edges {
+            if *locally_test_only || test_only.contains(parent) {
+                test_loaded.insert(child.clone());
+            } else {
+                production_loaded.insert(child.clone());
             }
         }
+        test_only.extend(test_loaded.difference(&production_loaded).cloned());
+        if test_only == before {
+            return test_only;
+        }
     }
-    test_loaded.difference(&production_loaded).cloned().collect()
+}
+
+/// Resolve declarations in their actual inline module namespace. In
+/// `host.rs`, `mod tests { mod child; }` loads `host/tests/child.rs`, not
+/// `host/child.rs`. A #[path] at file scope is relative to the containing
+/// file; inside an inline module it is relative to that module's directory.
+#[allow(clippy::too_many_arguments)]
+fn collect_module_loaders(
+    parent: &str,
+    raw: &[char],
+    masked: &[char],
+    production: &[char],
+    begin: usize,
+    end: usize,
+    module_dir: &str,
+    path_dir: &str,
+    edges: &mut Vec<(String, String, bool)>,
+) {
+    use super::helpers::{close_of_group, is_ident_char};
+    let keyword = ['m', 'o', 'd'];
+    let mut start = begin;
+    while start < end {
+        if !masked[start..end].starts_with(&keyword)
+            || (start > 0 && is_ident_char(masked[start - 1]))
+            || !masked
+                .get(start + keyword.len())
+                .is_some_and(|character| character.is_whitespace())
+        {
+            start += 1;
+            continue;
+        }
+        let mut cursor = start + keyword.len();
+        while masked.get(cursor).is_some_and(|character| character.is_whitespace()) {
+            cursor += 1;
+        }
+        // Rust raw identifiers name the same module/file as the identifier
+        // without `r#`; omitting a production raw loader could hide a child.
+        if masked.get(cursor..cursor + 2) == Some(&['r', '#']) {
+            cursor += 2;
+        }
+        let name_start = cursor;
+        while masked.get(cursor).copied().is_some_and(is_ident_char) {
+            cursor += 1;
+        }
+        let name: String = masked[name_start..cursor].iter().collect();
+        while masked.get(cursor).is_some_and(|character| character.is_whitespace()) {
+            cursor += 1;
+        }
+        assert!(
+            !name.is_empty() && matches!(masked.get(cursor), Some(';' | '{')),
+            "{parent}: unsupported module identifier or declaration; cannot prove test-only reachability"
+        );
+        let attributes_start = masked[..start]
+            .iter()
+            .rposition(|character| matches!(character, ';' | '}' | '{'))
+            .map_or(0, |index| index + 1);
+        let explicit_path = module_path_attribute(raw, masked, attributes_start, start);
+        if masked.get(cursor) == Some(&'{') {
+            let close = close_of_group(masked, cursor).min(end);
+            let inline_dir = match &explicit_path {
+                Ok(Some(path)) => resolve_module_path(parent, path_dir, path),
+                Ok(None) => format!("{module_dir}/{name}"),
+                Err(()) => panic!("{parent}: unsupported inline module path; cannot prove test-only reachability"),
+            };
+            collect_module_loaders(
+                parent,
+                raw,
+                masked,
+                production,
+                cursor + 1,
+                close.saturating_sub(1),
+                &inline_dir,
+                &inline_dir,
+                edges,
+            );
+            start = close;
+            continue;
+        }
+        if masked.get(cursor) != Some(&';') {
+            start += 1;
+            continue;
+        }
+        let target = match explicit_path {
+            Ok(Some(path)) => vec![resolve_module_path(parent, path_dir, &path)],
+            Ok(None) => vec![format!("{module_dir}/{name}.rs"), format!("{module_dir}/{name}/mod.rs")],
+            // A skipped unknown production loader could hide a mixed-load
+            // child. Require review instead of granting any exemption.
+            Err(()) => panic!("{parent}: unsupported module path; cannot prove test-only reachability"),
+        };
+        let locally_test_only = production.get(start..start + keyword.len()) != Some(&keyword[..]);
+        for candidate in target {
+            edges.push((parent.to_string(), candidate, locally_test_only));
+        }
+        start = cursor + 1;
+    }
+}
+
+/// Only repository-relative module paths can establish an exemption. Reject
+/// absolute paths and parent traversal beyond the repository; do not silently
+/// clip an external loader into an unrelated repository path.
+fn resolve_module_path(parent: &str, base: &str, path: &str) -> String {
+    assert!(
+        !std::path::Path::new(path).is_absolute() && !path.contains('\\'),
+        "{parent}: unsupported absolute module path; cannot prove test-only reachability"
+    );
+    let candidate = format!("{base}/{path}");
+    let mut components = Vec::new();
+    for component in candidate.split('/') {
+        match component {
+            "." | "" => {}
+            ".." => assert!(
+                components.pop().is_some(),
+                "{parent}: module path escapes repository; cannot prove test-only reachability"
+            ),
+            _ => components.push(component),
+        }
+    }
+    components.join("/")
+}
+
+/// Read only real path attributes; a matching string or comment is blanked
+/// in `masked` and cannot redirect module classification. Unknown attribute
+/// path syntax stops the classifier rather than exempting another file.
+fn module_path_attribute(raw: &[char], masked: &[char], begin: usize, end: usize) -> Result<Option<String>, ()> {
+    use super::helpers::{close_of_group, masked_word_at};
+    let mut cursor = begin;
+    let mut explicit_path = None;
+    while cursor + 1 < end {
+        if masked[cursor] != '#' || masked[cursor + 1] != '[' {
+            cursor += 1;
+            continue;
+        }
+        let close = close_of_group(masked, cursor + 1).min(end);
+        let (word, mut value) = masked_word_at(masked, cursor + 2);
+        if word == "cfg_attr" {
+            // A conditional path can load different files in production.
+            let attribute: String = masked[cursor..close].iter().collect();
+            if attribute.contains("path") {
+                return Err(());
+            }
+        }
+        if word == "path" {
+            while value < close && masked[value].is_whitespace() {
+                value += 1;
+            }
+            if masked.get(value) != Some(&'=') {
+                return Err(());
+            }
+            value += 1;
+            // The literal's characters were blanked, so locate its quote in
+            // raw text only after proving the attribute name on masked text.
+            while value < close && raw[value].is_whitespace() {
+                value += 1;
+            }
+            if raw.get(value) != Some(&'"') {
+                return Err(());
+            }
+            value += 1;
+            let start = value;
+            while value < close && raw[value] != '"' {
+                if raw[value] == '\\' {
+                    return Err(());
+                }
+                value += 1;
+            }
+            if value == close {
+                return Err(());
+            }
+            if explicit_path.is_some() {
+                return Err(());
+            }
+            explicit_path = Some(raw[start..value].iter().collect());
+        }
+        cursor = close;
+    }
+    Ok(explicit_path)
 }
 
 /// Whether the file at `relative` is test code: its own `#![cfg(test)]`
@@ -445,6 +603,83 @@ fn compaction_none_spellings_and_test_module_files_are_exact() {
         BTreeSet::from(["src/x/host_cases.rs".to_string()]),
         "a #[path] literal after multibyte comments is read from the right place"
     );
+    // Inline namespace, inherited test-only ancestry, relative paths, and
+    // a child that is also loaded by production must all be distinguished.
+    let module_graph = vec![
+        ("src/host.rs".into(), "#[cfg(test)] mod cases { mod child; #[path = \"../shared.rs\"] mod shared; }\n#[cfg(test)] mod tests;\n#[path = \"host/shared.rs\"] mod live;".into()),
+        ("src/host/tests.rs".into(), "mod nested;".into()),
+        ("src/host/tests/nested.rs".into(), "mod leaf;".into()),
+        ("src/host/shared.rs".into(), "fn production() {}".into()),
+        ("src/raw_host.rs".into(), "#[cfg(test)] mod cases; #[path = \"raw_host/cases.rs\"] mod r#live; #[cfg(test)] mod r#type;".into()),
+        ("src/fixture.rs".into(), "#![cfg(test)]\nmod child;".into()),
+        ("src/inline_host.rs".into(), "#[cfg(test)] #[path = \"inline_override\"] mod cases { mod child; }".into()),
+        ("src/mixed.rs".into(), "#[cfg(any(test, feature = \"live\"))] mod tests; #[cfg(not(test))] mod production; #[cfg(test)] /* #[path = \"decoy.rs\"] */ mod actual;".into()),
+        ("src/spoof.rs".into(), "const TEXT: &str = \"#[cfg(test)] mod tests;\"; /* #[cfg(test)] mod hidden; */ mod contests;".into()),
+    ];
+    let classified = test_module_files_of(&module_graph);
+    for relative in [
+        "src/host/cases/child.rs",
+        "src/host/tests.rs",
+        "src/host/tests/nested.rs",
+        "src/host/tests/nested/leaf.rs",
+        "src/fixture/child.rs",
+        "src/raw_host/type.rs",
+        "src/inline_override/child.rs",
+        "src/mixed/actual.rs",
+    ] {
+        assert!(
+            classified.contains(relative),
+            "test-only module ancestry lost: {relative}"
+        );
+    }
+    for relative in [
+        "src/host/shared.rs",
+        "src/raw_host/cases.rs",
+        "src/orphan/tests.rs",
+        "src/contests.rs",
+        "src/inline_host/cases/child.rs",
+        "src/mixed/tests.rs",
+        "src/mixed/production.rs",
+        "src/mixed/decoy.rs",
+        "src/spoof/tests.rs",
+        "src/spoof/hidden.rs",
+        "src/spoof/contests.rs",
+    ] {
+        assert!(
+            !classified.contains(relative),
+            "production or undeclared file excluded: {relative}"
+        );
+    }
+    // Neither attribute ordering nor an unrecognized loader may silently
+    // remove a possible production edge to an otherwise test-only child.
+    let unsupported = [
+        "#[cfg_attr(feature = \"live\", path = \"alternate.rs\")] mod child;".to_string(),
+        "#[path = \"child.rs\"] #[cfg_attr(feature = \"live\", path = \"alternate.rs\")] mod child;".to_string(),
+        "#[path = \"first.rs\"] #[path = \"second.rs\"] mod child;".to_string(),
+        "#[path = \"/absolute.rs\"] mod child;".to_string(),
+        "#[path = \"../../outside.rs\"] mod child;".to_string(),
+        format!(
+            "mod unsupported{};",
+            char::from_u32(0x00e9).expect("identifier character")
+        ),
+    ];
+    for declaration in unsupported {
+        let ambiguous = vec![("src/ambiguous.rs".into(), declaration.clone())];
+        assert!(
+            std::panic::catch_unwind(|| test_module_files_of(&ambiguous)).is_err(),
+            "unsupported production loader must fail explicitly: {declaration}"
+        );
+    }
+    for relative in [
+        "src/gateway/api/identity/tests.rs",
+        "src/runtime/h2_entry/profile/tests.rs",
+        "src/tools/owner_filesystem_dispatch/tests/h2_controlled.rs",
+    ] {
+        assert!(
+            modules.contains(relative),
+            "actual cfg(test) declaration not followed: {relative}"
+        );
+    }
     // Loaded by a production `#[path]` declaration, but test code by its own
     // `#![cfg(test)]` marker.
     let marked = "src/agent/turn_tests/context_paging.rs";

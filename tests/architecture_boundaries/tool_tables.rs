@@ -1,4 +1,5 @@
-use super::helpers::{function_body, repository_root, strip_cfg_test_items};
+use super::helpers::{blank_comments_and_literals, function_body, read_source, repository_root, strip_cfg_test_items};
+use super::loop_requests::compact_rust_tokens;
 use std::fs;
 /// A session worker must select its tool surface from its own manifest.
 ///
@@ -75,12 +76,33 @@ fn a_session_worker_selects_its_tools_through_its_manifest() {
 /// compares what the shared registrar produces; this pins that both entry points
 /// still go through it rather than growing a second registration of their own.
 #[test]
-fn both_gateway_launch_paths_register_their_tools_from_one_body() {
+pub(super) fn both_gateway_launch_paths_register_their_tools_from_one_body() {
     let root = repository_root();
-    let source = fs::read_to_string(root.join("src/gateway/mod.rs")).expect("read src/gateway/mod.rs");
-    let production = strip_cfg_test_items(&source);
+    let source = read_source(&root.join("src/gateway/mod.rs"));
+    let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
+    let wrapper = compact_rust_tokens(&function_body(&production, "run_gateway"));
+    assert_eq!(
+        &wrapper[wrapper.find('{').expect("Gateway wrapper body")..],
+        "{run_gateway_inner(host,port,config,shared_config,shutdown,None).await}",
+        "ordinary Gateway must forward all configuration and shutdown to the shared private owner"
+    );
+    assert_eq!(
+        production
+            .lines()
+            .find(|line| line.contains("async fn run_gateway_inner("))
+            .map(str::trim),
+        Some("async fn run_gateway_inner("),
+        "Gateway owner must remain private"
+    );
+    let controlled = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
+        &root.join("src/gateway/h2_control.rs"),
+    )));
+    let controlled = compact_rust_tokens(&function_body(&controlled, "run_gateway_controlled"));
+    assert_eq!(controlled.matches("super::run_gateway_inner(").count(), 1);
+    assert!(controlled.ends_with("letresult=super::run_gateway_inner(host,port,config,None,shutdown,Some(producer)).await;letcleanup=profile.close_reader().await;cleanup?;result}"),
+        "controlled Gateway must forward its verified producer to the same owner and retain cleanup");
 
-    for entry in ["build_gateway_turn_runtime", "run_gateway"] {
+    for entry in ["build_gateway_turn_runtime", "run_gateway_inner"] {
         let body = function_body(&production, entry);
         assert!(
             body.contains("register_gateway_turn_tools("),
@@ -332,7 +354,7 @@ pub(super) const ALLOWED_DIRECT_TOOL_INVOCATIONS: &[(&str, usize, &str)] = &[
         "operator-typed `/kill`; the human at the keyboard is the authority",
     ),
     (
-        "src/chat/run.rs::run",
+        "src/chat/run.rs::run_internal",
         4,
         "operator-typed `/spawn`, `/steer` and `!command`; the human at the keyboard is the \
          authority",

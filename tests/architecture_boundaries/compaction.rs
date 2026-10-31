@@ -7,7 +7,6 @@ use super::loop_requests::{
     compact_rust_tokens, compaction_argument_is_none, engine_turn_requests, is_identifier_byte, is_test_code_file,
     leading_identifier, nearest_let_initializer, request_field, test_module_files,
 };
-use std::fs;
 /// Where a loop-engine call's compaction config comes from, as far as the
 /// source text shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,7 +346,7 @@ const FORWARDED_COMPACTION_PRODUCERS: &[(&str, &str, &str, Option<&str>)] = &[
     // `Effect::StartTurn.compaction_config`, carried from this action.
     (
         "src/chat/run.rs",
-        "run",
+        "run_internal",
         "Action::StartLLMTurn {",
         Some("compaction_config"),
     ),
@@ -369,10 +368,42 @@ const FORWARDED_COMPACTION_PRODUCERS: &[(&str, &str, &str, Option<&str>)] = &[
 /// producer as `Base`, while the forwarded-site inventory stays green.
 #[test]
 pub(super) fn forwarded_compaction_values_are_produced_from_the_effective_window() {
+    // The checked owner moved behind an entry wrapper. Pin that edge so an
+    // empty public entry or a dropped input/authority cannot evade the owner.
+    let entry = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
+        &repository_root().join("src/chat/run/entry.rs"),
+    )));
+    let ordinary = compact_rust_tokens(&function_body(&entry, "run"));
+    assert_eq!(
+        braced_block(&ordinary, ordinary.find('{').expect("chat entry body")),
+        Some("{super::run_internal(config,provider,model,temperature,plain,session,list,shutdown,None,).await}"),
+        "ordinary chat must forward every input to the budgeted private owner"
+    );
+    let controlled = compact_rust_tokens(&function_body(&entry, "run_controlled"));
+    assert_eq!(controlled.matches("super::run_internal(").count(), 1);
+    assert!(controlled.ends_with("letresult=super::run_internal(config,provider,model,temperature,plain,session,false,shutdown,Some(producer),).await;letcleanup=profile.close_reader().await;cleanup?;result}"),
+        "controlled chat must forward its verified producer and retain reader cleanup");
+    let owner = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
+        &repository_root().join("src/chat/run.rs"),
+    )));
+    assert_eq!(
+        owner
+            .lines()
+            .find(|line| line.contains("async fn run_internal("))
+            .map(str::trim),
+        Some("async fn run_internal("),
+        "chat owner must remain private"
+    );
+    assert_eq!(
+        compact_rust_tokens(&function_body(&owner, "run_internal"))
+            .matches("entry::build_context(config,list_sessions,terminal_producer).await?")
+            .count(),
+        1,
+        "the private owner must pass its config, mode and producer to bootstrap"
+    );
     let mut classified = Vec::new();
     for (relative, function, anchor, field) in FORWARDED_COMPACTION_PRODUCERS {
-        let source = fs::read_to_string(repository_root().join(relative))
-            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        let source = read_source(&repository_root().join(relative));
         let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
         // Exactly one such function and exactly one producer in it (B4f): a
         // second producer, or a second function of the same name, fails by
@@ -573,7 +604,7 @@ pub(super) fn production_turns_budget_on_the_effective_context_window() {
         "production loop engine calls budgeted on the effective window",
         effective,
         &[
-            "src/chat/run.rs::run",
+            "src/chat/run.rs::run_internal",
             "src/gateway/api/sessions.rs::run_console_runtime_turn",
             "src/gateway/mod.rs::run_gateway_chat_with_multimodal",
         ],
