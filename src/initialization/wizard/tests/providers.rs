@@ -63,11 +63,9 @@ fn onboarding_credential_hints_name_only_what_the_daemon_reads() {
             "{provider}: {hint}"
         );
     }
-    for (provider, variable) in [("gemini", "GEMINI_API_KEY")] {
-        let hint = credential_setup_hint(provider);
-        assert!(hint.contains(variable), "{provider}: {hint}");
-        assert!(hint.contains("`api_key` in config.toml"), "{provider}: {hint}");
-    }
+    let hint = credential_setup_hint("gemini");
+    assert!(hint.contains("GEMINI_API_KEY"), "{hint}");
+    assert!(hint.contains("`api_key` in config.toml"), "{hint}");
 
     // No production text of the wizard suggests exporting a variable the
     // daemon does not read (the needles are split so this test does not

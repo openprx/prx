@@ -345,7 +345,7 @@ fn try_config_toml_with_decryption(config_dir: &Path, config_path: &Path) -> Opt
 /// and Bearer auth, which the `detect_credentials` caller does not support.
 /// Those tokens are handled separately by `resolve_claude_code_context` in the
 /// provider layer when the provider is explicitly set to "claude-code".
-fn try_claude_code_oauth() -> Option<String> {
+const fn try_claude_code_oauth() -> Option<String> {
     // Subscription credentials in ~/.claude/.credentials.json are not read.
     None
 }

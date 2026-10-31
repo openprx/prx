@@ -261,12 +261,12 @@ impl GeminiProvider {
     }
 
     /// Gemini CLI OAuth (`~/.gemini/oauth_creds.json`) is not loaded.
-    fn try_load_gemini_cli_token() -> Option<String> {
+    const fn try_load_gemini_cli_token() -> Option<String> {
         None
     }
 
     /// Check if Gemini CLI is configured and has valid credentials
-    pub fn has_cli_credentials() -> bool {
+    pub const fn has_cli_credentials() -> bool {
         false
     }
 
