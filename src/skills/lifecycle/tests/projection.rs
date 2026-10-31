@@ -5,11 +5,13 @@
 //! `CommittedRepairRequired` and repaired by recovery.
 
 use super::{exec_entry, md, owner};
+#[cfg(target_os = "macos")]
+use crate::skills::lifecycle::TransactionKind;
 use crate::skills::lifecycle::publish::crash_hooks;
 use crate::skills::lifecycle::{
     Bundle, BundleEntry, Correlation, LifecycleError, ManagedReadRequest, NewRevision, PublishRequest, RevisionId,
-    RollbackRequest, SkillId, SkillLifecycleStore, SourceKind, TransactionId, TransactionKind, TransactionState,
-    apply_migration, plan_migration, read_managed_resource, release_task_pins,
+    RollbackRequest, SkillId, SkillLifecycleStore, SourceKind, TransactionId, TransactionState, apply_migration,
+    plan_migration, read_managed_resource, release_task_pins,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -886,17 +888,25 @@ fn supported_exchange_keeps_the_target_present_for_a_concurrent_reader() {
     let old_revision = a.0;
     let new_revision = b.0.clone();
     let stop = Arc::new(AtomicBool::new(false));
+    let publishing = Arc::new(AtomicBool::new(false));
     let stop_reader = Arc::clone(&stop);
+    let publishing_reader = Arc::clone(&publishing);
     let (ready_tx, ready_rx) = mpsc::channel();
     let reader = thread::spawn(move || {
         let mut absent = false;
         let mut unreadable = false;
         let mut unexpected = false;
         let mut samples = 0_usize;
+        let mut during_publish = 0_usize;
         let mut complete = 0_usize;
+        let mut torn = 0_usize;
         let mut announced = false;
         while !stop_reader.load(Ordering::Acquire) {
             samples = samples.saturating_add(1);
+            let in_publish = publishing_reader.load(Ordering::Acquire);
+            if in_publish {
+                during_publish = during_publish.saturating_add(1);
+            }
             // Directory exchange is atomic. A path walk can still fail between
             // the swap and deletion of the previous tree; that is not absence.
             match fs::symlink_metadata(&dir) {
@@ -910,6 +920,8 @@ fn supported_exchange_keeps_the_target_present_for_a_concurrent_reader() {
                         if id != &old_revision && id != &new_revision {
                             unexpected = true;
                         }
+                    } else {
+                        torn = torn.saturating_add(1);
                     }
                 }
             }
@@ -918,16 +930,25 @@ fn supported_exchange_keeps_the_target_present_for_a_concurrent_reader() {
                 let _ = ready_tx.send(());
             }
         }
-        (absent, unreadable, unexpected, samples, complete)
+        (absent, unreadable, unexpected, samples, during_publish, complete, torn)
     });
     ready_rx.recv().expect("test: reader observed the projection");
-    store
-        .publish(&publish_req("reader-b", &skill(), &b, 1, true))
-        .expect("test: native exchange publishes");
+    publishing.store(true, Ordering::Release);
+    let published = store.publish(&publish_req("reader-b", &skill(), &b, 1, true));
+    publishing.store(false, Ordering::Release);
     stop.store(true, Ordering::Release);
-    let (absent, unreadable, unexpected, samples, complete) = reader.join().expect("test: reader joins");
+    let (absent, unreadable, unexpected, samples, during_publish, complete, torn) =
+        reader.join().expect("test: reader joins");
+    published.expect("test: native exchange publishes");
     assert!(samples > 1, "the reader kept sampling through the replacement");
-    assert!(complete > 0, "the reader never saw a complete projection");
+    assert!(
+        during_publish > 0,
+        "the reader took no sample while publish ran; torn walks: {torn}"
+    );
+    assert!(
+        complete > 0,
+        "the reader never saw a complete projection; torn walks: {torn}"
+    );
     assert!(!absent, "the projection directory was absent during replacement");
     assert!(
         !unreadable,

@@ -3045,11 +3045,14 @@ recovery and are never aged out solely because they were idle.
 Publication and rollback refresh the compatibility projection after commit;
 `CommittedRepairRequired` leaves the binding live for recovery to repair.
 Recovery resets the disabled marker to the binding's enabled state. First
-publication refuses different unmanaged content. Linux uses native atomic
-directory exchange where supported and otherwise a recoverable two-rename
-fallback. On macOS an existing projection is exchanged in place; an unsupported
-exchange leaves that projection in place and reports `CommittedRepairRequired`. Legacy executables are marked `ExecutableNeedsReview`
-and need operator re-import to run managed. Managed native execution clears
+publication refuses different unmanaged content. Linux and other non-macOS
+platforms use native atomic directory exchange where supported and otherwise
+a recoverable two-rename fallback. On macOS an existing projection is
+exchanged in place; an unsupported exchange leaves that projection in place
+and reports `CommittedRepairRequired`. See
+[compatibility projection](skill-lifecycle.md#compatibility-projection).
+Legacy executables are marked `ExecutableNeedsReview` and need operator
+re-import to run managed. Managed native execution clears
 the environment down to an allowlist and joins process cleanup; deliberate
 `setsid` escape requires docker runtime containment today. See the
 [upgrade actions](migration-unreleased.md) before adopting managed execution.
