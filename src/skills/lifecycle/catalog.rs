@@ -3,7 +3,10 @@
 use super::consolidate::{PATTERNS_DIR, verify_content};
 use super::generation::{ACTIVE_DIR, ActiveBinding};
 use super::knowledge::{KnowledgePattern, PatternId, PatternIndex, PatternIndexEntry};
-use super::product::*;
+use super::product::{
+    ExperimentCatalog, ExperimentCatalogPattern, ExperimentCatalogRequest, ExperimentCatalogSkill,
+    ExperimentCatalogState,
+};
 use super::store::{MAX_RECORD_BYTES, SkillLifecycleStore, check_private, record_digest};
 use super::types::{SCHEMA_VERSION, SkillId, SkillRevision};
 use serde::de::DeserializeOwned;

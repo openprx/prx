@@ -377,15 +377,15 @@ async fn v01_loopback_keeps_original_owner_denominator_private_oracles_and_seale
             "renaming case/root/partition cannot erase actual calibration source content"
         );
         let confirm = service.plan_v01_study(confirm, &cfg)?;
-        assert!(
-            !confirm
+        assert_ne!(
+            confirm
                 .manifest
                 .protocol
                 .calibration
                 .as_ref()
                 .context("calibration")?
-                .excluded_roots
-                .is_empty()
+                .excluded_roots,
+            [] as [crate::skills::lifecycle::study::StudyExcludedRoot; 0],
         );
         service.admit_v01_study(confirm.clone(), &cfg)?;
         assert_eq!(exact_calls, server.count.load(Ordering::SeqCst));

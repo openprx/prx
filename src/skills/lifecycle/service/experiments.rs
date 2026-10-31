@@ -116,10 +116,7 @@ impl SkillsLifecycleService {
         self.check_experiment_pins(&plan, config)?;
         let continuation = self.controlled_experiment_continuation(&plan, config)?;
         let admit = || self.store.admit_experiment(&plan, Utc::now());
-        Ok(match continuation {
-            Some(continuation) => continuation.sync_scope(admit),
-            None => admit(),
-        }?)
+        Ok(continuation.map_or_else(admit, |continuation| continuation.sync_scope(admit))?)
     }
     pub(crate) fn inspect_experiment(&self, id: &ExperimentId, digest: &str) -> Result<ExperimentJournal> {
         self.require_enabled()?;

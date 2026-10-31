@@ -1,7 +1,10 @@
 //! Read existing authorities; do not mint publication/adoption evidence.
 use super::{Config, ProductResult, SkillsLifecycleService};
 use crate::skills::lifecycle::experiment::{ExperimentJournal, ExperimentStageKind, LessonQueryIntent};
-use crate::skills::lifecycle::*;
+use crate::skills::lifecycle::{
+    ExperimentFinalExpectation, ExperimentLessonQueryRequest, ExperimentLessonQueryResult, ExperimentProductError,
+    ExperimentProductFailureKind, ExperimentProductHandle, LessonRef,
+};
 
 impl SkillsLifecycleService {
     pub(super) fn check_product_config(&self, config: &Config) -> ProductResult<()> {

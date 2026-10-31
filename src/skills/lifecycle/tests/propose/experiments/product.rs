@@ -198,7 +198,7 @@ async fn product_catalog_uses_fixed_existing_owner_and_stale_or_foreign_config_c
                 .kind,
             ExperimentProductFailureKind::WrongOwner
         );
-        let mut stale = cfg.clone();
+        let mut stale = cfg;
         stale.skills_lifecycle.max_edit_tokens += 1;
         assert_eq!(
             service

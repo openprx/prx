@@ -1,7 +1,13 @@
 //! Observation only. Never infer live termination from a durable cancel flag.
 use super::{Config, ProductResult, SkillsLifecycleService};
 use crate::skills::lifecycle::experiment::{ExperimentJournal, ExperimentResources, ExperimentStageKind, StageState};
-use crate::skills::lifecycle::*;
+use crate::skills::lifecycle::{
+    ExperimentAdoptionObservation, ExperimentAdoptionStatus, ExperimentCleanupStatus, ExperimentExecutionStatus,
+    ExperimentFinalExpectation, ExperimentProductError, ExperimentProductFailureKind, ExperimentProductHandle,
+    ExperimentProductSnapshot, ExperimentPublicationObservation, ExperimentPublicationStatus, ExperimentQualification,
+    ExperimentRootDrainStatus, ExperimentStageObservation, ExperimentStageStatus, ProposalStatus, TransactionKind,
+    TransactionState,
+};
 
 impl SkillsLifecycleService {
     pub(super) fn product_snapshot(
@@ -343,7 +349,7 @@ impl SkillsLifecycleService {
         })
     }
 }
-fn unavailable_publication() -> ExperimentPublicationObservation {
+const fn unavailable_publication() -> ExperimentPublicationObservation {
     ExperimentPublicationObservation {
         status: ExperimentPublicationStatus::ObservationUnavailable,
         transaction: None,

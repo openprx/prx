@@ -223,7 +223,7 @@ fn skill_cursor_is_exclusive_and_never_claims_exhaustive_first_page() {
     let first = page(&store);
     assert_eq!(first.skills.len(), SKILLS);
     assert_eq!(first.state, ExperimentCatalogState::Partial);
-    let cursor = first.next_after_skill.clone().expect("bounded continuation");
+    let cursor = first.next_after_skill.expect("bounded continuation");
     assert_eq!(Some(&cursor), pins.get(15).map(|pin| &pin.skill_id));
     let second = store.experiment_catalog(&ExperimentCatalogRequest {
         after_skill: Some(cursor.clone()),
@@ -285,7 +285,9 @@ fn read_budget_rejects_deadline_and_remaining_input_before_decoding() {
     let pin = skill(&store, 0);
     let path = store.root().join(ACTIVE_DIR).join(format!("{}.json", pin.skill_id));
     let mut expired = ReadBudget {
-        deadline: Instant::now() - Duration::from_secs(1),
+        deadline: Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("expired test deadline"),
         bytes: 0,
     };
     assert!(matches!(

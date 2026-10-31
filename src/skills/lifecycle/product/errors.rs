@@ -2,7 +2,7 @@ use super::{ExperimentProductError, ExperimentProductFailureKind as Kind};
 use crate::skills::lifecycle::experiment::ExperimentError;
 use crate::skills::lifecycle::{GateError, LifecycleError, ServiceError};
 
-fn lifecycle_kind(error: &LifecycleError) -> Kind {
+const fn lifecycle_kind(error: &LifecycleError) -> Kind {
     match error {
         LifecycleError::SourceReviewRequired { .. } => Kind::SourceReviewRequired,
         LifecycleError::OwnerMismatch { .. } => Kind::WrongOwner,
@@ -15,7 +15,7 @@ fn lifecycle_kind(error: &LifecycleError) -> Kind {
         _ => Kind::EvidenceUnavailable,
     }
 }
-fn gate_kind(error: &GateError) -> Kind {
+const fn gate_kind(error: &GateError) -> Kind {
     match error {
         GateError::Lifecycle(error) => lifecycle_kind(error),
         GateError::Stale(_) | GateError::Expired(_) | GateError::SuiteChanged(_) => Kind::Stale,
