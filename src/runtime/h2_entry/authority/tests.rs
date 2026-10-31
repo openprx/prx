@@ -244,7 +244,7 @@ pub(crate) async fn test_exact_call_scope<F: std::future::Future>(args: &serde_j
     let current = current_run_continuation().unwrap();
     let origin = Arc::new(VerifiedEntryOrigin {
         profile: current.profile().unwrap(),
-        record: current.source.clone(),
+        record: current.body.source.clone(),
     });
     let source = origin.record();
     let call = EntryCall {

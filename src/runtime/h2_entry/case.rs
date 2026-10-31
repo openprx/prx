@@ -44,7 +44,7 @@ impl ControlledCaseScope {
             "controlled case execution identity changed"
         );
         context.owner_filesystem = Some(Arc::clone(&self.filesystem));
-        context.controlled_case = Some(Arc::clone(self));
+        context.set_controlled_case(Arc::clone(self));
         Ok(())
     }
     pub(crate) fn registry(

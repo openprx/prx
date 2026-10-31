@@ -173,7 +173,7 @@ impl TurnDecisionService {
             "old-boot pending execution requires a fresh exact current request"
         );
         match &approval.local_owner {
-            Some(stamp) => Ok(Some(LocalOwnerReview::from_signed(origin, stamp.clone())?)),
+            Some(stamp) => Ok(Some(LocalOwnerReview::from_signed(origin, stamp.as_ref().clone())?)),
             None => {
                 anyhow::ensure!(
                     current.boot == original.boot,

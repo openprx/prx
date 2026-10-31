@@ -19,7 +19,7 @@ use std::sync::Arc;
 #[serde(deny_unknown_fields)]
 struct PendingRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    h2_origin: Option<crate::runtime::h2_entry::EntryOriginRecord>,
+    h2_origin: Option<Box<crate::runtime::h2_entry::EntryOriginRecord>>,
     subject: Subject,
     binding: DecisionApprovalBinding,
     source_event_id: String,
@@ -64,7 +64,7 @@ impl PendingRecord {
 /// Final claim and current-call validation remain mandatory.
 pub(super) struct VerifiedDecisionApproval {
     pending: VerifiedPendingDecisionApproval,
-    local_owner: Option<crate::runtime::h2_entry::LocalOwnerReviewStamp>,
+    local_owner: Option<Box<crate::runtime::h2_entry::LocalOwnerReviewStamp>>,
     grants: Vec<ApprovalGrantV2>,
 }
 
@@ -94,7 +94,7 @@ impl VerifiedPendingDecisionApproval {
 #[serde(deny_unknown_fields)]
 struct ReviewRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    local_owner: Option<crate::runtime::h2_entry::LocalOwnerReviewStamp>,
+    local_owner: Option<Box<crate::runtime::h2_entry::LocalOwnerReviewStamp>>,
     pending_mac: [u8; 32],
     approved: bool,
     grants: Vec<ApprovalGrantV2>,
@@ -283,7 +283,7 @@ impl TurnDecisionService {
             vec![crate::memory::principal::Role::Anonymous],
         );
         let record = PendingRecord {
-            h2_origin: proof.h2_entry_origin().map(|origin| origin.record().clone()),
+            h2_origin: proof.h2_entry_origin().map(|origin| Box::new(origin.record().clone())),
             subject: Subject {
                 agent_id: format!("prx:agent:{}", proof.policy_channel()),
                 principal_id: principal.principal_id,
@@ -470,7 +470,7 @@ impl TurnDecisionService {
             }
         }
         let review = ReviewRecord {
-            local_owner,
+            local_owner: local_owner.map(Box::new),
             pending_mac,
             approved,
             grants,
@@ -744,7 +744,7 @@ impl TurnDecisionService {
                 );
             }
         }
-        self.verify_h2_review_requirement(&pending, true, review.record.local_owner.as_ref())?;
+        self.verify_h2_review_requirement(&pending, true, review.record.local_owner.as_deref())?;
         self.check_live_parity()?;
         let now = Utc::now();
         anyhow::ensure!(
@@ -1036,7 +1036,7 @@ impl TurnDecisionService {
             vec![crate::memory::principal::Role::Anonymous],
         );
         let mut record = PendingRecord {
-            h2_origin: h2_origin.map(|origin| origin.record().clone()),
+            h2_origin: h2_origin.map(|origin| Box::new(origin.record().clone())),
             subject: Subject {
                 agent_id: format!("prx:agent:{channel}"),
                 principal_id: principal.principal_id,

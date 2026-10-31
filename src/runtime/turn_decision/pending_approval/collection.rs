@@ -249,7 +249,10 @@ impl ApprovalCollectionLease {
             "collection operation differs from pinned capability"
         );
         let mut record = PendingRecord {
-            h2_origin: self.source.h2_entry_origin().map(|origin| origin.record().clone()),
+            h2_origin: self
+                .source
+                .h2_entry_origin()
+                .map(|origin| Box::new(origin.record().clone())),
             subject: Subject {
                 agent_id: format!("prx:agent:{channel}"),
                 principal_id: principal.principal_id,

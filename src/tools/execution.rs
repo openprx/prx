@@ -517,11 +517,15 @@ impl ToolExecutionCommand {
 }
 
 /// Authenticated runtime facade available to every execution stage.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct H2ExecutionMetadata {
+    controlled_case: Option<Arc<crate::runtime::h2_entry::ControlledCaseScope>>,
+    origin: Option<Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>>,
+    review: Option<crate::runtime::h2_entry::LocalOwnerReview>,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionContext {
-    pub(crate) controlled_case: Option<Arc<crate::runtime::h2_entry::ControlledCaseScope>>,
-    pub(crate) h2_origin: Option<Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>>,
-    pub(crate) h2_review: Option<crate::runtime::h2_entry::LocalOwnerReview>,
+    h2_metadata: Option<Box<H2ExecutionMetadata>>,
     pub(crate) owner_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
     pub(crate) capability_search: Option<super::capability::search_tool::CapabilitySearchPort>,
     pub(crate) ordinary_child_publication: Option<crate::runtime::turn_decision::OrdinaryChildPublication>,
@@ -550,6 +554,41 @@ pub struct ToolExecutionContext {
 }
 
 impl ToolExecutionContext {
+    pub(crate) fn controlled_case(&self) -> Option<&Arc<crate::runtime::h2_entry::ControlledCaseScope>> {
+        self.h2_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.controlled_case.as_ref())
+    }
+    pub(crate) fn h2_origin(&self) -> Option<&Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>> {
+        self.h2_metadata.as_ref().and_then(|metadata| metadata.origin.as_ref())
+    }
+    pub(crate) fn h2_review(&self) -> Option<&crate::runtime::h2_entry::LocalOwnerReview> {
+        self.h2_metadata.as_ref().and_then(|metadata| metadata.review.as_ref())
+    }
+    fn normalize_h2_metadata(&mut self) {
+        if self.h2_metadata.as_ref().is_some_and(|metadata| {
+            metadata.controlled_case.is_none() && metadata.origin.is_none() && metadata.review.is_none()
+        }) {
+            self.h2_metadata = None;
+        }
+    }
+    pub(crate) fn set_controlled_case(&mut self, case: Arc<crate::runtime::h2_entry::ControlledCaseScope>) {
+        self.h2_metadata.get_or_insert_with(Box::default).controlled_case = Some(case);
+    }
+    pub(crate) fn set_h2_origin(&mut self, origin: Option<Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>>) {
+        if self.h2_metadata.is_none() && origin.is_none() {
+            return;
+        }
+        self.h2_metadata.get_or_insert_with(Box::default).origin = origin;
+        self.normalize_h2_metadata();
+    }
+    pub(crate) fn set_h2_review(&mut self, review: Option<crate::runtime::h2_entry::LocalOwnerReview>) {
+        if self.h2_metadata.is_none() && review.is_none() {
+            return;
+        }
+        self.h2_metadata.get_or_insert_with(Box::default).review = review;
+        self.normalize_h2_metadata();
+    }
     #[must_use]
     pub fn new(envelope: RuntimeEnvelope, chat_type: impl Into<String>) -> Self {
         let chat_id = envelope.session_key.clone();
@@ -560,9 +599,7 @@ impl ToolExecutionContext {
             .or_else(|| envelope.task_id.clone())
             .unwrap_or_else(|| envelope.session_key.clone());
         Self {
-            controlled_case: None,
-            h2_origin: None,
-            h2_review: None,
+            h2_metadata: None,
             owner_filesystem: None,
             capability_search: None,
             ordinary_child_publication: None,
@@ -2469,10 +2506,10 @@ impl ToolExecutionService {
             .owner_filesystem
             .as_ref()
             .filter(|scope| {
-                (context.controlled_case.is_some()
+                (context.controlled_case().is_some()
                     || (context.envelope.owner_isolated
                         && context.envelope.source == crate::runtime::envelope::RuntimeSource::Console))
-                    && (if context.controlled_case.is_some() {
+                    && (if context.controlled_case().is_some() {
                         scope.matches(&context.envelope.workspace_id, &context.envelope.resolved_owner_id())
                     } else {
                         context
@@ -2539,7 +2576,7 @@ impl ToolExecutionService {
                     .get("action")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|name| name.starts_with("lifecycle_experiment_"));
-            if let Some(origin) = &context.h2_origin {
+            if let Some(origin) = context.h2_origin() {
                 origin.ensure_live()?;
                 anyhow::ensure!(
                     origin.profile().permits_tool(&command.name),
@@ -2559,8 +2596,8 @@ impl ToolExecutionService {
                 return Ok::<_, anyhow::Error>(None);
             }
             let origin = context
-                .h2_origin
-                .clone()
+                .h2_origin()
+                .cloned()
                 .ok_or_else(|| anyhow::anyhow!("experiment action has no actual controlled source"))?;
             let binding = context
                 .execution_bindings
@@ -2587,7 +2624,7 @@ impl ToolExecutionService {
             Ok(Some(EntryInvocation::from_verified(
                 origin,
                 &verified,
-                context.h2_review.clone(),
+                context.h2_review().cloned(),
             )?))
         }
         .await

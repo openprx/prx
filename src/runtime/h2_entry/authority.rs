@@ -161,12 +161,14 @@ impl EntryInvocation {
             "controlled invocation already consumed"
         );
         let continuation = RunContinuation {
-            profile: Arc::downgrade(self.origin.profile()),
-            root: None,
-            target_owner: self.origin.record().target_owner.clone(),
-            workspace: self.origin.record().workspace.clone(),
-            source: self.origin.record().clone(),
-            admission: None,
+            body: Box::new(RunContinuationBody {
+                profile: Arc::downgrade(self.origin.profile()),
+                root: None,
+                target_owner: self.origin.record().target_owner.clone(),
+                workspace: self.origin.record().workspace.clone(),
+                source: self.origin.record().clone(),
+                admission: None,
+            }),
         };
         Ok(ValidatedLifecycleCommand {
             action,
@@ -181,6 +183,10 @@ impl EntryInvocation {
 
 #[derive(Clone)]
 pub(crate) struct RunContinuation {
+    body: Box<RunContinuationBody>,
+}
+#[derive(Clone)]
+struct RunContinuationBody {
     profile: Weak<ControlledH2Profile>,
     target_owner: String,
     workspace: String,
@@ -195,18 +201,20 @@ impl std::fmt::Debug for RunContinuation {
 }
 impl RunContinuation {
     pub(crate) fn ensure_active(&self, workspace: &std::path::Path, owner: &str) -> Result<()> {
-        self.profile
+        self.body
+            .profile
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("controlled entry owner ended"))?
             .ensure_live()?;
         ensure!(
-            workspace.to_string_lossy() == self.workspace && owner == self.target_owner,
+            workspace.to_string_lossy() == self.body.workspace && owner == self.body.target_owner,
             "controlled continuation moved to another target"
         );
         Ok(())
     }
     pub(crate) fn profile(&self) -> Result<Arc<ControlledH2Profile>> {
         let profile = self
+            .body
             .profile
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("controlled entry owner ended"))?;
@@ -214,11 +222,11 @@ impl RunContinuation {
         Ok(profile)
     }
     pub(crate) fn admission_pin(&self, config: &crate::config::Config) -> Result<ControlledAdmissionPin> {
-        self.ensure_active(&config.workspace_dir, &self.target_owner)?;
+        self.ensure_active(&config.workspace_dir, &self.body.target_owner)?;
         self.profile()?.verify(config)?;
-        Ok(self.admission.clone().unwrap_or_else(|| ControlledAdmissionPin {
+        Ok(self.body.admission.clone().unwrap_or_else(|| ControlledAdmissionPin {
             version: 1,
-            source: self.source.clone(),
+            source: self.body.source.clone(),
         }))
     }
     pub(crate) fn ensure_admission(
@@ -233,7 +241,7 @@ impl RunContinuation {
         );
         self.ensure_root(plan.digest())?;
         ensure!(
-            plan.spec().owner_scope.as_str() == self.target_owner,
+            plan.spec().owner_scope.as_str() == self.body.target_owner,
             "controlled admission owner changed"
         );
         Ok(())
@@ -254,7 +262,7 @@ impl RunContinuation {
         );
         self.ensure_root(plan.digest())?;
         ensure!(
-            self.admission.as_ref() == Some(pin),
+            self.body.admission.as_ref() == Some(pin),
             "store admission differs from held source authority"
         );
         Ok(())
@@ -281,7 +289,7 @@ impl RunContinuation {
         config: &crate::config::Config,
     ) -> Result<Self> {
         self.profile()?.verify(config)?;
-        self.for_store_plan(plan, pin, &config.workspace_dir, &self.target_owner)
+        self.for_store_plan(plan, pin, &config.workspace_dir, &self.body.target_owner)
     }
     pub(crate) fn for_store_plan(
         &self,
@@ -291,7 +299,7 @@ impl RunContinuation {
         owner: &str,
     ) -> Result<Self> {
         self.ensure_active(workspace, owner)?;
-        let current = &self.source;
+        let current = &self.body.source;
         ensure!(
             pin.version == 1
                 && pin.source.authority_expires_at > chrono::Utc::now()
@@ -304,11 +312,11 @@ impl RunContinuation {
             "controlled plan belongs to another original live launch delegation"
         );
         ensure!(
-            plan.spec().owner_scope.as_str() == self.target_owner,
+            plan.spec().owner_scope.as_str() == self.body.target_owner,
             "controlled root owner changed"
         );
         let mut next = self.for_root(plan.digest())?;
-        next.admission = Some(pin.clone());
+        next.body.admission = Some(pin.clone());
         Ok(next)
     }
     pub(crate) fn for_root(&self, digest: &str) -> Result<Self> {
@@ -317,16 +325,16 @@ impl RunContinuation {
             "invalid controlled root identity"
         );
         ensure!(
-            self.root.as_deref().is_none_or(|old| old == digest),
+            self.body.root.as_deref().is_none_or(|old| old == digest),
             "controlled continuation changed root"
         );
         let mut next = self.clone();
-        next.root = Some(digest.into());
+        next.body.root = Some(digest.into());
         Ok(next)
     }
     pub(crate) fn ensure_root(&self, digest: &str) -> Result<()> {
         ensure!(
-            self.root.as_deref() == Some(digest),
+            self.body.root.as_deref() == Some(digest),
             "controlled stage belongs to another experiment"
         );
         Ok(())

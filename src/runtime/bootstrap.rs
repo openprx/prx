@@ -238,7 +238,7 @@ pub(crate) enum AgentRuntimeConfig {
     },
     ControlledEntry {
         config: Box<Config>,
-        producer: super::h2_entry::TerminalInputProducer,
+        producer: Box<super::h2_entry::TerminalInputProducer>,
     },
     Pinned {
         generation: Arc<crate::config::ConfigGeneration>,
@@ -329,7 +329,7 @@ impl RuntimeBootstrap {
         Self::build_inner(
             AgentRuntimeConfig::ControlledEntry {
                 config: Box::new(config),
-                producer,
+                producer: Box::new(producer),
             },
             profile,
             crate::causal_tree::state::TurnSurfaceKind::Interactive,
@@ -434,7 +434,7 @@ impl RuntimeBootstrap {
                 (manager, generation)
             }
             AgentRuntimeConfig::ControlledEntry { config, producer } => {
-                terminal_producer = Some(producer);
+                terminal_producer = Some(*producer);
                 let manager = crate::config::new_shared(*config);
                 let generation = manager.pin();
                 (manager, generation)
