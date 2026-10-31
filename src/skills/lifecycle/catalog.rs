@@ -308,3 +308,6 @@ impl SkillLifecycleStore {
         Ok(skill)
     }
 }
+
+#[cfg(test)]
+mod tests;

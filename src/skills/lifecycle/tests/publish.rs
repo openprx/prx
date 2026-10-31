@@ -797,3 +797,5 @@ fn rollback_restores_the_enabled_state_of_its_target() {
     let restored = binding(&store).expect("test: binding");
     assert_eq!((restored.generation, restored.enabled), (3, false));
 }
+
+mod product_lock;
