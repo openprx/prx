@@ -42,10 +42,16 @@ pub(crate) struct ControlledH2Profile {
     deadline: std::time::Instant,
     pub(super) revoked: AtomicBool,
     limits: EntryLimits,
-    reader: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    reader: parking_lot::Mutex<ReaderState>,
     roots: parking_lot::Mutex<
         std::collections::BTreeMap<String, crate::skills::lifecycle::experiment::ExperimentResources>,
     >,
+}
+/// The original reader owner retains observation through timeout and task drop.
+#[derive(Default)]
+struct ReaderState {
+    handle: Option<std::thread::JoinHandle<()>>,
+    failure: Option<&'static str>,
 }
 impl std::fmt::Debug for ControlledH2Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -146,7 +152,7 @@ impl ControlledH2Profile {
             deadline,
             revoked: AtomicBool::new(false),
             limits,
-            reader: parking_lot::Mutex::new(None),
+            reader: parking_lot::Mutex::new(ReaderState::default()),
             roots: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
         }))
     }
@@ -268,25 +274,45 @@ impl ControlledH2Profile {
     }
     pub(crate) fn own_reader(&self, reader: std::thread::JoinHandle<()>) -> Result<()> {
         let mut slot = self.reader.lock();
-        ensure!(slot.is_none(), "controlled terminal already has an input owner");
-        *slot = Some(reader);
+        ensure!(
+            slot.handle.is_none() && slot.failure.is_none(),
+            "controlled terminal already has an input owner"
+        );
+        slot.handle = Some(reader);
         Ok(())
     }
     pub(crate) async fn close_reader(&self) -> Result<()> {
-        // Revoke before waiting: a queued input or backend first poll must fail.
+        // Keep the handle in its original slot until physical termination is
+        // observed. A timeout, concurrent close or dropped future cannot erase
+        // cleanup liability. Only this short synchronous section consumes it.
         self.revoke();
-        let reader = self.reader.lock().take();
-        if let Some(reader) = reader {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while !reader.is_finished() && std::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            {
+                let mut slot = self.reader.lock();
+                if let Some(failure) = slot.failure {
+                    anyhow::bail!(failure);
+                }
+                match slot.handle.as_ref() {
+                    None => return Ok(()),
+                    Some(reader) if reader.is_finished() => {
+                        if let Some(reader) = slot.handle.take() {
+                            if reader.join().is_err() {
+                                slot.failure = Some("controlled terminal reader failed");
+                                anyhow::bail!("controlled terminal reader failed");
+                            }
+                        }
+                        return Ok(());
+                    }
+                    Some(_) => {}
+                }
             }
-            ensure!(reader.is_finished(), "controlled terminal cleanup remains unconfirmed");
-            reader
-                .join()
-                .map_err(|_| anyhow::anyhow!("controlled terminal reader failed"))?;
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "controlled terminal cleanup remains unconfirmed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        Ok(())
     }
     pub(super) fn launch_description(&self) -> serde_json::Value {
         serde_json::json!({"mode":self.kind,"workspace":self.workspace,"actual_principal":self.principal,
