@@ -236,6 +236,7 @@ async fn apply_file_operation_inner(
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
+    mod h2_controlled;
     use super::*;
     use crate::runtime::turn_cleanup::CleanupScope;
     use crate::security::AutonomyLevel;

@@ -86,3 +86,6 @@ impl PartialEq for ControlledCaseScope {
     }
 }
 impl Eq for ControlledCaseScope {}
+
+#[cfg(all(test, unix))]
+mod tests;

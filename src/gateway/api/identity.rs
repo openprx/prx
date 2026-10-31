@@ -116,3 +116,6 @@ pub(in crate::gateway) async fn verify_startup_identity(config: &Config, princip
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

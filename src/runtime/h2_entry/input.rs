@@ -148,3 +148,6 @@ impl TerminalInputSink {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

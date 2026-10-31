@@ -151,3 +151,6 @@ impl SkillsManageTool {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

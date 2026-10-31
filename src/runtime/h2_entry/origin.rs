@@ -293,3 +293,6 @@ impl ControlledH2Profile {
         }))
     }
 }
+
+#[cfg(test)]
+pub(super) mod tests;

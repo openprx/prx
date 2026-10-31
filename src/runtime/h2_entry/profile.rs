@@ -420,3 +420,6 @@ impl Drop for ControlledReaderLifetime {
         }
     }
 }
+
+#[cfg(test)]
+pub(super) mod tests;

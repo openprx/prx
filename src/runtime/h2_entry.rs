@@ -20,3 +20,6 @@ pub(crate) use input::{
 pub use origin::EntryOriginRecord;
 pub(crate) use origin::{TerminalInputProducer, TerminalInputProof, VerifiedEntryOrigin};
 pub(crate) use profile::{ControlledH2Profile, ControlledReaderLifetime, EntryKind, EntryLimits};
+
+#[cfg(test)]
+pub(crate) use authority::tests::{test_exact_call_scope, test_recorded_terminal_scope, test_scope_root_claims};

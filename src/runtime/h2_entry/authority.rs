@@ -412,3 +412,6 @@ pub(crate) async fn scope_invocation<F: std::future::Future>(
 ) -> F::Output {
     INVOCATION.scope(value, future).await
 }
+
+#[cfg(test)]
+pub(super) mod tests;
