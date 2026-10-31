@@ -2205,7 +2205,7 @@
         "status": "retired",
         "deprecated_at": "2026-10-16T00:00:00Z",
         "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "gemini/gemini-3.5-flash"
+        "replacement": "gemini/gemini-3.8-flash"
       },
       "operations": [
         "chat"
@@ -2258,7 +2258,7 @@
         "status": "retired",
         "deprecated_at": "2026-10-16T00:00:00Z",
         "retire_at": "2026-10-16T00:00:00Z",
-        "replacement": "gemini/gemini-3.5-flash"
+        "replacement": "gemini/gemini-3.8-flash"
       },
       "operations": [
         "chat"
