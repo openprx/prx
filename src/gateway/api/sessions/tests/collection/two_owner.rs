@@ -433,6 +433,11 @@ async fn exercise_owners(
         .await?;
         assert_eq!(status, StatusCode::OK, "{value}");
         assert_eq!(writes.load(Ordering::SeqCst), index);
+        let awaiting = inbox_decision_ids(&app, token).await?;
+        assert!(
+            awaiting.iter().any(|item| item == &id),
+            "an approved call waiting to resume stays in the inbox"
+        );
         let (status, value) = routed(&app, Method::POST, &resume, Some(token), serde_json::json!({})).await?;
         assert_eq!(status, StatusCode::OK, "{value}");
         assert_eq!(

@@ -85,6 +85,35 @@ test('a media send that is accepted still shows progress when history refresh fa
   await expect(page.getByText('The send may have reached the gateway.')).toHaveCount(0);
 });
 
+test('a missing job unlocks the composer and keeps the draft', async ({ page }) => {
+  let messageReads = 0;
+  await signIn(page);
+  await stubStatus(page);
+  await page.route('**/api/sessions/*/messages**', (route) => {
+    messageReads += 1;
+    return fulfillJson(route, 200, []);
+  });
+  await page.route('**/api/sessions/*/message', (route) => fulfillJson(route, 202, {
+    status: 'accepted',
+    job_id: 'job-gone',
+    work_id: 'work-gone',
+    poll_url: '/api/jobs/job-gone',
+    cancel_url: '/api/jobs/job-gone/cancel'
+  }));
+  await page.route(/\/api\/jobs\/job-gone$/, (route) => fulfillJson(route, 404, { error: 'missing' }));
+  await page.goto('/chat/session-1');
+  await page.locator('textarea').fill('keep this draft');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect(page.getByText('The gateway no longer knows this job; check history.')).toBeVisible();
+  await expect(page.locator('textarea')).toHaveValue('keep this draft');
+  await expect(page.getByRole('button', { name: 'Send' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Attach files' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Cancel turn' })).toHaveCount(0);
+  const readsBeforeCheck = messageReads;
+  await page.getByRole('button', { name: 'Check again' }).click();
+  await expect.poll(() => messageReads).toBeGreaterThan(readsBeforeCheck);
+});
+
 test('an uncertain send is not repeated and the draft stays', async ({ page }) => {
   let posts = 0;
   await signIn(page);

@@ -19,6 +19,26 @@ test('shows the phase, elapsed time, and cancel action', async () => {
   expect(onCancel).toHaveBeenCalledOnce();
 });
 
+test('a missing job shows the history notice and check again, without cancel', async () => {
+  const onCheckAgain = vi.fn();
+  const onCancel = vi.fn();
+  render(TurnProgress, {
+    props: {
+      phase: 'running',
+      elapsedMs: 40,
+      jobId: 'job-1',
+      workId: 'work-1',
+      jobMissing: true,
+      onCheckAgain,
+      onCancel
+    }
+  });
+  expect(screen.getByText('The gateway no longer knows this job; check history.')).toBeInTheDocument();
+  await fireEvent.click(screen.getByRole('button', { name: 'Check again' }));
+  expect(onCheckAgain).toHaveBeenCalledOnce();
+  expect(screen.queryByRole('button', { name: 'Cancel turn' })).not.toBeInTheDocument();
+});
+
 test('hides cancel when the caller does not provide onCancel', () => {
   render(TurnProgress, {
     props: {

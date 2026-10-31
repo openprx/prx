@@ -40,7 +40,7 @@ test('a later cursor behind oldest_seq reports missed results', async ({ page })
     if (reads === 1) {
       return fulfillJson(route, 200, { results: [], next_seq: 5, oldest_seq: 1 });
     }
-    return fulfillJson(route, 200, { results: [], next_seq: 5, oldest_seq: 6 });
+    return fulfillJson(route, 200, { results: [], next_seq: 5, oldest_seq: 7 });
   });
   await page.route('**/api/chat-sessions', (route) => {
     if (route.request().method() !== 'GET') {

@@ -78,6 +78,16 @@
     });
   }
 
+  function checkProgressAgain() {
+    if (turn?.jobMissing) {
+      onsettled().catch(() => {
+        if (alive) error = t('decisionApproval.refreshFailed');
+      });
+      return;
+    }
+    watchHandle?.checkAgain();
+  }
+
   async function inspect(event) {
     event.preventDefault();
     if (busy) return;
@@ -97,6 +107,9 @@
       const result = await api.getDecisionApproval(sessionId, id);
       if (!alive) return;
       if (result?.decision_id?.toLowerCase() !== id.toLowerCase()) throw new Error(t('decisionApproval.unavailable'));
+      watchHandle?.stop();
+      watchHandle = null;
+      turn = null;
       reviewedId = result.decision_id;
       view = {
         tool: result.tool, effect: result.effect, call_digest: result.call_digest,
@@ -202,7 +215,7 @@
   {/if}
   {#if turn}
     <div class="mt-3">
-      <TurnProgress phase={turn.phase} elapsedMs={turn.elapsedMs} jobId={turn.jobId} workId={turn.workId} stillRunning={turn.stillRunning} pollStale={turn.pollStale} jobMissing={turn.jobMissing} ack={turn.ack} onCheckAgain={() => watchHandle?.checkAgain()} />
+      <TurnProgress phase={turn.phase} elapsedMs={turn.elapsedMs} jobId={turn.jobId} workId={turn.workId} stillRunning={turn.stillRunning} pollStale={turn.pollStale} jobMissing={turn.jobMissing} ack={turn.ack} onCheckAgain={checkProgressAgain} />
     </div>
   {/if}
   <div aria-live="polite" class="mt-2 text-gray-700 dark:text-gray-200">{busy ? t('common.loading') : notice}</div>

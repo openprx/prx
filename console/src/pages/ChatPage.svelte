@@ -36,6 +36,7 @@
   let turn = $state(null);
   let turnUncertain = $state(false);
   let cancelOpen = $state(false);
+  let acceptedDraft = '';
   let watchHandle = null;
 
   function pinnedToBottom() {
@@ -92,6 +93,10 @@
         }
         if (update.terminalUnknown) {
           turn = { ...turn, pollStale: false, jobMissing: true, stillRunning: false };
+          if (draftMessage.length === 0 && acceptedDraft.length > 0) {
+            draftMessage = acceptedDraft;
+          }
+          acceptedDraft = '';
           return;
         }
         if (update.error) {
@@ -109,9 +114,13 @@
           jobMissing: false
         };
         if (phase === 'succeeded') {
+          acceptedDraft = '';
           applyReply(snapshot.result);
         } else if (phase === 'failed') {
+          acceptedDraft = '';
           errorMessage = typeof snapshot.error === 'string' && snapshot.error.length > 0 ? snapshot.error : t('chat.failed');
+        } else if (phase === 'cancelled') {
+          acceptedDraft = '';
         }
       }
     });
@@ -460,7 +469,15 @@
   }
 
   function turnActive() {
-    return turn && !isTerminalPhase(turn.phase);
+    return Boolean(turn) && !turn.jobMissing && !isTerminalPhase(turn.phase);
+  }
+
+  function checkProgressAgain() {
+    if (turn?.jobMissing) {
+      refreshPreservingPin();
+      return;
+    }
+    watchHandle?.checkAgain();
   }
 
   async function confirmCancel() {
@@ -514,9 +531,11 @@
         turnUncertain = true;
         return;
       }
+      const sentDraft = draftMessage;
       draftMessage = '';
       clearSelectedFiles();
       if (accepted) {
+        acceptedDraft = sentDraft;
         startWatch(body, originSession);
       }
       try {
@@ -575,6 +594,7 @@
       cancelled = true;
       stopWatch();
       turn = null;
+      acceptedDraft = '';
     };
   });
 
@@ -621,7 +641,7 @@
       jobMissing={turn.jobMissing}
       ack={turn.ack}
       onCancel={() => { cancelOpen = true; }}
-      onCheckAgain={() => watchHandle?.checkAgain()}
+      onCheckAgain={checkProgressAgain}
     />
   {/if}
 

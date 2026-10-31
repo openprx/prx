@@ -1,6 +1,9 @@
-// `after_seq` 0 means "from the start". A retained window that begins at 1 is
-// a fresh log, not a gap. A later cursor is missed only when it is older than
-// the oldest row the gateway still has.
+// `after_seq` 0 means "from the start". `next_seq` is the last seq returned, so
+// a cursor of N whose oldest retained row is N + 1 has not missed a row. A row
+// was dropped only when the oldest retained seq is at least N + 2.
 export function resultsWereTrimmed(requested, oldestSeq) {
-  return Number.isFinite(requested) && Number.isFinite(oldestSeq) && requested > 0 && requested < oldestSeq;
+  return Number.isFinite(requested)
+    && Number.isFinite(oldestSeq)
+    && requested > 0
+    && requested + 1 < oldestSeq;
 }

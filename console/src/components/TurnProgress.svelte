@@ -59,6 +59,9 @@
   {/if}
   {#if jobMissing}
     <StateBlock variant="error" message={t('chat.jobUnknown')} />
+    <button type="button" class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-600 dark:bg-gray-800" onclick={() => onCheckAgain?.()}>
+      {t('chat.checkAgain')}
+    </button>
   {/if}
   {#if active && onCancel && !jobMissing}
     <button
