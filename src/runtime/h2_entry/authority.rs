@@ -342,19 +342,24 @@ impl RunContinuation {
     pub(crate) fn sync_scope<T>(&self, work: impl FnOnce() -> T) -> T {
         RUN.sync_scope(Some(self.clone()), work)
     }
-    pub(crate) async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
-        RUN.scope(Some(self.clone()), future).await
+    pub(crate) fn scope<'a, F: std::future::Future>(
+        &'a self,
+        future: F,
+    ) -> impl std::future::Future<Output = F::Output> + use<'a, F> {
+        let future = Box::pin(future);
+        async move { RUN.scope(Some(self.clone()), future).await }
     }
 }
 tokio::task_local! { static RUN:Option<RunContinuation>; }
 pub(crate) fn current_run_continuation() -> Option<RunContinuation> {
     RUN.try_with(Clone::clone).ok().flatten()
 }
-pub(crate) async fn retain_run_continuation<F: std::future::Future>(
+pub(crate) fn retain_run_continuation<F: std::future::Future>(
     continuation: Option<RunContinuation>,
     future: F,
-) -> F::Output {
-    RUN.scope(continuation, future).await
+) -> impl std::future::Future<Output = F::Output> + use<F> {
+    let future = Box::pin(future);
+    async move { RUN.scope(continuation, future).await }
 }
 
 /// Fixed service target, not a replacement caller identity or filesystem owner.
@@ -396,8 +401,12 @@ impl ValidatedLifecycleCommand {
         );
         self.target.verify(config, owner)
     }
-    pub(crate) async fn continuation_scope<F: std::future::Future>(&self, future: F) -> F::Output {
-        self.continuation.scope(future).await
+    pub(crate) fn continuation_scope<'a, F: std::future::Future>(
+        &'a self,
+        future: F,
+    ) -> impl std::future::Future<Output = F::Output> + use<'a, F> {
+        let future = Box::pin(future);
+        async move { self.continuation.scope(future).await }
     }
 }
 
@@ -430,11 +439,12 @@ pub(crate) fn current_invocation() -> Result<(Arc<EntryInvocation>, tokio_util::
         .flatten()
         .ok_or_else(|| anyhow::anyhow!("controlled action requires its exact admitted invocation"))
 }
-pub(crate) async fn scope_invocation<F: std::future::Future>(
+pub(crate) fn scope_invocation<F: std::future::Future>(
     value: Option<(Arc<EntryInvocation>, tokio_util::sync::CancellationToken)>,
     future: F,
-) -> F::Output {
-    INVOCATION.scope(value, future).await
+) -> impl std::future::Future<Output = F::Output> + use<F> {
+    let future = Box::pin(future);
+    async move { INVOCATION.scope(value, future).await }
 }
 
 #[cfg(test)]

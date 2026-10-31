@@ -60,7 +60,9 @@ pub(crate) async fn execute(
         bail!("the skill lifecycle is disabled; set [skills_lifecycle] enabled = true");
     };
     match command {
-        SkillLifecycleCommands::Experiment { command } => experiment::dispatch(command, service, config).await,
+        SkillLifecycleCommands::Experiment { command } => {
+            Box::pin(experiment::dispatch(command, service, config)).await
+        }
         SkillLifecycleCommands::SuiteDigest { source } => {
             let suite = read_suite(&source).await?;
             Ok(serde_json::json!({"skill_id":suite.suite().skill_id,"digest":suite.digest()}).to_string())

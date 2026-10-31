@@ -264,3 +264,81 @@ pub(crate) async fn test_exact_call_scope<F: std::future::Future>(args: &serde_j
     let invocation = EntryInvocation::admit(origin, call, None).unwrap();
     scope_invocation(Some((invocation, tokio_util::sync::CancellationToken::new())), work).await
 }
+
+/// Observe the real task locals at destruction without adding an authority producer.
+struct PendingScopeDrop(Arc<parking_lot::Mutex<Vec<(bool, bool)>>>);
+impl std::future::Future for PendingScopeDrop {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        std::task::Poll::Pending
+    }
+}
+impl Drop for PendingScopeDrop {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .push((current_run_continuation().is_some(), current_invocation().is_ok()));
+    }
+}
+
+#[test]
+fn boxed_scope_unpolled_and_polled_drop_preserve_original_task_local_boundaries() {
+    let fixture = Fixture::new(EntryKind::Terminal);
+    let admitted = invocation(&fixture, EntryAction::Catalog);
+    let command = admitted.consume(EntryAction::Catalog, &"a".repeat(64)).unwrap();
+    let drops = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let make_work = || {
+        scope_invocation(
+            Some((Arc::clone(&admitted), tokio_util::sync::CancellationToken::new())),
+            command.continuation_scope(command.continuation.scope(retain_run_continuation(
+                Some(command.continuation.clone()),
+                PendingScopeDrop(Arc::clone(&drops)),
+            ))),
+        )
+    };
+    let unpolled = make_work();
+    assert!(current_run_continuation().is_none());
+    assert!(current_invocation().is_err());
+    drop(unpolled);
+    assert_eq!(*drops.lock(), vec![(false, false)]);
+
+    let mut started = Box::pin(make_work());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(started.as_mut(), &mut context).is_pending());
+    assert!(current_run_continuation().is_none());
+    assert!(current_invocation().is_err());
+    drop(started);
+    assert_eq!(*drops.lock(), vec![(false, false), (true, true)]);
+    assert!(current_run_continuation().is_none());
+    assert!(current_invocation().is_err());
+    assert!(admitted.consume(EntryAction::Catalog, &"a".repeat(64)).is_err());
+}
+
+#[tokio::test]
+async fn retained_source_survives_delayed_poll_but_revocation_before_use_still_refuses() {
+    let fixture = Fixture::new(EntryKind::Terminal);
+    let command = invocation(&fixture, EntryAction::Catalog)
+        .consume(EntryAction::Catalog, &"a".repeat(64))
+        .unwrap();
+    let held = command.continuation;
+    let expected_boot = held.body.source.boot.clone();
+    let captured = retain_run_continuation(Some(held.clone()), async {
+        current_run_continuation().unwrap().body.source.boot.clone()
+    });
+    let other_fixture = Fixture::new(EntryKind::Terminal);
+    let other = invocation(&other_fixture, EntryAction::Catalog)
+        .consume(EntryAction::Catalog, &"a".repeat(64))
+        .unwrap();
+    assert_ne!(expected_boot, other.continuation.body.source.boot);
+    assert_eq!(other.continuation_scope(captured).await, expected_boot);
+    assert!(current_run_continuation().is_none());
+
+    let delayed = held.scope(async {
+        current_run_continuation()
+            .unwrap()
+            .ensure_active(&fixture.config.workspace_dir, fixture.profile.owner.as_str())
+    });
+    fixture.profile.revoke();
+    assert!(delayed.await.is_err());
+    assert!(current_run_continuation().is_none());
+}
