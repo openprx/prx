@@ -17,21 +17,52 @@
       return undefined;
     }
 
-    const measure = () => {
+    // Focusability follows the collapsed measurement only. The :focus rule
+    // expands the text, and measuring that expanded box would clear tabindex
+    // from the element that holds focus.
+    let focused = false;
+
+    const measureCollapsed = () => {
+      if (focused || current === document.activeElement) {
+        return;
+      }
       overflows = current.scrollWidth > current.clientWidth;
     };
-    measure();
 
-    if (typeof ResizeObserver !== 'function') {
-      return undefined;
+    measureCollapsed();
+
+    const onFocusIn = () => {
+      focused = true;
+    };
+    const onFocusOut = () => {
+      focused = false;
+      requestAnimationFrame(() => {
+        if (!current.isConnected || focused || current === document.activeElement) {
+          return;
+        }
+        overflows = current.scrollWidth > current.clientWidth;
+      });
+    };
+
+    current.addEventListener('focusin', onFocusIn);
+    current.addEventListener('focusout', onFocusOut);
+
+    let observer;
+    if (typeof ResizeObserver === 'function') {
+      observer = new ResizeObserver(() => {
+        measureCollapsed();
+      });
+      observer.observe(current);
     }
 
-    const observer = new ResizeObserver(measure);
-    observer.observe(current);
-    return () => observer.disconnect();
+    return () => {
+      current.removeEventListener('focusin', onFocusIn);
+      current.removeEventListener('focusout', onFocusOut);
+      observer?.disconnect();
+    };
   });
 </script>
 
-<!-- Focusable only when the text is clipped, so short values are not tab stops. -->
+<!-- Focusable only when the collapsed text is clipped, so short values are not tab stops. -->
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <span bind:this={node} class="ui-truncate-id" title={text} tabindex={overflows ? 0 : undefined}>{text}</span>

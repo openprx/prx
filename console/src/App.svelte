@@ -1,4 +1,5 @@
 <script>
+  import { tick } from 'svelte';
   import { Sun, Moon } from '@lucide/svelte';
   import { api, apiBaseUrl } from './lib/api';
   import { clearToken, getToken, syncTokenCookie } from './lib/auth';
@@ -54,6 +55,7 @@
   const isAuthenticated = $derived(token.length > 0);
   const activePath = $derived(isAuthenticated && path === '/' ? '/overview' : path);
   const navTarget = $derived(activeNavTarget(activePath));
+  const sidebarModal = $derived(narrowLayout && mobileSidebarOpen);
   const gatewayAddress = $derived(gatewayOrigin(apiBaseUrl));
   const languageOptions = $derived(
     SUPPORTED_LANGUAGES.map((lang) => ({
@@ -103,8 +105,9 @@
     syncTokenCookie();
   }
 
-  function closeSidebar() {
+  async function closeSidebar() {
     mobileSidebarOpen = false;
+    await tick();
     if (menuButton instanceof HTMLElement) {
       menuButton.focus();
     }
@@ -187,6 +190,32 @@
       if (event.key === 'Escape' && mobileSidebarOpen) {
         event.preventDefault();
         closeSidebar();
+        return;
+      }
+      if (event.key !== 'Tab' || !sidebarModal || !sidebar) {
+        return;
+      }
+      const items = [...sidebar.querySelectorAll('button, [href], input, select, textarea')].filter(
+        (element) => !element.hasAttribute('disabled')
+      );
+      if (items.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (!sidebar.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+        return;
+      }
+      if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -263,7 +292,7 @@
 </script>
 
 <div class="console-shell min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
-  <a class="ui-skip-link" href="#console-main">{t('shell.skipToContent')}</a>
+  <a class="ui-skip-link" href="#console-main" inert={sidebarModal}>{t('shell.skipToContent')}</a>
   {#if !isAuthenticated}
     <main id="console-main" class="min-h-screen" tabindex="-1">
       <LoginPage onLogin={onLogin} />
@@ -273,6 +302,7 @@
       {#if mobileSidebarOpen}
         <button
           type="button"
+          tabindex="-1"
           aria-label={t('app.closeSidebar')}
           class="fixed inset-0 z-30 bg-black/30 dark:bg-black/60 lg:hidden"
           onclick={closeSidebar}
@@ -329,7 +359,7 @@
         </nav>
       </aside>
 
-      <div class="flex min-w-0 max-w-full flex-1 flex-col">
+      <div class="flex min-w-0 max-w-full flex-1 flex-col" inert={sidebarModal}>
         <header class="console-header sticky top-0 z-20 flex max-w-full flex-wrap items-center justify-between gap-2 border-b border-gray-200 bg-white/95 px-4 py-3 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95">
           <div class="flex min-w-0 flex-1 flex-wrap items-center gap-2">
             <button

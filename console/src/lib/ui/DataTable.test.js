@@ -59,6 +59,62 @@ test('renders a semantic table and focuses a clipped identifier', () => {
   }
 });
 
+test('keeps a clipped identifier focusable after its box expands', () => {
+  const callbacks = [];
+  const originalObserver = globalThis.ResizeObserver;
+  let expanded = false;
+  const scroll = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollWidth');
+  const client = Object.getOwnPropertyDescriptor(Element.prototype, 'clientWidth');
+  globalThis.ResizeObserver = class {
+    constructor(callback) {
+      callbacks.push(callback);
+    }
+    observe() {}
+    disconnect() {}
+  };
+  Object.defineProperty(Element.prototype, 'scrollWidth', {
+    configurable: true,
+    get() {
+      if (expanded && this.classList?.contains('ui-truncate-id')) {
+        return 40;
+      }
+      return (this.textContent ?? '').length > 24 ? 480 : 40;
+    }
+  });
+  Object.defineProperty(Element.prototype, 'clientWidth', {
+    configurable: true,
+    get() {
+      return 160;
+    }
+  });
+
+  try {
+    render(DataTable, {
+      props: {
+        columns: [{ key: 'id', label: 'Session', truncate: true }],
+        rows: [{ id: longId }]
+      }
+    });
+    const identifier = screen.getAllByText(longId)[0];
+    identifier.focus();
+    expect(identifier).toHaveAttribute('tabindex', '0');
+    expanded = true;
+    for (const callback of callbacks) {
+      callback();
+    }
+    expect(identifier).toHaveAttribute('tabindex', '0');
+    expect(identifier).toHaveFocus();
+  } finally {
+    if (scroll) {
+      Object.defineProperty(Element.prototype, 'scrollWidth', scroll);
+    }
+    if (client) {
+      Object.defineProperty(Element.prototype, 'clientWidth', client);
+    }
+    globalThis.ResizeObserver = originalObserver;
+  }
+});
+
 test('leaves a short identifier out of the tab order', () => {
   const restore = mockClipMetrics();
   try {
