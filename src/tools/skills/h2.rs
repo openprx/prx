@@ -1,8 +1,14 @@
 //! Pure experiment intents reach the service only through the exact call port.
+mod schema;
 use super::*;
 use crate::runtime::h2_entry::{self, EntryAction};
 use crate::skills::lifecycle::*;
 use serde::de::DeserializeOwned;
+
+pub(super) const DESCRIPTION: &str = "Run the controlled instruction lifecycle using twelve typed actions. Plan accepts business intent (existing skill/pattern IDs and explicit budgets), then admit/run copy its complete returned plan. Inspect returns handle/final_selection/publication/adoption observations used by later actions. Review/publish/annotate use the exact observed final selection; rollback/retire/lessons use real history, never invented evidence. Required approval and explicit resume remain separate from execution. No create/install/import/legacy mutation or Study action exists in this controlled profile. See the request DTO mapping, field schemas and copy-source rules; never invent runtime owner, workspace, MAC, pins or proof.";
+pub(super) fn parameters_schema() -> serde_json::Value {
+    schema::parameters_schema()
+}
 
 pub(super) const ACTIONS: [&str; 12] = [
     "lifecycle_experiment_plan",

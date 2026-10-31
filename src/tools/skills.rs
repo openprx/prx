@@ -837,6 +837,7 @@ impl SkillsManageTool {
 impl SkillsManageTool {
     fn execution_schema(&self) -> &std::sync::Arc<serde_json::Value> {
         self.execution_schema.get_or_init(|| {
+            if self.controlled.is_some() {return std::sync::Arc::new(h2::parameters_schema());}
             std::sync::Arc::new({
                 let mut actions = vec![
                     "create", "install", "update", "enable", "disable", "validate", "sync", "remove",
@@ -953,6 +954,9 @@ impl Tool for SkillsManageTool {
     }
 
     fn description(&self) -> &str {
+        if self.controlled.is_some() {
+            return h2::DESCRIPTION;
+        }
         if self.lifecycle.is_some() {
             "Manage skill lifecycle: import reviewed executable bundles, publish proposals, and roll back revisions. Lifecycle writes require exact operator approval. Also 'create', 'install', 'update', 'enable', 'disable', 'validate', 'sync' and 'remove' instruction skills. Lifecycle actions: 'lifecycle_status', 'lifecycle_list' and 'lifecycle_inspect' only read and must use their same-named read-only capabilities instead of this mixed-effect root; 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes one and 'lifecycle_rollback' re-activates an earlier revision and 'lifecycle_import_executable' publishes an operator-reviewed executable bundle from a directory, bound to the complete bundle hash the operator reviewed, all under the operator's lifecycle mode and policy. Mutating actions are approval-gated."
         } else {
