@@ -46,3 +46,4 @@ mod tests;
 
 pub use entry::run;
 pub(crate) use entry::run_with_runtime_envelope;
+pub use turn_contracts::{ApprovalDecision, ApprovalResolver};

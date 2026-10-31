@@ -3005,6 +3005,10 @@ bot_token = "***"
         ("config/schema/providers.rs", include_str!("schema/providers.rs")),
         ("config/schema/proxy.rs", include_str!("schema/proxy.rs")),
         (
+            "config/schema/ramflux_channel.rs",
+            include_str!("schema/ramflux_channel.rs"),
+        ),
+        (
             "config/schema/recursive_spawn.rs",
             include_str!("schema/recursive_spawn.rs"),
         ),

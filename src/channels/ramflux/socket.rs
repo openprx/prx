@@ -1,9 +1,10 @@
 //! Unix socket lifecycle for the ramflux bridge.
 //!
-//! The socket is created with umask `0177` so the file is mode `0600`, then
-//! checked with `fstat`: owner uid must be this process, mode must be `0600`,
-//! and the path must not be a symlink. A second concurrent connection is
-//! rejected. Frames are newline-delimited and capped.
+//! The socket is bound and then chmod'd to `0600`. Startup checks the
+//! directory entry: owner uid must be this process, mode must be `0600`, and
+//! the path must not be a symlink. `fstat` confirms the listener fd is a
+//! socket. A second concurrent connection is rejected. Frames are
+//! newline-delimited and capped.
 
 use super::protocol::{self, RpcErrorBody, RpcId};
 use super::{Inner, inbound};
@@ -253,9 +254,9 @@ fn bind_unix(path: &Path) -> Result<tokio::net::UnixListener, SocketError> {
             std::fs::remove_file(path)?;
         }
     }
-    let listener = bind_with_umask(path)?;
+    let listener = tokio::net::UnixListener::bind(path)?;
     // macOS creates socket inodes as 0666 and rejects fchmod on them. chmod on the
-    // path sets 0600; fstat below refuses to continue if that did not stick.
+    // path sets 0600. verify_listener reads that directory-entry mode.
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -319,23 +320,6 @@ fn prepare_parent(path: &Path) -> Result<(), SocketError> {
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
-}
-
-#[cfg(unix)]
-struct UmaskGuard(rustix::fs::Mode);
-
-#[cfg(unix)]
-impl Drop for UmaskGuard {
-    fn drop(&mut self) {
-        let _ = rustix::process::umask(self.0);
-    }
-}
-
-#[cfg(unix)]
-fn bind_with_umask(path: &Path) -> Result<tokio::net::UnixListener, SocketError> {
-    let previous = rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o177));
-    let _guard = UmaskGuard(previous);
-    tokio::net::UnixListener::bind(path).map_err(SocketError::Io)
 }
 
 #[cfg(unix)]

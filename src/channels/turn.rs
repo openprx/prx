@@ -755,16 +755,20 @@ pub(super) async fn run_channel_turn(
     }
 
     let mut history = rebuild_history();
-    let use_streaming = target_channel.as_ref().is_some_and(|ch| ch.supports_draft_updates());
+    let rich_stream = target_channel
+        .as_ref()
+        .is_some_and(|channel| channel.as_rich().is_some());
+    let draft_streaming = target_channel.as_ref().is_some_and(|ch| ch.supports_draft_updates());
+    let capture_deltas = draft_streaming || rich_stream;
 
-    let (delta_tx, delta_rx) = if use_streaming {
+    let (delta_tx, delta_rx) = if capture_deltas {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         (Some(tx), Some(rx))
     } else {
         (None, None)
     };
 
-    let draft_message_id = if use_streaming {
+    let draft_message_id = if draft_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
                 .send_draft(&SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()))
@@ -784,18 +788,32 @@ pub(super) async fn run_channel_turn(
     };
 
     let draft_has_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let draft_updater = if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) =
+    let (draft_updater, rich_delta_task) = if rich_stream {
+        let task = match (delta_rx, target_channel.as_ref()) {
+            (Some(rx), Some(channel)) => Some(tokio::spawn(crate::channels::rich_turn::consume_stream(
+                Arc::clone(channel),
+                msg.reply_target.clone(),
+                turn_run_id.clone(),
+                rx,
+            ))),
+            _ => None,
+        };
+        (None, task)
+    } else if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) =
         (delta_rx, draft_message_id.as_deref(), target_channel.as_ref())
     {
-        Some(spawn_channel_draft_updater(
-            Arc::clone(channel_ref),
-            msg.reply_target.clone(),
-            draft_id_ref.to_string(),
-            rx,
-            Arc::clone(&draft_has_text),
-        ))
+        (
+            Some(spawn_channel_draft_updater(
+                Arc::clone(channel_ref),
+                msg.reply_target.clone(),
+                draft_id_ref.to_string(),
+                rx,
+                Arc::clone(&draft_has_text),
+            )),
+            None,
+        )
     } else {
-        None
+        (None, None)
     };
 
     let typing_cancellation = target_channel.as_ref().map(|_| CancellationToken::new());
@@ -835,6 +853,12 @@ pub(super) async fn run_channel_turn(
         _ => None,
     };
     let progress_started_at = started_at;
+    let rich_tool_channel = target_channel
+        .as_ref()
+        .filter(|channel| channel.as_rich().is_some())
+        .cloned();
+    let rich_conversation = msg.reply_target.clone();
+    let rich_turn_id = turn_run_id.clone();
     let tool_event_forwarder = tokio::spawn(async move {
         let mut iteration_seen = 0usize;
         while let Some(notif) = tool_event_rx.recv().await {
@@ -857,6 +881,17 @@ pub(super) async fn run_channel_turn(
                         tracing::debug!("Draft progress update failed: {e}");
                     }
                 }
+            }
+            if let Some(channel) = rich_tool_channel.as_ref() {
+                let iteration = u64::try_from(iteration_seen).unwrap_or(u64::MAX);
+                crate::channels::rich_turn::forward_tool_notification(
+                    channel.as_ref(),
+                    &rich_conversation,
+                    &rich_turn_id,
+                    &notif,
+                    iteration,
+                )
+                .await;
             }
             match notif {
                 crate::agent::turn_contracts::ToolCallNotification::Started { name, args_summary } => {
@@ -1098,6 +1133,9 @@ pub(super) async fn run_channel_turn(
     if let Some(handle) = draft_updater {
         let _ = handle.await;
     }
+    if let Some(handle) = rich_delta_task {
+        let _ = handle.await;
+    }
     let _ = tool_event_forwarder.await;
 
     if let Some(token) = typing_cancellation.as_ref() {
@@ -1191,7 +1229,18 @@ pub(super) async fn run_channel_turn(
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&delivered_response, 80)
             );
-            if let Some(channel) = target_channel.as_ref() {
+            if rich_stream {
+                if let Some(channel) = target_channel.as_ref() {
+                    crate::channels::rich_turn::finish_stream(
+                        channel.as_ref(),
+                        &msg.reply_target,
+                        &turn_run_id,
+                        u64::MAX,
+                        &delivered_response,
+                    )
+                    .await;
+                }
+            } else if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = finalize_draft_recording_activity(
                         channel.as_ref(),

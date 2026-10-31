@@ -157,7 +157,7 @@ pub fn parse_envelope(bytes: &[u8]) -> Result<Envelope, ProtocolError> {
 /// # Errors
 ///
 /// Returns [`ProtocolError`] when `params` cannot be serialized.
-pub fn encode_request(id: &RpcId, method: &str, params: &Value) -> Result<Vec<u8>, ProtocolError> {
+pub fn encode_bridge_call(id: &RpcId, method: &str, params: &Value) -> Result<Vec<u8>, ProtocolError> {
     encode(&RequestWire {
         jsonrpc: "2.0",
         id: id.clone(),

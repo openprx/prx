@@ -33,16 +33,23 @@ pub struct ApprovalGate {
     auth: Arc<Authority>,
     wait_ms: u64,
     waiters: Mutex<HashMap<String, oneshot::Sender<ApprovalOutcome>>>,
+    hint: Arc<Mutex<Option<super::TurnHint>>>,
 }
 
 impl ApprovalGate {
     #[must_use]
-    pub fn new(rpc: Arc<RpcHub>, auth: Arc<Authority>, wait_ms: u64) -> Arc<Self> {
+    pub fn new(
+        rpc: Arc<RpcHub>,
+        auth: Arc<Authority>,
+        wait_ms: u64,
+        hint: Arc<Mutex<Option<super::TurnHint>>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             rpc,
             auth,
             wait_ms: wait_ms.max(1),
             waiters: Mutex::new(HashMap::new()),
+            hint,
         })
     }
 
@@ -64,7 +71,13 @@ impl ApprovalGate {
         if self.auth.effective() == EffectiveAutonomy::Full {
             return ApprovalOutcome::Approved;
         }
-        let Some(turn) = rich_turn::active_turn() else {
+        let active = rich_turn::active_turn();
+        let hint = self.hint.lock().clone();
+        let turn = if let Some(active) = active {
+            (active.conversation_id, active.turn_id)
+        } else if let Some(hint) = hint {
+            (hint.conversation_id, hint.turn_id)
+        } else {
             tracing::warn!("ramflux approval refused because no turn is active");
             return ApprovalOutcome::Cancelled;
         };
@@ -86,8 +99,8 @@ impl ApprovalGate {
         crate::security::redaction::redact_json_value(&mut redacted);
         let risk = risk_label(request.risk);
         let params = ApprovalRequestParams {
-            conversation_id: &turn.conversation_id,
-            turn_id: &turn.turn_id,
+            conversation_id: &turn.0,
+            turn_id: &turn.1,
             approval_id: &approval_id,
             tool_name: &request.tool_name,
             arguments_redacted: &redacted,

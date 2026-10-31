@@ -5,7 +5,7 @@
 //! Inbound `idempotency_key` values are remembered for ten minutes.
 
 use super::protocol::{
-    self, Envelope, ProtocolError, RpcErrorBody, RpcId, encode_request, is_reply_method, parse_envelope,
+    self, Envelope, ProtocolError, RpcErrorBody, RpcId, encode_bridge_call, is_reply_method, parse_envelope,
 };
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -100,7 +100,7 @@ impl RpcHub {
         let number = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = RpcId::String(format!("prx-{number}"));
         let key = id.to_string();
-        let body = encode_request(&id, method, params)?;
+        let body = encode_bridge_call(&id, method, params)?;
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock();

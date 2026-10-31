@@ -3,13 +3,19 @@
 //! prx does not hold ramflux keys, does not sign, and does not know nodes or
 //! gateways. The agent-host owns everything beyond the socket.
 
+mod accounts;
 mod approval;
 mod authorization;
+pub mod crypto;
+mod erase;
 mod inbound;
 mod outbound;
 mod protocol;
 mod rpc;
 mod socket;
+mod storage;
+mod surface_schema;
+mod turn_queue;
 
 #[cfg(test)]
 mod tests;
@@ -41,6 +47,12 @@ struct LostTurn {
     turn_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnHint {
+    pub conversation_id: String,
+    pub turn_id: String,
+}
+
 pub(crate) struct Inner {
     config: RamfluxConfig,
     socket_path: PathBuf,
@@ -60,6 +72,12 @@ pub(crate) struct Inner {
     turns: Mutex<HashMap<String, Vec<TurnSlot>>>,
     deleted: Mutex<Vec<(String, String)>>,
     lost_status: Mutex<Vec<LostTurn>>,
+    crypto: Arc<crypto::AccountCrypto>,
+    store: storage::ChannelStore,
+    queue: turn_queue::TurnQueue,
+    hint: Arc<Mutex<Option<TurnHint>>>,
+    workspace: PathBuf,
+    persona: Mutex<Option<accounts::Persona>>,
 }
 
 impl Inner {
@@ -132,6 +150,16 @@ impl Inner {
         slots.retain(|slot| slot.turn_id != turn_id);
         if slots.is_empty() {
             turns.remove(conversation_id);
+            if let Some(next) = self.queue.pop_next(conversation_id) {
+                let tx = self.inbound_tx.lock().clone();
+                if let Some(tx) = tx {
+                    tokio::spawn(async move {
+                        if tx.send(RichInbound::Message(next)).await.is_err() {
+                            tracing::debug!("ramflux queued message was not delivered");
+                        }
+                    });
+                }
+            }
         }
     }
 
@@ -189,6 +217,50 @@ impl Inner {
         self.hello_done.store(false, Ordering::Release);
     }
 
+    fn memory_scope(&self, account_id: &str, conversation_id: &str) -> String {
+        let persona = self.persona.lock().clone();
+        accounts::memory_scope(persona.as_ref(), account_id, conversation_id)
+    }
+
+    fn store_tool_event(&self, conversation_id: &str, event: &super::rich::ToolEvent) {
+        let account_id = self.account_id.lock().clone();
+        let Some(account_id) = account_id else {
+            return;
+        };
+        let scope = self.memory_scope(&account_id, conversation_id);
+        let event_id = format!("{}-{}", event.tool_call_id, event.iteration);
+        let record = serde_json::json!({
+            "tool_call_id": event.tool_call_id,
+            "tool_name": event.tool_name,
+            "iteration": event.iteration,
+            "duration_ms": event.duration_ms,
+        });
+        let Ok(bytes) = serde_json::to_vec(&record) else {
+            tracing::warn!("ramflux tool event record could not be encoded");
+            return;
+        };
+        if let Err(error) = self
+            .store
+            .put_tool_event(&self.crypto, &account_id, &scope, &event_id, &bytes)
+        {
+            tracing::warn!(error = %error, "ramflux tool event was not stored");
+        }
+    }
+
+    fn store_media(&self, conversation_id: &str, object_id: &str, bytes: &[u8]) {
+        let account_id = self.account_id.lock().clone();
+        let Some(account_id) = account_id else {
+            return;
+        };
+        let scope = self.memory_scope(&account_id, conversation_id);
+        if let Err(error) = self
+            .store
+            .put_media(&self.crypto, &account_id, &scope, object_id, bytes)
+        {
+            tracing::warn!(error = %error, "ramflux attachment was not cached");
+        }
+    }
+
     async fn flush_lost_status(&self) {
         let lost = std::mem::take(&mut *self.lost_status.lock());
         for item in lost {
@@ -229,13 +301,36 @@ impl RamfluxChannel {
     ///
     /// Returns an error when `config` fails [`RamfluxConfig::validate`].
     pub fn new(config: RamfluxConfig, workspace_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let workspace_dir = workspace_dir.as_ref();
+        Self::with_secrets(config, workspace_dir, workspace_dir)
+    }
+
+    /// Build a channel whose data keys are wrapped by the secret store in `secrets_dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `config` fails [`RamfluxConfig::validate`] or the
+    /// channel data directory cannot be created.
+    pub fn with_secrets(
+        config: RamfluxConfig,
+        workspace_dir: impl AsRef<Path>,
+        secrets_dir: impl AsRef<Path>,
+    ) -> anyhow::Result<Self> {
         config.validate()?;
         let workspace_dir = workspace_dir.as_ref();
         let socket_path = config.resolve_socket_path(workspace_dir);
+        let store = storage::ChannelStore::open(workspace_dir)?;
+        let crypto = Arc::new(crypto::AccountCrypto::new(
+            secrets_dir.as_ref(),
+            store.root(),
+            config.encrypt_at_rest,
+        ));
         let auth = Authority::from_config(&config);
         let rpc = Arc::new(RpcHub::new());
         let wait_ms = config.turn_wall_clock_secs.saturating_mul(1000);
-        let approvals = ApprovalGate::new(Arc::clone(&rpc), Arc::clone(&auth), wait_ms);
+        let hint = Arc::new(Mutex::new(None));
+        let approvals = ApprovalGate::new(Arc::clone(&rpc), Arc::clone(&auth), wait_ms, Arc::clone(&hint));
+        let queue = turn_queue::TurnQueue::new(config.on_new_message);
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
@@ -256,6 +351,12 @@ impl RamfluxChannel {
                 turns: Mutex::new(HashMap::new()),
                 deleted: Mutex::new(Vec::new()),
                 lost_status: Mutex::new(Vec::new()),
+                crypto,
+                store,
+                queue,
+                hint,
+                workspace: workspace_dir.to_path_buf(),
+                persona: Mutex::new(None),
             }),
         })
     }
@@ -267,8 +368,9 @@ impl RamfluxChannel {
         Arc::clone(&self.inner.approvals)
     }
 
-    /// Stop the listener. In-flight bridge tasks observe the token.
+    /// Stop the listener and drop in-memory data keys.
     pub fn shutdown(&self) {
+        self.inner.crypto.lock_all();
         self.inner.shutdown.cancel();
     }
 
@@ -392,13 +494,18 @@ impl RichChannel for RamfluxChannel {
     }
 
     async fn on_tool_event(&self, event: &super::rich::ToolEvent) {
-        let Some(turn) = crate::channels::rich_turn::active_turn() else {
+        let active = crate::channels::rich_turn::active_turn();
+        let hint = self.inner.hint.lock().clone();
+        let turn = if let Some(active) = active {
+            (active.conversation_id, active.turn_id)
+        } else if let Some(hint) = hint {
+            (hint.conversation_id, hint.turn_id)
+        } else {
             tracing::warn!("ramflux tool event dropped because no turn is active");
             return;
         };
-        if let Err(error) =
-            outbound::send_tool_event(&self.inner.rpc, &turn.conversation_id, &turn.turn_id, event).await
-        {
+        self.inner.store_tool_event(&turn.0, event);
+        if let Err(error) = outbound::send_tool_event(&self.inner.rpc, &turn.0, &turn.1, event).await {
             tracing::warn!(error = %error, tool = %event.tool_name, "ramflux tool event was not sent");
         }
     }
@@ -425,7 +532,23 @@ impl RamfluxChannel {
         if fetched.mime.is_empty() {
             anyhow::bail!("attachment mime is empty");
         }
-        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, fetched.bytes_b64)
-            .map_err(|error| anyhow::anyhow!("attachment bytes are not base64: {error}"))
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, fetched.bytes_b64)
+            .map_err(|error| anyhow::anyhow!("attachment bytes are not base64: {error}"))?;
+        self.inner.store_media(&turn.conversation_id, object_id, &bytes);
+        Ok(bytes)
+    }
+
+    /// Encrypting memory view for the account bound by `bridge.hello`.
+    ///
+    /// Returns `None` before hello. The inner backend is unchanged; only this
+    /// namespace sees ciphertext.
+    #[must_use]
+    pub fn scoped_memory(&self, inner: Arc<dyn crate::memory::Memory>) -> Option<Arc<dyn crate::memory::Memory>> {
+        let account_id = self.inner.account_id.lock().clone()?;
+        Some(crate::memory::encrypted_scope::create_ramflux_scoped_memory(
+            inner,
+            Arc::clone(&self.inner.crypto),
+            account_id,
+        ))
     }
 }

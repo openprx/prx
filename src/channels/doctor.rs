@@ -266,7 +266,12 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref rf) = config.channels_config.ramflux {
-        match RamfluxChannel::new(rf.clone(), &config.workspace_dir) {
+        let secrets_dir = config
+            .config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| config.workspace_dir.clone());
+        match RamfluxChannel::with_secrets(rf.clone(), &config.workspace_dir, &secrets_dir) {
             Ok(channel) => {
                 let report = channel.doctor_report();
                 println!("  Ramflux socket: {}", report.socket_path.display());
