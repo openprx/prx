@@ -57,9 +57,6 @@ impl SkillsManageTool {
                 let source = h2_entry::current_run_continuation()
                     .ok_or_else(|| anyhow::anyhow!("controlled source continuation missing"))?;
                 let bound = source.for_admitted_plan(&plan, &envelope.pin, &self.config)?;
-                // This remains only the fixed launch ceiling; the original
-                // experiment owner retains every durable spend/unknown charge.
-                bound.profile()?.claim_experiment(&plan)?;
                 Some(bound)
             } else {
                 None
@@ -70,10 +67,6 @@ impl SkillsManageTool {
                     EntryAction::Plan => json!(service.plan_product(request(args)?, &self.config)?),
                     EntryAction::Admit => {
                         let plan: experiment::InstructionExperimentPlan = request(args)?;
-                        let frozen = plan.spec.clone().freeze()?;
-                        let continuation = h2_entry::current_run_continuation()
-                            .ok_or_else(|| anyhow::anyhow!("controlled admission continuation missing"))?;
-                        continuation.profile()?.claim_experiment(&frozen)?;
                         json!(service.admit_product(&plan, &self.config)?)
                     }
                     EntryAction::Run => {
