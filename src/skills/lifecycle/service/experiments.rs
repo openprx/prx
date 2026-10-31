@@ -82,6 +82,17 @@ impl SkillsLifecycleService {
         let plan = crate::skills::lifecycle::experiment::InstructionExperimentPlan { spec, operations };
         plan.validate()?;
         self.validate_study_instruction_plan(&plan, config)?;
+        for operation in plan.operations.values() {
+            if let ExperimentOperation::Proposal { patterns, .. }
+            | ExperimentOperation::DevelopmentProposal { patterns, .. } = operation
+            {
+                self.store.validate_proposal_patterns_for_plan(
+                    &plan.spec.pins.skill_id,
+                    &plan.spec.pins.baseline_revision,
+                    patterns,
+                )?;
+            }
+        }
         Ok(plan.spec.freeze()?)
     }
     /// Resolves actual owner/baseline/suite/model/runtime pins without a model

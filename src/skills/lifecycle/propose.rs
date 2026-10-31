@@ -37,6 +37,8 @@
 //!    fields, unmatched or ambiguous text, a changed name, a conflicting
 //!    manifest) fails the proposal and stages nothing.
 
+mod pattern_validation;
+
 use super::bundle::Bundle;
 use super::consolidate::{check_text, sorted_unique};
 use super::facts::Exclusion;
@@ -460,7 +462,7 @@ impl SkillLifecycleStore {
             }
             let refreshed = self.refresh_pattern(&pattern, support.ids.clone())?;
             if refreshed.pattern_id == pattern.pattern_id {
-                let counter = self.qualified_evidence(&pattern.counterevidence_ids, skill, baseline, false)?;
+                let (support, counter) = self.proposal_pattern_evidence(&pattern, skill, baseline)?;
                 return Ok((pattern, support, counter));
             }
             pattern = refreshed;
@@ -543,16 +545,6 @@ impl SkillLifecycleStore {
         let mut refreshed_ids = Vec::new();
         for id in &pattern_ids {
             let (pattern, support, counter) = self.bound_pattern(id, skill, &baseline_revision)?;
-            let pool: Vec<_> = support.facts.iter().chain(&counter.facts).cloned().collect();
-            let own = self.distinct_roots(&support.facts, &pool)?;
-            let against = self.distinct_roots(&counter.facts, &pool)?;
-            if own < MIN_DISTINCT_TASKS_FOR_PROPOSAL || against >= own {
-                return Err(refuse(format!(
-                    "pattern {} rests on {own} failed task(s) on revision {baseline_revision} against {against} \
-                     contradicting; it needs at least {MIN_DISTINCT_TASKS_FOR_PROPOSAL} and more than the contradiction",
-                    pattern.pattern_id
-                )));
-            }
             support_ids.extend(support.ids);
             support_facts.extend(support.facts);
             counter_facts.extend(counter.facts);
@@ -562,14 +554,7 @@ impl SkillLifecycleStore {
         refreshed_ids.sort();
         refreshed_ids.dedup();
         let evidence_ids = sorted_unique(&support_ids);
-        let pool: Vec<_> = support_facts.iter().chain(&counter_facts).cloned().collect();
-        let basis = ProposalBasis {
-            failed_tasks_on_baseline: self.distinct_roots(&support_facts, &pool)?,
-            contradicting_tasks: self.distinct_roots(&counter_facts, &pool)?,
-            // Every support fact passed `failure_attributable_to`, which requires
-            // `Adherence::Followed` for this skill and baseline revision.
-            adherence_verified: true,
-        };
+        let basis = self.proposal_evidence_basis(&support_facts, &counter_facts)?;
 
         let skill_md = baseline
             .file(SKILL_MD)

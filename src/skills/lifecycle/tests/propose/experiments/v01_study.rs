@@ -191,7 +191,16 @@ async fn v01_loopback_keeps_original_owner_denominator_private_oracles_and_seale
         assert_eq!(status.settled_and_clean_stages, 2);
         no_oracle_feedback(&status, &calibration)?;
         let generic = service.inspect_experiment(&calibration.manifest.id, &digest)?;
-        no_oracle_feedback(&generic, &calibration)?;
+        no_oracle_feedback(
+            &serde_json::json!({
+                "spec": generic.plan.spec(),
+                "plan_sha256": generic.plan.digest(),
+                "entries": &generic.entries,
+                "state": &generic.state,
+                "head_sha256": &generic.head_sha256,
+            }),
+            &calibration,
+        )?;
         // A separately configured read service uses the public product DTO.
         // It receives no custom judge identity, stage capability or grant.
         let mut observer_config = cfg.clone();
