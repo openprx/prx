@@ -22,7 +22,7 @@ pub struct XaiSubscriptionProvider {
 }
 
 impl XaiSubscriptionProvider {
-    pub(crate) fn from_runtime(options: &ProviderRuntimeOptions, parameter_provider: &str) -> Self {
+    pub(crate) fn from_provider_options(options: &ProviderRuntimeOptions, parameter_provider: &str) -> Self {
         let state_dir = options
             .openprx_dir
             .clone()

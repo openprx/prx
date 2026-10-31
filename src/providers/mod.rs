@@ -525,7 +525,7 @@ fn create_provider_with_url_and_options(
                 // must not receive the OAuth bearer; inference stays on
                 // https://api.x.ai/v1 even when the custom URL is that host.
                 crate::auth::xai_oauth::subscription_base_url(api_url)?;
-                return Ok(Box::new(xai::XaiSubscriptionProvider::from_runtime(options, name)));
+                return Ok(Box::new(xai::XaiSubscriptionProvider::from_provider_options(options, name)));
             }
             Ok(Box::new(
                 OpenAiCompatibleProvider::new("xAI", "https://api.x.ai/v1", key, AuthStyle::Bearer)
