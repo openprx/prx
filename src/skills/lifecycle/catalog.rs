@@ -61,11 +61,10 @@ impl ReadBudget {
         }
         let cap = remaining.min(MAX_RECORD_BYTES + 1);
         let mut bytes = Vec::new();
-        (&mut file)
-            .take(cap)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "catalog read failed")?;
+        let read = (&mut file).take(cap).read_to_end(&mut bytes);
+        // Partial reads count even when the final I/O operation fails.
         self.bytes += bytes.len() as u64;
+        read.map_err(|_| "catalog read failed")?;
         self.alive()?;
         if bytes.len() as u64 > MAX_RECORD_BYTES || bytes.len() as u64 == cap {
             return Err("catalog record exceeds input bounds");
