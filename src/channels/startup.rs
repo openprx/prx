@@ -330,7 +330,12 @@ pub async fn start_channels_with_config(
     }
 
     if let Some(ref rf) = config.channels_config.ramflux {
-        match RamfluxChannel::new(rf.clone(), &config.workspace_dir) {
+        let secrets_dir = config
+            .config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| config.workspace_dir.clone());
+        match RamfluxChannel::with_secrets(rf.clone(), &config.workspace_dir, &secrets_dir) {
             Ok(channel) => channels.push(Arc::new(channel)),
             Err(error) => {
                 tracing::warn!(error = %error, "ramflux channel was not started");

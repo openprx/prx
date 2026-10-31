@@ -10,9 +10,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 mod approval;
+mod crypto;
+mod erase;
 mod inbound;
 mod protocol;
 mod socket;
+mod surface_schema;
+mod turn_queue;
 
 fn tighten_dir(path: &Path) {
     use std::os::unix::fs::PermissionsExt;

@@ -6,7 +6,7 @@ use serde_json::json;
 #[test]
 fn request_round_trips() {
     let params = json!({"conversation_id": "c1", "text": "hello"});
-    let bytes = protocol::encode_request(&RpcId::Number(7), "inbound.message", &params).expect("test: encode");
+    let bytes = protocol::encode_bridge_call(&RpcId::Number(7), "inbound.message", &params).expect("test: encode");
     let envelope = parse_envelope(&bytes).expect("test: parse");
     match envelope {
         Envelope::Request {

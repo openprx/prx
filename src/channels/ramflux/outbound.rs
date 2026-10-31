@@ -28,14 +28,33 @@ pub async fn send_reply(inner: &Inner, reply: &RichReply) -> anyhow::Result<()> 
         RichReply::Text(text) => send_text(&inner.rpc, text).await,
         RichReply::Typing(typing) => send_typing(&inner.rpc, typing).await,
         RichReply::Status(status) => send_status(&inner.rpc, status).await,
-        RichReply::Surface(surface) => send_surface(&inner.rpc, surface).await,
+        RichReply::Surface(surface) => send_surface(inner, surface).await,
         RichReply::TaskUpdate(update) => send_task_update(&inner.rpc, update).await,
         RichReply::TaskPropose(propose) => send_task_propose(&inner.rpc, propose).await,
         RichReply::Attachment(attachment) => send_attachment(&inner.rpc, attachment).await,
     }
 }
 
-pub async fn send_surface(rpc: &RpcHub, surface: &SurfaceReply) -> anyhow::Result<()> {
+pub async fn send_surface(inner: &super::Inner, surface: &SurfaceReply) -> anyhow::Result<()> {
+    if let Err(error) =
+        super::surface_schema::validate(surface, &inner.config.surface_limits, &inner.config.allowed_block_types)
+    {
+        let status = crate::channels::rich::TurnStatus {
+            conversation_id: surface.conversation_id.clone(),
+            turn_id: surface.turn_id.clone(),
+            state: crate::channels::rich::TurnState::Failed,
+            error: Some(crate::channels::rich::TurnError {
+                code: "surface_rejected".to_string(),
+                message: error.to_string(),
+            }),
+        };
+        send_status(&inner.rpc, &status).await?;
+        anyhow::bail!("surface rejected: {error}");
+    }
+    send_surface_frame(&inner.rpc, surface).await
+}
+
+async fn send_surface_frame(rpc: &RpcHub, surface: &SurfaceReply) -> anyhow::Result<()> {
     let params = ReplySurfaceParams {
         conversation_id: &surface.conversation_id,
         turn_id: &surface.turn_id,
