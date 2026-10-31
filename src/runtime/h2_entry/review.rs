@@ -57,7 +57,10 @@ impl LocalControlAuthority {
             crate::decision::KeyDomain::ApprovalState,
             &[b"h2-local-owner-review-v1", &serde_json::to_vec(&body)?],
         );
-        Ok(LocalOwnerReviewStamp { body, mac })
+        Ok(LocalOwnerReviewStamp {
+            body: Box::new(body),
+            mac,
+        })
     }
     pub(crate) fn verify_source(&self, origin: &EntryOriginRecord) -> Result<()> {
         self.profile.ensure_live()?;
@@ -95,7 +98,7 @@ struct LocalReviewBody {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LocalOwnerReviewStamp {
-    body: LocalReviewBody,
+    body: Box<LocalReviewBody>,
     mac: [u8; 32],
 }
 impl LocalOwnerReviewStamp {
