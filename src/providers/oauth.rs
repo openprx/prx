@@ -12,8 +12,11 @@ pub(super) const MINIMAX_OAUTH_REGION_ENV: &str = "MINIMAX_OAUTH_REGION";
 pub(super) const MINIMAX_OAUTH_CLIENT_ID_ENV: &str = "MINIMAX_OAUTH_CLIENT_ID";
 pub(super) const MINIMAX_OAUTH_DEFAULT_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39113";
 pub(super) const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
+#[cfg(test)]
 pub(super) const QWEN_OAUTH_TOKEN_ENV: &str = "QWEN_OAUTH_TOKEN";
+#[cfg(test)]
 pub(super) const QWEN_OAUTH_REFRESH_TOKEN_ENV: &str = "QWEN_OAUTH_REFRESH_TOKEN";
+#[cfg(test)]
 pub(super) const QWEN_OAUTH_RESOURCE_URL_ENV: &str = "QWEN_OAUTH_RESOURCE_URL";
 
 #[derive(Clone, Copy, Debug)]

@@ -3316,7 +3316,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             let client = openprx::prx_http_client();
 
             if device_code {
-                auth::openai_oauth::start_device_code_flow(&client).await?;
+                auth::openai_oauth::start_device_code_flow(&client)?;
             }
 
             let state_dir = auth::state_dir_from_config(config);

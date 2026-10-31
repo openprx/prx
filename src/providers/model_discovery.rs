@@ -303,16 +303,14 @@ pub(crate) fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<Discov
         bail!("Anthropic model fetch requires API key or OAuth token");
     };
 
-    let client = build_model_fetch_client()?;
-    let mut request = client
-        .get("https://api.anthropic.com/v1/models")
-        .header("anthropic-version", "2023-06-01");
-
     if is_claude_code_oauth_setup_token(api_key) {
         bail!("{}", crate::auth::terms::ANTHROPIC_SUBSCRIPTION_REMOVED);
-    } else {
-        request = request.header("x-api-key", api_key);
     }
+    let client = build_model_fetch_client()?;
+    let request = client
+        .get("https://api.anthropic.com/v1/models")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-api-key", api_key);
 
     let response = request
         .send()

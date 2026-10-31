@@ -146,11 +146,11 @@ pub async fn refresh_access_token(client: &Client, refresh_token: &str, client_i
     parse_token_response(response).await
 }
 
-pub async fn start_device_code_flow(_client: &Client) -> Result<DeviceCodeStart> {
+pub fn start_device_code_flow(_client: &Client) -> Result<DeviceCodeStart> {
     bail!("{}", crate::auth::terms::OPENAI_DEVICE_CODE_UNSUPPORTED)
 }
 
-pub async fn poll_device_code_tokens(_client: &Client, _device: &DeviceCodeStart) -> Result<TokenSet> {
+pub fn poll_device_code_tokens(_client: &Client, _device: &DeviceCodeStart) -> Result<TokenSet> {
     bail!("{}", crate::auth::terms::OPENAI_DEVICE_CODE_UNSUPPORTED)
 }
 

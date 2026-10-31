@@ -260,7 +260,7 @@ impl CopilotProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let (token, endpoint) = self.get_api_key().await?;
+        let (token, endpoint) = self.get_api_key()?;
         let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
 
         let native_tools = self.convert_tools(tools)?;
@@ -316,7 +316,7 @@ impl CopilotProvider {
     }
 
     /// Copilot login is disabled. Cached tokens are not read or sent.
-    async fn get_api_key(&self) -> anyhow::Result<(String, String)> {
+    fn get_api_key(&self) -> anyhow::Result<(String, String)> {
         let _ = (&self.github_token, &self.token_dir, &self.refresh_lock);
         anyhow::bail!("{}", crate::auth::terms::COPILOT_LOGIN_DISABLED)
     }
@@ -423,7 +423,7 @@ impl Provider for CopilotProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
         crate::providers::compatible::spawn_until_closed(tx.clone(), async move {
-            let (token, endpoint) = match this.get_api_key().await {
+            let (token, endpoint) = match this.get_api_key() {
                 Ok(value) => value,
                 Err(err) => {
                     let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
@@ -484,7 +484,7 @@ impl Provider for CopilotProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        let _ = self.get_api_key().await?;
+        let _ = self.get_api_key()?;
         Ok(())
     }
 }

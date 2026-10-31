@@ -1276,11 +1276,13 @@ fn factory_qwen() {
     assert!(create_provider("qwen-coding", Some("key")).is_ok());
     assert!(create_provider("dashscope-coding-intl", Some("key")).is_ok());
     assert!(create_provider("qwen-coding-intl", Some("key")).is_ok());
-    let removed = create_provider("qwen-code", Some("key"));
-    assert!(removed.is_err(), "qwen-code oauth is removed");
+    let message = match create_provider("qwen-code", Some("key")) {
+        Ok(_provider) => panic!("qwen-code oauth is removed"),
+        Err(error) => error.to_string(),
+    };
     assert!(
-        removed.unwrap_err().to_string().contains("2026-04-15"),
-        "the error names the shutdown"
+        message.contains("2026-04-15"),
+        "the error names the shutdown: {message}"
     );
     assert!(create_provider("qwen-oauth", Some("key")).is_err());
 }

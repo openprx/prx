@@ -14,8 +14,6 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-
 /// Provider name attached to byte-level UTF-8 decode failures on the
 /// streaming path.
 const STREAM_DECODER_LABEL: &str = "Gemini";
@@ -265,11 +263,6 @@ impl GeminiProvider {
     /// Gemini CLI OAuth (`~/.gemini/oauth_creds.json`) is not loaded.
     fn try_load_gemini_cli_token() -> Option<String> {
         None
-    }
-
-    /// Get the Gemini CLI config directory (~/.gemini)
-    fn gemini_cli_dir() -> Option<PathBuf> {
-        crate::config::user_home_dir().map(|home| home.join(".gemini"))
     }
 
     /// Check if Gemini CLI is configured and has valid credentials
@@ -1412,16 +1405,6 @@ mod tests {
         let (_, contents) = GeminiProvider::convert_messages(&history);
         let json = serde_json::to_value(contents).unwrap();
         assert_eq!(json[0]["parts"][0]["thoughtSignature"], "c2lnbmF0dXJl");
-    }
-
-    #[test]
-    fn gemini_cli_dir_returns_path() {
-        let dir = GeminiProvider::gemini_cli_dir();
-        // Should return Some on systems with home dir
-        if crate::config::user_home_dir().is_some() {
-            assert!(dir.is_some());
-            assert!(dir.unwrap().ends_with(".gemini"));
-        }
     }
 
     #[test]

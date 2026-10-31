@@ -23,7 +23,6 @@ const STREAM_DECODER_LABEL: &str = "Anthropic";
 struct OAuthState {
     credential: Option<String>,
     refresh_token: Option<String>,
-    expires_at: Option<i64>,
 }
 
 pub struct AnthropicProvider {
@@ -258,14 +257,13 @@ impl AnthropicProvider {
                     .filter(|k| !k.is_empty())
                     .map(ToString::to_string),
                 refresh_token: None,
-                expires_at: None,
             }),
             base_url,
             parameter_provider: super::ProviderId::of("anthropic"),
         }
     }
 
-    pub fn with_oauth(credential: Option<&str>, refresh_token: Option<String>, expires_at: Option<i64>) -> Self {
+    pub fn with_oauth(credential: Option<&str>, refresh_token: Option<String>, _expires_at: Option<i64>) -> Self {
         Self {
             oauth: Mutex::new(OAuthState {
                 credential: credential
@@ -273,7 +271,6 @@ impl AnthropicProvider {
                     .filter(|k| !k.is_empty())
                     .map(ToString::to_string),
                 refresh_token,
-                expires_at,
             }),
             base_url: "https://api.anthropic.com".to_string(),
             parameter_provider: super::ProviderId::of("anthropic"),

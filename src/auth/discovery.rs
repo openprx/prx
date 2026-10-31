@@ -369,7 +369,7 @@ mod claude_credentials_for_tests {
 
 /// Returns `true` if the token is a Claude Code OAuth setup token that cannot
 /// be used as a plain Anthropic API key.
-pub(crate) fn is_claude_code_oauth_setup_token(token: &str) -> bool {
+pub fn is_claude_code_oauth_setup_token(token: &str) -> bool {
     token.starts_with("sk-ant-oat01-")
 }
 

@@ -91,9 +91,6 @@ use crate::auth::discovery::is_claude_code_oauth_setup_token;
 use crate::auth::{profiles::AuthProfilesStore, select_profile_id};
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-
 const MAX_API_ERROR_CHARS: usize = 200;
 
 /// How many characters of a refused, model-supplied provider string the
@@ -361,13 +358,19 @@ fn create_provider_with_url_and_options(
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => {
-            if resolved.claude_refresh_token.is_some() || key.is_some_and(is_claude_code_oauth_setup_token) {
+            if resolved.claude_refresh_token.is_some()
+                || resolved.claude_expires_at.is_some()
+                || key.is_some_and(is_claude_code_oauth_setup_token)
+            {
                 anyhow::bail!("{}", crate::auth::terms::ANTHROPIC_SUBSCRIPTION_REMOVED);
             }
             Ok(Box::new(anthropic::AnthropicProvider::new(key)))
         }
         name if is_claude_code_alias(name) => {
-            if resolved.claude_refresh_token.is_some() || key.is_some_and(is_claude_code_oauth_setup_token) {
+            if resolved.claude_refresh_token.is_some()
+                || resolved.claude_expires_at.is_some()
+                || key.is_some_and(is_claude_code_oauth_setup_token)
+            {
                 anyhow::bail!("{}", crate::auth::terms::ANTHROPIC_SUBSCRIPTION_REMOVED);
             }
             Ok(Box::new(anthropic::AnthropicProvider::new(key)))
@@ -450,6 +453,7 @@ fn create_provider_with_url_and_options(
         }
         "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
         name if is_qwen_oauth_alias(name) => {
+            let _ = resolved.qwen_base_url.as_deref();
             anyhow::bail!("{}", crate::auth::terms::QWEN_OAUTH_REMOVED);
         }
         name if is_qianfan_alias(name) => Ok(Box::new(

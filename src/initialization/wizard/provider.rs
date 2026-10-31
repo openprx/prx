@@ -310,9 +310,7 @@ pub(super) async fn setup_provider(
             "https://platform.z.ai/"
         } else if is_minimax_alias(provider_name) {
             "https://www.minimaxi.com/user-center/basic-information"
-        } else if matches!(provider_name, "qwen-coding" | "qwen-coding-intl") {
-            "https://help.aliyun.com/zh/model-studio/developer-reference/get-api-key"
-        } else if is_qwen_alias(provider_name) {
+        } else if is_qwen_alias(provider_name) || matches!(provider_name, "qwen-coding" | "qwen-coding-intl") {
             "https://help.aliyun.com/zh/model-studio/developer-reference/get-api-key"
         } else if is_qianfan_alias(provider_name) {
             "https://cloud.baidu.com/doc/WENXINWORKSHOP/s/7lm0vxo78"
