@@ -192,6 +192,10 @@ impl ApprovalCollectionLease {
                 ),
             "collection source differs from admitted input"
         );
+        if call.name=="skills_manage" && arguments.get("action").and_then(serde_json::Value::as_str)
+            .is_some_and(|action|action.starts_with("lifecycle_experiment_")) {
+            self.source.h2_entry_origin().context("experiment collection lacks actual controlled input")?.ensure_live()?;
+        }
         let digest = decision_call_digest(
             &self.context.decision_id().to_string(),
             &self.capability,
@@ -238,6 +242,7 @@ impl ApprovalCollectionLease {
             "collection operation differs from pinned capability"
         );
         let mut record = PendingRecord {
+            h2_origin: self.source.h2_entry_origin().map(|origin| origin.record().clone()),
             subject: Subject {
                 agent_id: format!("prx:agent:{channel}"),
                 principal_id: principal.principal_id,
@@ -268,7 +273,15 @@ impl ApprovalCollectionLease {
             risk: Some(risk),
             schema_dialect: Some(dialect),
             sealed_call: None,
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            expires_at: self.source.h2_entry_origin().map_or(
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                |origin| {
+                    origin
+                        .record()
+                        .authority_expires_at
+                        .min(chrono::Utc::now() + chrono::Duration::minutes(5))
+                },
+            ),
         };
         record.sealed_call = Some(
             self.service

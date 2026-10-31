@@ -3,6 +3,7 @@
 use super::SYNTHETIC_UI_COMMAND_SENDER;
 use super::provider_turns::provider_turn_visible_admission;
 use super::session_glue::is_chat_quit_command;
+use crate::runtime::h2_entry::{ChatInput, TerminalInputProof};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -16,12 +17,14 @@ pub(super) struct QueuedInputMessage {
     pub(super) priority: InputQueuePriority,
     pub(super) turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     pub(super) msg: crate::channels::traits::ChannelMessage,
+    pub(super) terminal_origin: Option<TerminalInputProof>,
 }
 
 pub(super) struct DequeuedInputMessage {
     pub(super) priority: InputQueuePriority,
     pub(super) turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     pub(super) msg: crate::channels::traits::ChannelMessage,
+    pub(super) terminal_origin: Option<TerminalInputProof>,
 }
 
 pub(super) fn is_local_operator_input(msg: &crate::channels::traits::ChannelMessage) -> bool {
@@ -54,14 +57,28 @@ pub(super) fn input_priority_from_text(input: &str) -> (InputQueuePriority, Stri
 
 pub(super) fn enqueue_input_message_and_return_priority(
     backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
-    mut msg: crate::channels::traits::ChannelMessage,
+    input: impl Into<ChatInput>,
 ) -> InputQueuePriority {
+    let ChatInput {
+        message: mut msg,
+        terminal,
+    } = input.into();
+    let original = msg.content.clone();
     let (priority, content) = classify_input_priority(&msg);
     msg.content = content;
+    // Keep a failed proof invalid so admission refuses it, rather than minting
+    // authority from a normalization error or silently broadening the call.
+    let terminal_origin = terminal.map(|proof| {
+        proof.routed(&msg.id, &original, &msg.content).unwrap_or_else(|_| {
+            proof.invalidate_source();
+            proof
+        })
+    });
     backlog.push_back(QueuedInputMessage {
         priority,
         turn_task_id: None,
         msg,
+        terminal_origin,
     });
     priority
 }
@@ -77,11 +94,24 @@ const fn turn_priority_from_input(priority: InputQueuePriority) -> crate::chat::
 pub(super) fn enqueue_input_message_and_return_priority_with_scheduler(
     backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
-    mut msg: crate::channels::traits::ChannelMessage,
+    input: impl Into<ChatInput>,
     history_base_len: usize,
 ) -> InputQueuePriority {
+    let ChatInput {
+        message: mut msg,
+        terminal,
+    } = input.into();
+    let original = msg.content.clone();
     let (priority, content) = classify_input_priority(&msg);
     msg.content = content;
+    // Keep a failed proof invalid so admission refuses it, rather than minting
+    // authority from a normalization error or silently broadening the call.
+    let terminal_origin = terminal.map(|proof| {
+        proof.routed(&msg.id, &original, &msg.content).unwrap_or_else(|_| {
+            proof.invalidate_source();
+            proof
+        })
+    });
     let turn_task_id = scheduler.enqueue(
         msg.content.clone(),
         turn_priority_from_input(priority),
@@ -91,6 +121,7 @@ pub(super) fn enqueue_input_message_and_return_priority_with_scheduler(
         priority,
         turn_task_id: Some(turn_task_id),
         msg,
+        terminal_origin,
     });
     priority
 }
@@ -98,7 +129,7 @@ pub(super) fn enqueue_input_message_and_return_priority_with_scheduler(
 pub(super) fn enqueue_input_message_with_scheduler(
     backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
-    msg: crate::channels::traits::ChannelMessage,
+    msg: impl Into<ChatInput>,
     history_base_len: usize,
 ) {
     let _ = enqueue_input_message_and_return_priority_with_scheduler(backlog, scheduler, msg, history_base_len);
@@ -106,7 +137,7 @@ pub(super) fn enqueue_input_message_with_scheduler(
 
 pub(super) fn enqueue_input_message(
     backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
-    msg: crate::channels::traits::ChannelMessage,
+    msg: impl Into<ChatInput>,
 ) {
     let _ = enqueue_input_message_and_return_priority(backlog, msg);
 }
@@ -148,6 +179,7 @@ pub(super) fn pop_next_input_task_with_scheduler(
         priority: queued.priority,
         turn_task_id: queued.turn_task_id,
         msg: queued.msg,
+        terminal_origin: queued.terminal_origin,
     })
 }
 
@@ -202,6 +234,7 @@ pub(super) fn requeue_post_route_admission_rejected_input(
         priority: input.priority,
         turn_task_id: input.turn_task_id,
         msg: input.msg,
+        terminal_origin: input.terminal_origin,
     });
     *defer_visible_input_pop_once = true;
 }
@@ -284,8 +317,8 @@ pub(super) fn format_input_backlog_report(
     lines.join("\n")
 }
 
-pub(super) fn drain_available_input_messages(
-    input_rx: &mut mpsc::Receiver<crate::channels::traits::ChannelMessage>,
+pub(super) fn drain_available_input_messages<M: Into<ChatInput>>(
+    input_rx: &mut mpsc::Receiver<M>,
     backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
     mut scheduler: Option<&mut crate::chat::turn_scheduler::TurnScheduler>,
     history_base_len: usize,

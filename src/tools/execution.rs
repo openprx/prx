@@ -519,6 +519,9 @@ impl ToolExecutionCommand {
 /// Authenticated runtime facade available to every execution stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionContext {
+    pub(crate) controlled_case: Option<Arc<crate::runtime::h2_entry::ControlledCaseScope>>,
+    pub(crate) h2_origin: Option<Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>>,
+    pub(crate) h2_review: Option<crate::runtime::h2_entry::LocalOwnerReview>,
     pub(crate) owner_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
     pub(crate) capability_search: Option<super::capability::search_tool::CapabilitySearchPort>,
     pub(crate) ordinary_child_publication: Option<crate::runtime::turn_decision::OrdinaryChildPublication>,
@@ -557,6 +560,9 @@ impl ToolExecutionContext {
             .or_else(|| envelope.task_id.clone())
             .unwrap_or_else(|| envelope.session_key.clone());
         Self {
+            controlled_case: None,
+            h2_origin: None,
+            h2_review: None,
             owner_filesystem: None,
             capability_search: None,
             ordinary_child_publication: None,
@@ -2463,13 +2469,15 @@ impl ToolExecutionService {
             .owner_filesystem
             .as_ref()
             .filter(|scope| {
-                context.envelope.owner_isolated
-                    && context.envelope.source == crate::runtime::envelope::RuntimeSource::Console
-                    && context
-                        .envelope
-                        .owner_id
-                        .as_deref()
-                        .is_some_and(|owner| scope.matches(&context.envelope.workspace_id, owner))
+                (context.controlled_case.is_some()
+                    || (context.envelope.owner_isolated
+                        && context.envelope.source == crate::runtime::envelope::RuntimeSource::Console))
+                    && (if context.controlled_case.is_some() {
+                        scope.matches(&context.envelope.workspace_id,&context.envelope.resolved_owner_id())
+                    }else {
+                        context.envelope.owner_id.as_deref()
+                            .is_some_and(|owner|scope.matches(&context.envelope.workspace_id,owner))
+                    })
                     && descriptor.adapter == ToolAdapterKind::Native
                     && descriptor.backend_name == descriptor.public_name
                     && matches!(
@@ -2519,6 +2527,86 @@ impl ToolExecutionService {
                 started,
             );
         }
+
+        let h2_invocation = match async {
+            use crate::runtime::h2_entry::{EntryAction, EntryInvocation};
+            let requested = command.name == "skills_manage"
+                && command
+                    .arguments
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name.starts_with("lifecycle_experiment_"));
+            if let Some(origin) = &context.h2_origin {
+                origin.ensure_live()?;
+                anyhow::ensure!(
+                    origin.profile().permits_tool(&command.name),
+                    "tool is outside the fixed controlled profile"
+                );
+                if command.name == "skills_manage" {
+                    EntryAction::parse(
+                        command
+                            .arguments
+                            .get("action")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default(),
+                    )?;
+                }
+            }
+            if !requested {
+                return Ok::<_, anyhow::Error>(None);
+            }
+            let origin = context
+                .h2_origin
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("experiment action has no actual controlled source"))?;
+            let binding = context
+                .execution_bindings
+                .as_ref()
+                .and_then(|bindings| bindings.get(&command.name))
+                .ok_or_else(|| anyhow::anyhow!("experiment action has no exact execution binding"))?;
+            let verified = binding
+                .bind_call(
+                    self,
+                    &context.envelope,
+                    &descriptor,
+                    &command,
+                    context.decision_approval.as_ref(),
+                    context.schema_dialect,
+                )
+                .await?;
+            // Only execution after the original approval can consume this port.
+            // The initial pending call still needs to be recorded first.
+            if context.decision_resume.is_none()
+                && crate::security::approval_operation::requires_explicit_grant(&command.name, &command.arguments)
+            {
+                return Ok(None);
+            }
+            Ok(Some(EntryInvocation::from_verified(
+                origin,
+                &verified,
+                context.h2_review.clone(),
+            )?))
+        }
+        .await
+        {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                let error = error.to_string();
+                return self.finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    Some(descriptor),
+                    None,
+                    ToolExecutionStatus::Denied,
+                    format!("Error: {error}"),
+                    None,
+                    Some(error),
+                    None,
+                    started,
+                );
+            }
+        };
 
         let decision = self.policy.decide(&descriptor, &context);
         // A call the tool itself only accepts with a signed one-shot grant
@@ -2955,6 +3043,7 @@ impl ToolExecutionService {
         // Scoped so any child process the tool spawns registers with this call
         // as its parent, which is what makes a cascading kill possible.
         let backend_cancellation = cancellation.clone();
+        let backend_h2_invocation = h2_invocation.clone();
         let exact_call_ref = exact_call.as_ref();
         let public_name = command.name.as_str();
         let execution_parameters = descriptor.execution_parameters.clone();
@@ -2989,7 +3078,12 @@ impl ToolExecutionService {
                                     crate::tools::schema::with_execution_contract(
                                         execution_parameters,
                                         schema_dialect,
-                                        backend.invoke_observed(public_name, arguments, backend_cancellation),
+                                        crate::runtime::h2_entry::scope_invocation(
+                                            backend_h2_invocation.map(|invocation| {
+                                                (invocation, backend_cancellation.clone().unwrap_or_default())
+                                            }),
+                                            backend.invoke_observed(public_name, arguments, backend_cancellation),
+                                        ),
                                     ),
                                 )
                                 .await
@@ -3000,6 +3094,9 @@ impl ToolExecutionService {
             ),
         );
         let tool_future = async {
+            if let Some(invocation) = &h2_invocation {
+                invocation.ensure_live()?;
+            }
             match claimed_decision {
                 Some(authority) => {
                     // Check again on the backend future's first poll, after

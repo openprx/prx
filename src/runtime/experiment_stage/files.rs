@@ -60,6 +60,26 @@ impl ExperimentStageRuntime {
         target: &Path,
         bytes: usize,
     ) -> anyhow::Result<NativeWrite> {
+        let owner = current_tracker().ok_or_else(|| anyhow::anyhow!("file write has no cleanup owner"))?;
+        self.prepare_native_write_owned(workspace, target, bytes, &owner)
+    }
+    pub(crate) fn native_scratch_root(&self, target: &Path) -> anyhow::Result<PathBuf> {
+        self.ensure_active()?;
+        self.files
+            .roots
+            .lock()
+            .iter()
+            .find(|root| target.starts_with(root))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("private file adapter is outside the original admitted scratch roots"))
+    }
+    pub(crate) fn prepare_native_write_owned(
+        self: &Arc<Self>,
+        workspace: &Path,
+        target: &Path,
+        bytes: usize,
+        owner: &Arc<crate::runtime::turn_cleanup::CleanupTracker>,
+    ) -> anyhow::Result<NativeWrite> {
         self.ensure_active()?;
         let root = workspace.canonicalize()?;
         anyhow::ensure!(
@@ -78,9 +98,7 @@ impl ExperimentStageRuntime {
                 })
             })
             .map_err(|_| anyhow::anyhow!("experiment native-write allowance exhausted"))?;
-        let ticket = current_tracker()
-            .ok_or_else(|| anyhow::anyhow!("file write has no cleanup owner"))?
-            .register(self.cancel.child_token())?;
+        let ticket = owner.register(self.cancel.child_token())?;
         Ok(NativeWrite {
             stage: Arc::clone(self),
             ticket,

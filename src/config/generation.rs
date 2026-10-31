@@ -346,6 +346,7 @@ pub trait ConfigGenerationAuditSink: Send + Sync {
 
 /// Sole process-level owner of active and desired configuration generations.
 pub struct ConfigGenerationManager {
+    runtime_writes_frozen: AtomicBool,
     active: ArcSwap<ConfigGeneration>,
     /// Published generations remain addressable while an admitted operation
     /// still owns its exact snapshot. Weak entries retain no configuration or
@@ -462,6 +463,7 @@ impl ConfigGenerationManager {
             reload_lock: Mutex::new(()),
             next_generation: AtomicU64::new(next_generation),
             participants: RwLock::new(Vec::new()),
+            runtime_writes_frozen: AtomicBool::new(false),
             reload_in_progress: AtomicBool::new(false),
             last_report: RwLock::new(None),
             last_failure: RwLock::new(None),
@@ -517,12 +519,25 @@ impl ConfigGenerationManager {
             reload_lock: Mutex::new(()),
             next_generation: AtomicU64::new(1),
             participants: RwLock::new(Vec::new()),
+            runtime_writes_frozen: AtomicBool::new(false),
             reload_in_progress: AtomicBool::new(false),
             last_report: RwLock::new(None),
             last_failure: RwLock::new(None),
             audit_sinks: RwLock::new(Vec::new()),
             model_allowlist,
         }
+    }
+
+    /// A runtime may only narrow this policy; no Config field clears it.
+    pub(crate) fn freeze_runtime_writes(&self) {
+        self.runtime_writes_frozen.store(true, Ordering::Release);
+    }
+    pub(crate) fn ensure_runtime_writable(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.runtime_writes_frozen.load(Ordering::Acquire),
+            "configuration is frozen for controlled experiments"
+        );
+        Ok(())
     }
 
     /// Register a weakly-held runtime participant.
@@ -609,6 +624,7 @@ impl ConfigGenerationManager {
 
     /// Load a stable merged snapshot from the configured source and apply it.
     pub fn reload_from_disk(&self, trigger: ConfigReloadTrigger) -> anyhow::Result<ConfigApplyReport> {
+        self.ensure_runtime_writable()?;
         let current = self.load_full();
         let config_path = current.config_path.clone();
         if config_path.as_os_str().is_empty() {
@@ -660,6 +676,7 @@ impl ConfigGenerationManager {
         source_revision: ConfigSourceRevision,
         trigger: ConfigReloadTrigger,
     ) -> anyhow::Result<ConfigApplyReport> {
+        self.ensure_runtime_writable()?;
         let _reload_guard = self.reload_lock.lock();
         self.reload_in_progress.store(true, Ordering::Release);
         let result = self.apply_config_locked(desired, source_revision.clone(), trigger);

@@ -1,6 +1,7 @@
 //! Authenticated pending approval metadata. No caller-supplied operation or
 //! digest can create a record; issuance requires the service's gated context.
 pub(super) mod collection;
+mod h2;
 mod sealed_call;
 use super::{TurnDecisionContext, TurnDecisionService, TurnExecutionDirective};
 use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject, WitnessKeyring};
@@ -17,6 +18,8 @@ use std::sync::Arc;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    h2_origin: Option<crate::runtime::h2_entry::EntryOriginRecord>,
     subject: Subject,
     binding: DecisionApprovalBinding,
     source_event_id: String,
@@ -61,6 +64,7 @@ impl PendingRecord {
 /// Final claim and current-call validation remain mandatory.
 pub(super) struct VerifiedDecisionApproval {
     pending: VerifiedPendingDecisionApproval,
+    local_owner: Option<crate::runtime::h2_entry::LocalOwnerReviewStamp>,
     grants: Vec<ApprovalGrantV2>,
 }
 
@@ -89,6 +93,8 @@ impl VerifiedPendingDecisionApproval {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_owner: Option<crate::runtime::h2_entry::LocalOwnerReviewStamp>,
     pending_mac: [u8; 32],
     approved: bool,
     grants: Vec<ApprovalGrantV2>,
@@ -277,6 +283,7 @@ impl TurnDecisionService {
             vec![crate::memory::principal::Role::Anonymous],
         );
         let record = PendingRecord {
+            h2_origin: proof.h2_entry_origin().map(|origin| origin.record().clone()),
             subject: Subject {
                 agent_id: format!("prx:agent:{}", proof.policy_channel()),
                 principal_id: principal.principal_id,
@@ -314,7 +321,9 @@ impl TurnDecisionService {
             risk: None,
             schema_dialect: None,
             sealed_call: None,
-            expires_at: approval_scope.expires_at,
+            expires_at: proof.h2_entry_origin().map_or(approval_scope.expires_at, |origin| {
+                approval_scope.expires_at.min(origin.record().authority_expires_at)
+            }),
         };
         let expires_at = record.expires_at;
         self.persist_pending_record(record, &source).await?;
@@ -425,11 +434,23 @@ impl TurnDecisionService {
         decision_id: DecisionId,
         approved: bool,
     ) -> anyhow::Result<DecisionApprovalReceipt> {
+        self.review_pending_with_local(owner, session, decision_id, approved, None)
+            .await
+    }
+    async fn review_pending_with_local(
+        &self,
+        owner: &str,
+        session: &str,
+        decision_id: DecisionId,
+        approved: bool,
+        local_owner: Option<crate::runtime::h2_entry::LocalOwnerReviewStamp>,
+    ) -> anyhow::Result<DecisionApprovalReceipt> {
         let pending = self.load_pending_decision_approval(owner, session, decision_id).await?;
         if approved {
             self.verify_pending_console_file_operation(&pending).await?;
         }
         let record = &pending.record;
+        self.verify_h2_review_requirement(&pending, approved, local_owner.as_ref())?;
         let risk = record.approval_risk()?;
         let keyring = WitnessKeyring::global()?;
         let pending_mac = self
@@ -449,6 +470,7 @@ impl TurnDecisionService {
             }
         }
         let review = ReviewRecord {
+            local_owner,
             pending_mac,
             approved,
             grants,
@@ -502,7 +524,7 @@ impl TurnDecisionService {
             "decision review does not authenticate this pending scope"
         );
         anyhow::ensure!(
-            stored.record.approved == approved,
+            stored.record.approved == approved && stored.record.local_owner == proposed.record.local_owner,
             "pending decision already has a different review"
         );
         anyhow::ensure!(
@@ -722,6 +744,7 @@ impl TurnDecisionService {
                 );
             }
         }
+        self.verify_h2_review_requirement(&pending, true, review.record.local_owner.as_ref())?;
         self.check_live_parity()?;
         let now = Utc::now();
         anyhow::ensure!(
@@ -731,6 +754,7 @@ impl TurnDecisionService {
         Ok(VerifiedDecisionApproval {
             pending,
             grants: review.record.grants,
+            local_owner: review.record.local_owner,
         })
     }
 
@@ -857,6 +881,7 @@ fn scope_from_source(source: &MessageEvent) -> MessageEventScope {
 /// The execution adapter owns only a reference to the issued turn. It cannot
 /// supply a new decision, operation set, actor or source event.
 pub(super) struct ExecutionApprovalRecorder {
+    pub(super) h2_origin: Option<Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>>,
     pub(super) service: Arc<TurnDecisionService>,
     pub(super) context: Arc<TurnDecisionContext>,
 }
@@ -906,7 +931,9 @@ impl crate::tools::capability::execution_binding::DecisionApprovalRecorder for E
         &self,
         call: &crate::tools::capability::execution_binding::VerifiedDecisionCall,
     ) -> anyhow::Result<()> {
-        self.service.record_pending_execution_call(&self.context, call).await
+        self.service
+            .record_pending_execution_call(&self.context, call, self.h2_origin.as_deref())
+            .await
     }
 }
 
@@ -915,6 +942,7 @@ impl TurnDecisionService {
         &self,
         context: &Arc<TurnDecisionContext>,
         call: &crate::tools::capability::execution_binding::VerifiedDecisionCall,
+        h2_origin: Option<&crate::runtime::h2_entry::VerifiedEntryOrigin>,
     ) -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
         let trusted = context.engine.state.trusted.parts();
@@ -1008,6 +1036,7 @@ impl TurnDecisionService {
             vec![crate::memory::principal::Role::Anonymous],
         );
         let mut record = PendingRecord {
+            h2_origin: h2_origin.map(|origin| origin.record().clone()),
             subject: Subject {
                 agent_id: format!("prx:agent:{channel}"),
                 principal_id: principal.principal_id,
@@ -1033,7 +1062,12 @@ impl TurnDecisionService {
             risk: Some(call.risk()),
             schema_dialect: Some(call.schema_dialect()),
             sealed_call: None,
-            expires_at: Utc::now() + chrono::Duration::minutes(5),
+            expires_at: h2_origin.map_or(Utc::now() + chrono::Duration::minutes(5), |origin| {
+                origin
+                    .record()
+                    .authority_expires_at
+                    .min(Utc::now() + chrono::Duration::minutes(5))
+            }),
         };
         record.sealed_call = Some(self.seal_pending_call(&record, call.command())?);
         let expires_at = record.expires_at;

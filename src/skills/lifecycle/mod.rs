@@ -41,6 +41,7 @@ mod facts;
 mod gate;
 mod gate_judge;
 mod generation;
+mod identity_evidence;
 mod journal;
 mod knowledge;
 mod lesson_delivery;

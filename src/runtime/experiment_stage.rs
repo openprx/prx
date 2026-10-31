@@ -17,6 +17,10 @@ use tokio_util::sync::CancellationToken;
 
 tokio::task_local! { static CURRENT: Arc<ExperimentStageRuntime>; }
 pub(crate) struct ExperimentStageRuntime {
+    continuation: Option<super::h2_entry::RunContinuation>,
+    workspace: std::path::PathBuf,
+    case_template_sha256: String,
+    configuration: Arc<Config>,
     pub(super) accounting: Arc<AccountingScope>,
     key: Arc<DecisionKey>,
     cancel: CancellationToken,
@@ -32,6 +36,35 @@ pub(crate) struct ExperimentStageRuntime {
     id: crate::skills::lifecycle::experiment::ExperimentId,
 }
 impl ExperimentStageRuntime {
+    fn case_template_digest(config: &Config) -> anyhow::Result<String> {
+        use sha2::{Digest, Sha256};
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&serde_json::json!({
+            "domain":"prx-admitted-case-template-v1","configuration":config,
+            "workspace":config.workspace_dir,"config_path":config.config_path,
+        }))?)))
+    }
+    pub(crate) fn verify_case_template(&self, config: &Config) -> anyhow::Result<()> {
+        self.ensure_active()?;
+        anyhow::ensure!(
+            Self::case_template_digest(config)? == self.case_template_sha256,
+            "controlled case template differs from the actual admitted stage configuration"
+        );
+        Ok(())
+    }
+    pub(crate) fn verified_experiment_origin(
+        &self,
+        owner: &crate::skills::lifecycle::OwnerScope,
+    ) -> anyhow::Result<(crate::skills::lifecycle::experiment::ExperimentId, String)> {
+        self.ensure_active()?;
+        anyhow::ensure!(
+            self.store.owner_scope() == owner,
+            "experiment stage belongs to another store owner"
+        );
+        Ok((self.id.clone(), self.binding.experiment_sha256.clone()))
+    }
+    pub(crate) fn kind(&self) -> crate::skills::lifecycle::experiment::ExperimentStageKind {
+        self.kind
+    }
     pub(crate) fn physical_identity(key: &DecisionKey, digest: &str, stage: &str) -> [u8; 32] {
         key.hmac(
             crate::decision::KeyDomain::TerminalClaim,
@@ -45,6 +78,12 @@ impl ExperimentStageRuntime {
         cancel: CancellationToken,
         store: Arc<crate::skills::lifecycle::SkillLifecycleStore>,
     ) -> anyhow::Result<Arc<Self>> {
+        let continuation = super::h2_entry::current_run_continuation();
+        match (&plan.spec().controlled_admission, &continuation) {
+            (Some(envelope), Some(owner)) => owner.ensure_admission(&envelope.pin, plan, config)?,
+            (None, None) => {}
+            _ => anyhow::bail!("experiment stage lost or changed its controlled admission owner"),
+        }
         anyhow::ensure!(current().is_none(), "nested experiment stage admission is forbidden");
         plan.ensure_live(chrono::Utc::now())?;
         let admitted = plan
@@ -84,6 +123,10 @@ impl ExperimentStageRuntime {
             micro_usd: plan.spec().resources.micro_usd,
         });
         let runtime = Arc::new(Self {
+            continuation,
+            workspace: config.workspace_dir.clone(),
+            case_template_sha256: Self::case_template_digest(config)?,
+            configuration: Arc::new(config.clone()),
             accounting: Arc::new(accounting),
             key,
             store,
@@ -122,7 +165,14 @@ impl ExperimentStageRuntime {
                     () = stop.cancelled() => break,
                     _ = interval.tick() => {
                         let read = Arc::clone(&stage);
-                        let status = tokio::task::spawn_blocking(move || read.ensure_active()).await;
+                        let status = tokio::task::spawn_blocking(move || {
+                            // Source/config observation occurs outside owner locks;
+                            // the existing stage watcher owns cancellation.
+                            if let Some(continuation)=&read.continuation {
+                                continuation.profile()?.verify(&read.configuration)?;
+                            }
+                            read.ensure_active()
+                        }).await;
                         if !matches!(status, Ok(Ok(()))) {
                             // Cancellation/expiry is normal; unreadable authority
                             // is conservative too and remains in the journal.
@@ -244,6 +294,16 @@ impl ExperimentStageRuntime {
     pub(crate) fn ensure_active(&self) -> anyhow::Result<()> {
         let journal = self.store.read_experiment(&self.id, &self.binding.experiment_sha256)?;
         journal.plan.ensure_live(chrono::Utc::now())?;
+        match (&journal.plan.spec().controlled_admission, &self.continuation) {
+            (Some(envelope), Some(owner)) => owner.ensure_store_admission(
+                &envelope.pin,
+                &journal.plan,
+                &self.workspace,
+                self.store.owner_scope().as_str(),
+            )?,
+            (None, None) => {}
+            _ => anyhow::bail!("experiment stage controlled admission changed"),
+        }
         if journal.state.cancelled {
             self.cancel.cancel();
         }
@@ -291,3 +351,4 @@ mod tests;
 mod chat;
 mod files;
 pub(crate) use chat::chat_traced;
+pub(crate) use files::NativeWrite;

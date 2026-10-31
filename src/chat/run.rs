@@ -137,11 +137,13 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+mod entry;
 mod startup;
+pub use entry::{run, run_controlled};
 
 /// Run the interactive chat session with rich terminal UI.
 #[allow(clippy::too_many_lines)]
-pub async fn run(
+async fn run_internal(
     config: Config,
     provider_override: Option<String>,
     model_override: Option<String>,
@@ -150,6 +152,7 @@ pub async fn run(
     session_id: Option<String>,
     list_sessions: bool,
     shutdown: CancellationToken,
+    terminal_producer: Option<crate::runtime::h2_entry::TerminalInputProducer>,
 ) -> Result<()> {
     let _tracing_guard = startup::chat_tracing_guard();
 
@@ -166,18 +169,7 @@ pub async fn run(
     // any scaffolding changes — see `TerminalGuard` above.
 
     // ── Wire up subsystems via RuntimeBootstrap (D1 step 2) ──────
-    // `list_sessions` is a CLI flag known before any subsystem is built, so we
-    // pick the profile once: `MemoryOnly` early-exits after memory (no tools),
-    // `Interactive` builds the full memory + tools set. Either way memory is
-    // built exactly once — no duplicate construction. The bootstrap wires
-    // observer → security(+audit) → memory → runtime → tools in the hard-ordered
-    // sequence, replacing the former hand-wired block (behaviour-equivalent).
-    let profile = if list_sessions {
-        crate::runtime::bootstrap::BootstrapProfile::MemoryOnly
-    } else {
-        crate::runtime::bootstrap::BootstrapProfile::Interactive
-    };
-    let ctx = crate::runtime::bootstrap::RuntimeBootstrap::build(config, profile).await?;
+    let ctx = entry::build_context(config, list_sessions, terminal_producer).await?;
 
     // `build` took ownership of `config`; reclaim a shared `Arc<Config>` for the
     // rest of this function. `Arc<Config>` deref-coerces to `&Config`, so almost
@@ -289,6 +281,7 @@ pub async fn run(
         startup_connection,
         &provider_runtime_options,
         base_tools_vec,
+        ctx.controlled_entry.as_ref(),
     )?;
 
     let mut turn_decisions = ctx
@@ -337,7 +330,7 @@ pub async fn run(
     };
 
     // ── Input channel ────────────────────────────────────────────
-    let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+    let (input_tx, mut input_rx) = crate::runtime::h2_entry::ChatInputSender::channel(INPUT_CHANNEL_CAPACITY);
     scheduled_input_handle.set_input_sender(input_tx.clone());
     // Taken before the terminal listener consumes `input_tx`: daemon-assigned
     // work is submitted through the very same FIFO as typed input, which is
@@ -488,7 +481,7 @@ pub async fn run(
     let active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>> = Arc::new(parking_lot::Mutex::new(None));
     #[cfg(feature = "terminal-tui")]
     let (terminal_guard, redraw_tx_for_main) = startup::terminal_input(
-        plain_mode, &ui_startup, &terminal, input_tx, &control_tx, &chat_mirror, &shutdown,
+        plain_mode, entry::take_producer(&ctx), &ui_startup, &terminal, input_tx, &control_tx, &chat_mirror, &shutdown,
         &last_ctrlc_ms, &chat_dispatcher, &executor_redraw_slot, &snapshot_rx_for_tui,
         &pty_handoff, &config, &security,
     ).await;
@@ -499,7 +492,7 @@ pub async fn run(
         println!("{banner}");
         let terminal_for_listen = TerminalChannel::new(plain_mode);
         tokio::spawn(async move {
-            if let Err(e) = terminal_for_listen.listen(input_tx).await {
+            if let Err(e) = terminal_for_listen.listen_input_sink(crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx)).await {
                 tracing::error!("Terminal input loop error: {e}");
             }
         });
@@ -1350,7 +1343,11 @@ pub async fn run(
         turn_signal.ensure_history_commits_healthy()?;
         let provider_queue_task_id = input.turn_task_id;
         let input_priority = input.priority;
+        let terminal_origin = input.terminal_origin;
         let msg = input.msg;
+        if let Err(error) = entry::validate_input(ctx.controlled_entry.is_some(),terminal_origin.is_some(),&msg.content) {
+            surface_session_message(&chat_dispatcher,sessions_redraw_handle.as_ref(),&error.to_string()); continue;
+        }
         let mut user_input = msg.content.clone();
         let mut resume_decision = false;
         let synthetic_ui_command = is_synthetic_ui_command(&msg);
@@ -3128,6 +3125,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     priority: input_priority,
                     turn_task_id: provider_queue_task_id,
                     msg,
+                    terminal_origin: terminal_origin.clone(),
                 },
             );
             publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
@@ -3171,10 +3169,10 @@ Retry with a compatible model: /provider {shown} <model>",
         #[cfg(not(feature = "terminal-tui"))]
         let admitted_chat_mode = chat_session.mode;
         let has_conversation_history = history.iter().any(|message| message.role != "system");
-        let (chat_user_event, admitted_binding, mut admission_guard) = current_provider_binding.record_guarded(
+        let (chat_user_event, admitted_binding, mut admission_guard) = current_provider_binding.record_guarded_with_origin(
             memory_fabric.clone(), (input_scope, &chat_session_key, decision_source::ChatAdmissionMode::Model(admitted_chat_mode), has_conversation_history), &user_input,
             format!("chat:{}:{turn_run_id}:{fabric_turn_seq}:user", chat_session.id),
-            child_cleanup.register(cancellation.clone())?,
+            child_cleanup.register(cancellation.clone())?, entry::prepare_origin(terminal_origin,&msg,&user_input,resume_decision)?,
         ).await?;
         let admission = if resume_decision {
             admitted_binding.decide_resume(&turn_decisions, &cancellation).await

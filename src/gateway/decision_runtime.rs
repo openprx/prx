@@ -4,6 +4,7 @@ use crate::runtime::turn_decision::TurnDecisionService;
 use std::sync::Arc;
 
 pub(super) struct GatewayDecisionSlot {
+    pub(super) controlled: Option<Arc<crate::runtime::h2_entry::ControlledH2Profile>>,
     pub(super) cleanup: Arc<super::decision_cleanup::CleanupTracker>,
     service: tokio::sync::OnceCell<Arc<TurnDecisionService>>,
     security: Arc<crate::security::SecurityPolicy>,
@@ -13,6 +14,7 @@ pub(super) struct GatewayDecisionSlot {
 impl GatewayDecisionSlot {
     pub(super) fn new(security: Arc<crate::security::SecurityPolicy>, plugin_generation: u64) -> Self {
         Self {
+            controlled: None,
             cleanup: Arc::new(super::decision_cleanup::CleanupTracker::default()),
             service: tokio::sync::OnceCell::new(),
             security,
@@ -20,11 +22,22 @@ impl GatewayDecisionSlot {
         }
     }
 
+    pub(super) fn with_controlled(
+        mut self,
+        profile: Option<Arc<crate::runtime::h2_entry::ControlledH2Profile>>,
+    ) -> Self {
+        self.controlled = profile;
+        self
+    }
+
     pub(super) async fn publish(
         &self,
         runtime: &super::TurnRuntimeGeneration,
         state: &super::AppState,
     ) -> anyhow::Result<&Arc<TurnDecisionService>> {
+        if let Some(profile) = &self.controlled {
+            profile.verify(&runtime.config_generation.effective)?;
+        }
         self.service
             .get_or_try_init(|| async {
                 let service = crate::runtime::turn_publication::TurnDecisionPublication {

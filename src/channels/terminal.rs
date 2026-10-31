@@ -768,6 +768,10 @@ pub struct TerminalChannel {
 }
 
 impl TerminalChannel {
+    pub(crate) async fn listen_input_sink(&self, sink: crate::runtime::h2_entry::TerminalInputSink) -> Result<()> {
+        terminal_input_loop(sink).await
+    }
+
     /// Create a new `TerminalChannel` and spawn the UI Actor task.
     ///
     /// Returns the channel and a handle to the UI Actor task.
@@ -926,7 +930,7 @@ impl Channel for TerminalChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
-        terminal_input_loop(tx).await
+        terminal_input_loop(crate::runtime::h2_entry::TerminalInputSink::ordinary(tx)).await
     }
 }
 
@@ -973,7 +977,7 @@ impl Drop for TerminalChannel {
 ///
 /// Reads user input, recognizes slash-commands, and sends `ChannelMessage`s
 /// to the agent pipeline.
-async fn terminal_input_loop(tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+async fn terminal_input_loop(mut tx: crate::runtime::h2_entry::TerminalInputSink) -> Result<()> {
     // Run stdin reads on a dedicated OS thread rather than the tokio blocking
     // pool. The loop blocks on stdin until EOF, i.e. for the life of the
     // process, so a pool slot given to it is never returned — and with no cap

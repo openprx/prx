@@ -11,6 +11,7 @@ pub mod docker;
 pub mod envelope;
 pub(crate) mod evolution_model;
 pub(crate) mod experiment_stage;
+pub(crate) mod h2_entry;
 pub(crate) mod lesson_delivery;
 pub mod native;
 pub mod registry;

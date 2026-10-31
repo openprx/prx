@@ -75,6 +75,9 @@ use crate::router::RouterEngine;
 /// deliberately **not** here — they live in the slot layer (dev-plan §2.2) and
 /// are built by each mode. Only the read-only core lives in `AppContext`.
 pub struct AppContext {
+    pub(crate) controlled_entry: Option<Arc<super::h2_entry::ControlledH2Profile>>,
+    pub(crate) terminal_producer: parking_lot::Mutex<Option<super::h2_entry::TerminalInputProducer>>,
+    pub(crate) controlled_case: Option<Arc<super::h2_entry::ControlledCaseScope>>,
     /// Sole configuration generation owner for this process/runtime bootstrap.
     pub config_manager: crate::config::SharedConfig,
     /// Startup generation pinned by non-hot-reloading CLI modes.
@@ -229,6 +232,14 @@ pub(crate) fn build_security_policy(config: &Config) -> Arc<SecurityPolicy> {
 /// generation label from the current configuration file.
 pub(crate) enum AgentRuntimeConfig {
     Standalone(Box<Config>),
+    ControlledCase {
+        config: Box<Config>,
+        scope: Arc<super::h2_entry::ControlledCaseScope>,
+    },
+    ControlledEntry {
+        config: Box<Config>,
+        producer: super::h2_entry::TerminalInputProducer,
+    },
     Pinned {
         generation: Arc<crate::config::ConfigGeneration>,
         manager: crate::config::SharedConfig,
@@ -244,7 +255,9 @@ impl From<Config> for AgentRuntimeConfig {
 impl AgentRuntimeConfig {
     pub(crate) fn effective(&self) -> &Config {
         match self {
-            Self::Standalone(config) => config,
+            Self::Standalone(config) | Self::ControlledCase { config, .. } | Self::ControlledEntry { config, .. } => {
+                config
+            }
             Self::Pinned { generation, .. } => &generation.effective,
         }
     }
@@ -303,6 +316,23 @@ impl RuntimeBootstrap {
             config.into(),
             profile,
             crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn build_controlled(
+        config: Config,
+        profile: BootstrapProfile,
+        producer: super::h2_entry::TerminalInputProducer,
+    ) -> Result<Arc<AppContext>> {
+        Self::build_inner(
+            AgentRuntimeConfig::ControlledEntry {
+                config: Box::new(config),
+                producer,
+            },
+            profile,
+            crate::causal_tree::state::TurnSurfaceKind::Interactive,
             None,
         )
         .await
@@ -381,14 +411,39 @@ impl RuntimeBootstrap {
         // (iron rule 7: Arc over deep copy). Arc<Config> deref-coerces to &Config
         // everywhere a borrow is needed. The bootstrap also owns the one
         // process-level generation manager used by every config-aware tool.
+        let controlled_entry = match &config_source {
+            AgentRuntimeConfig::ControlledEntry { config, producer } => {
+                let profile = producer.profile();
+                profile.verify(config)?;
+                Some(profile)
+            }
+            _ => None,
+        };
+        let mut terminal_producer = None;
+        let controlled_case = match &config_source {
+            AgentRuntimeConfig::ControlledCase { config, scope } => {
+                scope.verify_config(config)?;
+                Some(Arc::clone(scope))
+            }
+            _ => None,
+        };
         let (config_manager, config_generation) = match config_source {
-            AgentRuntimeConfig::Standalone(config) => {
+            AgentRuntimeConfig::Standalone(config) | AgentRuntimeConfig::ControlledCase { config, .. } => {
+                let manager = crate::config::new_shared(*config);
+                let generation = manager.pin();
+                (manager, generation)
+            }
+            AgentRuntimeConfig::ControlledEntry { config, producer } => {
+                terminal_producer = Some(producer);
                 let manager = crate::config::new_shared(*config);
                 let generation = manager.pin();
                 (manager, generation)
             }
             AgentRuntimeConfig::Pinned { generation, manager } => (manager, generation),
         };
+        if controlled_entry.is_some() || controlled_case.is_some() {
+            config_manager.freeze_runtime_writes();
+        }
         let config = Arc::clone(&config_generation.effective);
 
         // 1. observer — first, no dependencies beyond config.
@@ -532,33 +587,47 @@ impl RuntimeBootstrap {
             if let Some(plugin_runtime) = &plugin_runtime {
                 extensions.extend(plugin_runtime.control_tool_arcs(Arc::clone(&security)));
             }
-            let registry_result = tools::all_tools_with_runtime_ext_and_extensions(
-                Arc::clone(&config),
-                Arc::clone(&config_manager),
-                &security,
-                rt,
-                mem,
-                composio_key,
-                composio_entity_id,
-                &config.browser,
-                &config.http_request,
-                &config.workspace_dir,
-                &config.agents_with_references(),
-                config.api_key.as_deref(),
-                &config,
-                extensions,
-                Some(Arc::clone(&hooks)),
-            );
-            mcp_tool = registry_result.mcp_tool;
-            let registry = registry_result.tools;
-            if matches!(profile, BootstrapProfile::Interactive) {
-                base_tools = Some(parking_lot::Mutex::new(Some(registry)));
+            if let Some(case) = &controlled_case {
+                tools = Some(Arc::new(case.registry(&config, &security)?));
+            } else if let Some(entry) = &controlled_entry {
+                let registry = entry.registry(&config, &security)?;
+                if matches!(profile, BootstrapProfile::Interactive) {
+                    base_tools = Some(parking_lot::Mutex::new(Some(registry)));
+                } else {
+                    tools = Some(Arc::new(registry));
+                }
             } else {
-                tools = Some(Arc::new(registry));
+                let registry_result = tools::all_tools_with_runtime_ext_and_extensions(
+                    Arc::clone(&config),
+                    Arc::clone(&config_manager),
+                    &security,
+                    rt,
+                    mem,
+                    composio_key,
+                    composio_entity_id,
+                    &config.browser,
+                    &config.http_request,
+                    &config.workspace_dir,
+                    &config.agents_with_references(),
+                    config.api_key.as_deref(),
+                    &config,
+                    extensions,
+                    Some(Arc::clone(&hooks)),
+                );
+                mcp_tool = registry_result.mcp_tool;
+                let registry = registry_result.tools;
+                if matches!(profile, BootstrapProfile::Interactive) {
+                    base_tools = Some(parking_lot::Mutex::new(Some(registry)));
+                } else {
+                    tools = Some(Arc::new(registry));
+                }
             }
         }
 
         let mut context = AppContext {
+            controlled_entry,
+            terminal_producer: parking_lot::Mutex::new(terminal_producer),
+            controlled_case,
             config_manager,
             config_generation,
             config,

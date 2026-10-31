@@ -15,6 +15,8 @@ mod channels;
 mod chat_sessions;
 mod config;
 mod hooks;
+mod identity;
+pub(in crate::gateway) use identity::verify_startup_identity;
 mod jobs;
 mod logs;
 mod manage;
@@ -119,6 +121,7 @@ pub fn router(state: AppState) -> Router<AppState> {
 
     let protected_routes = Router::new()
         .route("/status", get(status::get_status))
+        .route("/identity",get(identity::get_identity))
         .route("/sessions", get(sessions::get_sessions).post(sessions::post_session))
         .route(
             "/sessions/{id}/messages",

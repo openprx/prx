@@ -71,6 +71,19 @@ impl ChatProviderBinding {
         key: String,
         ticket: crate::runtime::turn_cleanup::CleanupTicket,
     ) -> anyhow::Result<(Option<MessageEvent>, Arc<ChatTurnBinding>, ChatAdmissionGuard)> {
+        self.record_guarded_with_origin(fabric, source, input, key, ticket, None)
+            .await
+    }
+
+    pub(super) async fn record_guarded_with_origin(
+        &self,
+        fabric: crate::memory::MemoryFabric,
+        source: (crate::memory::MessageEventScope, &str, ChatAdmissionMode, bool),
+        input: &str,
+        key: String,
+        ticket: crate::runtime::turn_cleanup::CleanupTicket,
+        origin: Option<crate::runtime::h2_entry::TerminalInputProof>,
+    ) -> anyhow::Result<(Option<MessageEvent>, Arc<ChatTurnBinding>, ChatAdmissionGuard)> {
         let fabric = fabric
             .with_ingress_recovery(&self.generation.effective, &ticket)
             .await?;
@@ -89,6 +102,7 @@ impl ChatProviderBinding {
                 let session = &session;
                 let key = &key;
                 let scope = &scope;
+                let origin = &origin;
                 async move {
                     if let Some(event) = event.as_ref().filter(|event| event.id > 0) {
                         let mut recipient = scope.recipient.clone();
@@ -116,10 +130,15 @@ impl ChatProviderBinding {
                         event.as_ref(),
                     )
                     .await?;
-                    Ok::<_, anyhow::Error>((
-                        event,
-                        receipt.bind_provider_with_history(binding, admission_mode, has_conversation_history)?,
-                    ))
+                    let source =
+                        receipt.bind_provider_with_history(binding, admission_mode, has_conversation_history)?;
+                    if let Some(origin) = origin {
+                        source
+                            .h2_origin
+                            .set(origin.bind(source.as_ref())?)
+                            .map_err(|_| anyhow::anyhow!("chat input origin was already bound"))?;
+                    }
+                    Ok::<_, anyhow::Error>((event, source))
                 }
             };
             let operation = async {
@@ -445,6 +464,7 @@ pub(super) enum ChatAdmissionMode {
 
 /// Immutable input to a queued Chat task; no UI action can synthesize authority.
 pub struct ChatTurnBinding {
+    h2_origin: std::sync::OnceLock<Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>>,
     admission_mode: ChatAdmissionMode,
     terminal: std::sync::OnceLock<(
         crate::runtime::turn_terminal::TurnTerminalGuard,
@@ -1012,6 +1032,7 @@ impl ChatSourceReceipt {
             "chat source and provider generations differ"
         );
         Ok(Arc::new(ChatTurnBinding {
+            h2_origin: std::sync::OnceLock::new(),
             admission_mode,
             terminal: std::sync::OnceLock::new(),
             returned_trace: std::sync::OnceLock::new(),
@@ -1114,6 +1135,10 @@ impl ChatSourceReceipt {
 }
 
 impl crate::runtime::turn_source::TurnSourceProof for ChatTurnBinding {
+    fn h2_entry_origin(&self) -> Option<&Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>> {
+        self.h2_origin.get()
+    }
+
     fn owner_isolated(&self) -> bool {
         self.envelope.owner_isolated
     }

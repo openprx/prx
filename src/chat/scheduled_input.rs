@@ -48,14 +48,14 @@ struct ScheduledInputState {
 
 #[derive(Clone, Default)]
 pub struct ScheduledInputHandle {
-    input_tx: Arc<Mutex<Option<mpsc::Sender<ChannelMessage>>>>,
+    input_tx: Arc<Mutex<Option<crate::runtime::h2_entry::ChatInputSender>>>,
     state: Arc<Mutex<ScheduledInputState>>,
     next_id: Arc<AtomicU64>,
 }
 
 impl ScheduledInputHandle {
-    pub fn set_input_sender(&self, input_tx: mpsc::Sender<ChannelMessage>) {
-        *self.input_tx.lock() = Some(input_tx);
+    pub(crate) fn set_input_sender(&self, input_tx: impl Into<crate::runtime::h2_entry::ChatInputSender>) {
+        *self.input_tx.lock() = Some(input_tx.into());
     }
 }
 

@@ -120,7 +120,7 @@ pub(super) async fn active_turn_local_command_output(
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "terminal-tui")]
 pub(super) async fn process_active_turn_input_message(
-    msg: crate::channels::traits::ChannelMessage,
+    msg: impl Into<crate::runtime::h2_entry::ChatInput>,
     emit_chat_output: &mut impl FnMut(&str),
     backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
@@ -135,8 +135,10 @@ pub(super) async fn process_active_turn_input_message(
     tools_registry: &[Box<dyn Tool>],
     daemon: DaemonControl<'_>,
 ) {
+    let input = msg.into();
+    let msg = &input.message;
     if let Some((output, signal_cancel)) =
-        active_turn_workers_cancel_output(&msg, scheduler, provider_turn_workers, provider_turn_task_id)
+        active_turn_workers_cancel_output(msg, scheduler, provider_turn_workers, provider_turn_task_id)
     {
         emit_chat_output(&output);
         publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
@@ -183,15 +185,15 @@ pub(super) async fn process_active_turn_input_message(
     // the back of the backlog, `steer` and `interrupt` at the front, because
     // their message carries the same `/now ` prefix a person types to do that.
     let _priority =
-        enqueue_input_message_and_return_priority_with_scheduler(backlog, scheduler, msg, chat_session.turns.len());
+        enqueue_input_message_and_return_priority_with_scheduler(backlog, scheduler, input, chat_session.turns.len());
 }
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "terminal-tui")]
-pub(super) async fn process_active_turn_input_batch(
-    msg: crate::channels::traits::ChannelMessage,
+pub(super) async fn process_active_turn_input_batch<M: Into<crate::runtime::h2_entry::ChatInput>>(
+    msg: impl Into<crate::runtime::h2_entry::ChatInput>,
     emit_chat_output: &mut impl FnMut(&str),
-    input_rx: &mut mpsc::Receiver<crate::channels::traits::ChannelMessage>,
+    input_rx: &mut mpsc::Receiver<M>,
     backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
     provider_turn_workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,

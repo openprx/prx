@@ -305,6 +305,7 @@ impl GatewayProviderBinding {
 /// validation. Neither arbitrary metadata nor a caller-supplied owner can
 /// construct this proof.
 pub(crate) struct GatewayTurnProof {
+    h2_origin: std::sync::OnceLock<std::sync::Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>>,
     envelope: RuntimeEnvelope,
     provider_binding: std::sync::Arc<GatewayProviderBinding>,
     owner: String,
@@ -456,7 +457,8 @@ impl GatewaySourceReceipt {
         let model_name = crate::providers::selection::default_model(config).to_owned();
         let catalog = crate::providers::selection::catalog_for(config);
         let route = crate::providers::selection::route_target(&catalog, &provider_name, &model_name)?.cloned();
-        Ok(GatewayTurnProof {
+        let proof = GatewayTurnProof {
+            h2_origin: std::sync::OnceLock::new(),
             provider_binding: std::sync::Arc::clone(binding),
             owner,
             scope: self.envelope.memory_write_context(chat_type),
@@ -467,11 +469,24 @@ impl GatewaySourceReceipt {
             model_name,
             model_binding: crate::agent::entry::AgentModelBinding::from_resolved(&binding.resolved, route),
             has_conversation_history: self.has_conversation_history,
-        })
+        };
+        if let Some(profile) = &runtime.decision_slot.controlled {
+            if self.envelope.source == crate::runtime::envelope::RuntimeSource::Console {
+                let origin = profile.bind_gateway(&proof)?;
+                proof
+                    .h2_origin
+                    .set(origin)
+                    .map_err(|_| anyhow::anyhow!("controlled Gateway source already bound"))?;
+            }
+        }
+        Ok(proof)
     }
 }
 
 impl crate::runtime::turn_source::TurnSourceProof for GatewayTurnProof {
+    fn h2_entry_origin(&self) -> Option<&std::sync::Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>> {
+        self.h2_origin.get()
+    }
     fn owner_isolated(&self) -> bool {
         self.envelope.owner_isolated
     }

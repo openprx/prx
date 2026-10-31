@@ -69,6 +69,9 @@ impl AgentCaseExecutor {
         cancel: &CancellationToken,
     ) -> Result<RunObservation, EvaluationError> {
         let Some(owner) = crate::runtime::turn_cleanup::current_tracker() else {
+            if self.controlled.is_some() {
+                return Err(EvaluationError::Executor("controlled case lost cleanup owner".into()));
+            }
             return self.run_case_inner(request, cancel).await;
         };
         let child = cancel.child_token();

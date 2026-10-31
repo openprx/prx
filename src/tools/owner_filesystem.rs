@@ -128,7 +128,6 @@ impl OwnerFilesystem {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn namespace_root(&self) -> &Path {
         &self.namespace_root
     }
@@ -259,6 +258,19 @@ impl OwnerFilesystem {
         new: &str,
         replace_all: bool,
     ) -> anyhow::Result<usize> {
+        self.edit_authorized_with_admission(target, old, new, replace_all, |_| Ok(None))
+    }
+    pub(crate) fn edit_authorized_with_admission<F>(
+        &self,
+        target: &OwnerFileTarget,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+        admit: F,
+    ) -> anyhow::Result<usize>
+    where
+        F: FnOnce(usize) -> anyhow::Result<Option<crate::runtime::experiment_stage::NativeWrite>>,
+    {
         self.validate_target(target)?;
         ensure!(!old.is_empty() && old != new, "invalid owner file edit");
         #[cfg(unix)]
@@ -280,26 +292,46 @@ impl OwnerFilesystem {
                 count > 0 && (replace_all || count == 1),
                 "owner file edit requires an unambiguous match"
             );
-            let replacement = if replace_all {
-                text.replace(old, new)
-            } else {
-                text.replacen(old, new, 1)
-            };
-            let current = rustix::fs::statat(&parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
-            ensure!(
-                current.st_dev == original.st_dev
-                    && current.st_ino == original.st_ino
-                    && current.st_size == original.st_size
-                    && current.st_mtime == original.st_mtime,
-                "owner file changed during edit"
-            );
-            check_existing(&parent, name)?;
-            replace_file(&parent, name, replacement.as_bytes())?;
-            Ok(count)
+            let replacements = if replace_all { count } else { 1 };
+            let resulting_bytes = replacements
+                .checked_mul(old.len())
+                .and_then(|removed| text.len().checked_sub(removed))
+                .and_then(|remaining| {
+                    replacements
+                        .checked_mul(new.len())
+                        .and_then(|added| remaining.checked_add(added))
+                })
+                .ok_or_else(|| anyhow::anyhow!("owner edit size overflow"))?;
+            let admitted = admit(resulting_bytes)?;
+            let result = (|| -> anyhow::Result<usize> {
+                let replacement = if replace_all {
+                    text.replace(old, new)
+                } else {
+                    text.replacen(old, new, 1)
+                };
+                let current = rustix::fs::statat(&parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+                ensure!(
+                    current.st_dev == original.st_dev
+                        && current.st_ino == original.st_ino
+                        && current.st_size == original.st_size
+                        && current.st_mtime == original.st_mtime,
+                    "owner file changed during edit"
+                );
+                if let Some(admission) = &admitted {
+                    admission.check()?;
+                }
+                check_existing(&parent, name)?;
+                replace_file(&parent, name, replacement.as_bytes())?;
+                Ok(count)
+            })();
+            if let Some(admission) = admitted {
+                admission.finish();
+            }
+            result
         }
         #[cfg(not(unix))]
         {
-            let _ = replace_all;
+            let _ = (replace_all, admit);
             bail!("owner filesystem is unsupported")
         }
     }

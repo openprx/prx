@@ -27,6 +27,8 @@ mod api;
 mod compat;
 mod decision_cleanup;
 mod decision_runtime;
+mod h2_control;
+pub use h2_control::run_gateway_controlled;
 pub(crate) mod decision_source;
 mod jobs;
 
@@ -1108,6 +1110,10 @@ impl GatewayTurnRuntimeOwner {
     }
 
     fn build(&self, generation: Arc<crate::config::ConfigGeneration>) -> anyhow::Result<TurnRuntimeGeneration> {
+        if let Some(profile) = &self.current.load().decision_slot.controlled {
+            profile.revoke();
+            anyhow::bail!("controlled Gateway generation cannot be rebuilt");
+        }
         let mut runtime = build_gateway_turn_runtime(
             generation,
             Arc::clone(&self.config),
@@ -1329,6 +1335,9 @@ fn register_gateway_turn_tools(
     // One routing registry, keyed by `Channel::name`, shared by `message_send`
     // (destination of an explicit `channel` argument) and `sessions_spawn`
     // (announce/kill routing) so both address exactly the same channel set.
+    if shared_config.ensure_runtime_writable().is_err() {
+        return Ok((Arc::new(HashMap::new()), Arc::new(tools::ParentToolRegistry::default())));
+    }
     let mut registry: HashMap<String, Arc<dyn Channel>> = HashMap::new();
     if let Some(channel) = signal {
         registry.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
@@ -1564,6 +1573,21 @@ pub async fn run_gateway(
     shared_config: Option<crate::config::SharedConfig>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    run_gateway_inner(host, port, config, shared_config, shutdown, None).await
+}
+async fn run_gateway_inner(
+    host: &str,
+    port: u16,
+    config: Config,
+    shared_config: Option<crate::config::SharedConfig>,
+    shutdown: CancellationToken,
+    mut producer: Option<crate::runtime::h2_entry::TerminalInputProducer>,
+) -> Result<()> {
+    let controlled = producer.as_ref().map(|producer| producer.profile());
+    if let Some(profile) = &controlled {
+        profile.verify(&config)?;
+        anyhow::ensure!(shared_config.is_none(), "controlled Gateway requires direct OS launch");
+    }
     let start_time = Instant::now();
     crate::health::register_component(
         "gateway",
@@ -1611,6 +1635,9 @@ pub async fn run_gateway(
     let (provider, model, provider_binding) = build_gateway_turn_provider(&config, &provider_runtime_options)?;
     let temperature = config.default_temperature;
     let shared_config_for_reload = shared_config.unwrap_or_else(|| crate::config::new_shared(config.clone()));
+    if controlled.is_some() {
+        shared_config_for_reload.freeze_runtime_writes();
+    }
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
         Some(&config.storage.provider.config),
@@ -1661,23 +1688,30 @@ pub async fn run_gateway(
     if let Some(runtime) = &wasm_plugin_runtime {
         extensions.extend(runtime.control_tool_arcs(Arc::clone(&security)));
     }
-    let tools_result = tools::all_tools_with_runtime_ext_and_extensions(
-        Arc::new(config.clone()),
-        Arc::clone(&shared_config_for_reload),
-        &security,
-        runtime,
-        Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.workspace_dir,
-        &config.agents_with_references(),
-        config.api_key.as_deref(),
-        &config,
-        extensions,
-        Some(Arc::clone(&hooks)),
-    );
+    let tools_result = if let Some(profile) = &controlled {
+        tools::ToolsRegistryResult {
+            tools: profile.registry(&config, &security)?,
+            mcp_tool: None,
+        }
+    } else {
+        tools::all_tools_with_runtime_ext_and_extensions(
+            Arc::new(config.clone()),
+            Arc::clone(&shared_config_for_reload),
+            &security,
+            runtime,
+            Arc::clone(&mem),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.workspace_dir,
+            &config.agents_with_references(),
+            config.api_key.as_deref(),
+            &config,
+            extensions,
+            Some(Arc::clone(&hooks)),
+        )
+    };
     let mut tools_list = tools_result.tools;
     let mcp_tool = tools_result.mcp_tool;
     // Generic /webhook auth can require a standalone token and/or HMAC signature.
@@ -1897,18 +1931,21 @@ pub async fn run_gateway(
     let turn_runtime_owner = start_gateway_turn_runtime(
         TurnRuntimeGeneration {
             provider_binding,
-            decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(Arc::clone(&security), {
-                #[cfg(feature = "wasm-plugins")]
-                {
-                    wasm_plugin_runtime
-                        .as_ref()
-                        .map_or(0, |runtime| runtime.generation_id())
-                }
-                #[cfg(not(feature = "wasm-plugins"))]
-                {
-                    0
-                }
-            })),
+            decision_slot: Arc::new(
+                decision_runtime::GatewayDecisionSlot::new(Arc::clone(&security), {
+                    #[cfg(feature = "wasm-plugins")]
+                    {
+                        wasm_plugin_runtime
+                            .as_ref()
+                            .map_or(0, |runtime| runtime.generation_id())
+                    }
+                    #[cfg(not(feature = "wasm-plugins"))]
+                    {
+                        0
+                    }
+                })
+                .with_controlled(controlled.clone()),
+            ),
             config_generation: shared_config_for_reload.pin(),
             provider: Arc::clone(&provider),
             model: model.clone(),
@@ -1973,6 +2010,12 @@ pub async fn run_gateway(
         state.hooks.set_plugin_runtime(Arc::clone(runtime)).await;
     }
 
+    if let Some(profile) = &controlled {
+        let producer = producer
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("local control producer missing"))?;
+        h2_control::start_local_control(producer, state.clone(), shutdown.clone()).await?;
+    }
     let limited_public_routes = Router::new()
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
@@ -2008,7 +2051,29 @@ pub async fn run_gateway(
         .merge(limited_public_routes)
         .nest("/api", api_routes)
         .merge(ui::router())
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let controlled = controlled.clone();
+                async move {
+                    if let Some(profile) = controlled {
+                        if profile.ensure_live().is_err()
+                            || !crate::runtime::h2_entry::ControlledH2Profile::permits_route(
+                                request.method().as_str(),
+                                request.uri().path(),
+                            )
+                        {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                "route is outside the fixed controlled Gateway profile",
+                            )
+                                .into_response();
+                        }
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
 
     // The listener is bound and every route/state dependency is now constructed.
     // This explicit acknowledgement, rather than supervisor task survival, is the

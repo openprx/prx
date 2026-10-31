@@ -14,16 +14,35 @@ use std::os::unix::fs::OpenOptionsExt;
 /// Write file contents with path sandboxing
 pub struct FileWriteTool {
     security: Arc<SecurityPolicy>,
+    controlled_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
 }
 
 impl FileWriteTool {
+    pub(crate) fn new_controlled(
+        security: Arc<SecurityPolicy>,
+        filesystem: Arc<super::owner_filesystem::OwnerFilesystem>,
+    ) -> Self {
+        Self {
+            security,
+            controlled_filesystem: Some(filesystem),
+        }
+    }
     pub const fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            controlled_filesystem: None,
+        }
     }
 }
 
 impl FileWriteTool {
     async fn execute_operation(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Some(expected) = &self.controlled_filesystem {
+            anyhow::ensure!(
+                super::owner_filesystem_dispatch::current().as_ref() == Some(expected),
+                "controlled file tool requires its exact data filesystem"
+            );
+        }
         if let Some(scope) = super::owner_filesystem_dispatch::current() {
             return super::owner_filesystem_dispatch::apply_file_operation(
                 scope,

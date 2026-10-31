@@ -1034,7 +1034,7 @@ pub struct BatchOutcome {
 pub async fn take_batch(
     mailbox: &dyn AssignmentMailbox,
     batch: Vec<PulledAssignment>,
-    input: &tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    input: &crate::runtime::h2_entry::ChatInputSender,
     notify: &(dyn Fn(&str) + Send + Sync),
 ) -> BatchOutcome {
     let mut outcome = BatchOutcome::default();
@@ -1081,7 +1081,7 @@ pub async fn take_batch(
 pub async fn enrol_and_poll(
     client: Arc<AssignmentClient>,
     in_flight: InFlightRegistry,
-    input: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    input: crate::runtime::h2_entry::ChatInputSender,
     notify: Arc<dyn Fn(&str) + Send + Sync>,
     cancel: CancellationToken,
 ) {
@@ -1117,7 +1117,7 @@ pub async fn enrol_and_poll(
 pub async fn run_poller(
     mailbox: Arc<dyn AssignmentMailbox>,
     in_flight: InFlightRegistry,
-    input: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    input: crate::runtime::h2_entry::ChatInputSender,
     notify: Arc<dyn Fn(&str) + Send + Sync>,
     cancel: CancellationToken,
 ) {

@@ -262,7 +262,8 @@ fn new_fullscreen_terminal() -> Result<ChatTerminal> {
 #[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_tui_unified_loop(
-    input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    input_tx: crate::runtime::h2_entry::ChatInputSender,
+    producer: Option<crate::runtime::h2_entry::TerminalInputProducer>,
     control_tx: mpsc::Sender<ChatControlEvent>,
     mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
     redraw_rx: mpsc::Receiver<()>,
@@ -281,27 +282,46 @@ pub(super) fn spawn_tui_unified_loop(
     // config reload competes for. The loop needs no tokio context — it drives
     // crossterm synchronously and hands work off via `blocking_send`, which is
     // in fact only legal *outside* a runtime context.
-    let thread_result = crate::runtime::blocking::spawn_detached_thread("prx-tui-render", move || {
-        let result = run_tui_unified_loop(
-            input_tx,
-            control_tx,
-            mirror,
-            redraw_rx,
-            redraw_tx,
-            &shutdown,
-            last_ctrlc_ms,
-            &chat_dispatcher,
-            snapshot_rx,
-            &handoff,
-            workspace_dir,
-            security,
-        );
-        if let Err(e) = result {
-            tracing::error!("TUI unified loop error: {e}");
+    let profile = producer.as_ref().map(|producer| producer.profile());
+    let reader_profile = profile.clone();
+    let thread_result = std::thread::Builder::new()
+        .name("prx-tui-render".into())
+        .spawn(move || {
+            let _lifetime = crate::runtime::h2_entry::ControlledReaderLifetime::new(reader_profile, shutdown.clone());
+            let result = run_tui_unified_loop(
+                input_tx,
+                producer,
+                control_tx,
+                mirror,
+                redraw_rx,
+                redraw_tx,
+                &shutdown,
+                last_ctrlc_ms,
+                &chat_dispatcher,
+                snapshot_rx,
+                &handoff,
+                workspace_dir,
+                security,
+            );
+            if let Err(e) = result {
+                tracing::error!("TUI unified loop error: {e}");
+            }
+        });
+    match thread_result {
+        Ok(reader) => {
+            if let Some(profile) = profile {
+                if let Err(error) = profile.own_reader(reader) {
+                    profile.revoke();
+                    tracing::error!(%error,"controlled reader ownership failed");
+                }
+            }
         }
-    });
-    if let Err(error) = thread_result {
-        tracing::error!("failed to start TUI render thread: {error}");
+        Err(error) => {
+            if let Some(profile) = profile {
+                profile.revoke();
+            }
+            tracing::error!(%error,"failed to start TUI render thread");
+        }
     }
 }
 
@@ -419,10 +439,7 @@ pub(super) fn collect_at_path_candidates(
 /// in the main loop) rather than being duplicated in the synchronous key thread.
 /// Returns `Err(())` if the receiver has been dropped (chat tearing down).
 #[cfg(feature = "terminal-tui")]
-fn send_synthetic_command(
-    input_tx: &mpsc::Sender<crate::channels::traits::ChannelMessage>,
-    command: &str,
-) -> Result<(), ()> {
+fn send_synthetic_command(input_tx: &crate::runtime::h2_entry::ChatInputSender, command: &str) -> Result<(), ()> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -455,7 +472,8 @@ fn send_synthetic_command(
 #[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_tui_unified_loop(
-    input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    input_tx: crate::runtime::h2_entry::ChatInputSender,
+    producer: Option<crate::runtime::h2_entry::TerminalInputProducer>,
     control_tx: mpsc::Sender<ChatControlEvent>,
     mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
     mut redraw_rx: mpsc::Receiver<()>,
@@ -469,6 +487,11 @@ pub(super) fn run_tui_unified_loop(
     security: Arc<crate::security::SecurityPolicy>,
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
+    let controlled = producer.as_ref().map(|producer| producer.profile());
+    let mut terminal_input = match producer {
+        Some(producer) => crate::runtime::h2_entry::TerminalInputSink::controlled(input_tx.clone(), producer),
+        None => crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx.clone()),
+    };
     use crate::chat::action::Action;
     use crossterm::event::{Event, KeyEventKind};
 
@@ -508,7 +531,11 @@ pub(super) fn run_tui_unified_loop(
     let idle_poll = Duration::from_secs(1);
 
     loop {
-        if shutdown.is_cancelled() {
+        if shutdown.is_cancelled()
+            || controlled
+                .as_ref()
+                .is_some_and(|profile| profile.ensure_live().is_err())
+        {
             let _ = terminal.draw(|frame| {
                 let area = frame.area();
                 frame.render_widget(ratatui::widgets::Clear, area);
@@ -739,7 +766,7 @@ pub(super) fn run_tui_unified_loop(
                             is_group_hint: false,
                             sender_is_bot: false,
                         };
-                        if input_tx.blocking_send(msg).is_err() {
+                        if terminal_input.blocking_send(msg).is_err() {
                             // Receiver dropped — chat::run is tearing down.
                             return Ok(());
                         }
@@ -817,6 +844,9 @@ pub(super) fn run_tui_unified_loop(
                         );
                     }
                     tui::KeyDispatch::ResumeSavedSession { id } => {
+                        if controlled.is_some() {
+                            continue;
+                        }
                         let _ = chat_dispatcher.dispatch_or_log(
                             crate::chat::action::Action::SavedSessionPickerClosed,
                             "chat.saved_session_picker_closed_resume",
@@ -897,6 +927,9 @@ pub(super) fn run_tui_unified_loop(
                         close_diff_view(&mirror, chat_dispatcher, &redraw_tx);
                     }
                     tui::KeyDispatch::ExternalEditorRequested => {
+                        if controlled.is_some() {
+                            continue;
+                        }
                         let initial = mirror.lock().input.text();
                         let terminal_mode = CrosstermExternalEditorTerminalMode;
                         match edit_text_with_external_editor(&initial, resolve_external_editor(), &terminal_mode) {

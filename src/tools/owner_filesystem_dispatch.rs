@@ -97,10 +97,11 @@ async fn apply_file_operation_inner(
     operation: NativeFileOperation,
     arguments: serde_json::Value,
 ) -> anyhow::Result<String> {
-    ensure!(
-        crate::runtime::experiment_stage::current().is_none(),
-        "experiment file adapter requires its registered native scratch root"
-    );
+    let stage = crate::runtime::experiment_stage::current();
+    let scratch = stage
+        .as_ref()
+        .map(|stage| stage.native_scratch_root(filesystem.namespace_root()))
+        .transpose()?;
     let path = arguments
         .get("path")
         .and_then(serde_json::Value::as_str)
@@ -129,6 +130,7 @@ async fn apply_file_operation_inner(
     let owner = crate::runtime::turn_cleanup::current_tracker().context("private file cleanup owner missing")?;
     let cancellation = CancellationToken::new();
     let ticket = owner.register(cancellation.clone())?;
+    let write_owner = Arc::clone(&owner);
     let path = path.to_owned();
     crate::runtime::blocking::spawn_blocking(move || {
         let result = (|| -> anyhow::Result<String> {
@@ -136,6 +138,9 @@ async fn apply_file_operation_inner(
                 !cancellation.is_cancelled(),
                 "private file operation cancelled before start"
             );
+            if let Some(stage) = &stage {
+                stage.ensure_active()?;
+            }
             match operation {
                 NativeFileOperation::Read => {
                     const MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -164,7 +169,26 @@ async fn apply_file_operation_inner(
                         .get("content")
                         .and_then(serde_json::Value::as_str)
                         .context("missing file content")?;
-                    filesystem.write_authorized(&target, content.as_bytes())?;
+                    let admission = match (&stage, &scratch) {
+                        (Some(stage), Some(root)) => Some(stage.prepare_native_write_owned(
+                            root,
+                            target.operation_target(),
+                            content.len(),
+                            &write_owner,
+                        )?),
+                        (None, None) => None,
+                        _ => anyhow::bail!("native write lost its original scratch owner"),
+                    };
+                    let result = (|| -> anyhow::Result<()> {
+                        if let Some(admission) = &admission {
+                            admission.check()?;
+                        }
+                        filesystem.write_authorized(&target, content.as_bytes())
+                    })();
+                    if let Some(admission) = admission {
+                        admission.finish();
+                    }
+                    result?;
                     Ok(format!(
                         "Written {} bytes to {path} in your private file space",
                         content.len()
@@ -183,7 +207,17 @@ async fn apply_file_operation_inner(
                         .get("replace_all")
                         .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false);
-                    let count = filesystem.edit_authorized(&target, old, new, all)?;
+                    let count = match (&stage, &scratch) {
+                        (Some(stage), Some(root)) => {
+                            filesystem.edit_authorized_with_admission(&target, old, new, all, |bytes| {
+                                stage
+                                    .prepare_native_write_owned(root, target.operation_target(), bytes, &write_owner)
+                                    .map(Some)
+                            })?
+                        }
+                        (None, None) => filesystem.edit_authorized(&target, old, new, all)?,
+                        _ => anyhow::bail!("native edit lost its original scratch owner"),
+                    };
                     Ok(format!(
                         "Applied {count} replacements to {path} in your private file space"
                     ))

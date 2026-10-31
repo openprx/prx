@@ -49,6 +49,35 @@ pub(crate) async fn run_quiet(
         .await
 }
 
+/// A controlled case carries its native filesystem capability explicitly
+/// through bootstrap, never in Config or model input.
+pub(crate) async fn run_quiet_controlled(
+    config: Config,
+    message: String,
+    temperature: f64,
+    shutdown: CancellationToken,
+    scope: Arc<crate::runtime::h2_entry::ControlledCaseScope>,
+) -> anyhow::Result<String> {
+    QUIET_SINGLE_SHOT
+        .scope(
+            true,
+            Box::pin(run_with_runtime_envelope(
+                crate::runtime::bootstrap::AgentRuntimeConfig::ControlledCase {
+                    config: Box::new(config),
+                    scope,
+                },
+                Some(message),
+                None,
+                None,
+                temperature,
+                shutdown,
+                None,
+                None,
+            )),
+        )
+        .await
+}
+
 pub async fn run(
     config: Config,
     message: Option<String>,
@@ -1960,6 +1989,9 @@ pub(crate) async fn run_with_runtime_envelope(
                             || crate::tools::ToolExecutionContext::new(envelope, "private"),
                             |source| source.execution.clone(),
                         );
+                    }
+                    if let Some(case) = &ctx.controlled_case {
+                        case.apply(&mut adapter.tool_execution_context)?;
                     }
                     adapter.provider_trace = Some(Arc::clone(&retained_provider_trace));
                     adapter

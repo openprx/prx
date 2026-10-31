@@ -1,3 +1,4 @@
+mod h2;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier};
 use crate::config::Config;
 use crate::runtime::RuntimeAdapter;
@@ -511,6 +512,7 @@ pub(crate) const LIFECYCLE_OPERATOR_ONLY: [&str; 8] = [
 ];
 
 pub struct SkillsManageTool {
+    controlled: Option<Arc<crate::runtime::h2_entry::ControlledH2Profile>>,
     execution_schema: std::sync::OnceLock<Arc<serde_json::Value>>,
     workspace_dir: PathBuf,
     config: Config,
@@ -527,6 +529,7 @@ impl SkillsManageTool {
             config,
             security,
             lifecycle: None,
+            controlled: None,
             execution_schema: std::sync::OnceLock::new(),
         }
     }
@@ -557,7 +560,18 @@ impl SkillsManageTool {
         self
     }
 
+    pub(crate) fn with_controlled_profile(
+        mut self,
+        profile: Arc<crate::runtime::h2_entry::ControlledH2Profile>,
+    ) -> Self {
+        self.controlled = Some(profile);
+        self.execution_schema.take();
+        self
+    }
     fn lifecycle_actions(&self) -> Vec<&'static str> {
+        if self.controlled.is_some() {
+            return h2::ACTIONS.to_vec();
+        }
         if self.lifecycle.is_some() {
             LIFECYCLE_READ_ACTIONS
                 .iter()
@@ -827,10 +841,12 @@ impl SkillsManageTool {
                 let mut actions = vec![
                     "create", "install", "update", "enable", "disable", "validate", "sync", "remove",
                 ];
+                if self.controlled.is_some() {actions.clear();}
                 let lifecycle = self.lifecycle_actions();
                 actions.extend(lifecycle.iter().copied());
                 let mut action_description = "Skill action: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, 'remove' deletes one".to_string();
-                if !lifecycle.is_empty() {
+                if self.controlled.is_some() {action_description="Controlled instruction experiment intents. Exact source, decision approval, immutable admission and resource accounting are enforced by the runtime and lifecycle service.".into();}
+                else if !lifecycle.is_empty() {
                     action_description.push_str(", 'lifecycle_status' reports the lifecycle mode and proposal counts, 'lifecycle_list' lists proposals, 'lifecycle_inspect' shows one proposal, 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes a proposal, 'lifecycle_rollback' re-activates an earlier revision, 'lifecycle_import_executable' publishes a reviewed executable bundle");
                 }
                 let mut schema = json!({
@@ -852,6 +868,7 @@ impl SkillsManageTool {
                 if !lifecycle.is_empty()
                     && let Some(properties) = schema.get_mut("properties").and_then(serde_json::Value::as_object_mut)
                 {
+                    if self.controlled.is_some() {properties.insert("request".into(),json!({"type":"object","description":"Exact typed experiment intent; conveys no entry authority"}));}
                     properties.insert("proposal_id".to_string(), json!({"type": "string", "description": "Lifecycle proposal id; required for 'lifecycle_inspect', 'lifecycle_publish' and 'lifecycle_cancel'"}));
                     properties.insert("skill_id".to_string(), json!({"type": "string", "description": "Lifecycle skill id; optional filter for 'lifecycle_list', required for 'lifecycle_rollback'"}));
                     properties.insert("revision_id".to_string(), json!({"type": "string", "description": "An earlier published revision id, required for 'lifecycle_rollback'; for 'lifecycle_import_executable' the complete bundle hash the operator reviewed"}));
@@ -915,6 +932,14 @@ impl SkillsManageTool {
                         },
                     ]);
                 }
+                if self.controlled.is_some() {
+                    if let Some(properties)=schema.get_mut("properties").and_then(serde_json::Value::as_object_mut) {
+                        properties.retain(|key,_|matches!(key.as_str(),"action"|"request"));
+                    }
+                    requirements=h2::ACTIONS.iter().map(|action|crate::tools::schema::ActionRequirement {
+                        action:*action,required:&["request"],
+                    }).collect();
+                }
                 crate::tools::schema::with_action_requirements(schema, "action", &requirements)
             })
         })
@@ -945,7 +970,7 @@ impl Tool for SkillsManageTool {
 
     fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![self.spec()];
-        if self.lifecycle.is_some() {
+        if self.lifecycle.is_some() && self.controlled.is_none() {
             specs.extend(LIFECYCLE_READ_ACTIONS.into_iter().map(|action| {
                 let mut properties = serde_json::Map::from_iter([("action".into(), json!({"type":"string","enum":[action]}))]);
                 let mut required = vec!["action"];
@@ -1000,6 +1025,13 @@ impl SkillsManageTool {
     async fn execute_request(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
         crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let action = Self::required_string(&args, "action")?;
+        if let Some(profile) = &self.controlled {
+            profile.verify(&self.config)?;
+            crate::runtime::h2_entry::EntryAction::parse(action)?;
+        }
+        if action.starts_with("lifecycle_experiment_") {
+            return self.execute_h2(action, &args).await;
+        }
         if crate::tools::execution::scope_requires_owner_match(&args)
             && !matches!(
                 action,

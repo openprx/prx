@@ -442,6 +442,8 @@ impl TurnDecisionService {
             self.bind_execution(proof, context, execution_context, &selected.specs)?;
         execution_context.schema_dialect = dialect;
         execution_context.decision_approval = None;
+        execution_context.h2_origin = proof.h2_entry_origin().cloned();
+        execution_context.h2_review = self.resume_local_owner_review(context, proof)?;
         execution_context.decision_resume = Some(crate::tools::capability::execution_binding::DecisionResumePort::new(
             Arc::new(super::pending_approval::ExecutionResumeAdapter::new(
                 Arc::clone(self),
@@ -564,6 +566,12 @@ impl TurnDecisionService {
         self.verify_console_filesystem_context(proof, context)?;
         let mut execution_context = execution_context.clone();
         execution_context.owner_filesystem = context.owner_filesystem.clone();
+        execution_context.h2_origin = proof.h2_entry_origin().cloned();
+        if let Some(case) = execution_context.controlled_case.clone() {
+            case.verify_config(&self.generation.effective)?;
+            case.apply(&mut execution_context)?;
+        }
+
         execution_context.capability_search = bindings
             .contains_key("capability_search")
             .then(|| self.capability_search_port(proof, context))
@@ -595,6 +603,7 @@ impl TurnDecisionService {
         execution_context.decision_approval =
             Some(crate::tools::capability::execution_binding::DecisionApprovalPort::new(
                 Arc::new(super::pending_approval::ExecutionApprovalRecorder {
+                    h2_origin: proof.h2_entry_origin().cloned(),
                     service: Arc::clone(self),
                     context: Arc::clone(context),
                 }),

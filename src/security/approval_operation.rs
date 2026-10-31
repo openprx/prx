@@ -211,7 +211,23 @@ struct LifecycleAction {
 fn skills_manage_lifecycle_action(args: &serde_json::Value) -> Option<LifecycleAction> {
     use crate::acl::approval_grant::RiskLevel;
     let arg = |name: &str| args.get(name).and_then(serde_json::Value::as_str).map(str::trim);
-    match arg("action")? {
+    let name = arg("action")?;
+    if let Ok(action) = crate::runtime::h2_entry::EntryAction::parse(name) {
+        let read_only = matches!(
+            action,
+            crate::runtime::h2_entry::EntryAction::Plan
+                | crate::runtime::h2_entry::EntryAction::Inspect
+                | crate::runtime::h2_entry::EntryAction::Lessons
+        );
+        return Some(LifecycleAction {
+            operation: crate::runtime::h2_entry::arguments_digest(args)
+                .ok()
+                .map(|digest| format!("skills_manage:{name}:{digest}")),
+            risk: if read_only { RiskLevel::Low } else { RiskLevel::High },
+            grant_bound: !read_only,
+        });
+    }
+    match name {
         "lifecycle_publish" => Some(LifecycleAction {
             operation: arg("proposal_id").map(|proposal| format!("skills_manage:lifecycle_publish:{proposal}")),
             risk: RiskLevel::High,
@@ -263,8 +279,20 @@ fn skills_manage_lifecycle_operation(
 
 /// The `skills_manage` actions the tool accepts only under a grant bound to
 /// their target. A unit test pins this list to the table above.
-pub(crate) const SKILLS_MANAGE_GRANT_BOUND_ACTIONS: [&str; 3] =
-    ["lifecycle_publish", "lifecycle_rollback", "lifecycle_import_executable"];
+pub(crate) const SKILLS_MANAGE_GRANT_BOUND_ACTIONS: [&str; 12] = [
+    "lifecycle_publish",
+    "lifecycle_rollback",
+    "lifecycle_import_executable",
+    "lifecycle_experiment_admit",
+    "lifecycle_experiment_run",
+    "lifecycle_experiment_cancel",
+    "lifecycle_experiment_recover",
+    "lifecycle_experiment_review",
+    "lifecycle_experiment_publish",
+    "lifecycle_experiment_annotate",
+    "lifecycle_experiment_rollback",
+    "lifecycle_experiment_retire",
+];
 
 /// True when the call can only succeed with its own human approval: the tool
 /// itself demands a signed one-shot grant bound to the exact target, at every

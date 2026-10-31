@@ -59,6 +59,7 @@ pub(super) fn session_tools(
     startup_connection: providers::ProviderConnection<'_>,
     provider_runtime_options: &providers::ProviderRuntimeOptions,
     mut base_tools_vec: Vec<Box<dyn Tool>>,
+    controlled: Option<&Arc<crate::runtime::h2_entry::ControlledH2Profile>>,
 ) -> Result<(
     mpsc::Receiver<crate::chat::sessions::SessionEvent>,
     crate::chat::sessions::SessionEventSink,
@@ -136,48 +137,50 @@ pub(super) fn session_tools(
     .with_event_recording(config.memory.event_recording_config())
     .with_event_sink(session_event_sink.into_spawn_sink())
     .with_approval_resolver_factory(approval_resolver_factory)
-    .with_process_recovery(config.causal_tree.enabled)?;
+    .with_process_recovery(controlled.is_none() && config.causal_tree.enabled)?;
     let spawn_tools_handle = spawn_tool.tools_handle();
     let scheduled_input_handle = crate::chat::scheduled_input::ScheduledInputHandle::default();
 
-    // Sibling tools share the same single-source registry (only the v1a four;
-    // `subagents`/`sessions_history` are intentionally not registered in chat —
-    // see plan §C.0 blocker 4).
-    base_tools_vec.push(Box::new(
-        crate::tools::SessionsListTool::new(Arc::clone(&active_runs))
-            .with_shared_memory(Arc::clone(mem), sessions_workspace_id.clone()),
-    ));
-    base_tools_vec.push(Box::new(
-        crate::tools::SessionsSendTool::with_security(Arc::clone(&active_runs), security.clone())
-            .with_shared_memory(Arc::clone(mem))
-            .with_event_recording(config.memory.event_recording_config()),
-    ));
-    base_tools_vec.push(Box::new(
-        crate::tools::SessionStatusTool::new(
-            Arc::clone(&active_runs),
-            provider_name,
-            model_name,
-            vec![terminal.name().to_string()],
-        )
-        .with_shared_memory(Arc::clone(mem), sessions_workspace_id),
-    ));
-    base_tools_vec.push(Box::new(spawn_tool));
-    base_tools_vec.push(Box::new(crate::chat::managed_session::ManagedSessionTool::new(
-        config.workspace_dir.clone(),
-        managed_shell_registry,
-        shell_event_sink.clone(),
-    )));
-    base_tools_vec.push(Box::new(crate::chat::scheduled_input::ScheduledInputTool::new(
-        scheduled_input_handle.clone(),
-    )));
-    // Outbound IM. This process owns no channel object on purpose — a second
-    // listener would race the daemon for inbound messages — so `message_send`
-    // here is the variant that asks the daemon to deliver. Same tool name, same
-    // schema as the daemon's, so a model writes the same call either side.
-    base_tools_vec.push(Box::new(crate::tools::DaemonMessageSendTool::from_config(
-        config,
-        security.clone(),
-    )));
+    if controlled.is_none() {
+        // Sibling tools share the same single-source registry (only the v1a four;
+        // `subagents`/`sessions_history` are intentionally not registered in chat —
+        // see plan §C.0 blocker 4).
+        base_tools_vec.push(Box::new(
+            crate::tools::SessionsListTool::new(Arc::clone(&active_runs))
+                .with_shared_memory(Arc::clone(mem), sessions_workspace_id.clone()),
+        ));
+        base_tools_vec.push(Box::new(
+            crate::tools::SessionsSendTool::with_security(Arc::clone(&active_runs), security.clone())
+                .with_shared_memory(Arc::clone(mem))
+                .with_event_recording(config.memory.event_recording_config()),
+        ));
+        base_tools_vec.push(Box::new(
+            crate::tools::SessionStatusTool::new(
+                Arc::clone(&active_runs),
+                provider_name,
+                model_name,
+                vec![terminal.name().to_string()],
+            )
+            .with_shared_memory(Arc::clone(mem), sessions_workspace_id),
+        ));
+        base_tools_vec.push(Box::new(spawn_tool));
+        base_tools_vec.push(Box::new(crate::chat::managed_session::ManagedSessionTool::new(
+            config.workspace_dir.clone(),
+            managed_shell_registry,
+            shell_event_sink.clone(),
+        )));
+        base_tools_vec.push(Box::new(crate::chat::scheduled_input::ScheduledInputTool::new(
+            scheduled_input_handle.clone(),
+        )));
+        // Outbound IM. This process owns no channel object on purpose — a second
+        // listener would race the daemon for inbound messages — so `message_send`
+        // here is the variant that asks the daemon to deliver. Same tool name, same
+        // schema as the daemon's, so a model writes the same call either side.
+        base_tools_vec.push(Box::new(crate::tools::DaemonMessageSendTool::from_config(
+            config,
+            security.clone(),
+        )));
+    }
 
     // Wrap the now-complete registry in `Arc`, then inject it back into
     // sessions_spawn's tools OnceLock so spawned sub-agents can use the full tool
@@ -426,9 +429,10 @@ pub(super) fn initial_snapshot_channel(
 #[cfg(feature = "terminal-tui")]
 pub(super) async fn terminal_input(
     plain_mode: bool,
+    mut producer: Option<crate::runtime::h2_entry::TerminalInputProducer>,
     ui_startup: &ChatStartupUi<'_>,
     terminal: &Arc<TerminalChannel>,
-    input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    input_tx: crate::runtime::h2_entry::ChatInputSender,
     control_tx: &mpsc::Sender<ChatControlEvent>,
     chat_mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
     shutdown: &CancellationToken,
@@ -518,6 +522,7 @@ pub(super) async fn terminal_input(
                 // chat_mirror.lock() on the render path.
                 spawn_tui_unified_loop(
                     input_tx,
+                    producer.take(),
                     control_tx.clone(),
                     Arc::clone(chat_mirror),
                     redraw_rx,
@@ -533,6 +538,12 @@ pub(super) async fn terminal_input(
                 (Some(guard), Some(redraw_tx_main))
             }
             Err(e) => {
+                if let Some(producer) = producer.take() {
+                    producer.profile().revoke();
+                    shutdown.cancel();
+                    tracing::error!("controlled terminal reader unavailable: {e}");
+                    return (None, None);
+                }
                 tracing::warn!(error = %e, "TerminalGuard::enter failed; falling back to reedline input");
                 // On guard failure the banner has not been printed yet
                 // and we are about to use the legacy non-TUI path, so
@@ -540,7 +551,10 @@ pub(super) async fn terminal_input(
                 println!("{banner}");
                 let terminal_for_listen = TerminalChannel::new(plain_mode);
                 tokio::spawn(async move {
-                    if let Err(e) = terminal_for_listen.listen(input_tx).await {
+                    if let Err(e) = terminal_for_listen
+                        .listen_input_sink(crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx))
+                        .await
+                    {
                         tracing::error!("Terminal input loop error: {e}");
                     }
                 });
@@ -548,6 +562,11 @@ pub(super) async fn terminal_input(
             }
         }
     } else {
+        if let Some(producer) = producer.take() {
+            producer.profile().revoke();
+            shutdown.cancel();
+            return (None, None);
+        }
         // Fallback path (PRX_TUI=0 opt-out, or non-TTY pipe/heredoc) — keep
         // the legacy reedline + BufRead fallback via TerminalChannel and
         // print the banner the old way for parity with the previous
@@ -555,7 +574,10 @@ pub(super) async fn terminal_input(
         println!("{banner}");
         let terminal_for_listen = TerminalChannel::new(plain_mode);
         tokio::spawn(async move {
-            if let Err(e) = terminal_for_listen.listen(input_tx).await {
+            if let Err(e) = terminal_for_listen
+                .listen_input_sink(crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx))
+                .await
+            {
                 tracing::error!("Terminal input loop error: {e}");
             }
         });

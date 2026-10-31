@@ -671,6 +671,9 @@ impl ConfigTransactions {
         actor: ConfigActor,
         options: ApplyOptions<'_>,
     ) -> Result<ConfigTransactionOutcome, ConfigTransactionError> {
+        self.shared
+            .ensure_runtime_writable()
+            .map_err(ConfigTransactionError::Failed)?;
         let expected = options
             .expected_revision
             .map(str::to_string)

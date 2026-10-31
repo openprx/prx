@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -34,6 +35,7 @@ const CANCEL_GRACE: Duration = Duration::from_secs(20);
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024;
 const MAX_EXPERIENCES: usize = 16;
 
+mod controlled;
 mod owned;
 
 /// The workspace whose cost ledger and limits the evaluation spends against.
@@ -65,6 +67,7 @@ pub struct AgentCaseExecutor {
     scratch_root: PathBuf,
     temperature: f64,
     accounting: AccountingOwner,
+    controlled: Option<Arc<controlled::ControlledCasePolicy>>,
 }
 
 impl AgentCaseExecutor {
@@ -78,7 +81,26 @@ impl AgentCaseExecutor {
             scratch_root,
             temperature,
             accounting,
+            controlled: None,
         }
+    }
+
+    /// An actual admitted stage and cleanup owner are mandatory. The caller
+    /// supplies no trusted profile, physical scope or file authority.
+    pub fn new_controlled(
+        template: Config,
+        scratch_root: PathBuf,
+        temperature: f64,
+        accounting: AccountingOwner,
+    ) -> Result<Self, EvaluationError> {
+        let controlled = controlled::ControlledCasePolicy::capture(&template, &accounting.workspace_dir)?;
+        Ok(Self {
+            template,
+            scratch_root,
+            temperature,
+            accounting,
+            controlled: Some(Arc::new(controlled)),
+        })
     }
 
     fn tracker(&self) -> Result<std::sync::Arc<crate::cost::tracker::CostTracker>, EvaluationError> {
@@ -209,16 +231,29 @@ impl AgentCaseExecutor {
     /// it. The models come from the run's own cost ledger, so a fallback or
     /// route that served a different model changes the binding.
     pub(super) fn environment_hash(config: &Config, request: &ExecutionRequest<'_>, models_used: &[String]) -> String {
+        Self::environment_hash_with_root(config, request, models_used, None)
+    }
+    fn environment_hash_with_root(
+        config: &Config,
+        request: &ExecutionRequest<'_>,
+        models_used: &[String],
+        case_root: Option<&Path>,
+    ) -> String {
         let mut include = config.tool_tiering.always_include.clone();
         include.sort();
         let mut exclude = config.tool_tiering.always_exclude.clone();
         exclude.sort();
         let routes = serde_json::to_string(&config.model_routes).unwrap_or_default();
         // The policy names the run's own workspace; the binding must not.
-        let policy = serde_json::to_string(&config.autonomy)
-            .unwrap_or_default()
-            .replace(config.workspace_dir.to_string_lossy().as_ref(), "<workspace>");
-        let binding = serde_json::json!({
+        let policy = serde_json::to_string(&config.autonomy).unwrap_or_default();
+        // Normalize only this executor-created random container. State and DATA
+        // siblings keep their relative names; real policy differences remain.
+        let policy = case_root.map_or_else(
+            || policy.clone(),
+            |root| policy.replace(root.to_string_lossy().as_ref(), "<case-container>"),
+        );
+        let policy = policy.replace(config.workspace_dir.to_string_lossy().as_ref(), "<workspace>");
+        let mut binding = serde_json::json!({
             "provider": config.default_provider,
             "model": config.default_model,
             "temperature": config.default_temperature,
@@ -230,6 +265,14 @@ impl AgentCaseExecutor {
             "tools_withheld": exclude,
             "models_used": models_used,
         });
+        if case_root.is_some()
+            && let Some(binding) = binding.as_object_mut()
+        {
+            binding.insert(
+                "native_case_data_policy".into(),
+                serde_json::json!("owner-filesystem-v1"),
+            );
+        }
         let mut hasher = Sha256::new();
         hasher.update(b"prx-skill-eval-environment\0");
         hasher.update(binding.to_string().as_bytes());
@@ -487,6 +530,9 @@ impl AgentCaseExecutor {
         request: &ExecutionRequest<'_>,
         cancel: &CancellationToken,
     ) -> Result<RunObservation, EvaluationError> {
+        if let Some(controlled) = &self.controlled {
+            controlled.verify()?;
+        }
         self.admit_spend()?;
         let experiment = crate::runtime::experiment_stage::current();
         let before = experiment
@@ -524,8 +570,14 @@ impl AgentCaseExecutor {
             .prefix("prx-skill-eval-")
             .tempdir_in(&self.scratch_root)
             .map_err(|e| io_error(&self.scratch_root, e))?;
-        let workspace = scratch.path().canonicalize().map_err(|e| io_error(scratch.path(), e))?;
-        write_fixtures(&workspace, request.fixtures)?;
+        let container = scratch.path().canonicalize().map_err(|e| io_error(scratch.path(), e))?;
+        let workspace = if self.controlled.is_some() {
+            let state = container.join("runtime-state");
+            fs::create_dir(&state).map_err(|e| io_error(&state, e))?;
+            state
+        } else {
+            container.clone()
+        };
         let run_config = self.run_config(&workspace, request)?;
         let owner_id = crate::runtime::envelope::RuntimeEnvelope::agent(
             run_config.workspace_dir.to_string_lossy(),
@@ -533,6 +585,22 @@ impl AgentCaseExecutor {
         )
         .resolved_owner_id();
         let owner = OwnerScope::new(&owner_id)?;
+        let controlled_scope = if self.controlled.is_some() {
+            let private = container.join("case-data");
+            fs::create_dir(&private).map_err(|e| io_error(&private, e))?;
+            Some(
+                crate::runtime::h2_entry::ControlledCaseScope::create(&private, &workspace, &owner_id)
+                    .map_err(|e| EvaluationError::Executor(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let data_root = controlled_scope
+            .as_ref()
+            .map_or(workspace.as_path(), |scope| scope.data_root())
+            .to_path_buf();
+        fs::create_dir_all(&data_root).map_err(|e| io_error(&data_root, e))?;
+        write_fixtures(&data_root, request.fixtures)?;
 
         let installed = match request.skill {
             Some(InstallSkill { skill_id, bundle }) => {
@@ -551,17 +619,28 @@ impl AgentCaseExecutor {
             .as_ref()
             .map(|stage| {
                 stage
-                    .register_scratch(&workspace, scratch_bytes(&workspace)?)
+                    .register_scratch(&container, scratch_bytes(&container)?)
                     .map_err(|error| EvaluationError::Executor(error.to_string()))
             })
             .transpose()?;
         let token = cancel.child_token();
-        let mut run = Box::pin(crate::agent::entry::run_quiet(
-            run_config.clone(),
-            request.prompt.to_string(),
-            self.temperature,
-            token.clone(),
-        ));
+        let mut run: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>> =
+            if let Some(scope) = controlled_scope {
+                Box::pin(crate::agent::entry::run_quiet_controlled(
+                    run_config.clone(),
+                    request.prompt.into(),
+                    self.temperature,
+                    token.clone(),
+                    scope,
+                ))
+            } else {
+                Box::pin(crate::agent::entry::run_quiet(
+                    run_config.clone(),
+                    request.prompt.into(),
+                    self.temperature,
+                    token.clone(),
+                ))
+            };
         let mut cleanup_unconfirmed = false;
         let (terminal, response) = match tokio::time::timeout(request.deadline, &mut run).await {
             Ok(Ok(text)) => (RunTerminal::Completed, text),
@@ -612,7 +691,7 @@ impl AgentCaseExecutor {
                 .await
                 .map_err(|e| EvaluationError::Executor(format!("experience read task failed: {e}")))??
         };
-        let artifacts = collect_artifacts(&workspace, request.collect_artifacts);
+        let artifacts = collect_artifacts(&data_root, request.collect_artifacts);
         let usage = if let (Some(stage), Some(before)) = (experiment.as_ref(), before) {
             stage
                 .flush()
@@ -645,7 +724,7 @@ impl AgentCaseExecutor {
         };
         if let Some(stage) = &experiment {
             stage
-                .account_scratch(scratch_bytes(&workspace)?)
+                .account_scratch(scratch_bytes(&container)?)
                 .map_err(|error| EvaluationError::Executor(error.to_string()))?;
         }
         let cleanup = match scratch.close() {
@@ -660,7 +739,11 @@ impl AgentCaseExecutor {
             terminal,
             response,
             elapsed_ms,
-            environment_hash: Self::environment_hash(&run_config, request, &usage.models),
+            environment_hash: if self.controlled.is_some() {
+                Self::environment_hash_with_root(&run_config, request, &usage.models, Some(container.as_path()))
+            } else {
+                Self::environment_hash(&run_config, request, &usage.models)
+            },
             installed,
             hydrations,
             experience_terminal,

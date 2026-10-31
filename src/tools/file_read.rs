@@ -11,12 +11,29 @@ const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 /// Read file contents with path sandboxing
 pub struct FileReadTool {
     security: Arc<SecurityPolicy>,
+    controlled_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
     acl_enabled: bool,
 }
 
 impl FileReadTool {
     pub const fn new(security: Arc<SecurityPolicy>, acl_enabled: bool) -> Self {
-        Self { security, acl_enabled }
+        Self {
+            security,
+            acl_enabled,
+            controlled_filesystem: None,
+        }
+    }
+
+    pub(crate) fn new_controlled(
+        security: Arc<SecurityPolicy>,
+        acl_enabled: bool,
+        filesystem: Arc<super::owner_filesystem::OwnerFilesystem>,
+    ) -> Self {
+        Self {
+            security,
+            acl_enabled,
+            controlled_filesystem: Some(filesystem),
+        }
     }
 
     fn is_protected_memory_markdown(&self, resolved_path: &Path) -> bool {
@@ -86,6 +103,12 @@ fn truncate_to_utf8_boundary(mut bytes: Vec<u8>, max_bytes: usize) -> Vec<u8> {
 
 impl FileReadTool {
     async fn execute_operation(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Some(expected) = &self.controlled_filesystem {
+            anyhow::ensure!(
+                super::owner_filesystem_dispatch::current().as_ref() == Some(expected),
+                "controlled file tool requires its exact data filesystem"
+            );
+        }
         if let Some(scope) = super::owner_filesystem_dispatch::current() {
             return super::owner_filesystem_dispatch::apply_file_operation(
                 scope,

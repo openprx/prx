@@ -122,6 +122,10 @@ mod sealed {
 }
 
 pub(crate) trait TurnSourceProof: sealed::Sealed + Send + Sync {
+    fn h2_entry_origin(&self) -> Option<&std::sync::Arc<super::h2_entry::VerifiedEntryOrigin>> {
+        None
+    }
+
     /// Execution isolation from the actual sealed origin, never caller arguments.
     fn owner_isolated(&self) -> bool;
     /// Only the actual authenticated owner-review ingress opts in.
@@ -252,6 +256,7 @@ impl TurnSourceProof for AgentTurnProof {
 /// from a durable child receipt and a runtime-issued parent grant.
 /// Neither fields nor deserialization can synthesize source authority.
 pub(crate) struct OwnedTurnSourceProof {
+    h2_origin: Option<std::sync::Arc<super::h2_entry::VerifiedEntryOrigin>>,
     owner_isolated: bool,
     approval_review_adapter: Option<crate::causal_tree::approval_collection::ApprovalReviewAdapter>,
     previous_segment_input: Option<String>,
@@ -347,6 +352,7 @@ impl OwnedTurnSourceProof {
         let generation = selection.generation;
         let proof = Self {
             owner_isolated: parent.owner_isolated(),
+            h2_origin: None,
             approval_review_adapter: None,
             previous_segment_input: None,
             segment_input_sequence: None,
@@ -395,6 +401,7 @@ impl OwnedTurnSourceProof {
         let generation = selection.generation;
         let proof = Self {
             owner_isolated: parent.owner_isolated(),
+            h2_origin: None,
             approval_review_adapter: None,
             previous_segment_input: None,
             segment_input_sequence: None,
@@ -470,6 +477,7 @@ impl OwnedTurnSourceProof {
         };
         Ok(Self {
             owner_isolated: parent.owner_isolated(),
+            h2_origin: None,
             approval_review_adapter: None,
             previous_segment_input: receipt.previous_segment_input().map(str::to_owned),
             segment_input_sequence: Some(event.id),
@@ -567,6 +575,7 @@ impl OwnedTurnSourceProof {
         };
         Ok(Self {
             owner_isolated: actor.envelope.owner_isolated,
+            h2_origin: None,
             approval_review_adapter: None,
             previous_segment_input: None,
             segment_input_sequence: None,
@@ -634,6 +643,7 @@ impl OwnedTurnSourceProof {
             );
         }
         let mut proof = Self::capture(self);
+        proof.h2_origin = None;
         proof.run_id = run_id.to_owned();
         proof.task_id = Some(authority.run_id().to_owned());
         proof.routing_input = input.to_owned();
@@ -686,6 +696,7 @@ impl OwnedTurnSourceProof {
             );
         }
         let mut proof = Self::capture(self);
+        proof.h2_origin = None;
         proof.run_id = run_id.to_owned();
         proof.task_id = Some(authority.run_id().to_owned());
         proof.routing_input = input.to_owned();
@@ -722,6 +733,7 @@ impl OwnedTurnSourceProof {
             );
         }
         let mut proof = Self::capture(self);
+        proof.h2_origin = None;
         proof.run_id = run_id.to_owned();
         proof.task_id = Some(self.run_id.clone());
         proof.routing_input = input.to_owned();
@@ -768,6 +780,7 @@ impl OwnedTurnSourceProof {
             );
         }
         let mut proof = Self::capture(authority);
+        proof.h2_origin = None;
         proof.run_id = run_id.to_owned();
         proof.routing_input = input.to_owned();
         proof.source_event_id = receipt.map(|receipt| receipt.event().event_id.clone());
@@ -782,6 +795,7 @@ impl OwnedTurnSourceProof {
     pub(crate) fn capture(proof: &dyn TurnSourceProof) -> Self {
         Self {
             owner_isolated: proof.owner_isolated(),
+            h2_origin: proof.h2_entry_origin().cloned(),
             approval_review_adapter: proof.approval_review_adapter(),
             previous_segment_input: None,
             segment_input_sequence: None,
@@ -816,6 +830,10 @@ impl OwnedTurnSourceProof {
 }
 
 impl TurnSourceProof for OwnedTurnSourceProof {
+    fn h2_entry_origin(&self) -> Option<&std::sync::Arc<super::h2_entry::VerifiedEntryOrigin>> {
+        self.h2_origin.as_ref()
+    }
+
     fn owner_isolated(&self) -> bool {
         self.owner_isolated
     }
