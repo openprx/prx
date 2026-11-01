@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** a `[causal_tree]` section without `schema_version` that holds
+  nothing but `enabled = false` is now refused at load instead of being read as
+  the pre-1.7 serialized default and silently turned back on. The error names
+  the key and the replacement: write `schema_version = 2` next to
+  `enabled = false` to keep the disable, or delete the key to accept the
+  `enabled = true` default. Files saved by a current `prx` already carry
+  `schema_version`, so only hand-written or very old sections are affected.
 - **Breaking:** provider auth and API requests identify as `User-Agent: prx/<version>`.
   Provider-specific user agents (`OpenPRX/0.1`, `KimiCLI/0.77`, `QwenCode/1.0`,
   `GithubCopilot/…`) are no longer sent.
@@ -46,6 +53,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Previous defaults `gpt-5.6`, `kimi-k2.6`, and `mistral-large-latest` are
   deprecated; dated price changes are in the embedded catalog baseline in
   `docs/providers.md`.
+
+### Fixed
+
+- Every configuration section may now be written partially. A key an operator
+  leaves out takes the value the section's documented default already
+  produces, so `[autonomy]` with only `level`, or `[memory]` with only
+  `backend`, loads instead of failing with `missing field`. The top-level
+  scalars (`default_temperature`, `default_provider`, `default_model`) follow
+  the same rule, so an empty `config.toml` parses. Keys whose absence would
+  change the security posture still fail closed: `workspace_only` stays
+  `true`, `acknowledge_unrestricted_profile` stays `false`, and
+  `forbidden_paths` keeps the built-in denylist. See
+  [configuration](docs/configuration.md).
 
 ## [0.8.171] - 2026-10-31
 

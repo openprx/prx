@@ -82,14 +82,19 @@ pub struct Config {
     /// API key for the selected provider. No environment variable sets or
     /// overrides it; when it is unset, the key stored for the provider with
     /// `prx auth paste-token --provider <name>` is used.
+    #[serde(default)]
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
+    #[serde(default)]
     pub api_url: Option<String>,
     /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
+    #[serde(default = "default_provider_from_catalog")]
     pub default_provider: Option<String>,
     /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
+    #[serde(default = "default_model_from_catalog")]
     pub default_model: Option<String>,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
+    #[serde(default = "default_temperature")]
     pub default_temperature: f64,
 
     /// Catalog model levels and explicit parameters, keyed by canonical release ID.
@@ -394,22 +399,44 @@ redacted_debug! {
 
 // ── Config impl ──────────────────────────────────────────────────
 
+/// The catalog's default provider, or `None` when the embedded catalog cannot
+/// be read.
+///
+/// Shared by `#[serde(default)]` and `impl Default` so a `config.toml` that
+/// names no provider resolves the same one either way.
+fn default_provider_from_catalog() -> Option<String> {
+    crate::providers::catalog::ReleaseCatalog::embedded_ref()
+        .ok()
+        .map(|catalog| catalog.default_provider().to_string())
+}
+
+/// The catalog's global default model, or `None` when the embedded catalog
+/// cannot be read.
+fn default_model_from_catalog() -> Option<String> {
+    crate::providers::catalog::ReleaseCatalog::embedded_ref()
+        .ok()
+        .and_then(crate::providers::catalog::ReleaseCatalog::global_default_model)
+        .map(str::to_string)
+}
+
+/// The default sampling temperature.
+const fn default_temperature() -> f64 {
+    0.7
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = user_home_dir().unwrap_or_else(|| PathBuf::from("."));
         let openprx_dir = preferred_user_config_dir(&home);
-        let release = crate::providers::catalog::ReleaseCatalog::embedded_ref().ok();
 
         Self {
             workspace_dir: openprx_dir.join("workspace"),
             config_path: openprx_dir.join("config.toml"),
             api_key: None,
             api_url: None,
-            default_provider: release.map(|catalog| catalog.default_provider().to_string()),
-            default_model: release
-                .and_then(crate::providers::catalog::ReleaseCatalog::global_default_model)
-                .map(str::to_string),
-            default_temperature: 0.7,
+            default_provider: default_provider_from_catalog(),
+            default_model: default_model_from_catalog(),
+            default_temperature: default_temperature(),
             model_settings: Default::default(),
             providers: ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),

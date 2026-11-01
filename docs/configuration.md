@@ -15,6 +15,24 @@ loads. With no override, known Codex models now use `medium` effort instead of
 Kimi Code's temperature constraint follows its selected model, without inferring
 model support from the endpoint URL. These changes do not write configuration.
 
+## Partial Sections
+
+Every section may be written partially. A key you leave out takes the same
+value the section's documented default produces, so `[autonomy]` with only
+`level = "full"`, or `[memory]` with only `backend = "sqlite"`, loads and
+behaves exactly as if you had copied the remaining keys from the reference
+config. The same holds for the top-level scalars: a `config.toml` that names
+nothing at all parses and takes every default. The keys whose absence would
+change the security posture fail closed rather than open: `workspace_only`
+stays `true`, `acknowledge_unrestricted_profile` stays `false`, and
+`forbidden_paths` keeps the built-in denylist, so omitting them never widens
+what the agent may touch. Only a key with no safe default stays required, and
+`prx config show` names it when it is missing. One exception is refused rather
+than defaulted: a `[causal_tree]` section without `schema_version` that holds
+nothing but `enabled = false` cannot be told apart from a file an old `prx`
+wrote, so it fails at load with an error naming the key; write
+`schema_version = 2` next to it to keep the disable.
+
 ## Quick Setup
 
 ```bash

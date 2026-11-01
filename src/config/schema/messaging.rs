@@ -6,6 +6,7 @@ use super::{Deserialize, JsonSchema, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HeartbeatConfig {
     /// Interval in minutes between heartbeat pings. Default: `30`.
+    #[serde(default = "default_heartbeat_interval_minutes")]
     pub interval_minutes: u32,
     /// Inclusive active hour window `[start_hour, end_hour]` in local time.
     /// Heartbeat ticks outside this range are skipped.
@@ -19,11 +20,16 @@ pub struct HeartbeatConfig {
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
-            interval_minutes: 30,
+            interval_minutes: default_heartbeat_interval_minutes(),
             active_hours: default_heartbeat_active_hours(),
             prompt: default_heartbeat_prompt(),
         }
     }
+}
+
+/// The heartbeat interval a `[heartbeat]` section gets when it names none.
+pub(super) const fn default_heartbeat_interval_minutes() -> u32 {
+    30
 }
 
 pub(super) fn default_heartbeat_active_hours() -> Vec<u8> {
