@@ -43,6 +43,16 @@
     windowName = name;
   }
 
+  function scopeSentence(scope) {
+    if (scope === 'workspace') {
+      return t('operations.cost.scopeWorkspace');
+    }
+    if (scope === 'owner') {
+      return t('operations.cost.scopeOwner');
+    }
+    return t('operations.cost.scopeUnknown');
+  }
+
   $effect(() => {
     const ticket = ++loadGeneration;
     load(windowName, ticket);
@@ -51,7 +61,7 @@
 
 <section class="space-y-4">
   <PageHeader title={t('operations.cost.title')} description={t('operations.cost.description')} />
-  <p class="text-sm text-gray-600 dark:text-gray-300">{t('operations.cost.scopeWorkspace')}</p>
+  <p class="text-sm text-gray-600 dark:text-gray-300">{scopeSentence(report?.scope)}</p>
   <p class="text-sm text-gray-600 dark:text-gray-300">{t('operations.cost.estimates')}</p>
   <p class="text-sm text-gray-600 dark:text-gray-300">{t('operations.cost.unpriced')}</p>
   <div class="flex flex-wrap gap-2" role="group" aria-label={t('operations.cost.window')}>
@@ -73,7 +83,7 @@
   {:else}
     <dl class="grid gap-3 text-sm sm:grid-cols-2">
       <div>
-        <dt>{t('operations.cost.scopeWorkspace')}</dt>
+        <dt>{t('operations.cost.scopeLabel')}</dt>
         <dd>{report.scope ?? t('common.unknown')}</dd>
       </div>
       <div>
