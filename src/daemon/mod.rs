@@ -1746,6 +1746,7 @@ fn channels_prepares_for_field(field: &str) -> bool {
     field == "channels_config" || crate::config::generation::is_rebuild_and_swap(field)
 }
 
+#[cfg_attr(not(feature = "wasm-plugins"), allow(clippy::missing_const_for_fn))]
 fn has_supervised_channels(config: &Config) -> bool {
     let crate::config::ChannelsConfig {
         cli: _,     // `cli` is used only when running the CLI manually

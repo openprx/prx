@@ -34,6 +34,14 @@
     "data": {
       "description": "'middleware_test': the envelope passed to the stage."
     },
+    "expected_manifest_sha256": {
+      "description": "'install'/'update': manifest hash the operator reviewed. When present, it must equal the manifest bytes read in the call that records trust.",
+      "type": "string"
+    },
+    "expected_sha256": {
+      "description": "'install'/'update': component hash the operator reviewed. When present, it must equal the component bytes read in the call that records trust.",
+      "type": "string"
+    },
     "grant_permissions": {
       "description": "'install'/'update': host permissions the operator grants (must include every required permission of the plugin and only ones it declares). The approval is bound to the plugin name, WASM hash, manifest hash and this list; omitted means none.",
       "items": {

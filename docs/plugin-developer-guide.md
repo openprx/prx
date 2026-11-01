@@ -1707,11 +1707,13 @@ trust without executing guests. `prx plugin trust SOURCE --sha256 HASH
 --manifest-sha256 HASH --permission PERMISSION` previews an exact permission
 record; add `--yes` after reviewing both hashes to write it. Required permissions
 must all be named; undeclared permissions are refused. `prx plugin revoke NAME`
-also previews, and `--yes` removes standing trust. `prx plugin enable NAME`
-previews moving one disabled plugin back into the active directory; `--yes`
-performs that move and refreshes this process. Enable does not write trust and
-does not change `[plugins] enabled`. A plugin that was never disabled is not
-first-discoverable by reload. Read-only autonomy refuses these writes. These
+also previews, and `--yes` removes standing trust. `prx plugin enable NAME
+--gateway-url URL` previews a disabled-enable and does not contact the gateway.
+`--token-from-stdin --yes` posts `POST /api/plugins/NAME/enable` and reports the
+gateway's generation. Enable does not build a local runtime, does not write
+trust, and does not change `[plugins] enabled`. A name absent from the loaded
+generation is not first-discoverable by enable or reload. Read-only autonomy
+refuses before the request. These
 local commands neither download nor install bundles and do not silently mutate a
 running daemon: reload via its existing plugin API or restart the owning runtime
 to apply a trust change. Trust records remain outside the workspace; the CLI
@@ -1719,6 +1721,9 @@ cannot make a workspace-controlled trust file valid.
 
 Console install and update are one operator action. The request carries
 `source`, `sha256`, `manifest_sha256`, and `permissions`. The gateway checks
-those hashes against the source directory, then the manage tool records trust
-after the component compiles. A separate `prx plugin trust --yes` beforehand is
-not required for that route.
+those hashes against the source directory, then passes them into the manage
+tool as `expected_sha256` and `expected_manifest_sha256`. The tool checks those
+values against the bytes it reads in the call that records trust. A mismatch
+is refused, with no trust record and no `plugins/<name>`. The tool records
+trust after the component compiles. A separate `prx plugin trust --yes`
+beforehand is not required for that route.

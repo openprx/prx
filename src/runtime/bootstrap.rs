@@ -76,6 +76,7 @@ use crate::router::RouterEngine;
 /// are built by each mode. Only the read-only core lives in `AppContext`.
 pub struct AppContext {
     pub(crate) controlled_entry: Option<Arc<super::h2_entry::ControlledH2Profile>>,
+    #[cfg_attr(not(feature = "terminal-tui"), allow(dead_code))]
     pub(crate) terminal_producer: parking_lot::Mutex<Option<super::h2_entry::TerminalInputProducer>>,
     pub(crate) controlled_case: Option<Arc<super::h2_entry::ControlledCaseScope>>,
     /// Sole configuration generation owner for this process/runtime bootstrap.
