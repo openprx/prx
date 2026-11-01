@@ -11,12 +11,14 @@
 //! on logical time, so they do not sleep until that epoch.
 
 use std::future::Future;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::time::Duration;
 #[cfg(test)]
 use tokio::sync::watch;
 
@@ -168,17 +170,6 @@ pub(crate) async fn timeout_at_std<T>(deadline: Instant, call: impl Future<Outpu
     tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), call)
         .await
         .map_err(|_| ())
-}
-
-/// Waits for `call` for at most `limit`. With a clock installed, `limit` is
-/// logical time from [`now`].
-pub(crate) async fn timeout_for<T>(limit: Duration, call: impl Future<Output = T>) -> Result<T, ()> {
-    #[cfg(test)]
-    if let Some(clock) = current() {
-        let deadline = clock.instant().checked_add(limit).unwrap_or_else(|| clock.instant());
-        return clock.wait_until(deadline, call).await;
-    }
-    tokio::time::timeout(limit, call).await.map_err(|_| ())
 }
 
 /// Whether `deadline` (a tokio instant built from a decision deadline) has elapsed.

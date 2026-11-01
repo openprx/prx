@@ -143,11 +143,11 @@ async fn stage_wait<T>(
     call: impl std::future::Future<Output = T>,
 ) -> Result<T, ()> {
     if super::logical_clock::installed() {
-        let remaining = context
-            .deadline
-            .into_std()
-            .saturating_duration_since(super::logical_clock::now());
-        super::logical_clock::timeout_for(context.stage_cap.min(remaining), call).await
+        let now = super::logical_clock::now();
+        let remaining = context.deadline.into_std().saturating_duration_since(now);
+        let limit = context.stage_cap.min(remaining);
+        let deadline = now.checked_add(limit).unwrap_or(now);
+        super::logical_clock::timeout_at_std(deadline, call).await
     } else {
         tokio::time::timeout_at(stage_deadline, call).await.map_err(|_| ())
     }
