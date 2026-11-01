@@ -92,11 +92,13 @@ pub struct MemoryConfig {
     /// "sqlite" | "lucid" | "postgres" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
     /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
+    #[serde(default = "default_memory_backend")]
     pub backend: String,
     /// Backward-compatible semantic auto-promotion gate.
     ///
     /// Message events are controlled by `[memory.events]`; this controls whether
     /// eligible user messages are promoted into long-term semantic memories.
+    #[serde(default = "default_memory_auto_save")]
     pub auto_save: bool,
     /// Raw/quasi-raw message event recording controls (`[memory.events]`).
     #[serde(default)]
@@ -249,6 +251,18 @@ pub struct MemorySemanticConfig {
 pub(super) fn default_embedding_provider() -> String {
     "local".into()
 }
+
+/// The memory backend a `[memory]` section gets when it does not name one.
+pub(super) fn default_memory_backend() -> String {
+    "sqlite".into()
+}
+
+/// Whether eligible user messages are promoted into long-term semantic
+/// memory when `[memory]` does not say.
+pub(super) const fn default_memory_auto_save() -> bool {
+    true
+}
+
 pub(super) const fn default_archive_after_days() -> u32 {
     7
 }
@@ -305,8 +319,8 @@ pub(super) const fn default_lucid_failure_cooldown_ms() -> u64 {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            backend: "sqlite".into(),
-            auto_save: true,
+            backend: default_memory_backend(),
+            auto_save: default_memory_auto_save(),
             events: MemoryEventsConfig::default(),
             semantic: MemorySemanticConfig::default(),
             acl_enabled: false,

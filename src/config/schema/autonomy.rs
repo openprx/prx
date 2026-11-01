@@ -335,12 +335,24 @@ pub const DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS: u32 = 500;
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
     /// Autonomy level: `readonly` (alias `read_only`), `supervised`, or `full` (default).
+    #[serde(default)]
     pub level: AutonomyLevel,
     /// Restrict file writes and command paths to the workspace directory. Default: `true`.
+    ///
+    /// Fails closed: a `[autonomy]` section that omits this key keeps the
+    /// workspace restriction on, so a partial section can never widen the
+    /// filesystem reach by accident.
+    #[serde(default = "default_workspace_only")]
     pub workspace_only: bool,
     /// Explicit path denylist. Default includes system-critical paths.
+    ///
+    /// Fails closed: omitting the key keeps the built-in list rather than
+    /// emptying it, so a partial `[autonomy]` section never removes the
+    /// denylist.
+    #[serde(default = "default_forbidden_paths")]
     pub forbidden_paths: Vec<String>,
     /// Maximum cost per day in cents per policy. Default: `500`.
+    #[serde(default = "default_autonomy_max_cost_per_day_cents")]
     pub max_cost_per_day_cents: u32,
 
     /// Operator acknowledgement for an intentionally unrestricted profile.
@@ -357,30 +369,51 @@ impl Default for AutonomyConfig {
     fn default() -> Self {
         Self {
             level: AutonomyLevel::Full,
-            workspace_only: true,
-            forbidden_paths: vec![
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
-                "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
-            ],
-            max_cost_per_day_cents: DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS,
+            workspace_only: default_workspace_only(),
+            forbidden_paths: default_forbidden_paths(),
+            max_cost_per_day_cents: default_autonomy_max_cost_per_day_cents(),
             acknowledge_unrestricted_profile: false,
             scopes: ScopeConfig::default(),
         }
     }
+}
+
+/// Whether file writes and command paths stay inside the workspace.
+///
+/// `true` is the closed value: a `[autonomy]` section that omits the key keeps
+/// the restriction, so a partial section cannot widen the filesystem reach.
+pub(super) const fn default_workspace_only() -> bool {
+    true
+}
+
+/// The built-in path denylist.
+///
+/// Shared by `#[serde(default)]` and `impl Default` so a partial `[autonomy]`
+/// section keeps the same list a default section has, instead of an empty one.
+pub(super) fn default_forbidden_paths() -> Vec<String> {
+    vec![
+        "/etc".into(),
+        "/root".into(),
+        "/home".into(),
+        "/usr".into(),
+        "/bin".into(),
+        "/sbin".into(),
+        "/lib".into(),
+        "/opt".into(),
+        "/boot".into(),
+        "/dev".into(),
+        "/proc".into(),
+        "/sys".into(),
+        "/var".into(),
+        "/tmp".into(),
+        "~/.ssh".into(),
+        "~/.gnupg".into(),
+        "~/.aws".into(),
+        "~/.config".into(),
+    ]
+}
+
+/// The default per-policy daily cost ceiling, in cents.
+pub(super) const fn default_autonomy_max_cost_per_day_cents() -> u32 {
+    DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS
 }

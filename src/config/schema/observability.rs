@@ -6,6 +6,7 @@ use super::{Deserialize, JsonSchema, Serialize};
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ObservabilityConfig {
     /// "none" | "log" | "prometheus" | "otel"
+    #[serde(default = "default_observability_backend")]
     pub backend: String,
 
     /// OTLP endpoint (e.g. "http://localhost:4318"). Only used when backend = "otel".
@@ -20,9 +21,15 @@ pub struct ObservabilityConfig {
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
-            backend: "none".into(),
+            backend: default_observability_backend(),
             otel_endpoint: None,
             otel_service_name: None,
         }
     }
+}
+
+/// The observability backend a `[observability]` section gets when it names
+/// none: off.
+pub(super) fn default_observability_backend() -> String {
+    "none".into()
 }

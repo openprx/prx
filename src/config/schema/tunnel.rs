@@ -8,6 +8,10 @@ use super::{Deserialize, JsonSchema, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TunnelConfig {
     /// Tunnel provider: `"none"`, `"cloudflare"`, `"tailscale"`, `"ngrok"`, or `"custom"`. Default: `"none"`.
+    ///
+    /// Fails closed: a `[tunnel]` section that omits this key leaves the
+    /// gateway unexposed.
+    #[serde(default = "default_tunnel_provider")]
     pub provider: String,
 
     /// Cloudflare Tunnel configuration (used when `provider = "cloudflare"`).
@@ -30,13 +34,18 @@ pub struct TunnelConfig {
 impl Default for TunnelConfig {
     fn default() -> Self {
         Self {
-            provider: "none".into(),
+            provider: default_tunnel_provider(),
             cloudflare: None,
             tailscale: None,
             ngrok: None,
             custom: None,
         }
     }
+}
+
+/// The tunnel provider a `[tunnel]` section gets when it names none: no tunnel.
+pub(super) fn default_tunnel_provider() -> String {
+    "none".into()
 }
 
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
