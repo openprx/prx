@@ -42,6 +42,22 @@ test('shows the reload response and the polled status fields', async () => {
   expect(screen.getByText('["channels"]')).toBeInTheDocument();
 });
 
+test('polls status when reload returns 500', async () => {
+  const error = new Error('reload failed');
+  error.status = 500;
+  api.reloadConfig.mockRejectedValue(error);
+  api.getStatus.mockResolvedValue({
+    config_reload_status: 'idle',
+    last_config_reload_failure: 'publisher rejected the plan',
+    restart_required: false
+  });
+  render(ChangesPage);
+  await fireEvent.click(await screen.findByRole('button', { name: 'Reload configuration' }));
+  expect(await screen.findByText('reload failed')).toBeInTheDocument();
+  expect(screen.getByText('publisher rejected the plan')).toBeInTheDocument();
+  expect(api.getStatus).toHaveBeenCalled();
+});
+
 test('keeps going when reload status stays in progress', async () => {
   api.reloadConfig.mockResolvedValue({ success: true, message: 'still publishing' });
   api.getStatus.mockResolvedValue({ config_reload_in_progress: true, config_reload_status: 'publishing' });

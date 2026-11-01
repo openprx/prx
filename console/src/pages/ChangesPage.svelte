@@ -120,19 +120,27 @@
     reloadError = null;
     reloadResponse = null;
     try {
-      const response = await api.reloadConfig();
-      if (generation !== reloadGeneration) return;
-      reloadResponse = response && typeof response === 'object' ? response : {};
-      for (let attempt = 0; attempt < 5; attempt += 1) {
-        const status = await api.getStatus();
+      try {
+        const response = await api.reloadConfig();
         if (generation !== reloadGeneration) return;
-        reloadStatus = status && typeof status === 'object' ? status : {};
-        if (!reloadStatus.config_reload_in_progress) break;
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        reloadResponse = response && typeof response === 'object' ? response : {};
+      } catch (error) {
+        if (generation !== reloadGeneration) return;
+        reloadError = error;
       }
-    } catch (error) {
       if (generation !== reloadGeneration) return;
-      reloadError = error;
+      try {
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          const status = await api.getStatus();
+          if (generation !== reloadGeneration) return;
+          reloadStatus = status && typeof status === 'object' ? status : {};
+          if (!reloadStatus.config_reload_in_progress) break;
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      } catch (error) {
+        if (generation !== reloadGeneration) return;
+        if (!reloadError) reloadError = error;
+      }
     } finally {
       if (generation === reloadGeneration) reloading = false;
     }

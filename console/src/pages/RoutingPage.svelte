@@ -158,8 +158,9 @@
     <StateBlock variant={loadFailureVariant(loadError)} message={loadError?.message || ''} />
   {:else if !defaults}
     <StateBlock variant="loading" message={t('common.loading')} />
-  {:else}
+  {/if}
   <PlanReview {flow} />
+  {#if defaults}
 
   <div class="space-y-3 rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
     <h3 class="text-base font-semibold">{t('routing.defaults')}</h3>

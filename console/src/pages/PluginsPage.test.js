@@ -66,11 +66,49 @@ test('shows a conflict when enable is already done', async () => {
 
 test('names the plugin and the trust consequence before removal', async () => {
   render(PluginsPage);
-  await fireEvent.click(await screen.findByRole('button', { name: 'Remove' }));
+  expect(await screen.findByRole('button', { name: 'Reload voice-talk-realtime' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Disable voice-talk-realtime' })).toBeInTheDocument();
+  await fireEvent.click(await screen.findByRole('button', { name: 'Remove voice-talk-realtime' }));
   const dialog = await screen.findByRole('dialog');
   expect(dialog).toHaveTextContent('voice-talk-realtime');
   expect(dialog).toHaveTextContent(/revokes its trust record/);
   expect(api.removePlugin).not.toHaveBeenCalled();
+});
+
+test('install stays disabled until the hashes and a permission choice are reviewed', async () => {
+  api.installPlugin.mockResolvedValue({ action: 'install', generation: 5 });
+  render(PluginsPage);
+  const source = await screen.findByLabelText('Source directory');
+  const component = screen.getByLabelText('Component SHA-256');
+  const manifest = screen.getByLabelText('Manifest SHA-256');
+  const install = screen.getByRole('button', { name: 'Install' });
+  const update = screen.getByRole('button', { name: 'Update' });
+  const hash = 'a'.repeat(64);
+  const manifestHash = 'b'.repeat(64);
+  await fireEvent.input(source, { target: { value: 'plugin-sources/voice' } });
+  expect(install).toBeDisabled();
+  expect(update).toBeDisabled();
+  await fireEvent.input(component, { target: { value: 'abcd' } });
+  await fireEvent.input(manifest, { target: { value: manifestHash } });
+  expect(install).toBeDisabled();
+  await fireEvent.input(component, { target: { value: hash } });
+  expect(install).toBeDisabled();
+  await fireEvent.click(screen.getByRole('checkbox', { name: 'Grant no permissions' }));
+  expect(install).toBeEnabled();
+  expect(update).toBeEnabled();
+  await fireEvent.click(install);
+  const dialog = await screen.findByRole('dialog');
+  expect(dialog).toHaveTextContent(hash);
+  expect(dialog).toHaveTextContent(manifestHash);
+  expect(dialog).toHaveTextContent('Grant no permissions');
+  expect(dialog).toHaveTextContent('plugin-sources/voice');
+  await fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+  expect(api.installPlugin).toHaveBeenCalledWith({
+    source: 'plugin-sources/voice',
+    sha256: hash,
+    manifest_sha256: manifestHash,
+    permissions: []
+  });
 });
 
 test('shows the feature-off note as unavailable', async () => {

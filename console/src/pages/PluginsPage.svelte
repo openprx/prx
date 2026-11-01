@@ -25,6 +25,9 @@
   let sha256 = $state('');
   let manifestSha256 = $state('');
   let permissionsText = $state('');
+  let grantNone = $state(false);
+
+  const HEX_64 = /^[0-9a-fA-F]{64}$/;
 
   function showResult(response) {
     actionResult = response && typeof response === 'object' ? response : {};
@@ -60,13 +63,29 @@
       .filter((line) => line.length > 0);
   }
 
+  const reviewReady = $derived(
+    source.trim().length > 0 &&
+      HEX_64.test(sha256.trim()) &&
+      HEX_64.test(manifestSha256.trim()) &&
+      (grantNone || permissionList().length > 0)
+  );
+
   function reviewedBody() {
     return {
       source: source.trim(),
       sha256: sha256.trim(),
       manifest_sha256: manifestSha256.trim(),
-      permissions: permissionList()
+      permissions: grantNone ? [] : permissionList()
     };
+  }
+
+  function reviewText(body) {
+    const permissions = body.permissions.length === 0 ? t('plugins.grantNone') : body.permissions.join(', ');
+    return t('plugins.reviewConsequence', {
+      sha256: body.sha256,
+      manifest: body.manifest_sha256,
+      permissions
+    });
   }
 
   async function loadPlugins() {
@@ -194,6 +213,7 @@
                 type="button"
                 onclick={() => reloadPlugin(plugin.name)}
                 disabled={reloadingName === plugin.name || acting}
+                aria-label={t('plugins.reloadNamed', { name: plugin.name })}
                 class="flex items-center gap-1 rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs text-gray-700 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
               >
                 {#if reloadingName === plugin.name}
@@ -207,6 +227,7 @@
                 type="button"
                 onclick={() => runAction(() => api.disablePlugin(plugin.name))}
                 disabled={acting}
+                aria-label={t('plugins.disableNamed', { name: plugin.name })}
                 class="rounded-lg border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-50 dark:border-gray-600"
               >
                 {t('plugins.disable')}
@@ -215,6 +236,7 @@
                 type="button"
                 onclick={() => (pending = { kind: 'remove', name: plugin.name })}
                 disabled={acting}
+                aria-label={t('plugins.removeNamed', { name: plugin.name })}
                 class="rounded-lg border border-red-500/50 px-3 py-1.5 text-xs text-red-600 disabled:opacity-50 dark:text-red-300"
               >
                 {t('plugins.remove')}
@@ -260,12 +282,16 @@
         <Field name="plugin-manifest-sha256" label={t('plugins.manifestSha256')} value={manifestSha256} onValue={(value) => (manifestSha256 = value)} />
         <div class="ui-field">
           <label for="plugin-permissions">{t('plugins.permissions')}</label>
-          <textarea id="plugin-permissions" name="permissions" rows="3" bind:value={permissionsText} class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm dark:border-gray-600 dark:bg-gray-900"></textarea>
+          <textarea id="plugin-permissions" name="permissions" rows="3" bind:value={permissionsText} disabled={grantNone} class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm disabled:opacity-50 dark:border-gray-600 dark:bg-gray-900"></textarea>
         </div>
+        <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+          <input type="checkbox" bind:checked={grantNone} />
+          {t('plugins.grantNone')}
+        </label>
         <div class="flex flex-wrap gap-2">
           <button
             type="button"
-            disabled={acting || source.trim().length === 0}
+            disabled={acting || !reviewReady}
             onclick={() => (pending = { kind: 'install', name: source.trim(), body: reviewedBody() })}
             class="rounded-lg bg-sky-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
           >
@@ -273,7 +299,7 @@
           </button>
           <button
             type="button"
-            disabled={acting || source.trim().length === 0}
+            disabled={acting || !reviewReady}
             onclick={() => (pending = { kind: 'update', name: source.trim(), body: reviewedBody() })}
             class="rounded-lg border border-gray-300 px-3 py-2 text-sm disabled:opacity-50 dark:border-gray-600"
           >
@@ -308,8 +334,8 @@
 <ConfirmDialog
   open={pending !== null}
   title={pending?.kind === 'remove' ? t('plugins.removeTitle') : pending?.kind === 'update' ? t('plugins.update') : t('plugins.install')}
-  objectName={pending?.name ?? ''}
-  consequence={pending?.kind === 'remove' ? t('plugins.removeConsequence') : pending?.kind === 'update' ? t('plugins.updateConsequence') : t('plugins.installConsequence')}
+  objectName={pending?.kind === 'remove' ? (pending?.name ?? '') : (pending?.body?.source ?? '')}
+  consequence={pending?.kind === 'remove' ? t('plugins.removeConsequence') : pending?.body ? reviewText(pending.body) : ''}
   onConfirm={confirmPending}
   onCancel={() => (pending = null)}
 />
