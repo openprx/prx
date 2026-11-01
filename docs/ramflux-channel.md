@@ -11,11 +11,11 @@ nodes, gateways, or custody. The agent-host owns those. The socket file is
 mode `0600`, owned by the same Unix user as prx. prx refuses to listen when
 the path is a symlink, the owner uid differs, or the mode is not `0600`.
 
-Default path: `$XDG_RUNTIME_DIR/prx/ramflux.sock`, or `<workspace>/ramflux.sock`
-when `XDG_RUNTIME_DIR` is unset. Override with `socket_path`. The parent
-directory must be mode `0700` and owned by this user. prx creates a missing
-parent at `0700` and refuses an existing parent that is looser. Accept checks
-the peer uid and refuses a different user.
+Default path: `<workspace>/ramflux/run/ramflux.sock`. The channel creates
+`ramflux` and `run` at mode `0700` and leaves the workspace mode alone.
+Override with `socket_path`. The socket's parent must be mode `0700` and owned
+by this user. prx refuses an existing parent that is looser. Accept uses
+`UnixStream::peer_cred` and refuses a different user.
 
 The account data key is a 32-byte DEK wrapped by the prx secret store's file
 key (`.secret_key`). It is not stored in the OS keychain or Secret Service.
@@ -48,10 +48,36 @@ prx replies `{ok, prx_version, effective_autonomy}`.
 | `full` | `full` | `full` |
 | `full` | `supervised` or not yet hello | `supervised` |
 
-Config alone never selects `full`. In `full`, tool calls run and still emit
-`tool.event`. In `supervised`, prx sends `approval.request` and waits for
-`approval.decision`. Chat text is never an approval. A decision that does not
-arrive before `expires_at_ms` is cancelled.
+Config alone never selects `full`. Chat text is never an approval. A decision
+that does not arrive before `expires_at_ms` is cancelled.
+
+Approval matrix:
+
+| prx-local decision | ramflux effective | What happens |
+| --- | --- | --- |
+| Allow | full | The tool runs. Nothing is put on the wire. |
+| Allow | supervised | The channel asks. prx sends `approval.request` and waits. |
+| Ask from prx autonomy, `requires_explicit_grant`, or a decision binding | full or supervised | The durable prx approval path records the ask. prx sends `turn.status` `awaiting_approval` with the prx approval id. The bridge does not grant it. |
+| Deny | either | The tool does not run. |
+
+A delegated tool uses the same gate as its parent run. In supervised mode it
+sends `approval.request` and blocks until the host answers.
+
+`idempotency_key` on `reply.*` is `{turn_id}:{seq}`. Replay sends the same
+body, so the key survives a reconnect. A new turn after restart uses a new
+`turn_id`.
+
+Bridge errors:
+
+| Code | Meaning |
+| --- | --- |
+| -32001 | The account is paused. |
+| -32002 | `bridge.hello` is required. |
+| -32003 | Protocol version mismatch, or the account is not authorized after removal. |
+| -32004 | A second bridge connection was rejected. |
+| -32005 | `queue_full`. The message says `queue_full depth=N`. |
+| -32006 | The peer uid was refused. |
+| -32603 | No longer used for a removed account. Removal returns -32003. |
 
 `prx channel doctor` prints the socket path, the permission check, and the
 effective mode, for example `follow_rf→supervised`.

@@ -22,7 +22,7 @@ pub enum Admission {
     /// Hold the message until the running turn finishes.
     Queued,
     /// The queue for this conversation is full. The message was not stored.
-    Rejected,
+    Rejected { depth: usize },
 }
 
 /// Queue of messages that arrived while a conversation already had a turn.
@@ -66,10 +66,13 @@ impl TurnQueue {
                 Admission::Interrupt(message)
             }
             RamfluxOnNewMessage::Queue => {
+                let active = self.running.lock().get(&id).copied().unwrap_or(0);
                 let mut queued = self.queued.lock();
                 let bucket = queued.entry(id).or_default();
-                if bucket.len() >= MAX_QUEUED {
-                    Admission::Rejected
+                if active.saturating_add(bucket.len()) >= MAX_QUEUED {
+                    Admission::Rejected {
+                        depth: active.saturating_add(bucket.len()),
+                    }
                 } else {
                     bucket.push_back(message);
                     Admission::Queued

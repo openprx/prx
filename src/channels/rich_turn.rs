@@ -236,10 +236,37 @@ fn tool_event_from_notification(
 
 impl Drop for TurnGuard {
     fn drop(&mut self) {
+        abort_budget_task(&self.turn_id);
         crate::agent::channel_approval::clear(&self.turn_id);
         if let Some(rich) = self.channel.as_rich() {
             rich.unbind_turn(&self.conversation_id, &self.turn_id);
         }
+    }
+}
+
+static BUDGET_TASKS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+static BUDGET_EXPIRED: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+pub fn remember_budget_task(turn_id: &str, task: tokio::task::JoinHandle<()>) {
+    if let Some(previous) = BUDGET_TASKS.lock().insert(turn_id.to_string(), task) {
+        previous.abort();
+    }
+}
+
+pub fn mark_budget_expired(turn_id: &str) {
+    BUDGET_EXPIRED.lock().insert(turn_id.to_string());
+}
+
+fn budget_expired(turn_id: &str) -> bool {
+    BUDGET_EXPIRED.lock().remove(turn_id)
+}
+
+fn abort_budget_task(turn_id: &str) {
+    if let Some(task) = BUDGET_TASKS.lock().remove(turn_id) {
+        task.abort();
     }
 }
 
@@ -266,6 +293,7 @@ pub async fn complete_turn(
             on: false,
         }))
         .await;
+    let awaiting = matches!(state, super::rich::TurnState::AwaitingApproval);
     let status = super::rich::TurnStatus {
         conversation_id: conversation_id.to_string(),
         turn_id: turn_id.to_string(),
@@ -278,6 +306,8 @@ pub async fn complete_turn(
         } else {
             None
         },
+        // `code` is the prx decision id for this state, and an error code otherwise.
+        approval_id: awaiting.then(|| code.to_string()),
     };
     if let Err(error) = rich.send_rich(&super::rich::RichReply::Status(status)).await {
         tracing::debug!(error = %error, "ramflux turn status was not sent");
@@ -324,7 +354,9 @@ impl Drop for StatusFallback {
         let channel = Arc::clone(&self.channel);
         let conversation_id = std::mem::take(&mut self.conversation_id);
         let turn_id = std::mem::take(&mut self.turn_id);
-        let code = if self.token.is_cancelled() {
+        let code = if budget_expired(&turn_id) {
+            "turn_timeout"
+        } else if self.token.is_cancelled() {
             "cancelled"
         } else {
             "turn_aborted"

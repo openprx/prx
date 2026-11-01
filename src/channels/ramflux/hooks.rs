@@ -6,7 +6,6 @@
 use super::Inner;
 use crate::channels::rich::{RichReply, SurfaceBlock, SurfaceOp, SurfaceReply};
 use crate::channels::traits::{ChannelMessage, ChatKind};
-use crate::providers::ChatMessage;
 
 /// Surface action and task event projected onto the existing channel message.
 pub(super) fn inbound_as_message(
@@ -34,35 +33,70 @@ pub(super) fn inbound_as_message(
     }
 }
 
-/// Fetch attachment ids named in `content`, under the configured limits.
+/// Fetch structured attachments for `message_id` and append multimodal parts.
 ///
-/// The fetched bytes are stored and not logged.
-pub(super) async fn enrich_inbound(channel: &super::RamfluxChannel, content: &str) -> String {
+/// Ids come from the inbound attachment list, never from free text. Image
+/// bytes become an `[IMAGE:data:…]` part. Text-like bytes become a named text
+/// part. Anything else is a typed stub with size and sha256.
+pub(super) async fn enrich_inbound(channel: &super::RamfluxChannel, content: &str, message_id: &str) -> String {
+    let attachments = channel.take_attachments(message_id);
+    if attachments.is_empty() {
+        return content.to_string();
+    }
     let limits = &channel.config().attachment_fetch;
-    let mut notes = Vec::new();
+    let mut parts = vec![content.to_string()];
     let mut fetched = 0u8;
-    for object_id in attachment_ids(content) {
+    for attachment in attachments {
         if fetched >= limits.max_per_turn {
-            notes.push(format!("attachment {object_id} skipped: turn limit"));
+            parts.push(format!("[attachment {} skipped: turn limit]", attachment.object_id));
             continue;
         }
         fetched = fetched.saturating_add(1);
-        match channel.fetch_attachment(&object_id, limits.max_bytes).await {
+        match channel.fetch_attachment(&attachment.object_id, limits.max_bytes).await {
             Ok(bytes) => {
-                let len = bytes.len();
-                notes.push(format!("attachment {object_id} fetched ({len} bytes)"));
+                channel.note_media(message_id, &attachment.object_id);
+                parts.push(render_attachment(&attachment, &bytes));
             }
             Err(error) => {
-                tracing::debug!(error = %error, "ramflux attachment was not fetched");
-                notes.push(format!("attachment {object_id} was not fetched"));
+                tracing::debug!(
+                    error = %error,
+                    object_len = attachment.object_id.len(),
+                    "ramflux attachment was not fetched"
+                );
+                parts.push(format!("[attachment {} was not fetched]", attachment.object_id));
             }
         }
     }
-    if notes.is_empty() {
-        content.to_string()
-    } else {
-        format!("{content}\n{}", notes.join("\n"))
+    parts.join("\n")
+}
+
+fn render_attachment(attachment: &crate::channels::rich::AttachmentRef, bytes: &[u8]) -> String {
+    let name = attachment.name.as_deref().unwrap_or(attachment.object_id.as_str());
+    let mime = attachment.mime.as_str();
+    if mime.starts_with("image/") {
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+        return format!("[IMAGE:data:{mime};base64,{encoded}]");
     }
+    if is_text_mime(mime) {
+        let text = String::from_utf8_lossy(bytes);
+        return format!("[attachment {name}]\n{text}");
+    }
+    let digest = sha256_hex(bytes);
+    format!("[attachment {name} type={mime} size={} sha256={digest}]", bytes.len())
+}
+
+fn is_text_mime(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || mime == "application/json"
+        || mime == "application/pdf"
+        || mime.ends_with("+json")
+        || mime.ends_with("/markdown")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Best-effort markdown surface. An invalid surface is skipped.
@@ -111,58 +145,78 @@ pub(super) async fn project_final_surface(
     super::outbound::send_reply(inner, &RichReply::Surface(surface)).await
 }
 
-/// Remove one message from the channel store, memory, and in-memory history.
-pub(super) async fn erase_deleted(inner: &Inner, conversation_id: &str, message_id: &str) -> Result<(), String> {
-    let account_id = inner.account_id.lock().clone().unwrap_or_default();
+/// Erase files and scoped memory rows for one message. Message-event rows are
+/// deleted by the eraser task, not here.
+pub(super) async fn erase_local(
+    inner: &Inner,
+    account_id: &str,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<(), String> {
     let persona = inner.persona.lock().clone();
-    let scope = super::accounts::memory_scope(persona.as_ref(), &account_id, conversation_id);
-    let tracked = inner.take_tracked(message_id);
+    let scope = super::accounts::memory_scope(persona.as_ref(), account_id, conversation_id);
+    let entry = super::erase_index::load(&inner.store, &inner.crypto, &account_id, conversation_id, message_id);
     super::erase::erase_message(&inner.store, &account_id, &scope, message_id).map_err(|error| error.to_string())?;
-    if let Some(tracked) = tracked.as_ref() {
-        for object_id in &tracked.objects {
-            super::erase::erase_media(&inner.store, &account_id, object_id).map_err(|error| error.to_string())?;
+    if let Some(entry) = entry {
+        for object_id in &entry.media_ids {
+            super::erase::erase_media(&inner.store, &account_id, conversation_id, object_id)
+                .map_err(|error| error.to_string())?;
         }
-        scrub_history(inner, &tracked.content);
-        let memory = inner.attached_memory.lock().clone();
-        if let Some(memory) = memory {
-            let scoped = crate::memory::encrypted_scope::create_ramflux_scoped_memory(
-                memory,
-                std::sync::Arc::clone(&inner.crypto),
-                account_id,
-                scope,
-            );
-            let _ = scoped.forget(&tracked.memory_key).await;
-            let _ = scoped.forget(&format!("convturn:{conversation_id}:{message_id}")).await;
+        prune_history(inner, &entry.history_keys);
+    }
+    super::erase_index::remove(&inner.store, &account_id, conversation_id, message_id)
+        .map_err(|error| error.to_string())?;
+    if let Some(tracked) = inner.take_tracked(message_id) {
+        for object_id in &tracked.objects {
+            super::erase::erase_media(&inner.store, &account_id, conversation_id, object_id)
+                .map_err(|error| error.to_string())?;
         }
     }
     Ok(())
 }
 
-fn scrub_history(inner: &Inner, content: &str) {
-    if content.is_empty() {
+/// Erase every indexed message in one conversation, plus its media and rows.
+pub(super) async fn erase_conversation_scope(inner: &Inner, conversation_id: &str) -> Result<(), String> {
+    let account_id = inner.account_id.lock().clone().unwrap_or_default();
+    let entries = super::erase_index::entries(&inner.store, &inner.crypto, &account_id, conversation_id);
+    for entry in &entries {
+        let account_id = inner.account_id.lock().clone().unwrap_or_default();
+        erase_local(inner, &account_id, conversation_id, &entry.message_id).await?;
+    }
+    let persona = inner.persona.lock().clone();
+    let scope = super::accounts::memory_scope(persona.as_ref(), &account_id, conversation_id);
+    super::erase::erase_conversation(&inner.store, &account_id, &scope).map_err(|error| error.to_string())?;
+    super::erase::erase_conversation(&inner.store, &account_id, conversation_id).map_err(|error| error.to_string())?;
+    let memory = inner.attached_memory.lock().clone();
+    if let Some(memory) = memory {
+        let scoped = inner.scoped_memory(memory, &account_id, conversation_id);
+        let _ = scoped.forget_key_prefix("").await;
+    }
+    Ok(())
+}
+
+fn prune_history(inner: &Inner, keys: &[String]) {
+    if keys.is_empty() {
         return;
     }
     let Some(histories) = inner.histories.lock().clone() else {
         return;
     };
     let mut histories = histories.lock();
-    for turns in histories.values_mut() {
-        turns.retain(|turn: &ChatMessage| !turn.content.contains(content));
-    }
-}
-
-fn attachment_ids(content: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    for line in content.lines() {
-        let Some(rest) = line.trim().strip_prefix("[attachment:") else {
-            continue;
-        };
-        let Some(id) = rest.strip_suffix(']') else {
-            continue;
-        };
-        if !id.is_empty() {
-            ids.push(id.to_string());
+    let mut index = inner.history_keys.lock();
+    for (session, turns) in histories.iter_mut() {
+        let recorded = index.entry(session.clone()).or_default();
+        let mut kept_turns = Vec::new();
+        let mut kept_keys = Vec::new();
+        for (offset, turn) in turns.drain(..).enumerate() {
+            let key = recorded.get(offset).cloned().unwrap_or_default();
+            if keys.iter().any(|wanted| wanted == &key) {
+                continue;
+            }
+            kept_keys.push(key);
+            kept_turns.push(turn);
         }
+        *recorded = kept_keys;
+        *turns = kept_turns;
     }
-    ids
 }

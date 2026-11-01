@@ -2717,15 +2717,24 @@ impl ToolExecutionService {
         }
         let approval_run = context.envelope.run_id.clone().unwrap_or_default();
         let approval_channel = context.envelope.channel.clone().unwrap_or_default();
-        let channel_gate = crate::agent::channel_approval::lookup_for_call(&approval_run);
-        let decision = if channel_gate.as_ref().is_some_and(|(_, force_ask)| *force_ask)
-            && decision != ToolExecutionDecision::Deny
-        {
+        let channel_gate =
+            crate::agent::channel_approval::lookup_for_call(&approval_run, context.envelope.parent_run_id.as_deref());
+        let prx_operator_ask = decision == ToolExecutionDecision::Ask;
+        let channel_policy_ask =
+            channel_gate.as_ref().is_some_and(|gate| gate.force_ask) && decision == ToolExecutionDecision::Allow;
+        let decision = if channel_policy_ask && channel_gate.as_ref().is_some_and(|gate| !gate.effective_full) {
             ToolExecutionDecision::Ask
         } else {
             decision
         };
-        if decision == ToolExecutionDecision::Ask && context.decision_resume.is_none() && channel_gate.is_some() {
+        if channel_policy_ask && channel_gate.as_ref().is_some_and(|gate| gate.effective_full) {
+            runtime_approval_granted = true;
+        }
+        if decision == ToolExecutionDecision::Ask
+            && !prx_operator_ask
+            && context.decision_resume.is_none()
+            && channel_gate.is_some()
+        {
             let resolved = crate::agent::channel_approval::resolve_tool(
                 &approval_run,
                 &descriptor.public_name,

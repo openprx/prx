@@ -48,8 +48,13 @@ pub fn erase_message(
 /// # Errors
 ///
 /// Returns [`StorageError`] when the file cannot be overwritten.
-pub fn erase_media(store: &ChannelStore, account_id: &str, object_id: &str) -> Result<bool, StorageError> {
-    let path = store.media_path(account_id, object_id);
+pub fn erase_media(
+    store: &ChannelStore,
+    account_id: &str,
+    conversation_id: &str,
+    object_id: &str,
+) -> Result<bool, StorageError> {
+    let path = store.media_path(account_id, conversation_id, object_id);
     if !path.exists() {
         return Ok(false);
     }
@@ -80,6 +85,14 @@ pub fn erase_conversation(
         .unwrap_or_else(|| store.root().to_path_buf());
     report.memory_rows = remove_tree_files(&message_dir)?;
     report.tool_events = remove_tree_files(&event_dir)?;
+    let media = store.media_path(account_id, conversation_id, "placeholder");
+    if let Some(media_dir) = media.parent() {
+        report.media_files = remove_tree_files(media_dir)?;
+    }
+    let index = store.index_path(account_id, conversation_id, "placeholder");
+    if let Some(index_dir) = index.parent() {
+        let _ = remove_tree_files(index_dir);
+    }
     let marker = store.marker_path(account_id, conversation_id);
     if marker.exists() {
         storage::secure_remove(&marker)?;

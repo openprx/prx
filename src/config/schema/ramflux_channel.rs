@@ -163,8 +163,8 @@ pub struct RamfluxAccountConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RamfluxConfig {
-    /// Unix socket path. `None` uses `$XDG_RUNTIME_DIR/prx/ramflux.sock`, or
-    /// `<workspace>/ramflux.sock` when that variable is unset.
+    /// Unix socket path. `None` uses `<workspace>/ramflux/run/ramflux.sock`.
+    /// The channel creates `ramflux` and `run` at mode `0700`.
     #[serde(default)]
     pub socket_path: Option<PathBuf>,
     #[serde(default)]
@@ -250,17 +250,12 @@ impl RamfluxConfig {
         Ok(())
     }
 
-    /// Resolve the socket path from config, `$XDG_RUNTIME_DIR`, or the workspace.
+    /// Resolve the socket path. The default is `<workspace>/ramflux/run/ramflux.sock`.
     #[must_use]
     pub fn resolve_socket_path(&self, workspace_dir: &std::path::Path) -> PathBuf {
         if let Some(path) = &self.socket_path {
             return path.clone();
         }
-        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-            if !runtime.is_empty() {
-                return PathBuf::from(runtime).join("prx").join("ramflux.sock");
-            }
-        }
-        workspace_dir.join("ramflux.sock")
+        workspace_dir.join("ramflux").join("run").join("ramflux.sock")
     }
 }

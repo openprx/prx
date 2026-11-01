@@ -147,6 +147,8 @@ pub struct TurnStatus {
     pub turn_id: String,
     pub state: TurnState,
     pub error: Option<TurnError>,
+    /// prx decision id when `state` is [`TurnState::AwaitingApproval`].
+    pub approval_id: Option<String>,
 }
 
 /// Inbound user message mapped onto the existing channel pipeline.
@@ -173,10 +175,7 @@ impl RichMessage {
             ChatRoomKind::Dm => ChatKind::Dm,
             ChatRoomKind::Group => ChatKind::Group,
         };
-        let mut content = self.text.clone();
-        for attachment in &self.attachments {
-            content.push_str(&format!("\n[attachment:{}]", attachment.object_id));
-        }
+        let content = self.text.clone();
         ChannelMessage {
             id: self.message_id.clone(),
             sender: self.sender.principal_id.clone(),
@@ -402,10 +401,16 @@ pub trait RichChannel: Channel {
         inner
     }
 
-    /// Fetch inbound attachments named in `content` and append a short note.
-    async fn enrich_inbound(&self, content: &str, _conversation_id: &str, _turn_id: &str) -> String {
+    /// Fetch inbound attachments for `message_id` and append multimodal parts.
+    async fn enrich_inbound(&self, content: &str, _conversation_id: &str, _message_id: &str) -> String {
         content.to_string()
     }
+
+    /// Record a key so a later delete can forget it. The default keeps nothing.
+    fn record_erasure(&self, _message_id: &str, _memory_key: &str, _history_key: &str) {}
+
+    /// Mark that this turn owns the queue slot admitted for `message_id`.
+    fn claim_slot(&self, _message_id: &str, _turn_id: &str) {}
 
     /// Project the final answer as one markdown surface. Invalid surfaces are skipped.
     async fn project_final_surface(&self, _conversation_id: &str, _turn_id: &str, _text: &str) -> anyhow::Result<()> {

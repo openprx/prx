@@ -53,6 +53,7 @@ pub async fn send_surface(inner: &super::Inner, surface: &SurfaceReply) -> anyho
                 code: "surface_rejected".to_string(),
                 message: error.to_string(),
             }),
+            approval_id: None,
         };
         send_status(&inner.rpc, &status).await?;
         anyhow::bail!("surface rejected: {error}");
@@ -196,6 +197,7 @@ pub async fn send_status(rpc: &RpcHub, status: &TurnStatus) -> anyhow::Result<()
         turn_id: &status.turn_id,
         state: status.state,
         error: status.error.as_ref(),
+        approval_id: status.approval_id.as_deref(),
     };
     request(rpc, protocol::METHOD_TURN_STATUS, &params).await
 }
