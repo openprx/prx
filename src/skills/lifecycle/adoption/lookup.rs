@@ -68,6 +68,16 @@ impl LookupBudget {
         })
     }
     pub fn check(&mut self) -> Result<(), LifecycleError> {
+        // A test may sleep here on the wall. The measurement below still uses
+        // the logical clock, so the sleep does not spend `elapsed_ms` while a
+        // clock is installed. Production never arms the stall.
+        #[cfg(test)]
+        {
+            let stall_ms = take_lookup_wall_stall();
+            if stall_ms > 0 {
+                std::thread::sleep(Duration::from_millis(stall_ms));
+            }
+        }
         let elapsed = crate::causal_tree::logical_clock::now().saturating_duration_since(self.started);
         self.stats.elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         if elapsed > Duration::from_millis(self.limits.elapsed_ms) {
@@ -228,6 +238,24 @@ impl SkillLifecycleStore {
             expires_at: expiry,
         })
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LOOKUP_WALL_STALL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Sleep this long on the wall inside the next [`LookupBudget::check`].
+/// One shot. The calling thread must be the thread that checks the budget.
+#[cfg(test)]
+pub(crate) fn arm_lookup_wall_stall(delay: Duration) {
+    let millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    LOOKUP_WALL_STALL.with(|slot| slot.set(millis));
+}
+
+#[cfg(test)]
+fn take_lookup_wall_stall() -> u64 {
+    LOOKUP_WALL_STALL.with(|slot| slot.replace(0))
 }
 
 #[cfg(test)]

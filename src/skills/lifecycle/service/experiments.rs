@@ -306,18 +306,29 @@ impl SkillsLifecycleService {
         let ticket = owner.register(child.clone())?;
         let service = Arc::clone(self);
         let config = config.clone();
+        // The stage worker is a new task. A test clock does not cross `spawn`,
+        // so the lesson pin check would otherwise spend wall time.
+        #[cfg(test)]
+        let inherited_clock = crate::causal_tree::logical_clock::capture();
         tokio::spawn(async move {
-            let outcome = crate::runtime::h2_entry::retain_run_continuation(
-                continuation,
-                owner.scope(service.run_experiment_stage_owned(config, id, digest, stage, operation, child)),
-            )
-            .await;
-            ticket.finish(
-                !outcome
-                    .as_ref()
-                    .is_err_and(|error| error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>()),
-            );
-            outcome
+            let run = async move {
+                let outcome = crate::runtime::h2_entry::retain_run_continuation(
+                    continuation,
+                    owner.scope(service.run_experiment_stage_owned(config, id, digest, stage, operation, child)),
+                )
+                .await;
+                ticket.finish(
+                    !outcome
+                        .as_ref()
+                        .is_err_and(|error| error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>()),
+                );
+                outcome
+            };
+            #[cfg(test)]
+            if let Some(clock) = inherited_clock {
+                return crate::causal_tree::logical_clock::scope(clock, run).await;
+            }
+            run.await
         })
         .await
         .context("experiment stage worker failed")?

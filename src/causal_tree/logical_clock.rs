@@ -124,6 +124,19 @@ where
     CLOCK.scope(clock, fut)
 }
 
+/// The clock installed on this task, if any. Spawned work does not see it
+/// until the caller passes this handle back in through [`scope`] or [`sync_scope`].
+#[cfg(test)]
+pub(crate) fn capture() -> Option<Arc<ManualClock>> {
+    current()
+}
+
+/// Runs sync work, including a `spawn_blocking` body, on `clock`.
+#[cfg(test)]
+pub(crate) fn sync_scope<R>(clock: Arc<ManualClock>, body: impl FnOnce() -> R) -> R {
+    CLOCK.sync_scope(clock, body)
+}
+
 /// `Instant::now()` when no clock is installed.
 pub(crate) fn now() -> Instant {
     #[cfg(test)]

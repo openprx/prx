@@ -144,15 +144,33 @@ impl SkillsLifecycleService {
         let cancellation = tokio_util::sync::CancellationToken::new();
         let _cancel_on_drop = cancellation.clone().drop_guard();
         let ticket = cleanup.register(cancellation.clone())?;
+        // Verification runs on the blocking pool. Re-enter the test clock there
+        // so the snapshot budget does not fall back to wall time.
+        #[cfg(test)]
+        let inherited_clock = crate::causal_tree::logical_clock::capture();
         crate::runtime::blocking::spawn_blocking(move || {
-            let result = (|| -> Result<_> {
+            let run = || -> Result<_> {
                 ensure!(!cancellation.is_cancelled(), "lesson preparation cancelled");
                 runtime.ensure_active()?;
                 let prepared = store.prepare_verified_lesson_context(&plan, binding, &user, Utc::now())?;
                 ensure!(!cancellation.is_cancelled(), "lesson preparation cancelled");
                 runtime.ensure_active()?;
                 Ok(prepared)
-            })();
+            };
+            let result = {
+                #[cfg(test)]
+                {
+                    if let Some(clock) = inherited_clock {
+                        crate::causal_tree::logical_clock::sync_scope(clock, run)
+                    } else {
+                        run()
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    run()
+                }
+            };
             // Read-only I/O has joined even when business admission refuses.
             // A panic keeps the existing cleanup owner unconfirmed.
             ticket.finish(true);

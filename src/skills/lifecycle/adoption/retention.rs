@@ -9,7 +9,7 @@ use crate::skills::lifecycle::lesson_delivery::DeliveryRetentionLimits;
 use crate::skills::lifecycle::{LifecycleError, SkillLifecycleStore};
 use std::collections::BTreeSet;
 use std::fs;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 impl SkillLifecycleStore {
     /// All returned identities are retention references, never eligibility or
@@ -27,7 +27,7 @@ impl SkillLifecycleStore {
                 DeliveryRetentionLimits {
                     max_records: usize::try_from(limits.examined).unwrap_or(64),
                     max_decoded_bytes: limits.decoded_bytes,
-                    deadline: Instant::now()
+                    deadline: crate::causal_tree::logical_clock::now()
                         .checked_add(Duration::from_millis(limits.elapsed_ms))
                         .ok_or_else(|| refusal("retention deadline overflow"))?,
                 },
