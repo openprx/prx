@@ -335,11 +335,11 @@ fn scheduling_outside_a_runtime_is_skipped_and_keeps_the_claim_free() {
 
 /// Four seconds queued, before the worker reports that it started, is outside
 /// the 3 s selection budget. The receipt is kept and nothing is marked dropped.
+/// The hold is this workspace only.
 #[tokio::test(flavor = "current_thread")]
-#[serial_test::serial(receipt_worker_hold)]
 async fn a_worker_held_four_seconds_before_start_still_records_the_selection() {
     let (tmp, store, ids) = setup();
-    let hold = crate::skills::lifecycle::receipts::ReceiptWorkerHold::before_start(4_000);
+    let hold = crate::skills::lifecycle::receipts::ReceiptWorkerHold::before_start(tmp.path(), 4_000);
     assert_eq!(schedule_selection_receipts(&request(&tmp, &ids, true, &[NAME])), 1);
     drain_background_for_test(&ids.run).await;
     drop(hold);
@@ -354,11 +354,11 @@ async fn a_worker_held_four_seconds_before_start_still_records_the_selection() {
 
 /// Time after the worker has started still counts against the 3 s budget.
 /// Sleeping 3.5 s there marks the experience as dropped evidence.
+/// The hold is this workspace only.
 #[tokio::test(flavor = "current_thread")]
-#[serial_test::serial(receipt_worker_hold)]
 async fn a_worker_held_past_the_budget_after_start_marks_dropped_evidence() {
     let (tmp, store, ids) = setup();
-    let hold = crate::skills::lifecycle::receipts::ReceiptWorkerHold::after_start(3_500);
+    let hold = crate::skills::lifecycle::receipts::ReceiptWorkerHold::after_start(tmp.path(), 3_500);
     assert_eq!(schedule_selection_receipts(&request(&tmp, &ids, true, &[NAME])), 1);
     drain_background_for_test(&ids.run).await;
     drop(hold);
@@ -385,5 +385,70 @@ async fn a_worker_held_past_the_budget_after_start_marks_dropped_evidence() {
         experience.dropped_evidence >= 1,
         "the 3 s budget must trip while the worker is held after start"
     );
+    release_task_pins(&ids.scope(), &ids.run);
+}
+
+/// The awaited terminal call-in returns inside its wall bound when the worker
+/// has not started. The hold is longer than that bound and is this workspace
+/// only. The join is still absent when the call returns.
+#[tokio::test(flavor = "current_thread")]
+async fn an_awaited_terminal_returns_when_its_worker_never_starts() {
+    let (tmp, store, ids) = setup();
+    assert_eq!(record_selected_skills(&request(&tmp, &ids, true, &[NAME])), 1);
+    let hold = crate::skills::lifecycle::receipts::ReceiptWorkerHold::before_start(tmp.path(), 4_000);
+    let started = std::time::Instant::now();
+    settle_task_terminal(
+        tmp.path(),
+        Some(ids.owner.clone()),
+        Some(ids.run.clone()),
+        "term-starved",
+        observation(TerminalKind::Completed, true),
+        None,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let experience = store
+        .read_experience(&ids.run)
+        .expect("test: read")
+        .expect("test: record");
+    assert!(
+        experience.terminal.is_none(),
+        "a worker that has not started leaves the join unrecorded"
+    );
+    let bound = crate::skills::lifecycle::receipts::TERMINAL_BUDGET
+        + crate::skills::lifecycle::receipts::TERMINAL_START_GRACE
+        + std::time::Duration::from_millis(1_000);
+    assert!(
+        elapsed < bound,
+        "awaited terminal returned in {elapsed:?}, bound is {bound:?}"
+    );
+    drop(hold);
+    let activity = crate::skills::lifecycle::receipts::lifecycle_activity();
+    let cap = tokio::time::sleep(std::time::Duration::from_secs(8));
+    tokio::pin!(cap);
+    loop {
+        if store
+            .read_experience(&ids.run)
+            .expect("test: read")
+            .and_then(|record| record.terminal)
+            .is_some()
+        {
+            break;
+        }
+        let ping = activity.notified();
+        if store
+            .read_experience(&ids.run)
+            .expect("test: read")
+            .and_then(|record| record.terminal)
+            .is_some()
+        {
+            break;
+        }
+        tokio::select! {
+            biased;
+            () = ping => {}
+            () = &mut cap => panic!("test: the released worker did not finish the join"),
+        }
+    }
     release_task_pins(&ids.scope(), &ids.run);
 }

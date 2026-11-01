@@ -343,8 +343,9 @@ async fn a_disabled_lifecycle_records_no_work_even_with_a_store_present() {
         .run_task(&config, "TASK[release] Write the release notes for build 7.")
         .await
         .expect("test: run");
-    // Any wrongly spawned receipt worker has finished before the absence check.
-    crate::skills::lifecycle::receipts::drain_all_background_for_test().await;
+    // Receipt workers are registered under this world's workspace. Drain that
+    // key before the absence check. Other tests' handles stay registered.
+    crate::skills::lifecycle::receipts::drain_background_for_workspace(&world.ws).await;
     assert!(world.experiences().is_empty(), "{:?}", world.experiences());
 }
 

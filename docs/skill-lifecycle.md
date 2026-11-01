@@ -54,11 +54,18 @@ are not rewritten just by enabling the lifecycle; unmanaged reads keep their
 existing discovery behavior until a managed binding applies.
 
 Selection, hydration and terminal **receipts** connect skill use to the actual
-task outcome. Consolidated **knowledge** references those immutable experiences
-and preserves rejected proposals. A failed task is usable proposal evidence
-only with verified adherence to the skill's declared tools, available provider
-and tool infrastructure, and no permission refusal. Unknown facts, cancelled
-or blocked tasks, and ambiguous multi-skill attribution do not justify edits.
+task outcome. The turn awaits the terminal call-in for one wall bound: 1.5 s
+plus at most 250 ms for its blocking worker to start. If that worker has not
+started, finalization logs the miss and returns, and that call leaves the
+join unrecorded. Selection receipts and restart recovery run detached. Their
+write budget starts when the worker starts, and a worker that is still queued
+after 60 s is abandoned. A detached selection that misses its 3 s write budget
+is marked as dropped evidence. Consolidated **knowledge** references those
+immutable experiences and preserves rejected proposals. A failed task is
+usable proposal evidence only with verified adherence to the skill's declared
+tools, available provider and tool infrastructure, and no permission refusal.
+Unknown facts, cancelled or blocked tasks, and ambiguous multi-skill
+attribution do not justify edits.
 See [required tools and learning evidence](skills-catalog-security.md#required-tools-and-learning-evidence).
 
 The managed-provider **proposer** stages a bounded patch to `SKILL.md`; it does

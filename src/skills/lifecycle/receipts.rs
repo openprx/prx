@@ -4,6 +4,14 @@
 //!
 //! Everything here is best effort for the turn: a capture problem is logged
 //! and never fails the turn that caused it.
+//!
+//! The awaited terminal call-in ([`settle_task_terminal`]) has one wall bound:
+//! [`TERMINAL_BUDGET`] plus [`TERMINAL_START_GRACE`]. That bound covers both
+//! the wait for a blocking worker and the capture. A worker that has not
+//! started when the bound ends leaves the join unrecorded, and the call
+//! returns. Detached selection receipts and restart recovery
+//! ([`spawn_settle_task_terminal`]) may wait up to [`WORKER_START_CAP`] for a
+//! worker. Their write budget starts when that worker starts.
 
 use super::binding::{release_task_pins, task_pin};
 use super::capture::{Correlation, ExperienceOutcome, TaskTerminal, on_task_terminal, task_key};
@@ -16,18 +24,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 
-/// How long a background receipt worker may sit queued before the write is
-/// abandoned. Queue time is not part of [`SELECTION_BUDGET`] or
+/// How long a detached receipt worker may sit queued before the write is
+/// abandoned. The awaited terminal call-in does not use this cap. Queue time
+/// on a detached worker is not part of [`SELECTION_BUDGET`] or
 /// [`TERMINAL_BUDGET`].
 const WORKER_START_CAP: Duration = Duration::from_secs(60);
 
-#[cfg(test)]
-static RECEIPT_HOLD_BEFORE_START_MS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-static RECEIPT_HOLD_AFTER_START_MS: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
+/// How the caller waits for the blocking worker.
+#[derive(Clone, Copy)]
+enum WorkerStart {
+    /// Queue time is outside `write_budget`, up to `start_cap`.
+    Detached { start_cap: Duration },
+    /// Queue time and the write share `total`. The write gets only what remains.
+    Awaited { total: Duration },
+}
 
 enum WorkerBudgetMiss {
     NeverStarted,
@@ -35,9 +45,16 @@ enum WorkerBudgetMiss {
     Failed,
 }
 
-/// Runs `work` on the blocking pool. [`SELECTION_BUDGET`] / [`TERMINAL_BUDGET`]
-/// start when the worker begins `work`, after it has left the queue.
-async fn run_bounded_blocking<T, F>(budget: Duration, work: F) -> Result<T, WorkerBudgetMiss>
+/// Runs `work` on the blocking pool.
+///
+/// `Detached` applies `write_budget` after the worker starts.
+/// `Awaited` ends the whole call at `total`, including the start wait.
+async fn run_bounded_blocking<T, F>(
+    start: WorkerStart,
+    write_budget: Duration,
+    #[cfg(test)] hold_key: String,
+    work: F,
+) -> Result<T, WorkerBudgetMiss>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -48,18 +65,27 @@ where
     let ping = Arc::clone(&notify);
     let task = tokio::task::spawn_blocking(move || {
         #[cfg(test)]
-        hold_receipt_worker(true);
+        hold_receipt_worker(&hold_key, true);
         flag.store(true, Ordering::Release);
         ping.notify_one();
         #[cfg(test)]
-        hold_receipt_worker(false);
+        hold_receipt_worker(&hold_key, false);
         work()
     });
-    if !wait_until_worker_started(&started, &notify).await {
+    let wall_start = std::time::Instant::now();
+    let start_cap = match start {
+        WorkerStart::Detached { start_cap } => start_cap,
+        WorkerStart::Awaited { total } => total,
+    };
+    if !wait_until_worker_started(&started, &notify, start_cap).await {
         task.abort();
         return Err(WorkerBudgetMiss::NeverStarted);
     }
-    match tokio::time::timeout(budget, task).await {
+    let work_budget = match start {
+        WorkerStart::Detached { .. } => write_budget,
+        WorkerStart::Awaited { total } => total.saturating_sub(wall_start.elapsed()),
+    };
+    match tokio::time::timeout(work_budget, task).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(_)) => Err(WorkerBudgetMiss::Failed),
         Err(_) => Err(WorkerBudgetMiss::Exceeded),
@@ -67,50 +93,108 @@ where
 }
 
 #[cfg(test)]
-fn hold_receipt_worker(before_start: bool) {
-    let millis = if before_start {
-        RECEIPT_HOLD_BEFORE_START_MS.load(Ordering::SeqCst)
-    } else {
-        RECEIPT_HOLD_AFTER_START_MS.load(Ordering::SeqCst)
-    };
-    if millis > 0 {
-        std::thread::sleep(Duration::from_millis(millis));
+#[derive(Default)]
+struct HoldMillis {
+    before_start: u64,
+    after_start: u64,
+}
+
+#[cfg(test)]
+static RECEIPT_HOLDS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, HoldMillis>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn workspace_hold_key(workspace: &Path) -> String {
+    workspace.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+fn hold_millis(key: &str, before_start: bool) -> u64 {
+    let holds = RECEIPT_HOLDS.lock();
+    holds
+        .get(key)
+        .map(|slot| {
+            if before_start {
+                slot.before_start
+            } else {
+                slot.after_start
+            }
+        })
+        .unwrap_or(0)
+}
+
+/// Sleeps while this workspace's hold is armed, and returns when the duration
+/// elapses or the guard clears the hold.
+#[cfg(test)]
+fn hold_receipt_worker(key: &str, before_start: bool) {
+    let total = hold_millis(key, before_start);
+    if total == 0 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_millis(total);
+    while std::time::Instant::now() < deadline {
+        if hold_millis(key, before_start) == 0 {
+            return;
+        }
+        let slice = Duration::from_millis(20).min(deadline.saturating_duration_since(std::time::Instant::now()));
+        if slice.is_zero() {
+            return;
+        }
+        std::thread::sleep(slice);
     }
 }
 
-/// Holds every receipt worker for `millis` before it reports that it started.
-/// The guard clears the hold on drop.
+/// Holds receipt workers for one workspace. Other workspaces are unaffected.
+/// The guard clears the hold on drop, which releases a worker still inside it.
 #[cfg(test)]
 pub(crate) struct ReceiptWorkerHold {
+    key: String,
     before_start: bool,
 }
 
 #[cfg(test)]
 impl ReceiptWorkerHold {
-    pub(crate) fn before_start(millis: u64) -> Self {
-        RECEIPT_HOLD_BEFORE_START_MS.store(millis, Ordering::SeqCst);
-        Self { before_start: true }
+    pub(crate) fn before_start(workspace: &Path, millis: u64) -> Self {
+        Self::arm(workspace, true, millis)
     }
 
-    pub(crate) fn after_start(millis: u64) -> Self {
-        RECEIPT_HOLD_AFTER_START_MS.store(millis, Ordering::SeqCst);
-        Self { before_start: false }
+    pub(crate) fn after_start(workspace: &Path, millis: u64) -> Self {
+        Self::arm(workspace, false, millis)
+    }
+
+    fn arm(workspace: &Path, before_start: bool, millis: u64) -> Self {
+        let key = workspace_hold_key(workspace);
+        let mut holds = RECEIPT_HOLDS.lock();
+        let slot = holds.entry(key.clone()).or_default();
+        if before_start {
+            slot.before_start = millis;
+        } else {
+            slot.after_start = millis;
+        }
+        Self { key, before_start }
     }
 }
 
 #[cfg(test)]
 impl Drop for ReceiptWorkerHold {
     fn drop(&mut self) {
+        let mut holds = RECEIPT_HOLDS.lock();
+        let Some(slot) = holds.get_mut(&self.key) else {
+            return;
+        };
         if self.before_start {
-            RECEIPT_HOLD_BEFORE_START_MS.store(0, Ordering::SeqCst);
+            slot.before_start = 0;
         } else {
-            RECEIPT_HOLD_AFTER_START_MS.store(0, Ordering::SeqCst);
+            slot.after_start = 0;
+        }
+        if slot.before_start == 0 && slot.after_start == 0 {
+            holds.remove(&self.key);
         }
     }
 }
 
-async fn wait_until_worker_started(started: &AtomicBool, notify: &Notify) -> bool {
-    let cap = tokio::time::sleep(WORKER_START_CAP);
+async fn wait_until_worker_started(started: &AtomicBool, notify: &Notify, cap: Duration) -> bool {
+    let cap = tokio::time::sleep(cap);
     tokio::pin!(cap);
     loop {
         if started.load(Ordering::Acquire) {
@@ -141,9 +225,15 @@ pub(crate) fn lifecycle_activity() -> &'static Notify {
     &LIFECYCLE_ACTIVITY
 }
 
-/// How long the terminal call-in waits for the capture (its locks are bounded
-/// to about a second on their own).
-const TERMINAL_BUDGET: Duration = Duration::from_millis(1500);
+/// How long a detached terminal capture may run once its worker has started.
+/// The awaited call-in shares one wall bound of this budget plus
+/// [`TERMINAL_START_GRACE`] for the start wait and the capture together.
+pub(crate) const TERMINAL_BUDGET: Duration = Duration::from_millis(1500);
+
+/// Extra wall time the awaited terminal call-in may spend before its worker
+/// starts. The whole call returns within [`TERMINAL_BUDGET`] plus this grace.
+/// A worker that has not started leaves the join unrecorded.
+pub(crate) const TERMINAL_START_GRACE: Duration = Duration::from_millis(250);
 
 /// The skills one turn selected and exposed, for one owner and task.
 #[derive(Clone, Copy, Debug)]
@@ -258,55 +348,75 @@ fn claim_selection(request: &SelectionRequest<'_>, name: &str) -> bool {
 }
 
 #[cfg(test)]
-static BACKGROUND: std::sync::LazyLock<parking_lot::Mutex<Vec<(String, tokio::task::JoinHandle<()>)>>> =
+struct BackgroundJob {
+    key: String,
+    workspace: String,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(test)]
+static BACKGROUND: std::sync::LazyLock<parking_lot::Mutex<Vec<BackgroundJob>>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
+
+/// Removes handles for which `pred` is true. Every other handle stays
+/// registered. The lock is held until the rest are put back.
+#[cfg(test)]
+fn take_background(mut pred: impl FnMut(&BackgroundJob) -> bool) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut pending = BACKGROUND.lock();
+    let mut kept = Vec::with_capacity(pending.len());
+    let mut mine = Vec::new();
+    for job in pending.drain(..) {
+        if pred(&job) {
+            mine.push(job.handle);
+        } else {
+            kept.push(job);
+        }
+    }
+    *pending = kept;
+    mine
+}
 
 /// Waits for the background lifecycle writes started for `key` (a run or
 /// terminal id). Test hook: production never awaits them.
 #[cfg(test)]
 pub(crate) async fn drain_background_for_test(key: &str) {
-    let handles: Vec<_> = {
-        let mut pending = BACKGROUND.lock();
-        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending).into_iter().partition(|(k, _)| k == key);
-        *pending = rest;
-        mine.into_iter().map(|(_, handle)| handle).collect()
-    };
+    let handles = take_background(|job| job.key == key);
     for handle in handles {
         let _ = handle.await;
     }
 }
 
-/// Waits for every background lifecycle write this process has tracked.
+/// Waits for the background lifecycle writes registered for `workspace`.
+/// Handles from any other workspace stay registered.
 #[cfg(test)]
-pub(crate) async fn drain_all_background_for_test() {
-    let handles: Vec<_> = {
-        let mut pending = BACKGROUND.lock();
-        std::mem::take(&mut *pending)
-            .into_iter()
-            .map(|(_, handle)| handle)
-            .collect()
-    };
+pub(crate) async fn drain_background_for_workspace(workspace: &Path) {
+    let needle = workspace_hold_key(workspace);
+    let handles = take_background(|job| job.workspace == needle);
     for handle in handles {
         let _ = handle.await;
     }
 }
 
 #[cfg(test)]
-fn track_background(key: &str, handle: tokio::task::JoinHandle<()>) {
-    BACKGROUND.lock().push((key.to_string(), handle));
+fn track_background(key: &str, workspace: &Path, handle: tokio::task::JoinHandle<()>) {
+    BACKGROUND.lock().push(BackgroundJob {
+        key: key.to_string(),
+        workspace: workspace_hold_key(workspace),
+        handle,
+    });
 }
 
 #[cfg(not(test))]
-fn track_background(_key: &str, handle: tokio::task::JoinHandle<()>) {
+fn track_background(_key: &str, _workspace: &Path, handle: tokio::task::JoinHandle<()>) {
     drop(handle);
 }
 
 /// Turn-path entry for selection receipts. Never blocks and never fails the
 /// turn: skills already claimed for this run are skipped from memory without
 /// touching the store, and the store write for the rest runs in a spawned
-/// blocking task. [`SELECTION_BUDGET`] starts when that worker begins the
-/// write; time spent queued is not part of the budget (errors are logged).
-/// Outside a tokio
+/// blocking task. The worker may sit queued for up to [`WORKER_START_CAP`].
+/// [`SELECTION_BUDGET`] starts when that worker begins the write; time spent
+/// queued is not part of the budget (errors are logged). Outside a tokio
 /// runtime the receipts are skipped with a warning. Returns how many skills
 /// were handed to the background writer.
 pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
@@ -332,23 +442,32 @@ pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
     let run = request.run_id.to_string();
     let task = request.task_id.map(str::to_string);
     let key = run.clone();
+    let tracked_workspace = workspace.clone();
     let dropped = (
         workspace.clone(),
         owner.clone(),
         task_key(request.task_id, Some(request.run_id), None),
     );
     let handle = runtime.spawn(async move {
-        let outcome = run_bounded_blocking(SELECTION_BUDGET, move || {
-            let names: Vec<&str> = fresh.iter().map(String::as_str).collect();
-            record_selected_skills(&SelectionRequest {
-                workspace_dir: &workspace,
-                enabled: true,
-                owner_id: &owner,
-                run_id: &run,
-                task_id: task.as_deref(),
-                skill_names: &names,
-            })
-        })
+        let outcome = run_bounded_blocking(
+            WorkerStart::Detached {
+                start_cap: WORKER_START_CAP,
+            },
+            SELECTION_BUDGET,
+            #[cfg(test)]
+            workspace_hold_key(&workspace),
+            move || {
+                let names: Vec<&str> = fresh.iter().map(String::as_str).collect();
+                record_selected_skills(&SelectionRequest {
+                    workspace_dir: &workspace,
+                    enabled: true,
+                    owner_id: &owner,
+                    run_id: &run,
+                    task_id: task.as_deref(),
+                    skill_names: &names,
+                })
+            },
+        )
         .await;
         match outcome {
             Ok(_) => {}
@@ -362,7 +481,7 @@ pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
             }
         }
     });
-    track_background(&key, handle);
+    track_background(&key, &tracked_workspace, handle);
     count
 }
 
@@ -383,9 +502,11 @@ fn mark_selection_dropped((workspace, owner, task): &(std::path::PathBuf, String
     }
 }
 
-/// Starts [`settle_task_terminal`] without making the caller wait for it:
-/// restart recovery must not extend its own deadline. Outside a tokio runtime
-/// it is skipped with a warning.
+/// Starts the terminal call-in without making the caller wait for it:
+/// restart recovery must not extend its own deadline. The detached worker may
+/// sit queued for up to [`WORKER_START_CAP`]; [`TERMINAL_BUDGET`] then bounds
+/// the capture alone. Outside a tokio runtime the call-in is skipped with a
+/// warning.
 pub fn spawn_settle_task_terminal(
     workspace_dir: std::path::PathBuf,
     owner: Option<String>,
@@ -398,11 +519,23 @@ pub fn spawn_settle_task_terminal(
         return;
     };
     let key = terminal_id.clone();
+    let tracked_workspace = workspace_dir.clone();
     let handle = runtime.spawn(async move {
         // Recovery has no first-hand trace, so no observations: adherence is Unknown.
-        settle_task_terminal(&workspace_dir, owner, task_key, &terminal_id, observation, None).await;
+        settle_task_terminal_with(
+            &workspace_dir,
+            owner,
+            task_key,
+            &terminal_id,
+            observation,
+            None,
+            WorkerStart::Detached {
+                start_cap: WORKER_START_CAP,
+            },
+        )
+        .await;
     });
-    track_background(&key, handle);
+    track_background(&key, &tracked_workspace, handle);
 }
 
 /// How a turn ended, as the terminal owner observed it.
@@ -451,9 +584,15 @@ impl TerminalObservation {
 
 /// Task-terminal call-in of the skill lifecycle: joins the terminal to the
 /// task's skill experience and releases the task's revision pins. Used by
-/// normal finalization and by restart recovery, so both map the same way. A
-/// silent turn is not credited (pins are released, nothing is joined).
-/// Failures and a missed time budget are logged and never fail the caller.
+/// normal finalization. Restart recovery goes through
+/// [`spawn_settle_task_terminal`], which does not hold its caller. Both map
+/// the observation the same way. A silent turn is not credited (pins are
+/// released, nothing is joined). Failures and a missed time budget are logged
+/// and never fail the caller.
+///
+/// This awaited call returns within [`TERMINAL_BUDGET`] plus
+/// [`TERMINAL_START_GRACE`]. If the worker has not started by then, the join
+/// stays unrecorded and the call returns.
 pub async fn settle_task_terminal(
     workspace_dir: &Path,
     owner: Option<String>,
@@ -461,6 +600,29 @@ pub async fn settle_task_terminal(
     terminal_id: &str,
     observation: TerminalObservation,
     observations: Option<TerminalObservations>,
+) {
+    settle_task_terminal_with(
+        workspace_dir,
+        owner,
+        task_key,
+        terminal_id,
+        observation,
+        observations,
+        WorkerStart::Awaited {
+            total: TERMINAL_BUDGET + TERMINAL_START_GRACE,
+        },
+    )
+    .await;
+}
+
+async fn settle_task_terminal_with(
+    workspace_dir: &Path,
+    owner: Option<String>,
+    task_key: Option<String>,
+    terminal_id: &str,
+    observation: TerminalObservation,
+    observations: Option<TerminalObservations>,
+    start: WorkerStart,
 ) {
     let (Some(owner), Some(task)) = (owner, task_key) else {
         return;
@@ -478,33 +640,39 @@ pub async fn settle_task_terminal(
     let root = observation.root && crate::skills::lifecycle_runtime::lifecycle_enabled_for(workspace_dir);
     let workspace = workspace_dir.to_path_buf();
     let terminal_id = terminal_id.to_string();
-    let call_in = run_bounded_blocking(TERMINAL_BUDGET, move || {
-        let Some(outcome) = outcome else {
-            release_task_pins(&owner, &task);
-            return Ok(());
-        };
-        if recovered && already_joined(&workspace, &owner, &task) {
-            release_task_pins(&owner, &task);
-            return Ok(());
-        }
-        let joined = on_task_terminal(
-            &workspace,
-            &owner,
-            &TaskTerminal {
-                task_id: &task,
-                terminal_receipt_id: &terminal_id,
-                outcome,
-                observations: observations.as_ref(),
-                root_task: root,
-            },
-        )
-        .map(|_| ());
-        if joined.is_ok() {
-            #[cfg(test)]
-            notify_lifecycle_activity();
-        }
-        joined
-    })
+    let call_in = run_bounded_blocking(
+        start,
+        TERMINAL_BUDGET,
+        #[cfg(test)]
+        workspace_hold_key(&workspace),
+        move || {
+            let Some(outcome) = outcome else {
+                release_task_pins(&owner, &task);
+                return Ok(());
+            };
+            if recovered && already_joined(&workspace, &owner, &task) {
+                release_task_pins(&owner, &task);
+                return Ok(());
+            }
+            let joined = on_task_terminal(
+                &workspace,
+                &owner,
+                &TaskTerminal {
+                    task_id: &task,
+                    terminal_receipt_id: &terminal_id,
+                    outcome,
+                    observations: observations.as_ref(),
+                    root_task: root,
+                },
+            )
+            .map(|_| ());
+            if joined.is_ok() {
+                #[cfg(test)]
+                notify_lifecycle_activity();
+            }
+            joined
+        },
+    )
     .await;
     match call_in {
         Ok(Ok(())) => {}
