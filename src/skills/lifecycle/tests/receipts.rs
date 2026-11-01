@@ -420,7 +420,7 @@ fn an_awaited_terminal_returns_when_its_worker_never_starts() {
         let path = tmp.path().to_path_buf();
         let owner = ids.owner.clone();
         let run = ids.run.clone();
-        let settle = tokio::spawn(async move {
+        let mut settle = tokio::spawn(async move {
             settle_task_terminal(
                 &path,
                 Some(owner),
@@ -440,10 +440,28 @@ fn an_awaited_terminal_returns_when_its_worker_never_starts() {
         let bound = crate::skills::lifecycle::receipts::TERMINAL_BUDGET
             + crate::skills::lifecycle::receipts::TERMINAL_START_GRACE;
         // The wheel stores the sleep at the next millisecond, and the driver
-        // fires it when this runtime parks. One millisecond past the bound,
-        // then joining the call, is that check. A yield spin never parks.
+        // fires it when this runtime parks. One millisecond past the bound
+        // is that logical deadline. A yield spin never parks, so the select
+        // below parks on the call. Auto-advance is inhibited and the occupier
+        // hold does not decay; the wall watchdog turns a missed deadline into
+        // a failure instead of waiting out that hold.
+        let (wake, woke) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = wake.send(());
+        });
         tokio::time::advance(bound + std::time::Duration::from_millis(1)).await;
-        settle.await.expect("test: settle task");
+        tokio::select! {
+            biased;
+            result = &mut settle => {
+                result.expect("test: settle task");
+            }
+            _ = woke => {
+                panic!(
+                    "awaited terminal term-starved did not settle after the logical start bound ({bound:?})"
+                );
+            }
+        }
         let elapsed = wall.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(1),
