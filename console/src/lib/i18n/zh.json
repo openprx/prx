@@ -381,6 +381,7 @@
       "huggingface": "Hugging Face"
     },
     "toggle": "切换",
+    "toggleNamed": "切换 {name}",
     "toggling": "正在切换...",
     "toggleNote": "这只切换启用标志，不会发布技能生命周期。",
     "toggleDenied": "不允许切换此技能。",
@@ -397,6 +398,7 @@
     "permissions": "权限",
     "statusActive": "运行中",
     "reload": "重载",
+    "reloadNamed": "重载 {name}",
     "reloadSuccess": "插件 \"{name}\" 已重载",
     "reloadFailed": "插件重载失败",
     "exactArtifact": "此列表不含组件哈希、清单哈希或信任记录。信任与启用是分开的。",
@@ -409,6 +411,7 @@
     "enable": "启用",
     "enableName": "已禁用插件名称",
     "disable": "禁用",
+    "disableNamed": "禁用 {name}",
     "refreshAll": "刷新全部插件",
     "refreshNote": "刷新会重建每个符合条件的插件。它不是某个新名称的首次发现。",
     "install": "安装",
@@ -417,6 +420,7 @@
     "sha256": "组件 SHA-256",
     "manifestSha256": "清单 SHA-256",
     "remove": "移除",
+    "removeNamed": "移除 {name}",
     "removeTitle": "移除插件",
     "removeConsequence": "移除插件、撤销其信任记录，并留下可恢复的备份。此操作不会自行撤销。",
     "installConsequence": "安装已核对的构件，并按这些哈希和权限记录信任。",
@@ -429,6 +433,8 @@
     "featureOff": "WASM 插件系统不可用。",
     "loadDenied": "此操作员无法查看插件。",
     "noBytes": "安装和更新接受工作区目录以及已核对的哈希，不接受原始字节。",
+    "grantNone": "不授予任何权限",
+    "reviewConsequence": "组件 {sha256}。清单 {manifest}。权限：{permissions}。",
     "generation": "代"
   },
   "login": {
