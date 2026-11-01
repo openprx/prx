@@ -54,12 +54,6 @@ impl ApprovalRequest {
     }
 }
 
-impl Default for ApprovalRequest {
-    fn default() -> Self {
-        Self::new(String::new(), serde_json::Value::Null)
-    }
-}
-
 /// The user's response to an approval request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

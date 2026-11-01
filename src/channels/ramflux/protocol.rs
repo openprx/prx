@@ -48,6 +48,8 @@ pub enum ProtocolError {
     Version,
     #[error("bridge frame is not a request, notification, or response")]
     Shape,
+    #[error("bridge frame id is null")]
+    NullId,
     #[error("{0}")]
     Invalid(String),
 }
@@ -125,6 +127,7 @@ pub fn parse_envelope(bytes: &[u8]) -> Result<Envelope, ProtocolError> {
         return Err(ProtocolError::Version);
     }
     let id = match map.get("id") {
+        Some(Value::Null) => return Err(ProtocolError::NullId),
         Some(value) => Some(serde_json::from_value(value.clone()).map_err(ProtocolError::Json)?),
         None => None,
     };
@@ -573,6 +576,31 @@ pub fn args_hash(arguments: &Value) -> Result<String, ProtocolError> {
 #[must_use]
 pub fn is_reply_method(method: &str) -> bool {
     method.starts_with("reply.")
+}
+
+/// JSON-RPC code for a frame that could not be parsed.
+#[must_use]
+pub const fn parse_error_code(error: &ProtocolError) -> i64 {
+    match error {
+        ProtocolError::Json(_) => -32700,
+        ProtocolError::NullId
+        | ProtocolError::NotObject
+        | ProtocolError::UnknownField
+        | ProtocolError::Version
+        | ProtocolError::Shape
+        | ProtocolError::Invalid(_) => -32600,
+    }
+}
+
+/// Error frame with `id: null` for a frame that has no usable id.
+#[must_use]
+pub fn encode_null_error(code: i64, message: &str) -> Vec<u8> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": {"code": code, "message": message}
+    });
+    serde_json::to_vec(&body).unwrap_or_else(|_| Vec::new())
 }
 
 pub fn idempotency_key(params: &Value) -> Option<String> {

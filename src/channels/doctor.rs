@@ -266,23 +266,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref rf) = config.channels_config.ramflux {
-        let secrets_dir = config
-            .config_path
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| config.workspace_dir.clone());
-        match RamfluxChannel::with_secrets(rf.clone(), &config.workspace_dir, &secrets_dir) {
-            Ok(channel) => {
-                let report = channel.doctor_report();
-                println!("  Ramflux socket: {}", report.socket_path.display());
-                println!("  Ramflux permission: {}", report.permission);
-                println!("  Ramflux authorization: {}", report.authorization);
-                channels.push(("Ramflux", Arc::new(channel)));
-            }
-            Err(error) => {
-                println!("  ❌ Ramflux   invalid config: {error}");
-            }
-        }
+        let report = RamfluxChannel::describe(rf, &config.workspace_dir);
+        println!("  Ramflux socket: {}", report.socket_path.display());
+        println!("  Ramflux permission: {}", report.permission);
+        println!("  Ramflux authorization: {}", report.authorization);
+        println!("  Ramflux listener: not started (doctor does not open the store)");
     }
 
     if let Some(ref wc) = config.channels_config.wacli {

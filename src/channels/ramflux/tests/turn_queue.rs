@@ -29,13 +29,26 @@ fn message(id: &str) -> RichMessage {
 }
 
 #[test]
-fn queue_holds_and_interrupt_replaces() {
-    let queue = TurnQueue::new(RamfluxOnNewMessage::Queue);
-    assert!(matches!(queue.admit(false, message("1")), Admission::Start(_)));
-    assert!(matches!(queue.admit(true, message("2")), Admission::Queued));
-    assert_eq!(queue.pop_next("conv").expect("test: queued").message_id, "2");
-    assert!(queue.pop_next("conv").is_none());
+fn queue_marks_in_flight_and_drains() {
+    let queue = TurnQueue::new(RamfluxOnNewMessage::Queue, 1);
+    assert!(matches!(queue.admit(message("1")), Admission::Start(_)));
+    assert!(queue.is_running("conv"));
+    assert!(matches!(queue.admit(message("2")), Admission::Queued));
+    let next = queue.finish("conv").expect("test: queued");
+    assert_eq!(next.message_id, "2");
+    assert!(queue.is_running("conv"));
+    assert!(queue.finish("conv").is_none());
+    assert!(!queue.is_running("conv"));
 
-    let queue = TurnQueue::new(RamfluxOnNewMessage::Interrupt);
-    assert!(matches!(queue.admit(true, message("3")), Admission::Interrupt(_)));
+    assert!(matches!(queue.admit(message("3")), Admission::Start(_)));
+    assert!(matches!(queue.admit(message("4")), Admission::Queued));
+    queue.drain("conv");
+    assert!(!queue.is_running("conv"));
+    assert!(queue.finish("conv").is_none());
+
+    let queue = TurnQueue::new(RamfluxOnNewMessage::Interrupt, 1);
+    assert!(matches!(queue.admit(message("5")), Admission::Start(_)));
+    assert!(matches!(queue.admit(message("6")), Admission::Interrupt(_)));
+    assert!(queue.finish("conv").is_none());
+    assert!(queue.is_running("conv"));
 }

@@ -12,6 +12,7 @@ use super::inbound_policy::{
     collect_bot_names, collect_bot_uuids, collect_group_reply_mode_by_channel, collect_mention_only_by_channel,
     normalize_allowlist, normalize_dm_policy, warn_open_policy_allowlist_alignment,
 };
+use super::rich::RichChannel;
 use super::runtime_commands::{build_channel_startup_provider, resolved_default_model, resolved_default_provider};
 use super::supervisor::spawn_supervised_listener;
 use super::{
@@ -336,7 +337,10 @@ pub async fn start_channels_with_config(
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| config.workspace_dir.clone());
         match RamfluxChannel::with_secrets(rf.clone(), &config.workspace_dir, &secrets_dir) {
-            Ok(channel) => channels.push(Arc::new(channel)),
+            Ok(channel) => {
+                channel.attach_stores(Arc::clone(&mem), Arc::clone(&conversation_histories));
+                channels.push(Arc::new(channel));
+            }
             Err(error) => {
                 tracing::warn!(error = %error, "ramflux channel was not started");
             }

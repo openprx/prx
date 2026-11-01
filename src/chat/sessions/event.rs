@@ -248,7 +248,7 @@ fn forward(event_tx: &mpsc::Sender<SessionEvent>, id: &SessionId, event: Session
 /// display, or `None` for notifications we do not surface (progress ticks).
 fn summarize_tool_call(notif: &ToolCallNotification) -> Option<String> {
     match notif {
-        ToolCallNotification::Started { name, args_summary } => {
+        ToolCallNotification::Started { name, args_summary, .. } => {
             if args_summary.is_empty() {
                 Some(format!("→ {name}"))
             } else {
@@ -259,6 +259,7 @@ fn summarize_tool_call(notif: &ToolCallNotification) -> Option<String> {
             name,
             success,
             duration_ms,
+            ..
         } => {
             let mark = if *success { "ok" } else { "fail" };
             Some(format!("✓ {name} [{mark} {duration_ms}ms]"))
@@ -433,16 +434,19 @@ mod tests {
     #[test]
     fn summarize_started_and_finished() {
         let started = ToolCallNotification::Started {
+            id: "read-1".into(),
             name: "read".into(),
             args_summary: "file=x".into(),
         };
         assert_eq!(summarize_tool_call(&started), Some("→ read(file=x)".to_string()));
         let started_noargs = ToolCallNotification::Started {
+            id: "ls-1".into(),
             name: "ls".into(),
             args_summary: String::new(),
         };
         assert_eq!(summarize_tool_call(&started_noargs), Some("→ ls".to_string()));
         let finished = ToolCallNotification::Finished {
+            id: "read-1".into(),
             name: "read".into(),
             success: true,
             duration_ms: 12,
@@ -461,6 +465,7 @@ mod tests {
         delta_tx.send("hello".to_string()).await.expect("test: send delta");
         tool_tx
             .send(ToolCallNotification::Started {
+                id: "read-1".into(),
                 name: "read".into(),
                 args_summary: String::new(),
             })

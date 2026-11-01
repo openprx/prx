@@ -100,7 +100,8 @@ impl RpcHub {
         let number = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = RpcId::String(format!("prx-{number}"));
         let key = id.to_string();
-        let body = encode_bridge_call(&id, method, params)?;
+        let params = reply_params_with_key(method, params, &key);
+        let body = encode_bridge_call(&id, method, &params)?;
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock();
@@ -219,6 +220,14 @@ impl RpcHub {
         parse_envelope(bytes)
     }
 
+    /// Send a parse or transport error whose request id is null.
+    pub async fn emit_null_error(&self, code: i64, message: &str) {
+        let body = protocol::encode_null_error(code, message);
+        if !body.is_empty() {
+            let _ = self.emit(body).await;
+        }
+    }
+
     async fn emit(&self, body: Vec<u8>) -> Result<(), RpcFailure> {
         let writer = self.writer.lock().clone();
         let Some(writer) = writer else {
@@ -254,6 +263,19 @@ impl RpcHub {
         }
         pending.remove(key);
     }
+}
+
+fn reply_params_with_key(method: &str, params: &Value, key: &str) -> Value {
+    if !is_reply_method(method) {
+        return params.clone();
+    }
+    let mut owned = params.clone();
+    if let Some(object) = owned.as_object_mut() {
+        object
+            .entry("idempotency_key")
+            .or_insert_with(|| Value::String(key.to_string()));
+    }
+    owned
 }
 
 fn push_replay(replay: &mut VecDeque<String>, id: String) {

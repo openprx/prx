@@ -25,7 +25,13 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// available yet. A rejected kind also emits `turn.status`.
 pub async fn send_reply(inner: &Inner, reply: &RichReply) -> anyhow::Result<()> {
     match reply {
-        RichReply::Text(text) => send_text(&inner.rpc, text).await,
+        RichReply::Text(text) => {
+            let mut text = text.clone();
+            if text.reply_target.is_none() {
+                text.reply_target = inner.reply_target_for(&text.conversation_id);
+            }
+            send_text(&inner.rpc, &text).await
+        }
         RichReply::Typing(typing) => send_typing(&inner.rpc, typing).await,
         RichReply::Status(status) => send_status(&inner.rpc, status).await,
         RichReply::Surface(surface) => send_surface(inner, surface).await,

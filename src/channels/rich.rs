@@ -173,11 +173,15 @@ impl RichMessage {
             ChatRoomKind::Dm => ChatKind::Dm,
             ChatRoomKind::Group => ChatKind::Group,
         };
+        let mut content = self.text.clone();
+        for attachment in &self.attachments {
+            content.push_str(&format!("\n[attachment:{}]", attachment.object_id));
+        }
         ChannelMessage {
             id: self.message_id.clone(),
             sender: self.sender.principal_id.clone(),
             reply_target: self.conversation_id.clone(),
-            content: self.text.clone(),
+            content,
             channel: "ramflux".to_string(),
             timestamp: self.timestamp_ms,
             chat_kind,
@@ -363,4 +367,58 @@ pub trait RichChannel: Channel {
 
     /// Drop a turn registration. Cancelling is separate.
     fn unbind_turn(&self, _conversation_id: &str, _turn_id: &str) {}
+
+    /// Supervised channels force a tool call to ask this resolver.
+    fn forces_tool_approval(&self) -> bool {
+        false
+    }
+
+    /// Host-enforced turn budget. `None` leaves the caller unchanged.
+    fn turn_budget(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Account persona prepended to the channel system prompt.
+    fn augment_prompt(&self, prompt: &str, _conversation_id: &str) -> String {
+        prompt.to_string()
+    }
+
+    /// Optional model override from the account persona.
+    fn preferred_model(&self) -> Option<String> {
+        None
+    }
+
+    /// Optional provider override from the account persona.
+    fn preferred_provider(&self) -> Option<String> {
+        None
+    }
+
+    /// Memory view for this conversation. The default is the process memory.
+    fn memory_for_turn(
+        &self,
+        inner: std::sync::Arc<dyn crate::memory::Memory>,
+        _conversation_id: &str,
+    ) -> std::sync::Arc<dyn crate::memory::Memory> {
+        inner
+    }
+
+    /// Fetch inbound attachments named in `content` and append a short note.
+    async fn enrich_inbound(&self, content: &str, _conversation_id: &str, _turn_id: &str) -> String {
+        content.to_string()
+    }
+
+    /// Project the final answer as one markdown surface. Invalid surfaces are skipped.
+    async fn project_final_surface(&self, _conversation_id: &str, _turn_id: &str, _text: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Attach process stores so a delete can reach history and memory.
+    fn attach_stores(
+        &self,
+        _memory: std::sync::Arc<dyn crate::memory::Memory>,
+        _histories: std::sync::Arc<
+            parking_lot::Mutex<std::collections::HashMap<String, Vec<crate::providers::ChatMessage>>>,
+        >,
+    ) {
+    }
 }

@@ -53,9 +53,14 @@ impl ChatMode {
 #[derive(Debug, Clone)]
 pub enum ToolCallNotification {
     /// A tool call is about to be executed.
-    Started { name: String, args_summary: String },
+    Started {
+        id: String,
+        name: String,
+        args_summary: String,
+    },
     /// A tool call has finished executing.
     Finished {
+        id: String,
         name: String,
         success: bool,
         duration_ms: u64,

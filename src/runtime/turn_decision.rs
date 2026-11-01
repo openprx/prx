@@ -184,6 +184,11 @@ pub(crate) struct TurnDecisionService {
 }
 
 impl TurnDecisionService {
+    #[must_use]
+    pub(crate) fn memory(&self) -> &Arc<dyn Memory> {
+        &self.memory
+    }
+
     /// Bind runtime adapter ceilings to the provider catalog pinned by this
     /// exact configuration generation.
     pub(crate) fn effective_provider_capabilities(

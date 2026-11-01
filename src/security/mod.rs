@@ -16,6 +16,7 @@ pub mod inbound_gate;
 pub mod op_id;
 pub mod pairing;
 pub mod policy;
+pub mod ramflux_aead;
 pub mod redaction;
 pub mod secrets;
 pub use policy::{AutonomyLevel, SecurityPolicy, SideEffectGate};

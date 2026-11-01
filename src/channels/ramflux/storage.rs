@@ -1,6 +1,7 @@
 //! At-rest files for the ramflux channel.
 //!
-//! Content is ciphertext from [`super::crypto`]. File names are random ids.
+//! Content is ciphertext from [`super::crypto`]. File names are
+//! `hex(sha256(id))`, which is injective: distinct ids never share a path.
 //! A first open deletes any pre-existing plaintext left in this directory.
 
 use super::crypto::{self, AccountCrypto, CryptoError};
@@ -50,17 +51,18 @@ impl ChannelStore {
         message_id: &str,
         plaintext: &[u8],
     ) -> Result<PathBuf, StorageError> {
-        let blob = crypto.seal(account_id, conversation_id, plaintext)?;
+        let blob = crypto.seal(account_id, conversation_id, message_id, plaintext)?;
         let path = self.message_path(account_id, conversation_id, message_id);
         write_file(&path, &blob)?;
         Ok(path)
     }
 
-    /// Read one message blob.
+    /// Read one message blob. Tests use this to prove a round trip; erase does not.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError`] when the file is missing or cannot be opened.
+    #[cfg(test)]
     pub fn get_message(
         &self,
         crypto: &AccountCrypto,
@@ -70,7 +72,7 @@ impl ChannelStore {
     ) -> Result<Vec<u8>, StorageError> {
         let path = self.message_path(account_id, conversation_id, message_id);
         let blob = std::fs::read(&path).map_err(|error| StorageError::Io(error.to_string()))?;
-        Ok(crypto.open(account_id, conversation_id, &blob)?)
+        Ok(crypto.open(account_id, conversation_id, message_id, &blob)?)
     }
 
     pub fn put_tool_event(
@@ -81,8 +83,8 @@ impl ChannelStore {
         event_id: &str,
         plaintext: &[u8],
     ) -> Result<PathBuf, StorageError> {
-        let blob = crypto.seal(account_id, conversation_id, plaintext)?;
-        let path = self.event_path(account_id, event_id);
+        let blob = crypto.seal(account_id, conversation_id, event_id, plaintext)?;
+        let path = self.event_path(account_id, conversation_id, event_id);
         write_file(&path, &blob)?;
         Ok(path)
     }
@@ -95,8 +97,8 @@ impl ChannelStore {
         object_id: &str,
         plaintext: &[u8],
     ) -> Result<PathBuf, StorageError> {
-        let blob = crypto.seal(account_id, conversation_id, plaintext)?;
-        let path = self.media_path(&format!("{account_id}-{object_id}"));
+        let blob = crypto.seal(account_id, conversation_id, object_id, plaintext)?;
+        let path = self.media_path(account_id, object_id);
         write_file(&path, &blob)?;
         Ok(path)
     }
@@ -105,27 +107,31 @@ impl ChannelStore {
     pub fn message_path(&self, account_id: &str, conversation_id: &str, message_id: &str) -> PathBuf {
         self.root
             .join("mem")
-            .join(safe(account_id))
-            .join(safe(conversation_id))
-            .join(safe(message_id))
+            .join(name(account_id))
+            .join(name(conversation_id))
+            .join(name(message_id))
     }
 
     #[must_use]
-    pub fn event_path(&self, account_id: &str, event_id: &str) -> PathBuf {
-        self.root.join("events").join(safe(account_id)).join(safe(event_id))
+    pub fn event_path(&self, account_id: &str, conversation_id: &str, event_id: &str) -> PathBuf {
+        self.root
+            .join("events")
+            .join(name(account_id))
+            .join(name(conversation_id))
+            .join(name(event_id))
     }
 
     #[must_use]
-    pub fn media_path(&self, object_id: &str) -> PathBuf {
-        self.root.join("media").join(safe(object_id))
+    pub fn media_path(&self, account_id: &str, object_id: &str) -> PathBuf {
+        self.root.join("media").join(name(account_id)).join(name(object_id))
     }
 
     #[must_use]
     pub fn marker_path(&self, account_id: &str, conversation_id: &str) -> PathBuf {
         self.root
             .join("markers")
-            .join(safe(account_id))
-            .join(safe(conversation_id))
+            .join(name(account_id))
+            .join(name(conversation_id))
     }
 }
 
@@ -143,17 +149,8 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn safe(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
+fn name(value: &str) -> String {
+    crypto::id_hash(value)
 }
 
 fn delete_legacy_plaintext(root: &Path) {

@@ -1,10 +1,11 @@
-//! Hard delete for `inbound.message_deleted` and `agent_revoked`.
+//! Hard delete for one message, one conversation, or a whole account.
 //!
-//! Files are overwritten with zeros before removal. The report counts what
-//! was removed. A scan of the data directory after erase must not find the
-//! plaintext or the ciphertext bytes.
+//! Files are overwritten with zeros before removal. Account erase also
+//! destroys the wrapped data key. Conversation erase leaves the key in place.
+//! Media lives at `media/{hash(account)}/{hash(object)}`, so removing one
+//! account directory cannot match another account's hash.
 
-use super::crypto::AccountCrypto;
+use super::crypto::{self, AccountCrypto};
 use super::storage::{self, ChannelStore, StorageError};
 use std::path::Path;
 
@@ -17,7 +18,7 @@ pub struct EraseReport {
     pub key_material: bool,
 }
 
-/// Erase one message blob and any media or tool-event files that name it.
+/// Erase one message blob and its draft sidecar.
 ///
 /// # Errors
 ///
@@ -42,6 +43,51 @@ pub fn erase_message(
     Ok(report)
 }
 
+/// Erase one cached attachment. The object id is matched exactly via its hash.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the file cannot be overwritten.
+pub fn erase_media(store: &ChannelStore, account_id: &str, object_id: &str) -> Result<bool, StorageError> {
+    let path = store.media_path(account_id, object_id);
+    if !path.exists() {
+        return Ok(false);
+    }
+    storage::secure_remove(&path)?;
+    Ok(true)
+}
+
+/// Erase one conversation's messages, tool events, and marker. The DEK stays.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when a directory cannot be removed.
+pub fn erase_conversation(
+    store: &ChannelStore,
+    account_id: &str,
+    conversation_id: &str,
+) -> Result<EraseReport, StorageError> {
+    let mut report = EraseReport::default();
+    let message = store.message_path(account_id, conversation_id, "placeholder");
+    let events = store.event_path(account_id, conversation_id, "placeholder");
+    let message_dir = message
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| store.root().to_path_buf());
+    let event_dir = events
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| store.root().to_path_buf());
+    report.memory_rows = remove_tree_files(&message_dir)?;
+    report.tool_events = remove_tree_files(&event_dir)?;
+    let marker = store.marker_path(account_id, conversation_id);
+    if marker.exists() {
+        storage::secure_remove(&marker)?;
+        report.drafts = 1;
+    }
+    Ok(report)
+}
+
 /// Erase every file for an account, including the wrapped data key.
 ///
 /// # Errors
@@ -53,11 +99,11 @@ pub fn erase_account(
     account_id: &str,
 ) -> Result<EraseReport, StorageError> {
     let mut report = EraseReport::default();
-    report.memory_rows = remove_tree_files(&store.root().join("mem").join(safe(account_id)))?;
-    report.tool_events = remove_tree_files(&store.root().join("events").join(safe(account_id)))?;
-    report.media_files = remove_named_media(store.root(), account_id)?;
-    let markers = store.root().join("markers").join(safe(account_id));
-    report.drafts = remove_tree_files(&markers)?;
+    let account = crypto::id_hash(account_id);
+    report.memory_rows = remove_tree_files(&store.root().join("mem").join(&account))?;
+    report.tool_events = remove_tree_files(&store.root().join("events").join(&account))?;
+    report.media_files = remove_tree_files(&store.root().join("media").join(&account))?;
+    report.drafts = remove_tree_files(&store.root().join("markers").join(&account))?;
     crypto
         .destroy(account_id)
         .map_err(|error| StorageError::Io(error.to_string()))?;
@@ -122,37 +168,4 @@ fn remove_tree_files(dir: &Path) -> Result<usize, StorageError> {
     }
     let _ = std::fs::remove_dir_all(dir);
     Ok(count)
-}
-
-fn remove_named_media(root: &Path, account_id: &str) -> Result<usize, StorageError> {
-    let dir = root.join("media");
-    if !dir.exists() {
-        return Ok(0);
-    }
-    let mut count = 0usize;
-    let prefix = safe(account_id);
-    let entries = std::fs::read_dir(&dir).map_err(|error| StorageError::Io(error.to_string()))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| StorageError::Io(error.to_string()))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(&prefix) {
-            storage::secure_remove(&entry.path())?;
-            count = count.saturating_add(1);
-        }
-    }
-    Ok(count)
-}
-
-fn safe(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }

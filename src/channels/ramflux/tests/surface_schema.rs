@@ -70,11 +70,27 @@ fn rejects_script_urls_and_oversize() {
         surface_schema::validate(&unknown, &limits(), &allowed),
         Err(SchemaError::BlockKind(_))
     ));
-    let missing = reply(SurfaceOp::Close, None, Vec::new(), None);
+    let missing = reply(
+        SurfaceOp::Create,
+        None,
+        vec![SurfaceBlock {
+            id: "b".into(),
+            kind: "Text".into(),
+            data: serde_json::json!({}),
+        }],
+        None,
+    );
     assert_eq!(
         surface_schema::validate(&missing, &limits(), &allowed),
         Err(SchemaError::MissingFallback)
     );
-    let ok = reply(SurfaceOp::StreamAppend, None, Vec::new(), Some("hello"));
+    let ok = reply(SurfaceOp::StreamAppend, None, Vec::new(), Some("hello <script>"));
     assert!(surface_schema::validate(&ok, &limits(), &allowed).is_ok());
+    let text_close = reply(
+        SurfaceOp::Close,
+        Some("a reply with <script> and ftp://files.example"),
+        Vec::new(),
+        None,
+    );
+    assert!(surface_schema::validate(&text_close, &limits(), &allowed).is_ok());
 }

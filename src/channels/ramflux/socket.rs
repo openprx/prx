@@ -1,10 +1,11 @@
 //! Unix socket lifecycle for the ramflux bridge.
 //!
-//! The socket is bound and then chmod'd to `0600`. Startup checks the
-//! directory entry: owner uid must be this process, mode must be `0600`, and
-//! the path must not be a symlink. `fstat` confirms the listener fd is a
-//! socket. A second concurrent connection is rejected. Frames are
-//! newline-delimited and capped.
+//! The socket is bound inside a directory this process owns at mode `0700`,
+//! then chmod'd to `0600`. Startup checks the directory entry: owner uid must
+//! be this process, mode must be `0600`, and the path must not be a symlink.
+//! Accept checks the peer uid and refuses a mismatch. `fstat` confirms the
+//! listener fd is a socket. A second concurrent connection is rejected.
+//! Frames are newline-delimited and capped.
 
 use super::protocol::{self, RpcErrorBody, RpcId};
 use super::{Inner, inbound};
@@ -36,6 +37,12 @@ pub enum SocketError {
     NotSocket(PathBuf),
     #[error("frame exceeds {max} bytes")]
     FrameTooLarge { max: usize },
+    #[error("frame ended before a newline")]
+    Truncated,
+    #[error("directory mode is {mode:o}, expected 0700: {path}")]
+    DirMode { path: PathBuf, mode: u32 },
+    #[error("peer uid {peer} does not match process uid {own}")]
+    Peer { peer: u32, own: u32 },
     #[error("{0}")]
     Invalid(String),
     #[error(transparent)]
@@ -111,6 +118,12 @@ pub async fn accept_loop(inner: Arc<Inner>, listener: tokio::net::UnixListener) 
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
+                        #[cfg(unix)]
+                        if let Err(error) = peer_matches(&stream) {
+                            tracing::warn!(error = %error, "ramflux peer uid refused");
+                            reject_peer(stream).await;
+                            continue;
+                        }
                         if !inner.try_claim_connection() {
                             reject_second(stream).await;
                             continue;
@@ -133,6 +146,14 @@ pub async fn accept_loop(inner: Arc<Inner>, listener: tokio::net::UnixListener) 
                 }
             }
         }
+    }
+}
+
+async fn reject_peer(mut stream: UnixStream) {
+    let body = protocol::encode_null_error(-32005, "peer uid refused");
+    if !body.is_empty() {
+        let _ = stream.write_all(&body).await;
+        let _ = stream.write_all(b"\n").await;
     }
 }
 
@@ -173,6 +194,12 @@ async fn connection(inner: Arc<Inner>, stream: UnixStream) -> Result<(), SocketE
                     }
                     Ok(None) => break,
                     Err(error) => {
+                        let (code, message) = match &error {
+                            SocketError::FrameTooLarge { .. } => (-32600, "frame too large"),
+                            SocketError::Truncated => (-32700, "truncated frame"),
+                            _ => (-32700, "frame read failed"),
+                        };
+                        inner.rpc.emit_null_error(code, message).await;
                         tracing::warn!(error = %error, "ramflux frame read failed");
                         break;
                     }
@@ -182,7 +209,16 @@ async fn connection(inner: Arc<Inner>, stream: UnixStream) -> Result<(), SocketE
     }
     inner.rpc.clear_writer();
     inner.writer_ready.store(false, Ordering::Release);
-    writer.abort();
+    // Queued frames, including the error for an oversize or truncated read,
+    // have to reach the socket before this task ends. Abort only if the peer
+    // never accepts them.
+    let abort = writer.abort_handle();
+    if tokio::time::timeout(std::time::Duration::from_secs(1), writer)
+        .await
+        .is_err()
+    {
+        abort.abort();
+    }
     Ok(())
 }
 
@@ -197,7 +233,7 @@ where
             if buf.is_empty() {
                 return Ok(None);
             }
-            return Err(SocketError::FrameTooLarge { max });
+            return Err(SocketError::Truncated);
         }
         if let Some(pos) = available.iter().position(|byte| *byte == b'\n') {
             let line = available
@@ -314,12 +350,121 @@ fn prepare_parent(path: &Path) -> Result<(), SocketError> {
         return Ok(());
     }
     let existed = parent.exists();
-    std::fs::create_dir_all(parent)?;
     if !existed {
+        std::fs::create_dir_all(parent)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
+    verify_private_dir(parent)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn verify_private_dir(dir: &Path) -> Result<(), SocketError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(SocketError::Symlink(dir.to_path_buf()));
+    }
+    let mode = meta.mode() & 0o777;
+    if mode != 0o700 {
+        return Err(SocketError::DirMode {
+            path: dir.to_path_buf(),
+            mode,
+        });
+    }
+    let own = own_uid();
+    if meta.uid() != own {
+        return Err(SocketError::Owner {
+            path: dir.to_path_buf(),
+            owner: meta.uid(),
+            own,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn peer_matches(stream: &UnixStream) -> Result<(), SocketError> {
+    let peer = peer_uid(stream)?;
+    let own = own_uid();
+    if peer != own {
+        return Err(SocketError::Peer { peer, own });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn peer_uid(stream: &UnixStream) -> Result<u32, SocketError> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    // `getpeereid` is the BSD call. Linux reports the same fact with `SO_PEERCRED`.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        // SAFETY: `fd` is a connected Unix socket owned by `stream` for this call.
+        // `uid` and `gid` are valid for the duration of `getpeereid`, which writes
+        // the peer credentials and does not retain the pointers.
+        let rc = unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) };
+        if rc != 0 {
+            return Err(SocketError::Io(std::io::Error::last_os_error()));
+        }
+        return Ok(uid);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut len = match u32::try_from(std::mem::size_of::<libc::ucred>()) {
+            Ok(len) => len,
+            Err(_) => {
+                return Err(SocketError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ucred length does not fit socklen_t",
+                )));
+            }
+        };
+        // SAFETY: `fd` is a connected Unix socket owned by `stream` for this call.
+        // `cred` and `len` are valid outputs for `SO_PEERCRED`. The kernel writes
+        // the peer credentials and does not retain the pointers.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast::<libc::c_void>(),
+                &raw mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(SocketError::Io(std::io::Error::last_os_error()));
+        }
+        return Ok(cred.uid);
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
+    {
+        let _ = fd;
+        Err(SocketError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "peer uid requires getpeereid or SO_PEERCRED",
+        )))
+    }
 }
 
 #[cfg(unix)]
@@ -360,7 +505,9 @@ fn verify_listener(listener: &tokio::net::UnixListener, path: &Path) -> Result<(
 #[cfg(unix)]
 fn permission_bits(st_mode: rustix::fs::RawMode) -> u32 {
     let mode = rustix::fs::Mode::from_raw_mode(st_mode);
-    u32::from(mode.bits()) & 0o777
+    // `mode_t` is `u16` on macOS and `u32` on Linux. Widen first, then mask.
+    let bits = u64::from(mode.bits()) & 0o777;
+    u32::try_from(bits).unwrap_or(0)
 }
 
 #[cfg(unix)]

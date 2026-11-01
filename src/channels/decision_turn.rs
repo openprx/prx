@@ -85,7 +85,19 @@ impl ChannelDecisionTurn {
         cancellation: &tokio_util::sync::CancellationToken,
         admission: &mut super::decision_source::ChannelAdmissionGuard,
     ) -> anyhow::Result<Self> {
-        let service = ctx.decisions.publish(ctx, generation, security).await?;
+        let envelope_for_scope = source.envelope();
+        let conversation_id = envelope_for_scope.recipient.clone().unwrap_or_default();
+        let channel_name = envelope_for_scope.channel.clone().unwrap_or_default();
+        let turn_memory = ctx
+            .channels_by_name
+            .get(&channel_name)
+            .and_then(|channel| channel.as_rich())
+            .map(|rich| rich.memory_for_turn(Arc::clone(&ctx.memory), &conversation_id))
+            .unwrap_or_else(|| Arc::clone(&ctx.memory));
+        let service = ctx
+            .decisions
+            .publish(ctx, generation, security, Arc::clone(&turn_memory))
+            .await?;
         let proof = source.bind_model(&route.provider, &route.model)?;
         let model = service.resolve_agent_model(&proof)?;
         let route = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
@@ -113,7 +125,7 @@ impl ChannelDecisionTurn {
             admission.take_terminal_ticket()?,
             Arc::clone(&service),
             Arc::clone(&context),
-            crate::memory::MemoryFabric::new(Arc::clone(&ctx.memory), envelope.workspace_id.clone())
+            crate::memory::MemoryFabric::new(turn_memory, envelope.workspace_id.clone())
                 .with_event_recording(generation.effective.memory.event_recording_config()),
             Arc::clone(&generation.effective),
             envelope.clone(),
