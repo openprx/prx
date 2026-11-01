@@ -80,6 +80,10 @@
           "items": { "type": "string", "minLength": 1, "maxLength": 256 },
           "uniqueItems": true
         },
+        "billing": {
+          "description": "Per-token billing when omitted or token. subscription rows must not include pricing.",
+          "enum": ["token", "subscription"]
+        },
         "lifecycle": { "$ref": "#/$defs/lifecycle" },
         "operations": {
           "type": "array",

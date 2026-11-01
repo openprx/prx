@@ -816,6 +816,8 @@ impl CostTracker {
 
     /// Idempotently project a canonical terminal usage settlement into the
     /// persistent cost ledger. Unknown price remains explicit, never zero.
+    /// A subscription-billed row with no dollar amount returns
+    /// [`CostSettlement::Subscription`] and writes no cost row.
     pub fn settle_metered(
         &self,
         record: &crate::llm::route_decision::MeteredTokenUsageRecord,
@@ -2422,5 +2424,22 @@ mod tests {
         let settlement = tracker.settle_metered(&metered_record("turn-unknown", None)).unwrap();
         assert_eq!(settlement, CostSettlement::UnknownPricing);
         assert_eq!(tracker.get_summary().unwrap().request_count, 0);
+    }
+
+    #[test]
+    fn subscription_usage_is_not_recorded_as_unknown_pricing_or_zero() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::for_workspace(enabled_config(), tmp.path()).unwrap();
+        let mut record = metered_record("turn-subscription", None);
+        record.provider = "kimi-code".to_string();
+        record.model = "kimi-for-coding".to_string();
+        let settlement = tracker.settle_metered(&record).unwrap();
+        assert_eq!(settlement, CostSettlement::Subscription);
+        assert_eq!(tracker.get_summary().unwrap().request_count, 0);
+        let ledger = tmp.path().join("state").join("costs.jsonl");
+        if ledger.exists() {
+            let persisted = std::fs::read_to_string(ledger).unwrap();
+            assert!(persisted.trim().is_empty(), "{persisted}");
+        }
     }
 }

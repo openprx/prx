@@ -37,6 +37,20 @@ impl CostTracker {
         anyhow::ensure!(!settlement_id.trim().is_empty(), "Metered usage settlement_id is empty");
         let Some(cost_usd) = record.cost_usd else {
             anyhow::ensure!(receipt.is_none(), "reserved settlement price is unknown");
+            if matches!(
+                crate::llm::route_decision::usage_cost_resolution(
+                    &record.provider,
+                    &record.model,
+                    record.prompt_tokens,
+                    record.completion_tokens,
+                    record.cache_creation_input_tokens,
+                    record.cache_read_input_tokens,
+                    &config,
+                ),
+                crate::llm::route_decision::UsagePrice::Subscription
+            ) {
+                return Ok(CostSettlement::Subscription);
+            }
             return Ok(CostSettlement::UnknownPricing);
         };
         anyhow::ensure!(

@@ -228,14 +228,58 @@ pub(super) fn canonical_provider_info(provider_name: &str) -> Option<ProviderInf
     })
 }
 
-pub(super) const KIMI_CODE_SUPPORTED_MODELS: &[&str] = &["k3", "kimi-for-coding", "kimi-for-coding-highspeed"];
+/// Active catalog spellings for a catalog-backed provider.
+///
+/// `None` when the release catalog does not cover `provider_name`. The set is
+/// the catalog's active `api_model` values and aliases. It is not a hard-coded
+/// model array.
+#[must_use]
+pub fn provider_model_allowlist(provider_name: &str) -> Option<std::collections::BTreeSet<String>> {
+    let info = canonical_provider_info(provider_name)?;
+    let catalog = crate::providers::catalog::ReleaseCatalog::embedded().ok()?;
+    let mut spellings = None;
+    for candidate in std::iter::once(info.name).chain(info.aliases.iter().copied()) {
+        if let Some(allowed) = catalog.active_allowlist(candidate) {
+            spellings
+                .get_or_insert_with(std::collections::BTreeSet::new)
+                .extend(allowed);
+        }
+    }
+    spellings
+}
+
+/// Kimi Code's endpoint can report success for a model string it does not
+/// serve. That provider refuses spellings outside the catalog allowlist.
+/// A catalog that cannot be loaded fails closed for Kimi Code. Every other
+/// provider keeps an explicitly configured unknown id on the unverified path.
+fn closed_catalog_allowlist(provider_name: &str) -> anyhow::Result<Option<std::collections::BTreeSet<String>>> {
+    let Some(info) = canonical_provider_info(provider_name) else {
+        return Ok(None);
+    };
+    if info.name != "kimi-code" {
+        return Ok(None);
+    }
+    let catalog = crate::providers::catalog::ReleaseCatalog::embedded()
+        .map_err(|error| anyhow::anyhow!("kimi-code model allowlist is unavailable: {error}"))?;
+    let Some(allowed) = catalog.active_allowlist(info.name) else {
+        anyhow::bail!("kimi-code model allowlist is empty");
+    };
+    Ok(Some(allowed))
+}
 
 /// Validate model IDs that PRX can safely validate locally.
 ///
-/// Most OpenAI-compatible providers own model catalog changes, so PRX does not
-/// generally reject bare model IDs. Kimi Code is an exception in practice: the
-/// coding endpoint can return success even for an invalid model string, which
-/// makes CLI validation evidence misleading.
+/// Catalog-backed providers take their known set from the release catalog
+/// (active rows and aliases). Most providers do not reject a bare id the
+/// catalog does not list: an explicitly configured unknown model stays
+/// unverified and runs with a warning. Kimi Code is the exception. Its
+/// endpoint can return success for an invalid model string, so a spelling
+/// outside the catalog allowlist is refused here.
+///
+/// # Errors
+///
+/// The model is incompatible with the provider, or it is outside Kimi Code's
+/// catalog allowlist.
 pub fn validate_provider_model(provider_name: &str, model: &str) -> anyhow::Result<()> {
     let model = model.trim();
     if model.is_empty() || model.starts_with("hint:") {
@@ -246,13 +290,11 @@ pub fn validate_provider_model(provider_name: &str, model: &str) -> anyhow::Resu
         anyhow::bail!("model '{model}' is not compatible with provider '{provider_name}'");
     }
 
-    if canonical_provider_info(provider_name).is_some_and(|info| info.name == "kimi-code")
-        && !KIMI_CODE_SUPPORTED_MODELS.iter().any(|known| *known == model)
+    if let Some(allowed) = closed_catalog_allowlist(provider_name)?
+        && !allowed.iter().any(|known| known == model)
     {
-        anyhow::bail!(
-            "invalid model '{model}' for provider 'kimi-code'. Supported models: {}",
-            KIMI_CODE_SUPPORTED_MODELS.join(", ")
-        );
+        let listed = allowed.into_iter().collect::<Vec<_>>().join(", ");
+        anyhow::bail!("invalid model '{model}' for provider 'kimi-code'. Supported models: {listed}");
     }
 
     Ok(())

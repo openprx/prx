@@ -31,9 +31,9 @@ pub use descriptor::{
     Support,
 };
 pub use release::{
-    CatalogFeatures, CatalogLimits, CatalogOperation, CatalogParameter, CatalogPriceTier, CatalogPricing,
-    CatalogRouterHints, CatalogTransport, ModelLifecycle, ModelLifecycleStatus, ModelParameter, ReleaseCatalog,
-    ReleaseCatalogError, ReleaseDefaults, ReleaseModel, ReleaseProvider,
+    CatalogBilling, CatalogFeatures, CatalogLimits, CatalogOperation, CatalogParameter, CatalogPriceTier,
+    CatalogPricing, CatalogRouterHints, CatalogTransport, ModelLifecycle, ModelLifecycleStatus, ModelParameter,
+    ReleaseCatalog, ReleaseCatalogError, ReleaseDefaults, ReleaseModel, ReleaseProvider,
 };
 pub use resolver::{
     ResolutionError, ResolvedCredential, ResolvedModel, Selection, UnknownPolicy, Verification, resolve,

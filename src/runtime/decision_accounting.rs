@@ -240,6 +240,7 @@ fn estimated_cost(
     ] {
         let cost = match usage_cost_resolution(provider, model, input, output, write, read, config) {
             UsagePrice::Priced(cost) => cost,
+            UsagePrice::Subscription => 0.0,
             UsagePrice::Missing
                 if super::turn_cost::provider_is_zero_price_exempt(&ProviderId::of(provider), api_url) =>
             {

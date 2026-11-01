@@ -2531,7 +2531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selecting_unpriced_default_warns_without_changing_admission() {
+    async fn selecting_a_subscription_default_does_not_require_a_nominal_price() {
         let dir = tempfile::tempdir().unwrap();
         let config = loaded(dir.path(), |_| {}).await;
         let service = service_for(config);
@@ -2549,9 +2549,9 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            plan.warnings()
-                .iter()
-                .any(|warning| warning.contains(r#"[cost.prices."kimi-code/kimi-for-coding"]"#))
+            plan.warnings().iter().all(|warning| {
+                !warning.contains("G6 budget admission refuses") && !warning.contains("[cost.prices.")
+            })
         );
     }
 

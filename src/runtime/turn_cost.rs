@@ -30,6 +30,7 @@ pub(super) struct RuntimeCostModel<'a> {
     prices_valid: bool,
     zero_price_exempt: bool,
     warned_unpriced: AtomicBool,
+    noted_subscription: AtomicBool,
     model_backed_retrieval: bool,
 }
 
@@ -53,6 +54,7 @@ impl<'a> RuntimeCostModel<'a> {
             prices_valid: config.cost.prices.values().all(|price| price.is_finite_nonnegative()),
             zero_price_exempt: zero_price_exempt(model),
             warned_unpriced: AtomicBool::new(false),
+            noted_subscription: AtomicBool::new(false),
         }
     }
 }
@@ -80,6 +82,7 @@ impl CostEstimateSource for RuntimeCostModel<'_> {
             self.prices_valid,
             self.zero_price_exempt,
             &self.warned_unpriced,
+            &self.noted_subscription,
         )?;
         let latency = self
             .observed_latency_ms
@@ -97,6 +100,7 @@ impl CostEstimateSource for RuntimeCostModel<'_> {
             self.prices_valid,
             self.zero_price_exempt,
             &self.warned_unpriced,
+            &self.noted_subscription,
         )?;
         Some((cost, default_latency_ms(CapabilityTarget::None)))
     }
@@ -165,6 +169,7 @@ fn estimate_cost(model: &ResolvedModel, pricing: &CostConfig, schema_bytes: usiz
         prices_valid,
         zero_price_exempt(model),
         &AtomicBool::new(false),
+        &AtomicBool::new(false),
     )
 }
 
@@ -201,6 +206,7 @@ fn estimate_cost_with_validity(
     prices_valid: bool,
     zero_price_exempt: bool,
     warned_unpriced: &AtomicBool,
+    noted_subscription: &AtomicBool,
 ) -> Option<CostEstimate> {
     // Even a local model cannot turn a configured but invalid tariff into a
     // zero-cost fallback. Normal config loading rejects these values; this
@@ -234,6 +240,16 @@ fn estimate_cost_with_validity(
     );
     let usd = match price {
         crate::llm::route_decision::UsagePrice::Priced(cost) => cost,
+        crate::llm::route_decision::UsagePrice::Subscription => {
+            if !noted_subscription.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    target: "providers::selection",
+                    "{}",
+                    crate::providers::selection::SUBSCRIPTION_BILLING_NOTICE
+                );
+            }
+            0.0
+        }
         crate::llm::route_decision::UsagePrice::Missing if zero_price_exempt => 0.0,
         crate::llm::route_decision::UsagePrice::Missing => {
             if !warned_unpriced.swap(true, Ordering::Relaxed)
@@ -485,6 +501,34 @@ mod tests {
             "{log}"
         );
         assert!(log.contains(r#"[cost.prices."deepseek/deepseek-v3.2"]"#), "{log}");
+    }
+
+    #[test]
+    fn subscription_row_is_admitted_once_with_no_token_charge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admission.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::fs::File::create(&path).unwrap())
+            .finish();
+        let config = crate::config::Config::default();
+        let selected = model(&config, "kimi-code", "kimi-for-coding");
+        tracing::subscriber::with_default(subscriber, || {
+            let observed = BTreeMap::new();
+            let costs = RuntimeCostModel::new(&selected, &config, &observed);
+            let (first, _) = costs.estimate_terminal().expect("test: subscription row is admitted");
+            let (second, _) = costs.estimate_terminal().expect("test: second estimate stays admitted");
+            assert_eq!(first.micro_usd, 0);
+            assert_eq!(second.micro_usd, 0);
+        });
+        let log = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            log.matches("subscription-billed, no per-token cost recorded").count(),
+            1,
+            "{log}"
+        );
+        assert!(!log.contains("G6 budget admission refuses"), "{log}");
     }
 
     #[test]
