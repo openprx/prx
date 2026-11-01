@@ -694,11 +694,12 @@ impl AgentCaseExecutor {
             };
         let mut run = run;
         let mut cleanup_unconfirmed = false;
+        let mut failure_detail = String::new();
         let (terminal, response) = match tokio::time::timeout(request.deadline, &mut run).await {
             Ok(Ok(text)) => (RunTerminal::Completed, text),
             Ok(Err(error)) => {
                 cleanup_unconfirmed = error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>();
-                // The error text can echo provider detail; only its class is kept.
+                failure_detail = executor_failure_detail(&error);
                 tracing::debug!(
                     run_id = request.run_id,
                     "evaluation agent run failed: {}",
@@ -804,6 +805,7 @@ impl AgentCaseExecutor {
             tokens: usage.tokens,
             cost_micros: usage.cost_micros,
             models_used: usage.models,
+            failure_detail,
         })
     }
 }
@@ -838,6 +840,21 @@ fn scratch_bytes(root: &Path) -> Result<u64, EvaluationError> {
         }
     }
     Ok(bytes)
+}
+
+/// Bounded chain of a failed `run_quiet`. The receipt keeps this text so a
+/// later red run names the site. The response body stays empty.
+fn executor_failure_detail(error: &anyhow::Error) -> String {
+    let mut text = format!("{error:#}");
+    const MAX_BYTES: usize = 400;
+    if text.len() > MAX_BYTES {
+        let mut end = MAX_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 fn error_class(error: &anyhow::Error) -> &'static str {

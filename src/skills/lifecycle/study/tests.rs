@@ -262,6 +262,7 @@ fn observed_receipt(
         tokens: Some(10),
         cost_micros: Some(0),
         models_used: vec![model],
+        failure_detail: String::new(),
     };
     let operation = ExperimentOperation::StudyTrial {
         input: StudyTrialInput {

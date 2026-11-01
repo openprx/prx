@@ -288,6 +288,7 @@ pub(super) fn good(request: &ExecutionRequest<'_>) -> RunObservation {
         tokens: Some(10),
         cost_micros: Some(5),
         models_used: vec!["eval-model".to_string()],
+        failure_detail: String::new(),
     }
 }
 
@@ -1063,6 +1064,39 @@ async fn environment_drift_between_runs_is_invalid() {
             reason: InvalidReason::EnvironmentMismatch,
             ..
         }
+    )));
+}
+
+#[tokio::test]
+async fn a_failing_executor_error_reaches_the_receipt() {
+    let fx = fixture();
+    let suite = validation_suite(2);
+    let marker = "could not switch to WAL";
+    let exec = Scripted::new(|request| {
+        let mut observation = good(request);
+        observation.terminal = RunTerminal::Failed;
+        observation.response.clear();
+        observation.failure_detail = marker.to_string();
+        if is_candidate(request) {
+            observation.environment_hash = "env-failed".to_string();
+        }
+        Ok(observation)
+    });
+    let receipt = run(&fx, &suite, &exec).await;
+    assert!(!receipt.outcome.is_pass());
+    let verified = fx
+        .store
+        .verify_evaluation(&receipt.record_id, None)
+        .expect("test: verify");
+    assert!(
+        verified
+            .cases
+            .iter()
+            .all(|case| case.run.failure_detail.contains(marker))
+    );
+    assert!(verified.cases.iter().any(|case| matches!(
+        &case.verdict,
+        CaseVerdict::Invalid { detail, .. } if detail.contains(marker)
     )));
 }
 

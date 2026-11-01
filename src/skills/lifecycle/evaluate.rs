@@ -192,6 +192,9 @@ pub struct RunObservation {
     pub cost_micros: Option<u64>,
     /// Models that actually served the run, from the ledger.
     pub models_used: Vec<String>,
+    /// `run_quiet` error chain when the executor returned `Failed` or
+    /// `Cancelled`. Empty when the run completed or timed out at the case cap.
+    pub failure_detail: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +223,10 @@ pub struct RunReceipt {
     pub tokens: Option<u64>,
     pub cost_micros: Option<u64>,
     pub models_used: Vec<String>,
+    /// Error chain from a failed executor. Omitted when empty so older
+    /// receipts keep their seal.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failure_detail: String,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -256,6 +263,7 @@ impl RunReceipt {
             tokens: observation.tokens,
             cost_micros: observation.cost_micros,
             models_used: observation.models_used.clone(),
+            failure_detail: observation.failure_detail.clone(),
         }
     }
 
@@ -277,6 +285,7 @@ impl RunReceipt {
             tokens: None,
             cost_micros: None,
             models_used: Vec::new(),
+            failure_detail: String::new(),
         }
     }
 }
@@ -319,7 +328,7 @@ impl CaseVerdict {
         matches!(self, Self::Pass)
     }
 
-    fn invalid(reason: InvalidReason, detail: impl Into<String>) -> Self {
+    pub(crate) fn invalid(reason: InvalidReason, detail: impl Into<String>) -> Self {
         let mut detail = detail.into();
         if detail.len() > MAX_DETAIL_BYTES {
             let mut end = MAX_DETAIL_BYTES;
@@ -704,7 +713,16 @@ pub(super) fn derive_verdict(input: &DeriveInput<'_>) -> CaseVerdict {
     let invalid = |reason, detail: &str| CaseVerdict::invalid(reason, detail);
     match run.terminal {
         RunTerminal::Completed => {}
-        RunTerminal::Failed => return invalid(InvalidReason::Partial, "the run did not reach a completed terminal"),
+        RunTerminal::Failed => {
+            return if run.failure_detail.is_empty() {
+                invalid(InvalidReason::Partial, "the run did not reach a completed terminal")
+            } else {
+                CaseVerdict::invalid(
+                    InvalidReason::Partial,
+                    format!("the run did not reach a completed terminal: {}", run.failure_detail),
+                )
+            };
+        }
         RunTerminal::TimedOut => return invalid(InvalidReason::TimedOut, "the run exceeded its elapsed ceiling"),
         RunTerminal::Cancelled => return invalid(InvalidReason::Cancelled, "the run was cancelled"),
     }
