@@ -74,6 +74,10 @@ pub struct AgentCaseExecutor {
     /// logical decision deadline as `World::run_task`. Absent everywhere else.
     #[cfg(test)]
     logical_clock: Option<Arc<crate::causal_tree::logical_clock::ManualClock>>,
+    /// Replaces `run_quiet` so a test can enter the Failed arm with a chosen
+    /// error. Production never sets it.
+    #[cfg(test)]
+    forced_run_error: Option<String>,
 }
 
 impl AgentCaseExecutor {
@@ -90,7 +94,18 @@ impl AgentCaseExecutor {
             controlled: None,
             #[cfg(test)]
             logical_clock: None,
+            #[cfg(test)]
+            forced_run_error: None,
         }
+    }
+
+    /// Drives the real Failed arm without calling the provider. The text is
+    /// the `run_quiet` error the receipt will redact and store.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_forced_run_error(mut self, detail: String) -> Self {
+        self.forced_run_error = Some(detail);
+        self
     }
 
     /// Acceptance cases share the world's logical decision clock. The clock is
@@ -119,6 +134,8 @@ impl AgentCaseExecutor {
             controlled: Some(Arc::new(controlled)),
             #[cfg(test)]
             logical_clock: None,
+            #[cfg(test)]
+            forced_run_error: None,
         })
     }
 
@@ -692,6 +709,11 @@ impl AgentCaseExecutor {
                 Some(clock) => Box::pin(crate::causal_tree::logical_clock::scope(clock, run)),
                 None => run,
             };
+        #[cfg(test)]
+        let run = self.forced_run_error.clone().map_or(run, |detail| {
+            Box::pin(async move { Err::<String, anyhow::Error>(anyhow::Error::msg(detail)) })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>
+        });
         let mut run = run;
         let mut cleanup_unconfirmed = false;
         let mut failure_detail = String::new();
@@ -699,6 +721,7 @@ impl AgentCaseExecutor {
             Ok(Ok(text)) => (RunTerminal::Completed, text),
             Ok(Err(error)) => {
                 cleanup_unconfirmed = error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>();
+                // Receipt keeps a redacted detail. Verdicts keep the error class only.
                 failure_detail = executor_failure_detail(&error);
                 tracing::debug!(
                     run_id = request.run_id,
@@ -842,10 +865,16 @@ fn scratch_bytes(root: &Path) -> Result<u64, EvaluationError> {
     Ok(bytes)
 }
 
-/// Bounded chain of a failed `run_quiet`. The receipt keeps this text so a
-/// later red run names the site. The response body stays empty.
+/// Bounded chain of a failed `run_quiet`. The receipt keeps this redacted
+/// text so a later red run names the site. Verdicts keep the error class
+/// only. The response body stays empty.
+///
+/// `redact_secrets` treats `https:` as a keyed pair and never sees a `?key=`
+/// inside that value, so URL query values are masked first.
 fn executor_failure_detail(error: &anyhow::Error) -> String {
-    let mut text = format!("{error:#}");
+    let shown = format!("{error:#}");
+    let urls = crate::security::redaction::redact_url_components(&shown);
+    let mut text = crate::security::redaction::redact_secrets(urls.as_ref());
     const MAX_BYTES: usize = 400;
     if text.len() > MAX_BYTES {
         let mut end = MAX_BYTES;

@@ -713,16 +713,7 @@ pub(super) fn derive_verdict(input: &DeriveInput<'_>) -> CaseVerdict {
     let invalid = |reason, detail: &str| CaseVerdict::invalid(reason, detail);
     match run.terminal {
         RunTerminal::Completed => {}
-        RunTerminal::Failed => {
-            return if run.failure_detail.is_empty() {
-                invalid(InvalidReason::Partial, "the run did not reach a completed terminal")
-            } else {
-                CaseVerdict::invalid(
-                    InvalidReason::Partial,
-                    format!("the run did not reach a completed terminal: {}", run.failure_detail),
-                )
-            };
-        }
+        RunTerminal::Failed => return invalid(InvalidReason::Partial, "the run did not reach a completed terminal"),
         RunTerminal::TimedOut => return invalid(InvalidReason::TimedOut, "the run exceeded its elapsed ceiling"),
         RunTerminal::Cancelled => return invalid(InvalidReason::Cancelled, "the run was cancelled"),
     }

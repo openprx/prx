@@ -6,13 +6,15 @@
 //! drive the real agent entry against a loopback model.
 
 use super::{activate, entry, owner};
+use crate::config::Config;
+use crate::security::redaction::{redact_secrets, redact_url_components};
 use crate::skills::lifecycle::evaluate::{CaseReceipt, rewrite_evaluation_for_test, seal_digest};
 use crate::skills::lifecycle::{
-    Arm, Bundle, CaseExecutor, CaseVerdict, CleanupState, EvalCase, EvalSplit, EvalSuite, EvaluationError,
-    EvaluationOutcome, EvaluationReceipt, EvaluationRequest, ExecutionRequest, ExperienceOutcome,
-    ExperienceTerminalFact, FixtureFile, FrozenSuite, HydrationFact, IncompleteReason, InstalledSkill, InvalidReason,
-    LifecycleError, NewRevision, RevisionId, RunObservation, RunTerminal, SideEffects, SkillId, SkillLifecycleStore,
-    SourceKind, SuiteBudget, Validator,
+    AccountingOwner, AgentCaseExecutor, Arm, Bundle, CaseExecutor, CaseVerdict, CleanupState, EvalCase, EvalSplit,
+    EvalSuite, EvaluationError, EvaluationOutcome, EvaluationReceipt, EvaluationRequest, ExecutionRequest,
+    ExperienceOutcome, ExperienceTerminalFact, FixtureFile, FrozenSuite, HydrationFact, IncompleteReason,
+    InstalledSkill, InvalidReason, LifecycleError, NewRevision, RevisionId, RunObservation, RunTerminal, SideEffects,
+    SkillId, SkillLifecycleStore, SourceKind, SuiteBudget, Validator,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -1071,33 +1073,82 @@ async fn environment_drift_between_runs_is_invalid() {
 async fn a_failing_executor_error_reaches_the_receipt() {
     let fx = fixture();
     let suite = validation_suite(2);
-    let marker = "could not switch to WAL";
-    let exec = Scripted::new(|request| {
-        let mut observation = good(request);
-        observation.terminal = RunTerminal::Failed;
-        observation.response.clear();
-        observation.failure_detail = marker.to_string();
-        if is_candidate(request) {
-            observation.environment_hash = "env-failed".to_string();
-        }
-        Ok(observation)
-    });
-    let receipt = run(&fx, &suite, &exec).await;
+    let secret = "fakegeminikey0123456789";
+    let path = "/Users/prx/scratch";
+    let head = format!("transport failed for https://example.test/v1beta?key={secret} path={path} ");
+    // Same order as `executor_failure_detail`: URL components, then secrets.
+    let redacted_head = redact_secrets(redact_url_components(&head).as_ref());
+    assert!(
+        redacted_head.len() < 399,
+        "test: prefix leaves the 400-byte cut inside the multi-byte character"
+    );
+    assert!(!redacted_head.contains(secret));
+    assert!(redacted_head.contains("[redacted]"));
+    assert!(redacted_head.contains(path));
+    // U+00E9 is two bytes. It starts at byte 399 of the redacted text, so byte
+    // 400 is inside the character and the cut must step back to 399.
+    let raw = format!(
+        "{head}{}\u{00e9}{}",
+        "x".repeat(399 - redacted_head.len()),
+        "y".repeat(40)
+    );
+    let redacted = redact_secrets(redact_url_components(&raw).as_ref());
+    assert!(redacted.len() > 400);
+    assert!(
+        !redacted.is_char_boundary(400),
+        "test: byte 400 sits inside a multi-byte character, redacted={redacted:?}"
+    );
+    let mut end = 400;
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    let expected = redacted[..end].to_string();
+    assert!(expected.len() < 400);
+    assert!(!expected.contains(secret));
+    assert!(expected.contains(path));
+    assert!(!expected.contains('\u{00e9}'));
+
+    let accounting = fx.tmp.path().join("operator");
+    fs::create_dir_all(&accounting).expect("test: operator workspace");
+    let executor = AgentCaseExecutor::new(
+        Config::default(),
+        fx.tmp.path().join("scratch"),
+        0.0,
+        AccountingOwner::new(accounting),
+    )
+    .with_forced_run_error(raw);
+    let receipt = fx
+        .store
+        .evaluate(
+            &request(&fx, &suite, EvalSplit::Validation),
+            &executor,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("test: evaluate");
     assert!(!receipt.outcome.is_pass());
     let verified = fx
         .store
         .verify_evaluation(&receipt.record_id, None)
         .expect("test: verify");
-    assert!(
-        verified
-            .cases
-            .iter()
-            .all(|case| case.run.failure_detail.contains(marker))
-    );
-    assert!(verified.cases.iter().any(|case| matches!(
-        &case.verdict,
-        CaseVerdict::Invalid { detail, .. } if detail.contains(marker)
-    )));
+    assert_ne!(verified.cases.len(), 0, "test: evaluation recorded no cases");
+    for case in &verified.cases {
+        assert_eq!(case.run.failure_detail, expected, "receipt keeps the redacted cut");
+        assert!(!case.run.failure_detail.contains(secret));
+        let CaseVerdict::Invalid { detail, .. } = &case.verdict else {
+            panic!("test: a failed run is invalid, got {:?}", case.verdict);
+        };
+        // These two sentences are the Failed and environment-mismatch details at bc260fb1.
+        assert!(
+            detail == "the run did not reach a completed terminal"
+                || detail == "the run environment differs from the first run of this evaluation",
+            "test: verdict detail changed from bc260fb1: {detail}"
+        );
+        assert!(!detail.contains(secret));
+        assert!(!detail.contains(path));
+        assert!(!detail.contains("[REDACTED]"));
+        assert!(!detail.contains("[redacted]"));
+    }
 }
 
 #[tokio::test]

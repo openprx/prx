@@ -427,14 +427,10 @@ pub(super) fn evaluator_invalidity(
             *environment_hash = Some(observation.environment_hash.clone());
             None
         }
-        Some(first) if *first != observation.environment_hash => {
-            let mut detail = "the run environment differs from the first run of this evaluation".to_string();
-            if !observation.failure_detail.is_empty() {
-                detail.push_str(": ");
-                detail.push_str(&observation.failure_detail);
-            }
-            Some(CaseVerdict::invalid(InvalidReason::EnvironmentMismatch, detail))
-        }
+        Some(first) if *first != observation.environment_hash => Some(CaseVerdict::Invalid {
+            reason: InvalidReason::EnvironmentMismatch,
+            detail: "the run environment differs from the first run of this evaluation".to_string(),
+        }),
         Some(_) => None,
     }
 }
