@@ -132,6 +132,7 @@ impl TerminalInputSink {
             producer: None,
         }
     }
+    #[cfg_attr(not(feature = "terminal-tui"), allow(dead_code))]
     pub(crate) const fn controlled(sender: ChatInputSender, producer: TerminalInputProducer) -> Self {
         Self {
             sender,

@@ -37,12 +37,17 @@ pub enum PluginCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Move one disabled plugin back into the active directory.
+    /// Ask a running gateway to enable one disabled plugin.
     ///
-    /// This calls the disabled-enable owner only. It does not write trust and
-    /// it does not change `[plugins] enabled`.
+    /// Dry-run does not connect. `--token-from-stdin --yes` posts to that
+    /// gateway. This command does not write trust and it does not change
+    /// `[plugins] enabled`.
     Enable {
         name: String,
+        #[arg(long)]
+        gateway_url: String,
+        #[arg(long)]
+        token_from_stdin: bool,
         #[arg(long)]
         yes: bool,
     },
@@ -57,7 +62,12 @@ pub async fn handle(config: &crate::config::Config, command: PluginCommand) -> a
             token_from_stdin,
             yes,
         } => super::cli_reload::reload(config, &name, &gateway_url, token_from_stdin, yes).await?,
-        PluginCommand::Enable { name, yes } => enable_disabled(config, &name, yes).await?,
+        PluginCommand::Enable {
+            name,
+            gateway_url,
+            token_from_stdin,
+            yes,
+        } => super::cli_reload::enable(config, &name, &gateway_url, token_from_stdin, yes).await?,
         other => run(config, other)?,
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -124,41 +134,6 @@ fn run(config: &crate::config::Config, command: PluginCommand) -> anyhow::Result
             Ok(serde_json::json!({"applied":yes,"name":name,"activation":"reload or restart the owning runtime"}))
         }
     }
-}
-async fn enable_disabled(config: &crate::config::Config, name: &str, yes: bool) -> anyhow::Result<serde_json::Value> {
-    if !yes {
-        return Ok(serde_json::json!({
-            "applied": false,
-            "name": name,
-            "enabled": false,
-            "activation": "disabled-enable only; pass --yes to move the disabled plugin and refresh this process"
-        }));
-    }
-    anyhow::ensure!(
-        config.autonomy.level != crate::security::AutonomyLevel::ReadOnly,
-        "read-only mode refuses plugin enable"
-    );
-    anyhow::ensure!(
-        config.plugins.enabled,
-        "plugins are disabled; enable does not change [plugins] enabled"
-    );
-    let runtime = crate::plugins::init_plugin_runtime(config, None)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("plugin runtime is not available; enable does not change [plugins] enabled"))?;
-    let security = crate::runtime::bootstrap::build_security_policy(config);
-    let tool = runtime.manage_tool(security);
-    let result = tool
-        .execute(serde_json::json!({"action": "enable", "name": name}))
-        .await?;
-    if !result.success {
-        let message = result.error.unwrap_or_else(|| "plugin enable failed".to_string());
-        anyhow::bail!(message);
-    }
-    let mut value: serde_json::Value = serde_json::from_str(&result.output)?;
-    if let Some(object) = value.as_object_mut() {
-        object.insert("applied".to_string(), serde_json::Value::Bool(true));
-    }
-    Ok(value)
 }
 
 fn inspect(source: &std::path::Path, policy: &PluginPolicy) -> anyhow::Result<serde_json::Value> {
@@ -251,9 +226,16 @@ mod tests {
         let disabled = disabled_fixture(temp.path(), "prx_fixture", b"test artifact, never executed");
         let config = config_for(temp.path(), true, true);
         let before = std::fs::read_to_string(&config.config_path).unwrap();
-        let value = enable_disabled(&config, "prx_fixture", false).await.unwrap();
+        let value = super::super::cli_reload::enable(&config, "prx_fixture", "http://127.0.0.1:1", false, false)
+            .await
+            .unwrap();
         assert_eq!(value.get("applied").and_then(serde_json::Value::as_bool), Some(false));
         assert_eq!(value.get("enabled").and_then(serde_json::Value::as_bool), Some(false));
+        let activation = value
+            .get("activation")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        assert!(!activation.contains("refresh this process"), "{activation}");
         assert!(disabled.join("plugin.toml").exists());
         assert!(!config.workspace_dir.join("plugins/prx_fixture").exists());
         let policy = PluginPolicy::from_config(&config).unwrap();
@@ -267,7 +249,9 @@ mod tests {
         let disabled = disabled_fixture(temp.path(), "prx_fixture", b"test artifact, never executed");
         let config = config_for(temp.path(), true, true);
         let before = std::fs::read_to_string(&config.config_path).unwrap();
-        let error = enable_disabled(&config, "prx_fixture", true).await.unwrap_err();
+        let error = super::super::cli_reload::enable(&config, "prx_fixture", "http://127.0.0.1:1", true, true)
+            .await
+            .unwrap_err();
         assert!(
             error.to_string().contains("read-only mode refuses plugin enable"),
             "{error}"
@@ -278,70 +262,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enable_yes_refuses_when_plugins_are_disabled_and_does_not_flip_the_flag() {
+    async fn enable_yes_without_a_token_does_not_flip_plugins_enabled() {
         let temp = tempfile::tempdir().unwrap();
-        let _disabled = disabled_fixture(temp.path(), "prx_fixture", b"test artifact, never executed");
+        let disabled = disabled_fixture(temp.path(), "prx_fixture", b"test artifact, never executed");
         let config = config_for(temp.path(), false, false);
         let before = std::fs::read_to_string(&config.config_path).unwrap();
-        let error = enable_disabled(&config, "prx_fixture", true).await.unwrap_err();
-        assert!(
-            error.to_string().contains("does not change [plugins] enabled"),
-            "{error}"
-        );
+        let error = super::super::cli_reload::enable(&config, "prx_fixture", "http://127.0.0.1:1", false, true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("token-from-stdin"), "{error}");
         // A plugins-only file is not a full stored config. The bytes are the
         // proof that enable did not rewrite `[plugins] enabled`.
         assert!(before.contains("enabled = false"), "{before}");
         assert_eq!(std::fs::read_to_string(&config.config_path).unwrap(), before);
-        assert!(!PluginPolicy::from_config(&config).unwrap().trust_file().exists());
-    }
-
-    #[tokio::test]
-    async fn enable_yes_does_not_write_trust_when_the_plugin_is_untrusted() {
-        let temp = tempfile::tempdir().unwrap();
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/voice-talk-realtime");
-        let disabled = disabled_fixture(
-            temp.path(),
-            "voice-talk-realtime",
-            &std::fs::read(fixture.join("plugin.wasm")).unwrap(),
-        );
-        std::fs::copy(fixture.join("plugin.toml"), disabled.join("plugin.toml")).unwrap();
-        let config = config_for(temp.path(), true, false);
-        let error = enable_disabled(&config, "voice-talk-realtime", true).await.unwrap_err();
-        assert!(error.to_string().contains("cannot be enabled"), "{error}");
         assert!(disabled.join("plugin.toml").exists());
-        assert!(!config.workspace_dir.join("plugins/voice-talk-realtime").exists());
+        assert!(!config.workspace_dir.join("plugins/prx_fixture").exists());
         assert!(!PluginPolicy::from_config(&config).unwrap().trust_file().exists());
     }
 
     #[tokio::test]
-    async fn enable_yes_moves_a_disabled_trusted_plugin_without_rewriting_trust_or_config() {
+    async fn enable_yes_posts_the_gateway_route_and_leaves_the_local_plugin_alone() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let temp = tempfile::tempdir().unwrap();
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/voice-talk-realtime");
-        let disabled = disabled_fixture(
-            temp.path(),
-            "voice-talk-realtime",
-            &std::fs::read(fixture.join("plugin.wasm")).unwrap(),
-        );
-        std::fs::copy(fixture.join("plugin.toml"), disabled.join("plugin.toml")).unwrap();
-        let config = config_for(temp.path(), true, false);
-        let before_config = std::fs::read_to_string(&config.config_path).unwrap();
-        let policy = PluginPolicy::from_config(&config).unwrap();
-        let material = PluginMaterial::read(&disabled).unwrap();
-        policy
-            .record(material.record_for(&material.manifest.permissions.required).unwrap())
-            .unwrap();
-        let trust_before = std::fs::read(policy.trust_file()).unwrap();
-        let value = enable_disabled(&config, "voice-talk-realtime", true).await.unwrap();
+        let disabled = disabled_fixture(temp.path(), "prx_fixture", b"test artifact, never executed");
+        let config = config_for(temp.path(), false, false);
+        let before = std::fs::read_to_string(&config.config_path).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let byte = stream.read_u8().await.unwrap();
+                request.push(byte);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                assert!(request.len() < 8192);
+            }
+            let header = String::from_utf8(request).unwrap();
+            let lower = header.to_ascii_lowercase();
+            assert!(
+                lower.starts_with("post /api/plugins/prx_fixture/enable http/1.1\r\n"),
+                "{header}"
+            );
+            assert!(lower.contains("authorization: bearer prx-test-token\r\n"), "{header}");
+            assert!(lower.contains("content-type: application/json"), "{header}");
+            let length = lower
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap();
+            let mut body = vec![0_u8; length];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(body, b"{}");
+            let response_body = r#"{"plugin":"prx_fixture","enabled":true,"generation":11}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let url =
+            super::super::cli_reload::plugin_endpoint(&format!("http://{address}"), "prx_fixture", "enable").unwrap();
+        let value = super::super::cli_reload::submit_enable(
+            url,
+            crate::config::manage::credentials::SecretString::new("prx-test-token".into()),
+        )
+        .await
+        .unwrap();
         assert_eq!(value.get("applied").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(value.get("generation").and_then(serde_json::Value::as_u64), Some(11));
         assert_eq!(value.get("enabled").and_then(serde_json::Value::as_bool), Some(true));
-        assert!(
-            config
-                .workspace_dir
-                .join("plugins/voice-talk-realtime/plugin.toml")
-                .exists()
-        );
-        assert!(!disabled.exists());
-        assert_eq!(std::fs::read(policy.trust_file()).unwrap(), trust_before);
-        assert_eq!(std::fs::read_to_string(&config.config_path).unwrap(), before_config);
+        server.await.unwrap();
+        assert!(disabled.join("plugin.toml").exists());
+        assert!(!config.workspace_dir.join("plugins/prx_fixture").exists());
+        assert!(!PluginPolicy::from_config(&config).unwrap().trust_file().exists());
+        assert_eq!(std::fs::read_to_string(&config.config_path).unwrap(), before);
     }
 }

@@ -1276,7 +1276,11 @@ trust record. `install` and `update` are high-risk operations: the approval
 names the plugin, the SHA-256 of its component and manifest and the
 `grant_permissions` list (which must include every required permission and only
 declared ones), and PRX records that grant in the operator trust file
-(`plugin-trust.json` beside `config.toml`, outside the workspace). `remove`
+(`plugin-trust.json` beside `config.toml`, outside the workspace). Optional
+`expected_sha256` and `expected_manifest_sha256` bind that call to the reviewed
+bytes: when either is present and differs from the bytes read while recording
+trust, install and update fail before a trust record or `plugins/<name>` is
+written. Omitting them leaves the previous callers valid. `remove`
 revokes it. Manually placed plugins, a `.prx-managed` marker, or any file under
 `<workspace>/plugins` confer nothing: a plugin without a matching record is
 listed with an error status and never compiled.
@@ -1845,10 +1849,15 @@ request. Success reports the gateway's new plugin generation. Trust/revoke
 alone does not reload a running owner; this command calls its existing reload
 endpoint and does not restart it or change configuration.
 
-`prx plugin enable NAME` previews a disabled-enable. Add `--yes` to move that
-disabled plugin into the active directory and refresh the process that ran the
-command. The command does not write trust and does not change `[plugins] enabled`.
-Read-only autonomy refuses the write.
+`prx plugin enable NAME --gateway-url https://gateway.example.com` previews a
+disabled-enable without reading a token or contacting the gateway. Add
+`--token-from-stdin --yes` and pipe an already-paired token to post
+`POST /api/plugins/NAME/enable` with body `{}`. The command reports the
+gateway's plugin generation. It does not build a local plugin runtime, does
+not write trust, and does not change `[plugins] enabled`. Read-only autonomy
+refuses before the request. A name absent from the loaded generation is not
+first-discoverable by enable or reload. HTTP is accepted only for numeric
+loopback addresses; redirects and ambient proxies are disabled.
 
 ### Bounded instruction experiments
 

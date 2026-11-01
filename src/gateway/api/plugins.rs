@@ -46,10 +46,12 @@ fn unavailable() -> (StatusCode, Json<Value>) {
     )
 }
 
+#[cfg(feature = "wasm-plugins")]
 fn bad_request(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()})))
 }
 
+#[cfg(feature = "wasm-plugins")]
 fn confirm_high_risk(confirmed: bool) -> Result<(), (StatusCode, Json<Value>)> {
     if confirmed {
         Ok(())
@@ -67,14 +69,17 @@ fn confirm_high_risk(confirmed: bool) -> Result<(), (StatusCode, Json<Value>)> {
 
 /// Map a manage-tool failure onto the HTTP status the console can show.
 ///
-/// Rollback text is matched before "already", and "already" before "not
-/// installed", because a rollback message can also say the refresh failed.
+/// Rollback and refresh failures are matched before approval, because a
+/// rollback message can also mention approval. "already" is matched before
+/// "not installed", because a conflict message can also say a plugin is not
+/// installed in the other directory.
+#[cfg(any(test, feature = "wasm-plugins"))]
 fn tool_error_status(error: &str) -> StatusCode {
     let lower = error.to_ascii_lowercase();
-    if lower.contains("read-only") || lower.contains("security policy") || lower.contains("approval") {
-        StatusCode::FORBIDDEN
-    } else if lower.contains("rolled back") || lower.contains("refresh failed") {
+    if lower.contains("rolled back") || lower.contains("refresh failed") {
         StatusCode::INTERNAL_SERVER_ERROR
+    } else if lower.contains("read-only") || lower.contains("security policy") || lower.contains("approval") {
+        StatusCode::FORBIDDEN
     } else if lower.contains("already enabled")
         || lower.contains("already installed")
         || lower.contains("already exists")
@@ -131,6 +136,7 @@ fn review_hashes(runtime: &crate::plugins::PluginRuntime, body: &InstallBody) ->
 }
 
 /// GET /api/plugins — list all loaded plugins with status.
+#[cfg_attr(not(feature = "wasm-plugins"), allow(clippy::unused_async))]
 pub async fn list_plugins(State(state): State<AppState>) -> impl IntoResponse {
     #[cfg(feature = "wasm-plugins")]
     {
@@ -160,6 +166,7 @@ pub async fn list_plugins(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /api/plugins/{name}/reload — reload a specific plugin.
+#[cfg_attr(not(feature = "wasm-plugins"), allow(clippy::unused_async))]
 pub async fn reload_plugin(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
     if let Err(error) = super::authorize_resource_mutation(&state, "gateway_api:plugins:reload", ResourceRiskLevel::Low)
     {
@@ -226,6 +233,7 @@ pub async fn disable_plugin(
 }
 
 /// POST /api/plugins/refresh — rebuild every eligible plugin. Not first discovery.
+#[cfg_attr(not(feature = "wasm-plugins"), allow(clippy::unused_async))]
 pub async fn refresh_plugins(State(state): State<AppState>, Json(_body): Json<EmptyBody>) -> impl IntoResponse {
     if let Err(error) =
         super::authorize_resource_mutation(&state, "gateway_api:plugins:refresh", ResourceRiskLevel::Low)
@@ -287,6 +295,7 @@ pub async fn remove_plugin_post(
     remove_named(state, name, query.confirm_high_risk).await
 }
 
+#[cfg_attr(not(feature = "wasm-plugins"), allow(clippy::unused_async))]
 async fn mutate_named(
     state: &AppState,
     operation: &str,
@@ -300,6 +309,20 @@ async fn mutate_named(
     #[cfg(feature = "wasm-plugins")]
     {
         if let Some(runtime) = state.plugin_runtime.clone() {
+            if action == "enable" {
+                match runtime.absent_from_loaded_generation(&name).await {
+                    Ok(true) => {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({
+                                "error": "not in the loaded generation; not first-discoverable by enable or reload"
+                            })),
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => return bad_request(error),
+                }
+            }
             return match execute_manage(state, &runtime, json!({"action": action, "name": name})).await {
                 Ok(value) => (StatusCode::OK, Json(value)),
                 Err(error) => error,
@@ -310,6 +333,7 @@ async fn mutate_named(
     unavailable()
 }
 
+#[cfg_attr(not(feature = "wasm-plugins"), allow(clippy::unused_async))]
 async fn remove_named(state: AppState, name: String, confirmed: bool) -> (StatusCode, Json<Value>) {
     if let Err(error) =
         super::authorize_resource_mutation(&state, "gateway_api:plugins:remove", ResourceRiskLevel::High)
@@ -334,6 +358,7 @@ async fn remove_named(state: AppState, name: String, confirmed: bool) -> (Status
 
 /// Install or update after authorization, a live runtime, confirmation, and
 /// the hash review. The manage tool is the only trust writer.
+#[cfg_attr(not(feature = "wasm-plugins"), allow(clippy::unused_async))]
 async fn install_or_update(
     state: AppState,
     body: InstallBody,
@@ -358,6 +383,7 @@ async fn install_or_update(
                 return error;
             }
             let action = if update { "update" } else { "install" };
+            // The reviewed hashes travel in the call that records trust.
             return match execute_manage(
                 &state,
                 &runtime,
@@ -365,6 +391,8 @@ async fn install_or_update(
                     "action": action,
                     "source": body.source,
                     "grant_permissions": body.permissions,
+                    "expected_sha256": body.sha256,
+                    "expected_manifest_sha256": body.manifest_sha256,
                 }),
             )
             .await
@@ -374,7 +402,15 @@ async fn install_or_update(
             };
         }
     }
-    let _ = (state, body, update, confirmed);
+    let _ = (
+        state,
+        body.source,
+        body.sha256,
+        body.manifest_sha256,
+        body.permissions,
+        update,
+        confirmed,
+    );
     unavailable()
 }
 
@@ -392,6 +428,14 @@ mod tests {
         );
         assert_eq!(
             tool_error_status("plugin 'a' refresh failed and enable was rolled back: boom"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            tool_error_status("plugin 'a' refresh failed and disable was rolled back: approval denied"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            tool_error_status("plugin 'a' refresh failed and remove was rolled back: boom"),
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(
@@ -765,6 +809,25 @@ mod runtime_tests {
     }
 
     #[tokio::test]
+    async fn enable_of_a_directory_dropped_after_startup_is_not_found() {
+        let (served, workspace) = serve_enabled(|_| {}).await;
+        std::fs::create_dir_all(workspace.join("plugins/dropped-after-start")).expect("test: drop directory");
+        let (status, body) = served
+            .call(
+                reqwest::Method::POST,
+                "/api/plugins/dropped-after-start/enable",
+                Some(serde_json::json!({})),
+            )
+            .await;
+        assert_eq!(status, 404, "{body}");
+        assert!(
+            body.contains("not in the loaded generation; not first-discoverable by enable or reload"),
+            "{body}"
+        );
+        assert!(workspace.join("plugins/dropped-after-start").is_dir());
+    }
+
+    #[tokio::test]
     async fn enable_partial_failure_is_an_error_and_rolls_back() {
         let (served, workspace) = serve_enabled(|workspace| {
             let dest = workspace.join(".plugins-disabled/not-the-manifest-name");
@@ -793,7 +856,16 @@ mod runtime_tests {
             .await;
         assert_eq!(status, 500, "{body}");
         assert!(body.contains("rolled back"), "{body}");
-        assert!(!body.contains("\"enabled\": true"), "{body}");
+        let parsed = json(&body);
+        assert!(
+            parsed.get("error").and_then(serde_json::Value::as_str).is_some(),
+            "{body}"
+        );
+        assert_ne!(
+            parsed.get("enabled").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "{body}"
+        );
         assert!(workspace.join(".plugins-disabled/not-the-manifest-name").is_dir());
         assert!(!workspace.join("plugins/not-the-manifest-name").exists());
     }
