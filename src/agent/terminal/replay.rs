@@ -17,6 +17,22 @@ use std::sync::Arc;
 const SIGNATURE_FIELD: &str = "terminal_replay_mac_v1";
 const BINDING_FIELD: &str = "terminal_replay_v1";
 const MAC_DOMAIN: &[u8] = b"terminal-replay-v1";
+
+/// `serde_json` 1.0 prints some finite floats with a spelling its own parser
+/// does not restore. The stored payload is parsed again on verify, so the MAC
+/// has to cover that restored spelling. One extra parse reaches it; a second
+/// parse must not move the bytes.
+fn canonical_json_value(value: &Value) -> anyhow::Result<Value> {
+    let encoded = serde_json::to_vec(value)?;
+    let parsed: Value = serde_json::from_slice(&encoded)?;
+    let stable = serde_json::to_vec(&parsed)?;
+    let confirmed: Value = serde_json::from_slice(&stable)?;
+    anyhow::ensure!(
+        serde_json::to_vec(&confirmed)? == stable,
+        "terminal replay payload is not canonically stable"
+    );
+    Ok(confirmed)
+}
 const AUXILIARY_DOMAIN: &[u8] = b"terminal-replay-served-auxiliary-v1";
 const SOURCE_DOMAIN: &[u8] = b"terminal-replay-source-v1";
 const CLAIM_DOMAIN: &[u8] = b"terminal-replay-claim-v1";
@@ -523,6 +539,8 @@ impl PreparedReplay {
             "terminal replay binding already exists"
         );
         object.insert(BINDING_FIELD.to_owned(), serde_json::to_value(&self.0)?);
+        let stable = canonical_json_value(payload)?;
+        *payload = stable;
         let mac = hex::encode(key.hmac(KeyDomain::TerminalClaim, &[MAC_DOMAIN, &serde_json::to_vec(payload)?]));
         payload
             .as_object_mut()
@@ -1211,5 +1229,95 @@ mod collection_decline_tests {
                 "missing {field}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod canonical_mac_tests {
+    use super::*;
+
+    fn binding() -> ReplayBinding {
+        ReplayBinding {
+            version: 1,
+            collected_pending: None,
+            collected_declined: None,
+            router_read: None,
+            served_auxiliary: None,
+            parent: None,
+            operator: None,
+            workspace_id: "prx-workspace".to_owned(),
+            store_workspace_id: "prx-store".to_owned(),
+            owner_id: "prx-owner".to_owned(),
+            session_key: "prx-session".to_owned(),
+            run_id: "prx-run".to_owned(),
+            terminal_id: "prx-run".to_owned(),
+            terminal_scope: serde_json::json!({}),
+            source: EventBinding {
+                event_id: "prx-source".to_owned(),
+                mac: "aa".repeat(32),
+            },
+            hops: vec![ReplayHop {
+                decision_id: "prx-decision".to_owned(),
+                digest: "bb".repeat(32),
+            }],
+            claim: Some(EventBinding {
+                event_id: "prx-claim".to_owned(),
+                mac: "cc".repeat(32),
+            }),
+            assistant: None,
+            fixed_close: false,
+            run_capabilities: Vec::new(),
+            resume_claim: None,
+        }
+    }
+
+    fn stored_mac_verifies(payload: &mut Value) {
+        let key = DecisionKey::ephemeral();
+        PreparedReplay(binding())
+            .seal(key.as_ref(), payload, None)
+            .expect("seal");
+        let stored = serde_json::to_string(payload).expect("store");
+        let mut loaded: Value = serde_json::from_str(&stored).expect("load");
+        let signature = loaded
+            .as_object_mut()
+            .expect("object")
+            .remove(SIGNATURE_FIELD)
+            .expect("signature");
+        let tag = hex::decode(signature.as_str().expect("hex")).expect("decode");
+        assert!(
+            key.verify_hmac(
+                KeyDomain::TerminalClaim,
+                &[MAC_DOMAIN, &serde_json::to_vec(&loaded).expect("bytes")],
+                &tag
+            ),
+            "stored payload must verify"
+        );
+    }
+
+    #[test]
+    fn non_round_tripping_cost_still_verifies_after_storage() {
+        let cost = serde_json::json!(0.002_917_600_000_000_000_2_f64);
+        let spelled = serde_json::to_string(&cost).expect("spell");
+        let reparsed: Value = serde_json::from_str(&spelled).expect("parse");
+        assert_ne!(
+            serde_json::to_string(&reparsed).expect("respell"),
+            spelled,
+            "fixture must be a float spelling the parser does not restore"
+        );
+        let mut payload = serde_json::json!({
+            "terminal_id": "prx-run",
+            "usage_settlement": {"cost_usd": 0.002_917_600_000_000_000_2_f64}
+        });
+        stored_mac_verifies(&mut payload);
+    }
+
+    #[test]
+    fn stable_payload_still_verifies_after_storage() {
+        let mut payload = serde_json::json!({
+            "terminal_id": "prx-run",
+            "usage_settlement": {"cost_usd": 2.0_f64},
+            "note": "prx stable"
+        });
+        stored_mac_verifies(&mut payload);
     }
 }
