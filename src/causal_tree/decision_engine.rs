@@ -409,7 +409,7 @@ impl EngineDecision {
             || self.state.routing_input.as_str() != source_query
             || !self.state.routing_input.supports_selected_read_query()
             || sources.len() != 1
-            || Instant::now() >= self.deadline
+            || super::logical_clock::now() >= self.deadline
         {
             return Err(RetrievalIssueError);
         }
@@ -486,7 +486,7 @@ impl EngineDecision {
             || families
                 .iter()
                 .any(|family| !super::candidate_generator::DiscoveryFamilies::supports(*family))
-            || Instant::now() >= self.deadline
+            || super::logical_clock::now() >= self.deadline
         {
             return Err(DiscoveryIssueError);
         }
@@ -532,7 +532,7 @@ impl EngineDecision {
         } else {
             exact_refs
         };
-        if Instant::now() >= self.deadline {
+        if super::logical_clock::now() >= self.deadline {
             return Err(DiscoveryIssueError);
         }
         Ok(DiscoveredRefs::from_selected_search(refs))
@@ -728,7 +728,7 @@ impl CausalDecisionEngine {
             .any(|step| step.kind() == ObservedStepKind::Retrieve && step.status() == ObservedStepStatus::Ok);
         let selection = if inputs.allow_terminal_answer
             && (has_retrieved_evidence || exhausted_discovery || exhausted_retrieval)
-            && Instant::now() < inputs.deadline
+            && super::logical_clock::now() < inputs.deadline
         {
             passed(CausalActionKind::Answer).map(|answer| Selection::Commit {
                 candidate_id: answer.candidate_id().clone(),
@@ -814,7 +814,7 @@ impl CausalDecisionEngine {
         adapter
             .filter(|_| {
                 !inputs.terminal_only
-                    && Instant::now() < inputs.deadline
+                    && super::logical_clock::now() < inputs.deadline
                     && trusted.delivery.interactive
                     && trusted.delivery.approval_channel
             })
@@ -971,7 +971,7 @@ impl CausalDecisionEngine {
                 );
             }
         }
-        if matches!(candidates, CandidateSet::Legal { .. }) && Instant::now() < inputs.deadline {
+        if matches!(candidates, CandidateSet::Legal { .. }) && super::logical_clock::now() < inputs.deadline {
             let compiled = QuestionCompiler::compile(
                 &state,
                 &candidates,
@@ -989,20 +989,20 @@ impl CausalDecisionEngine {
             let outcome = if inputs.inject_builtin_failure {
                 Ok(Err(DecisionError::Unavailable))
             } else {
-                tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(inputs.deadline),
+                super::logical_clock::timeout_at_std(
+                    inputs.deadline,
                     inputs.prediction.predict(compiled.request(), &lineage(trusted)),
                 )
                 .await
             };
             #[cfg(not(test))]
-            let outcome = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(inputs.deadline),
+            let outcome = super::logical_clock::timeout_at_std(
+                inputs.deadline,
                 inputs.prediction.predict(compiled.request(), &lineage(trusted)),
             )
             .await;
             match outcome {
-                Ok(Ok(result)) if Instant::now() < inputs.deadline => {
+                Ok(Ok(result)) if super::logical_clock::now() < inputs.deadline => {
                     let terminal_cause = inputs.prediction.terminal_fallback_cause(&result);
                     if let Some(cause) = terminal_cause {
                         // Keep the factory result for truthful attempt and
@@ -1042,11 +1042,7 @@ impl CausalDecisionEngine {
             #[cfg(test)]
             if prediction.is_some() {
                 if let Some(pause) = inputs.after_prediction_pause {
-                    let _ = tokio::time::timeout_at(
-                        tokio::time::Instant::from_std(inputs.deadline),
-                        tokio::time::sleep(pause),
-                    )
-                    .await;
+                    let _ = super::logical_clock::timeout_at_std(inputs.deadline, tokio::time::sleep(pause)).await;
                 }
             }
         } else if matches!(candidates, CandidateSet::Legal { .. }) {
@@ -1070,11 +1066,12 @@ impl CausalDecisionEngine {
             stage_cap: Duration::from_millis(u64::from(inputs.config.rehearsal.timeout_ms)),
             deadline: tokio::time::Instant::from_std(inputs.deadline),
         };
-        let rehearsal = if prediction.is_some() && fallback_cause.is_none() && Instant::now() < inputs.deadline {
-            BoundedRehearsal::run(&all, inputs.catalog, inputs.rehearsal_ports, &rehearsal_context).await?
-        } else {
-            BTreeMap::new()
-        };
+        let rehearsal =
+            if prediction.is_some() && fallback_cause.is_none() && super::logical_clock::now() < inputs.deadline {
+                BoundedRehearsal::run(&all, inputs.catalog, inputs.rehearsal_ports, &rehearsal_context).await?
+            } else {
+                BTreeMap::new()
+            };
         let remaining_budget = remaining_budget(inputs, &state);
         let post_rehearsal =
             HardGates::apply_with_remaining_budget(&state, inputs.catalog, &all, inputs.gates, remaining_budget)?;
@@ -1085,11 +1082,12 @@ impl CausalDecisionEngine {
         let mut scores = BTreeMap::new();
         let mut scored_count = 0usize;
         let (mut selection, mut exploration_propensities) = if let Some(evidence) = evidence.as_ref() {
-            let weights = if prediction.is_some() && fallback_cause.is_none() && Instant::now() < inputs.deadline {
-                Some(ScorerWeights::effective(&inputs.config.scoring)?)
-            } else {
-                None
-            };
+            let weights =
+                if prediction.is_some() && fallback_cause.is_none() && super::logical_clock::now() < inputs.deadline {
+                    Some(ScorerWeights::effective(&inputs.config.scoring)?)
+                } else {
+                    None
+                };
             let CandidateSet::Legal {
                 candidates: admitted, ..
             } = &candidates
@@ -1100,7 +1098,10 @@ impl CausalDecisionEngine {
                 let Some(features) = evidence.candidates.get(candidate.candidate_id()) else {
                     return Err(EngineError::CandidateDrift);
                 };
-                let score = if let Some(weights) = weights.as_ref().filter(|_| Instant::now() < inputs.deadline) {
+                let score = if let Some(weights) = weights
+                    .as_ref()
+                    .filter(|_| super::logical_clock::now() < inputs.deadline)
+                {
                     scored_count = scored_count.saturating_add(1);
                     let cost = candidate.estimated_cost().ok_or(EngineError::MissingEstimate)?;
                     let latency = candidate.estimated_latency_ms().ok_or(EngineError::MissingEstimate)?;
@@ -1132,13 +1133,13 @@ impl CausalDecisionEngine {
                 };
                 scores.insert(candidate.candidate_id().clone(), score);
             }
-            let selection_evidence = if Instant::now() >= inputs.deadline {
+            let selection_evidence = if super::logical_clock::now() >= inputs.deadline {
                 fallback_cause.get_or_insert(FallbackCause::DeadlineExceeded);
                 terminal_evidence(&candidates)
             } else {
                 evidence.clone()
             };
-            if prediction.is_some() && fallback_cause.is_none() && Instant::now() < inputs.deadline {
+            if prediction.is_some() && fallback_cause.is_none() && super::logical_clock::now() < inputs.deadline {
                 CausalSelector::select_with_exploration(
                     &candidates,
                     &scores,
@@ -1200,7 +1201,7 @@ impl CausalDecisionEngine {
                 BTreeMap::new(),
             )
         };
-        if Instant::now() >= inputs.deadline
+        if super::logical_clock::now() >= inputs.deadline
             && matches!(selection, Selection::Commit { .. } | Selection::Recover { .. })
         {
             fallback_cause.get_or_insert(FallbackCause::DeadlineExceeded);
@@ -1252,9 +1253,15 @@ fn remaining_budget<P: PredictionPort>(
     state: &CausalState,
 ) -> super::state::TurnBudgets {
     let mut remaining = state.trusted.parts().budgets;
-    remaining.latency_ms = remaining
-        .latency_ms
-        .min(u64::try_from(inputs.deadline.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX));
+    remaining.latency_ms = remaining.latency_ms.min(
+        u64::try_from(
+            inputs
+                .deadline
+                .saturating_duration_since(super::logical_clock::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX),
+    );
     if let Some((tokens, micro_usd)) = inputs.prediction.remaining_budget() {
         remaining.tokens = remaining.tokens.min(tokens);
         remaining.micro_usd = remaining.micro_usd.min(micro_usd);

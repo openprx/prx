@@ -123,7 +123,9 @@ impl Loopback {
         let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let hook: Arc<Mutex<Option<Hook>>> = Arc::new(Mutex::new(None));
         let (sink, hook_slot) = (Arc::clone(&bodies), Arc::clone(&hook));
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
         let server = tokio::spawn(async move {
+            let _ = ready_tx.send(true);
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
@@ -207,6 +209,12 @@ impl Loopback {
                 });
             }
         });
+        if !*ready_rx.borrow() {
+            tokio::time::timeout(std::time::Duration::from_secs(30), ready_rx.changed())
+                .await
+                .expect("test: accept loop did not start")
+                .expect("test: accept loop ended");
+        }
         Self {
             addr,
             bodies,
@@ -339,6 +347,9 @@ pub(super) struct World {
     pub owner: OwnerScope,
     pub store: Arc<SkillLifecycleStore>,
     pub loopback: Loopback,
+    /// Decision deadlines on this world's runs elapse only when a test advances
+    /// this clock. The latency budget itself is unchanged.
+    clock: std::sync::Arc<crate::causal_tree::logical_clock::ManualClock>,
 }
 
 impl World {
@@ -362,6 +373,7 @@ impl World {
             owner,
             store,
             loopback,
+            clock: crate::causal_tree::logical_clock::ManualClock::new(),
         }
     }
 
@@ -420,17 +432,34 @@ impl World {
 
     /// One task through the real single-shot agent entry (`prx agent -m`).
     pub async fn run_task(&self, config: &Config, prompt: &str) -> anyhow::Result<String> {
-        let run = crate::agent::run(
-            config.clone(),
-            Some(prompt.to_string()),
-            None,
-            None,
-            0.0,
-            tokio_util::sync::CancellationToken::new(),
+        let run = crate::causal_tree::logical_clock::scope(
+            std::sync::Arc::clone(&self.clock),
+            crate::agent::run(
+                config.clone(),
+                Some(prompt.to_string()),
+                None,
+                None,
+                0.0,
+                tokio_util::sync::CancellationToken::new(),
+            ),
         );
         tokio::time::timeout(std::time::Duration::from_secs(60), run)
             .await
             .map_err(|_| anyhow::anyhow!("the agent run did not finish within 60s"))?
+    }
+
+    /// One plain turn whose decision sleeps 600 ms of wall time after the
+    /// deadline is captured. The logical budget is not spent.
+    pub async fn run_plain_under_wall_stall(&self, config: &Config) -> anyhow::Result<String> {
+        self.clock.arm_wall_stall(std::time::Duration::from_millis(600));
+        self.run_task(config, "Say hello.").await
+    }
+
+    /// One plain turn that spends the 500 ms logical latency budget as soon as
+    /// the deadline is captured.
+    pub async fn run_plain_after_logical_budget(&self, config: &Config) -> anyhow::Result<String> {
+        self.clock.arm_logical_advance(std::time::Duration::from_millis(500));
+        self.run_task(config, "Say hello.").await
     }
 
     /// [`Self::run_task`] for a task that selects a catalog skill, with the
@@ -457,6 +486,7 @@ impl World {
             0.0,
             AccountingOwner::new(self.operator_ws.clone()),
         )
+        .with_logical_clock(std::sync::Arc::clone(&self.clock))
     }
 
     /// Every experience record in the owner store, oldest first.
@@ -490,31 +520,53 @@ impl World {
     /// terminal is joined. The terminal creates these records itself, so the
     /// run has finished by the time one exists.
     pub async fn uncovered_runs(&self, expected: usize) -> Vec<SkillExperience> {
-        for _ in 0..200 {
-            let runs: Vec<SkillExperience> = self
-                .experiences()
-                .into_iter()
-                .filter(|record| record.hydration_receipts.is_empty() && record.selection_receipts.is_empty())
-                .collect();
-            if runs.len() == expected && runs.iter().all(|record| record.terminal.is_some()) {
+        let ready = |record: &SkillExperience| {
+            record.hydration_receipts.is_empty() && record.selection_receipts.is_empty() && record.terminal.is_some()
+        };
+        self.wait_for_experiences(expected, ready, "uncovered").await
+    }
+
+    async fn wait_for_experiences(
+        &self,
+        expected: usize,
+        ready: impl Fn(&SkillExperience) -> bool,
+        label: &str,
+    ) -> Vec<SkillExperience> {
+        let activity = crate::skills::lifecycle::receipts::lifecycle_activity();
+        let cap = tokio::time::sleep(std::time::Duration::from_secs(60));
+        tokio::pin!(cap);
+        loop {
+            let runs: Vec<SkillExperience> = self.experiences().into_iter().filter(&ready).collect();
+            if runs.len() == expected {
                 return runs;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let ping = activity.notified();
+            let runs: Vec<SkillExperience> = self.experiences().into_iter().filter(&ready).collect();
+            if runs.len() == expected {
+                return runs;
+            }
+            tokio::select! {
+                biased;
+                () = ping => {}
+                () = &mut cap => {
+                    let seen: Vec<String> = self
+                        .experiences()
+                        .iter()
+                        .map(|r| {
+                            format!(
+                                "task={} run={:?} sel={} hyd={} term={:?}",
+                                r.task_id,
+                                r.correlation.run_id,
+                                r.selection_receipts.len(),
+                                r.hydration_receipts.len(),
+                                r.terminal.as_ref().map(|t| t.outcome)
+                            )
+                        })
+                        .collect();
+                    panic!("test: {expected} {label} runs did not appear: {seen:#?}");
+                }
+            }
         }
-        let seen: Vec<String> = self
-            .experiences()
-            .iter()
-            .map(|r| {
-                format!(
-                    "task={} hyd={} sel={} term={:?}",
-                    r.task_id,
-                    r.hydration_receipts.len(),
-                    r.selection_receipts.len(),
-                    r.terminal.as_ref().map(|t| t.outcome)
-                )
-            })
-            .collect();
-        panic!("test: {expected} uncovered runs did not appear: {seen:#?}");
     }
 
     /// The experiences of `expected` real agent runs (they carry a run id and
@@ -522,32 +574,10 @@ impl World {
     /// the terminal join is awaited by the run itself. The selection receipt is
     /// written off the turn path and depends on retrieval, so it is not waited for.
     pub async fn production_runs(&self, expected: usize) -> Vec<SkillExperience> {
-        for _ in 0..200 {
-            let runs: Vec<SkillExperience> = self
-                .experiences()
-                .into_iter()
-                .filter(|record| record.correlation.run_id.is_some() && !record.hydration_receipts.is_empty())
-                .collect();
-            if runs.len() == expected && runs.iter().all(|record| record.terminal.is_some()) {
-                return runs;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        let seen: Vec<String> = self
-            .experiences()
-            .iter()
-            .map(|r| {
-                format!(
-                    "task={} run={:?} sel={} hyd={} term={:?}",
-                    r.task_id,
-                    r.correlation.run_id,
-                    r.selection_receipts.len(),
-                    r.hydration_receipts.len(),
-                    r.terminal.as_ref().map(|t| t.outcome)
-                )
-            })
-            .collect();
-        panic!("test: {expected} settled production runs did not appear: {seen:#?}");
+        let ready = |record: &SkillExperience| {
+            record.correlation.run_id.is_some() && !record.hydration_receipts.is_empty() && record.terminal.is_some()
+        };
+        self.wait_for_experiences(expected, ready, "settled production").await
     }
 }
 
@@ -575,15 +605,32 @@ pub(super) fn selection_count(store: &SkillLifecycleStore) -> usize {
     })
 }
 
-/// Waits (bounded) until more than `before` experiences hold a selection receipt.
-pub(super) fn wait_for_selection_beyond(store: &SkillLifecycleStore, before: usize) -> bool {
-    for _ in 0..100 {
-        if selection_count(store) > before {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(30));
+/// Waits until more than `before` experiences hold a selection receipt.
+/// The 60 s bound is a failure cap. The receipt write is the readiness signal.
+pub(super) fn wait_for_selection_beyond(store: &SkillLifecycleStore, before: usize) {
+    if selection_count(store) > before {
+        return;
     }
-    false
+    let activity = crate::skills::lifecycle::receipts::lifecycle_activity();
+    let wait = async {
+        let cap = tokio::time::sleep(std::time::Duration::from_secs(60));
+        tokio::pin!(cap);
+        loop {
+            if selection_count(store) > before {
+                return;
+            }
+            let ping = activity.notified();
+            if selection_count(store) > before {
+                return;
+            }
+            tokio::select! {
+                biased;
+                () = ping => {}
+                () = &mut cap => panic!("test: selection receipt did not arrive"),
+            }
+        }
+    };
+    tokio::runtime::Handle::current().block_on(wait);
 }
 
 // ---- suites -----------------------------------------------------------------------

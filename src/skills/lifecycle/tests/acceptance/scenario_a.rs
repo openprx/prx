@@ -343,8 +343,8 @@ async fn a_disabled_lifecycle_records_no_work_even_with_a_store_present() {
         .run_task(&config, "TASK[release] Write the release notes for build 7.")
         .await
         .expect("test: run");
-    // Let any (wrongly) spawned work settle before looking.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Any wrongly spawned receipt worker has finished before the absence check.
+    crate::skills::lifecycle::receipts::drain_all_background_for_test().await;
     assert!(world.experiences().is_empty(), "{:?}", world.experiences());
 }
 
@@ -442,4 +442,29 @@ async fn a_new_skill_never_overwrites_an_unmanaged_directory_of_the_same_name() 
         own_text,
         "the unmanaged directory is untouched"
     );
+}
+
+#[tokio::test]
+async fn a_wall_stall_past_the_latency_budget_still_answers() {
+    let world = World::new().await;
+    let config = world.production_config(SkillsLifecycleModeConfig::Auto, &[]);
+    let answer = world
+        .run_plain_under_wall_stall(&config)
+        .await
+        .expect("test: 600 ms of wall time does not spend the logical budget");
+    assert_eq!(answer, "plain answer");
+}
+
+#[tokio::test]
+async fn advancing_the_logical_latency_budget_refuses_before_a_plain_answer() {
+    let world = World::new().await;
+    let config = world.production_config(SkillsLifecycleModeConfig::Auto, &[]);
+    let reply = world
+        .run_plain_after_logical_budget(&config)
+        .await
+        .expect("test: a spent logical budget completes as a refusal");
+    // The spent budget skips Answer. This CLI turn is not interactive, so the
+    // terminal is Refuse. `render_terminal_directive` renders that as the
+    // policy sentence. The wall-stall sibling still receives `plain answer`.
+    assert_eq!(reply, "I can't complete this request under the current policy.");
 }

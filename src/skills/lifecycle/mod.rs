@@ -44,6 +44,7 @@ mod gate_judge;
 mod generation;
 mod identity_evidence;
 mod journal;
+mod judge_deadline;
 mod knowledge;
 mod lesson_delivery;
 mod manifest;

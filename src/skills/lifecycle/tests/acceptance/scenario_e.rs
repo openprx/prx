@@ -153,3 +153,14 @@ async fn the_cli_refuses_to_publish_in_draft_only_and_leaves_the_binding_alone()
         "{listed}"
     );
 }
+
+#[tokio::test]
+async fn a_wall_stall_past_the_latency_budget_still_answers() {
+    let world = World::new().await;
+    let config = world.production_config(SkillsLifecycleModeConfig::Auto, &[]);
+    let answer = world
+        .run_plain_under_wall_stall(&config)
+        .await
+        .expect("test: 600 ms of wall time does not spend the logical budget");
+    assert_eq!(answer, "plain answer");
+}

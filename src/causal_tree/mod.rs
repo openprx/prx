@@ -26,6 +26,7 @@ pub mod evaluate;
 pub(crate) mod exploration;
 pub(crate) mod gates;
 pub mod ids;
+pub(crate) mod logical_clock;
 pub(crate) mod outcome;
 pub mod projection;
 pub(crate) mod questions;

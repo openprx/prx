@@ -488,6 +488,12 @@ impl SkillsLifecycleService {
         self.store.owner_scope()
     }
 
+    /// The store `gate_proposal` runs on. Tests key a judge clock by its address.
+    #[cfg(test)]
+    pub(crate) fn store_for_test(&self) -> &SkillLifecycleStore {
+        &self.store
+    }
+
     #[must_use]
     pub const fn mode(&self) -> LifecycleMode {
         self.settings.mode

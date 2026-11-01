@@ -11,8 +11,9 @@ use crate::skills::lifecycle::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 mod admission;
 mod adoption;
 mod adoption_contract;
@@ -33,6 +34,11 @@ struct Server {
     h2_mode: Arc<AtomicUsize>,
     judge_mode: Arc<AtomicUsize>,
     judge_count: Arc<AtomicUsize>,
+    /// Wall delay before a gate request is counted. Forces the old 50 ms
+    /// judge deadline to lose the race.
+    judge_delay_ms: Arc<AtomicU64>,
+    /// Signaled after `judge_count` increments.
+    judge_arrived: Arc<Notify>,
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<Result<()>>,
 }
@@ -57,6 +63,10 @@ impl Server {
         let judge_behavior = judge_mode.clone();
         let judge_count = Arc::new(AtomicUsize::new(0));
         let judges = judge_count.clone();
+        let judge_delay_ms = Arc::new(AtomicU64::new(0));
+        let judge_delay = judge_delay_ms.clone();
+        let judge_arrived = Arc::new(Notify::new());
+        let judge_seen = judge_arrived.clone();
         let editor_barrier = Arc::new(tokio::sync::Barrier::new(2));
         let editor_count = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn(async move {
@@ -66,7 +76,7 @@ impl Server {
                     biased;
                     () = stop.cancelled() => { connections.abort_all(); while connections.join_next().await.is_some() {} return Ok(()); },
                     accepted = listener.accept() => {
-                        let (mut socket, _) = accepted?; let count = counter.clone(); let captured = captured.clone(); let large = large.clone(); let h2_behavior = h2_behavior.clone(); let editor_barrier = editor_barrier.clone(); let editor_count = editor_count.clone(); let judge_behavior = judge_behavior.clone(); let judges = judges.clone();
+                        let (mut socket, _) = accepted?; let count = counter.clone(); let captured = captured.clone(); let large = large.clone(); let h2_behavior = h2_behavior.clone(); let editor_barrier = editor_barrier.clone(); let editor_count = editor_count.clone(); let judge_behavior = judge_behavior.clone(); let judges = judges.clone(); let judge_delay = judge_delay.clone(); let judge_seen = judge_seen.clone();
                         connections.spawn(async move {
                             let mut bytes = Vec::new(); let mut chunk = [0_u8; 4096];
                             let body = loop {
@@ -95,7 +105,10 @@ impl Server {
                             let is_gate = messages.iter().any(|message| message["role"] == "system"
                                 && message["content"].as_str().is_some_and(|text|text.starts_with("You review one proposed change to an instruction skill")));
                             if is_gate {
+                                let delay_ms = judge_delay.load(Ordering::SeqCst);
+                                if delay_ms > 0 { tokio::time::sleep(Duration::from_millis(delay_ms)).await; }
                                 let number = judges.fetch_add(1, Ordering::SeqCst);
+                                judge_seen.notify_waiters();
                                 if judge_behavior.load(Ordering::SeqCst) == 2 { std::future::pending::<()>().await; }
                                 if judge_behavior.load(Ordering::SeqCst) == 4 && number == 0 {
                                     let error = r#"{"error":{"message":"fixture judge transient unavailable"}}"#;
@@ -227,6 +240,8 @@ impl Server {
             h2_mode,
             judge_mode,
             judge_count,
+            judge_delay_ms,
+            judge_arrived,
             cancel,
             task,
         })

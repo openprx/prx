@@ -1256,7 +1256,7 @@ impl SkillLifecycleStore {
                     proposal: &proposal,
                     metrics: &metrics,
                 };
-                Some(consult_judge(judge, &brief, request.policy, cancel).await?)
+                Some(consult_judge(judge, &brief, request.policy, cancel, judge_limit(self, request.policy)).await?)
             }
             _ => None,
         };
@@ -1633,6 +1633,21 @@ fn merged_usage(reported: ReportedUsage, tally: ReportedUsage) -> ReportedUsage 
     }
 }
 
+/// The policy deadline, plus the test clock installed on this store.
+#[cfg(test)]
+fn judge_limit(store: &SkillLifecycleStore, policy: &GatePolicy) -> super::judge_deadline::Limit {
+    // The stage worker is a spawned task. The clock is stored against the
+    // store address so this call sees the test's clock.
+    super::judge_deadline::Limit::from_millis(policy.judge_timeout_ms)
+        .with_clock(super::judge_deadline::installed(store))
+}
+
+/// The policy deadline. Production has no logical judge clock.
+#[cfg(not(test))]
+const fn judge_limit(_store: &SkillLifecycleStore, policy: &GatePolicy) -> super::judge_deadline::Limit {
+    super::judge_deadline::Limit::from_millis(policy.judge_timeout_ms)
+}
+
 /// Asks the judge under the policy's deadline and the caller's cancellation.
 /// A failure, denial or timeout becomes a non-passing record that carries the
 /// physical tally of the call; it is never an approval. A caller cancellation
@@ -1640,13 +1655,13 @@ fn merged_usage(reported: ReportedUsage, tally: ReportedUsage) -> ReportedUsage 
 async fn consult_judge(
     judge: &dyn GateJudge,
     brief: &JudgeBrief<'_>,
-    policy: &GatePolicy,
+    _policy: &GatePolicy,
     cancel: &CancellationToken,
+    limit: super::judge_deadline::Limit,
 ) -> Result<JudgeRecord, GateError> {
     let tally = Arc::new(TallyCounters::default());
     let identity = judge.identity();
     let call = judge.review(brief, Arc::clone(&tally));
-    let deadline = Duration::from_millis(policy.judge_timeout_ms);
     let unavailable = |detail: &str, usage: ReportedUsage| JudgeRecord {
         identity: identity.clone(),
         result: JudgeResult::Unavailable {
@@ -1656,7 +1671,7 @@ async fn consult_judge(
     };
     tokio::select! {
         () = cancel.cancelled() => Err(GateError::Cancelled),
-        answer = tokio::time::timeout(deadline, call) => Ok(match answer {
+        answer = limit.apply(call) => Ok(match answer {
             Err(_) => unavailable("the judge did not answer before its deadline", tally.snapshot()),
             Ok(Err(JudgeError::BudgetDenied)) => unavailable("the judge budget reservation was denied", tally.snapshot()),
             Ok(Err(JudgeError::Failed { detail, usage })) => unavailable(&detail, merged_usage(usage, tally.snapshot())),

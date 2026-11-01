@@ -216,3 +216,14 @@ async fn operator_cli_evaluates_both_frozen_splits_without_publishing() {
         baseline
     );
 }
+
+#[tokio::test]
+async fn a_wall_stall_past_the_latency_budget_still_answers() {
+    let world = World::new().await;
+    let config = world.production_config(SkillsLifecycleModeConfig::Auto, &[]);
+    let answer = world
+        .run_plain_under_wall_stall(&config)
+        .await
+        .expect("test: 600 ms of wall time does not spend the logical budget");
+    assert_eq!(answer, "plain answer");
+}

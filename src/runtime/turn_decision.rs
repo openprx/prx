@@ -2044,10 +2044,10 @@ impl TurnDecisionService {
             },
             projected_input.as_ref(),
         )?;
-        if Instant::now() >= decision.deadline {
+        if crate::causal_tree::logical_clock::now() >= decision.deadline {
             return Err(AgentRetrievalError::Deadline);
         }
-        let artifacts = tokio::time::timeout_at(tokio::time::Instant::from_std(decision.deadline), async {
+        let artifacts = crate::causal_tree::logical_clock::timeout_at_std(decision.deadline, async {
             match selected_family {
                 crate::causal_tree::branch::CapabilityTarget::Memory => {
                     if let Some(loader) = &self.memory_loader {
@@ -2122,7 +2122,7 @@ impl TurnDecisionService {
         .await
         .map_err(|_| AgentRetrievalError::Deadline)?
         .map_err(AgentRetrievalError::Backend)?;
-        if Instant::now() >= decision.deadline {
+        if crate::causal_tree::logical_clock::now() >= decision.deadline {
             return Err(AgentRetrievalError::Deadline);
         }
         self.check_live_parity()?;
@@ -2278,9 +2278,10 @@ impl TurnDecisionService {
         let observed_latency = self
             .observed_capability_latency(proof.owner_id(), *self.catalog.generation())
             .await;
-        let deadline = Instant::now()
+        let deadline = crate::causal_tree::logical_clock::now()
             .checked_add(Duration::from_millis(budget.budgets.latency_ms))
             .ok_or(AgentDecisionError::Deadline)?;
+        crate::causal_tree::logical_clock::apply_test_stall().await;
         let (accounting, telemetry) = accounting::admission_resources(self, proof, budget.budgets, deadline);
         let config = &self.generation.effective;
         let owner_filesystem = self
@@ -2530,10 +2531,14 @@ impl TurnDecisionService {
             };
             if has_router_transition {
                 let mut parts = terminal_state.trusted.parts().clone();
-                parts.budgets.latency_ms = parts
-                    .budgets
-                    .latency_ms
-                    .min(u64::try_from(deadline.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(0));
+                parts.budgets.latency_ms = parts.budgets.latency_ms.min(
+                    u64::try_from(
+                        deadline
+                            .saturating_duration_since(crate::causal_tree::logical_clock::now())
+                            .as_millis(),
+                    )
+                    .unwrap_or(0),
+                );
                 terminal_state.trusted = TrustedState::from_runtime(parts);
             }
             terminal_state.derived = DerivedState::default();
@@ -2710,7 +2715,7 @@ impl TurnDecisionService {
             if self.check_live_parity().is_err() {
                 return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry));
             }
-            let terminal_only = stop_hops || hop == max_hops || Instant::now() >= deadline;
+            let terminal_only = stop_hops || hop == max_hops || crate::causal_tree::logical_clock::now() >= deadline;
             let decision_id = DecisionId::new_runtime();
             self.emit_agent_phase(proof, decision_id, CausalEventKind::SnapshotCreated, None);
             let delegation = (!terminal_only && resume.is_none())
@@ -2768,7 +2773,7 @@ impl TurnDecisionService {
                 Some(prepared.candidate_count()),
             );
             let decision = if terminal_only {
-                if hop == max_hops && !stop_hops && Instant::now() < deadline {
+                if hop == max_hops && !stop_hops && crate::causal_tree::logical_clock::now() < deadline {
                     CausalDecisionEngine::decide_terminal_with_collection(prepared, proof.approval_review_adapter())?
                 } else {
                     CausalDecisionEngine::decide_terminal_prepared(prepared)?
@@ -3100,7 +3105,7 @@ impl TurnDecisionService {
                 }
             });
             if progress_operand!("hop_limit", hop >= max_hops)
-                || progress_operand!("deadline_expired", Instant::now() >= deadline)
+                || progress_operand!("deadline_expired", crate::causal_tree::logical_clock::now() >= deadline)
                 || progress_operand!(
                     "no_added_discovery_refs",
                     discovery_change.as_ref().is_some_and(|(_, added)| !added)

@@ -11,7 +11,135 @@ use super::facts::TerminalObservations;
 use super::store::SkillLifecycleStore;
 use super::types::{LifecycleError, OwnerScope};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::sync::Notify;
+
+/// How long a background receipt worker may sit queued before the write is
+/// abandoned. Queue time is not part of [`SELECTION_BUDGET`] or
+/// [`TERMINAL_BUDGET`].
+const WORKER_START_CAP: Duration = Duration::from_secs(60);
+
+#[cfg(test)]
+static RECEIPT_HOLD_BEFORE_START_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static RECEIPT_HOLD_AFTER_START_MS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+
+enum WorkerBudgetMiss {
+    NeverStarted,
+    Exceeded,
+    Failed,
+}
+
+/// Runs `work` on the blocking pool. [`SELECTION_BUDGET`] / [`TERMINAL_BUDGET`]
+/// start when the worker begins `work`, after it has left the queue.
+async fn run_bounded_blocking<T, F>(budget: Duration, work: F) -> Result<T, WorkerBudgetMiss>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let started = Arc::new(AtomicBool::new(false));
+    let notify = Arc::new(Notify::new());
+    let flag = Arc::clone(&started);
+    let ping = Arc::clone(&notify);
+    let task = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        hold_receipt_worker(true);
+        flag.store(true, Ordering::Release);
+        ping.notify_one();
+        #[cfg(test)]
+        hold_receipt_worker(false);
+        work()
+    });
+    if !wait_until_worker_started(&started, &notify).await {
+        task.abort();
+        return Err(WorkerBudgetMiss::NeverStarted);
+    }
+    match tokio::time::timeout(budget, task).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(WorkerBudgetMiss::Failed),
+        Err(_) => Err(WorkerBudgetMiss::Exceeded),
+    }
+}
+
+#[cfg(test)]
+fn hold_receipt_worker(before_start: bool) {
+    let millis = if before_start {
+        RECEIPT_HOLD_BEFORE_START_MS.load(Ordering::SeqCst)
+    } else {
+        RECEIPT_HOLD_AFTER_START_MS.load(Ordering::SeqCst)
+    };
+    if millis > 0 {
+        std::thread::sleep(Duration::from_millis(millis));
+    }
+}
+
+/// Holds every receipt worker for `millis` before it reports that it started.
+/// The guard clears the hold on drop.
+#[cfg(test)]
+pub(crate) struct ReceiptWorkerHold {
+    before_start: bool,
+}
+
+#[cfg(test)]
+impl ReceiptWorkerHold {
+    pub(crate) fn before_start(millis: u64) -> Self {
+        RECEIPT_HOLD_BEFORE_START_MS.store(millis, Ordering::SeqCst);
+        Self { before_start: true }
+    }
+
+    pub(crate) fn after_start(millis: u64) -> Self {
+        RECEIPT_HOLD_AFTER_START_MS.store(millis, Ordering::SeqCst);
+        Self { before_start: false }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReceiptWorkerHold {
+    fn drop(&mut self) {
+        if self.before_start {
+            RECEIPT_HOLD_BEFORE_START_MS.store(0, Ordering::SeqCst);
+        } else {
+            RECEIPT_HOLD_AFTER_START_MS.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+async fn wait_until_worker_started(started: &AtomicBool, notify: &Notify) -> bool {
+    let cap = tokio::time::sleep(WORKER_START_CAP);
+    tokio::pin!(cap);
+    loop {
+        if started.load(Ordering::Acquire) {
+            return true;
+        }
+        let ping = notify.notified();
+        if started.load(Ordering::Acquire) {
+            return true;
+        }
+        tokio::select! {
+            biased;
+            () = ping => {}
+            () = &mut cap => return false,
+        }
+    }
+}
+
+#[cfg(test)]
+static LIFECYCLE_ACTIVITY: std::sync::LazyLock<Notify> = std::sync::LazyLock::new(Notify::new);
+
+#[cfg(test)]
+pub(crate) fn notify_lifecycle_activity() {
+    LIFECYCLE_ACTIVITY.notify_waiters();
+}
+
+#[cfg(test)]
+pub(crate) fn lifecycle_activity() -> &'static Notify {
+    &LIFECYCLE_ACTIVITY
+}
 
 /// How long the terminal call-in waits for the capture (its locks are bounded
 /// to about a second on their own).
@@ -88,7 +216,11 @@ pub fn record_selected_skills(request: &SelectionRequest<'_>) -> usize {
             }
         };
         match store.record_selection_once(&task, &pin, &correlation) {
-            Ok(_) => recorded += 1,
+            Ok(_) => {
+                recorded += 1;
+                #[cfg(test)]
+                notify_lifecycle_activity();
+            }
             Err(error) => {
                 tracing::warn!(%error, skill = *name, "failed to record a skill selection receipt");
             }
@@ -144,6 +276,21 @@ pub(crate) async fn drain_background_for_test(key: &str) {
     }
 }
 
+/// Waits for every background lifecycle write this process has tracked.
+#[cfg(test)]
+pub(crate) async fn drain_all_background_for_test() {
+    let handles: Vec<_> = {
+        let mut pending = BACKGROUND.lock();
+        std::mem::take(&mut *pending)
+            .into_iter()
+            .map(|(_, handle)| handle)
+            .collect()
+    };
+    for handle in handles {
+        let _ = handle.await;
+    }
+}
+
 #[cfg(test)]
 fn track_background(key: &str, handle: tokio::task::JoinHandle<()>) {
     BACKGROUND.lock().push((key.to_string(), handle));
@@ -157,7 +304,9 @@ fn track_background(_key: &str, handle: tokio::task::JoinHandle<()>) {
 /// Turn-path entry for selection receipts. Never blocks and never fails the
 /// turn: skills already claimed for this run are skipped from memory without
 /// touching the store, and the store write for the rest runs in a spawned
-/// blocking task with a time budget (errors are logged). Outside a tokio
+/// blocking task. [`SELECTION_BUDGET`] starts when that worker begins the
+/// write; time spent queued is not part of the budget (errors are logged).
+/// Outside a tokio
 /// runtime the receipts are skipped with a warning. Returns how many skills
 /// were handed to the background writer.
 pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
@@ -189,7 +338,7 @@ pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
         task_key(request.task_id, Some(request.run_id), None),
     );
     let handle = runtime.spawn(async move {
-        let write = tokio::task::spawn_blocking(move || {
+        let outcome = run_bounded_blocking(SELECTION_BUDGET, move || {
             let names: Vec<&str> = fresh.iter().map(String::as_str).collect();
             record_selected_skills(&SelectionRequest {
                 workspace_dir: &workspace,
@@ -199,14 +348,15 @@ pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
                 task_id: task.as_deref(),
                 skill_names: &names,
             })
-        });
-        match tokio::time::timeout(SELECTION_BUDGET, write).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "skill selection receipt task failed");
+        })
+        .await;
+        match outcome {
+            Ok(_) => {}
+            Err(WorkerBudgetMiss::Failed) => {
+                tracing::warn!("skill selection receipt task failed");
                 mark_selection_dropped(&dropped);
             }
-            Err(_) => {
+            Err(WorkerBudgetMiss::NeverStarted | WorkerBudgetMiss::Exceeded) => {
                 tracing::warn!("skill selection receipts exceeded their time budget; continuing");
                 mark_selection_dropped(&dropped);
             }
@@ -328,7 +478,7 @@ pub async fn settle_task_terminal(
     let root = observation.root && crate::skills::lifecycle_runtime::lifecycle_enabled_for(workspace_dir);
     let workspace = workspace_dir.to_path_buf();
     let terminal_id = terminal_id.to_string();
-    let call_in = tokio::task::spawn_blocking(move || {
+    let call_in = run_bounded_blocking(TERMINAL_BUDGET, move || {
         let Some(outcome) = outcome else {
             release_task_pins(&owner, &task);
             return Ok(());
@@ -337,7 +487,7 @@ pub async fn settle_task_terminal(
             release_task_pins(&owner, &task);
             return Ok(());
         }
-        on_task_terminal(
+        let joined = on_task_terminal(
             &workspace,
             &owner,
             &TaskTerminal {
@@ -348,18 +498,26 @@ pub async fn settle_task_terminal(
                 root_task: root,
             },
         )
-        .map(|_| ())
-    });
-    match tokio::time::timeout(TERMINAL_BUDGET, call_in).await {
-        Ok(Ok(Ok(()))) => {}
+        .map(|_| ());
+        if joined.is_ok() {
+            #[cfg(test)]
+            notify_lifecycle_activity();
+        }
+        joined
+    })
+    .await;
+    match call_in {
+        Ok(Ok(())) => {}
         // A join that already exists with another terminal is expected on a
         // replay racing the live path; the first join is kept.
-        Ok(Ok(Err(error @ LifecycleError::TerminalConflict { .. }))) => {
+        Ok(Err(error @ LifecycleError::TerminalConflict { .. })) => {
             tracing::debug!(%error, "skill lifecycle terminal already joined; keeping the first join");
         }
-        Ok(Ok(Err(error))) => tracing::warn!(%error, "skill lifecycle terminal join failed"),
-        Ok(Err(error)) => tracing::warn!(%error, "skill lifecycle terminal task failed"),
-        Err(_) => tracing::warn!("skill lifecycle terminal join exceeded its time budget; continuing"),
+        Ok(Err(error)) => tracing::warn!(%error, "skill lifecycle terminal join failed"),
+        Err(WorkerBudgetMiss::Failed) => tracing::warn!("skill lifecycle terminal task failed"),
+        Err(WorkerBudgetMiss::NeverStarted | WorkerBudgetMiss::Exceeded) => {
+            tracing::warn!("skill lifecycle terminal join exceeded its time budget; continuing")
+        }
     }
 }
 

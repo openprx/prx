@@ -70,6 +70,10 @@ pub struct AgentCaseExecutor {
     temperature: f64,
     accounting: AccountingOwner,
     controlled: Option<Arc<controlled::ControlledCasePolicy>>,
+    /// Acceptance installs this so a spawned evaluation case sees the same
+    /// logical decision deadline as `World::run_task`. Absent everywhere else.
+    #[cfg(test)]
+    logical_clock: Option<Arc<crate::causal_tree::logical_clock::ManualClock>>,
 }
 
 impl AgentCaseExecutor {
@@ -84,7 +88,18 @@ impl AgentCaseExecutor {
             temperature,
             accounting,
             controlled: None,
+            #[cfg(test)]
+            logical_clock: None,
         }
+    }
+
+    /// Acceptance cases share the world's logical decision clock. The clock is
+    /// entered inside the spawned case task, where `agent::run` polls.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_logical_clock(mut self, clock: Arc<crate::causal_tree::logical_clock::ManualClock>) -> Self {
+        self.logical_clock = Some(clock);
+        self
     }
 
     /// An actual admitted stage and cleanup owner are mandatory. The caller
@@ -102,6 +117,8 @@ impl AgentCaseExecutor {
             temperature,
             accounting,
             controlled: Some(Arc::new(controlled)),
+            #[cfg(test)]
+            logical_clock: None,
         })
     }
 
@@ -650,7 +667,7 @@ impl AgentCaseExecutor {
             })
             .transpose()?;
         let token = cancel.child_token();
-        let mut run: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>> =
+        let run: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>> =
             if let Some(scope) = controlled_scope {
                 Box::pin(crate::agent::entry::run_quiet_controlled(
                     run_config.clone(),
@@ -667,6 +684,15 @@ impl AgentCaseExecutor {
                     token.clone(),
                 ))
             };
+        // `run_case_inner` already runs on the spawned case task. Enter the
+        // clock here so deadline checks inside `run_quiet` see it.
+        #[cfg(test)]
+        let run: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>> =
+            match self.logical_clock.clone() {
+                Some(clock) => Box::pin(crate::causal_tree::logical_clock::scope(clock, run)),
+                None => run,
+            };
+        let mut run = run;
         let mut cleanup_unconfirmed = false;
         let (terminal, response) = match tokio::time::timeout(request.deadline, &mut run).await {
             Ok(Ok(text)) => (RunTerminal::Completed, text),

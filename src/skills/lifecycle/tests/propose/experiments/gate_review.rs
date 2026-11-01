@@ -483,6 +483,31 @@ async fn unknown_stage_after_bound_finish_is_not_automatically_judged_or_reopene
     result
 }
 
+/// Waits until the fixture has counted one judge request. The 30 s bound is a
+/// failure cap. The count is the readiness signal.
+async fn wait_until_judge_counted<F, T>(server: &Server, run: &mut std::pin::Pin<&mut F>) -> Result<()>
+where
+    F: std::future::Future<Output = T>,
+{
+    let cap = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(cap);
+    loop {
+        if server.judge_count.load(Ordering::SeqCst) > 0 {
+            return Ok(());
+        }
+        let arrived = server.judge_arrived.notified();
+        if server.judge_count.load(Ordering::SeqCst) > 0 {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            () = arrived => {}
+            () = &mut cap => anyhow::bail!("judge request did not arrive"),
+            _ = run.as_mut() => anyhow::bail!("gate finished before the judge request was counted"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn judge_timeout_or_durable_cancel_keeps_actual_root_liability_and_never_rejudges() -> Result<()> {
     for durable_cancel in [false, true] {
@@ -490,49 +515,102 @@ async fn judge_timeout_or_durable_cancel_keeps_actual_root_liability_and_never_r
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
         server.judge_mode.store(2, Ordering::SeqCst);
-        let result:Result<()>=async {
-            let config=config(&f,&server); let suite=suite(&f);
-            let service=reviewed_service(&f,&suite,&config,(!durable_cancel).then_some(50))?;
-            let plan=service.plan_instruction_cycle(draft(&f,&service,&config,pattern.pattern_id)?,&config)?;
-            let prefix=through_holdout(&service,&config,&plan).await?;
-            let cancel=CancellationToken::new();
-            let cleanup=CleanupScope::new(None,cancel.clone())?;
-            let run=cleanup.run(service.run_instruction_plan(&config,&plan,&cancel));
+        // 200 ms of real delay before the fixture counts the request. A wall
+        // deadline of 50 ms loses this race; the logical deadline does not.
+        server.judge_delay_ms.store(200, Ordering::SeqCst);
+        let result: Result<()> = async {
+            let config = config(&f, &server);
+            let suite = suite(&f);
+            let service = reviewed_service(&f, &suite, &config, (!durable_cancel).then_some(50))?;
+            let clock = (!durable_cancel).then(|| {
+                let clock = crate::skills::lifecycle::judge_deadline::JudgeClock::new();
+                crate::skills::lifecycle::judge_deadline::install(service.store_for_test(), clock.clone());
+                clock
+            });
+            let plan = service.plan_instruction_cycle(draft(&f, &service, &config, pattern.pattern_id)?, &config)?;
+            let prefix = through_holdout(&service, &config, &plan).await?;
+            let cancel = CancellationToken::new();
+            let cleanup = CleanupScope::new(None, cancel.clone())?;
+            let run = cleanup.run(service.run_instruction_plan(&config, &plan, &cancel));
             tokio::pin!(run);
+            wait_until_judge_counted(&server, &mut run).await?;
             if durable_cancel {
-                let wait=async {
-                    while server.judge_count.load(Ordering::SeqCst)==0 {
-                        tokio::select! { finished=&mut run=>anyhow::bail!("gate finished before cancellation: {finished:?}"), ()=tokio::time::sleep(Duration::from_millis(5))=>{} }
-                    }
-                    Ok::<_,anyhow::Error>(())
-                };
-                tokio::time::timeout(Duration::from_secs(10),wait).await??;
-                service.cancel_experiment(&plan.spec.id,prefix.plan.digest())?;
+                service.cancel_experiment(&plan.spec.id, prefix.plan.digest())?;
                 cancel.cancel();
+            } else {
+                clock
+                    .expect("test: timeout arm installs a judge clock")
+                    .advance(Duration::from_millis(50));
             }
-            assert!(tokio::time::timeout(Duration::from_secs(10),&mut run).await?.is_err());
-            let journal=service.inspect_experiment(&plan.spec.id,prefix.plan.digest())?;
+            assert!(tokio::time::timeout(Duration::from_secs(10), &mut run).await?.is_err());
+            let journal = service.inspect_experiment(&plan.spec.id, prefix.plan.digest())?;
             assert!(!service.experiment_qualified(&journal)?);
-            assert!(matches!(journal.state.stages["gate-review"],StageState::DispatchUnknown));
-            let actual=service.experiment_physical_observations(&journal,&config)?;
-            assert_eq!(server.judge_count.load(Ordering::SeqCst),1);
-            assert_eq!(actual["gate-review"]["physical"]["calls"],1);
+            assert!(matches!(
+                journal.state.stages["gate-review"],
+                StageState::DispatchUnknown
+            ));
+            let actual = service.experiment_physical_observations(&journal, &config)?;
+            assert_eq!(server.judge_count.load(Ordering::SeqCst), 1);
+            assert_eq!(actual["gate-review"]["physical"]["calls"], 1);
             assert!(actual["gate-review"]["needs_reconciliation"].as_bool().unwrap());
             assert!(!actual["gate-review"]["may_dispatch_again"].as_bool().unwrap());
-            let sends=server.count.load(Ordering::SeqCst); let raw=std::fs::read(config.workspace_dir.join("state/costs.reservations.jsonl"))?;
-            let recovered=service.recover_experiment(&plan.spec.id,prefix.plan.digest())?;
-            assert_eq!(recovered.head_sha256,journal.head_sha256);
-            let replay_cancel=CancellationToken::new();
-            assert!(CleanupScope::new(None,replay_cancel.clone())?.run(service.run_instruction_plan(&config,&plan,&replay_cancel)).await.is_err());
-            assert_eq!(server.count.load(Ordering::SeqCst),sends);
-            assert_eq!(std::fs::read(config.workspace_dir.join("state/costs.reservations.jsonl"))?,raw);
-            assert_eq!(f.store.active_binding(&f.pin.skill_id)?.unwrap().generation,1);
+            let sends = server.count.load(Ordering::SeqCst);
+            let raw = std::fs::read(config.workspace_dir.join("state/costs.reservations.jsonl"))?;
+            let recovered = service.recover_experiment(&plan.spec.id, prefix.plan.digest())?;
+            assert_eq!(recovered.head_sha256, journal.head_sha256);
+            crate::skills::lifecycle::judge_deadline::clear(service.store_for_test());
+            let replay_cancel = CancellationToken::new();
+            assert!(
+                CleanupScope::new(None, replay_cancel.clone())?
+                    .run(service.run_instruction_plan(&config, &plan, &replay_cancel))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(server.count.load(Ordering::SeqCst), sends);
+            assert_eq!(
+                std::fs::read(config.workspace_dir.join("state/costs.reservations.jsonl"))?,
+                raw
+            );
+            assert_eq!(f.store.active_binding(&f.pin.skill_id)?.unwrap().generation, 1);
             Ok(())
-        }.await;
+        }
+        .await;
         server.finish().await?;
         result?;
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn slow_judge_answer_is_kept_when_the_logical_deadline_has_not_elapsed() -> Result<()> {
+    let f = fixture();
+    let pattern = usable_pattern(&f);
+    let server = Server::start(false).await?;
+    server.judge_delay_ms.store(200, Ordering::SeqCst);
+    let result = async {
+        let config = config(&f, &server);
+        let suite = suite(&f);
+        let service = reviewed_service(&f, &suite, &config, Some(50))?;
+        let clock = crate::skills::lifecycle::judge_deadline::JudgeClock::new();
+        crate::skills::lifecycle::judge_deadline::install(service.store_for_test(), clock);
+        let plan = service.plan_instruction_cycle(draft(&f, &service, &config, pattern.pattern_id)?, &config)?;
+        service.admit_experiment(plan.spec.clone(), &config)?;
+        let cancel = CancellationToken::new();
+        let journal = CleanupScope::new(None, cancel.clone())?
+            .run(service.run_instruction_plan(&config, &plan, &cancel))
+            .await?;
+        assert!(service.experiment_qualified(&journal)?);
+        assert_eq!(server.judge_count.load(Ordering::SeqCst), 1);
+        assert!(
+            !matches!(journal.state.stages["gate-review"], StageState::DispatchUnknown),
+            "a 200 ms judge that the test has not timed out logically still answers"
+        );
+        crate::skills::lifecycle::judge_deadline::clear(service.store_for_test());
+        Ok(())
+    }
+    .await;
+    server.finish().await?;
+    result
 }
 
 #[tokio::test]

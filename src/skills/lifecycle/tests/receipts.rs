@@ -332,3 +332,58 @@ fn scheduling_outside_a_runtime_is_skipped_and_keeps_the_claim_free() {
     assert_eq!(experience.selection_receipts.len(), 1);
     release_task_pins(&ids.scope(), &outside);
 }
+
+/// Four seconds queued, before the worker reports that it started, is outside
+/// the 3 s selection budget. The receipt is kept and nothing is marked dropped.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(receipt_worker_hold)]
+async fn a_worker_held_four_seconds_before_start_still_records_the_selection() {
+    let (tmp, store, ids) = setup();
+    let hold = crate::skills::lifecycle::receipts::ReceiptWorkerHold::before_start(4_000);
+    assert_eq!(schedule_selection_receipts(&request(&tmp, &ids, true, &[NAME])), 1);
+    drain_background_for_test(&ids.run).await;
+    drop(hold);
+    let experience = store
+        .read_experience(&ids.run)
+        .expect("test: read")
+        .expect("test: record");
+    assert_eq!(experience.selection_receipts.len(), 1);
+    assert_eq!(experience.dropped_evidence, 0);
+    release_task_pins(&ids.scope(), &ids.run);
+}
+
+/// Time after the worker has started still counts against the 3 s budget.
+/// Sleeping 3.5 s there marks the experience as dropped evidence.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(receipt_worker_hold)]
+async fn a_worker_held_past_the_budget_after_start_marks_dropped_evidence() {
+    let (tmp, store, ids) = setup();
+    let hold = crate::skills::lifecycle::receipts::ReceiptWorkerHold::after_start(3_500);
+    assert_eq!(schedule_selection_receipts(&request(&tmp, &ids, true, &[NAME])), 1);
+    drain_background_for_test(&ids.run).await;
+    drop(hold);
+    // The budget trip detaches the worker. The receipt write lands after the
+    // hold, and the dropped-evidence marker is folded into the record.
+    let activity = crate::skills::lifecycle::receipts::lifecycle_activity();
+    let cap = tokio::time::sleep(std::time::Duration::from_secs(30));
+    tokio::pin!(cap);
+    let experience = loop {
+        if let Some(record) = store.read_experience(&ids.run).expect("test: read") {
+            break record;
+        }
+        let ping = activity.notified();
+        if let Some(record) = store.read_experience(&ids.run).expect("test: read") {
+            break record;
+        }
+        tokio::select! {
+            biased;
+            () = ping => {}
+            () = &mut cap => panic!("test: selection record did not appear after the hold"),
+        }
+    };
+    assert!(
+        experience.dropped_evidence >= 1,
+        "the 3 s budget must trip while the worker is held after start"
+    );
+    release_task_pins(&ids.scope(), &ids.run);
+}

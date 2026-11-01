@@ -135,6 +135,24 @@ impl BoundedRehearsal {
     }
 }
 
+/// The stage cap, and never longer than the decision deadline.
+/// A logical clock spends the cap in logical time.
+async fn stage_wait<T>(
+    context: &RehearsalContext<'_>,
+    stage_deadline: tokio::time::Instant,
+    call: impl std::future::Future<Output = T>,
+) -> Result<T, ()> {
+    if super::logical_clock::installed() {
+        let remaining = context
+            .deadline
+            .into_std()
+            .saturating_duration_since(super::logical_clock::now());
+        super::logical_clock::timeout_for(context.stage_cap.min(remaining), call).await
+    } else {
+        tokio::time::timeout_at(stage_deadline, call).await.map_err(|_| ())
+    }
+}
+
 async fn probe_one(
     candidate: &CausalCandidate,
     catalog: &CatalogView<'_>,
@@ -166,13 +184,20 @@ async fn probe_one(
     }) {
         return RehearsalStatus::Unavailable;
     }
-    let now = tokio::time::Instant::now();
-    if now >= context.deadline || context.stage_cap.is_zero() {
+    if super::logical_clock::tokio_deadline_reached(context.deadline) || context.stage_cap.is_zero() {
         return RehearsalStatus::TimedOut;
     }
+    let now = tokio::time::Instant::now();
     let stage_deadline = now
         .checked_add(context.stage_cap)
         .map_or(context.deadline, |cap| cap.min(context.deadline));
+    // A logical clock keeps the probe's wall deadline at the decision deadline,
+    // which sits ahead of wall time. The stage cap is then logical.
+    let probe_deadline = if super::logical_clock::installed() {
+        context.deadline
+    } else {
+        stage_deadline
+    };
     let generation = catalog.generation();
     if candidate.action() == CausalActionKind::Retrieve && candidate.target() == CapabilityTarget::Memory {
         let Some(port) = ports.memory else {
@@ -182,9 +207,10 @@ async fn probe_one(
         if requested == 0 {
             return RehearsalStatus::NoProbe;
         }
-        return match tokio::time::timeout_at(
+        return match stage_wait(
+            context,
             stage_deadline,
-            port.count_hits(context.principal, context.query_ref, context.memory_k, stage_deadline),
+            port.count_hits(context.principal, context.query_ref, context.memory_k, probe_deadline),
         )
         .await
         {
@@ -200,12 +226,12 @@ async fn probe_one(
         let Some(port) = ports.skill else {
             return RehearsalStatus::NoProbe;
         };
-        tokio::time::timeout_at(stage_deadline, port.metadata(generation, references)).await
+        stage_wait(context, stage_deadline, port.metadata(generation, references)).await
     } else {
         let Some(port) = ports.catalog else {
             return RehearsalStatus::NoProbe;
         };
-        tokio::time::timeout_at(stage_deadline, port.availability(generation, references)).await
+        stage_wait(context, stage_deadline, port.availability(generation, references)).await
     };
     match response {
         Ok(Ok(count)) if count.generation == generation && count.present <= references.len() as u32 => {
