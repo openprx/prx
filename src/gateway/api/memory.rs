@@ -400,6 +400,41 @@ mod tests {
         serde_json::json!({ "key": "c4-note", "content": "alpha-only-note" })
     }
 
+    /// Pins the prose the memory tools emit today. A format change that the
+    /// HTTP parser no longer understands must fail here, not return an empty
+    /// `hits` list beside a still-successful `output`.
+    #[test]
+    fn search_and_recall_prose_parse_into_owner_hits() {
+        let search = "Found 1 matches:\n- key: c4-note\n  content: alpha-only-note\n  snippet: alpha-only-note\n";
+        assert_eq!(
+            super::hits_from_output(search, "sqlite"),
+            vec![serde_json::json!({
+                "key": "c4-note",
+                "content": "alpha-only-note",
+                "scope": "owner",
+                "source": "sqlite"
+            })]
+        );
+        let recall = "Found 1 memories:\n- [core] c4-note: alpha-only-note [100%]\n";
+        assert_eq!(
+            super::hits_from_output(recall, "sqlite"),
+            vec![serde_json::json!({
+                "key": "c4-note",
+                "content": "alpha-only-note [100%]",
+                "scope": "owner",
+                "source": "sqlite"
+            })]
+        );
+        assert_eq!(
+            super::hits_from_output("No matches found for query: 'alpha-only-note'", "sqlite"),
+            Vec::<serde_json::Value>::new()
+        );
+        assert_eq!(
+            super::hits_from_output("No memories found matching that query.", "sqlite"),
+            Vec::<serde_json::Value>::new()
+        );
+    }
+
     #[tokio::test]
     async fn memory_routes_isolate_owners_and_do_not_leak_a_foreign_key() {
         let served = serve_config(|_| {}).await;
@@ -453,8 +488,44 @@ mod tests {
         assert_eq!(at(&found, "/scope"), "owner");
         assert_eq!(at(&found, "/source"), "sqlite");
         let output = at(&found, "/output").as_str().unwrap_or("").to_string();
-        assert!(output.contains("alpha-only-note"), "{output}");
-        assert!(output.contains("c4-note"), "{output}");
+        assert!(output.contains("- key: c4-note"), "{output}");
+        assert!(output.contains("content: alpha-only-note"), "{output}");
+        assert_eq!(
+            at(&found, "/hits"),
+            serde_json::json!([{
+                "key": "c4-note",
+                "content": "alpha-only-note",
+                "scope": "owner",
+                "source": "sqlite"
+            }])
+        );
+
+        let (status, body) = served
+            .call(
+                reqwest::Method::POST,
+                "/api/memory/recall",
+                Some(serde_json::json!({ "query": "alpha-only-note" })),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let recalled = json(&body);
+        assert_eq!(at(&recalled, "/empty"), false);
+        let recall_output = at(&recalled, "/output").as_str().unwrap_or("").to_string();
+        assert!(
+            recall_output.contains("- [core] c4-note: alpha-only-note"),
+            "{recall_output}"
+        );
+        let recall_hits = at(&recalled, "/hits");
+        assert_eq!(at(&recall_hits, "/0/key"), "c4-note");
+        assert_eq!(at(&recall_hits, "/0/scope"), "owner");
+        assert_eq!(at(&recall_hits, "/0/source"), "sqlite");
+        assert!(
+            at(&recall_hits, "/0/content")
+                .as_str()
+                .unwrap_or("")
+                .starts_with("alpha-only-note"),
+            "{recall_hits}"
+        );
 
         let (status, body) = served
             .call_as(
