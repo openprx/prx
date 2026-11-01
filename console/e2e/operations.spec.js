@@ -138,12 +138,20 @@ test('schedules list, run once, and show denied and conflict states', async ({ p
 test('memory, cost, lifecycle, and experiments keep failures distinct', async ({ page }) => {
   await page.route('**/api/status', (route) => fulfill(route, 200, statusBody));
   await page.route('**/api/memory/search', (route) =>
-    fulfill(route, 503, { success: false, error: 'memory tools cannot take the API principal' })
+    fulfill(route, 200, { success: true, scope: 'owner', source: 'sqlite', empty: true, hits: [], output: 'No matches found' })
   );
   await signIn(page);
   await page.goto('/memory');
-  await expect(page.getByText('memory tools cannot take the API principal', { exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: /store|forget|recall/i })).toHaveCount(0);
+  await page.getByLabel('Search query').fill('notes');
+  await page.getByRole('button', { name: 'Search' }).click();
+  await expect(page.getByText('No memories matched.', { exact: true })).toBeVisible();
+  await expect(page.getByText(/Scope: owner/)).toBeVisible();
+  await page.route('**/api/memory/search', (route) =>
+    fulfill(route, 503, { success: false, error: 'memory is unavailable' })
+  );
+  await page.getByRole('button', { name: 'Search' }).click();
+  await expect(page.getByText('memory is unavailable', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Store' })).toBeVisible();
   await expectNoHorizontalScroll(page);
 
   await page.route('**/api/cost**', (route) => {
@@ -153,7 +161,7 @@ test('memory, cost, lifecycle, and experiments keep failures distinct', async ({
     }
     return fulfill(route, 200, {
       scope: 'workspace',
-      estimates: true,
+      reservation_estimates: true,
       unpriced_usage: 'omitted',
       outstanding_reservation_micro_usd: 15,
       as_of_utc: '2026-10-31T00:00:00Z',
@@ -176,7 +184,7 @@ test('memory, cost, lifecycle, and experiments keep failures distinct', async ({
     fulfill(route, 200, { proposal_id: 'p1', status: 'open' })
   );
   await page.route('**/api/skills/lifecycle/proposals/p1/publish', (route) =>
-    fulfill(route, 403, { error: 'explicit approval grant required' })
+    fulfill(route, 403, { error: "publish and rollback need the operator's full session" })
   );
   await page.route('**/api/skills/lifecycle/rollback', (route) =>
     fulfill(route, 409, { error: 'committed with repair required', committed_repair_required: true })
@@ -185,7 +193,7 @@ test('memory, cost, lifecycle, and experiments keep failures distinct', async ({
   await expect(page.getByText(/not live or benefit acceptance/)).toBeVisible();
   await page.getByRole('button', { name: 'Open proposal p1' }).click();
   await page.getByRole('button', { name: 'Publish' }).click();
-  await expect(page.getByText('explicit approval grant required')).toBeVisible();
+  await expect(page.getByText("publish and rollback need the operator's full session").first()).toBeVisible();
   await page.getByLabel('Skill id').fill('skill-a');
   await page.getByLabel('Revision id').fill('rev-1');
   await page.getByLabel('Expected generation').fill('3');
@@ -201,6 +209,7 @@ test('memory, cost, lifecycle, and experiments keep failures distinct', async ({
   await page.getByRole('button', { name: 'Submit' }).click();
   await expect(page.getByText('the gateway cannot mint an H2 invocation')).toBeVisible();
   await expect(page.getByText(/There is no job to poll/)).toBeVisible();
+  await expect(page.getByText(/refuses this route before the handler/)).toBeVisible();
   await expectNoHorizontalScroll(page);
 });
 

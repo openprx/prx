@@ -136,11 +136,26 @@ test('a schedule run conflict stays an error', async () => {
   expect(await screen.findByText('The job changed or is already running.')).toBeInTheDocument();
 });
 
-test('memory stays unavailable and does not offer store, recall, or forget', async () => {
-  api.searchMemory.mockRejectedValue(new ApiError(503, 'memory tools cannot take the API principal'));
+test('memory search shows an empty result and an unavailable backend separately', async () => {
+  api.searchMemory.mockResolvedValue({ success: true, scope: 'owner', source: 'sqlite', empty: true, hits: [], output: 'No matches found' });
+  const view = render(MemoryPage);
+  expect(screen.getByRole('button', { name: 'Search' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Store' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Recall' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Forget' })).toBeInTheDocument();
+  await fireEvent.input(screen.getByLabelText('Search query'), { target: { value: 'notes' } });
+  await fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+  expect(await screen.findByText('No memories matched.')).toBeInTheDocument();
+  expect(screen.getByText(/Scope: owner/)).toBeInTheDocument();
+  expect(screen.getByText(/Source: sqlite/)).toBeInTheDocument();
+  expect(screen.queryByText('Unavailable in this deployment.')).toBeNull();
+  view.unmount();
+
+  api.searchMemory.mockRejectedValue(new ApiError(503, 'memory is unavailable'));
   render(MemoryPage);
-  expect(await screen.findByText('memory tools cannot take the API principal')).toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: /store|forget|recall/i })).toBeNull();
+  await fireEvent.input(screen.getByLabelText('Search query'), { target: { value: 'notes' } });
+  await fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+  expect(await screen.findByText('memory is unavailable')).toBeInTheDocument();
   expect(screen.getByText(/reindex and prx migrate/)).toBeInTheDocument();
 });
 
@@ -170,11 +185,13 @@ test('lifecycle shows a grant refusal and committed repair without calling it a 
   api.getLifecycleStatus.mockResolvedValue({ action: 'lifecycle_status', enabled: true });
   api.listLifecycleProposals.mockResolvedValue({ proposals: [{ proposal_id: 'p1', skill_id: 'skill-a', status: 'open' }] });
   api.getLifecycleProposal.mockResolvedValue({ proposal_id: 'p1', status: 'open' });
-  api.publishLifecycleProposal.mockRejectedValue(new ApiError(403, 'explicit approval grant required'));
+  api.publishLifecycleProposal.mockRejectedValue(
+    new ApiError(403, "publish and rollback need the operator's full session")
+  );
   const view = render(SkillLifecyclePage);
   await fireEvent.click(await screen.findByRole('button', { name: 'Open proposal p1' }));
   await fireEvent.click(await screen.findByRole('button', { name: 'Publish' }));
-  expect(await screen.findByText('explicit approval grant required')).toBeInTheDocument();
+  expect(await screen.findByText("publish and rollback need the operator's full session")).toBeInTheDocument();
   expect(screen.getByText(/not live or benefit acceptance/)).toBeInTheDocument();
   view.unmount();
 

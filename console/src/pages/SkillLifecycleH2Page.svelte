@@ -58,6 +58,7 @@
   <PageHeader title={t('operations.h2.title')} description={t('operations.h2.description')} />
   <p class="text-sm text-gray-600 dark:text-gray-300">{t('operations.h2.engineering')}</p>
   <p class="text-sm text-gray-600 dark:text-gray-300">{t('operations.h2.mintGap')}</p>
+  <p class="text-sm text-gray-600 dark:text-gray-300">{t('operations.h2.controlled')}</p>
   <p class="text-sm text-gray-600 dark:text-gray-300">{t('operations.h2.noJob')}</p>
   <button type="button" onclick={() => navigate('/skills')} class="rounded-lg border border-gray-300 px-3 py-2 text-sm">{t('nav.skills')}</button>
   <form class="space-y-3" onsubmit={submit}>
