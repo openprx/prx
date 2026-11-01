@@ -456,7 +456,10 @@ default_temperature = 0.7
 "#;
     let parsed: Config = toml::from_str(minimal).unwrap();
     assert!(parsed.api_key.is_none());
-    assert!(parsed.default_provider.is_none());
+    // A config that names no provider resolves the catalog default, the same
+    // value `Config::default()` carries (PRX-CONFIG-PARTIAL-01).
+    assert_eq!(parsed.default_provider, Config::default().default_provider);
+    assert_eq!(parsed.default_model, Config::default().default_model);
     assert_eq!(parsed.observability.backend, "none");
     assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
     assert_eq!(parsed.runtime.kind, "native");

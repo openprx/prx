@@ -183,6 +183,7 @@ mod agent_features;
 mod channels;
 mod defaults_and_integrations;
 mod memory;
+mod partial_sections;
 mod paths;
 mod persistence;
 mod proxy;
