@@ -583,6 +583,45 @@ impl SkillsManageTool {
         }
     }
 
+    fn lifecycle_refusal(code: &str, transaction_id: Option<&str>, error: impl Into<String>) -> ToolResult {
+        let output = transaction_id.map_or_else(
+            || json!({"lifecycle_code": code}),
+            |id| json!({"lifecycle_code": code, "transaction_id": id}),
+        );
+        ToolResult {
+            success: false,
+            output: output.to_string(),
+            error: Some(error.into()),
+        }
+    }
+
+    fn lifecycle_error_code(error: &crate::skills::lifecycle::ServiceError) -> (&'static str, Option<String>) {
+        use crate::skills::lifecycle::{LifecycleError, ServiceError};
+        match error {
+            ServiceError::Lifecycle(LifecycleError::CommittedRepairRequired { transaction_id, .. }) => {
+                ("committed_repair_required", Some(transaction_id.clone()))
+            }
+            ServiceError::Lifecycle(
+                LifecycleError::StaleGeneration { .. } | LifecycleError::RevisionAlreadyActive(_),
+            ) => ("stale_generation", None),
+            ServiceError::Lifecycle(
+                LifecycleError::TransactionConflict { .. } | LifecycleError::ProposalConflict { .. },
+            ) => ("conflict", None),
+            ServiceError::NoSuchProposal(_)
+            | ServiceError::NoGateDecision(_)
+            | ServiceError::Lifecycle(LifecycleError::RevisionNotFound(_) | LifecycleError::RollbackTargetUnknown(_)) => {
+                ("not_found", None)
+            }
+            ServiceError::Lifecycle(LifecycleError::OwnerMismatch { .. }) => ("wrong_owner", None),
+            ServiceError::Lifecycle(LifecycleError::InvalidId { .. } | LifecycleError::InvalidOwnerScope(_)) => {
+                ("invalid", None)
+            }
+            ServiceError::Disabled | ServiceError::ModeForbids { .. } => ("unavailable", None),
+            ServiceError::Busy { .. } => ("busy", None),
+            _ => ("lifecycle_failed", None),
+        }
+    }
+
     async fn execute_lifecycle(&self, action: &str, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         use crate::skills::lifecycle::{RevisionId, ServiceError, SkillId};
         let Some(service) = self.lifecycle.clone() else {
@@ -692,15 +731,15 @@ impl SkillsManageTool {
                     error: None,
                 }
             }
-            Err(error) => ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(if error.is_retryable() {
+            Err(error) => {
+                let (code, transaction_id) = Self::lifecycle_error_code(&error);
+                let text = if error.is_retryable() {
                     format!("{error} (retryable)")
                 } else {
                     error.to_string()
-                }),
-            },
+                };
+                Self::lifecycle_refusal(code, transaction_id.as_deref(), text)
+            }
         })
     }
 
@@ -765,22 +804,23 @@ impl SkillsManageTool {
                     grant.v2.is_some() && grant.permits_resource_operation(self.name(), &operation, risk, now)
                 });
             if !granted {
-                return Err(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "{action} requires an explicit approval grant bound to its target ({operation})"
-                    )),
-                });
+                return Err(Self::lifecycle_refusal(
+                    "approval_required",
+                    None,
+                    format!("{action} requires an explicit approval grant bound to its target ({operation})"),
+                ));
             }
         }
         SideEffectGate::new(self.security.as_ref())
             .authorize_resource_operation(self.name(), &operation, risk, grant.as_ref())
             .map(|_| ())
-            .map_err(|error| ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(error),
+            .map_err(|error| {
+                let code = if error.to_ascii_lowercase().contains("read-only") {
+                    "read_only"
+                } else {
+                    "policy_denied"
+                };
+                Self::lifecycle_refusal(code, None, error)
             })?;
         // Replay ledger. Under `supervised` the gate above has just spent the
         // grant; under `full` it lets the call through without looking at the
@@ -795,11 +835,11 @@ impl SkillsManageTool {
         ) && self.security.autonomy == crate::security::AutonomyLevel::Full
             && !grant.as_ref().is_some_and(ApprovalGrant::consume_single_use)
         {
-            return Err(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("{action} approval grant was already used (replay refused)")),
-            });
+            return Err(Self::lifecycle_refusal(
+                "approval_required",
+                None,
+                format!("{action} approval grant was already used (replay refused)"),
+            ));
         }
         Ok(())
     }
@@ -1042,11 +1082,11 @@ impl SkillsManageTool {
                 "lifecycle_status" | "lifecycle_list" | "lifecycle_inspect" | "lifecycle_cancel"
             )
         {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("owner-isolated callers may inspect or cancel their own lifecycle proposals; shared-workspace actions require the local operator".to_owned()),
-            });
+            return Ok(Self::lifecycle_refusal(
+                "owner_isolated_write",
+                None,
+                "owner-isolated callers may inspect or cancel their own lifecycle proposals; shared-workspace actions require the local operator",
+            ));
         }
         if action.starts_with("lifecycle_") {
             if !self.lifecycle_actions().contains(&action) {
@@ -1061,19 +1101,21 @@ impl SkillsManageTool {
                 let configured = service.owner_scope().as_str();
                 let refusal = match Self::lifecycle_caller_owner(&args) {
                     Some(caller) if caller == configured => None,
-                    Some(caller) => Some(format!(
-                        "the skill lifecycle store belongs to another owner scope (configured owner_scope: {configured}; this caller's owner id: {caller})"
+                    Some(caller) => Some((
+                        "wrong_owner",
+                        format!(
+                            "the skill lifecycle store belongs to another owner scope (configured owner_scope: {configured}; this caller's owner id: {caller})"
+                        ),
                     )),
-                    None => Some(format!(
-                        "the skill lifecycle needs a caller with a known owner scope (configured owner_scope: {configured}; the runtime could not derive one for this caller)"
+                    None => Some((
+                        "unknown_owner",
+                        format!(
+                            "the skill lifecycle needs a caller with a known owner scope (configured owner_scope: {configured}; the runtime could not derive one for this caller)"
+                        ),
                     )),
                 };
-                if let Some(error) = refusal {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(error),
-                    });
+                if let Some((code, error)) = refusal {
+                    return Ok(Self::lifecycle_refusal(code, None, error));
                 }
             }
             if let Err(result) = self.authorize(action, &args) {

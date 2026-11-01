@@ -446,6 +446,22 @@ impl Principal {
             // `(channel, chat_id, raw_sender)` triple, excluding secrets.
             Role::Anonymous => {
                 let fragment = self.owner_match_fragment();
+                // The management API principal carries `owner_id` and
+                // `owner_isolated` and no channel, chat, or sender. Its rows
+                // are stored with those columns NULL, so the channel triple
+                // would hide them from the writer. Match that caller on
+                // `owner_id` alone. A caller that has any of the three anchors
+                // keeps the triple, including the owner suffix when isolated.
+                let has_channel_anchor =
+                    !self.current_channel.is_empty() || !self.current_chat_id.is_empty() || !self.raw_sender.is_empty();
+                if self.require_owner_match && self.isolated_owner_id().is_some() && !has_channel_anchor {
+                    let mut params = Vec::new();
+                    let owned = self.owner_scoped_group(&fragment, "1=1", &mut params);
+                    return ScopePredicate {
+                        template: format!("(visibility = 'public' OR {owned}) AND sensitivity != 'secret'"),
+                        params,
+                    };
+                }
                 let mut params = vec![
                     ScopeParam::Text(self.current_channel.clone()),
                     ScopeParam::Text(self.current_chat_id.clone()),
@@ -1403,6 +1419,19 @@ AND tp.user_id = ?\
              AND sensitivity != 'secret'"
         );
         assert_eq!(texts(&params), vec!["telegram", "chat-1", "sender-1", TEST_OWNER]);
+
+        // No channel triple: the management API scope. The non-public arm is
+        // owner equality, and a channel-bearing caller above stays on the triple.
+        let mut api_principal = isolated_principal(Role::Anonymous, Visibility::Private, Some(TEST_OWNER));
+        api_principal.current_channel.clear();
+        api_principal.current_chat_id.clear();
+        api_principal.raw_sender.clear();
+        let (scope, params) = api_principal.build_sql_scope();
+        assert_eq!(
+            scope,
+            "(visibility = 'public' OR (1=1 AND owner_id = ?)) AND sensitivity != 'secret'"
+        );
+        assert_eq!(texts(&params), vec![TEST_OWNER]);
 
         let member = isolated_principal(Role::Member, Visibility::Project, Some(TEST_OWNER));
         let (scope, params) = member.build_sql_scope();

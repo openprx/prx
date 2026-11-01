@@ -79,11 +79,72 @@ fn parse_json<T: for<'de> Deserialize<'de>>(bytes: &Bytes) -> Result<T, ApiRespo
 fn scoped_args(owner_id: &str, mut fields: Map<String, Value>) -> Value {
     fields.retain(|key, _| !crate::tools::execution::is_runtime_only_arg(key) && key != "owner_id" && key != "owner");
     fields.insert("_zc_scope_trusted".to_string(), json!(true));
-    fields.insert("_zc_scope".to_string(), json!({ "owner_id": owner_id }));
+    fields.insert(
+        "_zc_scope".to_string(),
+        json!({ "owner_id": owner_id, "owner_isolated": true }),
+    );
     Value::Object(fields)
 }
 
-fn classify(error: &str) -> ApiResponse {
+fn lifecycle_code(output: &str) -> Option<(String, Option<String>)> {
+    let value: Value = serde_json::from_str(output).ok()?;
+    let code = value.get("lifecycle_code")?.as_str()?.to_string();
+    let transaction_id = value
+        .get("transaction_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    Some((code, transaction_id))
+}
+
+fn classify_failure(output: &str, error: &str) -> ApiResponse {
+    if let Some((code, transaction_id)) = lifecycle_code(output)
+        && let Some(response) = classify_code(&code, transaction_id.as_deref())
+    {
+        return response;
+    }
+    classify_text(error)
+}
+
+fn classify_code(code: &str, transaction_id: Option<&str>) -> Option<ApiResponse> {
+    Some(match code {
+        "committed_repair_required" => {
+            let mut body = serde_json::Map::new();
+            body.insert("error".to_string(), json!("committed with repair required"));
+            body.insert("committed_repair_required".to_string(), json!(true));
+            if let Some(id) = transaction_id {
+                body.insert("transaction_id".to_string(), json!(id));
+            }
+            (StatusCode::CONFLICT, Json(Value::Object(body)))
+        }
+        "owner_isolated_write" => error_response(
+            StatusCode::FORBIDDEN,
+            "publish and rollback need the operator's full session",
+        ),
+        "not_found" => error_response(StatusCode::NOT_FOUND, "not found"),
+        "wrong_owner" => error_response(
+            StatusCode::FORBIDDEN,
+            "the skill lifecycle store belongs to another owner",
+        ),
+        "unknown_owner" => error_response(
+            StatusCode::FORBIDDEN,
+            "the skill lifecycle needs a caller with a known owner scope",
+        ),
+        "invalid" => bad_request("lifecycle request is invalid"),
+        "unavailable" => unavailable(),
+        "busy" => error_response(StatusCode::CONFLICT, "skill lifecycle is busy"),
+        "stale_generation" | "conflict" => error_response(StatusCode::CONFLICT, "lifecycle generation conflict"),
+        "approval_required" => error_response(StatusCode::FORBIDDEN, "explicit approval grant required"),
+        "read_only" => error_response(
+            StatusCode::FORBIDDEN,
+            "read-only mode cannot change the skill lifecycle",
+        ),
+        "policy_denied" => error_response(StatusCode::FORBIDDEN, "the skill lifecycle change was refused"),
+        _ => return None,
+    })
+}
+
+fn classify_text(error: &str) -> ApiResponse {
     let lower = error.to_ascii_lowercase();
     if lower.contains("committed but needs repair") {
         return (
@@ -146,8 +207,11 @@ async fn execute(state: &AppState, principal: &ApiPrincipal, fields: Map<String,
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, "skill lifecycle result was not json")
             }
         },
-        Ok(result) => classify(result.error.as_deref().unwrap_or("skill lifecycle call failed")),
-        Err(error) => classify(&error.to_string()),
+        Ok(result) => classify_failure(
+            &result.output,
+            result.error.as_deref().unwrap_or("skill lifecycle call failed"),
+        ),
+        Err(error) => classify_failure("", &error.to_string()),
     }
 }
 
@@ -283,22 +347,27 @@ mod tests {
 
     #[test]
     fn lifecycle_errors_keep_repair_conflict_and_not_found_distinct() {
-        let repair = classify("transaction tx is committed but needs repair or recovery: disk");
+        let repair = classify_failure(
+            r#"{"lifecycle_code":"committed_repair_required","transaction_id":"tx-1"}"#,
+            "transaction tx-1 is committed but needs repair or recovery: disk",
+        );
         assert_eq!(repair.0, StatusCode::CONFLICT);
         assert_eq!(at(&repair.1.0, "/committed_repair_required"), true);
+        assert_eq!(at(&repair.1.0, "/transaction_id"), "tx-1");
         assert_eq!(at(&repair.1.0, "/error"), "committed with repair required");
         assert!(!at(&repair.1.0, "/error").as_str().unwrap_or("").contains("rolled back"));
 
-        let conflict = classify("stale generation for skill demo: expected 1, active is 2");
+        let conflict = classify_failure("", "stale generation for skill demo: expected 1, active is 2");
         assert_eq!(conflict.0, StatusCode::CONFLICT);
 
-        let missing = classify("no such proposal proposal-1");
-        let foreign = classify("revision not found: r1-other");
+        let missing = classify_failure("", "no such proposal proposal-1");
+        let foreign = classify_failure("", "revision not found: r1-other");
         assert_eq!(missing.0, StatusCode::NOT_FOUND);
         assert_eq!(foreign.0, StatusCode::NOT_FOUND);
         assert_eq!(at(&missing.1.0, "/error"), at(&foreign.1.0, "/error"));
 
-        let denied = classify(
+        let denied = classify_failure(
+            "",
             "the skill lifecycle store belongs to another owner scope (configured owner_scope: owner:ws:cli:other; this caller's owner id: api:token)",
         );
         assert_eq!(denied.0, StatusCode::FORBIDDEN);
@@ -356,7 +425,37 @@ mod tests {
             )
             .await;
         assert_eq!(status, 403, "{body}");
-        assert_eq!(at(&json(&body), "/error"), "explicit approval grant required");
+        assert_eq!(
+            at(&json(&body), "/error"),
+            "publish and rollback need the operator's full session"
+        );
+
+        let (status, body) = served
+            .call(
+                reqwest::Method::POST,
+                &format!("/api/skills/lifecycle/proposals/{missing}/cancel"),
+                None,
+            )
+            .await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(at(&json(&body), "/error"), "not found");
+
+        let (status, body) = served
+            .call(
+                reqwest::Method::POST,
+                "/api/skills/lifecycle/rollback",
+                Some(serde_json::json!({
+                    "skill_id": "demo",
+                    "revision_id": "r1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "expected_generation": 1
+                })),
+            )
+            .await;
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(
+            at(&json(&body), "/error"),
+            "publish and rollback need the operator's full session"
+        );
 
         let (status, _) = served
             .call(
