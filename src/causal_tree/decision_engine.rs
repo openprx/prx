@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 mod approval_selection_tests;
 #[cfg(test)]
+mod deadline_keep_tests;
+#[cfg(test)]
 pub(crate) mod original_observation;
 #[cfg(test)]
 mod resume_availability_tests;
@@ -24,7 +26,10 @@ use super::decision_score::{
     CandidatePrediction, CandidateScore, CausalBranchScorer, ExtractionError, PredictionEvidence, ScoreError,
     ScoreInputs, ScorerWeights,
 };
-use super::decision_select::{CausalSelector, SelectError, Selection, SelectorContext};
+use super::decision_select::{
+    CausalSelector, SelectError, Selection, SelectorContext, commit_threshold_for, pure_textual_reply,
+    routing_has_concrete_artifact,
+};
 use super::directive::{DirectiveContext, TurnExecutionDirective, directive_from_selection};
 use super::gates::{GateError, GateInputs, GateOutcome, GateReport, HardGates};
 use super::ids::DecisionId;
@@ -51,6 +56,56 @@ use crate::tools::execution::{ToolExecutionDecision, decide_tool_execution};
 /// introduced on builtin/cache or physical paths by this contract.
 pub(crate) mod prediction_sealed {
     pub(crate) trait Producer {}
+}
+
+const PHASE_PREDICTION: u8 = 0;
+const PHASE_SCORING: u8 = 1;
+const PHASE_SELECTION: u8 = 2;
+const PHASE_POST_SELECTION: u8 = 3;
+
+#[cfg(test)]
+struct DecisionClock {
+    before: Instant,
+    after: Instant,
+    exceed_at: u8,
+    phase: std::sync::atomic::AtomicU8,
+}
+
+#[cfg(test)]
+impl DecisionClock {
+    fn instant(&self) -> Instant {
+        if self.phase.load(std::sync::atomic::Ordering::Relaxed) >= self.exceed_at {
+            self.after
+        } else {
+            self.before
+        }
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static DECISION_CLOCK: Arc<DecisionClock>;
+}
+
+fn decision_now() -> Instant {
+    #[cfg(test)]
+    {
+        if let Ok(now) = DECISION_CLOCK.try_with(|clock| clock.instant()) {
+            return now;
+        }
+    }
+    // No phase clock: share the engine logical clock (wall time unless a test installed one).
+    super::logical_clock::now()
+}
+
+#[cfg(not(test))]
+const fn enter_decision_phase(_phase: u8) {}
+
+#[cfg(test)]
+fn enter_decision_phase(phase: u8) {
+    let _ = DECISION_CLOCK.try_with(|clock| {
+        clock.phase.store(phase, std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
 pub(crate) trait PredictionPort: prediction_sealed::Producer + Clone + Send + Sync {
@@ -971,7 +1026,8 @@ impl CausalDecisionEngine {
                 );
             }
         }
-        if matches!(candidates, CandidateSet::Legal { .. }) && super::logical_clock::now() < inputs.deadline {
+        enter_decision_phase(PHASE_PREDICTION);
+        if matches!(candidates, CandidateSet::Legal { .. }) && decision_now() < inputs.deadline {
             let compiled = QuestionCompiler::compile(
                 &state,
                 &candidates,
@@ -1002,7 +1058,7 @@ impl CausalDecisionEngine {
             )
             .await;
             match outcome {
-                Ok(Ok(result)) if super::logical_clock::now() < inputs.deadline => {
+                Ok(Ok(result)) if decision_now() < inputs.deadline => {
                     let terminal_cause = inputs.prediction.terminal_fallback_cause(&result);
                     if let Some(cause) = terminal_cause {
                         // Keep the factory result for truthful attempt and
@@ -1066,12 +1122,11 @@ impl CausalDecisionEngine {
             stage_cap: Duration::from_millis(u64::from(inputs.config.rehearsal.timeout_ms)),
             deadline: tokio::time::Instant::from_std(inputs.deadline),
         };
-        let rehearsal =
-            if prediction.is_some() && fallback_cause.is_none() && super::logical_clock::now() < inputs.deadline {
-                BoundedRehearsal::run(&all, inputs.catalog, inputs.rehearsal_ports, &rehearsal_context).await?
-            } else {
-                BTreeMap::new()
-            };
+        let rehearsal = if prediction.is_some() && fallback_cause.is_none() && decision_now() < inputs.deadline {
+            BoundedRehearsal::run(&all, inputs.catalog, inputs.rehearsal_ports, &rehearsal_context).await?
+        } else {
+            BTreeMap::new()
+        };
         let remaining_budget = remaining_budget(inputs, &state);
         let post_rehearsal =
             HardGates::apply_with_remaining_budget(&state, inputs.catalog, &all, inputs.gates, remaining_budget)?;
@@ -1081,13 +1136,13 @@ impl CausalDecisionEngine {
 
         let mut scores = BTreeMap::new();
         let mut scored_count = 0usize;
+        enter_decision_phase(PHASE_SCORING);
         let (mut selection, mut exploration_propensities) = if let Some(evidence) = evidence.as_ref() {
-            let weights =
-                if prediction.is_some() && fallback_cause.is_none() && super::logical_clock::now() < inputs.deadline {
-                    Some(ScorerWeights::effective(&inputs.config.scoring)?)
-                } else {
-                    None
-                };
+            let weights = if prediction.is_some() && fallback_cause.is_none() && decision_now() < inputs.deadline {
+                Some(ScorerWeights::effective(&inputs.config.scoring)?)
+            } else {
+                None
+            };
             let CandidateSet::Legal {
                 candidates: admitted, ..
             } = &candidates
@@ -1098,10 +1153,7 @@ impl CausalDecisionEngine {
                 let Some(features) = evidence.candidates.get(candidate.candidate_id()) else {
                     return Err(EngineError::CandidateDrift);
                 };
-                let score = if let Some(weights) = weights
-                    .as_ref()
-                    .filter(|_| super::logical_clock::now() < inputs.deadline)
-                {
+                let score = if let Some(weights) = weights.as_ref().filter(|_| decision_now() < inputs.deadline) {
                     scored_count = scored_count.saturating_add(1);
                     let cost = candidate.estimated_cost().ok_or(EngineError::MissingEstimate)?;
                     let latency = candidate.estimated_latency_ms().ok_or(EngineError::MissingEstimate)?;
@@ -1133,13 +1185,18 @@ impl CausalDecisionEngine {
                 };
                 scores.insert(candidate.candidate_id().clone(), score);
             }
-            let selection_evidence = if super::logical_clock::now() >= inputs.deadline {
+            enter_decision_phase(PHASE_SELECTION);
+            let selection_evidence = if decision_now() >= inputs.deadline {
                 fallback_cause.get_or_insert(FallbackCause::DeadlineExceeded);
-                terminal_evidence(&candidates)
+                if legal_commit_above_threshold(&candidates, &scores, evidence, &inputs.config.policy) {
+                    evidence.clone()
+                } else {
+                    terminal_evidence(&candidates)
+                }
             } else {
                 evidence.clone()
             };
-            if prediction.is_some() && fallback_cause.is_none() && super::logical_clock::now() < inputs.deadline {
+            if prediction.is_some() && fallback_cause.is_none() && decision_now() < inputs.deadline {
                 CausalSelector::select_with_exploration(
                     &candidates,
                     &scores,
@@ -1201,27 +1258,36 @@ impl CausalDecisionEngine {
                 BTreeMap::new(),
             )
         };
-        if super::logical_clock::now() >= inputs.deadline
+        enter_decision_phase(PHASE_POST_SELECTION);
+        if decision_now() >= inputs.deadline
             && matches!(selection, Selection::Commit { .. } | Selection::Recover { .. })
         {
             fallback_cause.get_or_insert(FallbackCause::DeadlineExceeded);
-            selection = CausalSelector::select(
-                &candidates,
-                &scores,
-                &terminal_evidence(&candidates),
-                &pre_commit,
-                &inputs.config.policy,
-                &selector_context_for_config(
+            let keep_commit = match &selection {
+                Selection::Commit { candidate_id, .. } => {
+                    commit_is_above_threshold(&candidates, &scores, &inputs.config.policy, candidate_id)
+                }
+                _ => false,
+            };
+            if !keep_commit {
+                selection = CausalSelector::select(
                     &candidates,
-                    inputs.catalog,
-                    trusted.delivery.interactive,
-                    resume_target,
-                    inputs.discovered_refs,
-                    inputs.config.enabled,
-                    state.routing_input.as_str(),
-                ),
-            )?;
-            exploration_propensities.clear();
+                    &scores,
+                    &terminal_evidence(&candidates),
+                    &pre_commit,
+                    &inputs.config.policy,
+                    &selector_context_for_config(
+                        &candidates,
+                        inputs.catalog,
+                        trusted.delivery.interactive,
+                        resume_target,
+                        inputs.discovered_refs,
+                        inputs.config.enabled,
+                        state.routing_input.as_str(),
+                    ),
+                )?;
+                exploration_propensities.clear();
+            }
         }
         Ok(EngineDecision {
             decision_id: inputs.decision_id,
@@ -1355,6 +1421,55 @@ const fn is_terminal(action: CausalActionKind) -> bool {
         action,
         CausalActionKind::Clarify | CausalActionKind::RequestApproval | CausalActionKind::Refuse
     )
+}
+
+fn commit_is_above_threshold(
+    set: &CandidateSet,
+    scores: &BTreeMap<CandidateId, CandidateScore>,
+    policy: &super::config::CausalPolicy,
+    candidate_id: &CandidateId,
+) -> bool {
+    let CandidateSet::Legal { candidates, .. } = set else {
+        return false;
+    };
+    candidates
+        .iter()
+        .find(|candidate| candidate.candidate_id() == candidate_id)
+        .is_some_and(|candidate| scored_above_threshold(scores, policy, candidate))
+}
+
+fn legal_commit_above_threshold(
+    set: &CandidateSet,
+    scores: &BTreeMap<CandidateId, CandidateScore>,
+    evidence: &PredictionEvidence,
+    policy: &super::config::CausalPolicy,
+) -> bool {
+    let CandidateSet::Legal { candidates, .. } = set else {
+        return false;
+    };
+    candidates.iter().any(|candidate| {
+        if is_terminal(candidate.action()) {
+            return false;
+        }
+        let probability = evidence
+            .candidates
+            .get(candidate.candidate_id())
+            .map_or(0.0, |features| features.choice_probability);
+        probability > 0.0 && scored_above_threshold(scores, policy, candidate)
+    })
+}
+
+fn scored_above_threshold(
+    scores: &BTreeMap<CandidateId, CandidateScore>,
+    policy: &super::config::CausalPolicy,
+    candidate: &CausalCandidate,
+) -> bool {
+    if is_terminal(candidate.action()) {
+        return false;
+    }
+    scores.get(candidate.candidate_id()).is_some_and(|score| {
+        score.execution_utility >= commit_threshold_for(f64::from(policy.commit_threshold), candidate.side_effect())
+    })
 }
 
 fn derive_state(set: &CandidateSet, catalog: &CatalogView<'_>) -> Result<DerivedState, DuplicateCandidate> {
@@ -1628,6 +1743,8 @@ fn selector_context(
         discovery_completed: discovered_refs.iter().next().is_some(),
         single_exact_capability: false,
         single_exact_read_capability: false,
+        concrete_artefact: false,
+        pure_textual_reply: false,
     }
 }
 
@@ -1653,6 +1770,8 @@ fn selector_context_for_config(
     routing_input: &str,
 ) -> SelectorContext {
     let mut context = selector_context(set, catalog, interactive, resume_target, discovered_refs);
+    context.concrete_artefact = routing_has_concrete_artifact(routing_input);
+    context.pure_textual_reply = pure_textual_reply(routing_input);
     context.single_exact_capability = single_exact_capability(catalog, routing_input);
     let folded = routing_input.to_lowercase();
     context.single_exact_read_capability = catalog

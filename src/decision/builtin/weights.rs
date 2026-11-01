@@ -1,6 +1,7 @@
 //! The versioned constants of the builtin decision model `builtin-v4`
-//! (SP-CDP-A 5.7). Every number the builtin uses is here; changing one is a
-//! new model version.
+//! (SP-CDP-A 5.7). Every number the builtin uses is here. Changing a softmax
+//! weight or a log-score bonus is a new model version. A named evidence rule
+//! may be added inside the current version when the policy text records it.
 
 use super::features::Action;
 
@@ -19,6 +20,12 @@ pub const STALE_ARTIFACT_MS: u64 = 60 * 60 * 1000;
 /// or above its threshold (also 0.5) as sufficient, so these turns answer
 /// directly without a retrieve hop.
 pub const PLAIN_TURN_EVIDENCE: f64 = 0.5;
+
+/// Evidence-sufficient probability of a first hop that already names a path,
+/// URL, or code shape, has a matching available tool, and has no retrieve or
+/// discover candidate. Softmax weights are unchanged. The selector still
+/// keeps retrieve-first when a recovery candidate is admitted.
+pub const CONCRETE_ARTIFACT_EVIDENCE: f64 = 0.75;
 
 /// Log-score bonus for a candidate the user named exactly.
 pub const EXACT_MENTION: f64 = 2.0;

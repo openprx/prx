@@ -143,6 +143,37 @@ fn continued_plain_conversation_turn(state: &StateFeatures<'_>) -> bool {
         && state.artifact_count == 0
 }
 
+fn tool_matches_structure(state: &StateFeatures<'_>, candidate: &CandidateFeatures<'_>) -> bool {
+    let text = &state.text;
+    candidate.available
+        && candidate.action == Some(Action::UseTool)
+        && ((text.path && matches!(candidate.target, "filesystem" | "document"))
+            || (text.url && candidate.target == "web")
+            || (text.code
+                && (candidate.target == "shell" || (candidate.target == "filesystem" && candidate.executes_process))))
+}
+
+/// A structural first hop with a matching tool and no recovery candidate.
+/// Retrieve and discover stay on the existing evidence path when they are offered.
+fn concrete_artifact_without_recovery(state: &StateFeatures<'_>) -> bool {
+    let text = &state.text;
+    text.has_text
+        && text.structural()
+        && state.retry_count == 0
+        && state.unsuccessful_action_steps == 0
+        && !state.approval_pending
+        && state.fresh_artifacts == 0
+        && state.successful_lookups == 0
+        && !state
+            .candidates
+            .iter()
+            .any(|candidate| matches!(candidate.action, Some(Action::Retrieve | Action::Discover)))
+        && state
+            .candidates
+            .iter()
+            .any(|candidate| tool_matches_structure(state, candidate))
+}
+
 fn plain_turn_has_no_read_recovery(state: &StateFeatures<'_>) -> bool {
     plain_conversation_turn(state)
         && !state
@@ -364,6 +395,9 @@ fn noul(state: &StateFeatures<'_>, meaning: Meaning<'_>) -> f64 {
             // run. Structurally or exactly targeted tool turns retain the
             // existing retrieve-first evidence path. Exact delegation instead
             // serves the model with only the sealed delegator publication.
+            if concrete_artifact_without_recovery(state) {
+                return weights::CONCRETE_ARTIFACT_EVIDENCE;
+            }
             let plain = plain_conversation_turn(state) || model_managed_delegation_turn(state);
             let decisive = if plain {
                 1.0
@@ -2227,6 +2261,86 @@ mod tests {
             noul_probability(&retried, GlobalQuestion::EvidenceSufficient) < 0.5,
             "an exhausted retry budget still requires clarification"
         );
+    }
+
+    #[test]
+    fn concrete_artifact_without_recovery_is_sufficient_evidence() {
+        let key = key();
+        let direct_tools = || {
+            vec![
+                candidate_json("use_tool", "filesystem", "use_tool-filesystem"),
+                candidate_json("use_tool", "shell", "use_tool-shell"),
+                candidate_json("use_tool", "web", "use_tool-web"),
+                candidate_json("answer", "none", "answer-none"),
+                candidate_json("clarify", "none", "clarify-none"),
+                candidate_json("refuse", "none", "refuse-none"),
+            ]
+        };
+        let answer = |turn: &str, candidates: Vec<Value>| {
+            let value = state(turn, candidates);
+            let request = seal(&key, value.clone(), compiler_questions(&value));
+            answer_and_validate(&request)
+        };
+        let explicit =
+            "Read /tmp/prx_fixture/input.md and write /tmp/prx_fixture/reports/x.md. End the file with STATUS: A or B.";
+        let direct = answer(explicit, direct_tools());
+        assert_eq!(chosen(&direct, GlobalQuestion::NextAction), "use_tool");
+        assert_eq!(chosen(&direct, GlobalQuestion::CapabilityTarget), "filesystem");
+        assert!(
+            (noul_probability(&direct, GlobalQuestion::EvidenceSufficient) - weights::CONCRETE_ARTIFACT_EVIDENCE).abs()
+                < 1e-12
+        );
+
+        let with_recovery = answer(explicit, typical_candidates());
+        assert!(
+            noul_probability(&with_recovery, GlobalQuestion::EvidenceSufficient) < 0.5,
+            "retrieve or discover still owns the first hop"
+        );
+
+        let terminal = answer(
+            explicit,
+            vec![
+                candidate_json("answer", "none", "answer-none"),
+                candidate_json("clarify", "none", "clarify-none"),
+                candidate_json("refuse", "none", "refuse-none"),
+            ],
+        );
+        assert!(noul_probability(&terminal, GlobalQuestion::EvidenceSufficient) < 0.5);
+
+        let url = answer("look at https://example.com/report and summarize it", direct_tools());
+        assert_eq!(chosen(&url, GlobalQuestion::CapabilityTarget), "web");
+        assert!(
+            (noul_probability(&url, GlobalQuestion::EvidenceSufficient) - weights::CONCRETE_ARTIFACT_EVIDENCE).abs()
+                < 1e-12
+        );
+        let code = answer("run `cargo test` for me", direct_tools());
+        assert_eq!(chosen(&code, GlobalQuestion::CapabilityTarget), "shell");
+        assert!(
+            (noul_probability(&code, GlobalQuestion::EvidenceSufficient) - weights::CONCRETE_ARTIFACT_EVIDENCE).abs()
+                < 1e-12
+        );
+
+        let ambiguous = answer("make this friendlier", direct_tools());
+        assert_eq!(chosen(&ambiguous, GlobalQuestion::NextAction), "answer");
+        assert!(
+            (noul_probability(&ambiguous, GlobalQuestion::EvidenceSufficient) - weights::PLAIN_TURN_EVIDENCE).abs()
+                < 1e-12
+        );
+        let empty = answer("  ", direct_tools());
+        assert_eq!(chosen(&empty, GlobalQuestion::NextAction), "clarify");
+        assert!(noul_probability(&empty, GlobalQuestion::EvidenceSufficient) < 0.5);
+
+        let mut failed = state(explicit, direct_tools());
+        failed["completed_steps"] = json!([{"kind": "tool", "status": "failed"}]);
+        let failed_request = seal(&key, failed.clone(), compiler_questions(&failed));
+        let failed = answer_and_validate(&failed_request);
+        assert!(noul_probability(&failed, GlobalQuestion::EvidenceSufficient) < 0.5);
+
+        let mut retried = state(explicit, direct_tools());
+        retried["retry_count"] = json!(weights::RETRY_THRESHOLD);
+        let retried_request = seal(&key, retried.clone(), compiler_questions(&retried));
+        let retried = answer_and_validate(&retried_request);
+        assert!(noul_probability(&retried, GlobalQuestion::EvidenceSufficient) < 0.5);
     }
 
     /// D-061 amendment N-1..N-4: a localized path, an internationalized

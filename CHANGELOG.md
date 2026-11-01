@@ -98,6 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `config.d/agent.toml`; startup and `prx init --force` remain available.
   Versioned disables and unversioned disables alongside modern settings
   remain explicit, and loading does not rewrite files.
+- Keep an explicit first-hop instruction that names a path, URL, or command from abstaining to Clarify when a matching tool is legal and no retrieve or discover candidate is available (`concrete_artifact`). A pure textual reply such as "reply with exactly one word" is answered, including when an execution check predicted a tool and the corrective retry produced none (`pure_answer_no_tool`). A decision deadline that expires after a legal Commit candidate is already above the commit threshold keeps that candidate and records `deadline_exceeded`.
 
 ## [0.8.171] - 2026-10-31
 
