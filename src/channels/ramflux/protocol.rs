@@ -502,6 +502,9 @@ pub struct TurnStatusParams<'a> {
     pub state: TurnState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<&'a TurnError>,
+    /// Present when `state` is `awaiting_approval`. This is the prx decision id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<&'a str>,
 }
 
 /// Canonical JSON: object keys sorted, no insignificant whitespace.

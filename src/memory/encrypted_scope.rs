@@ -12,9 +12,6 @@ use base64::Engine;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// How many namespace rows `recall` will open before it stops.
-const RECALL_SCAN_LIMIT: usize = 200;
-
 /// Encrypting view of `inner` for one `agent_account_id/conversation_id` scope.
 pub struct EncryptedScope {
     inner: Arc<dyn Memory>,
@@ -43,14 +40,15 @@ impl EncryptedScope {
         format!("rf:{}:", id_hash(&self.scope))
     }
 
-    fn namespaced(&self, key: &str) -> String {
-        format!("{}{key}", self.prefix())
+    fn stored_key(&self, record_id: &str) -> String {
+        format!("{}{}", self.prefix(), id_hash(record_id))
     }
 
     fn seal(&self, record_id: &str, content: &str) -> Result<String, CryptoError> {
+        let wrapped = serde_json::json!({ "id": record_id, "body": content }).to_string();
         let blob = self
             .crypto
-            .seal(&self.account_id, &self.scope, record_id, content.as_bytes())?;
+            .seal(&self.account_id, &self.scope, &id_hash(record_id), wrapped.as_bytes())?;
         if self.crypto.encryption_enabled() {
             Ok(base64::engine::general_purpose::STANDARD.encode(blob))
         } else {
@@ -59,6 +57,29 @@ impl EncryptedScope {
     }
 
     fn open_record(&self, record_id: &str, stored: &str) -> Option<String> {
+        let plain = self.open_aad(&id_hash(record_id), stored)?;
+        let value: serde_json::Value = serde_json::from_str(&plain).ok()?;
+        value.get("body").and_then(|item| item.as_str()).map(str::to_string)
+    }
+
+    fn open_stored(&self, stored_key: &str, stored: &str) -> Option<(String, String)> {
+        let aad = stored_key.rsplit(':').next()?;
+        let plain = self.open_aad(aad, stored)?;
+        let value: serde_json::Value = serde_json::from_str(&plain).ok()?;
+        let id = value.get("id").and_then(|item| item.as_str())?;
+        let body = value.get("body").and_then(|item| item.as_str())?;
+        Some((id.to_string(), body.to_string()))
+    }
+
+    /// Seal message text. `raw_payload_json` stays intact: ingress stores a
+    /// JSON capsule wrapper there and the sqlite receipt parser requires it.
+    fn seal_event_content(&self, input: &mut crate::memory::MessageEventInput) -> Result<(), CryptoError> {
+        let record_id = input.idempotency_key.clone().unwrap_or_else(|| "event".to_string());
+        input.content = self.seal(&record_id, &input.content)?;
+        Ok(())
+    }
+
+    fn open_aad(&self, record_hash: &str, stored: &str) -> Option<String> {
         if !self.crypto.encryption_enabled() {
             return Some(stored.to_string());
         }
@@ -68,12 +89,11 @@ impl EncryptedScope {
         if !blob.starts_with(b"RF1") {
             return None;
         }
-        let plain = self.crypto.open(&self.account_id, &self.scope, record_id, &blob).ok()?;
+        let plain = self
+            .crypto
+            .open(&self.account_id, &self.scope, record_hash, &blob)
+            .ok()?;
         String::from_utf8(plain).ok()
-    }
-
-    fn original_key<'a>(&self, stored_key: &'a str) -> Option<&'a str> {
-        stored_key.strip_prefix(&self.prefix())
     }
 
     fn reveal(&self, mut event: crate::memory::MessageEvent) -> crate::memory::MessageEvent {
@@ -107,24 +127,16 @@ impl Memory for EncryptedScope {
     ) -> anyhow::Result<()> {
         let sealed = self.seal(key, content)?;
         self.inner
-            .store(&self.namespaced(key), &sealed, category, Some(self.scope.as_str()))
+            .store(&self.stored_key(key), &sealed, category, Some(self.scope.as_str()))
             .await
     }
 
     async fn recall(&self, query: &str, limit: usize, _session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
-        let entries = self.inner.list(None, None).await?;
+        let entries = self.inner.list_key_prefix(&self.prefix(), usize::MAX).await?;
         let needle = query.to_lowercase();
         let mut matched = Vec::new();
-        let mut scanned = 0usize;
         for mut entry in entries {
-            let Some(record_id) = self.original_key(&entry.key).map(str::to_string) else {
-                continue;
-            };
-            if scanned >= RECALL_SCAN_LIMIT {
-                break;
-            }
-            scanned = scanned.saturating_add(1);
-            let Some(plain) = self.open_record(&record_id, &entry.content) else {
+            let Some((record_id, plain)) = self.open_stored(&entry.key, &entry.content) else {
                 continue;
             };
             if !needle.is_empty() && !plain.to_lowercase().contains(&needle) {
@@ -141,7 +153,7 @@ impl Memory for EncryptedScope {
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        let Some(mut entry) = self.inner.get(&self.namespaced(key)).await? else {
+        let Some(mut entry) = self.inner.get(&self.stored_key(key)).await? else {
             return Ok(None);
         };
         let Some(plain) = self.open_record(key, &entry.content) else {
@@ -154,16 +166,13 @@ impl Memory for EncryptedScope {
 
     async fn list(
         &self,
-        category: Option<&MemoryCategory>,
+        _category: Option<&MemoryCategory>,
         _session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let entries = self.inner.list(category, None).await?;
+        let entries = self.inner.list_key_prefix(&self.prefix(), usize::MAX).await?;
         let mut own = Vec::new();
         for mut entry in entries {
-            let Some(record_id) = self.original_key(&entry.key).map(str::to_string) else {
-                continue;
-            };
-            let Some(plain) = self.open_record(&record_id, &entry.content) else {
+            let Some((record_id, plain)) = self.open_stored(&entry.key, &entry.content) else {
                 continue;
             };
             entry.content = plain;
@@ -173,8 +182,55 @@ impl Memory for EncryptedScope {
         Ok(own)
     }
 
+    async fn list_key_prefix(&self, prefix: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        let query = if prefix.is_empty() {
+            self.prefix()
+        } else {
+            prefix.to_string()
+        };
+        let entries = self.inner.list_key_prefix(&query, limit).await?;
+        let mut own = Vec::new();
+        for mut entry in entries {
+            let Some((record_id, plain)) = self.open_stored(&entry.key, &entry.content) else {
+                continue;
+            };
+            entry.content = plain;
+            entry.key = record_id;
+            own.push(entry);
+        }
+        Ok(own)
+    }
+
+    fn persisted_key(&self, key: &str) -> String {
+        self.stored_key(key)
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
-        self.inner.forget(&self.namespaced(key)).await
+        self.inner.forget(&self.stored_key(key)).await
+    }
+
+    async fn forget_message_idempotency(&self, idempotency_key: &str) -> anyhow::Result<usize> {
+        self.inner.forget_message_idempotency(idempotency_key).await
+    }
+
+    async fn checkpoint_wal(&self) -> anyhow::Result<()> {
+        self.inner.checkpoint_wal().await
+    }
+
+    async fn forget_key_prefix(&self, prefix: &str) -> anyhow::Result<usize> {
+        let query = if prefix.is_empty() {
+            self.prefix()
+        } else {
+            prefix.to_string()
+        };
+        let entries = self.inner.list_key_prefix(&query, usize::MAX).await?;
+        let mut removed = 0usize;
+        for entry in entries {
+            if self.inner.forget(&entry.key).await? {
+                removed = removed.saturating_add(1);
+            }
+        }
+        Ok(removed)
     }
 
     async fn count(&self) -> anyhow::Result<usize> {
@@ -193,10 +249,13 @@ impl Memory for EncryptedScope {
         &self,
         mut input: crate::memory::MessageEventInput,
     ) -> anyhow::Result<crate::memory::MessageEvent> {
-        let record_id = input.idempotency_key.clone().unwrap_or_else(|| "event".to_string());
-        input.content = self.seal(&record_id, &input.content)?;
-        if let Some(payload) = input.raw_payload_json.as_deref() {
-            input.raw_payload_json = Some(self.seal(&format!("{record_id}:payload"), payload)?);
+        self.seal_event_content(&mut input)?;
+        // Ingress keeps its capsule wrapper parseable. Every other event,
+        // including the terminal marker, seals the payload so reply text is
+        // not stored beside the ciphertext.
+        if let Some(payload) = input.raw_payload_json.clone() {
+            let record_id = input.idempotency_key.clone().unwrap_or_else(|| "event".to_string());
+            input.raw_payload_json = Some(self.seal(&format!("{record_id}:payload"), &payload)?);
         }
         let event = self.inner.append_message_event(input).await?;
         Ok(self.reveal(event))
@@ -251,8 +310,8 @@ impl Memory for EncryptedScope {
         message_id: Option<&str>,
         _owner_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let record = message_id.unwrap_or(session_key);
-        let key = format!("convturn:{session_key}:{record}");
+        let record = message_id.filter(|value| !value.is_empty()).unwrap_or(session_key);
+        let key = format!("convturn:{session_key}:{role}:{record}");
         let payload = serde_json::json!({
             "role": role,
             "content": content,
@@ -315,7 +374,243 @@ impl Memory for EncryptedScope {
                     .map(str::to_string),
             });
         }
+        for turns in out.values_mut() {
+            turns.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        }
         Ok(out)
+    }
+
+    async fn retrieve_decision_memory(
+        &self,
+        query: &str,
+        limit: u8,
+        context: &crate::memory::MemoryWriteContext,
+        session_id: Option<&str>,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<crate::memory::traits::DecisionMemoryHit>> {
+        self.inner
+            .retrieve_decision_memory(query, limit, context, session_id, deadline)
+            .await
+    }
+
+    async fn retrieve_decision_documents(
+        &self,
+        query: &str,
+        limit: u8,
+        principal: &crate::memory::MemoryPrincipal,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<crate::memory::traits::DecisionDocumentHit>> {
+        self.inner
+            .retrieve_decision_documents(query, limit, principal, deadline)
+            .await
+    }
+
+    async fn retrieve_decision_session(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        before_event_id: &str,
+        limit: u8,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<crate::memory::traits::DecisionSessionHit>> {
+        self.inner
+            .retrieve_decision_session(principal, before_event_id, limit, deadline)
+            .await
+    }
+
+    async fn read_router_history(
+        &self,
+        evidence: crate::memory::RouterHistoryReadEvidence,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<crate::memory::RouterHistoryRead> {
+        self.inner.read_router_history(evidence, deadline).await
+    }
+
+    async fn commit_router_history(
+        &self,
+        evidence: &crate::memory::RouterHistoryWriteEvidence,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<crate::memory::RouterHistoryCommitReceipt> {
+        self.inner.commit_router_history(evidence, deadline).await
+    }
+
+    async fn read_router_learning(
+        &self,
+        evidence: &crate::memory::traits::RouterLearningEvidence,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<crate::memory::traits::RouterLearningRead> {
+        self.inner.read_router_learning(evidence, deadline).await
+    }
+
+    async fn commit_router_learning(
+        &self,
+        evidence: &crate::memory::traits::RouterLearningEvidence,
+        expected_version: i64,
+        next: &crate::memory::traits::RouterLearningSnapshot,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<crate::memory::traits::RouterLearningCommit> {
+        self.inner
+            .commit_router_learning(evidence, expected_version, next, deadline)
+            .await
+    }
+
+    async fn count_rehearsal_hits(
+        &self,
+        query: &str,
+        limit: u8,
+        context: &crate::memory::MemoryWriteContext,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<u32> {
+        self.inner.count_rehearsal_hits(query, limit, context, deadline).await
+    }
+
+    async fn project_console_message(&self, event: &crate::memory::MessageEvent) -> anyhow::Result<()> {
+        self.inner.project_console_message(event).await
+    }
+
+    async fn acquire_ingress_lifetime(
+        &self,
+        workspace_id: &str,
+        token: &str,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<std::sync::Arc<dyn crate::memory::ingress_recovery::IngressLifetime>> {
+        self.inner.acquire_ingress_lifetime(workspace_id, token, deadline).await
+    }
+
+    async fn append_ingress_input(
+        &self,
+        input: crate::memory::MessageEventInput,
+        capsule: crate::memory::ingress_recovery::IngressCapsule,
+        lifetime: std::sync::Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
+        let mut input = input;
+        self.seal_event_content(&mut input)?;
+        let outcome = self
+            .inner
+            .append_ingress_input(input, capsule, lifetime, deadline)
+            .await?;
+        Ok(match outcome {
+            crate::memory::ingress_recovery::IngressAppendOutcome::Inserted(event) => {
+                crate::memory::ingress_recovery::IngressAppendOutcome::Inserted(self.reveal(event))
+            }
+            crate::memory::ingress_recovery::IngressAppendOutcome::AlreadyAccepted(event) => {
+                crate::memory::ingress_recovery::IngressAppendOutcome::AlreadyAccepted(self.reveal(event))
+            }
+        })
+    }
+
+    async fn list_ingress_recovery_candidates(
+        &self,
+        scope: &crate::memory::ingress_recovery::IngressRecoveryScope,
+        current: std::sync::Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
+        phase: crate::memory::ingress_recovery::IngressRecoveryScan,
+        after_id: i64,
+        limit: usize,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Vec<crate::memory::ingress_recovery::IngressRecoveryCandidate>> {
+        self.inner
+            .list_ingress_recovery_candidates(scope, current, phase, after_id, limit, deadline)
+            .await
+    }
+
+    async fn read_ingress_event(
+        &self,
+        scope: &crate::memory::ingress_recovery::IngressRecoveryScope,
+        lookup: &crate::memory::ingress_recovery::IngressEventLookup,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Option<crate::memory::MessageEvent>> {
+        let event = self.inner.read_ingress_event(scope, lookup, deadline).await?;
+        Ok(event.map(|event| self.reveal(event)))
+    }
+
+    async fn claim_ingress_recovery(
+        &self,
+        workspace_id: &str,
+        token: &str,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Option<crate::memory::ingress_recovery::IngressRecoveryClaim>> {
+        self.inner.claim_ingress_recovery(workspace_id, token, deadline).await
+    }
+
+    async fn commit_ingress_recovery(
+        &self,
+        mut commit: crate::memory::ingress_recovery::IngressRecoveryCommit,
+    ) -> anyhow::Result<crate::memory::MessageEvent> {
+        self.seal_event_content(&mut commit.evidence)?;
+        let event = self.inner.commit_ingress_recovery(commit).await?;
+        Ok(self.reveal(event))
+    }
+
+    async fn load_recent_shared_context(
+        &self,
+        query: crate::memory::SharedContextQuery,
+    ) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
+        let events = self.inner.load_recent_shared_context(query).await?;
+        Ok(events.into_iter().map(|event| self.reveal(event)).collect())
+    }
+
+    async fn load_recent_session_context(
+        &self,
+        query: crate::memory::SessionContextQuery,
+    ) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
+        let events = self.inner.load_recent_session_context(query).await?;
+        Ok(events.into_iter().map(|event| self.reveal(event)).collect())
+    }
+
+    async fn append_memory_event(
+        &self,
+        input: crate::memory::MemoryEventInput,
+    ) -> anyhow::Result<crate::memory::MemoryEvent> {
+        self.inner.append_memory_event(input).await
+    }
+
+    async fn list_memory_events_since(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::memory::MemoryEvent>> {
+        self.inner.list_memory_events_since(principal, after_id, limit).await
+    }
+
+    async fn list_memory_events_recent(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::memory::MemoryEvent>> {
+        self.inner.list_memory_events_recent(principal, limit).await
+    }
+
+    async fn create_memory_draft(
+        &self,
+        input: crate::memory::MemoryDraftInput,
+    ) -> anyhow::Result<crate::memory::MemoryDraft> {
+        self.inner.create_memory_draft(input).await
+    }
+
+    async fn list_memory_drafts_for_run(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        worker_run_id: &str,
+    ) -> anyhow::Result<Vec<crate::memory::MemoryDraft>> {
+        self.inner.list_memory_drafts_for_run(principal, worker_run_id).await
+    }
+
+    async fn merge_memory_draft(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        draft_id: &str,
+    ) -> anyhow::Result<Option<crate::memory::MemoryDraft>> {
+        self.inner.merge_memory_draft(principal, draft_id).await
+    }
+
+    async fn reject_memory_draft(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        draft_id: &str,
+        reason: Option<&str>,
+    ) -> anyhow::Result<Option<crate::memory::MemoryDraft>> {
+        self.inner.reject_memory_draft(principal, draft_id, reason).await
     }
 }
 

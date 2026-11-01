@@ -112,9 +112,12 @@ const SQLITE_READER_PRAGMAS: &str = "PRAGMA foreign_keys  = ON;
 /// pooled readers are unsound without it. The rest are per-connection — normal
 /// sync (2x write speed, still durable on WAL), mmap 8 MB (let the OS page
 /// cache serve hot reads), cache 2 MB (~500 hot pages in-process), and temp
-/// tables that never hit disk.
+/// tables that never hit disk. `secure_delete` zeros a cell when it is
+/// removed so a later `wal_checkpoint(TRUNCATE)` does not leave the payload
+/// in a free block of `brain.db`.
 const SQLITE_WRITER_PRAGMAS: &str = "PRAGMA synchronous   = NORMAL;
      PRAGMA foreign_keys  = ON;
+     PRAGMA secure_delete = ON;
      PRAGMA mmap_size     = 8388608;
      PRAGMA cache_size    = -2000;
      PRAGMA temp_store    = MEMORY;";
@@ -124,6 +127,28 @@ const SQLITE_WRITER_PRAGMAS: &str = "PRAGMA synchronous   = NORMAL;
 /// Re-exported from the shared pool so callers keep reaching it at
 /// `memory::sqlite::SqlitePoolStats`.
 pub use crate::runtime::sqlite_pool::SqlitePoolStats;
+
+/// Make `path` and its parent owner-only, plus any sqlite wal siblings.
+fn restrict_owner_mode(db_path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let restrict = |path: &Path, mode: u32| -> anyhow::Result<()> {
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+        Ok(())
+    };
+    if let Some(parent) = db_path.parent() {
+        restrict(parent, 0o700)?;
+    }
+    restrict(db_path, 0o600)?;
+    let mut wal = db_path.as_os_str().to_os_string();
+    wal.push("-wal");
+    restrict(Path::new(&wal), 0o600)?;
+    let mut shm = db_path.as_os_str().to_os_string();
+    shm.push("-shm");
+    restrict(Path::new(&shm), 0o600)?;
+    Ok(())
+}
 
 /// SQLite-backed persistent memory — the brain
 ///
@@ -147,7 +172,56 @@ pub struct SqliteMemory {
     vector_candidate_cap: usize,
 }
 
+#[cfg(test)]
+pub struct WriterRelease {
+    flag: parking_lot::Mutex<bool>,
+    cv: parking_lot::Condvar,
+}
+
+#[cfg(test)]
+impl WriterRelease {
+    pub fn new() -> Self {
+        Self {
+            flag: parking_lot::Mutex::new(false),
+            cv: parking_lot::Condvar::new(),
+        }
+    }
+
+    pub fn wait(&self) {
+        let mut flag = self.flag.lock();
+        while !*flag {
+            self.cv.wait(&mut flag);
+        }
+    }
+
+    pub fn release(&self) {
+        *self.flag.lock() = true;
+        self.cv.notify_all();
+    }
+
+    pub fn reset(&self) {
+        *self.flag.lock() = false;
+    }
+}
+
+#[cfg(test)]
+pub type WriterHold = std::sync::Arc<dyn Fn(&WriterRelease, tokio::sync::oneshot::Sender<()>) + Send + Sync>;
+
 impl SqliteMemory {
+    /// Hold the sqlite writer until `release` is signaled, then notify `entered`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn writer_hold(&self) -> WriterHold {
+        let pool = std::sync::Arc::clone(&self.pool);
+        std::sync::Arc::new(
+            move |release: &WriterRelease, entered: tokio::sync::oneshot::Sender<()>| {
+                let _guard = pool.write();
+                let _ = entered.send(());
+                release.wait();
+            },
+        )
+    }
+
     pub fn new(workspace_dir: &Path) -> anyhow::Result<Self> {
         Self::with_embedder_with_acl(
             workspace_dir,
@@ -273,6 +347,10 @@ impl SqliteMemory {
             .reader_pragmas(SQLITE_READER_PRAGMAS)
             .reset_transactions_on_release(true)
             .build()?;
+        // SQLite creates the file as 0666 masked by the process umask. A
+        // group-writable umask makes the ingress lease reject the database.
+        // Tighten the directory and the file without changing the process umask.
+        restrict_owner_mode(&db_path)?;
 
         Self::init_schema(&pool.write())?;
 

@@ -98,9 +98,50 @@ impl ChannelStore {
         plaintext: &[u8],
     ) -> Result<PathBuf, StorageError> {
         let blob = crypto.seal(account_id, conversation_id, object_id, plaintext)?;
-        let path = self.media_path(account_id, object_id);
+        let path = self.media_path(account_id, conversation_id, object_id);
         write_file(&path, &blob)?;
         Ok(path)
+    }
+
+    pub fn put_index(
+        &self,
+        crypto: &AccountCrypto,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        plaintext: &[u8],
+    ) -> Result<PathBuf, StorageError> {
+        let record = name(message_id);
+        let blob = crypto.seal(account_id, conversation_id, &record, plaintext)?;
+        let path = self.index_path(account_id, conversation_id, message_id);
+        write_file(&path, &blob)?;
+        Ok(path)
+    }
+
+    pub fn read_index(
+        &self,
+        crypto: &AccountCrypto,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        let path = self.index_path(account_id, conversation_id, message_id);
+        self.read_index_file(crypto, account_id, conversation_id, &path)
+    }
+
+    pub fn read_index_file(
+        &self,
+        crypto: &AccountCrypto,
+        account_id: &str,
+        conversation_id: &str,
+        path: &Path,
+    ) -> Result<Vec<u8>, StorageError> {
+        let record = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let blob = std::fs::read(path).map_err(|error| StorageError::Io(error.to_string()))?;
+        Ok(crypto.open(account_id, conversation_id, &record, &blob)?)
     }
 
     #[must_use]
@@ -122,8 +163,44 @@ impl ChannelStore {
     }
 
     #[must_use]
-    pub fn media_path(&self, account_id: &str, object_id: &str) -> PathBuf {
-        self.root.join("media").join(name(account_id)).join(name(object_id))
+    pub fn media_path(&self, account_id: &str, conversation_id: &str, object_id: &str) -> PathBuf {
+        self.root
+            .join("media")
+            .join(name(account_id))
+            .join(name(conversation_id))
+            .join(name(object_id))
+    }
+
+    #[must_use]
+    pub fn index_path(&self, account_id: &str, conversation_id: &str, message_id: &str) -> PathBuf {
+        self.root
+            .join("index")
+            .join(name(account_id))
+            .join(name(conversation_id))
+            .join(name(message_id))
+    }
+
+    /// Message ids are the file names, which are hashes. Callers that need the
+    /// original id read the sealed entry. This lists the hashed file stems so
+    /// a conversation erase can open each one.
+    #[must_use]
+    pub fn index_files(&self, account_id: &str, conversation_id: &str) -> Vec<PathBuf> {
+        let dir = self
+            .root
+            .join("index")
+            .join(name(account_id))
+            .join(name(conversation_id));
+        let mut files = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return files;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+        files
     }
 
     #[must_use]

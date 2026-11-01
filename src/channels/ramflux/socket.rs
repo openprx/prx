@@ -119,7 +119,7 @@ pub async fn accept_loop(inner: Arc<Inner>, listener: tokio::net::UnixListener) 
                 match accepted {
                     Ok((stream, _)) => {
                         #[cfg(unix)]
-                        if let Err(error) = peer_matches(&stream) {
+                        if let Err(error) = peer_matches(&inner, &stream) {
                             tracing::warn!(error = %error, "ramflux peer uid refused");
                             reject_peer(stream).await;
                             continue;
@@ -150,7 +150,7 @@ pub async fn accept_loop(inner: Arc<Inner>, listener: tokio::net::UnixListener) 
 }
 
 async fn reject_peer(mut stream: UnixStream) {
-    let body = protocol::encode_null_error(-32005, "peer uid refused");
+    let body = protocol::encode_null_error(-32006, "peer uid refused");
     if !body.is_empty() {
         let _ = stream.write_all(&body).await;
         let _ = stream.write_all(b"\n").await;
@@ -349,8 +349,14 @@ fn prepare_parent(path: &Path) -> Result<(), SocketError> {
     if parent.as_os_str().is_empty() {
         return Ok(());
     }
-    let existed = parent.exists();
-    if !existed {
+    if !parent.exists() {
+        if let Some(grand) = parent.parent() {
+            if !grand.exists() && grand.file_name().is_some_and(|name| name == "ramflux") {
+                std::fs::create_dir_all(grand)?;
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(grand, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
         std::fs::create_dir_all(parent)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
@@ -385,9 +391,9 @@ fn verify_private_dir(dir: &Path) -> Result<(), SocketError> {
 }
 
 #[cfg(unix)]
-fn peer_matches(stream: &UnixStream) -> Result<(), SocketError> {
+fn peer_matches(inner: &Inner, stream: &UnixStream) -> Result<(), SocketError> {
     let peer = peer_uid(stream)?;
-    let own = own_uid();
+    let own = inner.expected_peer.lock().unwrap_or_else(own_uid);
     if peer != own {
         return Err(SocketError::Peer { peer, own });
     }
@@ -395,76 +401,9 @@ fn peer_matches(stream: &UnixStream) -> Result<(), SocketError> {
 }
 
 #[cfg(unix)]
-#[allow(unsafe_code)]
 fn peer_uid(stream: &UnixStream) -> Result<u32, SocketError> {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    // `getpeereid` is the BSD call. Linux reports the same fact with `SO_PEERCRED`.
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))]
-    {
-        let mut uid: libc::uid_t = 0;
-        let mut gid: libc::gid_t = 0;
-        // SAFETY: `fd` is a connected Unix socket owned by `stream` for this call.
-        // `uid` and `gid` are valid for the duration of `getpeereid`, which writes
-        // the peer credentials and does not retain the pointers.
-        let rc = unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) };
-        if rc != 0 {
-            return Err(SocketError::Io(std::io::Error::last_os_error()));
-        }
-        return Ok(uid);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
-        let mut len = match u32::try_from(std::mem::size_of::<libc::ucred>()) {
-            Ok(len) => len,
-            Err(_) => {
-                return Err(SocketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "ucred length does not fit socklen_t",
-                )));
-            }
-        };
-        // SAFETY: `fd` is a connected Unix socket owned by `stream` for this call.
-        // `cred` and `len` are valid outputs for `SO_PEERCRED`. The kernel writes
-        // the peer credentials and does not retain the pointers.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&raw mut cred).cast::<libc::c_void>(),
-                &raw mut len,
-            )
-        };
-        if rc != 0 {
-            return Err(SocketError::Io(std::io::Error::last_os_error()));
-        }
-        return Ok(cred.uid);
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    )))]
-    {
-        let _ = fd;
-        Err(SocketError::Io(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "peer uid requires getpeereid or SO_PEERCRED",
-        )))
-    }
+    let cred = stream.peer_cred()?;
+    Ok(cred.uid())
 }
 
 #[cfg(unix)]

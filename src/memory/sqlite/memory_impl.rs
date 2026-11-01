@@ -18,6 +18,20 @@ use uuid::Uuid;
 use super::SqliteMemory;
 use super::ingress_recovery;
 
+/// Run `wal_checkpoint(TRUNCATE)` once, without the pool's unbounded busy wait.
+///
+/// A reader snapshot makes SQLite return `SQLITE_BUSY` or a non-zero busy
+/// count. Waiting inside the handler would hold the writer until that reader
+/// released it, and a turn that needs the writer to finish the read never would.
+fn checkpoint_truncate(conn: &rusqlite::Connection) -> anyhow::Result<i64> {
+    conn.busy_handler(Some(|_attempts: i32| false))?;
+    let queried = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0));
+    if let Err(error) = crate::runtime::sqlite_pool::install_busy_handler(conn) {
+        return Err(error).context("restore sqlite busy handler");
+    }
+    queried.context("wal_checkpoint(TRUNCATE)")
+}
+
 #[async_trait]
 impl Memory for SqliteMemory {
     fn name(&self) -> &str {
@@ -255,6 +269,45 @@ impl Memory for SqliteMemory {
         self.list_impl(category, session_id).await
     }
 
+    async fn list_key_prefix(&self, prefix: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        let pool = self.pool.clone();
+        let prefix = prefix.to_string();
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let reader = pool.read()?;
+            let conn = reader.connection()?;
+            let pattern = format!(
+                "{}%",
+                prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            );
+            let mut stmt = conn.prepare(
+                "SELECT id, key, content, category, created_at, session_id, useful_count FROM memories
+                 WHERE key LIKE ?1 ESCAPE '\\' ORDER BY created_at ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![pattern, limit], |row| {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: row.get(6)?,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(anyhow::Error::from)
+        })
+        .await?
+    }
+
     async fn list_owner_ids(
         &self,
         category: &MemoryCategory,
@@ -270,6 +323,66 @@ impl Memory for SqliteMemory {
             let conn = pool.write();
             let affected = conn.execute("DELETE FROM memories WHERE key = ?1", params![key])?;
             Ok(affected > 0)
+        })
+        .await?
+    }
+
+    async fn forget_message_idempotency(&self, idempotency_key: &str) -> anyhow::Result<usize> {
+        let pool = self.pool.clone();
+        let key = idempotency_key.to_string();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = pool.write();
+            conn.execute_batch("PRAGMA secure_delete = ON")?;
+            conn.execute(
+                "DELETE FROM ingress_recovery WHERE input_key = ?1
+                    OR input_event_id IN (SELECT event_id FROM message_events WHERE idempotency_key = ?1)
+                    OR evidence_event_id IN (SELECT event_id FROM message_events WHERE idempotency_key = ?1)",
+                params![key],
+            )?;
+            let affected = conn.execute(
+                "DELETE FROM message_events WHERE idempotency_key = ?1
+                    OR instr(ifnull(content, ''), ?1) > 0
+                    OR instr(ifnull(raw_payload_json, ''), ?1) > 0",
+                params![key],
+            )?;
+            conn.execute(
+                "DELETE FROM memories WHERE instr(ifnull(content, ''), ?1) > 0 OR instr(ifnull(key, ''), ?1) > 0",
+                params![key],
+            )?;
+            Ok(affected)
+        })
+        .await?
+    }
+
+    async fn checkpoint_wal(&self) -> anyhow::Result<()> {
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
+            // TRUNCATE is the last step. VACUUM in WAL mode writes the rebuilt
+            // image into the WAL and leaves the previous pages in the main
+            // file, so a raw read of brain.db still sees deleted rows.
+            // Drop the writer between attempts so a turn that holds a read
+            // snapshot can finish and release it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            let mut last_busy = -1_i64;
+            loop {
+                let outcome = {
+                    let conn = pool.write();
+                    checkpoint_truncate(&conn)
+                };
+                match outcome {
+                    Ok(0) => return Ok(()),
+                    Ok(busy) => last_busy = busy,
+                    Err(error) => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(error);
+                        }
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("wal_checkpoint(TRUNCATE) left {last_busy} frames in the wal");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
         })
         .await?
     }

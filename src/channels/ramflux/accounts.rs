@@ -99,7 +99,25 @@ pub fn clear_removed(store: &ChannelStore, account_id: &str, conversation_id: &s
 
 #[must_use]
 pub fn is_removed(store: &ChannelStore, account_id: &str, conversation_id: &str) -> bool {
-    store.marker_path(account_id, conversation_id).is_file()
+    is_account_removed(store, account_id) || store.marker_path(account_id, conversation_id).is_file()
+}
+
+/// Record that the whole account was erased. Later traffic is not authorized.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the marker cannot be written.
+pub fn mark_account_removed(store: &ChannelStore, account_id: &str) -> Result<(), StorageError> {
+    let path = store.marker_path(account_id, "account");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| StorageError::Io(error.to_string()))?;
+    }
+    std::fs::write(&path, b"removed").map_err(|error| StorageError::Io(error.to_string()))
+}
+
+#[must_use]
+pub fn is_account_removed(store: &ChannelStore, account_id: &str) -> bool {
+    store.marker_path(account_id, "account").is_file()
 }
 
 fn read_prompt(account: &RamfluxAccountConfig, workspace: &Path) -> Option<String> {

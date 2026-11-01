@@ -125,8 +125,8 @@ impl ChannelSourceReceipt {
                     )
                     .await
                     .map_or_else(
-                        |_| {
-                            tracing::warn!("channel input persistence is unconfirmed");
+                        |error| {
+                            tracing::warn!(error = %error, "channel input persistence is unconfirmed");
                             None
                         },
                         Some,
@@ -164,6 +164,14 @@ impl ChannelSourceReceipt {
                     &persist_memory,
                 )
                 .await;
+                if let Some(channel) = ctx.channels_by_name.get(&message.channel) {
+                    if let Some(rich) = channel.as_rich() {
+                        let stored = format!("convturn:{}:user:{}", key.canonical, message.id);
+                        rich.record_erasure(&message.id, &stored, &stored);
+                        let event_key = format!("channel:{}:{}", message.channel, message.id);
+                        rich.record_erasure(&message.id, &event_key, &event_key);
+                    }
+                }
                 Ok::<_, anyhow::Error>((event, source))
             };
             let result = tokio::time::timeout(std::time::Duration::from_secs(15), operation)

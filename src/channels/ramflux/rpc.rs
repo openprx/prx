@@ -49,6 +49,12 @@ pub struct RpcHub {
     pending: Mutex<HashMap<String, Pending>>,
     replay: Mutex<VecDeque<String>>,
     dedupe: Mutex<VecDeque<DedupeEntry>>,
+    #[cfg(test)]
+    writer_hold: Mutex<Option<crate::memory::sqlite::WriterHold>>,
+    #[cfg(test)]
+    writer_release: std::sync::Arc<crate::memory::sqlite::WriterRelease>,
+    #[cfg(test)]
+    writer_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl RpcHub {
@@ -60,7 +66,38 @@ impl RpcHub {
             pending: Mutex::new(HashMap::new()),
             replay: Mutex::new(VecDeque::new()),
             dedupe: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            writer_hold: Mutex::new(None),
+            #[cfg(test)]
+            writer_release: std::sync::Arc::new(crate::memory::sqlite::WriterRelease::new()),
+            #[cfg(test)]
+            writer_entered: Mutex::new(None),
         }
+    }
+
+    /// The next outbound request holds `memory`'s sqlite writer until its ack.
+    #[cfg(test)]
+    pub fn arm_writer_hold(&self, hold: crate::memory::sqlite::WriterHold) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.writer_release.reset();
+        *self.writer_entered.lock() = Some(tx);
+        *self.writer_hold.lock() = Some(hold);
+        rx
+    }
+
+    #[cfg(test)]
+    async fn hold_writer_for_ack(&self) {
+        let Some(hold) = self.writer_hold.lock().take() else {
+            return;
+        };
+        let release = std::sync::Arc::clone(&self.writer_release);
+        let entered = self.writer_entered.lock().take();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(entered) = entered {
+                hold(&release, entered);
+            }
+        })
+        .await;
     }
 
     pub fn set_writer(&self, writer: mpsc::Sender<Vec<u8>>) {
@@ -98,9 +135,12 @@ impl RpcHub {
     /// Unacked `reply.*` remain replayable after a timeout or disconnect.
     pub async fn request(&self, method: &str, params: &Value, timeout: Duration) -> Result<Value, RpcFailure> {
         let number = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let id = RpcId::String(format!("prx-{number}"));
-        let key = id.to_string();
-        let params = reply_params_with_key(method, params, &key);
+        let rpc_id = format!("prx-{number}");
+        let id = RpcId::String(rpc_id.clone());
+        let turn_id = params.get("turn_id").and_then(Value::as_str).unwrap_or("turn");
+        let idempotency = format!("{turn_id}:{number}");
+        let params = reply_params_with_key(method, params, &idempotency);
+        let key = rpc_id;
         let body = encode_bridge_call(&id, method, &params)?;
         let (tx, rx) = oneshot::channel();
         {
@@ -121,6 +161,8 @@ impl RpcHub {
             self.fail_emit(&key, method);
             return Err(error);
         }
+        #[cfg(test)]
+        self.hold_writer_for_ack().await;
         tokio::select! {
             biased;
             received = rx => received.unwrap_or(Err(RpcFailure::ConnectionLost)),
@@ -153,6 +195,8 @@ impl RpcHub {
 
     /// Complete an outgoing request when its response arrives.
     pub fn complete(&self, id: &RpcId, body: Result<Value, RpcErrorBody>) {
+        #[cfg(test)]
+        self.writer_release.release();
         let key = id.to_string();
         let entry = self.pending.lock().remove(&key);
         self.replay.lock().retain(|queued| queued != &key);

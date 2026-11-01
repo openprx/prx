@@ -58,6 +58,50 @@ async fn created_socket_is_0600_and_rejects_a_second_connection() {
 }
 
 #[tokio::test]
+async fn default_socket_listens_when_the_workspace_is_0755() {
+    let dir = tempfile::tempdir().expect("test: temp");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).expect("test: mode");
+    let channel = super::super::RamfluxChannel::new(RamfluxConfig::default(), dir.path()).expect("test: channel");
+    channel.start().await.expect("test: default socket in a 0755 workspace");
+    let parent = channel.socket_path().parent().expect("test: parent");
+    let mode = std::fs::metadata(parent).expect("test: meta").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    assert!(channel.socket_path().ends_with("ramflux/run/ramflux.sock"));
+}
+
+#[tokio::test]
+async fn refuses_a_0755_parent() {
+    let dir = tempfile::tempdir().expect("test: temp");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).expect("test: mode");
+    let path = dir.path().join("ramflux.sock");
+    let channel = super::super::RamfluxChannel::new(config_at(&path), dir.path()).expect("test: channel");
+    let error = channel.start().await.expect_err("test: 0755 parent");
+    assert!(error.to_string().contains("0700"), "{error}");
+}
+
+#[tokio::test]
+async fn refuses_a_mismatched_peer_uid() {
+    let dir = tempfile::tempdir().expect("test: temp");
+    super::tighten_dir(dir.path());
+    let path = dir.path().join("ramflux.sock");
+    let channel = super::super::RamfluxChannel::new(config_at(&path), dir.path()).expect("test: channel");
+    channel.set_expected_peer(Some(1));
+    channel.start().await.expect("test: start");
+    let mut stream = UnixStream::connect(&path).await.expect("test: connect");
+    stream.write_all(b"\n").await.expect("test: poke");
+    let mut reader = BufReader::new(stream);
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), reader.read_until(b'\n', &mut buf))
+        .await
+        .expect("test: peer refusal timed out");
+    let value: serde_json::Value = serde_json::from_slice(&buf).expect("test: json");
+    assert!(
+        value["error"]["message"].as_str().unwrap_or("").contains("peer"),
+        "{value}"
+    );
+}
+
+#[tokio::test]
 async fn health_requires_a_recent_ping() {
     let mut host = Host::connect(RamfluxConfig::default()).await;
     assert!(!host.channel.health_check().await);
