@@ -4,7 +4,6 @@
   import { confirmationText } from '../lib/change-flow.svelte.js';
   import { loadFailureVariant } from '../lib/load-state';
   import ErrorNotice from '../lib/ErrorNotice.svelte';
-  import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
 
   let files = $state([]);
@@ -122,7 +121,7 @@
 
 <div class="config-page">
   <div class="config-header">
-    <PageHeader title={t('config.advancedTitle')} />
+    <h2>{t('config.advancedTitle')}</h2>
     <div class="view-tabs">
       <button
         class="tab-btn" class:active={viewMode === 'files'}
@@ -205,6 +204,12 @@
     justify-content: space-between;
     padding: 16px 24px;
     border-bottom: 1px solid var(--border, #27272a);
+  }
+  .config-header h2 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary, #fafafa);
   }
   .view-tabs {
     display: flex;

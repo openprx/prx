@@ -673,25 +673,64 @@ mod tests {
 
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    /// Local server answering every request with `response`; returns its port
-    /// and a counter of accepted connections.
-    fn local_server(response: String) -> (u16, Arc<AtomicUsize>) {
+    /// Loopback server that answers every request with `response`.
+    ///
+    /// Accept is non-blocking and the thread stops when this value is dropped.
+    /// A blocking `incoming()` loop would stay in `accept` for the rest of the
+    /// process whenever the client under test never connects.
+    struct LocalServer {
+        port: u16,
+        hits: Arc<AtomicUsize>,
+        shutdown: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for LocalServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn local_server(response: String) -> LocalServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&hits);
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                counter.fetch_add(1, Ordering::SeqCst);
-                let mut buffer = [0_u8; 2048];
-                let _ = stream.read(&mut buffer);
-                let _ = stream.write_all(response.as_bytes());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let thread = std::thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let mut buffer = [0_u8; 2048];
+                        let _ = stream.read(&mut buffer);
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => return,
+                }
             }
         });
-        (port, hits)
+        LocalServer {
+            port,
+            hits,
+            shutdown,
+            thread: Some(thread),
+        }
     }
 
     fn ok_response() -> String {
@@ -707,12 +746,13 @@ mod tests {
     /// listening server must never see a connection.
     #[tokio::test]
     async fn the_real_client_refuses_an_allowlisted_name_that_resolves_to_loopback() {
-        let (port, hits) = local_server(ok_response());
+        let server = local_server(ok_response());
+        let port = server.port;
         let entry = format!("http://localhost:{port}/*");
         let allowlist = Arc::new(list(&[entry.as_str()]));
         let client = build_http_client(allowlist, Duration::from_secs(5)).unwrap();
         let error = client
-            .get(format!("http://localhost:{port}/secret"))
+            .get(format!("http://localhost:{}/secret", server.port))
             .send()
             .await
             .expect_err("loopback resolution must be refused");
@@ -724,27 +764,28 @@ mod tests {
         }
         assert!(text.contains("not reachable"), "{text}");
         settle().await;
-        assert_eq!(hits.load(Ordering::SeqCst), 0, "the server was contacted");
+        assert_eq!(server.hits.load(Ordering::SeqCst), 0, "the server was contacted");
     }
 
     /// A redirect to loopback is refused on the hop, whether the target is off
     /// the allowlist or on it; the target is never contacted.
     #[tokio::test]
     async fn the_real_client_does_not_follow_a_redirect_to_loopback() {
-        let (target_port, target_hits) = local_server(ok_response());
-        let (origin_port, origin_hits) = local_server(format!(
-            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{target_port}/secret\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        let target = local_server(ok_response());
+        let origin_server = local_server(format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{}/secret\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            target.port
         ));
         // The origin itself is reached through the client directly (an IP
         // literal skips the resolver; the request-level literal check is
         // `authorize_url`'s job), so the hop policy is what is under test.
-        let origin = format!("http://127.0.0.1:{origin_port}/start");
+        let origin = format!("http://127.0.0.1:{}/start", origin_server.port);
 
         for entries in [
-            vec![format!("http://127.0.0.1:{origin_port}/*")],
+            vec![format!("http://127.0.0.1:{}/*", origin_server.port)],
             vec![
-                format!("http://127.0.0.1:{origin_port}/*"),
-                format!("http://127.0.0.1:{target_port}/*"),
+                format!("http://127.0.0.1:{}/*", origin_server.port),
+                format!("http://127.0.0.1:{}/*", target.port),
             ],
         ] {
             let allowlist = Arc::new(OutboundAllowlist::parse_all(&entries).unwrap());
@@ -757,11 +798,11 @@ mod tests {
             assert!(error.is_redirect(), "{error:?}");
             settle().await;
             assert_eq!(
-                target_hits.load(Ordering::SeqCst),
+                target.hits.load(Ordering::SeqCst),
                 0,
                 "the redirect target was contacted"
             );
         }
-        assert!(origin_hits.load(Ordering::SeqCst) >= 1);
+        assert!(origin_server.hits.load(Ordering::SeqCst) >= 1);
     }
 }

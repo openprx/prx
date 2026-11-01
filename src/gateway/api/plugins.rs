@@ -92,6 +92,66 @@ fn tool_error_status(error: &str) -> StatusCode {
     }
 }
 
+/// Admit a console mutation that already passed `authorize_resource_mutation`.
+///
+/// High-risk routes also required `confirm_high_risk` before this runs. This
+/// stage does not mint a runtime grant: the manage tool still demands one for
+/// medium and high operations when autonomy is supervised.
+#[cfg(feature = "wasm-plugins")]
+struct ConsolePlaneApproval;
+
+#[cfg(feature = "wasm-plugins")]
+#[async_trait::async_trait]
+impl crate::tools::ApprovalStrategy for ConsolePlaneApproval {
+    async fn resolve(&self, _request: crate::tools::ToolApprovalRequest) -> crate::tools::ToolApprovalDecision {
+        crate::tools::ToolApprovalDecision::Approved {
+            runtime_approval_granted: false,
+            runtime_grant: None,
+        }
+    }
+}
+
+#[cfg(feature = "wasm-plugins")]
+fn console_plugin_context(config: &crate::config::Config) -> crate::tools::ToolExecutionContext {
+    let workspace_id = config.workspace_dir.to_string_lossy().into_owned();
+    // The manage tool is not owner-isolation aware, so this envelope does not
+    // set that flag: the service would refuse the call. The channel and sender
+    // still name the console operator plane for admission and audit.
+    let envelope = crate::runtime::envelope::RuntimeEnvelope::console(workspace_id, "console:plugins")
+        .with_channel("console")
+        .with_sender("console-operator");
+    crate::tools::ToolExecutionContext::new(envelope, "private")
+}
+
+#[cfg(feature = "wasm-plugins")]
+fn manage_outcome(outcome: crate::tools::ToolExecutionOutcome) -> Result<Value, (StatusCode, Json<Value>)> {
+    if let Some(result) = outcome.result {
+        if !result.success {
+            let message = result
+                .error
+                .or(outcome.error)
+                .unwrap_or_else(|| "plugin action failed".to_string());
+            let status = tool_error_status(&message);
+            return Err((status, Json(json!({"error": message}))));
+        }
+        return serde_json::from_str(&result.output).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "plugin action returned a non-JSON result"})),
+            )
+        });
+    }
+    let message = outcome.error.unwrap_or_else(|| "plugin action failed".to_string());
+    let status = match outcome.status {
+        crate::tools::ToolExecutionStatus::Denied | crate::tools::ToolExecutionStatus::ApprovalDenied => {
+            StatusCode::FORBIDDEN
+        }
+        crate::tools::ToolExecutionStatus::InvalidArguments => StatusCode::BAD_REQUEST,
+        _ => tool_error_status(&message),
+    };
+    Err((status, Json(json!({"error": message}))))
+}
+
 #[cfg(feature = "wasm-plugins")]
 async fn execute_manage(
     state: &AppState,
@@ -100,19 +160,24 @@ async fn execute_manage(
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     let config = state.config.load_full();
     let security = crate::runtime::bootstrap::build_security_policy(&config);
-    let tool = runtime.manage_tool(security);
-    let result = tool.execute(args).await.map_err(|error| bad_request(error))?;
-    if !result.success {
-        let message = result.error.unwrap_or_else(|| "plugin action failed".to_string());
-        let status = tool_error_status(&message);
-        return Err((status, Json(json!({"error": message}))));
-    }
-    serde_json::from_str(&result.output).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "plugin action returned a non-JSON result"})),
+    let tool = runtime.manage_tool(std::sync::Arc::clone(&security));
+    let service: crate::tools::ToolExecutionService = crate::tools::ToolExecutionService::from_boxed(
+        vec![tool],
+        std::sync::Arc::new(crate::tools::SecurityEffectPolicy::new(std::sync::Arc::clone(
+            &security,
+        ))),
+        std::sync::Arc::new(ConsolePlaneApproval),
+        std::sync::Arc::new(crate::tools::AdapterOwnedPreparation),
+        std::sync::Arc::new(crate::tools::TracingToolExecutionAudit),
+    );
+    let outcome = service
+        .execute(
+            crate::tools::ToolExecutionCommand::new("wasm_plugins_manage", args),
+            console_plugin_context(&config),
+            None,
         )
-    })
+        .await;
+    manage_outcome(outcome)
 }
 
 #[cfg(feature = "wasm-plugins")]

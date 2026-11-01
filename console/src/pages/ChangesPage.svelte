@@ -4,7 +4,6 @@
   import { riskReasonText } from '../lib/change-flow.svelte.js';
   import ErrorNotice from '../lib/ErrorNotice.svelte';
   import { t } from '../lib/i18n';
-  import { loadFailureVariant } from '../lib/load-state';
   import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
 
@@ -194,7 +193,7 @@
     </button>
     <p class="text-xs text-gray-500 dark:text-gray-400">{t('changes.reloadNotEveryone')}</p>
     {#if reloadError}
-      <StateBlock variant={loadFailureVariant(reloadError)} message={reloadError?.message || t('changes.loadDenied')} />
+      <ErrorNotice error={reloadError} />
     {:else if reloadResponse}
       <div class="space-y-1 text-sm">
         <p class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">{t('changes.reloadResult')}</p>
@@ -269,7 +268,7 @@
   {#if loading}
     <StateBlock variant="loading" message={t('common.loading')} />
   {:else if loadError}
-    <StateBlock variant={loadFailureVariant(loadError)} message={loadError?.message || t('changes.loadDenied')} />
+    <ErrorNotice error={loadError} />
   {:else if records.length === 0}
     <StateBlock variant="empty" message={t('changes.none')} />
   {:else}

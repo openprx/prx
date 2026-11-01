@@ -2,9 +2,9 @@
   import { onDestroy, untrack } from 'svelte';
   import { api } from '../lib/api';
   import { ChangeFlow, isMasked, unmasked } from '../lib/change-flow.svelte.js';
+  import ErrorNotice from '../lib/ErrorNotice.svelte';
   import PlanReview from '../lib/PlanReview.svelte';
   import { t } from '../lib/i18n';
-  import { loadFailureVariant } from '../lib/load-state';
   import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
 
@@ -154,9 +154,8 @@
     </button>
   </div>
 
-  {#if loadError}
-    <StateBlock variant={loadFailureVariant(loadError)} message={loadError?.message || ''} />
-  {:else if !defaults}
+  <ErrorNotice error={loadError} />
+  {#if !loadError && !defaults}
     <StateBlock variant="loading" message={t('common.loading')} />
   {/if}
   <PlanReview {flow} />

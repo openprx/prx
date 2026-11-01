@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// A provider that never starts, or a handler that never returns, used to park
+/// the suite in the decision listener's `accept`. Fail the test instead.
+const WEBHOOK_STEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+async fn within_budget<T>(label: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(WEBHOOK_STEP_BUDGET, future)
+        .await
+        .unwrap_or_else(|_| panic!("test: {label} exceeded {WEBHOOK_STEP_BUDGET:?}"))
+}
+
 /// A failed attempt is not handed back for re-execution.
 ///
 /// The turn behind a webhook can call tools before the provider error that
@@ -112,17 +122,25 @@ async fn webhook_idempotency_cancelled_attempt_does_not_reexecute() {
             .await
             .into_response()
         });
-        started.await;
+        within_budget("cancelled-attempt provider start", started).await;
         first.abort();
-        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(
+            within_budget("cancelled caller", first)
+                .await
+                .unwrap_err()
+                .is_cancelled()
+        );
 
         // The abandoned caller must not have handed the key back for re-execution.
-        let retry = handle_webhook(
-            State(state.clone()),
-            test_connect_info(),
-            test_uri(),
-            headers.clone(),
-            Bytes::from_static(br#"{"message":"hello"}"#),
+        let retry = within_budget(
+            "cancelled redelivery",
+            handle_webhook(
+                State(state.clone()),
+                test_connect_info(),
+                test_uri(),
+                headers.clone(),
+                Bytes::from_static(br#"{"message":"hello"}"#),
+            ),
         )
         .await
         .into_response();
@@ -135,24 +153,24 @@ async fn webhook_idempotency_cancelled_attempt_does_not_reexecute() {
         // Once the detached run finishes, the redelivery is answered from the
         // stored result instead of by running the request a second time.
         provider_impl.release_first.notify_one();
-        let mut duplicate = None;
-        for _ in 0..200_u32 {
-            let response = handle_webhook(
-                State(state.clone()),
-                test_connect_info(),
-                test_uri(),
-                headers.clone(),
-                Bytes::from_static(br#"{"message":"hello"}"#),
-            )
-            .await
-            .into_response();
-            if response.status() == StatusCode::OK {
-                duplicate = Some(response);
-                break;
+        let duplicate = within_budget("detached idempotent result", async {
+            loop {
+                let response = handle_webhook(
+                    State(state.clone()),
+                    test_connect_info(),
+                    test_uri(),
+                    headers.clone(),
+                    Bytes::from_static(br#"{"message":"hello"}"#),
+                )
+                .await
+                .into_response();
+                if response.status() == StatusCode::OK {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let duplicate = duplicate.expect("detached run should commit its idempotent result");
+        })
+        .await;
         let payload = duplicate.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(parsed["status"], "duplicate");
@@ -182,14 +200,17 @@ async fn webhook_idempotency_concurrent_attempt_reports_processing() {
             .await
             .into_response()
         });
-        started.await;
+        within_budget("concurrent-attempt provider start", started).await;
 
-        let concurrent = handle_webhook(
-            State(state.clone()),
-            test_connect_info(),
-            test_uri(),
-            headers.clone(),
-            Bytes::from_static(br#"{"message":"hello"}"#),
+        let concurrent = within_budget(
+            "concurrent redelivery",
+            handle_webhook(
+                State(state.clone()),
+                test_connect_info(),
+                test_uri(),
+                headers.clone(),
+                Bytes::from_static(br#"{"message":"hello"}"#),
+            ),
         )
         .await
         .into_response();
@@ -198,7 +219,7 @@ async fn webhook_idempotency_concurrent_attempt_reports_processing() {
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
 
         provider_impl.release_first.notify_one();
-        let first_response = first.await.unwrap();
+        let first_response = within_budget("concurrent caller", first).await.unwrap();
         assert_eq!(first_response.status(), StatusCode::OK);
         assert_eq!(concurrent_status, StatusCode::CONFLICT);
         assert_eq!(parsed["status"], "processing");
@@ -228,16 +249,19 @@ async fn webhook_idempotency_full_capacity_returns_service_unavailable() {
             .await
             .into_response()
         });
-        started.await;
+        within_budget("capacity provider start", started).await;
 
         let mut second_headers = HeaderMap::new();
         second_headers.insert("X-Idempotency-Key", HeaderValue::from_static("second-key"));
-        let at_capacity = handle_webhook(
-            State(state),
-            test_connect_info(),
-            test_uri(),
-            second_headers,
-            Bytes::from_static(br#"{"message":"second"}"#),
+        let at_capacity = within_budget(
+            "second key at capacity",
+            handle_webhook(
+                State(state),
+                test_connect_info(),
+                test_uri(),
+                second_headers,
+                Bytes::from_static(br#"{"message":"second"}"#),
+            ),
         )
         .await
         .into_response();
@@ -247,7 +271,10 @@ async fn webhook_idempotency_full_capacity_returns_service_unavailable() {
         assert_eq!(parsed["retryable"], true);
 
         provider_impl.release_first.notify_one();
-        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            within_budget("capacity caller", first).await.unwrap().status(),
+            StatusCode::OK
+        );
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     })
     .await;

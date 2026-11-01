@@ -290,7 +290,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut stream, _) = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .expect("test: gateway client did not connect")
+                .unwrap();
             let mut request = Vec::new();
             loop {
                 let byte = stream.read_u8().await.unwrap();

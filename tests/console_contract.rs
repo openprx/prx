@@ -62,6 +62,10 @@ const MANAGEMENT_API: &[(&str, &str)] = &[
     ("getConfigHistory", "'/api/config/history'"),
     ("rollbackConfig", "'/api/config/rollback'"),
     ("setConfigSecret", "`/api/config/secrets"),
+    // G10: the Changes page reloads configuration and then reads status.
+    // These are not a raw file save.
+    ("reloadConfig", "'/api/config/reload'"),
+    ("getStatus", "'/api/status'"),
 ];
 
 /// The query parameters the management endpoints take; the gateway refuses
