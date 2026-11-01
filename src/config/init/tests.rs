@@ -1273,12 +1273,13 @@ async fn scaffold_skips_existing_md_files() {
     assert_eq!(soul, "# My custom soul\n", "existing .md files must not be overwritten");
 }
 
-/// D-074 with X-3: the frozen full template from BASE `8a5d160d`
-/// contains the old serialized default. The migration reads its bare
-/// `enabled = false` as unset, so the CDP-31 default flip reaches installs
-/// that were never saved.
+/// D-074 with X-3 and O6: the frozen full template from BASE `8a5d160d`
+/// contains a bare `enabled = false`. X-3 used to read it as the old
+/// serialized default and turn the plane on; the two readings differ in
+/// whether the decision plane runs, so the migration refuses the bare
+/// disable and names the `schema_version = 2` spelling that keeps it.
 #[test]
-fn the_base_full_template_disable_reads_as_unset() {
+fn the_base_full_template_disable_is_refused_rather_than_flipped_on() {
     let mut root: toml::Value =
         toml::from_str(include_str!("../fixtures/agent-full-base-8a5d160d.toml")).expect("test: template parses");
     assert_eq!(
@@ -1288,7 +1289,8 @@ fn the_base_full_template_disable_reads_as_unset() {
         Some(vec!["enabled".to_string()]),
         "the template writes a bare disable"
     );
-    let report = crate::causal_tree::config::migrate_legacy(&mut root, &|_| None).expect("test: migrates");
-    assert_eq!(report.dropped, ["enabled"]);
-    assert!(root.get("causal_tree").and_then(|table| table.get("enabled")).is_none());
+    let error = crate::causal_tree::config::migrate_legacy(&mut root, &|_| None)
+        .expect_err("a bare unversioned disable is refused");
+    assert_eq!(error.key, "enabled");
+    assert!(error.remedy.contains("schema_version = 2"), "{error:?}");
 }
