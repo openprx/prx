@@ -258,6 +258,17 @@ fn retention_capture(f: &Fixture, task: &str, run: Option<&str>) -> Result<Strin
     Ok(crate::skills::lifecycle::experience_id(f.store.owner_scope(), task))
 }
 
+/// The lookup budget follows `causal_tree::logical_clock`. This test does
+/// not advance that clock, so slow disk under load cannot exhaust the 500 ms
+/// cap. Production still measures wall time when no clock is installed.
+async fn query_lessons_on_logical_clock(
+    store: &crate::skills::lifecycle::SkillLifecycleStore,
+    query: &LessonQuery,
+) -> Result<LessonSnapshot> {
+    let clock = crate::causal_tree::logical_clock::ManualClock::new();
+    Ok(crate::causal_tree::logical_clock::scope(clock, async { store.query_adopted_lessons(query) }).await?)
+}
+
 #[tokio::test]
 async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and_retirement() -> Result<()> {
     let mut f = fixture();
@@ -330,7 +341,7 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
             committed_proposal.publication.as_ref().unwrap().transaction_id,
             request.publication_tx
         );
-        let reference = retention_barrier_faults_then_record(&f, &origin, &request, &config)?;
+        let reference = retention_barrier_faults_then_record(&f, &origin, &request, &config).await?;
         assert_eq!(origin.record_adoption(&request, &config)?, reference);
         assert_eq!(
             server.count.load(Ordering::SeqCst),
@@ -415,7 +426,7 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         );
         let next_suite = fresh_suite(&f);
         let q = query(&f, &config, &journal, &next_suite)?;
-        let snapshot = f.store.query_adopted_lessons(&q)?;
+        let snapshot = query_lessons_on_logical_clock(&f.store, &q).await?;
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.entries[0].reference, reference);
         confirm(&f, &snapshot, &q, Utc::now())?;
@@ -427,15 +438,15 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         assert!(block.is_ascii() && block.len() + 320 <= 1536);
         let mut overlap = q.clone();
         overlap.excluded_roots = suite(&f).lesson_root_digests();
-        assert_eq!(f.store.query_adopted_lessons(&overlap)?.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
+        assert_eq!(query_lessons_on_logical_clock(&f.store, &overlap).await?.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
         let mut family = q.clone();
         family.task_family = "unrelated-family".into();
-        assert_eq!(f.store.query_adopted_lessons(&family)?.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
+        assert_eq!(query_lessons_on_logical_clock(&f.store, &family).await?.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
         let mut old = q.clone();
         old.baseline_revision = f.pin.revision_id.clone();
         old.baseline_record_sha256 = f.pin.record_digest.clone();
         assert!(
-            f.store.query_adopted_lessons(&old)?.entries.is_empty(),
+            query_lessons_on_logical_clock(&f.store, &old).await?.entries.is_empty(),
             "origin baseline is not the adopted target baseline"
         );
         for component in 0..3 {
@@ -446,7 +457,7 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
                 _ => capped.limits.decoded_bytes = 1,
             };
             assert!(
-                f.store.query_adopted_lessons(&capped).is_err(),
+                query_lessons_on_logical_clock(&f.store, &capped).await.is_err(),
                 "cap exhaustion cannot return a partial usable snapshot"
             );
         }
@@ -661,7 +672,7 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         limited.baseline_revision = eligible.adopted_revision.clone();
         limited.baseline_record_sha256 = eligible.adopted_record_sha256.clone();
         limited.limits.lessons = 1;
-        let selected = f.store.query_adopted_lessons(&limited)?;
+        let selected = query_lessons_on_logical_clock(&f.store, &limited).await?;
         assert_eq!(selected.entries.len(), 1);
         assert_eq!(selected.entries[0].reference, *eligible);
         assert!(
@@ -673,14 +684,14 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         owned_attempts_then_retire(&f, &server, &config, &next, &owner_service, owned_draft, &second).await?;
         origin.set_adoption_status(&reference, true, false)?;
         let sends = server.count.load(Ordering::SeqCst);
-        assert_eq!(f.store.query_adopted_lessons(&q)?.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
+        assert_eq!(query_lessons_on_logical_clock(&f.store, &q).await?.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
         assert!(
             confirm(&f, &snapshot, &q, Utc::now()).is_err(),
             "retirement between planning and handoff must revoke the snapshot"
         );
         origin.set_adoption_status(&reference, false, false)?;
         assert!(
-            f.store.query_adopted_lessons(&q)?.entries.is_empty(),
+            query_lessons_on_logical_clock(&f.store, &q).await?.entries.is_empty(),
             "false cannot revive a retired origin"
         );
         assert_eq!(server.count.load(Ordering::SeqCst), sends);
@@ -866,7 +877,7 @@ mod legacy_4ac {
     include!("fixtures/skill_proposal_4ac.rs");
 }
 
-fn retention_barrier_faults_then_record(
+async fn retention_barrier_faults_then_record(
     f: &Fixture,
     service: &SkillsLifecycleService,
     request: &RecordAdoptionRequest,
@@ -982,8 +993,8 @@ fn retention_barrier_faults_then_record(
     );
     let orphan_bytes = std::fs::read(&paths[0])?;
     assert!(
-        f.store
-            .query_adopted_lessons(&query(f, config, &journal, &fresh_suite(f))?)?
+        query_lessons_on_logical_clock(&f.store, &query(f, config, &journal, &fresh_suite(f))?)
+            .await?
             .entries
             .is_empty(),
         "an orphan record is retained evidence, not usable indexed guidance"
