@@ -147,9 +147,15 @@ pub enum BudgetCheck {
 pub enum CostSettlement {
     Disabled,
     UnknownPricing,
+    /// Subscription billing. No per-token amount is written to the ledger.
+    Subscription,
     Replayed,
-    Recorded { budget: BudgetCheck },
-    Failed { error: String },
+    Recorded {
+        budget: BudgetCheck,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 /// Cost summary for reporting.

@@ -1848,6 +1848,9 @@ fn validate_provider_model_rejects_unknown_kimi_code_model() {
     assert!(validate_provider_model("kimi-code", "k3").is_ok());
     assert!(validate_provider_model("kimi_coding", "kimi-for-coding").is_ok());
     assert!(validate_provider_model("kimi-code", "kimi-for-coding-highspeed").is_ok());
+    assert!(validate_provider_model("kimi-code", "k3.1-pro").is_ok());
+    assert!(validate_provider_model("kimi-code", "k3.1-pro-highspeed").is_ok());
+    assert!(validate_provider_model("kimi-code", "k3-256k").is_ok());
     assert!(validate_provider_model("kimi-code", "kimi-k2.7-code").is_err());
 
     let err = validate_provider_model("kimi-code", "definitely-not-a-real-model")
@@ -2549,6 +2552,9 @@ fn custom_endpoint_accepts_slash_qualified_model_id() {
     assert!(validate_provider_model("kimi-code", "k3").is_ok());
     assert!(validate_provider_model("kimi_coding", "kimi-for-coding").is_ok());
     assert!(validate_provider_model("kimi-code", "kimi-for-coding-highspeed").is_ok());
+    assert!(validate_provider_model("kimi-code", "k3.1-pro").is_ok());
+    assert!(validate_provider_model("kimi-code", "k3.1-pro-highspeed").is_ok());
+    assert!(validate_provider_model("kimi-code", "k3-256k").is_ok());
     assert!(validate_provider_model("kimi-code", "kimi-k2.7-code").is_err());
     assert!(validate_provider_model("kimi-code", "definitely-not-a-real-model").is_err());
 

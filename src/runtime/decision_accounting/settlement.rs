@@ -33,6 +33,10 @@ impl OwnedReceipt {
                 &self.config.cost,
             ) {
                 UsagePrice::Priced(cost) => cost,
+                // A subscription row has no per-token tariff. The reserved
+                // hold is zero. The turn ledger records `subscription` when
+                // the usage row itself has no dollar amount.
+                UsagePrice::Subscription => 0.0,
                 UsagePrice::Missing
                     if super::super::turn_cost::provider_is_zero_price_exempt(
                         &crate::providers::ProviderId::of(&self.provider),

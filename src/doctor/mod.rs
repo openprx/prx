@@ -1334,9 +1334,16 @@ fn check_model_selection(config: &Config, items: &mut Vec<DiagItem>) {
         crate::providers::selection::default_model(config),
         &crate::providers::catalog::Requirement::chat(),
         crate::providers::catalog::UnknownPolicy::Invocation,
-    ) && let Some(warning) = crate::providers::selection::pricing_warning(&resolved, &config.cost)
-    {
-        items.push(DiagItem::warn(cat, warning));
+    ) {
+        if let Some(warning) = crate::providers::selection::pricing_warning(&resolved, &config.cost) {
+            items.push(DiagItem::warn(cat, warning));
+        } else if let Some(notice) = crate::providers::selection::subscription_billing_notice(
+            resolved.provider_label(),
+            resolved.model(),
+            &config.cost,
+        ) {
+            items.push(DiagItem::ok(cat, notice));
+        }
     }
 
     match crate::config::model_settings::warnings(config) {
@@ -2597,7 +2604,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn doctor_names_unpriced_model_and_override() {
+    fn doctor_names_subscription_billing_without_an_unpriced_refusal() {
         let dir = TempDir::new().unwrap();
         let mut config = Config::default();
         config.workspace_dir = dir.path().join("workspace");
@@ -2606,8 +2613,22 @@ mod tests {
         config.default_model = Some("kimi-for-coding".into());
         let mut items = Vec::new();
         check_model_selection(&config, &mut items);
-        assert!(items.iter().any(|item| item.severity == Severity::Warn
-            && item.message.contains(r#"[cost.prices."kimi-code/kimi-for-coding"]"#)));
+        assert!(items.iter().any(|item| {
+            item.severity == Severity::Ok && item.message == "subscription-billed, no per-token cost recorded"
+        }));
+        assert!(
+            items
+                .iter()
+                .all(|item| !item.message.contains("G6 budget admission refuses"))
+        );
+
+        config.default_provider = Some("openrouter".into());
+        config.default_model = Some("deepseek/deepseek-v3.2".into());
+        items.clear();
+        check_model_selection(&config, &mut items);
+        assert!(items.iter().any(|item| {
+            item.severity == Severity::Warn && item.message.contains(r#"[cost.prices."deepseek/deepseek-v3.2"]"#)
+        }));
     }
 
     #[test]

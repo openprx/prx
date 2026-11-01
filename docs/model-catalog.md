@@ -164,20 +164,36 @@ features. Adapter capabilities remain an upper bound: a positive catalog fact
 cannot enable a feature the adapter cannot send. Negative operator or discovery
 evidence continues to outrank a positive release fact.
 
+## Allowlist
+
+Model validation reads the active release rows. For each catalog provider the
+allowed spellings are the active `api_model` values and aliases. Kimi Code
+refuses anything outside that set, because its endpoint can accept a mistype.
+An explicitly configured unknown id on another provider stays unverified and
+runs with a warning. See [Allowlist derivation](providers.md#allowlist-derivation).
+
 `[cost.prices]` contains operator overrides only. An exact or redacted endpoint
 override wins; otherwise usage accounting and the G6 admission gate read the
-release price. A missing catalog and override price remains unpriced, with the
-existing Ollama-only zero-price exemption. OpenRouter rows without a duplicated
-tariff resolve stable upstream Anthropic, Google/Gemini, Moonshot, OpenAI and
-xAI model prices from those providers' release rows; unknown or dynamic proxy
-models remain unpriced. G6 refuses these selections before a model call until
-an operator supplies `[cost.prices]`, even for subscription-billed Kimi Code.
-Logs, `prx doctor`, `prx providers test`, and a new default's change plan explain
-the missing price. See the [price override example](providers.md#unpriced-models-and-operator-overrides):
-use `[cost.prices."kimi-code/kimi-for-coding"]` for Kimi Code, or the exact
-slash-containing model ID such as `[cost.prices."deepseek/deepseek-v3.2"]` for
-OpenRouter. Set `input`, `output`, `cache_read` and `cache_write` in USD per
-million tokens; these are operator accounting rates, not invented catalog prices.
+release price. A row with `billing` set to `subscription` has no per-token
+price. G6 admits it, logs `subscription-billed, no per-token cost recorded`,
+and the turn cost ledger records `subscription` instead of `unknown_pricing`.
+Kimi Code, OpenAI Codex, and GitHub Copilot rows use that marker. xAI rows
+keep their API token prices. A missing catalog and override price on any other
+row remains unpriced, with the existing Ollama-only zero-price exemption.
+OpenRouter rows without a duplicated tariff resolve stable upstream Anthropic,
+Google/Gemini, Moonshot, OpenAI and xAI model prices from those providers'
+release rows; unknown or dynamic proxy models remain unpriced. G6 refuses
+those unpriced selections before a model call until an operator supplies
+`[cost.prices]`. Logs, `prx doctor`, `prx providers test`, and a new default's
+change plan explain the missing price. A `[cost.prices]` entry is optional for
+a subscription row and, when present, replaces the subscription marker.
+See the [price override example](providers.md#unpriced-models-and-operator-overrides):
+the Kimi Code example is an operator budget tariff, not a published price and
+not required for admission. For an unpriced OpenRouter id, use the exact
+slash-containing model ID such as `[cost.prices."deepseek/deepseek-v3.2"]`.
+Set `input`, `output`, `cache_read` and `cache_write` in USD per million
+tokens; these are operator accounting rates, not invented catalog prices.
+
 Compaction reads the effective
 descriptor's context window after explicit agent and `[[router.models]]`
 overrides. The default Router candidate list uses active rows with `router`

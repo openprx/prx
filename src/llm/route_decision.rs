@@ -246,6 +246,8 @@ pub(crate) enum UsagePrice {
     Missing,
     Invalid,
     Priced(f64),
+    /// A catalog `billing = "subscription"` row. No per-token amount exists.
+    Subscription,
 }
 
 pub(crate) fn usage_cost_resolution(
@@ -331,9 +333,11 @@ pub(crate) fn usage_cost_resolution(
     let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref() else {
         return UsagePrice::Missing;
     };
-    let direct_pricing = catalog
-        .model(&provider_id, model)
-        .and_then(|entry| entry.pricing.as_ref());
+    let direct = catalog.model(&provider_id, model);
+    if direct.is_some_and(crate::providers::catalog::ReleaseModel::is_subscription_billed) {
+        return UsagePrice::Subscription;
+    }
+    let direct_pricing = direct.and_then(|entry| entry.pricing.as_ref());
     let upstream_pricing = (provider_id.catalog_name() == Some("openrouter"))
         .then(|| openrouter_upstream_model(model))
         .flatten()
@@ -391,7 +395,7 @@ pub(crate) fn usage_cost_usd(
         cost_config,
     ) {
         UsagePrice::Priced(cost) => Some(cost),
-        UsagePrice::Missing | UsagePrice::Invalid => None,
+        UsagePrice::Missing | UsagePrice::Invalid | UsagePrice::Subscription => None,
     }
 }
 
@@ -1529,6 +1533,48 @@ mod tests {
             (cost - expected).abs() < 0.000_000_1,
             "cache read/write cost should be priced separately: {cost}"
         );
+    }
+
+    #[test]
+    fn subscription_catalog_rows_have_no_token_price_until_an_operator_override() {
+        let cost = crate::config::schema::CostConfig::default();
+        for (provider, model) in [
+            ("kimi-code", "kimi-for-coding"),
+            ("kimi-code", "k3.1-pro"),
+            ("openai-codex", "gpt-5.2-codex"),
+            ("copilot", "gpt-5.4"),
+        ] {
+            assert_eq!(
+                usage_cost_resolution(provider, model, 64, 64, 0, 0, &cost),
+                UsagePrice::Subscription,
+                "{provider}/{model}"
+            );
+            assert_eq!(usage_cost_usd(provider, model, 64, 64, 0, 0, &cost), None);
+        }
+        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().expect("test: catalog");
+        let xai = catalog.default_model("xai").expect("test: xai default");
+        assert!(matches!(
+            usage_cost_resolution("xai", xai, 64, 64, 0, 0, &cost),
+            UsagePrice::Priced(price) if price > 0.0
+        ));
+        assert!(matches!(
+            usage_cost_resolution("custom:https://llm.example/v1", "local-model", 64, 64, 0, 0, &cost),
+            UsagePrice::Missing
+        ));
+        let mut override_cost = cost;
+        override_cost.prices.insert(
+            "kimi-code/kimi-for-coding".into(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 3.0,
+                cache_write: 1.0,
+                cache_read: 0.25,
+            },
+        );
+        assert!(matches!(
+            usage_cost_resolution("kimi-code", "kimi-for-coding", 64, 64, 0, 0, &override_cost),
+            UsagePrice::Priced(price) if price > 0.0
+        ));
     }
 
     #[test]

@@ -185,6 +185,18 @@ pub struct CatalogPriceTier {
     pub cache_read: Option<f64>,
 }
 
+/// How a catalog row is billed. Absent means a per-token tariff.
+///
+/// `subscription` is a plan the operator already pays for. It is not a zero
+/// token price: a zero tariff would be recorded as a priced charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogBilling {
+    #[default]
+    Token,
+    Subscription,
+}
+
 /// Per-million-token prices shipped by a release.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -291,6 +303,9 @@ pub struct ReleaseModel {
     pub limits: CatalogLimits,
     #[serde(default)]
     pub tokenizer: Option<String>,
+    /// `subscription` rows have no [`Self::pricing`] object.
+    #[serde(default)]
+    pub billing: CatalogBilling,
     #[serde(default)]
     pub pricing: Option<CatalogPricing>,
     #[serde(default)]
@@ -312,6 +327,12 @@ impl ReleaseModel {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.lifecycle.status == ModelLifecycleStatus::Active && self.api_model != "*"
+    }
+
+    /// A plan the operator already pays for, with no per-token tariff.
+    #[must_use]
+    pub fn is_subscription_billed(&self) -> bool {
+        self.billing == CatalogBilling::Subscription
     }
 
     /// Whether this row can be offered for a new selection.
@@ -511,6 +532,30 @@ impl ReleaseCatalog {
     #[must_use]
     pub fn default_provider(&self) -> &str {
         &self.defaults.provider
+    }
+
+    /// Active model spellings for one provider: `api_model` plus aliases.
+    ///
+    /// `None` when the catalog does not cover `provider`. Server-defined
+    /// placeholders (`default`, `*`) stay in the set when they are active
+    /// rows; they are not a closed list of every id the server can run.
+    #[must_use]
+    pub fn active_allowlist(&self, provider: &str) -> Option<BTreeSet<String>> {
+        let provider_name = self.provider_name(provider)?;
+        let mut spellings = BTreeSet::new();
+        for model in &self.models {
+            if !model.provider.eq_ignore_ascii_case(provider_name) || !model.is_active() {
+                continue;
+            }
+            spellings.insert(model.api_model.clone());
+            for alias in &model.aliases {
+                let alias = alias.trim();
+                if !alias.is_empty() {
+                    spellings.insert(alias.to_string());
+                }
+            }
+        }
+        (!spellings.is_empty()).then_some(spellings)
     }
 
     /// The release-wide default in the API-model spelling used by config.
@@ -812,6 +857,11 @@ fn validate_model_shape(model: &ReleaseModel) -> Result<(), ReleaseCatalogError>
             "catalog token limits must be greater than zero",
         ));
     }
+    if model.billing == CatalogBilling::Subscription && model.pricing.is_some() {
+        return Err(ReleaseCatalogError::new(
+            "a subscription catalog row must not carry a per-token price",
+        ));
+    }
     if let Some(pricing) = &model.pricing {
         if pricing.unit != "usd_per_1m_tokens"
             || ![pricing.input, pricing.output, pricing.cache_write, pricing.cache_read]
@@ -993,7 +1043,7 @@ mod tests {
             return;
         };
         assert_eq!(catalog.schema_version, "1.0");
-        assert_eq!(catalog.revision, "2026-10-31.2");
+        assert_eq!(catalog.revision, "2026-10-31.3");
         assert_eq!(catalog.schema.as_deref(), Some("./models.schema.json"));
         assert!(catalog.content_sha256().starts_with("sha256:"));
         assert!(catalog.models.len() >= 100);
@@ -1011,6 +1061,169 @@ mod tests {
             assert!(model.levels.contains_key("medium"), "{} lacks medium", model.id);
             assert!(model.levels.contains_key("high"), "{} lacks high", model.id);
         }
+    }
+
+    fn independent_active_allowlist(raw: &Value, provider: &str) -> BTreeSet<String> {
+        let mut spellings = BTreeSet::new();
+        let Some(models) = raw.get("models").and_then(Value::as_array) else {
+            return spellings;
+        };
+        for model in models {
+            if model.get("provider").and_then(Value::as_str) != Some(provider) {
+                continue;
+            }
+            if model.pointer("/lifecycle/status").and_then(Value::as_str) != Some("active") {
+                continue;
+            }
+            let Some(api_model) = model.get("api_model").and_then(Value::as_str) else {
+                continue;
+            };
+            if api_model == "*" {
+                continue;
+            }
+            spellings.insert(api_model.to_string());
+            if let Some(aliases) = model.get("aliases").and_then(Value::as_array) {
+                for alias in aliases {
+                    let Some(alias) = alias.as_str().map(str::trim).filter(|alias| !alias.is_empty()) else {
+                        continue;
+                    };
+                    spellings.insert(alias.to_string());
+                }
+            }
+        }
+        spellings
+    }
+
+    #[test]
+    fn provider_allowlists_equal_the_catalog_active_set() {
+        let raw: Value = serde_json::from_str(EMBEDDED_CATALOG_JSON).expect("test: catalog json");
+        let catalog = ReleaseCatalog::embedded().expect("test: catalog");
+        let providers = raw
+            .get("providers")
+            .and_then(Value::as_object)
+            .expect("test: providers");
+        for provider in providers.keys() {
+            let expected = independent_active_allowlist(&raw, provider);
+            assert_eq!(
+                catalog.active_allowlist(provider).unwrap_or_default(),
+                expected,
+                "{provider}"
+            );
+        }
+        let kimi = independent_active_allowlist(&raw, "kimi-code");
+        for spelling in &kimi {
+            for provider in ["kimi-code", "kimi_coding"] {
+                crate::providers::validate_provider_model(provider, spelling).unwrap_or_else(|error| {
+                    panic!("{provider}/{spelling} is an active catalog model: {error}");
+                });
+            }
+        }
+        for id in [
+            "k3",
+            "k3-256k",
+            "k3.1-pro",
+            "k3.1-pro-highspeed",
+            "kimi-for-coding",
+            "kimi-for-coding-highspeed",
+        ] {
+            assert!(kimi.contains(id), "{id}");
+        }
+        let refused = crate::providers::validate_provider_model("kimi-code", "definitely-not-a-real-model")
+            .expect_err("test: unknown kimi-code model")
+            .to_string();
+        let listed = refused
+            .split_once("Supported models: ")
+            .expect("test: supported-model list")
+            .1;
+        let listed: BTreeSet<String> = listed.split(", ").map(str::to_string).collect();
+        assert_eq!(listed, kimi);
+        assert!(crate::providers::validate_provider_model("kimi-code", "K3").is_err());
+        assert!(crate::providers::validate_provider_model("openai", "prx-unlisted-model").is_ok());
+
+        for info in crate::providers::list_providers() {
+            let expected = std::iter::once(info.name)
+                .chain(info.aliases.iter().copied())
+                .filter(|name| providers.contains_key(*name))
+                .flat_map(|name| independent_active_allowlist(&raw, name))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                crate::providers::provider_model_allowlist(info.name).unwrap_or_default(),
+                expected,
+                "{}",
+                info.name
+            );
+        }
+        for uncovered in [
+            "vercel",
+            "cloudflare",
+            "synthetic",
+            "opencode",
+            "qianfan",
+            "lmstudio",
+            "ovhcloud",
+            "mock",
+        ] {
+            assert!(
+                crate::providers::provider_model_allowlist(uncovered).is_none(),
+                "{uncovered}"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_rows_have_no_contradictory_token_price() {
+        let raw: Value = serde_json::from_str(EMBEDDED_CATALOG_JSON).expect("test: catalog json");
+        let mut marked = 0_usize;
+        for row in raw.get("models").and_then(Value::as_array).expect("test: models") {
+            if row.get("billing").and_then(Value::as_str) != Some("subscription") {
+                continue;
+            }
+            marked += 1;
+            assert!(
+                row.get("pricing").is_none(),
+                "{} carries a token price",
+                row.get("id").and_then(Value::as_str).unwrap_or("<missing>")
+            );
+        }
+        assert!(marked > 0, "the release marks subscription rows");
+        let catalog = ReleaseCatalog::embedded().expect("test: catalog");
+        assert!(catalog.models.iter().any(|model| {
+            model.provider == "kimi-code" && model.api_model == "kimi-for-coding" && model.is_subscription_billed()
+        }));
+        assert!(
+            catalog.models.iter().any(|model| {
+                model.provider == "openai-codex" && model.is_active() && model.is_subscription_billed()
+            })
+        );
+        assert!(
+            catalog
+                .models
+                .iter()
+                .any(|model| { model.provider == "copilot" && model.is_active() && model.is_subscription_billed() })
+        );
+        assert!(
+            catalog
+                .models
+                .iter()
+                .filter(|model| model.provider == "xai" || model.provider == "qwen-code" || model.provider == "zai")
+                .all(|model| !model.is_subscription_billed())
+        );
+
+        let mut contradictory = serde_json::from_str::<Value>(&minimal_catalog("fixture")).expect("test: fixture");
+        let row = contradictory
+            .pointer_mut("/models/0")
+            .and_then(Value::as_object_mut)
+            .expect("test: fixture row");
+        row.insert("billing".into(), Value::from("subscription"));
+        row.insert(
+            "pricing".into(),
+            serde_json::json!({"unit":"usd_per_1m_tokens","input":1.0,"output":2.0}),
+        );
+        let error = ReleaseCatalog::from_json(&contradictory.to_string()).expect_err("test: subscription plus price");
+        assert!(
+            error.to_string().contains("must not carry a per-token price"),
+            "{error}"
+        );
     }
 
     #[test]

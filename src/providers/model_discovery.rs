@@ -84,18 +84,25 @@ pub(crate) fn check_onboarding_selection(config: &Config, provider: &str, model:
                 );
             }
             if let Ok(release) = crate::providers::catalog::ReleaseCatalog::embedded_ref()
-                && let Some(model) = release.model(
+                && let Some(row) = release.model(
                     &crate::providers::ProviderId::of(resolved.provider_label()),
                     resolved.model(),
                 )
-                && model_has_no_billing_tariff(resolved.provider_label(), model, &config.cost)
             {
-                println!(
-                    "  {} model '{}' has no published token tariff; add an exact `[cost.prices]` entry before \
-                     cost-admitted use.",
-                    style("!").yellow().bold(),
-                    resolved.model()
-                );
+                if let Some(notice) = crate::providers::selection::subscription_billing_notice(
+                    resolved.provider_label(),
+                    resolved.model(),
+                    &config.cost,
+                ) {
+                    println!("  {} {notice}", style("i").cyan().bold());
+                } else if model_has_no_billing_tariff(resolved.provider_label(), row, &config.cost) {
+                    println!(
+                        "  {} model '{}' has no published token tariff; add an exact `[cost.prices]` entry before \
+                         cost-admitted use.",
+                        style("!").yellow().bold(),
+                        resolved.model()
+                    );
+                }
             }
             Ok(())
         }
@@ -119,8 +126,12 @@ pub(crate) fn onboarding_model_warning(
     model: &crate::providers::catalog::ReleaseModel,
 ) -> Option<String> {
     let lifecycle = model.selection_warning();
-    let pricing = model_has_no_billing_tariff(provider, model, &crate::config::schema::CostConfig::default())
-        .then_some("pricing unavailable; add [cost.prices] before cost-admitted use".to_owned());
+    let pricing = if model.is_subscription_billed() {
+        Some(crate::providers::selection::SUBSCRIPTION_BILLING_NOTICE.to_owned())
+    } else {
+        model_has_no_billing_tariff(provider, model, &crate::config::schema::CostConfig::default())
+            .then_some("pricing unavailable; add [cost.prices] before cost-admitted use".to_owned())
+    };
     match (lifecycle, pricing) {
         (Some(lifecycle), Some(pricing)) => Some(format!("{lifecycle}; {pricing}")),
         (Some(warning), None) | (None, Some(warning)) => Some(warning),

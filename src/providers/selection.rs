@@ -619,8 +619,27 @@ pub(crate) fn resolve_route(
     .map_err(|refusal| anyhow::anyhow!("model route `hint:{}` is refused: {refusal}", route.hint))
 }
 
+/// Shown when G6 admits a subscription row. No per-token amount is recorded.
+pub(crate) const SUBSCRIPTION_BILLING_NOTICE: &str = "subscription-billed, no per-token cost recorded";
+
+/// `Some` when `provider`/`model` is a catalog subscription row and no
+/// operator `[cost.prices]` override replaces it.
+pub(crate) fn subscription_billing_notice(
+    provider: &str,
+    model: &str,
+    cost: &crate::config::schema::CostConfig,
+) -> Option<&'static str> {
+    use crate::llm::route_decision::{UsagePrice, usage_cost_resolution};
+    matches!(
+        usage_cost_resolution(provider, model, 64, 64, 0, 0, cost),
+        UsagePrice::Subscription
+    )
+    .then_some(SUBSCRIPTION_BILLING_NOTICE)
+}
+
 /// Diagnose the same missing tariff that leaves G6 without a cost estimate.
 /// This reports configuration to the operator; it never changes admission.
+/// A subscription row is not unpriced; [`subscription_billing_notice`] covers it.
 pub(crate) fn pricing_warning(
     resolved: &catalog::ResolvedModel,
     cost: &crate::config::schema::CostConfig,

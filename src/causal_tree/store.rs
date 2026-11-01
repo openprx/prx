@@ -523,7 +523,7 @@ impl OutcomeRecord {
         if self.idempotency_status.as_deref().is_some_and(|status| {
             !matches!(
                 status,
-                "recorded" | "replayed" | "disabled" | "unknown_pricing" | "failed"
+                "recorded" | "replayed" | "disabled" | "unknown_pricing" | "subscription" | "failed"
             )
         }) {
             return false;
