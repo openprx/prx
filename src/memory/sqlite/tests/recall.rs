@@ -36,6 +36,18 @@ async fn sqlite_store_rejects_pii_before_write() {
 }
 
 #[tokio::test]
+async fn sqlite_store_accepts_run_ids_digests_and_decimal_fractions() {
+    let (_tmp, mem) = temp_sqlite();
+    let content = "run 41283835316 sha a1b2c3d4e5f6789012345678901234567890abcd \
+                   score 0.694437731664143 weight 0.007207550038104219";
+    mem.store("prx-technical", content, MemoryCategory::Conversation, None)
+        .await
+        .expect("technical transcript is not identity data");
+    let stored = mem.get("prx-technical").await.expect("read").expect("row");
+    assert_eq!(stored.content, content);
+}
+
+#[tokio::test]
 async fn sqlite_store_rejects_prompt_injection_before_write() {
     let (_tmp, mem) = temp_sqlite();
     let err = mem

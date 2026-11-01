@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `prx chat` shares the memory store created by `prx agent` when a previous
+  terminal record cannot be authenticated. The terminal replay MAC is taken
+  over the JSON spelling a stored payload parses back to. An unverifiable
+  terminal or ingress capsule is quarantined with a log line so chat can
+  start without deleting state. A failed inbound write names that cause.
+  `chat.log` is written under `--config-dir` when the flag is set, and under
+  `~/.openprx` otherwise.
+- A session snapshot that contains a decimal fraction, a numeric run id, or a
+  hexadecimal digest is no longer rejected as an identity number. The safety
+  check still rejects an SSN-shaped token and a bare 15-digit identity number,
+  and a rejection still happens before any memory row is written.
+
 ### Changed
 
 - **Breaking:** provider auth and API requests identify as `User-Agent: prx/<version>`.

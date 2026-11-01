@@ -84,6 +84,18 @@ fn setup_returns_err_when_path_is_not_a_directory() {
 }
 
 #[test]
+fn resolve_chat_log_dir_prefers_the_process_config_dir() {
+    let _lock = crate::config::schema::process_config_dir_test_lock();
+    let previous = crate::config::schema::swap_process_config_dir_for_tests(None);
+    let dir = unique_tmpdir("config-dir");
+    crate::config::set_process_config_dir(dir.clone());
+    let resolved = resolve_chat_log_dir();
+    crate::config::schema::swap_process_config_dir_for_tests(previous);
+    let resolved = resolved.expect("process config dir");
+    assert_eq!(resolved, dir);
+}
+
+#[test]
 fn resolve_chat_log_dir_yields_an_absolute_path() {
     // Should succeed via either UserDirs or HOME; on container runners
     // without HOME the function bails — accept either outcome but never

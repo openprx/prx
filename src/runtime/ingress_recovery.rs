@@ -5,7 +5,7 @@ use crate::memory::ingress_recovery::{
     IngressRecoveryScan, IngressRecoveryScope, IngressRecoveryState, MAX_CAPSULE_BYTES, MAX_RECOVERY_EVENT_BYTES,
     MAX_RECOVERY_PAGE, input_within_bounds, remaining, serialized_within,
 };
-use crate::memory::{Memory, MessageEvent, MessageEventInput};
+use crate::memory::{Memory, MemoryVisibility, MessageEvent, MessageEventInput};
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -116,7 +116,7 @@ impl IngressRecorder {
             .set((scope.clone(), surface))
             .map_err(|_| anyhow::anyhow!("ingress recorder already owns an input"))?;
         register_recorder(self)?;
-        self.recover(&scope, None, self.deadline).await?;
+        self.boxed_recover(&scope, None, self.deadline).await?;
         input.event_id = Some(uuid::Uuid::new_v4().to_string());
         let mut capsule = IngressCapsule {
             version: 1,
@@ -207,6 +207,9 @@ impl IngressRecorder {
                 if capsule.lifetime == self.lifetime.token() {
                     continue;
                 }
+                if self.boxed_quarantine_marker(scope, &capsule).await? {
+                    continue;
+                }
                 let Some(claim) = self
                     .memory
                     .claim_ingress_recovery(&scope.workspace_id, &capsule.lifetime, deadline)
@@ -223,7 +226,15 @@ impl IngressRecorder {
                     )
                     .await?
                     .context("durable ingress input is missing")?;
-                let mut evidence = self.verify(&capsule, &event)?;
+                let verified = match self.verify(&capsule, &event) {
+                    Ok(input) => input,
+                    Err(error) if unverifiable_ingress(&error) => {
+                        self.boxed_record_quarantine(scope, &capsule, "invalid ingress capsule authentication")
+                            .await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let final_event = if service.is_some() {
                     self.memory
                         .read_ingress_event(
@@ -235,12 +246,20 @@ impl IngressRecorder {
                 } else {
                     None
                 };
-                let state = if let (Some(service), Some(_)) = (service, final_event) {
-                    service.rejoin_ingress_terminal(&capsule, deadline, &self.owner).await?;
-                    IngressRecoveryState::Reconciled
+                let state = if let (Some(service), Some(_)) = (service, final_event.as_ref()) {
+                    match service.rejoin_ingress_terminal(&capsule, deadline, &self.owner).await {
+                        Ok(_) => IngressRecoveryState::Reconciled,
+                        Err(error) if unverifiable_ingress(&error) => {
+                            self.boxed_record_quarantine(scope, &capsule, "terminal replay authentication failed")
+                                .await?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 } else {
                     IngressRecoveryState::Unconfirmed
                 };
+                let mut evidence = verified;
                 let state_label = if state == IngressRecoveryState::Reconciled {
                     "reconciled"
                 } else {
@@ -305,7 +324,127 @@ impl IngressRecorder {
             }
         }
     }
+
+    // `append` and service startup await recovery. Storing that state machine
+    // in those futures overflows the test thread stack.
+    #[inline(never)]
+    fn boxed_recover<'a>(
+        &'a self,
+        scope: &'a IngressRecoveryScope,
+        service: Option<&'a super::turn_decision::TurnDecisionService>,
+        deadline: Instant,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(self.recover(scope, service, deadline))
+    }
+
+    // The marker futures stay out of `recover` for the same reason.
+    #[inline(never)]
+    fn boxed_quarantine_marker<'a>(
+        &'a self,
+        scope: &'a IngressRecoveryScope,
+        capsule: &'a IngressCapsule,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>> {
+        Box::pin(self.quarantine_marker_present(scope, capsule))
+    }
+
+    #[inline(never)]
+    fn boxed_record_quarantine<'a>(
+        &'a self,
+        scope: &'a IngressRecoveryScope,
+        capsule: &'a IngressCapsule,
+        reason: &'static str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(self.record_quarantine(scope, capsule, reason))
+    }
+
+    fn quarantine_key(capsule: &IngressCapsule) -> String {
+        format!("ingress:{}:quarantine", capsule.input_event_id)
+    }
+
+    async fn quarantine_marker_present(
+        &self,
+        scope: &IngressRecoveryScope,
+        capsule: &IngressCapsule,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .memory
+            .find_owned_message_event_by_idempotency_key(
+                &scope.workspace_id,
+                &scope.owner_id,
+                &Self::quarantine_key(capsule),
+            )
+            .await?
+            .is_some())
+    }
+
+    /// Leave the unverifiable row in place and remember that it must not block
+    /// a later turn. The marker carries no user content and no key material.
+    async fn record_quarantine(
+        &self,
+        scope: &IngressRecoveryScope,
+        capsule: &IngressCapsule,
+        reason: &'static str,
+    ) -> anyhow::Result<()> {
+        if self.quarantine_marker_present(scope, capsule).await? {
+            return Ok(());
+        }
+        tracing::error!(reason, "quarantined unverifiable terminal record; chat will continue");
+        let key = Self::quarantine_key(capsule);
+        let recorded = self
+            .memory
+            .append_message_event(MessageEventInput {
+                event_id: None,
+                idempotency_key: Some(key.clone()),
+                workspace_id: scope.workspace_id.clone(),
+                owner_id: Some(scope.owner_id.clone()),
+                source: scope.source.clone(),
+                channel: None,
+                session_key: None,
+                parent_session_key: None,
+                run_id: Some(capsule.run_id.clone()),
+                parent_run_id: None,
+                agent_id: None,
+                persona_id: None,
+                sender: None,
+                recipient: None,
+                role: "event".to_owned(),
+                event_type: "turn.ingress.quarantined".to_owned(),
+                subject: None,
+                goal_id: None,
+                causation_event_id: Some(capsule.input_event_id.clone()),
+                correlation_id: None,
+                attempt_id: None,
+                lease_epoch: None,
+                config_generation_id: None,
+                config_source_revision: None,
+                content: format!("turn.ingress.quarantined {reason}"),
+                raw_payload_json: None,
+                visibility: MemoryVisibility::System,
+            })
+            .await?;
+        anyhow::ensure!(
+            recorded.idempotency_key.as_deref() == Some(key.as_str())
+                && recorded.event_type == "turn.ingress.quarantined",
+            "quarantine marker was not recorded"
+        );
+        Ok(())
+    }
 }
+
+fn unverifiable_ingress(error: &anyhow::Error) -> bool {
+    const REASONS: &[&str] = &[
+        "terminal replay authentication failed",
+        "terminal replay event authentication failed",
+        "invalid ingress capsule authentication",
+        "unsigned terminal cannot be replayed",
+        "invalid terminal replay signature",
+    ];
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        REASONS.iter().any(|reason| text == *reason)
+    })
+}
+
 fn digest_value(value: &impl serde::Serialize) -> anyhow::Result<String> {
     struct DigestWriter(Sha256);
     impl std::io::Write for DigestWriter {
@@ -471,7 +610,7 @@ pub(crate) async fn service_ready(service: &super::turn_decision::TurnDecisionSe
             let (sent, received) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
                 let result = async {
-                    recorder.recover(&scope, Some(&service), deadline).await?;
+                    recorder.boxed_recover(&scope, Some(&service), deadline).await?;
                     // Historical child repair is independent of the ordinary
                     // ingress capsule state; its report cannot mark that input
                     // reconciled or authorize execution of a child again.
