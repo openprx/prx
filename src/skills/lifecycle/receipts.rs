@@ -8,10 +8,12 @@
 //! The awaited terminal call-in ([`settle_task_terminal`]) has one wall bound:
 //! [`TERMINAL_BUDGET`] plus [`TERMINAL_START_GRACE`]. That bound covers both
 //! the wait for a blocking worker and the capture. A worker that has not
-//! started when the bound ends leaves the join unrecorded, and the call
-//! returns. Detached selection receipts and restart recovery
-//! ([`spawn_settle_task_terminal`]) may wait up to [`WORKER_START_CAP`] for a
-//! worker. Their write budget starts when that worker starts.
+//! started when the bound ends is left queued: this call returns without the
+//! join, and the worker records the join when it later runs. Detached
+//! selection receipts and restart recovery ([`spawn_settle_task_terminal`])
+//! may wait up to [`WORKER_START_CAP`] for a worker, and a worker still queued
+//! after that cap is abandoned. Their write budget starts when that worker
+//! starts.
 
 use super::binding::{release_task_pins, task_pin};
 use super::capture::{Correlation, ExperienceOutcome, TaskTerminal, on_task_terminal, task_key};
@@ -36,6 +38,7 @@ enum WorkerStart {
     /// Queue time is outside `write_budget`, up to `start_cap`.
     Detached { start_cap: Duration },
     /// Queue time and the write share `total`. The write gets only what remains.
+    /// A miss detaches the worker instead of cancelling it.
     Awaited { total: Duration },
 }
 
@@ -78,7 +81,13 @@ where
         WorkerStart::Awaited { total } => total,
     };
     if !wait_until_worker_started(&started, &notify, start_cap).await {
-        task.abort();
+        match start {
+            // Dropping the handle detaches the task. A worker still sitting in
+            // the blocking pool runs later and records the join. Aborting it
+            // here can stop that task from ever starting.
+            WorkerStart::Awaited { .. } => drop(task),
+            WorkerStart::Detached { .. } => task.abort(),
+        }
         return Err(WorkerBudgetMiss::NeverStarted);
     }
     let work_budget = match start {
@@ -121,6 +130,25 @@ fn hold_millis(key: &str, before_start: bool) -> u64 {
             }
         })
         .unwrap_or(0)
+}
+
+/// Parks a blocking-pool thread until this workspace's before-start hold is
+/// cleared. The caller sets `entered` once the thread is inside the hold, so
+/// a test can queue the real worker only after the pool slot is taken.
+#[cfg(test)]
+pub(crate) fn occupy_pool_until_before_start_hold_clears(workspace: &Path, entered: &AtomicBool) {
+    let key = workspace_hold_key(workspace);
+    loop {
+        if hold_millis(&key, true) > 0 {
+            entered.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        if entered.load(Ordering::Acquire) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Sleeps while this workspace's hold is armed, and returns when the duration
@@ -232,7 +260,7 @@ pub(crate) const TERMINAL_BUDGET: Duration = Duration::from_millis(1500);
 
 /// Extra wall time the awaited terminal call-in may spend before its worker
 /// starts. The whole call returns within [`TERMINAL_BUDGET`] plus this grace.
-/// A worker that has not started leaves the join unrecorded.
+/// A worker that has not started stays queued and records the join when it runs.
 pub(crate) const TERMINAL_START_GRACE: Duration = Duration::from_millis(250);
 
 /// The skills one turn selected and exposed, for one owner and task.
@@ -406,11 +434,6 @@ fn track_background(key: &str, workspace: &Path, handle: tokio::task::JoinHandle
     });
 }
 
-#[cfg(not(test))]
-fn track_background(_key: &str, _workspace: &Path, handle: tokio::task::JoinHandle<()>) {
-    drop(handle);
-}
-
 /// Turn-path entry for selection receipts. Never blocks and never fails the
 /// turn: skills already claimed for this run are skipped from memory without
 /// touching the store, and the store write for the rest runs in a spawned
@@ -441,7 +464,9 @@ pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
     let owner = request.owner_id.to_string();
     let run = request.run_id.to_string();
     let task = request.task_id.map(str::to_string);
+    #[cfg(test)]
     let key = run.clone();
+    #[cfg(test)]
     let tracked_workspace = workspace.clone();
     let dropped = (
         workspace.clone(),
@@ -481,7 +506,10 @@ pub fn schedule_selection_receipts(request: &SelectionRequest<'_>) -> usize {
             }
         }
     });
+    #[cfg(test)]
     track_background(&key, &tracked_workspace, handle);
+    #[cfg(not(test))]
+    drop(handle);
     count
 }
 
@@ -518,7 +546,9 @@ pub fn spawn_settle_task_terminal(
         tracing::warn!("skill lifecycle terminal skipped: no async runtime");
         return;
     };
+    #[cfg(test)]
     let key = terminal_id.clone();
+    #[cfg(test)]
     let tracked_workspace = workspace_dir.clone();
     let handle = runtime.spawn(async move {
         // Recovery has no first-hand trace, so no observations: adherence is Unknown.
@@ -535,7 +565,10 @@ pub fn spawn_settle_task_terminal(
         )
         .await;
     });
+    #[cfg(test)]
     track_background(&key, &tracked_workspace, handle);
+    #[cfg(not(test))]
+    drop(handle);
 }
 
 /// How a turn ended, as the terminal owner observed it.
@@ -591,8 +624,8 @@ impl TerminalObservation {
 /// and never fail the caller.
 ///
 /// This awaited call returns within [`TERMINAL_BUDGET`] plus
-/// [`TERMINAL_START_GRACE`]. If the worker has not started by then, the join
-/// stays unrecorded and the call returns.
+/// [`TERMINAL_START_GRACE`]. If the worker has not started by then, the call
+/// returns and the queued worker records the join when it runs.
 pub async fn settle_task_terminal(
     workspace_dir: &Path,
     owner: Option<String>,

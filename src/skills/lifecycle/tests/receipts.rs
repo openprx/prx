@@ -7,6 +7,8 @@ use crate::skills::lifecycle::{
     release_task_pins, schedule_selection_receipts, settle_task_terminal, task_pin,
 };
 use std::fs;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::TempDir;
 
 const NAME: &str = "Deploy helper";
@@ -388,67 +390,103 @@ async fn a_worker_held_past_the_budget_after_start_marks_dropped_evidence() {
     release_task_pins(&ids.scope(), &ids.run);
 }
 
-/// The awaited terminal call-in returns inside its wall bound when the worker
-/// has not started. The hold is longer than that bound and is this workspace
-/// only. The join is still absent when the call returns.
-#[tokio::test(flavor = "current_thread")]
-async fn an_awaited_terminal_returns_when_its_worker_never_starts() {
-    let (tmp, store, ids) = setup();
-    assert_eq!(record_selected_skills(&request(&tmp, &ids, true, &[NAME])), 1);
-    let hold = crate::skills::lifecycle::receipts::ReceiptWorkerHold::before_start(tmp.path(), 4_000);
-    let started = std::time::Instant::now();
-    settle_task_terminal(
-        tmp.path(),
-        Some(ids.owner.clone()),
-        Some(ids.run.clone()),
-        "term-starved",
-        observation(TerminalKind::Completed, true),
-        None,
-    )
-    .await;
-    let elapsed = started.elapsed();
-    let experience = store
-        .read_experience(&ids.run)
-        .expect("test: read")
-        .expect("test: record");
-    assert!(
-        experience.terminal.is_none(),
-        "a worker that has not started leaves the join unrecorded"
-    );
-    let bound = crate::skills::lifecycle::receipts::TERMINAL_BUDGET
-        + crate::skills::lifecycle::receipts::TERMINAL_START_GRACE
-        + std::time::Duration::from_millis(1_000);
-    assert!(
-        elapsed < bound,
-        "awaited terminal returned in {elapsed:?}, bound is {bound:?}"
-    );
-    drop(hold);
-    let activity = crate::skills::lifecycle::receipts::lifecycle_activity();
-    let cap = tokio::time::sleep(std::time::Duration::from_secs(8));
-    tokio::pin!(cap);
-    loop {
-        if store
+/// The awaited terminal call-in returns when its worker is still queued, and
+/// that worker records the join after the pool slot is released.
+///
+/// The before-start hold occupies the runtime's only blocking thread, so the
+/// receipt worker has not entered its closure when the bound ends. Aborting
+/// that queued task would keep the join from ever appearing.
+#[test]
+fn an_awaited_terminal_returns_when_its_worker_never_starts() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("test: runtime");
+    runtime.block_on(async {
+        let (tmp, store, ids) = setup();
+        assert_eq!(record_selected_skills(&request(&tmp, &ids, true, &[NAME])), 1);
+        let hold = crate::skills::lifecycle::receipts::ReceiptWorkerHold::before_start(tmp.path(), 60_000);
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_flag = Arc::clone(&entered);
+        let occupied = tmp.path().to_path_buf();
+        let occupier = tokio::task::spawn_blocking(move || {
+            crate::skills::lifecycle::receipts::occupy_pool_until_before_start_hold_clears(&occupied, &entered_flag);
+        });
+        while !entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::pause();
+        let path = tmp.path().to_path_buf();
+        let owner = ids.owner.clone();
+        let run = ids.run.clone();
+        let settle = tokio::spawn(async move {
+            settle_task_terminal(
+                &path,
+                Some(owner),
+                Some(run),
+                "term-starved",
+                observation(TerminalKind::Completed, true),
+                None,
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !settle.is_finished(),
+            "the awaited call must still be waiting while its worker is queued"
+        );
+        let wall = std::time::Instant::now();
+        let bound = crate::skills::lifecycle::receipts::TERMINAL_BUDGET
+            + crate::skills::lifecycle::receipts::TERMINAL_START_GRACE;
+        // The wheel stores the sleep at the next millisecond, and the driver
+        // fires it when this runtime parks. One millisecond past the bound,
+        // then joining the call, is that check. A yield spin never parks.
+        tokio::time::advance(bound + std::time::Duration::from_millis(1)).await;
+        settle.await.expect("test: settle task");
+        let elapsed = wall.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the awaited miss follows the paused clock, not a wall wait ({elapsed:?})"
+        );
+        let experience = store
             .read_experience(&ids.run)
             .expect("test: read")
-            .and_then(|record| record.terminal)
-            .is_some()
-        {
-            break;
+            .expect("test: record");
+        assert!(
+            experience.terminal.is_none(),
+            "a worker that has not started leaves the join unrecorded at return"
+        );
+        tokio::time::resume();
+        drop(hold);
+        let activity = crate::skills::lifecycle::receipts::lifecycle_activity();
+        let cap = tokio::time::sleep(std::time::Duration::from_secs(8));
+        tokio::pin!(cap);
+        loop {
+            if store
+                .read_experience(&ids.run)
+                .expect("test: read")
+                .and_then(|record| record.terminal)
+                .is_some()
+            {
+                break;
+            }
+            let ping = activity.notified();
+            if store
+                .read_experience(&ids.run)
+                .expect("test: read")
+                .and_then(|record| record.terminal)
+                .is_some()
+            {
+                break;
+            }
+            tokio::select! {
+                biased;
+                () = ping => {}
+                () = &mut cap => panic!("test: the released worker did not finish the join"),
+            }
         }
-        let ping = activity.notified();
-        if store
-            .read_experience(&ids.run)
-            .expect("test: read")
-            .and_then(|record| record.terminal)
-            .is_some()
-        {
-            break;
-        }
-        tokio::select! {
-            biased;
-            () = ping => {}
-            () = &mut cap => panic!("test: the released worker did not finish the join"),
-        }
-    }
-    release_task_pins(&ids.scope(), &ids.run);
+        occupier.await.expect("test: pool occupier");
+        release_task_pins(&ids.scope(), &ids.run);
+    });
 }
