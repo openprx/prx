@@ -26,9 +26,9 @@ beforeEach(() => {
 test('toggles a skill and shows the returned fields', async () => {
   api.toggleSkill.mockResolvedValue({ status: 'ok', id: 'prx-skill', enabled: true });
   render(SkillsPage);
-  await screen.findByRole('button', { name: 'Toggle' });
+  await screen.findByRole('button', { name: 'Toggle prx-skill' });
   expect(screen.getByText(/does not publish a skill lifecycle/)).toBeInTheDocument();
-  await fireEvent.click(screen.getByRole('button', { name: 'Toggle' }));
+  await fireEvent.click(screen.getByRole('button', { name: 'Toggle prx-skill' }));
   expect(await screen.findByText('Status ok, id prx-skill, enabled true.')).toBeInTheDocument();
   expect(api.toggleSkill).toHaveBeenCalledWith('prx-skill');
 });
@@ -38,7 +38,7 @@ test('shows a denied toggle', async () => {
   error.status = 403;
   api.toggleSkill.mockRejectedValue(error);
   render(SkillsPage);
-  await fireEvent.click(await screen.findByRole('button', { name: 'Toggle' }));
+  await fireEvent.click(await screen.findByRole('button', { name: 'Toggle prx-skill' }));
   expect(await screen.findByRole('alert')).toHaveTextContent('toggle refused');
 });
 

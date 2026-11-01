@@ -244,6 +244,7 @@
                   type="button"
                   onclick={() => toggleSkill(skill)}
                   disabled={togglingId === skillId(skill)}
+                  aria-label={t('skills.toggleNamed', { name: skill.name })}
                   class="rounded px-2 py-1 text-xs text-sky-700 transition hover:bg-sky-500/10 disabled:opacity-50 dark:text-sky-300"
                 >
                   {togglingId === skillId(skill) ? t('skills.toggling') : t('skills.toggle')}

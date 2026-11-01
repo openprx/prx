@@ -381,6 +381,7 @@
       "huggingface": "Hugging Face"
     },
     "toggle": "Toggle",
+    "toggleNamed": "Toggle {name}",
     "toggling": "Toggling...",
     "toggleNote": "This switches the enable flag. It does not publish a skill lifecycle.",
     "toggleDenied": "Toggling this skill is not allowed.",
@@ -397,6 +398,7 @@
     "permissions": "Permissions",
     "statusActive": "Active",
     "reload": "Reload",
+    "reloadNamed": "Reload {name}",
     "reloadSuccess": "Plugin \"{name}\" reloaded",
     "reloadFailed": "Failed to reload plugin",
     "exactArtifact": "This list does not include the component hash, the manifest hash, or the trust record. Trust is separate from enable.",
@@ -409,6 +411,7 @@
     "enable": "Enable",
     "enableName": "Disabled plugin name",
     "disable": "Disable",
+    "disableNamed": "Disable {name}",
     "refreshAll": "Refresh all plugins",
     "refreshNote": "Refresh rebuilds every eligible plugin. It is not first discovery of one new name.",
     "install": "Install",
@@ -417,6 +420,7 @@
     "sha256": "Component SHA-256",
     "manifestSha256": "Manifest SHA-256",
     "remove": "Remove",
+    "removeNamed": "Remove {name}",
     "removeTitle": "Remove plugin",
     "removeConsequence": "Removes the plugin, revokes its trust record, and leaves a recoverable backup. This does not undo itself.",
     "installConsequence": "Installs the reviewed artifact and records trust for these hashes and permissions.",
@@ -429,6 +433,8 @@
     "featureOff": "The WASM plugin system is not available.",
     "loadDenied": "Plugins are not available to this operator.",
     "noBytes": "Install and update take a workspace directory and the reviewed hashes. They do not accept raw bytes.",
+    "grantNone": "Grant no permissions",
+    "reviewConsequence": "Component {sha256}. Manifest {manifest}. Permissions: {permissions}.",
     "generation": "Generation"
   },
   "login": {
