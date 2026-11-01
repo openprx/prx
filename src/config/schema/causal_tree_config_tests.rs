@@ -63,6 +63,30 @@ fn a_backend_table_loads() {
     assert_eq!(loaded.causal_tree.rehearsal.timeout_ms, 80);
 }
 
+/// O6 regression: a `[causal_tree]` section holding only `enabled = false`
+/// stops the load and names the key and the replacement, instead of being
+/// silently read as "unset" and running the plane the operator disabled.
+#[test]
+fn an_enabled_only_section_stops_the_load_and_names_the_fix() {
+    let (_dir, loaded) = load("default_temperature = 0.7\n\n[causal_tree]\nenabled = false\n");
+    let error = loaded.expect_err("test: an enabled-only section is refused");
+    let message = format!("{error:#}");
+
+    assert!(message.contains("causal_tree.enabled"), "{message}");
+    assert!(
+        message.contains("schema_version = 2"),
+        "the error names the spelling that keeps the disable: {message}"
+    );
+}
+
+/// The documented replacement keeps the disable.
+#[test]
+fn an_enabled_only_section_with_the_schema_version_keeps_the_disable() {
+    let (_dir, loaded) = load("default_temperature = 0.7\n\n[causal_tree]\nschema_version = 2\nenabled = false\n");
+    let loaded = loaded.expect("test: a versioned disable loads");
+    assert!(!loaded.causal_tree.enabled, "the disable survives");
+}
+
 #[test]
 fn a_config_saved_by_8a5d160d_loads_and_maps() {
     let (_dir, loaded) = load(SAVED_BY_8A5D160D);
@@ -241,12 +265,15 @@ fn a_migration_error_names_the_fragment_that_holds_the_key() {
     );
 }
 
-/// D-074 with X-3: the `[causal_tree]` block of the BASE `prx init` full
-/// template (a bare `enabled = false` in `config.d/agent.toml`) is the
-/// old serialized default and reads as unset; the first save writes the
-/// versioned form, after which it is the operator's.
+/// D-074 with X-3 and O6: the `[causal_tree]` block of the BASE `prx init`
+/// full template is a bare `enabled = false` in `config.d/agent.toml`. X-3
+/// used to read it as the old serialized default and turn the plane on,
+/// which is exactly the silent drop O6 reports. The two readings differ in
+/// whether the decision plane runs, so the load is refused and the error
+/// names the key and the `schema_version = 2` spelling that keeps the
+/// disable.
 #[tokio::test]
-async fn a_base_init_install_reads_its_disable_as_unset_until_saved() {
+async fn a_base_init_install_disable_is_refused_rather_than_flipped_on() {
     const BASE_INIT_AGENT_BLOCK: &str = "# Causal tree (CTE) — experimental, opt-in. When enabled, the agent loop runs\n\
              # speculative multi-branch prediction (in-memory rehearsal, no extra LLM calls)\n\
              # before each turn. Default off; runtime evidence appears as observer CteRun events.\n\
@@ -256,24 +283,24 @@ async fn a_base_init_install_reads_its_disable_as_unset_until_saved() {
         ("config.toml", "default_temperature = 0.7\n"),
         ("config.d/agent.toml", BASE_INIT_AGENT_BLOCK),
     ]);
-    let loaded = loaded.expect("test: loads");
-    assert_eq!(loaded.causal_tree, crate::causal_tree::CausalTreeConfig::default());
-    let mut root: toml::Value = toml::from_str(BASE_INIT_AGENT_BLOCK).expect("test: toml");
+    let message = format!("{:#}", loaded.expect_err("test: refused"));
+    let agent = dir.path().join("config.d").join("agent.toml").display().to_string();
+    assert!(message.contains(&format!("{agent}: causal_tree.enabled")), "{message}");
+    assert!(message.contains("schema_version = 2"), "{message}");
+
+    // The versioned spelling of the same intent loads and keeps the disable.
+    let mut root: toml::Value =
+        toml::from_str("[causal_tree]\nschema_version = 2\nenabled = false\n").expect("test: toml");
     let report = crate::causal_tree::config::migrate_legacy(&mut root, &|_| None).expect("test: migrates");
-    assert_eq!(report.dropped, ["enabled"], "the template's disable is the old default");
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("config.d/agent.toml")).expect("test: read"),
-        BASE_INIT_AGENT_BLOCK,
-        "loading never stamps the marker on a file it only mapped in memory"
-    );
-    crate::config::files::write_split_config(&loaded, false)
-        .await
-        .expect("test: save");
-    let saved = saved_text(dir.path());
-    assert!(
-        saved.contains("schema_version = 2") && saved.contains("enabled = true"),
-        "{saved}"
-    );
+    assert!(report.dropped.is_empty(), "a versioned disable is never dropped");
+    let table = root
+        .get("causal_tree")
+        .and_then(toml::Value::as_table)
+        .expect("test: the section survives migration");
+    let config: crate::causal_tree::CausalTreeConfig = toml::Value::Table(table.clone())
+        .try_into()
+        .expect("test: the versioned section parses");
+    assert!(!config.enabled, "the operator's disable survives");
 }
 
 /// D-073: in a file saved with the versioned schema, an explicit
