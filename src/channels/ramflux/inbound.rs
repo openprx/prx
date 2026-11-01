@@ -42,10 +42,14 @@ pub enum InboundError {
 /// Returns [`InboundError`] when the frame is not valid JSON-RPC or the
 /// method is rejected. A response has already been written for requests.
 pub async fn on_frame(inner: &Inner, bytes: &[u8]) -> Result<(), InboundError> {
-    let envelope = inner
-        .rpc
-        .parse(bytes)
-        .map_err(|error| InboundError::Failed(error.to_string()))?;
+    let envelope = match inner.rpc.parse(bytes) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            let code = protocol::parse_error_code(&error);
+            inner.rpc.emit_null_error(code, &error.to_string()).await;
+            return Err(InboundError::Failed(error.to_string()));
+        }
+    };
     match envelope {
         Envelope::Response { id, body } => {
             inner.rpc.complete(&id, body);
@@ -191,20 +195,30 @@ async fn on_message(inner: &Inner, params: &Value) -> Result<Value, InboundError
         reply_target: message.reply_target,
         timestamp_ms: message.timestamp_ms,
     };
-    *inner.hint.lock() = Some(super::TurnHint {
-        conversation_id: rich.conversation_id.clone(),
-        turn_id: format!("turn-{}", rich.message_id),
-    });
-    let in_flight = inner.turns.lock().contains_key(&rich.conversation_id);
-    match inner.queue.admit(in_flight, rich) {
+    if let Some(target) = rich.reply_target.clone() {
+        inner.remember_reply_target(&rich.conversation_id, &target);
+    }
+    let objects: Vec<String> = rich.attachments.iter().map(|item| item.object_id.clone()).collect();
+    inner.track_message(
+        &rich.message_id,
+        super::TrackedMessage {
+            content: rich.text.clone(),
+            memory_key: format!("ramflux_{}_{}", rich.sender.principal_id, rich.message_id),
+            objects,
+        },
+    );
+    match inner.queue.admit(rich) {
         super::turn_queue::Admission::Interrupt(message) => {
-            inner.cancel_conversation(&message.conversation_id);
+            inner.cancel_tokens(&message.conversation_id);
             inner.emit_inbound(RichInbound::Message(message)).await?;
         }
         super::turn_queue::Admission::Start(message) => {
             inner.emit_inbound(RichInbound::Message(message)).await?;
         }
         super::turn_queue::Admission::Queued => {}
+        super::turn_queue::Admission::Rejected => {
+            tracing::warn!("ramflux conversation queue is full");
+        }
     }
     Ok(json!({"ok": true}))
 }
@@ -261,6 +275,8 @@ async fn on_control(inner: &Inner, params: &Value) -> Result<Value, InboundError
     match control.kind {
         ControlKind::AgentRemoved => {
             inner.cancel_conversation(&control.conversation_id);
+            super::erase::erase_account(&inner.store, &inner.crypto, &account_id)
+                .map_err(|error| InboundError::Failed(error.to_string()))?;
             super::accounts::mark_removed(
                 &inner.store,
                 &account_id,
@@ -271,7 +287,9 @@ async fn on_control(inner: &Inner, params: &Value) -> Result<Value, InboundError
         }
         ControlKind::AgentRevoked => {
             inner.cancel_conversation(&control.conversation_id);
-            super::erase::erase_account(&inner.store, &inner.crypto, &account_id)
+            let persona = inner.persona.lock().clone();
+            let scope = super::accounts::memory_scope(persona.as_ref(), &account_id, &control.conversation_id);
+            super::erase::erase_conversation(&inner.store, &account_id, &scope)
                 .map_err(|error| InboundError::Failed(error.to_string()))?;
         }
         ControlKind::AgentOffline => {
@@ -310,18 +328,9 @@ async fn on_deleted(inner: &Inner, params: &Value) -> Result<Value, InboundError
         message_id = %deleted.message_id,
         "ramflux message deleted"
     );
-    inner.note_deleted(&deleted.conversation_id, &deleted.message_id);
-    let account_id = inner.account_id.lock().clone().unwrap_or_default();
-    let persona = inner.persona.lock().clone();
-    let scope = super::accounts::memory_scope(persona.as_ref(), &account_id, &deleted.conversation_id);
-    if let Err(error) = inner
-        .store
-        .get_message(&inner.crypto, &account_id, &scope, &deleted.message_id)
-    {
-        tracing::debug!(error = %error, "ramflux message was not readable before erase");
-    }
-    super::erase::erase_message(&inner.store, &account_id, &scope, &deleted.message_id)
-        .map_err(|error| InboundError::Failed(error.to_string()))?;
+    super::hooks::erase_deleted(inner, &deleted.conversation_id, &deleted.message_id)
+        .await
+        .map_err(InboundError::Failed)?;
     inner
         .emit_inbound(RichInbound::MessageDeleted(MessageDeletedInbound {
             conversation_id: deleted.conversation_id,

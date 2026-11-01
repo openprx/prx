@@ -1,8 +1,7 @@
 //! Glue between a channel turn and [`super::rich::RichChannel`].
 //!
-//! The turn loop stays in `turn.rs`. This module owns the small pieces that
-//! loop should not: which resolver to pass, the task-local turn id the
-//! approval bridge reads, and (in later stages) stream and tool projection.
+//! The turn loop stays in `turn.rs`. This module owns the resolver lookup, the
+//! task-local turn id, versioned text streaming, and tool-event projection.
 
 use super::rich::RichChannel;
 use super::traits::Channel;
@@ -163,12 +162,13 @@ pub async fn consume_stream(
     conversation_id: String,
     turn_id: String,
     mut deltas: tokio::sync::mpsc::Receiver<String>,
-) {
+) -> u64 {
     let mut version = 0u64;
     while let Some(delta) = deltas.recv().await {
         version = version.saturating_add(1);
         append_stream_delta(channel.as_ref(), &conversation_id, &turn_id, version, &delta).await;
     }
+    version
 }
 
 /// Map a channel tool notification onto [`super::rich::ToolEvent`] and send it.
@@ -195,15 +195,16 @@ fn tool_event_from_notification(
     use super::rich::{ToolEvent, ToolEventKind};
     use crate::agent::turn_contracts::ToolCallNotification;
     match notification {
-        ToolCallNotification::Started { name, args_summary } => Some(ToolEvent {
+        ToolCallNotification::Started { id, name, args_summary } => Some(ToolEvent {
             kind: ToolEventKind::Started,
-            tool_call_id: format!("{name}:{iteration}"),
+            tool_call_id: id.clone(),
             tool_name: name.clone(),
             iteration,
             duration_ms: None,
             summary: Some(format!("args_len={}", args_summary.len())),
         }),
         ToolCallNotification::Finished {
+            id,
             name,
             success,
             duration_ms,
@@ -213,7 +214,7 @@ fn tool_event_from_notification(
             } else {
                 ToolEventKind::Failed
             },
-            tool_call_id: format!("{name}:{iteration}"),
+            tool_call_id: id.clone(),
             tool_name: name.clone(),
             iteration,
             duration_ms: Some(*duration_ms),
@@ -235,8 +236,112 @@ fn tool_event_from_notification(
 
 impl Drop for TurnGuard {
     fn drop(&mut self) {
+        crate::agent::channel_approval::clear(&self.turn_id);
         if let Some(rich) = self.channel.as_rich() {
             rich.unbind_turn(&self.conversation_id, &self.turn_id);
+        }
+    }
+}
+
+/// Close a streamed surface at `last_version + 1` and emit terminal status.
+pub async fn complete_turn(
+    channel: &dyn Channel,
+    conversation_id: &str,
+    turn_id: &str,
+    last_version: u64,
+    text: &str,
+    state: super::rich::TurnState,
+    code: &str,
+) {
+    let Some(rich) = channel.as_rich() else {
+        return;
+    };
+    if last_version > 0 {
+        finish_stream(channel, conversation_id, turn_id, last_version.saturating_add(1), text).await;
+    }
+    let _ = rich
+        .send_rich(&super::rich::RichReply::Typing(super::rich::TypingReply {
+            conversation_id: conversation_id.to_string(),
+            turn_id: turn_id.to_string(),
+            on: false,
+        }))
+        .await;
+    let status = super::rich::TurnStatus {
+        conversation_id: conversation_id.to_string(),
+        turn_id: turn_id.to_string(),
+        state,
+        error: if matches!(state, super::rich::TurnState::Failed) {
+            Some(super::rich::TurnError {
+                code: code.to_string(),
+                message: code.to_string(),
+            })
+        } else {
+            None
+        },
+    };
+    if let Err(error) = rich.send_rich(&super::rich::RichReply::Status(status)).await {
+        tracing::debug!(error = %error, "ramflux turn status was not sent");
+    }
+}
+
+/// Emits `turn.status` failed/cancelled when a rich turn returns without one.
+pub struct StatusFallback {
+    channel: Arc<dyn Channel>,
+    conversation_id: String,
+    turn_id: String,
+    token: tokio_util::sync::CancellationToken,
+    armed: bool,
+}
+
+impl StatusFallback {
+    #[must_use]
+    pub fn arm(
+        channel: Arc<dyn Channel>,
+        conversation_id: String,
+        turn_id: String,
+        token: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            channel,
+            conversation_id,
+            turn_id,
+            token,
+            armed: true,
+        }
+    }
+
+    pub const fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StatusFallback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let channel = Arc::clone(&self.channel);
+        let conversation_id = std::mem::take(&mut self.conversation_id);
+        let turn_id = std::mem::take(&mut self.turn_id);
+        let code = if self.token.is_cancelled() {
+            "cancelled"
+        } else {
+            "turn_aborted"
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                complete_turn(
+                    channel.as_ref(),
+                    &conversation_id,
+                    &turn_id,
+                    0,
+                    "",
+                    super::rich::TurnState::Failed,
+                    code,
+                )
+                .await;
+            });
         }
     }
 }

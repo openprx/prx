@@ -12,7 +12,16 @@ mode `0600`, owned by the same Unix user as prx. prx refuses to listen when
 the path is a symlink, the owner uid differs, or the mode is not `0600`.
 
 Default path: `$XDG_RUNTIME_DIR/prx/ramflux.sock`, or `<workspace>/ramflux.sock`
-when `XDG_RUNTIME_DIR` is unset. Override with `socket_path`.
+when `XDG_RUNTIME_DIR` is unset. Override with `socket_path`. The parent
+directory must be mode `0700` and owned by this user. prx creates a missing
+parent at `0700` and refuses an existing parent that is looser. Accept checks
+the peer uid and refuses a different user.
+
+The account data key is a 32-byte DEK wrapped by the prx secret store's file
+key (`.secret_key`). It is not stored in the OS keychain or Secret Service.
+That file key is the current custody boundary. Overwriting a file with zeros
+cannot promise erasure on a copy-on-write filesystem such as APFS or btrfs;
+destroying the DEK is what makes a leftover ciphertext unreadable.
 
 One connection is active. A second connection is rejected. After a disconnect
 the host handshakes again. prx replays unacknowledged `reply.*` frames and
@@ -65,7 +74,7 @@ inbound keys for ten minutes. Every outbound frame carries `turn_id`.
 | `inbound.message` | User message. `sender` is a principal, `chat.conversation_id` is the reply target. |
 | `inbound.surface_action` | A person activated a card. Not a tool approval. |
 | `inbound.task_event` | Task event passthrough. |
-| `inbound.control` | Membership and presence. `agent_removed` and `agent_revoked` cancel that conversation. `agent_offline` pauses the account. `agent_online` resumes it. |
+| `inbound.control` | Membership and presence. `agent_revoked` erases that conversation and keeps the account key. `agent_removed` erases the account, destroys the data key, and leaves a removal marker until `agent_added`. `agent_offline` pauses the account. `agent_online` resumes it. |
 | `inbound.message_deleted` | Hard-delete that message's stored bytes. Reply `{erased: true}`. |
 | `approval.decision` | `approved`, `denied`, or `expired`. |
 | `turn.cancel` | Cancel one turn. |

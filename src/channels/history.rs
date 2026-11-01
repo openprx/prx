@@ -140,6 +140,7 @@ pub(super) async fn append_sender_turn(
     // (latent provenance, EU AI Act Art.12).
     run_id: &str,
     record_message_event: bool,
+    memory: &Arc<dyn Memory>,
 ) -> Option<crate::memory::MessageEvent> {
     let role = turn.role.clone();
     // The reply is persisted (conversation turn and message event) redacted like
@@ -180,8 +181,7 @@ pub(super) async fn append_sender_turn(
     .with_config_generation(config_generation);
     let owner_id = envelope.resolved_owner_id();
 
-    if let Err(error) = ctx
-        .memory
+    if let Err(error) = memory
         .append_conversation_turn(
             &key.canonical,
             channel,
@@ -203,7 +203,7 @@ pub(super) async fn append_sender_turn(
     }
 
     let fabric = MemoryFabric::new(
-        ctx.memory.clone(),
+        Arc::clone(memory),
         ctx.workspace_dir.as_path().to_string_lossy().to_string(),
     )
     .with_event_recording(ctx.memory_event_recording);

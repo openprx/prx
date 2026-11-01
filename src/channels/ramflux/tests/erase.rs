@@ -13,6 +13,10 @@ fn erase_removes_plaintext_and_ciphertext() {
     let path = store
         .put_message(&crypto, "agent-a", "conv-1", "m1", plaintext)
         .expect("test: put");
+    let opened = store
+        .get_message(&crypto, "agent-a", "conv-1", "m1")
+        .expect("test: get");
+    assert_eq!(opened, plaintext);
     let ciphertext = std::fs::read(&path).expect("test: read cipher");
     assert!(!dir_contains(store.root(), plaintext), "plaintext was written to disk");
     assert!(dir_contains(store.root(), &ciphertext));

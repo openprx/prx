@@ -67,6 +67,11 @@ impl Authority {
         *self.hello.lock() = Some(hello);
     }
 
+    /// Forget the host's authorization. Effective mode falls back until the next hello.
+    pub fn clear_hello(&self) {
+        *self.hello.lock() = None;
+    }
+
     #[must_use]
     pub fn hello(&self) -> Option<HelloAuthorization> {
         *self.hello.lock()

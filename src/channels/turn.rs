@@ -65,7 +65,23 @@ pub(super) async fn process_channel_message(
     );
     let rich_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     let conversation_id = msg.reply_target.clone();
+    let installed_approval = rich_channel.as_ref().and_then(|channel| {
+        let rich = channel.as_rich()?;
+        let resolver = rich.approval_resolver()?;
+        let force_ask = rich.forces_tool_approval();
+        crate::agent::channel_approval::install(&turn_run_id, Arc::clone(&resolver), force_ask);
+        Some(crate::agent::channel_approval::installed(resolver, force_ask))
+    });
     let _rich_turn = rich_channel.as_ref().and_then(|channel| {
+        if let Some(rich) = channel.as_rich() {
+            if let Some(budget) = rich.turn_budget() {
+                let token = cancellation_token.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(budget).await;
+                    token.cancel();
+                });
+            }
+        }
         crate::channels::rich_turn::TurnGuard::bind(
             Arc::clone(channel),
             &conversation_id,
@@ -73,7 +89,7 @@ pub(super) async fn process_channel_message(
             cancellation_token.clone(),
         )
     });
-    crate::channels::rich_turn::scope_if_rich(
+    let work = crate::channels::rich_turn::scope_if_rich(
         rich_channel.as_ref(),
         &conversation_id,
         &turn_run_id,
@@ -81,8 +97,12 @@ pub(super) async fn process_channel_message(
             guard,
             boxed_channel_work(ctx, msg, cancellation_token, turn_run_id.clone()),
         ),
-    )
-    .await;
+    );
+    if let Some(installed) = installed_approval {
+        crate::agent::channel_approval::scope_installed(installed, work).await;
+    } else {
+        work.await;
+    }
 }
 
 // Construct the large channel-work future outside the caller's async poll
@@ -103,6 +123,16 @@ pub(super) async fn run_channel_turn(
     cancellation_token: CancellationToken,
     turn_run_id: String,
 ) {
+    let mut rich_status = ctx.channels_by_name.get(&msg.channel).and_then(|channel| {
+        channel.as_rich().map(|_| {
+            crate::channels::rich_turn::StatusFallback::arm(
+                Arc::clone(channel),
+                msg.reply_target.clone(),
+                turn_run_id.clone(),
+                cancellation_token.clone(),
+            )
+        })
+    });
     if cancellation_token.is_cancelled() {
         return;
     }
@@ -137,7 +167,27 @@ pub(super) async fn run_channel_turn(
 
     let history_key = ConversationKey::from_message(&msg);
     let message_visibility = channel_message_visibility(&msg);
-    let route = get_route_selection_for_generation(ctx.as_ref(), &history_key, &config_generation);
+    let mut route = get_route_selection_for_generation(ctx.as_ref(), &history_key, &config_generation);
+    if let Some(rich) = target_channel.as_ref().and_then(|channel| channel.as_rich()) {
+        if let Some(model) = rich.preferred_model() {
+            route.model = model;
+        }
+        if let Some(provider) = rich.preferred_provider() {
+            route.provider = provider;
+        }
+    }
+    let turn_memory = target_channel
+        .as_ref()
+        .and_then(|channel| channel.as_rich())
+        .map(|rich| rich.memory_for_turn(Arc::clone(&ctx.memory), &msg.reply_target))
+        .unwrap_or_else(|| Arc::clone(&ctx.memory));
+    let msg = if let Some(rich) = target_channel.as_ref().and_then(|channel| channel.as_rich()) {
+        let mut msg = msg;
+        msg.content = rich.enrich_inbound(&msg.content, &msg.reply_target, &turn_run_id).await;
+        msg
+    } else {
+        msg
+    };
     let runtime_defaults = runtime_defaults_for_generation(ctx.as_ref(), &config_generation);
     let chat_kind = chat_kind_from_message(&msg);
     let inferred_chat_type = chat_kind.scope_chat_type();
@@ -283,8 +333,7 @@ pub(super) async fn run_channel_turn(
             owner_id: None,
             require_owner_match: false,
         };
-        let _ = ctx
-            .memory
+        let _ = turn_memory
             .store_with_context_and_metadata(
                 &autosave_key,
                 &msg.content,
@@ -478,6 +527,7 @@ pub(super) async fn run_channel_turn(
                 None,
                 &turn_run_id,
                 false,
+                &turn_memory,
             )
             .await;
             if let Some(channel) = target_channel.as_ref() {
@@ -572,6 +622,7 @@ pub(super) async fn run_channel_turn(
                 None,
                 &turn_run_id,
                 true,
+                &turn_memory,
             )
             .await;
             println!(
@@ -702,6 +753,9 @@ pub(super) async fn run_channel_turn(
     if smart_group {
         system_prompt.push_str(smart_group_prompt_addendum(mentioned));
     }
+    if let Some(rich) = target_channel.as_ref().and_then(|channel| channel.as_rich()) {
+        system_prompt = rich.augment_prompt(&system_prompt, &msg.reply_target);
+    }
     let rebuild_history = || {
         // Read the canonical ∪ legacy union (FIX-P1-25b read-merge) so pre-cutover
         // turns stored under the legacy key remain visible alongside new canonical
@@ -788,6 +842,21 @@ pub(super) async fn run_channel_turn(
     };
 
     let draft_has_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if rich_stream {
+        if let Some(channel) = target_channel.as_ref() {
+            if let Some(rich) = channel.as_rich() {
+                let _ = rich
+                    .send_rich(&crate::channels::rich::RichReply::Typing(
+                        crate::channels::rich::TypingReply {
+                            conversation_id: msg.reply_target.clone(),
+                            turn_id: turn_run_id.clone(),
+                            on: true,
+                        },
+                    ))
+                    .await;
+            }
+        }
+    }
     let (draft_updater, rich_delta_task) = if rich_stream {
         let task = match (delta_rx, target_channel.as_ref()) {
             (Some(rx), Some(channel)) => Some(tokio::spawn(crate::channels::rich_turn::consume_stream(
@@ -894,7 +963,7 @@ pub(super) async fn run_channel_turn(
                 .await;
             }
             match notif {
-                crate::agent::turn_contracts::ToolCallNotification::Started { name, args_summary } => {
+                crate::agent::turn_contracts::ToolCallNotification::Started { name, args_summary, .. } => {
                     tracing::info!(
                         channel = %tool_event_channel_name,
                         sender = %tool_event_sender_name,
@@ -907,6 +976,7 @@ pub(super) async fn run_channel_turn(
                     name,
                     success,
                     duration_ms,
+                    ..
                 } => {
                     tracing::info!(
                         channel = %tool_event_channel_name,
@@ -1056,13 +1126,13 @@ pub(super) async fn run_channel_turn(
                                         .and_then(|channel| crate::channels::rich_turn::resolver_for(channel.as_ref())),
                                     runtime_adapter: Some(decision_turn.adapter()),
                                     memory: crate::agent::turn_request::ToolLoopMemory::new(
-                                            &ctx.memory,
+                                            &turn_memory,
                                             &ctx.workspace_dir,
-                                            Some(DocumentIngestRuntime::from_scope(ctx.memory.clone(), &scope_ctx)),
+                                            Some(DocumentIngestRuntime::from_scope(Arc::clone(&turn_memory), &scope_ctx)),
                                         )
                                         .with_event_fabric(
                                             MemoryFabric::new(
-                                                ctx.memory.clone(),
+                                                Arc::clone(&turn_memory),
                                                 ctx.workspace_dir.as_path().to_string_lossy().to_string(),
                                             )
                                             .with_event_recording(ctx.memory_event_recording),
@@ -1133,9 +1203,11 @@ pub(super) async fn run_channel_turn(
     if let Some(handle) = draft_updater {
         let _ = handle.await;
     }
-    if let Some(handle) = rich_delta_task {
-        let _ = handle.await;
-    }
+    let rich_last_version = if let Some(handle) = rich_delta_task {
+        handle.await.unwrap_or(0)
+    } else {
+        0
+    };
     let _ = tool_event_forwarder.await;
 
     if let Some(token) = typing_cancellation.as_ref() {
@@ -1147,6 +1219,23 @@ pub(super) async fn run_channel_turn(
 
     match final_outcome {
         LlmFinalOutcome::Cancelled => {
+            if let Some(channel) = target_channel.as_ref() {
+                if channel.as_rich().is_some() {
+                    if let Some(status) = rich_status.as_mut() {
+                        status.defuse();
+                    }
+                    crate::channels::rich_turn::complete_turn(
+                        channel.as_ref(),
+                        &msg.reply_target,
+                        &turn_run_id,
+                        rich_last_version,
+                        "",
+                        crate::channels::rich::TurnState::Failed,
+                        "cancelled",
+                    )
+                    .await;
+                }
+            }
             if let Err(error) = decision_turn
                 .fail(&anyhow::anyhow!("channel turn cancelled"), true)
                 .await
@@ -1222,6 +1311,7 @@ pub(super) async fn run_channel_turn(
                 None,
                 &turn_run_id,
                 !terminal_committed,
+                &turn_memory,
             )
             .await;
             println!(
@@ -1231,14 +1321,24 @@ pub(super) async fn run_channel_turn(
             );
             if rich_stream {
                 if let Some(channel) = target_channel.as_ref() {
-                    crate::channels::rich_turn::finish_stream(
+                    if let Some(status) = rich_status.as_mut() {
+                        status.defuse();
+                    }
+                    crate::channels::rich_turn::complete_turn(
                         channel.as_ref(),
                         &msg.reply_target,
                         &turn_run_id,
-                        u64::MAX,
+                        rich_last_version,
                         &delivered_response,
+                        crate::channels::rich::TurnState::Done,
+                        "done",
                     )
                     .await;
+                    if let Some(rich) = channel.as_rich() {
+                        let _ = rich
+                            .project_final_surface(&msg.reply_target, &turn_run_id, &delivered_response)
+                            .await;
+                    }
                 }
             } else if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
@@ -1311,6 +1411,23 @@ pub(super) async fn run_channel_turn(
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&reason, 80)
             );
+            if let Some(channel) = target_channel.as_ref() {
+                if channel.as_rich().is_some() {
+                    if let Some(status) = rich_status.as_mut() {
+                        status.defuse();
+                    }
+                    crate::channels::rich_turn::complete_turn(
+                        channel.as_ref(),
+                        &msg.reply_target,
+                        &turn_run_id,
+                        rich_last_version,
+                        "",
+                        crate::channels::rich::TurnState::Done,
+                        "done",
+                    )
+                    .await;
+                }
+            }
             if let (Some(channel), Some(draft_id)) = (target_channel.as_ref(), draft_message_id.as_deref()) {
                 if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
                     tracing::debug!(
@@ -1350,6 +1467,31 @@ pub(super) async fn run_channel_turn(
             );
             if let Some(channel) = target_channel.as_ref() {
                 let error_text = turn_failure_notice(failure_kind, &error_id);
+                if channel.as_rich().is_some() {
+                    let code = if cancellation_token.is_cancelled() {
+                        "cancelled"
+                    } else {
+                        match failure_kind {
+                            crate::channels::turn_failure::TurnFailureKind::RateLimited => "rate_limited",
+                            crate::channels::turn_failure::TurnFailureKind::ServiceUnavailable
+                            | crate::channels::turn_failure::TurnFailureKind::Network => "provider_unavailable",
+                            other => other.log_label(),
+                        }
+                    };
+                    if let Some(status) = rich_status.as_mut() {
+                        status.defuse();
+                    }
+                    crate::channels::rich_turn::complete_turn(
+                        channel.as_ref(),
+                        &msg.reply_target,
+                        &turn_run_id,
+                        rich_last_version,
+                        &error_text,
+                        crate::channels::rich::TurnState::Failed,
+                        code,
+                    )
+                    .await;
+                }
                 if let Some(ref draft_id) = draft_message_id {
                     let _ =
                         finalize_draft_recording_activity(channel.as_ref(), &msg.reply_target, draft_id, &error_text)

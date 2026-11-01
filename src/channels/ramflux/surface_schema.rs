@@ -26,20 +26,17 @@ pub enum SchemaError {
 ///
 /// Returns [`SchemaError`] when the reply is not safe to hand to the agent-host.
 pub fn validate(reply: &SurfaceReply, limits: &RamfluxSurfaceLimits, allowed: &[String]) -> Result<(), SchemaError> {
-    match reply.op {
-        SurfaceOp::StreamAppend => {
-            let delta = reply.text_delta.as_deref().unwrap_or("");
-            reject_markup(delta)?;
-            reject_urls(delta)?;
-        }
-        SurfaceOp::Create | SurfaceOp::Patch | SurfaceOp::Close => {
-            if reply.fallback_text.as_deref().unwrap_or("").trim().is_empty() {
-                return Err(SchemaError::MissingFallback);
-            }
-        }
-    }
     let blocks = reply.blocks.as_deref().unwrap_or(&[]);
     let actions = reply.actions.as_deref().unwrap_or(&[]);
+    // Text-stream frames carry plain text. Markup and URL rules apply only to
+    // blocks and actions, so a long reply or one that mentions `<script` is
+    // still delivered as text.
+    if matches!(reply.op, SurfaceOp::StreamAppend) || (blocks.is_empty() && actions.is_empty()) {
+        return Ok(());
+    }
+    if reply.fallback_text.as_deref().unwrap_or("").trim().is_empty() {
+        return Err(SchemaError::MissingFallback);
+    }
     if u32::try_from(blocks.len()).unwrap_or(u32::MAX) > limits.max_blocks
         || u32::try_from(actions.len()).unwrap_or(u32::MAX) > limits.max_actions
     {

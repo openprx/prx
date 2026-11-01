@@ -552,6 +552,7 @@ async fn append_sender_turn_records_channel_message_event() {
         Some("msg-1"),
         "turn-run-id-1",
         true,
+        &ctx.memory,
     )
     .await;
 

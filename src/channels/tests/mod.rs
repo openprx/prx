@@ -20,6 +20,7 @@ mod process_message;
 mod prompt;
 mod provider_switch;
 mod provider_tool_reload;
+mod ramflux_real_turn;
 mod sanitize_identity;
 mod signal_accounted;
 mod smart_group_accounted;
