@@ -1850,13 +1850,17 @@ async fn run_turn_unguarded(
                 };
                 match assessment {
                     ReplyAssessment::Execution(ExecutionRequirement::ExecutionRequired) => {
-                        anyhow::ensure!(
-                            execution_requirement.is_none(),
-                            "request requires execution but no tool result was produced after one corrective retry; execution is unverified"
-                        );
-                        execution_requirement = Some(ExecutionRequirement::ExecutionRequired);
-                        inject_execution_retry = true;
-                        continue;
+                        let textual_reply = execution_requirement.is_some()
+                            && crate::causal_tree::decision_select::pure_textual_reply(proof.routing_input());
+                        if !textual_reply {
+                            anyhow::ensure!(
+                                execution_requirement.is_none(),
+                                "request requires execution but no tool result was produced after one corrective retry; execution is unverified"
+                            );
+                            execution_requirement = Some(ExecutionRequirement::ExecutionRequired);
+                            inject_execution_retry = true;
+                            continue;
+                        }
                     }
                     ReplyAssessment::Execution(ExecutionRequirement::Uncertain) => {
                         // Do not release the unverified draft or claim an action

@@ -134,13 +134,15 @@ async fn exercise_grounding_request(
                         &provider,
                     )
                     .await;
-                    assert_eq!(
-                        matches!(
-                            admission.decision().context.directive(),
-                            crate::causal_tree::directive::TurnExecutionDirective::Execute { .. }
-                        ),
-                        explicit_execution
-                    );
+                    if !crate::causal_tree::decision_select::pure_textual_reply(input) {
+                        assert_eq!(
+                            matches!(
+                                admission.decision().context.directive(),
+                                crate::causal_tree::directive::TurnExecutionDirective::Execute { .. }
+                            ),
+                            explicit_execution
+                        );
+                    }
                     // An old successful-looking assistant message must not count as this turn's execution.
                     let mut history = vec![
                         ChatMessage::system("sys"),
@@ -215,6 +217,30 @@ async fn exercise_grounding_request(
                 .unwrap()
         })
         .await
+}
+
+#[tokio::test]
+async fn pure_textual_reply_degrades_failed_execution_prediction_to_answer() {
+    let hello = "hello";
+    let (result, requests, history, streamed) = exercise_grounding_request(
+        true,
+        &[
+            hello,
+            r#"{"requirement":"execution_required"}"#,
+            hello,
+            r#"{"requirement":"execution_required"}"#,
+        ],
+        false,
+        "Reply with exactly one word: hello",
+    )
+    .await;
+    let delivered = result.expect("pure textual reply delivers the draft");
+    assert_eq!(delivered, hello);
+    assert!(!requests.is_empty());
+    assert!(
+        history.iter().any(|message| message.content == hello) || streamed.contains(hello),
+        "the draft must be delivered on a history or stream sink"
+    );
 }
 
 #[tokio::test]

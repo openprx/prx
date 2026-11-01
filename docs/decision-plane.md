@@ -93,6 +93,12 @@ closed even when the builtin shadow completes discovery. Transport, 5xx,
 circuit-open and local decision-budget failures fall back to the builtin; a
 later configured attempt that serves also keeps the normal terminal path.
 
+A first hop whose text has a path, URL, or code shape, a matching legal tool, and no retrieve or discover candidate does not Clarify. The builtin reports concrete-artifact evidence at or above the evidence threshold, and the selector recovers that tool with reason `concrete_artifact` even when execution utility or choice confidence is below the commit bar. Retrieve and discover still run first when those candidates are admitted. Empty input, text with no concrete artifact, a terminal-only structural request, and failed or repeated tool work still Clarify.
+
+A request whose only instruction is an exact textual reply, such as "reply with exactly one word", is selected as Answer with reason `pure_answer_no_tool`. That check lives in the selector, outside the language-neutral builtin model. If a later execution check still predicts a tool and the corrective retry produces none, the turn delivers that answer instead of an unverified-execution error.
+
+When the decision deadline expires after a legal Commit candidate has already scored at or above the commit threshold for its side-effect class, that candidate is kept and the record stores fallback `deadline_exceeded`. A deadline that expires before scoring, or a selection that is only a recovery hop, still falls back to Clarify. The deadline itself is unchanged.
+
 Exactly named native file operations can form one bounded file plan instead
 of keeping only the first name in that family. It includes only individually
 admitted `file_read`, `file_write` and `file_edit` refs, with maximum effect,
