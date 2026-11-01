@@ -103,10 +103,14 @@ fn store_key(store: &super::store::SkillLifecycleStore) -> usize {
 
 /// Remembers `clock` for later `consult_judge` calls on this store, including
 /// calls that run on a spawned stage worker. The worker and the test share
-/// the service's `Arc` store, so the address stays stable.
+/// the service's `Arc` store, so the address stays stable. Dropping the guard
+/// removes the entry, including when the test fails before it finishes.
 #[cfg(test)]
-pub(crate) fn install(store: &super::store::SkillLifecycleStore, clock: Arc<JudgeClock>) {
-    JUDGE_CLOCKS.lock().insert(store_key(store), clock);
+#[must_use = "the judge clock stays installed until the guard is dropped"]
+pub(crate) fn install(store: &super::store::SkillLifecycleStore, clock: Arc<JudgeClock>) -> JudgeClockGuard {
+    let key = store_key(store);
+    JUDGE_CLOCKS.lock().insert(key, clock);
+    JudgeClockGuard { key }
 }
 
 #[cfg(test)]
@@ -114,7 +118,15 @@ pub(crate) fn installed(store: &super::store::SkillLifecycleStore) -> Option<Arc
     JUDGE_CLOCKS.lock().get(&store_key(store)).cloned()
 }
 
+/// Clears the judge clock installed for one store when dropped.
 #[cfg(test)]
-pub(crate) fn clear(store: &super::store::SkillLifecycleStore) {
-    JUDGE_CLOCKS.lock().remove(&store_key(store));
+pub(crate) struct JudgeClockGuard {
+    key: usize,
+}
+
+#[cfg(test)]
+impl Drop for JudgeClockGuard {
+    fn drop(&mut self) {
+        JUDGE_CLOCKS.lock().remove(&self.key);
+    }
 }

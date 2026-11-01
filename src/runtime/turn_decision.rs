@@ -2281,6 +2281,7 @@ impl TurnDecisionService {
         let deadline = crate::causal_tree::logical_clock::now()
             .checked_add(Duration::from_millis(budget.budgets.latency_ms))
             .ok_or(AgentDecisionError::Deadline)?;
+        #[cfg(test)]
         crate::causal_tree::logical_clock::apply_test_stall().await;
         let (accounting, telemetry) = accounting::admission_resources(self, proof, budget.budgets, deadline);
         let config = &self.generation.effective;

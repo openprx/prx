@@ -3338,9 +3338,14 @@ mod tests {
         assert_eq!(failed_builtin.scored_count, 0, "builtin failure cannot claim scoring");
 
         inputs.inject_builtin_failure = false;
-        inputs.after_prediction_pause = Some(Duration::from_secs(1));
+        // No logical clock is installed. The deadline is the production extra
+        // latency budget, and the pause runs past it on the wall clock.
+        assert!(!crate::causal_tree::logical_clock::installed());
+        let latency_budget =
+            Duration::from_millis(crate::causal_tree::config::CausalPolicy::default().extra_latency_budget_ms);
+        inputs.after_prediction_pause = Some(latency_budget + Duration::from_millis(500));
         let late_start = Instant::now();
-        inputs.deadline = late_start + Duration::from_millis(500);
+        inputs.deadline = late_start + latency_budget;
         let late_valid = CausalDecisionEngine::decide_once(&inputs).await.unwrap();
         assert!(
             late_valid.prediction.is_some(),
@@ -3354,8 +3359,8 @@ mod tests {
         );
         assert!(matches!(late_valid.selection, Selection::Abstain { .. }));
         assert!(
-            late_start.elapsed() < Duration::from_secs(1),
-            "later work shares the same deadline"
+            late_start.elapsed() < latency_budget + Duration::from_millis(500),
+            "a wall stall past extra_latency_budget_ms stops on that deadline"
         );
 
         inputs.terminal_only = true;

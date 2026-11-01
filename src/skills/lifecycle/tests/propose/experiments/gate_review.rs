@@ -522,11 +522,17 @@ async fn judge_timeout_or_durable_cancel_keeps_actual_root_liability_and_never_r
             let config = config(&f, &server);
             let suite = suite(&f);
             let service = reviewed_service(&f, &suite, &config, (!durable_cancel).then_some(50))?;
-            let clock = (!durable_cancel).then(|| {
+            let mut clock_guard = None;
+            let clock = if durable_cancel {
+                None
+            } else {
                 let clock = crate::skills::lifecycle::judge_deadline::JudgeClock::new();
-                crate::skills::lifecycle::judge_deadline::install(service.store_for_test(), clock.clone());
-                clock
-            });
+                clock_guard = Some(crate::skills::lifecycle::judge_deadline::install(
+                    service.store_for_test(),
+                    clock.clone(),
+                ));
+                Some(clock)
+            };
             let plan = service.plan_instruction_cycle(draft(&f, &service, &config, pattern.pattern_id)?, &config)?;
             let prefix = through_holdout(&service, &config, &plan).await?;
             let cancel = CancellationToken::new();
@@ -558,7 +564,7 @@ async fn judge_timeout_or_durable_cancel_keeps_actual_root_liability_and_never_r
             let raw = std::fs::read(config.workspace_dir.join("state/costs.reservations.jsonl"))?;
             let recovered = service.recover_experiment(&plan.spec.id, prefix.plan.digest())?;
             assert_eq!(recovered.head_sha256, journal.head_sha256);
-            crate::skills::lifecycle::judge_deadline::clear(service.store_for_test());
+            drop(clock_guard);
             let replay_cancel = CancellationToken::new();
             assert!(
                 CleanupScope::new(None, replay_cancel.clone())?
@@ -591,8 +597,10 @@ async fn slow_judge_answer_is_kept_when_the_logical_deadline_has_not_elapsed() -
         let config = config(&f, &server);
         let suite = suite(&f);
         let service = reviewed_service(&f, &suite, &config, Some(50))?;
-        let clock = crate::skills::lifecycle::judge_deadline::JudgeClock::new();
-        crate::skills::lifecycle::judge_deadline::install(service.store_for_test(), clock);
+        let _clock = crate::skills::lifecycle::judge_deadline::install(
+            service.store_for_test(),
+            crate::skills::lifecycle::judge_deadline::JudgeClock::new(),
+        );
         let plan = service.plan_instruction_cycle(draft(&f, &service, &config, pattern.pattern_id)?, &config)?;
         service.admit_experiment(plan.spec.clone(), &config)?;
         let cancel = CancellationToken::new();
@@ -605,7 +613,6 @@ async fn slow_judge_answer_is_kept_when_the_logical_deadline_has_not_elapsed() -
             !matches!(journal.state.stages["gate-review"], StageState::DispatchUnknown),
             "a 200 ms judge that the test has not timed out logically still answers"
         );
-        crate::skills::lifecycle::judge_deadline::clear(service.store_for_test());
         Ok(())
     }
     .await;

@@ -142,24 +142,20 @@ pub(crate) const fn installed() -> bool {
 }
 
 /// Applies a test stall or logical advance armed on the current clock.
-/// Production and unarmed tests return immediately.
+/// Unarmed tests return immediately. Production does not call this.
+#[cfg(test)]
 pub(crate) async fn apply_test_stall() {
-    #[cfg(test)]
-    {
-        let Some(clock) = current() else {
-            return;
-        };
-        let stall = clock.stall_ms.swap(0, Ordering::AcqRel);
-        if stall > 0 {
-            tokio::time::sleep(Duration::from_millis(stall)).await;
-        }
-        let advance = clock.advance_ms.swap(0, Ordering::AcqRel);
-        if advance > 0 {
-            clock.advance(Duration::from_millis(advance));
-        }
+    let Some(clock) = current() else {
+        return;
+    };
+    let stall = clock.stall_ms.swap(0, Ordering::AcqRel);
+    if stall > 0 {
+        tokio::time::sleep(Duration::from_millis(stall)).await;
     }
-    #[cfg(not(test))]
-    std::future::ready(()).await;
+    let advance = clock.advance_ms.swap(0, Ordering::AcqRel);
+    if advance > 0 {
+        clock.advance(Duration::from_millis(advance));
+    }
 }
 
 /// Waits for `call` until `deadline`. With a clock installed the wait follows

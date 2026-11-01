@@ -1256,7 +1256,7 @@ impl SkillLifecycleStore {
                     proposal: &proposal,
                     metrics: &metrics,
                 };
-                Some(consult_judge(judge, &brief, request.policy, cancel, judge_limit(self, request.policy)).await?)
+                Some(consult_judge(judge, &brief, cancel, judge_limit(self, request.policy)).await?)
             }
             _ => None,
         };
@@ -1655,7 +1655,6 @@ const fn judge_limit(_store: &SkillLifecycleStore, policy: &GatePolicy) -> super
 async fn consult_judge(
     judge: &dyn GateJudge,
     brief: &JudgeBrief<'_>,
-    _policy: &GatePolicy,
     cancel: &CancellationToken,
     limit: super::judge_deadline::Limit,
 ) -> Result<JudgeRecord, GateError> {
