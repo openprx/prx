@@ -216,6 +216,17 @@ impl PluginRuntime {
         plugins
     }
 
+    /// `plugins/<name>` is on disk, but this generation did not load that name.
+    /// Enable and reload cannot first-discover it.
+    pub async fn absent_from_loaded_generation(&self, name: &str) -> anyhow::Result<bool> {
+        validate_plugin_name(name)?;
+        if !self.plugins_dir.join(name).is_dir() {
+            return Ok(false);
+        }
+        let loaded = self.list_plugins().await;
+        Ok(!loaded.iter().any(|plugin| plugin.name == name))
+    }
+
     /// Build a complete replacement generation, verify the requested plugin is
     /// still present, then publish all registries/adapters with one swap.
     pub async fn reload_plugin(&self, name: &str) -> PluginResult<u64> {
@@ -837,6 +848,24 @@ impl PluginManageTool {
             .ok_or_else(|| anyhow::anyhow!("Missing non-empty '{key}' parameter"))
     }
 
+    /// Optional reviewed hash. Absent or JSON null means the caller did not
+    /// bind one. A present value must be a non-empty string.
+    fn reviewed_hash<'a>(args: &'a serde_json::Value, key: &str) -> anyhow::Result<Option<&'a str>> {
+        match args.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => {
+                let text = value
+                    .as_str()
+                    .map(str::trim)
+                    .ok_or_else(|| anyhow::anyhow!("'{key}' must be a string"))?;
+                if text.is_empty() {
+                    anyhow::bail!("'{key}' must be a non-empty string");
+                }
+                Ok(Some(text))
+            }
+        }
+    }
+
     fn authorize(&self, action: &str, args: &serde_json::Value) -> Result<(), ToolResult> {
         let risk = match action {
             "status" | "get" | "middleware_test" | "provider_chat" | "storage_health" | "storage_recall"
@@ -924,6 +953,18 @@ impl PluginManageTool {
             Some(_) => anyhow::bail!("'grant_permissions' must be an array of strings"),
         };
         let record = material.record_for(&grant)?;
+        // The same read that will be trusted. A hash supplied by the caller
+        // has to match these bytes; a later swap fails closed before any record.
+        if let Some(expected) = Self::reviewed_hash(args, "expected_sha256")?
+            && expected != record.sha256
+        {
+            anyhow::bail!("plugin hashes differ from the reviewed artifacts");
+        }
+        if let Some(expected) = Self::reviewed_hash(args, "expected_manifest_sha256")?
+            && expected != record.manifest_sha256
+        {
+            anyhow::bail!("plugin hashes differ from the reviewed artifacts");
+        }
         Ok(CandidateIdentity { source, record })
     }
 
@@ -1140,7 +1181,7 @@ impl PluginManageTool {
             Err(error) => {
                 let _ = std::fs::rename(&destination, &source);
                 let _ = self.runtime.refresh_all().await;
-                Err(error.into())
+                anyhow::bail!("plugin '{name}' refresh failed and disable was rolled back: {error}");
             }
         }
     }
@@ -1217,7 +1258,7 @@ impl PluginManageTool {
                 Err(error) => {
                     let _ = std::fs::rename(&backup, &source);
                     let _ = self.runtime.refresh_all().await;
-                    return Err(error.into());
+                    anyhow::bail!("plugin '{name}' refresh failed and remove was rolled back: {error}");
                 }
             }
         } else {
@@ -1453,6 +1494,14 @@ fn plugin_manage_execution_schema() -> &'static Arc<serde_json::Value> {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "'install'/'update': host permissions the operator grants (must include every required permission of the plugin and only ones it declares). The approval is bound to the plugin name, WASM hash, manifest hash and this list; omitted means none."
+                    },
+                    "expected_sha256": {
+                        "type": "string",
+                        "description": "'install'/'update': component hash the operator reviewed. When present, it must equal the component bytes read in the call that records trust."
+                    },
+                    "expected_manifest_sha256": {
+                        "type": "string",
+                        "description": "'install'/'update': manifest hash the operator reviewed. When present, it must equal the manifest bytes read in the call that records trust."
                     },
                     "stage": {"type": "string", "enum": ["inbound", "outbound", "llm_request", "llm_response"], "description": "'middleware_test': pipeline stage to exercise."},
                     "data": {"description": "'middleware_test': the envelope passed to the stage."},
@@ -4097,6 +4146,38 @@ max_execution_time_ms = 30000";
         );
         assert!(!temp.path().join("plugins/audit-hook").exists());
         assert_eq!(test_policy(temp.path()).records().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn install_refuses_expected_hashes_that_differ_from_the_bytes_it_reads() {
+        let temp = TempDir::new().unwrap();
+        let source = source_for_install(temp.path(), "audit-hook");
+        let runtime = init_plugin_runtime(temp.path(), None).await.unwrap();
+        let manage = manage_for(&runtime, temp.path(), crate::security::AutonomyLevel::Full);
+        let mismatched = manage
+            .execute(serde_json::json!({
+                "action": "install",
+                "source": source,
+                "grant_permissions": ["events", "kv", "log"],
+                "expected_sha256": "0".repeat(64),
+                "expected_manifest_sha256": "1".repeat(64),
+            }))
+            .await
+            .unwrap();
+        assert!(!mismatched.success);
+        let error = mismatched.error.unwrap_or_default();
+        assert!(
+            error.contains("plugin hashes differ from the reviewed artifacts"),
+            "{error}"
+        );
+        assert!(
+            test_policy(temp.path())
+                .records()
+                .unwrap()
+                .iter()
+                .all(|record| record.name != "audit-hook")
+        );
+        assert!(!temp.path().join("plugins/audit-hook").exists());
     }
 
     #[tokio::test]

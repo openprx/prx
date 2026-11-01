@@ -491,12 +491,13 @@ An operator can call the authenticated plugin reload route through
 uses an existing paired token supplied on stdin and reports the returned plugin
 generation. It does not start or restart the gateway.
 
-`prx plugin enable NAME` previews a disabled-enable. `--yes` moves that one
-disabled plugin back into the active directory and refreshes the process that
-ran the command. It calls the existing disabled-enable owner only. It does not
-write trust, and it does not change `[plugins] enabled`. Read-only autonomy
-refuses the write. A name that is not in the disabled set is not first-discoverable
-by reload.
+`prx plugin enable NAME --gateway-url URL` previews a disabled-enable and does
+not contact the gateway. `--token-from-stdin --yes` posts
+`POST /api/plugins/NAME/enable` with body `{}` and reports the gateway's plugin
+generation. It does not build a local plugin runtime, does not write trust, and
+does not change `[plugins] enabled`. Read-only autonomy refuses before the
+request. A name absent from the loaded generation is not first-discoverable by
+enable or reload.
 
 The Console plugin routes use that same owner:
 
@@ -511,11 +512,19 @@ The Console plugin routes use that same owner:
 
 Install and update use one operator action (TRANSPORT-GAPS option A). The
 handler checks `sha256` and `manifest_sha256` against the workspace source
-directory, then calls `PluginManageTool` install or update. That tool records
-trust after a successful compile. A prior `prx plugin trust` record is not
-required, and the handler does not record trust itself. Unknown JSON fields are
-rejected. A missing runtime answers `503`. Read-only autonomy answers `403`
+directory, then calls `PluginManageTool` install or update with those hashes
+as `expected_sha256` and `expected_manifest_sha256`. The manage tool checks
+them again against the bytes it reads in the call that records trust. A
+mismatch is HTTP 400, with no trust record and no `plugins/<name>`. That tool
+records trust after a successful compile. A prior `prx plugin trust` record is
+not required, and the handler does not record trust itself. Unknown JSON fields
+are rejected. A missing runtime answers `503`. Read-only autonomy answers `403`
 before that check. A partial enable that rolls back is an error, not success.
+A directory that appears under `plugins/` after the runtime started, and is not
+in the loaded generation, answers 404 from enable: it is not first-discoverable
+by enable or reload. HTTP 409 is reserved for a name the loaded generation
+already contains.
+
 `GET /api/plugins` lists the loaded generation only. It does not report separate
 trusted, enabled, healthy, or listening facts, and it does not include artifact
 hashes.
