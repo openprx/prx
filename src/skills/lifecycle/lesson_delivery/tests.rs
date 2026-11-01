@@ -1,6 +1,7 @@
 //! Backend integrity/retention tests; fixture pins are not adoption authority.
 use super::*;
 use crate::skills::lifecycle::RevisionId;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn payload(store: &SkillLifecycleStore, key: &DecisionKey, attempt: &str) -> Result<SealedDelivery> {
@@ -133,4 +134,36 @@ fn tampered_or_corrupt_delivery_aborts_the_whole_retention_read() -> Result<()> 
             .is_err()
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn advancing_the_manual_clock_expires_the_retention_deadline() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let store = SkillLifecycleStore::open(workspace.path(), OwnerScope::new("fixture-owner")?)?;
+    let clock = crate::causal_tree::logical_clock::ManualClock::new();
+    crate::causal_tree::logical_clock::scope(Arc::clone(&clock), async move {
+        let exclusive = store.lock_store(false, Duration::from_secs(1))?;
+        let deadline = crate::causal_tree::logical_clock::now() + Duration::from_millis(500);
+        let open = DeliveryRetentionLimits {
+            max_records: 1,
+            max_decoded_bytes: 1024,
+            deadline,
+        };
+        store.delivery_retention_refs_locked(&exclusive, open)?;
+        clock.advance(Duration::from_millis(501));
+        let expired = DeliveryRetentionLimits {
+            max_records: 1,
+            max_decoded_bytes: 1024,
+            deadline,
+        };
+        let Err(error) = store.delivery_retention_refs_locked(&exclusive, expired) else {
+            panic!("test: logical deadline");
+        };
+        assert!(
+            error.to_string().contains("delivery retention work deadline exhausted"),
+            "test: refusal must name the retention deadline, got {error}"
+        );
+        Ok(())
+    })
+    .await
 }

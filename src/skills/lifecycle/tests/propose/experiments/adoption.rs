@@ -585,7 +585,9 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
                 crate::skills::lifecycle::lesson_delivery::DeliveryRetentionLimits {
                     max_records: 64,
                     max_decoded_bytes: 1024 * 1024,
-                    deadline: std::time::Instant::now() + Duration::from_secs(5),
+                    // This body runs on a logical clock an hour ahead of wall
+                    // time. The retention comparison reads that clock.
+                    deadline: crate::causal_tree::logical_clock::now() + Duration::from_secs(5),
                 },
             )?;
             assert_eq!(refs.refs, vec![reference.clone()]);

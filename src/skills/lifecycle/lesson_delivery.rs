@@ -279,10 +279,10 @@ impl SkillLifecycleStore {
             limits.max_records > 0 && limits.max_decoded_bytes > 0,
             "invalid delivery retention work bounds"
         );
-        ensure!(
-            Instant::now() < limits.deadline,
-            "delivery retention work deadline exhausted"
-        );
+        // The deadline is `logical_clock::now() + elapsed`. Compare on that
+        // same clock. With no clock installed, both sides are wall time.
+        let now = || crate::causal_tree::logical_clock::now();
+        ensure!(now() < limits.deadline, "delivery retention work deadline exhausted");
         let dir = self.root().join(DIRECTORY);
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -297,18 +297,12 @@ impl SkillLifecycleStore {
         };
         check_private(&dir)?;
         let key = existing_store_key(self)?;
-        ensure!(
-            Instant::now() < limits.deadline,
-            "delivery retention work deadline exhausted"
-        );
+        ensure!(now() < limits.deadline, "delivery retention work deadline exhausted");
         let mut examined_records = 0_usize;
         let mut decoded_bytes = 0_u64;
         let mut refs = BTreeMap::new();
         for entry in entries {
-            ensure!(
-                Instant::now() < limits.deadline,
-                "delivery retention work deadline exhausted"
-            );
+            ensure!(now() < limits.deadline, "delivery retention work deadline exhausted");
             examined_records = examined_records
                 .checked_add(1)
                 .context("delivery retention count overflow")?;
@@ -363,15 +357,9 @@ impl SkillLifecycleStore {
             for reference in payload.refs.iter().cloned() {
                 refs.insert(serde_json::to_vec(&reference)?, reference);
             }
-            ensure!(
-                Instant::now() < limits.deadline,
-                "delivery retention work deadline exhausted"
-            );
+            ensure!(now() < limits.deadline, "delivery retention work deadline exhausted");
         }
-        ensure!(
-            Instant::now() < limits.deadline,
-            "delivery retention work deadline exhausted"
-        );
+        ensure!(now() < limits.deadline, "delivery retention work deadline exhausted");
         Ok(DeliveryRetentionRefs {
             refs: refs.into_values().collect(),
             examined_records,
