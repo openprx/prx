@@ -67,6 +67,11 @@ pub(crate) struct SelectorContext {
     /// One named read can acquire its own evidence even when another named
     /// operation has side effects. This never grants either operation.
     pub single_exact_read_capability: bool,
+    /// The routing text has a path, URL, or code shape. This does not raise
+    /// evidence while a retrieve or discover candidate is still admitted.
+    pub concrete_artefact: bool,
+    /// The routing text asks only for an exact textual reply.
+    pub pure_textual_reply: bool,
 }
 
 pub(crate) struct CausalSelector;
@@ -408,6 +413,36 @@ impl CausalSelector {
         } else {
             discover
         };
+        // A reply contract is not a tool request. Force Answer before a
+        // higher-scoring discover hop or a use_tool prediction can run.
+        if !stale
+            && context.pure_textual_reply
+            && let Some((candidate, _, _)) = passed
+                .iter()
+                .find(|(candidate, _, _)| candidate.action() == CausalActionKind::Answer)
+        {
+            return Ok(Selection::Recover {
+                candidate_id: candidate.candidate_id().clone(),
+                reason_code: "pure_answer_no_tool",
+            });
+        }
+        // An explicit artifact with a matching tool and no recovery candidate
+        // must not Clarify on the first hop, including when utility or
+        // confidence is below the commit bar. Recover stores the reason.
+        let concrete_tool_ready = !stale
+            && !context.discovery_completed
+            && context.concrete_artefact
+            && retrieve.is_none()
+            && discover.is_none()
+            && top.action() == CausalActionKind::UseTool
+            && prediction.chosen_action == top.action().as_str()
+            && prediction.chosen_target == top.target().as_str();
+        if concrete_tool_ready {
+            return Ok(Selection::Recover {
+                candidate_id: top.candidate_id().clone(),
+                reason_code: "concrete_artifact",
+            });
+        }
         if insufficient && !exact_current_action && retrieve.is_none() && evidence_discover.is_none() {
             return terminal_abstain(candidates, pre_commit, context, "insufficient_evidence");
         }
@@ -541,6 +576,31 @@ const fn effective_threshold(base: f64, effect: SideEffectClass) -> f64 {
         SideEffectClass::Destructive => 0.25,
     };
     if base + offset > 1.0 { 1.0 } else { base + offset }
+}
+
+/// Commit bar for `effect`, including the side-effect offset.
+pub(crate) const fn commit_threshold_for(base: f64, effect: SideEffectClass) -> f64 {
+    effective_threshold(base, effect)
+}
+
+/// Whether `text` only asks for an exact textual reply.
+/// A path, URL, or code shape stays on the tool path.
+#[must_use]
+pub(crate) fn pure_textual_reply(text: &str) -> bool {
+    let signals = crate::decision::builtin::features::text_signals(text);
+    if !signals.has_text || signals.structural() {
+        return false;
+    }
+    let folded = text.trim().to_lowercase();
+    folded.contains("exactly one word")
+        || folded.starts_with("reply with exactly")
+        || folded.starts_with("reply exactly")
+}
+
+/// Whether `text` names a path, URL, or code shape.
+#[must_use]
+pub(crate) fn routing_has_concrete_artifact(text: &str) -> bool {
+    crate::decision::builtin::features::text_signals(text).structural()
 }
 
 fn available_approval(
@@ -734,6 +794,8 @@ mod tests {
             discovery_completed: false,
             single_exact_capability: false,
             single_exact_read_capability: false,
+            concrete_artefact: false,
+            pure_textual_reply: false,
         };
         (
             set,
@@ -1903,5 +1965,208 @@ mod tests {
             assert_eq!(actual, expected);
             assert!(distribution.is_empty(), "a deterministic commit did not explore");
         }
+    }
+
+    fn install(
+        set: &mut CandidateSet,
+        scores: &mut BTreeMap<CandidateId, CandidateScore>,
+        evidence: &mut PredictionEvidence,
+        report: &mut GateReport,
+        candidate: CausalCandidate,
+        utility: f64,
+        probability: f64,
+    ) {
+        let mut features = evidence
+            .candidates
+            .values()
+            .next()
+            .expect("test: seed prediction")
+            .clone();
+        features.choice_probability = probability;
+        scores.insert(
+            candidate.candidate_id().clone(),
+            CandidateScore {
+                semantic_utility: utility,
+                execution_utility: utility,
+            },
+        );
+        evidence.candidates.insert(candidate.candidate_id().clone(), features);
+        report
+            .outcomes
+            .insert(candidate.candidate_id().clone(), GateOutcome::Passed);
+        let CandidateSet::Legal { candidates, .. } = set else {
+            panic!("legal fixture");
+        };
+        candidates.push(candidate);
+    }
+
+    #[test]
+    fn explicit_artifact_does_not_clarify_on_the_first_hop() {
+        let (mut set, mut scores, mut evidence, mut report, mut policy, mut context) = fixture(0.4);
+        let CandidateSet::Legal { candidates, .. } = &mut set else {
+            panic!("legal fixture");
+        };
+        candidates.retain(|candidate| candidate.action() != CausalActionKind::Retrieve);
+        for score in scores.values_mut() {
+            score.semantic_utility = 0.364;
+            score.execution_utility = 0.364;
+        }
+        let tool = candidate(CausalActionKind::UseTool, CapabilityTarget::Filesystem);
+        install(
+            &mut set,
+            &mut scores,
+            &mut evidence,
+            &mut report,
+            tool.clone(),
+            0.522,
+            0.5,
+        );
+        evidence.chosen_action = "use_tool".into();
+        evidence.chosen_target = "filesystem".into();
+        evidence.action_confidence = 0.29;
+        evidence.target_confidence = 0.47;
+        evidence.evidence_sufficient = 0.377_540_668_798_145_4;
+        policy.commit_threshold = 0.62;
+        policy.minimum_top_margin = 0.10;
+        context.concrete_artefact = true;
+        let chosen =
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).expect("test: select");
+        assert!(matches!(
+            chosen,
+            Selection::Recover { reason_code: "concrete_artifact", candidate_id } if candidate_id == *tool.candidate_id()
+        ));
+        evidence.evidence_sufficient = 0.75;
+        assert!(matches!(
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context)
+                .expect("test: raised evidence"),
+            Selection::Recover {
+                reason_code: "concrete_artifact",
+                ..
+            }
+        ));
+        context.concrete_artefact = false;
+        evidence.evidence_sufficient = 0.377_540_668_798_145_4;
+        assert!(matches!(
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).expect("test: ambiguous"),
+            Selection::Abstain {
+                reason_code: "insufficient_evidence",
+                ..
+            }
+        ));
+        evidence.evidence_sufficient = 0.75;
+        assert!(matches!(
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).expect("test: below bar"),
+            Selection::Abstain {
+                reason_code: "commit_threshold_or_margin",
+                ..
+            }
+        ));
+
+        context.concrete_artefact = true;
+        evidence.evidence_sufficient = 0.377_540_668_798_145_4;
+        let discovery = candidate(CausalActionKind::Discover, CapabilityTarget::Filesystem);
+        install(&mut set, &mut scores, &mut evidence, &mut report, discovery, 0.2, 0.2);
+        assert!(matches!(
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).expect("test: discover first"),
+            Selection::Recover {
+                reason_code: "discover_capability",
+                ..
+            }
+        ));
+
+        let (
+            mut retrieved,
+            mut retrieved_scores,
+            mut retrieved_evidence,
+            mut retrieved_report,
+            retrieved_policy,
+            mut retrieved_context,
+        ) = fixture(0.4);
+        for score in retrieved_scores.values_mut() {
+            score.execution_utility = 0.2;
+        }
+        let retrieved_tool = candidate(CausalActionKind::UseTool, CapabilityTarget::Filesystem);
+        install(
+            &mut retrieved,
+            &mut retrieved_scores,
+            &mut retrieved_evidence,
+            &mut retrieved_report,
+            retrieved_tool,
+            0.522,
+            0.5,
+        );
+        retrieved_evidence.chosen_action = "use_tool".into();
+        retrieved_evidence.chosen_target = "filesystem".into();
+        retrieved_evidence.evidence_sufficient = 0.3;
+        retrieved_context.concrete_artefact = true;
+        assert!(matches!(
+            CausalSelector::select(
+                &retrieved,
+                &retrieved_scores,
+                &retrieved_evidence,
+                &retrieved_report,
+                &retrieved_policy,
+                &retrieved_context,
+            )
+            .expect("test: retrieve stays first"),
+            Selection::Recover {
+                reason_code: "retrieve_evidence",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pure_textual_reply_selects_answer_instead_of_execution() {
+        assert!(pure_textual_reply("Reply with exactly one word: hello"));
+        assert!(pure_textual_reply("  reply exactly: hello"));
+        assert!(!pure_textual_reply("hello"));
+        assert!(!pure_textual_reply("Use file_read to inspect the requested report."));
+        assert!(!pure_textual_reply("make this friendlier"));
+        assert!(!pure_textual_reply("say the files in /tmp/prx_fixture"));
+        assert!(routing_has_concrete_artifact("read /tmp/prx_fixture/input.md"));
+        assert!(!routing_has_concrete_artifact("Reply with exactly one word: hello"));
+
+        let (mut set, mut scores, mut evidence, mut report, policy, mut context) = fixture(0.5);
+        let CandidateSet::Legal { candidates, .. } = &mut set else {
+            panic!("legal fixture");
+        };
+        candidates.retain(|candidate| candidate.action() != CausalActionKind::Retrieve);
+        let discovery = candidate(CausalActionKind::Discover, CapabilityTarget::Skill);
+        install(
+            &mut set,
+            &mut scores,
+            &mut evidence,
+            &mut report,
+            discovery.clone(),
+            0.9,
+            0.8,
+        );
+        for (id, score) in &mut scores {
+            if *id != *discovery.candidate_id() {
+                score.execution_utility = 0.2;
+                score.semantic_utility = 0.2;
+            }
+        }
+        evidence.chosen_action = "discover".into();
+        evidence.chosen_target = "skill".into();
+        evidence.evidence_sufficient = 0.2;
+        evidence.action_confidence = 0.9;
+        evidence.target_confidence = 0.9;
+        context.pure_textual_reply = true;
+        let selected =
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).expect("test: select");
+        assert!(matches!(
+            selected,
+            Selection::Recover { reason_code: "pure_answer_no_tool", candidate_id }
+                if candidate_id.action() == CausalActionKind::Answer
+        ));
+        context.pure_textual_reply = false;
+        let discovered =
+            CausalSelector::select(&set, &scores, &evidence, &report, &policy, &context).expect("test: discover");
+        assert!(matches!(
+            discovered,
+            Selection::Recover { reason_code: "discover_capability", candidate_id } if candidate_id == *discovery.candidate_id()
+        ));
     }
 }
