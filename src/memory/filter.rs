@@ -124,7 +124,7 @@ impl MemorySafetyFilter {
                 detail: "detected email address".to_string(),
             });
         }
-        if pii_id_regex().is_match(&numeric_pii_content) {
+        if contains_identity_number(&numeric_pii_content) {
             issues.push(SafetyIssue {
                 kind: SafetyIssueKind::Pii,
                 detail: "detected identity-number-like token".to_string(),
@@ -255,6 +255,23 @@ fn credit_card_candidate_regex() -> &'static Regex {
     &CARD
 }
 
+/// Decimal fractions of routing scores and prices are not identity numbers.
+/// `serde_json` prints some finite floats with 15 or 18 fractional digits, and
+/// a word boundary on `.` makes that digit run look like a national id. A
+/// short numeric run id or a hexadecimal digest does not match this shape.
+/// The check runs before the memory row is written.
+fn contains_identity_number(content: &str) -> bool {
+    pii_id_regex()
+        .find_iter(content)
+        .any(|candidate| !touches_decimal_point(content, candidate.start(), candidate.end()))
+}
+
+fn touches_decimal_point(content: &str, start: usize, end: usize) -> bool {
+    let preceded_by_decimal_point = content.get(..start).and_then(|prefix| prefix.chars().next_back()) == Some('.');
+    let followed_by_decimal_point = content.get(end..).and_then(|suffix| suffix.chars().next()) == Some('.');
+    preceded_by_decimal_point || followed_by_decimal_point
+}
+
 fn contains_credit_card_number(content: &str) -> bool {
     for candidate in credit_card_candidate_regex().find_iter(content) {
         // Long floating-point telemetry values (for example a fitness ratio
@@ -262,13 +279,7 @@ fn contains_credit_card_number(content: &str) -> bool {
         // card candidate is an integer-like token, never the fractional part
         // of a decimal number. Check both boundaries because the regex starts
         // after, or stops before, the decimal point.
-        let preceded_by_decimal_point = content
-            .get(..candidate.start())
-            .and_then(|prefix| prefix.chars().next_back())
-            == Some('.');
-        let followed_by_decimal_point =
-            content.get(candidate.end()..).and_then(|suffix| suffix.chars().next()) == Some('.');
-        if preceded_by_decimal_point || followed_by_decimal_point {
+        if touches_decimal_point(content, candidate.start(), candidate.end()) {
             continue;
         }
         let digits: String = candidate.as_str().chars().filter(|ch| ch.is_ascii_digit()).collect();
@@ -361,6 +372,26 @@ mod tests {
         let result = filter.check(&with_phone, &source).await;
         assert!(!result.passed);
         assert!(result.issues.iter().any(|issue| issue.kind == SafetyIssueKind::Pii));
+    }
+
+    #[tokio::test]
+    async fn technical_ids_and_decimal_fractions_are_not_identity_numbers() {
+        let filter = MemorySafetyFilter::default();
+        let source = SourceMetadata {
+            actor: Actor::Agent,
+            historical_accuracy: None,
+        };
+        let transcript = "run 41283835316 sha a1b2c3d4e5f6789012345678901234567890abcd \
+                          score 0.694437731664143 weight 0.007207550038104219";
+        assert!(filter.check(transcript, &source).await.passed);
+
+        let ssn = filter.check("record 123-45-6789", &source).await;
+        assert!(!ssn.passed);
+        assert!(ssn.issues.iter().any(|issue| issue.detail.contains("identity-number")));
+
+        let bare = filter.check("record 123456789012345", &source).await;
+        assert!(!bare.passed);
+        assert!(bare.issues.iter().any(|issue| issue.detail.contains("identity-number")));
     }
 
     #[tokio::test]

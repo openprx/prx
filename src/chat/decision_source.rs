@@ -7,6 +7,43 @@ use crate::runtime::envelope::RuntimeEnvelope;
 use anyhow::Context;
 use std::sync::Arc;
 
+/// Resume admission stays opaque: its sources may contain private identifiers.
+/// An inbound persistence failure is different. The operator needs the cause,
+/// so the user-facing line names a public error class and drops everything else.
+pub(super) fn chat_input_persistence_failure(error: &anyhow::Error) -> anyhow::Error {
+    let cause = safe_persistence_cause(error);
+    tracing::error!(error = %error, "chat input persistence failed");
+    anyhow::anyhow!("chat input persistence failed: {cause}")
+}
+
+fn safe_persistence_cause(error: &anyhow::Error) -> String {
+    let mut selected = None;
+    for cause in error.chain() {
+        let text = cause.to_string();
+        if persistence_cause_is_public(&text) {
+            selected = Some(text);
+        }
+    }
+    selected.unwrap_or_else(|| "inbound write was rejected".to_owned())
+}
+
+fn persistence_cause_is_public(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    !text.is_empty()
+        && text.len() <= 180
+        && !text.contains('/')
+        && !text.contains('\\')
+        && !text.contains('@')
+        && !lower.contains("token")
+        && !lower.contains("secret")
+        && !lower.contains("password")
+        && !lower.contains("authorization")
+        && !lower.contains("api_key")
+        && text
+            .chars()
+            .all(|character| character.is_ascii() && !character.is_control())
+}
+
 /// Only typed infrastructure failures receive retry guidance. Opaque approval
 /// failures include owner/scope/consumption checks and retain the same refusal.
 /// Never render an error's text: its sources may contain private identifiers.
@@ -142,7 +179,7 @@ impl ChatProviderBinding {
                 }
             };
             let operation = async {
-                let event = fabric
+                let event = match fabric
                     .record_inbound_user_message(
                         scope.clone(),
                         super::sanitize::sanitize_for_persistence(&input),
@@ -150,13 +187,10 @@ impl ChatProviderBinding {
                         None,
                     )
                     .await
-                    .map_or_else(
-                        |_| {
-                            tracing::warn!("chat input persistence is unconfirmed");
-                            None
-                        },
-                        Some,
-                    );
+                {
+                    Ok(event) => Some(event),
+                    Err(error) => return Err(chat_input_persistence_failure(&error)),
+                };
                 issue(event).await
             };
             let result = tokio::time::timeout(std::time::Duration::from_secs(15), operation)
@@ -1285,6 +1319,22 @@ pub(crate) mod admission_failure_tests {
                 "Decision resume failed before execution. You can retry this request."
             );
         }
+    }
+
+    #[test]
+    fn failed_inbound_persistence_names_the_cause_and_hides_private_text() {
+        let error = anyhow::anyhow!("invalid ingress capsule authentication")
+            .context("owner=/Users/hidden/prx_owner token=abcd");
+        let surfaced = chat_input_persistence_failure(&error);
+        let text = surfaced.to_string();
+        assert!(text.contains("invalid ingress capsule authentication"), "{text}");
+        assert!(
+            !text.contains("enabled chat decision source was not recorded"),
+            "{text}"
+        );
+        assert!(!text.contains("hidden"), "{text}");
+        assert!(!text.contains("abcd"), "{text}");
+        assert!(!text.contains("token"), "{text}");
     }
 
     #[test]

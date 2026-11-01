@@ -457,13 +457,18 @@ impl Drop for TracingChatGuard {
     }
 }
 
-/// Compute `~/.openprx/` (or `$HOME/.openprx/`) for the chat log directory.
+/// Chat log directory. An explicit `--config-dir` wins; otherwise the
+/// historical default is `~/.openprx/` (or `$HOME/.openprx/`).
 pub(super) fn resolve_chat_log_dir() -> Result<std::path::PathBuf> {
+    if let Some(dir) = crate::config::process_config_dir() {
+        return Ok(dir);
+    }
     crate::config::default_openprx_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory for chat.log"))
 }
 
-/// Redirect the global `tracing` writer to `~/.openprx/chat.log` so
-/// `INFO`/`WARN`/`ERROR` lines never collide with the ratatui TUI.
+/// Redirect the global `tracing` writer to `chat.log` so `INFO`/`WARN`/`ERROR`
+/// lines never collide with the ratatui TUI. The file is under `--config-dir`
+/// when that flag was published, and under `~/.openprx/` otherwise.
 ///
 /// Returns a guard that MUST be held for the lifetime of the chat session.
 /// On any failure (no HOME, dir not creatable, file not openable, no global

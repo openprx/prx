@@ -1692,9 +1692,10 @@ async fn async_main() -> Result<()> {
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
     // For `chat` subcommand, we build a reloadable subscriber so tracing can
-    // move to ~/.openprx/chat.log before configuration is loaded. Otherwise
-    // startup INFO/WARN lines written behind the alternate screen reappear as
-    // a wall of stale output when the user exits the TUI.
+    // move to chat.log before configuration is loaded. `--config-dir`, when
+    // set above, selects that directory; otherwise the file is ~/.openprx/chat.log.
+    // Startup INFO/WARN lines written behind the alternate screen would
+    // otherwise reappear as a wall of stale output when the user exits the TUI.
     let use_stderr = matches!(
         cli.command,
         Commands::Chat { .. }

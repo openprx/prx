@@ -91,6 +91,9 @@ mod reasoning_extraction_tests;
 mod terminal_guard_tests;
 
 #[cfg(test)]
+mod persist_recovery_tests;
+
+#[cfg(test)]
 mod tracing_redirect_tests;
 
 #[cfg(test)]
