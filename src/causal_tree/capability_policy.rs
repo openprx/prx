@@ -67,6 +67,13 @@ pub const OWNER_ISOLATION_AWARE_TOOLS: &[&str] = &[
     // The tool restricts isolated callers to owner-bound proposal reads/cancellation.
     // Shared projection, executable import and legacy workspace actions are refused.
     "skills_manage",
+    // Every cron action either records the trusted owner at creation (`add`,
+    // `schedule`, `once` via `lineage_from_trusted_scope`) or admits only that
+    // owner's jobs (`CallerScope` on list, get, status, runs, history, events,
+    // remove, cancel, update, patch, run, pause, and resume). An isolated
+    // caller is never the local-process operator, so it cannot see or change
+    // another owner's jobs.
+    "cron",
 ];
 
 /// Both public identity and actual backend must name the audited implementation.

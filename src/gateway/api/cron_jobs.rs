@@ -4,11 +4,16 @@
 //! path. It does not start a second scheduler. An API token is never the
 //! local-process operator: the owner comes only from
 //! [`crate::cron::lineage_from_trusted_scope`] over a server-built scope whose
-//! `owner_id` is [`ApiPrincipal::owner_id`].
+//! `owner_id` is [`ApiPrincipal::owner_id`] and whose `owner_isolated` flag is
+//! set. Mutations go through [`super::authorize_resource_mutation`]. A command
+//! that is stored or run is also checked with
+//! [`crate::security::SideEffectGate::authorize_command_execution`]. The
+//! scheduler does not apply that command policy when the job later runs.
 
 use super::{ApiPrincipal, AppState};
 use crate::cron::{self, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronRun, Schedule};
-use crate::security::policy::SecurityPolicy;
+use crate::security::SideEffectGate;
+use crate::security::policy::{ResourceRiskLevel, SecurityPolicy};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
@@ -76,7 +81,10 @@ fn unavailable(error: impl Into<String>) -> ApiResponse {
 fn scope_args(owner_id: &str) -> Value {
     json!({
         "_zc_scope_trusted": true,
-        "_zc_scope": { "owner_id": owner_id }
+        "_zc_scope": {
+            "owner_id": owner_id,
+            "owner_isolated": true
+        }
     })
 }
 
@@ -100,15 +108,17 @@ fn policy(config: &crate::config::Config) -> std::sync::Arc<SecurityPolicy> {
     crate::runtime::bootstrap::build_security_policy(config)
 }
 
-fn require_mutation(config: &crate::config::Config, action: &str) -> Result<(), ApiResponse> {
-    if policy(config).can_act() {
-        Ok(())
-    } else {
-        Err(error_response(
-            StatusCode::FORBIDDEN,
-            format!("Security policy: read-only mode, cannot perform '{action}'"),
-        ))
-    }
+fn authorize_cron(state: &AppState, operation: &str, risk: ResourceRiskLevel) -> Result<(), ApiResponse> {
+    super::authorize_resource_mutation(state, operation, risk)
+}
+
+/// Command policy at the HTTP boundary. `run_job_command` does not call this.
+fn authorize_stored_command(config: &crate::config::Config, command: &str) -> Result<(), ApiResponse> {
+    let policy = policy(config);
+    SideEffectGate::new(policy.as_ref())
+        .authorize_command_execution("cron", command, None)
+        .map(|_| ())
+        .map_err(|error| error_response(StatusCode::FORBIDDEN, error))
 }
 
 fn parse_json<T: for<'de> Deserialize<'de>>(bytes: &Bytes) -> Result<T, ApiResponse> {
@@ -435,9 +445,6 @@ pub(super) async fn create_job(
     body: Bytes,
 ) -> ApiResponse {
     let config = state.config.load_full();
-    if let Err(response) = require_mutation(&config, "add") {
-        return response;
-    }
     let lineage = match require_owner(&config, &principal) {
         Ok(lineage) => lineage,
         Err(response) => return response,
@@ -456,6 +463,12 @@ pub(super) async fn create_job(
         Err(response) => return response,
     };
     let name = non_empty(write.name.as_deref());
+    if let Err(response) = authorize_cron(&state, "gateway_api:cron:create", ResourceRiskLevel::High) {
+        return response;
+    }
+    if let Err(response) = authorize_stored_command(&config, &command) {
+        return response;
+    }
     let created = match schedule {
         WriteSchedule::Once(delay) => {
             cron::add_once_with_lineage_and_approval_grant(&config, &delay, &command, None, lineage)
@@ -487,9 +500,6 @@ pub(super) async fn patch_job(
     body: Bytes,
 ) -> ApiResponse {
     let config = state.config.load_full();
-    if let Err(response) = require_mutation(&config, "update") {
-        return response;
-    }
     let lineage = match require_owner(&config, &principal) {
         Ok(lineage) => lineage,
         Err(response) => return response,
@@ -520,6 +530,26 @@ pub(super) async fn patch_job(
     let name = write.name.as_deref().map(|name| name.trim().to_string());
     if schedule.is_none() && command.is_none() && name.is_none() {
         return bad_request("update requires a schedule, command, or name");
+    }
+    if let Err(response) = authorize_cron(
+        &state,
+        if command.is_some() {
+            "gateway_api:cron:update"
+        } else {
+            "gateway_api:cron:update_meta"
+        },
+        if command.is_some() {
+            ResourceRiskLevel::High
+        } else {
+            ResourceRiskLevel::Medium
+        },
+    ) {
+        return response;
+    }
+    if let Some(command) = command.as_deref()
+        && let Err(response) = authorize_stored_command(&config, command)
+    {
+        return response;
     }
     let patch_schedule = match schedule {
         Some(WriteSchedule::Once(_)) => {
@@ -556,10 +586,6 @@ pub(super) async fn patch_job(
 
 fn set_enabled(state: &AppState, principal: &ApiPrincipal, id: &str, enabled: bool, body: &Bytes) -> ApiResponse {
     let config = state.config.load_full();
-    let action = if enabled { "resume" } else { "pause" };
-    if let Err(response) = require_mutation(&config, action) {
-        return response;
-    }
     if let Err(response) = ensure_empty_body(body) {
         return response;
     }
@@ -573,6 +599,17 @@ fn set_enabled(state: &AppState, principal: &ApiPrincipal, id: &str, enabled: bo
     };
     let id = id.trim();
     if let Err(response) = visible_job(&config, owner, id) {
+        return response;
+    }
+    if let Err(response) = authorize_cron(
+        state,
+        if enabled {
+            "gateway_api:cron:resume"
+        } else {
+            "gateway_api:cron:pause"
+        },
+        ResourceRiskLevel::Medium,
+    ) {
         return response;
     }
     let updated = if enabled {
@@ -615,9 +652,6 @@ pub(super) async fn delete_job(
     body: Bytes,
 ) -> ApiResponse {
     let config = state.config.load_full();
-    if let Err(response) = require_mutation(&config, "remove") {
-        return response;
-    }
     if let Err(response) = ensure_empty_body(&body) {
         return response;
     }
@@ -631,6 +665,9 @@ pub(super) async fn delete_job(
     };
     let id = id.trim();
     if let Err(response) = visible_job(&config, owner, id) {
+        return response;
+    }
+    if let Err(response) = authorize_cron(&state, "gateway_api:cron:remove", ResourceRiskLevel::Medium) {
         return response;
     }
     match cron::remove_job(&config, id) {
@@ -647,9 +684,6 @@ pub(super) async fn run_job(
     body: Bytes,
 ) -> ApiResponse {
     let config = state.config.load_full();
-    if let Err(response) = require_mutation(&config, "run") {
-        return response;
-    }
     if let Err(response) = ensure_empty_body(&body) {
         return response;
     }
@@ -666,6 +700,12 @@ pub(super) async fn run_job(
         Ok(job) => job,
         Err(response) => return response,
     };
+    if let Err(response) = authorize_cron(&state, "gateway_api:cron:run", ResourceRiskLevel::High) {
+        return response;
+    }
+    if let Err(response) = authorize_stored_command(&config, &job.command) {
+        return response;
+    }
     let Ok(lease_secs) = i64::try_from(config.scheduler.claim_lease_secs) else {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "scheduler lease does not fit");
     };
@@ -805,6 +845,41 @@ mod tests {
         assert!(!missing_error.contains("another principal"));
         assert!(!foreign_error.contains("another principal"));
 
+        let foreign_path = format!("/api/cron/jobs/{}", foreign.id);
+        let hidden = format!("Job '{}' not found", foreign.id);
+        let (status, body) = served
+            .call(
+                reqwest::Method::PATCH,
+                &foreign_path,
+                Some(serde_json::json!({ "name": "nope" })),
+            )
+            .await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(at(&json(&body), "/error"), hidden.as_str());
+        let (status, body) = served
+            .call(
+                reqwest::Method::POST,
+                &format!("{foreign_path}/pause"),
+                Some(serde_json::json!({})),
+            )
+            .await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(at(&json(&body), "/error"), hidden.as_str());
+        let (status, body) = served
+            .call(reqwest::Method::POST, &format!("{foreign_path}/resume"), None)
+            .await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(at(&json(&body), "/error"), hidden.as_str());
+        let (status, body) = served.call(reqwest::Method::DELETE, &foreign_path, None).await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(at(&json(&body), "/error"), hidden.as_str());
+        let (status, body) = served
+            .call(reqwest::Method::POST, &format!("{foreign_path}/run"), None)
+            .await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(at(&json(&body), "/error"), hidden.as_str());
+        assert!(!hidden.contains("another principal"));
+
         let (status, body) = served.call(reqwest::Method::GET, "/api/cron/jobs", None).await;
         assert_eq!(status, 200, "{body}");
         let parsed = json(&body);
@@ -887,6 +962,92 @@ mod tests {
         let (status, body) = blocked.call(reqwest::Method::GET, "/api/cron/jobs", None).await;
         assert_eq!(status, 503, "{body}");
         assert_eq!(at(&json(&body), "/success"), false);
+    }
+
+    #[tokio::test]
+    async fn supervised_cron_create_and_run_require_a_grant() {
+        let served = serve_config(|config| {
+            config.autonomy.level = AutonomyLevel::Supervised;
+        })
+        .await;
+        let (status, body) = served
+            .call(
+                reqwest::Method::POST,
+                "/api/cron/jobs",
+                Some(serde_json::json!({ "every_ms": 60_000, "command": "echo hello" })),
+            )
+            .await;
+        assert_eq!(status, 403, "{body}");
+        let denied = at(&json(&body), "/error").as_str().unwrap_or("").to_string();
+        assert!(denied.contains("approval grant"), "{denied}");
+
+        let config = served.state.config.load_full();
+        let owner = ApiPrincipal::of_token(super::super::test_support::TOKEN).owner_id;
+        let job = cron::add_shell_job_with_lineage_and_approval_grant(
+            &config,
+            Some("seeded".to_string()),
+            Schedule::Every { every_ms: 60_000 },
+            "echo hello",
+            None,
+            CronJobLineage {
+                owner_id: Some(owner),
+                ..CronJobLineage::default()
+            },
+        )
+        .expect("test: seed a job without the HTTP gate");
+        let (status, body) = served
+            .call(reqwest::Method::POST, &format!("/api/cron/jobs/{}/run", job.id), None)
+            .await;
+        assert_eq!(status, 403, "{body}");
+        let denied = at(&json(&body), "/error").as_str().unwrap_or("").to_string();
+        assert!(denied.contains("approval grant"), "{denied}");
+        let stored = cron::get_job(&config, &job.id).expect("test: seeded job remains");
+        assert!(
+            stored.last_status.is_none(),
+            "a refused run must not execute the command"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_command_policy_rejects_a_forbidden_path_and_allows_a_plain_command() {
+        let served = serve_config(|_| {}).await;
+        let (status, body) = served
+            .call(
+                reqwest::Method::POST,
+                "/api/cron/jobs",
+                Some(serde_json::json!({ "every_ms": 60_000, "command": "cat /etc/passwd" })),
+            )
+            .await;
+        assert_eq!(status, 403, "{body}");
+        assert!(
+            at(&json(&body), "/error")
+                .as_str()
+                .unwrap_or("")
+                .contains("/etc/passwd"),
+            "{body}"
+        );
+
+        let (status, body) = served
+            .call(
+                reqwest::Method::POST,
+                "/api/cron/jobs",
+                Some(serde_json::json!({ "every_ms": 60_000, "command": "echo hello" })),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let id = at_str(&json(&body), "/id");
+        let (status, body) = served
+            .call(
+                reqwest::Method::PATCH,
+                &format!("/api/cron/jobs/{id}"),
+                Some(serde_json::json!({ "command": "cat /etc/passwd" })),
+            )
+            .await;
+        assert_eq!(status, 403, "{body}");
+        let (status, body) = served
+            .call(reqwest::Method::POST, &format!("/api/cron/jobs/{id}/run"), None)
+            .await;
+        assert_eq!(status, 200, "{body}");
     }
 
     fn at_str(value: &Value, pointer: &str) -> String {

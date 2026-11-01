@@ -21,6 +21,9 @@ use tracing::instrument::WithSubscriber as _;
 /// The bearer token the served router accepts. Not a real credential.
 pub(super) const TOKEN: &str = "zc_management_api_test_token";
 
+/// A second paired token, so two API owners can be tested against one store.
+pub(super) const TOKEN_OTHER: &str = "zc_management_api_other_token";
+
 /// Provider the gateway state needs but these tests never reach.
 struct UnusedProvider;
 
@@ -50,12 +53,18 @@ pub(super) fn app_state(config: Config) -> AppState {
     let workspace = config.workspace_dir.clone();
     std::fs::create_dir_all(&workspace).expect("test: workspace dir");
     let memory = SqliteMemory::new(&workspace).expect("test: sqlite memory");
+    app_state_with_memory(config, Arc::new(memory))
+}
+
+fn app_state_with_memory(config: Config, memory: Arc<dyn crate::memory::Memory>) -> AppState {
+    let workspace = config.workspace_dir.clone();
+    std::fs::create_dir_all(&workspace).expect("test: workspace dir");
     AppState {
         config: crate::config::new_shared(config),
         provider: Arc::new(UnusedProvider),
         model: "test-model".into(),
         temperature: 0.0,
-        mem: Arc::new(memory),
+        mem: memory,
         auto_save: false,
         tools_registry: Arc::new(vec![]),
         mcp_tool: None,
@@ -63,7 +72,7 @@ pub(super) fn app_state(config: Config) -> AppState {
         hooks: Arc::new(HookManager::new(workspace)),
         webhook_token_hash: None,
         webhook_signing_secret: None,
-        pairing: Arc::new(PairingGuard::new(true, &[TOKEN.to_string()])),
+        pairing: Arc::new(PairingGuard::new(true, &[TOKEN.to_string(), TOKEN_OTHER.to_string()])),
         trust_forwarded_headers: false,
         rate_limiter: Arc::new(GatewayRateLimiter::new(10_000, 10_000, 10_000, 10_000)),
         idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
@@ -107,6 +116,17 @@ impl Served {
     pub(super) fn loaded(&self) -> Config {
         Config::load_from_path(&self.dir.path().join("config.toml"), self.dir.path().join("workspace"))
             .expect("test: load")
+    }
+
+    /// A request with a paired bearer token; returns `(status, body)`.
+    pub(super) async fn call_as(
+        &self,
+        token: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (u16, String) {
+        send(method, &format!("{}{path}", self.base), Some(token), None, body).await
     }
 
     /// A request with the bearer token; returns `(status, body)`.
@@ -164,6 +184,26 @@ pub(super) async fn serve_config(edit: impl FnOnce(&mut Config)) -> Served {
     let loaded =
         Config::load_from_path(&config.config_path, config.workspace_dir.clone()).expect("test: load initial config");
     serve_state(dir, app_state(loaded)).await
+}
+
+/// Serve `edit`ed defaults with an explicit memory backend.
+pub(super) async fn serve_with_memory(
+    edit: impl FnOnce(&mut Config),
+    memory: Arc<dyn crate::memory::Memory>,
+) -> Served {
+    let dir = tempfile::TempDir::new().expect("test: temp config dir");
+    let mut config = Config {
+        config_path: dir.path().join("config.toml"),
+        workspace_dir: dir.path().join("workspace"),
+        default_provider: Some("openai".into()),
+        default_model: Some("gpt-4o".into()),
+        ..Config::default()
+    };
+    edit(&mut config);
+    config.save().await.expect("test: save initial config");
+    let loaded =
+        Config::load_from_path(&config.config_path, config.workspace_dir.clone()).expect("test: load initial config");
+    serve_state(dir, app_state_with_memory(loaded, memory)).await
 }
 
 /// Serve an already-built state. Callers that need a plugin runtime set it

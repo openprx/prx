@@ -64,7 +64,7 @@ pub(super) async fn get_cost(State(state): State<AppState>, Query(query): Query<
     if let Some(object) = value.as_object_mut() {
         object.insert("scope".to_string(), json!("workspace"));
         object.insert("window".to_string(), json!(query.window.trim()));
-        object.insert("estimates".to_string(), json!(true));
+        object.insert("reservation_estimates".to_string(), json!(true));
         object.insert(
             "estimate_note".to_string(),
             json!("reservation amounts include estimates and are not settled charges"),
@@ -94,7 +94,8 @@ mod tests {
         assert_eq!(status, 200, "{body}");
         let report = json(&body);
         assert_eq!(at(&report, "/scope"), "workspace");
-        assert_eq!(at(&report, "/estimates"), true);
+        assert!(report.get("estimates").is_none());
+        assert_eq!(at(&report, "/reservation_estimates"), true);
         assert_eq!(at(&report, "/unpriced_usage"), "omitted");
         assert!(report.get("unknown_cost_usd").is_none());
         assert!(report.get("selected").is_some());
