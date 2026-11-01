@@ -2070,7 +2070,7 @@ async fn run_turn_unguarded(
         // - run read-only tools in small bounded batches;
         // - keep all stateful tools strictly serial.
         let mut tool_results = String::new();
-        for call in &tool_calls {
+        for (index, call) in tool_calls.iter().enumerate() {
             hooks
                 .emit(
                     HookEvent::ToolCallStart,
@@ -2083,8 +2083,14 @@ async fn run_turn_unguarded(
             if let Some(ref tx) = on_tool_call {
                 let args_str = scrub_credentials(&call.arguments.to_string());
                 let args_summary = truncate_with_ellipsis(&args_str, 80);
+                let id = native_tool_calls
+                    .get(index)
+                    .map(|native| native.id.clone())
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| format!("{}#{index}", call.name));
                 let _ = tx
                     .send(ToolCallNotification::Started {
+                        id,
                         name: call.name.clone(),
                         args_summary,
                     })
@@ -2162,7 +2168,7 @@ async fn run_turn_unguarded(
         // tool result does. Built once per tool round and shared by the inline
         // caps and the mid-turn trim.
         let reserved_config = compaction_config.map(|config| reserve_request_tool_surface(config, tool_surface));
-        for (call, outcome) in tool_calls.iter().zip(individual_results.iter()) {
+        for (index, (call, outcome)) in tool_calls.iter().zip(individual_results.iter()).enumerate() {
             let success = outcome.succeeded();
             let result = &outcome.content;
             hooks
@@ -2176,8 +2182,14 @@ async fn run_turn_unguarded(
                 )
                 .await;
             if let Some(ref tx) = on_tool_call {
+                let id = native_tool_calls
+                    .get(index)
+                    .map(|native| native.id.clone())
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| format!("{}#{index}", call.name));
                 let _ = tx
                     .send(ToolCallNotification::Finished {
+                        id,
                         name: call.name.clone(),
                         success,
                         duration_ms: tools_elapsed_ms,

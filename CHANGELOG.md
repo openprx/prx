@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add a local `ramflux` channel: a same-user `0600` Unix socket bridge with
+  typed rich turns, supervised or host-declared full autonomy, and at-rest
+  encryption for that channel's memory. prx does not hold ramflux keys.
+
 ### Changed
 
 - **Breaking:** provider auth and API requests identify as `User-Agent: prx/<version>`.

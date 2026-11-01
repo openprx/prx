@@ -1,5 +1,6 @@
 //! Channel-owned input provenance after transport admission. Model admission
 //! remains separate and follows smart-group suppression.
+use super::rich::RichChannel;
 use crate::config::ConfigGeneration;
 use crate::memory::{Memory, MessageEvent};
 use crate::runtime::envelope::RuntimeEnvelope;
@@ -85,8 +86,14 @@ impl ChannelSourceReceipt {
         run: String,
         ticket: crate::runtime::turn_cleanup::CleanupTicket,
     ) -> anyhow::Result<(Option<MessageEvent>, Arc<Self>, ChannelAdmissionGuard)> {
+        let persist_memory = ctx
+            .channels_by_name
+            .get(&message.channel)
+            .and_then(|channel| channel.as_rich())
+            .map(|rich| RichChannel::memory_for_turn(rich, Arc::clone(&ctx.memory), &message.reply_target))
+            .unwrap_or_else(|| Arc::clone(&ctx.memory));
         let fabric = crate::memory::MemoryFabric::new(
-            Arc::clone(&ctx.memory),
+            Arc::clone(&persist_memory),
             generation.effective.workspace_dir.to_string_lossy(),
         )
         .with_event_recording(generation.effective.memory.event_recording_config())
@@ -118,8 +125,8 @@ impl ChannelSourceReceipt {
                     )
                     .await
                     .map_or_else(
-                        |_| {
-                            tracing::warn!("channel input persistence is unconfirmed");
+                        |error| {
+                            tracing::warn!(error = %error, "channel input persistence is unconfirmed");
                             None
                         },
                         Some,
@@ -131,7 +138,7 @@ impl ChannelSourceReceipt {
                     );
                 }
                 let source =
-                    Arc::new(Self::issue(ctx.memory.as_ref(), &generation, &message, &run, event.as_ref()).await?);
+                    Arc::new(Self::issue(persist_memory.as_ref(), &generation, &message, &run, event.as_ref()).await?);
                 admission = Some(ChannelAdmissionGuard {
                     source: Some(Arc::clone(&source)),
                     fabric: fabric.clone(),
@@ -154,8 +161,17 @@ impl ChannelSourceReceipt {
                     Some(&message.id),
                     &run,
                     false,
+                    &persist_memory,
                 )
                 .await;
+                if let Some(channel) = ctx.channels_by_name.get(&message.channel) {
+                    if let Some(rich) = channel.as_rich() {
+                        let stored = format!("convturn:{}:user:{}", key.canonical, message.id);
+                        rich.record_erasure(&message.id, &stored, &stored);
+                        let event_key = format!("channel:{}:{}", message.channel, message.id);
+                        rich.record_erasure(&message.id, &event_key, &event_key);
+                    }
+                }
                 Ok::<_, anyhow::Error>((event, source))
             };
             let result = tokio::time::timeout(std::time::Duration::from_secs(15), operation)
@@ -176,8 +192,7 @@ impl ChannelSourceReceipt {
                 Err(error) => {
                     if admission.is_none() {
                         let recovery = async {
-                            let event = ctx
-                                .memory
+                            let event = persist_memory
                                 .find_owned_message_event_by_idempotency_key(
                                     fabric.workspace_id(),
                                     &envelope.resolved_owner_id(),
@@ -189,7 +204,7 @@ impl ChannelSourceReceipt {
                                 event.idempotency_key.as_deref() == Some(input_key.as_str()),
                                 "channel recovery input identity changed"
                             );
-                            Self::issue(ctx.memory.as_ref(), &generation, &message, &run, Some(&event)).await
+                            Self::issue(persist_memory.as_ref(), &generation, &message, &run, Some(&event)).await
                         };
                         if let Ok(Ok(source)) = tokio::time::timeout(std::time::Duration::from_secs(15), recovery).await
                         {

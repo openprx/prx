@@ -13,11 +13,45 @@ use std::io::{self, BufRead, Write};
 
 // ── Types ────────────────────────────────────────────────────────
 
+/// Coarse risk carried on a channel approval. prx does not grade calls itself;
+/// callers may leave this unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalRisk {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
 /// A request to approve a tool call before execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub tool_name: String,
     pub arguments: serde_json::Value,
+    /// Optional risk hint. Absent for callers that do not grade the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<ApprovalRisk>,
+    /// Unix millis after which a pending channel approval is cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    /// SHA-256 hex of the canonical JSON of `arguments`, when already computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_hash: Option<String>,
+}
+
+impl ApprovalRequest {
+    /// Build a request with no risk, expiry, or argument hash.
+    #[must_use]
+    pub fn new(tool_name: impl Into<String>, arguments: serde_json::Value) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            arguments,
+            risk: None,
+            expires_at_ms: None,
+            args_hash: None,
+        }
+    }
 }
 
 /// The user's response to an approval request.
@@ -346,10 +380,7 @@ mod tests {
 
     #[test]
     fn approval_request_serde() {
-        let req = ApprovalRequest {
-            tool_name: "shell".into(),
-            arguments: serde_json::json!({"command": "echo hi"}),
-        };
+        let req = ApprovalRequest::new("shell", serde_json::json!({"command": "echo hi"}));
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "shell");

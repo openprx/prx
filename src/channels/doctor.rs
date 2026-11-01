@@ -7,8 +7,8 @@ use super::WhatsAppWebChannel;
 use super::service::bind_telegram_identity;
 use super::{
     Arc, Channel, Config, DingTalkChannel, DiscordChannel, Duration, EmailChannel, IMessageChannel, IrcChannel,
-    LarkChannel, LinqChannel, NextcloudTalkChannel, QQChannel, Result, SignalChannel, SignalNativeChannel,
-    SlackChannel, TelegramChannel, WacliChannel, WhatsAppChannel, irc, wacli,
+    LarkChannel, LinqChannel, NextcloudTalkChannel, QQChannel, RamfluxChannel, Result, SignalChannel,
+    SignalNativeChannel, SlackChannel, TelegramChannel, WacliChannel, WhatsAppChannel, irc, wacli,
 };
 
 /// Return the configured state of every real-time channel supported by this build.
@@ -37,6 +37,7 @@ pub fn channel_configuration_statuses(config: &Config) -> Vec<(&'static str, boo
         ("Lark", config.channels_config.lark.is_some()),
         ("DingTalk", config.channels_config.dingtalk.is_some()),
         ("QQ", config.channels_config.qq.is_some()),
+        ("Ramflux", config.channels_config.ramflux.is_some()),
     ]
 }
 
@@ -262,6 +263,14 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 );
             }
         }
+    }
+
+    if let Some(ref rf) = config.channels_config.ramflux {
+        let report = RamfluxChannel::describe(rf, &config.workspace_dir);
+        println!("  Ramflux socket: {}", report.socket_path.display());
+        println!("  Ramflux permission: {}", report.permission);
+        println!("  Ramflux authorization: {}", report.authorization);
+        println!("  Ramflux listener: not started (doctor does not open the store)");
     }
 
     if let Some(ref wc) = config.channels_config.wacli {

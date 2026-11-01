@@ -1532,6 +1532,48 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
+    /// Rows whose key starts with `prefix`, limited by the backend query.
+    async fn list_key_prefix(&self, prefix: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        let mut entries = self.list(None, None).await?;
+        entries.retain(|entry| entry.key.starts_with(prefix));
+        entries.truncate(limit);
+        Ok(entries)
+    }
+
+    /// Delete message-event rows whose idempotency key is `idempotency_key`.
+    ///
+    /// The default leaves the log untouched. Backends that store the causal
+    /// log override this so a channel erase can remove one message and its
+    /// terminal payload without listing the table.
+    async fn forget_message_idempotency(&self, idempotency_key: &str) -> anyhow::Result<usize> {
+        let _ = idempotency_key;
+        Ok(0)
+    }
+
+    /// Key as stored in the backend. Encrypting scopes hash it.
+    fn persisted_key(&self, key: &str) -> String {
+        key.to_string()
+    }
+
+    /// Truncate the sqlite WAL so deleted pages are not left in `brain.db-wal`.
+    ///
+    /// Backends without a WAL ignore this.
+    async fn checkpoint_wal(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Forget every row whose stored key starts with `prefix`.
+    async fn forget_key_prefix(&self, prefix: &str) -> anyhow::Result<usize> {
+        let entries = self.list_key_prefix(prefix, usize::MAX).await?;
+        let mut removed = 0usize;
+        for entry in entries {
+            if self.forget(&entry.key).await? {
+                removed = removed.saturating_add(1);
+            }
+        }
+        Ok(removed)
+    }
+
     /// The owner of every row in `category`, by row id, for maintenance that
     /// must never act across owners (deduplication, for one).
     ///

@@ -45,6 +45,9 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
+    /// Local ramflux agent-host bridge.
+    #[serde(default)]
+    pub ramflux: Option<super::RamfluxConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -68,6 +71,7 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            ramflux: None,
         }
     }
 }

@@ -524,6 +524,9 @@ pub use tunnel::*;
 mod channels;
 pub use channels::*;
 
+mod ramflux_channel;
+pub use ramflux_channel::*;
+
 mod security;
 pub use security::*;
 

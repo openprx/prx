@@ -1,6 +1,7 @@
 #[allow(clippy::module_inception)]
 pub mod agent;
 pub(crate) mod approval_collection;
+pub(crate) mod channel_approval;
 pub mod classifier;
 pub(crate) mod compaction;
 mod completion_review;
@@ -46,3 +47,4 @@ mod tests;
 
 pub use entry::run;
 pub(crate) use entry::run_with_runtime_envelope;
+pub use turn_contracts::{ApprovalDecision, ApprovalResolver};

@@ -3454,13 +3454,14 @@ Retry with a compatible model: /provider {shown} <model>",
         let tool_event_forwarder = tokio::spawn(async move {
             while let Some(notif) = tool_event_rx.recv().await {
                 match notif {
-                    ToolCallNotification::Started { name, args_summary } => {
+                    ToolCallNotification::Started { name, args_summary, .. } => {
                         terminal_for_tools.notify_tool_started(&name, &args_summary).await;
                     }
                     ToolCallNotification::Finished {
                         name,
                         success,
                         duration_ms,
+                        ..
                     } => {
                         terminal_for_tools
                             .notify_tool_finished(&name, success, duration_ms)

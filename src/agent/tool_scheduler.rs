@@ -366,12 +366,20 @@ fn spawn_delegation_tool(
     let cleanup = crate::runtime::turn_cleanup::current_tracker();
     let parent_work = crate::runtime::registry::current_work_id();
     let progress = crate::agent::idle::current_beat();
+    let approval = crate::agent::channel_approval::current_installed();
     let spawn_context = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
         .try_with(Clone::clone)
         .ok();
     let work: std::pin::Pin<Box<dyn std::future::Future<Output = crate::tools::ToolExecutionOutcome> + Send>> =
         Box::pin(async move {
             let execute = async move { service.execute(command, context, cancellation).await };
+            let execute = async move {
+                if let Some(approval) = approval {
+                    crate::agent::channel_approval::scope_installed(approval, execute).await
+                } else {
+                    execute.await
+                }
+            };
             let execute = async move {
                 match spawn_context {
                     Some(spawn_context) => {

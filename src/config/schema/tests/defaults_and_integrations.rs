@@ -374,6 +374,7 @@ async fn config_toml_roundtrip() {
             lark: None,
             dingtalk: None,
             qq: None,
+            ramflux: None,
         },
         memory: MemoryConfig::default(),
         identity_bindings: Vec::new(),
