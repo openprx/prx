@@ -93,8 +93,6 @@ jobs:
               run: cargo install cargo-machete --locked
             - name: Run unused dependency gate
               run: cargo machete
-            - name: Type-check criterion benchmarks
-              run: cargo check --locked --profile ci --bench router_decision --bench prompt_render --bench tool_dispatch
 
     test:
         name: Test
@@ -137,6 +135,8 @@ jobs:
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
             - name: Build binary (smoke check)
               run: cargo build --locked --verbose
+            - name: Type-check criterion benchmarks
+              run: cargo check --locked --profile ci --bench router_decision --bench prompt_render --bench tool_dispatch
 
     windows-check:
         name: Windows Check
