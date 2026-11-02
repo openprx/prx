@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Explicit controlled predictions for turn mechanics; registry, gates and bars stay real.
 use super::*;
 use crate::decision::backend::DecisionBackend;
