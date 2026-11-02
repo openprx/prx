@@ -2,7 +2,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::causal_tree::branch::{CapabilityTarget, CostEstimate};
+use crate::causal_tree::branch::{CapabilityTarget, CostEstimate, SideEffectClass};
 use crate::causal_tree::candidate_generator::CapabilityCostModel;
 use crate::causal_tree::outcome::DecisionRecordBuilder;
 use crate::causal_tree::state::{ObservedState, ObservedStepStatus, TrustedState, fixtures};
@@ -15,12 +15,12 @@ fn fixture_key() -> Arc<DecisionKey> {
     Arc::clone(KEY.get_or_init(fixtures::key))
 }
 
-/// A validated optimistic prediction makes the first score exceed the commit
-/// bar. The interrupted ranking must still account for unseen competitors.
+/// A validated strongest-tool prediction isolates the trusted policy limits.
+/// Read-only deadline cases clear the bar; high-risk ceilings remain below it.
 #[derive(Clone)]
 struct ScoringPrediction<P> {
     inner: P,
-    optimistic: bool,
+    optimistic_target: Option<&'static str>,
 }
 impl<P: PredictionPort> prediction_sealed::Producer for ScoringPrediction<P> {}
 impl<P: PredictionPort> PredictionPort for ScoringPrediction<P> {
@@ -36,17 +36,19 @@ impl<P: PredictionPort> PredictionPort for ScoringPrediction<P> {
         lineage: &'a CausalLineage,
     ) -> Result<PredictionResult, DecisionError> {
         let mut result = Box::pin(self.inner.predict(request, lineage)).await?;
-        if self.optimistic {
-            use crate::decision::{ChoiceAnswer, DecisionQuestion, NoulAnswer, Probability, ScoreAnswer};
+        if let Some(target) = self.optimistic_target {
+            use crate::decision::{
+                ChoiceAnswer, DecisionQuestion, GlobalQuestion, NoulAnswer, Probability, QuestionId, ScoreAnswer,
+            };
             let probability = |value| Probability::new(value).unwrap();
             let mut response = crate::decision::builtin::BuiltinDecisionBackend::answer(request)?;
             for (id, question) in request.questions() {
                 let answer = match question {
                     DecisionQuestion::Choice { criteria, .. } => {
-                        let preferred = if id.as_str() == "next_action" {
+                        let preferred = if id == &QuestionId::global(GlobalQuestion::NextAction) {
                             "use_tool"
                         } else {
-                            "filesystem"
+                            target
                         };
                         let chosen = criteria
                             .keys()
@@ -63,13 +65,16 @@ impl<P: PredictionPort> PredictionPort for ScoringPrediction<P> {
                         })
                     }
                     DecisionQuestion::Noul { .. } => DecisionAnswer::Noul(NoulAnswer {
-                        probability_true: probability(if id.as_str() == "needs_fresh_state" { 0.0 } else { 1.0 }),
+                        probability_true: probability(f64::from(
+                            id == &QuestionId::global(GlobalQuestion::EvidenceSufficient)
+                                || id.as_str().starts_with("candidate.use_tool-"),
+                        )),
                     }),
                     DecisionQuestion::Score { levels, .. } => {
-                        let index = if id.as_str().ends_with("risk") {
-                            0
-                        } else {
+                        let index = if id.as_str().ends_with("gain") && id.as_str().starts_with("candidate.use_tool-") {
                             levels.len() - 1
+                        } else {
+                            0
                         };
                         DecisionAnswer::Score(ScoreAnswer {
                             distribution: (0..levels.len()).map(|n| probability(f64::from(n == index))).collect(),
@@ -98,19 +103,44 @@ impl<P: PredictionPort> PredictionPort for ScoringPrediction<P> {
     }
 }
 
+enum FixtureTools {
+    None,
+    Filesystem,
+    Named(&'static str),
+}
+
+struct EffectFixtureTool(&'static str);
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for EffectFixtureTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn description(&self) -> &str {
+        "PRX effect-class selection fixture"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{}})
+    }
+    async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        anyhow::bail!("the effect-class fixture must never execute")
+    }
+}
+
 async fn decide_turn(
     turn: &str,
     checkpoint: Option<(&'static str, usize)>,
-    with_tools: bool,
+    tools: FixtureTools,
     prior: Option<(ObservedStepStatus, CandidateId)>,
+    optimistic_target: Option<&'static str>,
 ) -> EngineDecision {
     let key = fixture_key();
     let mut state = fixtures::state(&key, turn);
     state.observed = ObservedState::from_runtime_records(Vec::new(), Vec::new(), 0);
     let mut security = SecurityPolicy::default();
     security.autonomy = AutonomyLevel::Full;
-    let registry: Vec<Box<dyn crate::tools::Tool>> = if with_tools {
-        vec![
+    let registry: Vec<Box<dyn crate::tools::Tool>> = match tools {
+        FixtureTools::Filesystem => vec![
             Box::new(crate::tools::file_read::FileReadTool::new(
                 Arc::new(security.clone()),
                 false,
@@ -120,12 +150,12 @@ async fn decide_turn(
                 Arc::new(crate::runtime::native::NativeRuntime::new()),
                 std::env::temp_dir(),
             )),
-        ]
-    } else {
-        Vec::new()
+        ],
+        FixtureTools::None => Vec::new(),
+        FixtureTools::Named(name) => vec![Box::new(EffectFixtureTool(name))],
     };
     let surface = SurfacePolicy {
-        direct_names: BTreeSet::from(["file_read".to_owned(), "file_write".to_owned(), "shell".to_owned()]),
+        direct_names: registry.iter().map(|tool| tool.name().to_owned()).collect(),
         ..SurfacePolicy::default()
     };
     let catalog = CapabilityCatalog::build(&registry, &CatalogSources::default(), &surface).unwrap();
@@ -220,8 +250,7 @@ async fn decide_turn(
         delegation_max_depth: 2,
         prediction: ScoringPrediction {
             inner: backend.prediction_port(None),
-            optimistic: checkpoint.is_some_and(|(name, _)| name == "candidate_scored")
-                || turn.starts_with("Use file_read"),
+            optimistic_target,
         },
         rehearsal_ports: &ports,
         request_limits: RequestLimits::default(),
@@ -238,7 +267,7 @@ async fn decide_turn(
     super::super::logical_clock::scope(clock, async {
         let first = Box::pin(CausalDecisionEngine::decide_once(&inputs)).await.unwrap();
         if checkpoint.is_none()
-            && !turn.starts_with("Use file_read")
+            && optimistic_target.is_none()
             && matches!(&first.selection, Selection::Recover { candidate_id, .. } if matches!(candidate_id.action(), CausalActionKind::Retrieve | CausalActionKind::Discover))
         {
             // Reproduce the service's terminal pass when bounded recovery stops.
@@ -282,7 +311,7 @@ fn assert_answer(decision: &EngineDecision) {
 #[tokio::test]
 async fn deadline_keeps_commit_only_after_complete_scoring() {
     for phase in ["selection", "post_selection"] {
-        let decision = decide_turn("hello", Some((phase, 1)), false, None).await;
+        let decision = decide_turn("hello", Some((phase, 1)), FixtureTools::None, None, None).await;
         assert!(
             matches!(decision.selection, Selection::Commit { .. }),
             "{:?}",
@@ -297,8 +326,9 @@ async fn deadline_keeps_commit_only_after_complete_scoring() {
     let partial = decide_turn(
         "Read /tmp/prx_fixture/input.md and write the result.",
         Some(("candidate_scored", 1)),
-        true,
+        FixtureTools::Filesystem,
         None,
+        Some("filesystem"),
     )
     .await;
     assert_eq!(partial.scored_count, 1);
@@ -323,32 +353,53 @@ async fn deadline_keeps_commit_only_after_complete_scoring() {
 
 #[tokio::test]
 async fn o9_long_paths_and_output_contract_reaches_the_model() {
-    let decision = decide_turn("Read /tmp/prx_fixture/brief.md, /tmp/prx_fixture/src/plan.rs and /tmp/prx_fixture/docs/contract.md. Complete the implementation and write /tmp/prx_fixture/report.md. Include the changed files and verification results. End the report with STATUS: READY_FOR_REVIEW.", None, true, None).await;
+    let decision = decide_turn("Read /tmp/prx_fixture/brief.md, /tmp/prx_fixture/src/plan.rs and /tmp/prx_fixture/docs/contract.md. Complete the implementation and write /tmp/prx_fixture/report.md. Include the changed files and verification results. End the report with STATUS: READY_FOR_REVIEW.", None, FixtureTools::Filesystem, None, None).await;
     assert_answer(&decision);
 }
 
 #[tokio::test]
 async fn o5_exact_reply_uses_model_answer() {
-    let decision = decide_turn("Reply with exactly one word: hello", None, false, None).await;
+    let decision = decide_turn(
+        "Reply with exactly one word: hello",
+        None,
+        FixtureTools::None,
+        None,
+        None,
+    )
+    .await;
     assert_answer(&decision);
 }
 
 #[tokio::test]
 async fn o14_negations_and_ten_paths_do_not_refuse() {
-    let decision = decide_turn("Resume and finish the requested implementation. Do not run git, do not redo completed work, do not deploy, and do not change unrelated files. Inspect /tmp/prx_fixture/a.rs /tmp/prx_fixture/b.rs /tmp/prx_fixture/c.rs /tmp/prx_fixture/d.rs /tmp/prx_fixture/e.rs /tmp/prx_fixture/f.rs /tmp/prx_fixture/g.rs /tmp/prx_fixture/h.rs /tmp/prx_fixture/i.rs /tmp/prx_fixture/j.rs. Write the report with changes, tests and final STATUS.", None, true, None).await;
+    let decision = decide_turn("Resume and finish the requested implementation. Do not run git, do not redo completed work, do not deploy, and do not change unrelated files. Inspect /tmp/prx_fixture/a.rs /tmp/prx_fixture/b.rs /tmp/prx_fixture/c.rs /tmp/prx_fixture/d.rs /tmp/prx_fixture/e.rs /tmp/prx_fixture/f.rs /tmp/prx_fixture/g.rs /tmp/prx_fixture/h.rs /tmp/prx_fixture/i.rs /tmp/prx_fixture/j.rs. Write the report with changes, tests and final STATUS.", None, FixtureTools::Filesystem, None, None).await;
     assert_answer(&decision);
     assert_ne!(record(&decision).directive_kind, "refuse");
 }
 
 #[tokio::test]
 async fn a_shell_explanation_never_executes_the_quoted_command() {
-    let decision = decide_turn("what does `rm -rf build/` do?", None, true, None).await;
+    let decision = decide_turn(
+        "what does `rm -rf build/` do?",
+        None,
+        FixtureTools::Filesystem,
+        None,
+        None,
+    )
+    .await;
     assert_answer(&decision);
 }
 
 #[tokio::test]
 async fn failed_tool_cannot_execute_on_the_next_hop() {
-    let first = decide_turn("Use file_read on /tmp/prx_fixture/input.md", None, true, None).await;
+    let first = decide_turn(
+        "Use file_read on /tmp/prx_fixture/input.md",
+        None,
+        FixtureTools::Filesystem,
+        None,
+        Some("filesystem"),
+    )
+    .await;
     let CandidateSet::Legal { candidates, .. } = &first.candidates else {
         panic!("legal set")
     };
@@ -365,12 +416,87 @@ async fn failed_tool_cannot_execute_on_the_next_hop() {
     let second = decide_turn(
         "Use file_read on /tmp/prx_fixture/input.md",
         None,
-        true,
+        FixtureTools::Filesystem,
         Some((ObservedStepStatus::Failed, tool.clone())),
+        Some("filesystem"),
     )
     .await;
     assert!(
         !matches!(second.selection, Selection::Commit { ref candidate_id, .. } | Selection::Recover { ref candidate_id, .. } if candidate_id == &tool)
     );
     assert_ne!(record(&second).directive_kind, "use_tool");
+}
+
+async fn assert_default_effect_abstains(name: &'static str, effect: SideEffectClass, maximum: f64, bar: f64) {
+    for optimistic_target in [None, Some("native_tool")] {
+        let decision = Box::pin(decide_turn(
+            &format!("Use {name}"),
+            None,
+            FixtureTools::Named(name),
+            None,
+            optimistic_target,
+        ))
+        .await;
+        let CandidateSet::Legal { candidates, .. } = &decision.candidates else {
+            panic!("an otherwise legal tool is required");
+        };
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.action() == CausalActionKind::UseTool)
+            .unwrap();
+        assert_eq!(candidate.side_effect(), effect);
+        assert_eq!(
+            decision.pre_commit.outcomes.get(candidate.candidate_id()),
+            Some(&GateOutcome::Passed)
+        );
+        let score = decision.scores.get(candidate.candidate_id()).unwrap();
+        assert!(score.semantic_utility <= maximum + 1e-9);
+        assert!(score.execution_utility < bar);
+        if optimistic_target.is_some() {
+            assert!(
+                (score.semantic_utility - maximum).abs() < 1e-9,
+                "the strongest prediction pins the ceiling"
+            );
+        }
+        let rehearsal = decision.rehearsal.get(candidate.candidate_id()).unwrap();
+        assert!(matches!(
+            rehearsal.status,
+            super::super::decision_rehearsal::RehearsalStatus::Refused
+        ));
+        assert!(rehearsal.bounded_delta.abs() < 1e-9);
+        assert!(maximum < bar);
+        if optimistic_target.is_some() {
+            assert!(matches!(
+                decision.selection,
+                Selection::Abstain {
+                    action: CausalActionKind::Answer,
+                    reason_code: "commit_threshold_or_margin",
+                }
+            ));
+        }
+        assert!((f64::from(CausalTreeConfig::default().policy.commit_threshold) - 0.62).abs() < 1e-6);
+        assert_answer(&decision);
+    }
+}
+
+#[tokio::test]
+async fn default_destructive_tool_cannot_reach_commit_bar() {
+    Box::pin(assert_default_effect_abstains(
+        "nodes",
+        SideEffectClass::Destructive,
+        0.755,
+        0.87,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn default_credential_tool_cannot_reach_commit_bar() {
+    Box::pin(assert_default_effect_abstains(
+        "config_reload",
+        SideEffectClass::CredentialOrConfig,
+        0.79,
+        0.82,
+    ))
+    .await;
 }

@@ -671,6 +671,23 @@ These values are fixed constants, not configuration:
 | Deterministic propensity | 1.0 | recorded for every non-exploratory selection; only read-only exploration replaces it |
 | Approval lifetime | at most 5 minutes | an approval request whose expiry is later than five minutes after issue is refused |
 
+Under the default policy, the builtin plane never auto-executes destructive or
+credential/config tools. Even a perfect prediction cannot reach their commit
+bars: positive utility weights sum to one, the risk penalty is 0.35, and
+non-read-only rehearsal adds zero.
+
+| Effect class | Risk floor | Maximum utility | Commit bar |
+|---|---|---|---|
+| Destructive | 0.7 | 0.755 | 0.87 |
+| Credential/config | 0.6 | 0.79 | 0.82 |
+
+Cost, latency and uncertainty only lower those ceilings. When the tool otherwise
+passes its gates, this confidence shortfall ends in a model-backed Answer, or
+Clarify with the reason when Answer is unavailable, never Refuse and never
+Execute. Whether supervised approval should let these classes reach the bar is
+a separate policy decision. The default bars, weights and risk floors remain
+unchanged.
+
 Confidence abstention (`commit_threshold_or_margin`, `insufficient_evidence`,
 `hop_stopped` or `deadline_exceeded`) selects a
 gated Answer when available. This calls the serving model with normal context;
