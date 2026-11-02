@@ -513,6 +513,34 @@ mod tests {
         assert!(!priced.contains("subscription-billed"), "{priced}");
     }
 
+    #[tokio::test]
+    async fn unpriced_model_probe_explains_g6_without_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut unpriced = config_for(dir.path(), "openrouter");
+        unpriced.default_model = Some("deepseek/deepseek-v3.2".into());
+        let report = test_connection(&unpriced, None, None, ProbeMode::Local).await;
+        assert!(report.local.resolved);
+        assert!(report.live.is_none());
+        let shown = report.to_string();
+        assert!(
+            shown.contains("G6 budget admission refuses unpriced model 'openrouter/deepseek/deepseek-v3.2'"),
+            "{shown}"
+        );
+        assert!(shown.contains(r#"[cost.prices."deepseek/deepseek-v3.2"]"#), "{shown}");
+        assert!(!shown.contains("subscription-billed"), "{shown}");
+        unpriced.cost.prices.insert(
+            "deepseek/deepseek-v3.2".into(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.5,
+                cache_write: 1.0,
+            },
+        );
+        let priced = test_connection(&unpriced, None, None, ProbeMode::Local).await;
+        assert!(!priced.to_string().contains("G6"));
+    }
+
     /// A credential-shaped sentinel. Not a real secret.
     const KEY: &str = "pmmd7-probe-sentinel";
 
