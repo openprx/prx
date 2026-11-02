@@ -242,20 +242,18 @@
       }
     },
     "default_model": {
-      "description": "Default model routed through the selected provider (e.g. `\"anthropic/claude-sonnet-4-6\"`).",
+      "description": "Default model routed through the selected provider (e.g. `\"anthropic/claude-sonnet-4-6\"`).\n\n`None` when the file omits it; see `default_provider`.",
       "type": [
         "string",
         "null"
-      ],
-      "default": "anthropic/claude-sonnet-5"
+      ]
     },
     "default_provider": {
-      "description": "Default provider ID or alias (e.g. `\"openrouter\"`, `\"ollama\"`, `\"anthropic\"`). Default: `\"openrouter\"`.",
+      "description": "Default provider ID or alias (e.g. `\"openrouter\"`, `\"ollama\"`, `\"anthropic\"`).\n\n`None` when the file omits it: the release catalog stays the sole owner\nof the release default, so a save never pins today's catalog value into\nthe operator's file.",
       "type": [
         "string",
         "null"
-      ],
-      "default": "openrouter"
+      ]
     },
     "default_temperature": {
       "description": "Default model temperature (0.0–2.0). Default: `0.7`.",
@@ -1341,7 +1339,8 @@
       "properties": {
         "cli": {
           "description": "Enable the CLI interactive channel. Default: `true`.",
-          "type": "boolean"
+          "type": "boolean",
+          "default": true
         },
         "dingtalk": {
           "description": "DingTalk channel configuration.",
@@ -1531,10 +1530,7 @@
             }
           ]
         }
-      },
-      "required": [
-        "cli"
-      ]
+      }
     },
     "ChatConfig": {
       "description": "Interactive chat configuration (`[chat]`).",

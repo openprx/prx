@@ -150,11 +150,20 @@ pub(super) fn migrate_legacy_config_keys(root: &mut toml::Value, config_path: Op
     // operator values; one without a faithful home stops the load.
     let locate = |path: &[&str]| config_path.and_then(|main| crate::config::deprecations::file_holding(main, path));
     let causal = crate::causal_tree::config::migrate_legacy(root, &locate)?;
-    if causal.found_legacy_keys() {
+    if causal.ignored.is_empty() && causal.found_legacy_keys() {
         tracing::warn!(
             moved = ?causal.moved,
             dropped = ?causal.dropped,
             "Mapped legacy causal_tree keys; the next save writes the new form"
+        );
+    }
+    for key in &causal.ignored {
+        // D-074 reads this key as unset, but the reading is not silent: an
+        // operator who meant the disable needs the versioned spelling.
+        tracing::warn!(
+            key = %format!("causal_tree.{key}"),
+            "Ignored bare unversioned causal_tree.enabled = false: read as unset, so the decision plane keeps \
+             its default. To keep the disable, write `schema_version = 2` alongside `enabled = false`"
         );
     }
     // Retired keys are dropped *here*, before the unknown-path check below, so

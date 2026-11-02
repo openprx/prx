@@ -910,13 +910,18 @@ pub struct MigrationReport {
     /// Legacy keys that held the legacy default and were dropped, so they
     /// take the new default.
     pub dropped: Vec<&'static str>,
+    /// Keys that were read as unset although they may have been an explicit
+    /// operator choice, so the load reports each one instead of passing it
+    /// silently. Today only a bare unversioned `causal_tree.enabled = false`
+    /// (D-074).
+    pub ignored: Vec<&'static str>,
 }
 
 impl MigrationReport {
     /// Whether the configuration held any legacy key.
     #[must_use]
     pub const fn found_legacy_keys(&self) -> bool {
-        !self.moved.is_empty() || !self.dropped.is_empty()
+        !self.moved.is_empty() || !self.dropped.is_empty() || !self.ignored.is_empty()
     }
 }
 
@@ -1125,9 +1130,11 @@ fn full_path<'p>(path: &[&'p str]) -> Vec<&'p str> {
 ///   `enabled = false` is the old serialized default, and is treated as
 ///   unset, when the table holds at least one legacy-only key (a pre-CDP-03
 ///   `Config::save`). Otherwise it is an operator's explicit disable. A table
-///   holding nothing but `enabled = false` is refused instead of guessed at:
-///   the two readings differ in whether the decision plane runs, so the error
-///   names the key and the `schema_version = 2` spelling that keeps it.
+///   holding nothing but `enabled = false` — the shape the BASE `prx init`
+///   full template writes — keeps D-074's reading (unset, so the plane keeps
+///   its default), and is reported in [`MigrationReport::ignored`] so the
+///   load names the key, that it was ignored, and the `schema_version = 2`
+///   spelling that keeps the disable.
 ///
 /// The X-3 rule and the original legacy default of a key that kept its name
 /// (`policy.extra_latency_budget_ms = 300`) apply only to a table without
@@ -1176,23 +1183,15 @@ pub fn migrate_legacy(root: &mut toml::Value, locate: KeyLocator<'_>) -> Result<
             take(table, &["enabled"]);
             report.dropped.push("enabled");
         } else if bare {
-            // A table holding nothing but `enabled = false` is the one shape
-            // X-3 cannot tell apart from an operator's explicit disable, and
-            // silently reading it as "unset" turns the decision plane *on*
-            // when the operator asked for it off (O6). Refuse instead of
-            // guessing, and name the key and the spelling that keeps it.
-            return Err(MigrationError {
-                file: file_of(&["enabled"]),
-                key: "enabled",
-                problem: "is the only key of an unversioned [causal_tree] section, so it cannot be told apart \
-                          from the default an old prx wrote; reading it as unset would enable the decision \
-                          plane the operator disabled"
-                    .to_string(),
-                remedy: "write `schema_version = 2` next to it to keep the disable \
-                         (`[causal_tree]` with `schema_version = 2` and `enabled = false`), or delete the key \
-                         to accept the enabled default"
-                    .to_string(),
-            });
+            // D-074 keeps the X-3 reading: a table holding nothing but
+            // `enabled = false` is the shape the BASE `prx init` template
+            // writes, so the value is read as unset and the plane keeps its
+            // default. That reading is not silent any more (O6): the load
+            // reports the key, that it was ignored, and the versioned
+            // spelling that keeps the disable.
+            take(table, &["enabled"]);
+            report.dropped.push("enabled");
+            report.ignored.push("enabled");
         }
     }
 
@@ -1792,17 +1791,20 @@ circuit_breaker_cooldown_secs = 60
         assert_eq!(config, CausalTreeConfig::default());
     }
 
-    /// X-3 with D-074: before the versioned schema, `enabled = false` next
-    /// to a legacy-only key (a `Config::save`) is the old serialized default
-    /// and reads as unset; next to a setting the operator wrote, or in a
-    /// versioned table, it is an explicit disable and is kept.
+    /// X-3: an unversioned save's false next to a legacy-only key is the
+    /// old serialized default and reads as unset.
     #[test]
-    fn an_explicit_disable_is_kept() {
+    fn a_legacy_save_disable_is_dropped() {
         let text = "[causal_tree]\nenabled = false\nwrite_metrics = true\n";
         let mut root = causal(text);
         let report = migrate_legacy(&mut root, &nowhere).expect("test: migrates");
         assert!(report.dropped.contains(&"enabled"), "{text}");
         assert_eq!(root["causal_tree"].get("enabled"), None, "{text}");
+    }
+
+    /// Versioned disables and disables beside modern settings stay explicit.
+    #[test]
+    fn an_explicit_disable_is_kept() {
         for text in [
             "[causal_tree]\nschema_version = 1\nenabled = false\n",
             "[causal_tree]\nenabled = false\n[causal_tree.policy]\nextra_latency_budget_ms = 400\n",
@@ -1821,41 +1823,49 @@ circuit_breaker_cooldown_secs = 60
         assert_eq!(root["causal_tree"].get("enabled"), Some(&toml::Value::Boolean(true)));
     }
 
-    /// O6: a `[causal_tree]` section holding nothing but `enabled = false` is
-    /// refused, not silently read as "unset". Reading it as unset would run
-    /// the decision plane the operator disabled, and the error names the key
-    /// and the spelling that keeps the disable.
+    /// O6 with D-074: a `[causal_tree]` section holding nothing but
+    /// `enabled = false` keeps D-074's reading (treated as unset, so the
+    /// plane keeps its default) and is reported as ignored, naming the key,
+    /// that it was ignored, and the spelling that keeps the disable.
     #[test]
-    fn an_enabled_only_section_is_refused_and_names_the_fix() {
+    fn an_enabled_only_section_is_read_as_unset_and_reported() {
         let mut root = causal("[causal_tree]\nenabled = false\n");
-        let error = migrate_legacy(&mut root, &nowhere).expect_err("test: refused");
-        assert_eq!(error.key, "enabled");
-        let message = error.to_string();
-        assert!(message.contains("causal_tree.enabled"), "{message}");
-        assert!(message.contains("schema_version = 2"), "{message}");
+        let report = migrate_legacy(&mut root, &nowhere).expect("test: migrates");
+        assert_eq!(report.ignored, ["enabled"], "the ignored key is reported");
+        assert_eq!(report.dropped, ["enabled"], "D-074 removes the old default in memory");
+        assert!(root["causal_tree"].get("enabled").is_none());
+        let config: CausalTreeConfig = root["causal_tree"].clone().try_into().expect("test: migrated section");
+        assert_eq!(config, CausalTreeConfig::default());
+        let second = migrate_legacy(&mut root, &nowhere).expect("test: idempotent migration");
         assert!(
-            !message.contains("false\n"),
-            "the error never quotes the value: {message}"
+            !second.found_legacy_keys(),
+            "an already mapped tree is not reported twice"
         );
     }
 
-    /// The refusal is scoped to the ambiguous shape: `enabled = false` next to
-    /// `schema_version` keeps the disable, and `enabled = true` alone is not
-    /// ambiguous (it is what the default already is).
+    /// The reporting is scoped to the ambiguous shape: `enabled = false` next
+    /// to `schema_version` keeps the disable and is not reported, and
+    /// `enabled = true` alone is not ambiguous (it is what the default
+    /// already is).
     #[test]
-    fn the_enabled_only_refusal_does_not_widen() {
-        for (text, expected) in [
-            ("[causal_tree]\nschema_version = 2\nenabled = false\n", Some(false)),
-            ("[causal_tree]\nenabled = true\n", Some(true)),
-            ("[causal_tree]\nschema_version = 2\n", None),
+    fn the_enabled_only_report_does_not_widen() {
+        for (text, expected, reported) in [
+            (
+                "[causal_tree]\nschema_version = 2\nenabled = false\n",
+                Some(false),
+                false,
+            ),
+            ("[causal_tree]\nenabled = true\n", Some(true), false),
+            ("[causal_tree]\nschema_version = 2\n", None, false),
         ] {
             let mut root = causal(text);
-            migrate_legacy(&mut root, &nowhere).unwrap_or_else(|error| panic!("test: {text}: {error}"));
+            let report = migrate_legacy(&mut root, &nowhere).unwrap_or_else(|error| panic!("test: {text}: {error}"));
             assert_eq!(
                 root["causal_tree"].get("enabled").and_then(toml::Value::as_bool),
                 expected,
                 "{text}"
             );
+            assert_eq!(report.ignored.contains(&"enabled"), reported, "{text}");
         }
     }
 

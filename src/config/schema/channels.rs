@@ -1,4 +1,4 @@
-use super::{Context, Deserialize, DmPolicy, GroupPolicy, GroupReplyMode, JsonSchema, Result, Serialize};
+use super::{Context, Deserialize, DmPolicy, GroupPolicy, GroupReplyMode, JsonSchema, Result, Serialize, default_true};
 
 // ── Channels ─────────────────────────────────────────────────────
 
@@ -9,6 +9,7 @@ use super::{Context, Deserialize, DmPolicy, GroupPolicy, GroupReplyMode, JsonSch
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
+    #[serde(default = "default_true")]
     pub cli: bool,
     /// Telegram bot channel configuration.
     pub telegram: Option<TelegramConfig>,
@@ -50,7 +51,7 @@ pub struct ChannelsConfig {
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
-            cli: true,
+            cli: default_true(),
             telegram: None,
             discord: None,
             slack: None,

@@ -17,21 +17,22 @@ model support from the endpoint URL. These changes do not write configuration.
 
 ## Partial Sections
 
-Every section may be written partially. A key you leave out takes the same
-value the section's documented default produces, so `[autonomy]` with only
-`level = "full"`, or `[memory]` with only `backend = "sqlite"`, loads and
-behaves exactly as if you had copied the remaining keys from the reference
-config. The same holds for the top-level scalars: a `config.toml` that names
-nothing at all parses and takes every default. The keys whose absence would
-change the security posture fail closed rather than open: `workspace_only`
-stays `true`, `acknowledge_unrestricted_profile` stays `false`, and
-`forbidden_paths` keeps the built-in denylist, so omitting them never widens
-what the agent may touch. Only a key with no safe default stays required, and
-`prx config show` names it when it is missing. One exception is refused rather
-than defaulted: a `[causal_tree]` section without `schema_version` that holds
-nothing but `enabled = false` cannot be told apart from a file an old `prx`
-wrote, so it fails at load with an error naming the key; write
-`schema_version = 2` next to it to keep the disable.
+Configuration sections accept partial settings: omitted fields with documented
+defaults take those values, so `[autonomy]` with only `level = "full"`,
+`[memory]` with only `backend = "sqlite"`, or a `[channels_config.telegram]`
+entry without its parent section's `cli` setting can load. Integration entries still require
+credentials, endpoints, identities, and explicit allowlists where no safe default
+exists. An empty `config.toml` parses with `default_temperature = 0.7`;
+omitted `default_provider` and `default_model` remain unset so saving does not
+pin a release catalog default. Security-posture defaults stay closed:
+`workspace_only = true`, `acknowledge_unrestricted_profile = false`, and
+`forbidden_paths` retains the built-in denylist. A bare unversioned
+`[causal_tree] enabled = false`, including the old full `prx init` template in
+`config.d/agent.toml`, still loads as unset and inherits the enabled default.
+The loader now emits one warning naming `causal_tree.enabled`, that it was
+ignored, and the versioned replacement: write `schema_version = 2` alongside
+`enabled = false` to keep the plane disabled. Loading does not rewrite the file;
+a structured save writes the canonical versioned form.
 
 ## Quick Setup
 
@@ -1260,7 +1261,10 @@ as explicit. The decision-plane migration has its own versioned contract:
 Schema 1 or current schema 2 with `enabled = false` remains explicitly disabled, even
 when the sidecar also records false. Recognized unversioned legacy-default
 signatures, including the old bare `enabled = false` template, are treated as
-unset by the existing loader migration. An unversioned false alongside modern
+unset by the existing loader migration. The bare-template case emits a warning
+naming `causal_tree.enabled`, that it was ignored, and `schema_version = 2`
+alongside `enabled = false` as the replacement. It does not stop startup or
+`prx init --force`. An unversioned false alongside modern
 non-legacy settings remains explicit. The staged candidate now defaults the
 local plane to true and writes the version marker in the full init template;
 adoption, behavioral migration and rollback acceptance remain pending.
@@ -1290,7 +1294,7 @@ cap; the default change grants no provider or credential permission.
 | Existing configuration | Candidate behavior |
 | --- | --- |
 | No causal section, or no `enabled` value | Inherits true |
-| Unversioned bare `enabled = false` from the old template | Recognized legacy default becomes unset, then inherits true |
+| Unversioned bare `enabled = false` from the old full init template | Warns that `causal_tree.enabled` was ignored, names `schema_version = 2` with `enabled = false`, then inherits true; ordinary load leaves the file unchanged |
 | Unversioned false with legacy-only keys | Legacy classification removes the default false and migrates compatible settings |
 | Unversioned false alongside modern non-legacy settings | Explicit false remains false |
 | Schema 1 or current schema 2 and false, including development snapshots | Explicit false remains false on load, save, JSON/management and `init --force`, even if its sidecar also records false |

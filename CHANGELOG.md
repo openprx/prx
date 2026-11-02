@@ -21,13 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconciles its reserved hold at zero micro-USD. Kimi Code, OpenAI Codex,
   and GitHub Copilot rows use this marker. An operator `[cost.prices]` entry
   still wins. Catalog revision `2026-10-31.3`.
-- **Breaking:** a `[causal_tree]` section without `schema_version` that holds
-  nothing but `enabled = false` is now refused at load instead of being read as
-  the pre-1.7 serialized default and silently turned back on. The error names
-  the key and the replacement: write `schema_version = 2` next to
-  `enabled = false` to keep the disable, or delete the key to accept the
-  `enabled = true` default. Files saved by a current `prx` already carry
-  `schema_version`, so only hand-written or very old sections are affected.
 - **Breaking:** provider auth and API requests identify as `User-Agent: prx/<version>`.
   Provider-specific user agents (`OpenPRX/0.1`, `KimiCLI/0.77`, `QwenCode/1.0`,
   `GithubCopilot/…`) are no longer sent.
@@ -68,16 +61,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Every configuration section may now be written partially. A key an operator
-  leaves out takes the value the section's documented default already
-  produces, so `[autonomy]` with only `level`, or `[memory]` with only
-  `backend`, loads instead of failing with `missing field`. The top-level
-  scalars (`default_temperature`, `default_provider`, `default_model`) follow
-  the same rule, so an empty `config.toml` parses. Keys whose absence would
-  change the security posture still fail closed: `workspace_only` stays
-  `true`, `acknowledge_unrestricted_profile` stays `false`, and
-  `forbidden_paths` keeps the built-in denylist. See
+- Partial configuration settings inherit their documented defaults, including
+  `[autonomy]` with only `level`, `[memory]` with only `backend`, and
+  `[channels_config.telegram]` without `cli`. Required credentials, endpoints,
+  identities and allowlists stay required. An empty `config.toml` parses;
+  omitted `default_provider` and `default_model` remain unset across saves,
+  while `default_temperature` defaults to 0.7. Security defaults stay closed:
+  `workspace_only` remains `true`, `acknowledge_unrestricted_profile` remains
+  `false`, and `forbidden_paths` keeps the built-in denylist. See
   [configuration](docs/configuration.md).
+- A bare unversioned `[causal_tree] enabled = false` no longer passes silently:
+  one warning names `causal_tree.enabled`, says it was ignored, and gives
+  `schema_version = 2` alongside `enabled = false` as the replacement. The
+  D-074 reading stays unchanged: that old default is unset in memory and the
+  plane inherits true. This includes old full `prx init` installations with
+  `config.d/agent.toml`; startup and `prx init --force` remain available.
+  Versioned disables and unversioned disables alongside modern settings
+  remain explicit, and loading does not rewrite files.
 
 ## [0.8.171] - 2026-10-31
 

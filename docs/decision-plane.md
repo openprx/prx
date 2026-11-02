@@ -25,7 +25,10 @@ enabled = false
 
 Versioned false, including development snapshots, survives load, save and
 `prx init --force`. Recognized unversioned legacy-default signatures become
-unset and inherit the new true default; an unversioned false alongside modern
+unset and inherit the new true default. The bare `enabled = false` from the old
+full init template emits one warning naming `causal_tree.enabled`, that it was
+ignored, and `schema_version = 2` alongside `enabled = false` to keep the plane
+off; startup and `prx init --force` remain available. An unversioned false alongside modern
 non-legacy settings remains explicit. See the [migration matrix](configuration.md#decision-plane-default-and-migration).
 The loader migrates in memory; it does not rewrite files on startup.
 

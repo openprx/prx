@@ -147,8 +147,8 @@ fn restore_home(original: Option<String>) {
     }
 }
 
-/// A log capture for the INT-2B B2 tests: every event `f` emits, as text.
-fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+/// Capture configuration events emitted by `f`, as text.
+pub(super) fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
     #[derive(Clone, Default)]
     struct Sink(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
     impl std::io::Write for Sink {

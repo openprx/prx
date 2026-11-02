@@ -87,11 +87,15 @@ pub struct Config {
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     #[serde(default)]
     pub api_url: Option<String>,
-    /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
-    #[serde(default = "default_provider_from_catalog")]
+    /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`).
+    ///
+    /// `None` when the file omits it: the release catalog stays the sole owner
+    /// of the release default, so a save never pins today's catalog value into
+    /// the operator's file.
     pub default_provider: Option<String>,
     /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
-    #[serde(default = "default_model_from_catalog")]
+    ///
+    /// `None` when the file omits it; see `default_provider`.
     pub default_model: Option<String>,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     #[serde(default = "default_temperature")]
