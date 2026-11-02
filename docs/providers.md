@@ -92,16 +92,50 @@ Release entries are onboarding defaults and model evidence within the adapter
 ceiling; they do not grant credentials or transport support. Live discovery
 also reads the active auth profile when `api_key` is absent, and custom
 llama.cpp/vLLM/LiteLLM/Hugging Face/compatible base URLs are honored for model
-discovery. Kimi Code rejects model strings outside its six documented IDs
-(`k3`, `k3-256k`, `k3.1-pro`, `k3.1-pro-highspeed`, `kimi-for-coding`, and
-`kimi-for-coding-highspeed`) because that endpoint can silently accept or
-remap a mistyped model.
+discovery. Kimi Code's allowed set is the release catalog's active rows and
+aliases, computed when the model is checked. A spelling outside that set is
+refused, because the coding endpoint can silently accept or remap a mistype.
+Other catalog providers do not reject an explicitly configured id the catalog
+does not list: that selection stays unverified and runs with a warning.
 
 Catalog lifecycle controls new selections: active and deprecated chat rows are
 listed, with deprecated rows labeled with their replacement when one exists;
 retired rows stay hidden. Ollama Cloud has no live model-list endpoint, so an
 authenticated onboarding fallback uses the release rows and places `:cloud`
 models before local-only ids.
+
+## Allowlist derivation
+
+For a provider the release catalog covers, the known model set is that
+provider's active `api_model` values plus their aliases. PRX reads the set
+from the embedded catalog at runtime. There is no separate hard-coded model
+array for those providers.
+
+Only Kimi Code rejects a configured model outside that set. Its endpoint can
+return success for a model string it does not serve. Every other provider
+keeps an explicitly configured unknown id on the unverified path: the resolver
+marks it unverified and the call still runs, with a warning. Providers the
+catalog does not cover have no catalog allowlist.
+
+## Subscription billing
+
+A catalog row may set `billing` to `subscription`. The field is optional;
+omitted rows are per-token. A subscription row must not include a `pricing`
+object. G6 admits the row and records no per-token charge. Admission logs
+`subscription-billed, no per-token cost recorded`. The cost ledger status is
+`subscription`, not `unknown_pricing` and not a zero-dollar usage row. The
+settlement names the provider, the model, and the token counts, and it carries
+no price. A turn and a decision attempt record
+that same settlement. The decision attempt also reconciles its reserved hold
+at zero micro-USD and does not write a priced row.
+`prx doctor` and `prx providers test` show the same line.
+
+Kimi Code, OpenAI Codex, and GitHub Copilot rows are subscription-billed.
+xAI API rows keep their published token prices. A Grok subscription is an
+OAuth sign-in for those priced API models, not a separate unpriced catalog
+row. Other providers without a tariff stay unpriced until `[cost.prices]`
+supplies one. An operator `[cost.prices]` entry always wins over the
+subscription marker and is then billed as a token price.
 
 ## Capability contracts
 
@@ -886,9 +920,11 @@ LM Studio, llama.cpp, vLLM, and custom loopback endpoints need an explicit
 
 ### Unpriced models and operator overrides
 
-For example, the following is an **illustrative operator budget tariff**, not a
-published Kimi Code price. Replace all four rates with the tariff you intend to
-use for budget accounting (USD per million tokens):
+A subscription row does not need this table. The example below is an optional
+operator budget tariff for `kimi-code/kimi-for-coding`. It wins over the
+subscription marker and is not a published Kimi Code price. Replace all four
+rates with the tariff you intend to use for budget accounting (USD per million
+tokens):
 
 ```toml
 [cost.prices."kimi-code/kimi-for-coding"]

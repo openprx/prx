@@ -619,8 +619,27 @@ pub(crate) fn resolve_route(
     .map_err(|refusal| anyhow::anyhow!("model route `hint:{}` is refused: {refusal}", route.hint))
 }
 
+/// Shown when G6 admits a subscription row. No per-token amount is recorded.
+pub(crate) const SUBSCRIPTION_BILLING_NOTICE: &str = "subscription-billed, no per-token cost recorded";
+
+/// `Some` when `provider`/`model` is a catalog subscription row and no
+/// operator `[cost.prices]` override replaces it.
+pub(crate) fn subscription_billing_notice(
+    provider: &str,
+    model: &str,
+    cost: &crate::config::schema::CostConfig,
+) -> Option<&'static str> {
+    use crate::llm::route_decision::{UsagePrice, usage_cost_resolution};
+    matches!(
+        usage_cost_resolution(provider, model, 64, 64, 0, 0, cost),
+        UsagePrice::Subscription
+    )
+    .then_some(SUBSCRIPTION_BILLING_NOTICE)
+}
+
 /// Diagnose the same missing tariff that leaves G6 without a cost estimate.
 /// This reports configuration to the operator; it never changes admission.
+/// A subscription row is not unpriced; [`subscription_billing_notice`] covers it.
 pub(crate) fn pricing_warning(
     resolved: &catalog::ResolvedModel,
     cost: &crate::config::schema::CostConfig,
@@ -803,6 +822,34 @@ mod tests {
         );
         assert!(!text.contains("PMMC-ROUTE-KEY"), "{text}");
         resolve_route(&config, &catalog_for(&config), route, UnknownPolicy::Invocation).expect("an id-only route runs");
+    }
+
+    #[test]
+    fn a_code_route_to_kimi_code_k3_1_pro_resolves() {
+        let temp = tempfile::TempDir::new().expect("test: temp dir");
+        let mut config: Config = toml::from_str(
+            r#"
+default_provider = "kimi-code"
+default_model = "kimi-for-coding"
+default_temperature = 0.7
+api_key = "PRX-ROUTE-TEST"
+
+[[model_routes]]
+hint = "code"
+provider = "kimi-code"
+model = "k3.1-pro"
+"#,
+        )
+        .expect("test: model_routes config parses");
+        config.workspace_dir = temp.path().to_owned();
+        config.config_path = temp.path().join("config.toml");
+        config.secrets.encrypt = false;
+        let configured = config.model_routes.first().expect("test: configured route");
+        assert_eq!(configured.hint, "code");
+        let resolved = resolve_route(&config, &catalog_for(&config), configured, UnknownPolicy::Invocation)
+            .expect("hint:code routes to the catalog model");
+        assert_eq!(resolved.provider_label(), "kimi-code");
+        assert_eq!(resolved.model(), "k3.1-pro");
     }
 
     /// A catalog that declares `model` of `provider` for the given

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Catalog-backed model checks read the active release rows and aliases at
+  runtime. Kimi Code still refuses a spelling outside that set, because its
+  endpoint can accept a mistype. Other providers keep an explicitly configured
+  unknown id unverified, with a warning.
+- Subscription catalog rows use `billing = "subscription"` and carry no
+  per-token price. G6 admits them and logs
+  `subscription-billed, no per-token cost recorded`. A turn and a decision
+  attempt both record `subscription` with the provider, model, and token
+  counts, and neither writes a priced usage row. The decision attempt
+  reconciles its reserved hold at zero micro-USD. Kimi Code, OpenAI Codex,
+  and GitHub Copilot rows use this marker. An operator `[cost.prices]` entry
+  still wins. Catalog revision `2026-10-31.3`.
 - **Breaking:** provider auth and API requests identify as `User-Agent: prx/<version>`.
   Provider-specific user agents (`OpenPRX/0.1`, `KimiCLI/0.77`, `QwenCode/1.0`,
   `GithubCopilot/…`) are no longer sent.

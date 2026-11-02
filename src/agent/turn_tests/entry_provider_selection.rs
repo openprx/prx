@@ -523,7 +523,7 @@ fn openai_codex_ignores_root_key_url_and_rotation_material() {
 }
 
 /// Kimi Code accepts any model string and answers anyway, so an id outside
-/// its short list is refused locally; that stays true through the resolver.
+/// the catalog allowlist is refused locally; that stays true through the resolver.
 #[test]
 fn an_unlisted_kimi_code_model_is_still_refused() {
     let temp = tempfile::tempdir().expect("test: temp config dir");
@@ -533,6 +533,7 @@ fn an_unlisted_kimi_code_model_is_still_refused() {
     };
     assert!(format!("{error:#}").contains("kimi-code"), "{error:#}");
     resolve_agent_model_choice(&config, Some("kimi-code"), Some("k3")).expect("test: a listed model");
+    resolve_agent_model_choice(&config, Some("kimi-code"), Some("k3.1-pro")).expect("test: catalog active id");
 }
 
 /// Real wire plus actual factory lookup observation: no header-only inference.

@@ -160,6 +160,15 @@ enum Event {
     EstimatedUnsentV1 {
         attempt_id: String,
     },
+    /// A subscription call closed its zero hold. There is no priced cost row.
+    SubscriptionSettledV1 {
+        attempt_id: String,
+        provider: String,
+        model: String,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+    },
     Settled {
         attempt_id: String,
         actual_micro_usd: String,
@@ -172,8 +181,36 @@ enum Event {
 pub(super) struct Reservations {
     entries: BTreeMap<String, (ReservationRequest, State)>,
     settlements: BTreeMap<String, (String, String)>,
+    /// Provider, model, and token counts for a subscription settlement.
+    /// These calls are not priced, so they are absent from `settlements`.
+    subscription_calls: BTreeMap<String, SubscriptionCall>,
     unreconciled_over_bound: bool,
     estimates: BTreeMap<String, EstimatedTokens>,
+}
+
+#[derive(PartialEq, Eq)]
+pub(super) struct SubscriptionCall {
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl SubscriptionCall {
+    fn validate(&self) -> Result<()> {
+        for value in [&self.provider, &self.model] {
+            ensure!(
+                !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control),
+                "invalid subscription provider or model"
+            );
+        }
+        ensure!(
+            u128::from(self.prompt_tokens) + u128::from(self.completion_tokens) == u128::from(self.total_tokens),
+            "subscription settlement token total conflicts"
+        );
+        Ok(())
+    }
 }
 
 /// Read-only projection of the existing physical journal, not a new ledger.
@@ -417,6 +454,41 @@ impl Reservations {
                 let (_, state) = self.entries.get_mut(&attempt_id).context("unknown unsent attempt")?;
                 ensure!(*state == State::Dispatched, "unsent estimate was already consumed");
                 *state = State::Released;
+            }
+            Event::SubscriptionSettledV1 {
+                attempt_id,
+                provider,
+                model,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            } => {
+                let call = SubscriptionCall {
+                    provider,
+                    model,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                };
+                call.validate()?;
+                ensure!(
+                    self.estimates.contains_key(&attempt_id),
+                    "subscription settlement has legacy reservation"
+                );
+                let (_, state) = self
+                    .entries
+                    .get_mut(&attempt_id)
+                    .context("unknown subscription settlement")?;
+                ensure!(
+                    *state == State::Dispatched,
+                    "subscription settlement requires a dispatched reservation"
+                );
+                *state = State::Settled { actual_micro_usd: 0 };
+                self.estimates
+                    .get_mut(&attempt_id)
+                    .context("missing subscription reservation")?
+                    .actual = Some(u128::from(total_tokens));
+                self.subscription_calls.insert(attempt_id, call);
             }
         }
         Ok(())
@@ -711,6 +783,56 @@ impl Reservations {
             actual_tokens: actual_tokens.to_string(),
             settlement_sha256,
             cost_row_sha256,
+        };
+        append(workspace, &event)?;
+        self.apply(event)
+            .map_err(|error| ReservationWriteUnconfirmed(error).into())
+    }
+
+    /// Close a dispatched estimated hold for a subscription call.
+    ///
+    /// The journal records the provider, model, and token counts. No priced
+    /// cost row is written, and the attempt is not added to the cost-projection
+    /// map, so recovery does not look for one. The hold settles at zero.
+    pub(super) fn settle_subscription(
+        &mut self,
+        workspace: &Path,
+        receipt: &ReservationReceipt,
+        call: SubscriptionCall,
+    ) -> Result<()> {
+        call.validate()?;
+        ensure!(
+            workspace.canonicalize()? == receipt.workspace,
+            "subscription receipt belongs to another workspace"
+        );
+        let (previous, state) = self
+            .entries
+            .get(&receipt.request.attempt_id)
+            .context("unknown subscription receipt")?;
+        let estimate = self
+            .estimates
+            .get(&receipt.request.attempt_id)
+            .context("subscription receipt has legacy reservation")?;
+        ensure!(previous == &receipt.request, "subscription receipt conflicts");
+        if matches!(state, State::Settled { actual_micro_usd: 0 }) {
+            let recorded = self
+                .subscription_calls
+                .get(&receipt.request.attempt_id)
+                .context("subscription settlement is missing its call")?;
+            ensure!(
+                recorded == &call && estimate.actual == Some(u128::from(call.total_tokens)),
+                "subscription settlement replay conflicts"
+            );
+            return Ok(());
+        }
+        ensure!(*state == State::Dispatched, "subscription receipt was not dispatched");
+        let event = Event::SubscriptionSettledV1 {
+            attempt_id: receipt.request.attempt_id.clone(),
+            provider: call.provider,
+            model: call.model,
+            prompt_tokens: call.prompt_tokens,
+            completion_tokens: call.completion_tokens,
+            total_tokens: call.total_tokens,
         };
         append(workspace, &event)?;
         self.apply(event)

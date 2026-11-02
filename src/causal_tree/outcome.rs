@@ -896,8 +896,9 @@ fn usage_settlements_agree(
 /// The first finalization stores `Recorded`; replaying the same settlement id
 /// over the committed marker returns `Replayed` because the ledger already holds
 /// it. Those two are one settlement seen at two times, so they agree. Every
-/// other pairing must match exactly in kind, so `UnknownPricing`, `Disabled`
-/// and `Failed` never pass for a recorded charge. The amount and id are pinned
+/// other pairing must match exactly in kind, so `UnknownPricing`,
+/// `Subscription`, `Disabled` and `Failed` never pass for a recorded charge.
+/// The amount and id are pinned
 /// separately by [`usage_settlements_agree`] and, on replay, by the ledger's own
 /// `verify_replayed_settlement`.
 fn cost_settlements_agree(
@@ -1089,6 +1090,7 @@ impl OutcomeCorrelator {
                 CostSettlement::Replayed => "replayed",
                 CostSettlement::Disabled => "disabled",
                 CostSettlement::UnknownPricing => "unknown_pricing",
+                CostSettlement::Subscription { .. } => "subscription",
                 CostSettlement::Failed { .. } => "failed",
             }
             .to_owned()
@@ -1271,7 +1273,7 @@ mod tests {
 
     #[test]
     fn a_genuinely_different_settlement_is_still_rejected() {
-        use crate::cost::types::CostSettlement::{Disabled, Failed, Replayed, UnknownPricing};
+        use crate::cost::types::CostSettlement::{Disabled, Failed, Replayed, Subscription, UnknownPricing};
         let stored = priced_usage("terminal-1", 0.25);
         let mut other_amount = stored.clone();
         other_amount.cost_usd = Some(0.5);
@@ -1286,7 +1288,18 @@ mod tests {
         assert!(!usage_settlements_agree(Some(&stored), None));
         assert!(!usage_settlements_agree(None, Some(&stored)));
         // Replayed only stands in for Recorded, never for any other outcome.
-        for kind in [UnknownPricing, Disabled, Failed { error: "x".to_owned() }] {
+        for kind in [
+            UnknownPricing,
+            Subscription {
+                provider: "kimi-code".to_owned(),
+                model: "kimi-for-coding".to_owned(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+            Disabled,
+            Failed { error: "x".to_owned() },
+        ] {
             assert!(!cost_settlements_agree(Some(&recorded()), Some(&kind)));
             assert!(!cost_settlements_agree(Some(&Replayed), Some(&kind)));
             assert!(!cost_settlements_agree(Some(&kind), Some(&Replayed)));

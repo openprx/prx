@@ -159,6 +159,11 @@ fn catalog_models_for_kimi_code_include_official_agent_model() {
             "k3-256k".to_string()
         ]
     );
+    assert!(
+        catalog_models_for_provider("kimi-code")
+            .iter()
+            .all(|(_, label)| { label.contains("subscription-billed, no per-token cost recorded") })
+    );
 }
 
 #[test]

@@ -23,7 +23,7 @@ impl OwnedReceipt {
             let output = u64::from(output);
             let cache_write = usage.cache_creation_input_tokens.map_or(0, u64::from);
             let cache_read = usage.cache_read_input_tokens.map_or(0, u64::from);
-            let cost = match usage_cost_resolution(
+            let (cost_usd, actual_micro_usd) = match usage_cost_resolution(
                 &self.provider,
                 &self.model,
                 input,
@@ -32,14 +32,18 @@ impl OwnedReceipt {
                 cache_read,
                 &self.config.cost,
             ) {
-                UsagePrice::Priced(cost) => cost,
+                UsagePrice::Priced(cost) => (Some(cost), crate::cost::tracker::ceil_micro_usd(cost)?),
+                // A subscription row has no per-token tariff. The usage row
+                // carries no dollar amount. The settlement names the provider,
+                // model, and tokens, and the reserved hold closes at zero.
+                UsagePrice::Subscription => (None, 0),
                 UsagePrice::Missing
                     if super::super::turn_cost::provider_is_zero_price_exempt(
                         &crate::providers::ProviderId::of(&self.provider),
                         super::effective_api_url(&self.config, &self.provider),
                     ) =>
                 {
-                    0.0
+                    (Some(0.0), 0)
                 }
                 UsagePrice::Missing | UsagePrice::Invalid => {
                     anyhow::bail!("decision usage has no valid pinned PMM price")
@@ -56,9 +60,8 @@ impl OwnedReceipt {
                 cache_creation_input_tokens: cache_write,
                 cache_read_input_tokens: cache_read,
                 source: TokenUsageSource::Reported,
-                cost_usd: Some(cost),
+                cost_usd,
             };
-            let actual_micro_usd = crate::cost::tracker::ceil_micro_usd(cost)?;
 
             Ok((record, total, actual_micro_usd))
         })();

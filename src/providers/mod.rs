@@ -898,7 +898,8 @@ pub(crate) fn fallback_admission_for(
                 && *descriptor.features.get(catalog::Feature::NativeTools) == catalog::Support::Supported;
             let cost_admitted =
                 match crate::llm::route_decision::usage_cost_resolution(provider, model, 1, 1, 0, 0, cost) {
-                    crate::llm::route_decision::UsagePrice::Priced(_) => true,
+                    crate::llm::route_decision::UsagePrice::Priced(_)
+                    | crate::llm::route_decision::UsagePrice::Subscription => true,
                     crate::llm::route_decision::UsagePrice::Missing => {
                         crate::runtime::turn_cost::provider_is_zero_price_exempt(
                             &provider_id,

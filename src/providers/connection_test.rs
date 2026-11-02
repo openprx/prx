@@ -128,6 +128,13 @@ pub async fn test_connection(
                     detail.push_str("; ");
                 }
                 detail.push_str(&warning);
+            } else if let Some(notice) =
+                selection::subscription_billing_notice(resolved.provider_label(), resolved.model(), &config.cost)
+            {
+                if !detail.is_empty() {
+                    detail.push_str("; ");
+                }
+                detail.push_str(notice);
             }
             (
                 LocalCheck {
@@ -478,7 +485,7 @@ mod tests {
     use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
 
     #[tokio::test]
-    async fn unpriced_model_probe_explains_g6_without_sending() {
+    async fn subscription_model_probe_names_billing_without_sending() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_for(dir.path(), "kimi-code");
         config.default_model = Some("kimi-for-coding".into());
@@ -487,13 +494,10 @@ mod tests {
         assert!(report.live.is_none());
         let shown = report.to_string();
         assert!(
-            shown.contains("G6 budget admission refuses unpriced model 'kimi-code/kimi-for-coding'"),
+            shown.contains("subscription-billed, no per-token cost recorded"),
             "{shown}"
         );
-        assert!(
-            shown.contains(r#"[cost.prices."kimi-code/kimi-for-coding"]"#),
-            "{shown}"
-        );
+        assert!(!shown.contains("G6 budget admission refuses"), "{shown}");
         config.cost.prices.insert(
             "kimi-code/kimi-for-coding".into(),
             crate::config::schema::ModelPricing {
@@ -504,6 +508,36 @@ mod tests {
             },
         );
         let priced = test_connection(&config, None, None, ProbeMode::Local).await;
+        let priced = priced.to_string();
+        assert!(!priced.contains("G6"), "{priced}");
+        assert!(!priced.contains("subscription-billed"), "{priced}");
+    }
+
+    #[tokio::test]
+    async fn unpriced_model_probe_explains_g6_without_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut unpriced = config_for(dir.path(), "openrouter");
+        unpriced.default_model = Some("deepseek/deepseek-v3.2".into());
+        let report = test_connection(&unpriced, None, None, ProbeMode::Local).await;
+        assert!(report.local.resolved);
+        assert!(report.live.is_none());
+        let shown = report.to_string();
+        assert!(
+            shown.contains("G6 budget admission refuses unpriced model 'openrouter/deepseek/deepseek-v3.2'"),
+            "{shown}"
+        );
+        assert!(shown.contains(r#"[cost.prices."deepseek/deepseek-v3.2"]"#), "{shown}");
+        assert!(!shown.contains("subscription-billed"), "{shown}");
+        unpriced.cost.prices.insert(
+            "deepseek/deepseek-v3.2".into(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.5,
+                cache_write: 1.0,
+            },
+        );
+        let priced = test_connection(&unpriced, None, None, ProbeMode::Local).await;
         assert!(!priced.to_string().contains("G6"));
     }
 
