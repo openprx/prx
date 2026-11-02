@@ -345,3 +345,92 @@ fn binding_a_stricter_scope_can_only_reduce_the_original_money_owner() {
     assert_eq!(older.remaining_budgets().micro_usd, 1000);
     assert_eq!(money.load(Ordering::Acquire), 1000);
 }
+
+#[tokio::test]
+async fn a_subscription_decision_settles_without_a_priced_row() -> anyhow::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let mut config = Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    let cleanup = Arc::new(CleanupTracker::default());
+    let budgets = TurnBudgets {
+        tokens: 1024,
+        micro_usd: 5000,
+        latency_ms: 5_000,
+    };
+    let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
+    let scope = AccountingScope::new(
+        Arc::new(config.clone()),
+        DecisionKey::ephemeral(),
+        Arc::clone(&cleanup),
+        [8; 32],
+        budgets,
+        deadline,
+    );
+    let binding = [0; 32];
+    let receipt = scope
+        .begin_physical(PhysicalEstimate {
+            purpose: "decision",
+            provider: "kimi-code",
+            model: "kimi-for-coding",
+            body: b"{}",
+            transport_binding: &binding,
+            request_id: "kimi-subscription",
+            deadline,
+            remaining_attempts: 1,
+        })
+        .await?;
+    Box::new(receipt)
+        .settle(DecisionUsage {
+            input_tokens: Some(11),
+            output_tokens: Some(7),
+            ..Default::default()
+        })
+        .await?;
+    cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+    let rows = super::super::transport_tests::journal(workspace.path())?;
+    let settled = rows.last().ok_or_else(|| anyhow::anyhow!("subscription settlement"))?;
+    assert_eq!(
+        settled.get("event").and_then(serde_json::Value::as_str),
+        Some("subscription_settled_v1")
+    );
+    assert_eq!(
+        settled.get("provider").and_then(serde_json::Value::as_str),
+        Some("kimi-code")
+    );
+    assert_eq!(
+        settled.get("model").and_then(serde_json::Value::as_str),
+        Some("kimi-for-coding")
+    );
+    assert_eq!(
+        settled.get("prompt_tokens").and_then(serde_json::Value::as_u64),
+        Some(11)
+    );
+    assert_eq!(
+        settled.get("completion_tokens").and_then(serde_json::Value::as_u64),
+        Some(7)
+    );
+    assert_eq!(
+        settled.get("total_tokens").and_then(serde_json::Value::as_u64),
+        Some(18)
+    );
+    assert!(settled.get("actual_micro_usd").is_none());
+    assert!(settled.get("cost_usd").is_none());
+    assert!(settled.get("settlement_sha256").is_none());
+    assert!(settled.get("cost_row_sha256").is_none());
+    let ledger = workspace.path().join("state/costs.jsonl");
+    if ledger.exists() {
+        let persisted = std::fs::read_to_string(&ledger)?;
+        assert!(persisted.trim().is_empty(), "{persisted}");
+    }
+    assert_eq!(scope.remaining_budgets().tokens, budgets.tokens - 18);
+    assert_eq!(scope.remaining_budgets().micro_usd, budgets.micro_usd);
+    let tracker = crate::cost::tracker::CostTracker::for_workspace(config.cost.clone(), workspace.path())?;
+    let usage = tracker.physical_scope_usage(&scope.scope_id())?;
+    assert_eq!(usage.calls, 1);
+    assert_eq!(usage.settled_calls, 1);
+    assert_eq!(usage.tokens, 18);
+    assert_eq!(usage.micro_usd, 0);
+    assert!(!usage.unresolved);
+    crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, workspace.path())?;
+    Ok(())
+}

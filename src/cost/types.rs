@@ -147,8 +147,20 @@ pub enum BudgetCheck {
 pub enum CostSettlement {
     Disabled,
     UnknownPricing,
-    /// Subscription billing. No per-token amount is written to the ledger.
-    Subscription,
+    /// Subscription billing. The call is named by provider, model, and token
+    /// counts. No per-token amount is written to the cost ledger.
+    Subscription {
+        #[serde(default)]
+        provider: String,
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        prompt_tokens: u64,
+        #[serde(default)]
+        completion_tokens: u64,
+        #[serde(default)]
+        total_tokens: u64,
+    },
     Replayed,
     Recorded {
         budget: BudgetCheck,

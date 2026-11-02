@@ -1090,7 +1090,7 @@ impl OutcomeCorrelator {
                 CostSettlement::Replayed => "replayed",
                 CostSettlement::Disabled => "disabled",
                 CostSettlement::UnknownPricing => "unknown_pricing",
-                CostSettlement::Subscription => "subscription",
+                CostSettlement::Subscription { .. } => "subscription",
                 CostSettlement::Failed { .. } => "failed",
             }
             .to_owned()
@@ -1288,7 +1288,18 @@ mod tests {
         assert!(!usage_settlements_agree(Some(&stored), None));
         assert!(!usage_settlements_agree(None, Some(&stored)));
         // Replayed only stands in for Recorded, never for any other outcome.
-        for kind in [UnknownPricing, Subscription, Disabled, Failed { error: "x".to_owned() }] {
+        for kind in [
+            UnknownPricing,
+            Subscription {
+                provider: "kimi-code".to_owned(),
+                model: "kimi-for-coding".to_owned(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+            Disabled,
+            Failed { error: "x".to_owned() },
+        ] {
             assert!(!cost_settlements_agree(Some(&recorded()), Some(&kind)));
             assert!(!cost_settlements_agree(Some(&Replayed), Some(&kind)));
             assert!(!cost_settlements_agree(Some(&kind), Some(&Replayed)));

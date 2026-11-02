@@ -308,3 +308,70 @@ fn experiment_case_usage_excludes_prior_unknown_attempts_without_freeing_parent_
     assert_eq!((parent.calls, parent.tokens, parent.micro_usd), (2, 1036, 375_000));
     Ok(())
 }
+
+#[test]
+fn subscription_settlement_reopens_without_a_cost_projection_and_rejects_conflicts() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let tracker = CostTracker::new(config(), workspace.path())?;
+    let mut reserved = request();
+    reserved.reservation.maximum_micro_usd = 0;
+    let receipt = tracker.reserve_dispatched_estimated_attempt(reserved, || true)?;
+    let mut record = usage();
+    record.provider = "kimi-code".to_owned();
+    record.model = "kimi-for-coding".to_owned();
+    record.cost_usd = None;
+    let expected = CostSettlement::Subscription {
+        provider: record.provider.clone(),
+        model: record.model.clone(),
+        prompt_tokens: record.prompt_tokens,
+        completion_tokens: record.completion_tokens,
+        total_tokens: record.total_tokens,
+    };
+    assert_eq!(tracker.settle_and_reconcile_estimated(&receipt, &record)?, expected);
+    assert_eq!(tracker.get_summary()?.request_count, 0);
+    let journal_path = workspace.path().join("state").join(JOURNAL);
+    let journal = rows(&journal_path)?;
+    assert_eq!(journal.len(), 3);
+    let event = journal.last().context("subscription journal event")?;
+    assert_eq!(
+        event.get("event").and_then(Value::as_str),
+        Some("subscription_settled_v1")
+    );
+    assert_eq!(
+        event.get("provider").and_then(Value::as_str),
+        Some(record.provider.as_str())
+    );
+    assert_eq!(event.get("model").and_then(Value::as_str), Some(record.model.as_str()));
+    assert_eq!(
+        event.get("prompt_tokens").and_then(Value::as_u64),
+        Some(record.prompt_tokens)
+    );
+    assert_eq!(
+        event.get("completion_tokens").and_then(Value::as_u64),
+        Some(record.completion_tokens)
+    );
+    assert_eq!(
+        event.get("total_tokens").and_then(Value::as_u64),
+        Some(record.total_tokens)
+    );
+    assert!(event.get("actual_micro_usd").is_none());
+    let reopened = CostTracker::new(config(), workspace.path())?;
+    assert_eq!(reopened.settle_and_reconcile_estimated(&receipt, &record)?, expected);
+    assert_eq!(rows(&journal_path)?, journal);
+    let usage = reopened.physical_scope_usage("prx_settlement_turn")?;
+    assert_eq!(usage.calls, 1);
+    assert_eq!(usage.settled_calls, 1);
+    assert_eq!(usage.tokens, record.total_tokens);
+    assert_eq!(usage.micro_usd, 0);
+    assert!(!usage.unresolved);
+    record.completion_tokens += 1;
+    record.total_tokens += 1;
+    assert!(reopened.settle_and_reconcile_estimated(&receipt, &record).is_err());
+    assert_eq!(rows(&journal_path)?, journal);
+    assert_eq!(remaining_micro_usd_read_only(&config(), workspace.path())?, 1_000_000);
+    let cost_path = workspace.path().join("state/costs.jsonl");
+    if cost_path.exists() {
+        assert_eq!(fs::read_to_string(cost_path)?.trim(), "");
+    }
+    Ok(())
+}

@@ -3,7 +3,7 @@ use super::{
     CostRecord, CostSettlement, CostStorage, CostTracker, TokenUsage, acquire_cost_ledger_lock, budget_check,
     ceil_micro_usd, settlement_fingerprint,
 };
-use crate::cost::reservation::{ReservationReceipt, Reservations, cost_row_sha256};
+use crate::cost::reservation::{ReservationReceipt, Reservations, SubscriptionCall, cost_row_sha256};
 use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource};
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -36,7 +36,6 @@ impl CostTracker {
             .ok_or_else(|| anyhow!("Metered usage settlement is missing settlement_id"))?;
         anyhow::ensure!(!settlement_id.trim().is_empty(), "Metered usage settlement_id is empty");
         let Some(cost_usd) = record.cost_usd else {
-            anyhow::ensure!(receipt.is_none(), "reserved settlement price is unknown");
             if matches!(
                 crate::llm::route_decision::usage_cost_resolution(
                     &record.provider,
@@ -49,8 +48,16 @@ impl CostTracker {
                 ),
                 crate::llm::route_decision::UsagePrice::Subscription
             ) {
-                return Ok(CostSettlement::Subscription);
+                let settlement = subscription_settlement(record)?;
+                if let Some(receipt) = receipt {
+                    let mut storage = self.lock_storage();
+                    let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+                    storage.refresh_from_disk()?;
+                    reconcile_subscription_hold(&storage, receipt, record)?;
+                }
+                return Ok(settlement);
             }
+            anyhow::ensure!(receipt.is_none(), "reserved settlement price is unknown");
             return Ok(CostSettlement::UnknownPricing);
         };
         anyhow::ensure!(
@@ -144,6 +151,46 @@ pub(super) fn reconcile_durable_projection(
         "estimated settlement token total conflicts"
     );
     reservations.settle_estimated(workspace, receipt, actual, actual_tokens, digest, row_digest)
+}
+
+fn subscription_settlement(record: &MeteredTokenUsageRecord) -> Result<CostSettlement> {
+    anyhow::ensure!(
+        u128::from(record.prompt_tokens).checked_add(u128::from(record.completion_tokens))
+            == Some(u128::from(record.total_tokens)),
+        "subscription settlement token total conflicts"
+    );
+    Ok(CostSettlement::Subscription {
+        provider: record.provider.clone(),
+        model: record.model.clone(),
+        prompt_tokens: record.prompt_tokens,
+        completion_tokens: record.completion_tokens,
+        total_tokens: record.total_tokens,
+    })
+}
+
+fn reconcile_subscription_hold(
+    storage: &CostStorage,
+    receipt: &ReservationReceipt,
+    record: &MeteredTokenUsageRecord,
+) -> Result<()> {
+    anyhow::ensure!(
+        record.settlement_id.as_deref() == Some(receipt.attempt_id()),
+        "reserved settlement does not identify this physical attempt"
+    );
+    subscription_settlement(record)?;
+    let workspace = storage.workspace()?;
+    let mut reservations = Reservations::load(workspace)?;
+    reservations.settle_subscription(
+        workspace,
+        receipt,
+        SubscriptionCall {
+            provider: record.provider.clone(),
+            model: record.model.clone(),
+            prompt_tokens: record.prompt_tokens,
+            completion_tokens: record.completion_tokens,
+            total_tokens: record.total_tokens,
+        },
+    )
 }
 
 #[cfg(test)]
