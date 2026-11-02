@@ -1,13 +1,12 @@
 //! Skill lifecycle HTTP adapter.
 //!
-//! Calls [`crate::tools::skills::SkillsManageTool`] through `Tool::execute`
-//! after installing a trusted scope whose `owner_id` is only the paired
-//! [`ApiPrincipal`]. The tool's owner check and approval gate stay in place.
+//! Calls [`crate::tools::skills::SkillsManageTool`] through the shared execution
+//! service with an owner-isolated context bound to the paired [`ApiPrincipal`].
+//! The tool's owner check and approval gate stay in place.
 //! The browser cannot send `owner_id` or a grant.
 
 use super::{ApiPrincipal, AppState};
 use crate::tools::SkillsManageTool;
-use crate::tools::traits::Tool;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
@@ -74,16 +73,6 @@ fn parse_json<T: for<'de> Deserialize<'de>>(bytes: &Bytes) -> Result<T, ApiRespo
         return Err(bad_request("request body is required"));
     }
     serde_json::from_slice(bytes).map_err(|error| bad_request(format!("malformed request: {error}")))
-}
-
-fn scoped_args(owner_id: &str, mut fields: Map<String, Value>) -> Value {
-    fields.retain(|key, _| !crate::tools::execution::is_runtime_only_arg(key) && key != "owner_id" && key != "owner");
-    fields.insert("_zc_scope_trusted".to_string(), json!(true));
-    fields.insert(
-        "_zc_scope".to_string(),
-        json!({ "owner_id": owner_id, "owner_isolated": true }),
-    );
-    Value::Object(fields)
 }
 
 fn lifecycle_code(output: &str) -> Option<(String, Option<String>)> {
@@ -198,8 +187,27 @@ async fn execute(state: &AppState, principal: &ApiPrincipal, fields: Map<String,
     }
     let security = crate::runtime::bootstrap::build_security_policy(&config);
     let tool = SkillsManageTool::from_config(config.workspace_dir.clone(), config.as_ref().clone(), security);
-    let args = scoped_args(&principal.owner_id, fields);
-    match tool.execute(args).await {
+    // Reads use the published read-only capabilities rather than the mixed-effect root.
+    let action = fields.get("action").and_then(Value::as_str).unwrap_or("");
+    let tool_name = match action {
+        "lifecycle_status" => "lifecycle_status",
+        "lifecycle_list" => "lifecycle_list",
+        "lifecycle_inspect" => "lifecycle_inspect",
+        _ => "skills_manage",
+    };
+    let operator_write = matches!(action, "lifecycle_publish" | "lifecycle_rollback");
+    let outcome = super::operations_tools::execute_operation(
+        &config,
+        principal,
+        Box::new(tool),
+        tool_name,
+        Value::Object(fields),
+    )
+    .await;
+    if outcome.status == crate::tools::ToolExecutionStatus::Failed && outcome.result.is_none() {
+        return classify_failure("", outcome.error.as_deref().unwrap_or("skill lifecycle call failed"));
+    }
+    match super::operations_tools::result(outcome) {
         Ok(result) if result.success => match serde_json::from_str::<Value>(&result.output) {
             Ok(value) => (StatusCode::OK, Json(value)),
             Err(error) => {
@@ -211,7 +219,17 @@ async fn execute(state: &AppState, principal: &ApiPrincipal, fields: Map<String,
             &result.output,
             result.error.as_deref().unwrap_or("skill lifecycle call failed"),
         ),
-        Err(error) => classify_failure("", &error.to_string()),
+        Err((status, error)) if status == StatusCode::FORBIDDEN => {
+            if operator_write {
+                error_response(
+                    StatusCode::FORBIDDEN,
+                    "publish and rollback need the operator's full session",
+                )
+            } else {
+                error_response(status, error)
+            }
+        }
+        Err((status, error)) => error_response(status, error),
     }
 }
 
@@ -375,6 +393,109 @@ mod tests {
         let text = error.as_str().unwrap_or("");
         assert!(!text.contains("owner:ws"));
         assert!(!text.contains("api:token"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_routes_enforce_service_scope_policy_and_audit_denials() {
+        let owner = ApiPrincipal::of_token(TOKEN).owner_id;
+        let served = serve_config(|config| {
+            enable(owner.clone())(config);
+            config.autonomy.scopes.rules.push(crate::config::ScopeRule {
+                user: Some(owner.clone()),
+                channel: Some("console".into()),
+                chat_type: Some("private".into()),
+                tools_deny: vec![
+                    "lifecycle_status".into(),
+                    "lifecycle_list".into(),
+                    "lifecycle_inspect".into(),
+                    "skills_manage".into(),
+                ],
+                ..crate::config::ScopeRule::default()
+            });
+        })
+        .await;
+        for (method, path, args, capability) in [
+            (
+                reqwest::Method::GET,
+                "/api/skills/lifecycle/status",
+                None,
+                "lifecycle_status",
+            ),
+            (
+                reqwest::Method::GET,
+                "/api/skills/lifecycle/proposals",
+                None,
+                "lifecycle_list",
+            ),
+            (
+                reqwest::Method::GET,
+                "/api/skills/lifecycle/proposals/missing",
+                None,
+                "lifecycle_inspect",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/skills/lifecycle/proposals/missing/cancel",
+                None,
+                "skills_manage",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/skills/lifecycle/proposals/missing/publish",
+                Some(serde_json::json!({})),
+                "skills_manage",
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/skills/lifecycle/rollback",
+                Some(serde_json::json!({"skill_id":"demo", "revision_id":"r1", "expected_generation":1})),
+                "skills_manage",
+            ),
+        ] {
+            let (status, body) = served.call(method, path, args).await;
+            assert_eq!(status, 403, "{path}: {body}");
+            let rows = served.tool_audit(capability);
+            let row = rows.last().expect("test: terminal audit row");
+            assert_eq!(at(row, "/actor/user_id"), owner);
+            assert_eq!(at(row, "/result/error"), "Denied", "{path}: {row}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_reads_use_read_capabilities_and_cancel_requires_service_approval() {
+        let served = serve_config(|config| {
+            enable(ApiPrincipal::of_token(TOKEN).owner_id)(config);
+            config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        })
+        .await;
+        for (path, capability) in [
+            ("/api/skills/lifecycle/status", "lifecycle_status"),
+            ("/api/skills/lifecycle/proposals", "lifecycle_list"),
+        ] {
+            let (status, body) = served.call(reqwest::Method::GET, path, None).await;
+            assert_eq!(status, 200, "{body}");
+            let rows = served.tool_audit(capability);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                at(rows.first().expect("test: terminal audit row"), "/result/success"),
+                true
+            );
+        }
+        let (status, body) = served
+            .call(
+                reqwest::Method::POST,
+                "/api/skills/lifecycle/proposals/missing/cancel",
+                None,
+            )
+            .await;
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(at(&json(&body), "/error"), "explicit approval grant required");
+        let rows = served.tool_audit("skills_manage");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            at(rows.first().expect("test: terminal audit row"), "/result/error"),
+            "ApprovalDenied"
+        );
     }
 
     #[tokio::test]

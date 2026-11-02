@@ -1,13 +1,12 @@
 //! Memory HTTP routes.
 //!
-//! Each route calls the existing memory tool with a server-built scope whose
-//! `owner_id` is only [`ApiPrincipal::owner_id`] and whose `owner_isolated`
-//! flag is set. The body cannot name an owner, a channel, or a sender.
+//! Each route calls the shared execution service with an authenticated,
+//! owner-isolated context. The service authors the memory tool scope; the
+//! body cannot name an owner, a channel, or a sender.
 //! Forget uses the tool's own approval path. A backend named `none` is
 //! unavailable. A missing key and another owner's key share one 404 body.
 
 use super::{ApiPrincipal, AppState};
-use crate::tools::traits::Tool;
 use crate::tools::{MemoryForgetTool, MemoryRecallTool, MemorySearchTool, MemoryStoreTool};
 use axum::Json;
 use axum::body::Bytes;
@@ -103,24 +102,6 @@ fn ensure_backend(state: &AppState) -> Result<(), ApiResponse> {
     } else {
         Ok(())
     }
-}
-
-fn scoped(owner_id: &str, fields: Map<String, Value>) -> Value {
-    let mut fields = fields;
-    fields.insert("_zc_scope_trusted".to_string(), json!(true));
-    fields.insert(
-        "_zc_scope".to_string(),
-        json!({
-            "owner_id": owner_id,
-            "owner_isolated": true
-        }),
-    );
-    Value::Object(fields)
-}
-
-fn security(state: &AppState) -> Arc<crate::security::SecurityPolicy> {
-    let config = state.config.load_full();
-    crate::runtime::bootstrap::build_security_policy(config.as_ref())
 }
 
 fn source_name(state: &AppState) -> String {
@@ -235,10 +216,10 @@ pub(super) async fn search(
     let mut fields = Map::new();
     fields.insert("query".to_string(), json!(query));
     if let Some(limit) = parsed.max_results.or(parsed.max_results_camel) {
-        fields.insert("max_results".to_string(), json!(limit));
+        fields.insert("max_results".to_string(), json!(limit.clamp(1, 500)));
     }
     if let Some(score) = parsed.min_score {
-        fields.insert("minScore".to_string(), json!(score));
+        fields.insert("minScore".to_string(), json!(score.clamp(0.0, 1.0)));
     }
     let config = state.config.load_full();
     let tool = MemorySearchTool::new(
@@ -246,12 +227,17 @@ pub(super) async fn search(
         Arc::clone(&state.mem),
         config.memory.acl_enabled,
     );
-    let executed = match tool.execute(scoped(&principal.owner_id, fields)).await {
+    let outcome = super::operations_tools::execute_operation(
+        &config,
+        &principal,
+        Box::new(tool),
+        "memory_search",
+        Value::Object(fields),
+    )
+    .await;
+    let executed = match super::operations_tools::result(outcome) {
         Ok(result) => result,
-        Err(error) => {
-            tracing::warn!(%error, "memory search failed");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "memory call failed");
-        }
+        Err((status, error)) => return error_response(status, error),
     };
     match tool_output(executed) {
         Ok(output) => (StatusCode::OK, Json(read_body(&source_name(&state), output))),
@@ -290,12 +276,17 @@ pub(super) async fn recall(
     }
     let config = state.config.load_full();
     let tool = MemoryRecallTool::new(Arc::clone(&state.mem), config.memory.acl_enabled);
-    let executed = match tool.execute(scoped(&principal.owner_id, fields)).await {
+    let outcome = super::operations_tools::execute_operation(
+        &config,
+        &principal,
+        Box::new(tool),
+        "memory_recall",
+        Value::Object(fields),
+    )
+    .await;
+    let executed = match super::operations_tools::result(outcome) {
         Ok(result) => result,
-        Err(error) => {
-            tracing::warn!(%error, "memory recall failed");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "memory call failed");
-        }
+        Err((status, error)) => return error_response(status, error),
     };
     match tool_output(executed) {
         Ok(output) => (StatusCode::OK, Json(read_body(&source_name(&state), output))),
@@ -334,13 +325,22 @@ pub(super) async fn store(
     {
         fields.insert("category".to_string(), json!(category));
     }
-    let tool = MemoryStoreTool::new(Arc::clone(&state.mem), security(&state));
-    let executed = match tool.execute(scoped(&principal.owner_id, fields)).await {
+    let config = state.config.load_full();
+    let tool = MemoryStoreTool::new(
+        Arc::clone(&state.mem),
+        crate::runtime::bootstrap::build_security_policy(&config),
+    );
+    let outcome = super::operations_tools::execute_operation(
+        &config,
+        &principal,
+        Box::new(tool),
+        "memory_store",
+        Value::Object(fields),
+    )
+    .await;
+    let executed = match super::operations_tools::result(outcome) {
         Ok(result) => result,
-        Err(error) => {
-            tracing::warn!(%error, "memory store failed");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "memory call failed");
-        }
+        Err((status, error)) => return error_response(status, error),
     };
     match tool_output(executed) {
         Ok(_) => {
@@ -370,13 +370,22 @@ pub(super) async fn forget(
     };
     let mut fields = Map::new();
     fields.insert("key".to_string(), json!(key));
-    let tool = MemoryForgetTool::new(Arc::clone(&state.mem), security(&state));
-    let executed = match tool.execute(scoped(&principal.owner_id, fields)).await {
+    let config = state.config.load_full();
+    let tool = MemoryForgetTool::new(
+        Arc::clone(&state.mem),
+        crate::runtime::bootstrap::build_security_policy(&config),
+    );
+    let outcome = super::operations_tools::execute_operation(
+        &config,
+        &principal,
+        Box::new(tool),
+        "memory_forget",
+        Value::Object(fields),
+    )
+    .await;
+    let executed = match super::operations_tools::result(outcome) {
         Ok(result) => result,
-        Err(error) => {
-            tracing::warn!(%error, "memory forget failed");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "memory call failed");
-        }
+        Err((status, error)) => return error_response(status, error),
     };
     match tool_output(executed) {
         Ok(output) if output.starts_with("Forgot memory:") => {
@@ -612,6 +621,84 @@ mod tests {
             .await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(at(&json(&body), "/forgotten"), true);
+        for capability in ["memory_search", "memory_recall", "memory_store", "memory_forget"] {
+            let rows = served.tool_audit(capability);
+            assert!(
+                rows.iter().any(|row| at(row, "/result/success") == true),
+                "{capability}: {rows:?}"
+            );
+            assert!(rows.iter().all(|row| !row.to_string().contains("alpha-only-note")));
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_routes_enforce_service_scope_policy_and_audit_denials() {
+        use crate::config::ScopeRule;
+        let owner = super::ApiPrincipal::of_token(super::super::test_support::TOKEN).owner_id;
+        let served = serve_config(|config| {
+            config.autonomy.scopes.rules.push(ScopeRule {
+                user: Some(owner.clone()),
+                channel: Some("console".into()),
+                chat_type: Some("private".into()),
+                tools_deny: vec![
+                    "memory_search".into(),
+                    "memory_recall".into(),
+                    "memory_store".into(),
+                    "memory_forget".into(),
+                ],
+                ..ScopeRule::default()
+            });
+        })
+        .await;
+        for (action, args) in [
+            ("search", serde_json::json!({"query": "notes"})),
+            ("recall", serde_json::json!({"query": "notes"})),
+            ("store", note()),
+            ("forget", serde_json::json!({"key": "c4-note"})),
+        ] {
+            let (status, body) = served
+                .call(reqwest::Method::POST, &format!("/api/memory/{action}"), Some(args))
+                .await;
+            assert_eq!(status, 403, "{action}: {body}");
+            assert_eq!(at(&json(&body), "/error"), "tool execution denied by policy");
+            let rows = served.tool_audit(&format!("memory_{action}"));
+            assert_eq!(rows.len(), 1, "{action}: {rows:?}");
+            assert_eq!(
+                at(rows.first().expect("test: terminal audit row"), "/actor/user_id"),
+                owner
+            );
+            assert_eq!(
+                at(rows.first().expect("test: terminal audit row"), "/result/error"),
+                "Denied"
+            );
+            assert_eq!(
+                at(rows.first().expect("test: terminal audit row"), "/result/success"),
+                false
+            );
+        }
+        assert!(served.state.mem.get("c4-note").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_mutations_require_service_approval_and_leave_audit_rows() {
+        let served = serve_config(|config| {
+            config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        })
+        .await;
+        for (action, args) in [("store", note()), ("forget", serde_json::json!({"key": "c4-note"}))] {
+            let (status, body) = served
+                .call(reqwest::Method::POST, &format!("/api/memory/{action}"), Some(args))
+                .await;
+            assert_eq!(status, 403, "{body}");
+            assert_eq!(at(&json(&body), "/error"), "explicit approval grant required");
+            let rows = served.tool_audit(&format!("memory_{action}"));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                at(rows.first().expect("test: terminal audit row"), "/result/error"),
+                "ApprovalDenied"
+            );
+        }
+        assert!(served.state.mem.get("c4-note").await.unwrap().is_none());
     }
 
     #[tokio::test]

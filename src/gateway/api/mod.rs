@@ -25,6 +25,7 @@ mod manage;
 mod mcp;
 mod memory;
 mod models;
+mod operations_tools;
 mod plugins;
 mod providers;
 mod runtime;

@@ -112,6 +112,17 @@ impl Served {
         std::fs::read_to_string(self.dir.path().join("config.toml")).expect("test: read config.toml")
     }
 
+    /// Terminal execution-service audit rows, excluding resource-gate events.
+    pub(super) fn tool_audit(&self, capability: &str) -> Vec<serde_json::Value> {
+        let config = self.state.config.load_full();
+        std::fs::read_to_string(config.workspace_dir.join(&config.security.audit.log_path))
+            .expect("test: persisted audit ledger")
+            .lines()
+            .map(json)
+            .filter(|row| at(row, "/action/command") == capability)
+            .collect()
+    }
+
     /// The configuration as the next load reads it.
     pub(super) fn loaded(&self) -> Config {
         Config::load_from_path(&self.dir.path().join("config.toml"), self.dir.path().join("workspace"))
