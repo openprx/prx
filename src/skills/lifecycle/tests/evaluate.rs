@@ -1083,7 +1083,8 @@ async fn a_failing_executor_error_reaches_the_receipt() {
         "test: prefix leaves the 400-byte cut inside the multi-byte character"
     );
     assert!(!redacted_head.contains(secret));
-    assert!(redacted_head.contains("[redacted]"));
+    // The general pair pass masks the URL pass's placeholder again.
+    assert!(redacted_head.contains("[REDACTED]"));
     assert!(redacted_head.contains(path));
     // U+00E9 is two bytes. It starts at byte 399 of the redacted text, so byte
     // 400 is inside the character and the cut must step back to 399.

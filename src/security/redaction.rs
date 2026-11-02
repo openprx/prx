@@ -1752,7 +1752,7 @@ mod tests {
             let mut plain =
                 format!("{name_quote}{plain_name}{name_quote}{separator}{value_quote}{secret}{value_quote}");
             for level in 0..depth {
-                plain = format!("context{level}: {plain}");
+                plain = format!("{name_quote}context{level}{name_quote}{separator}{value_quote}{plain}{value_quote}");
             }
             plain = format!("é context: {plain} https://example.com/path/{case}?page=2");
             assert_eq!(redact_secrets(&plain), plain, "plain case {case}");

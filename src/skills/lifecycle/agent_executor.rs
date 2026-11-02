@@ -869,8 +869,8 @@ fn scratch_bytes(root: &Path) -> Result<u64, EvaluationError> {
 /// text so a later red run names the site. Verdicts keep the error class
 /// only. The response body stays empty.
 ///
-/// `redact_secrets` treats `https:` as a keyed pair and never sees a `?key=`
-/// inside that value, so URL query values are masked first.
+/// Mask whole URL components before the general secret pass. That pass may
+/// normalize the URL pass's lowercase placeholder to its canonical marker.
 fn executor_failure_detail(error: &anyhow::Error) -> String {
     let shown = format!("{error:#}");
     let urls = crate::security::redaction::redact_url_components(&shown);
