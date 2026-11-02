@@ -817,7 +817,8 @@ impl CostTracker {
     /// Idempotently project a canonical terminal usage settlement into the
     /// persistent cost ledger. Unknown price remains explicit, never zero.
     /// A subscription-billed row with no dollar amount returns
-    /// [`CostSettlement::Subscription`] and writes no cost row.
+    /// [`CostSettlement::Subscription`] naming the provider, model, and token
+    /// counts. It writes no priced cost row.
     pub fn settle_metered(
         &self,
         record: &crate::llm::route_decision::MeteredTokenUsageRecord,
@@ -2427,6 +2428,21 @@ mod tests {
     }
 
     #[test]
+    fn subscription_settlement_accepts_legacy_status_only() {
+        let settlement: CostSettlement = serde_json::from_str(r#"{"status":"subscription"}"#).unwrap();
+        assert_eq!(
+            settlement,
+            CostSettlement::Subscription {
+                provider: String::new(),
+                model: String::new(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            }
+        );
+    }
+
+    #[test]
     fn subscription_usage_is_not_recorded_as_unknown_pricing_or_zero() {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::for_workspace(enabled_config(), tmp.path()).unwrap();
@@ -2434,7 +2450,22 @@ mod tests {
         record.provider = "kimi-code".to_string();
         record.model = "kimi-for-coding".to_string();
         let settlement = tracker.settle_metered(&record).unwrap();
-        assert_eq!(settlement, CostSettlement::Subscription);
+        assert_eq!(
+            settlement,
+            CostSettlement::Subscription {
+                provider: "kimi-code".to_owned(),
+                model: "kimi-for-coding".to_owned(),
+                prompt_tokens: record.prompt_tokens,
+                completion_tokens: record.completion_tokens,
+                total_tokens: record.total_tokens,
+            }
+        );
+        let encoded = serde_json::to_value(&settlement).unwrap();
+        assert_eq!(
+            encoded.get("status").and_then(serde_json::Value::as_str),
+            Some("subscription")
+        );
+        assert!(encoded.get("cost_usd").is_none(), "{encoded}");
         assert_eq!(tracker.get_summary().unwrap().request_count, 0);
         let ledger = tmp.path().join("state").join("costs.jsonl");
         if ledger.exists() {

@@ -44,14 +44,20 @@ For a metered model outcome, the terminal path:
 Priced projection is durable and idempotent by settlement id. A matching replay
 returns `replayed`; conflicting usage is refused. Missing pricing returns
 `unknown_pricing`, never a zero-cost substitute. A catalog row marked
-`billing = "subscription"` has no token amount: the turn usage ledger returns
-`subscription` and does not append a dollar row. An operator `[cost.prices]`
-override still prices that model as a token charge. A decision attempt
-reconciles its reserved hold; for a subscription model that hold is zero
-micro-USD. Canonical incurred usage is projected even when optional tracking
+`billing = "subscription"` has no token amount. A turn and a decision attempt
+both return `subscription` with the provider, model, and token counts, and
+neither appends a dollar row. An operator `[cost.prices]` override still
+prices that model as a token charge. A subscription decision attempt
+reconciles its reserved hold at zero micro-USD without a priced cost row.
+Canonical incurred usage is projected even when optional tracking
 is disabled; disabling reporting does not erase a charge. Projection failure
 remains an explicit terminal settlement result and is not evidence that no
 provider cost was incurred.
+
+Physical subscription settlements use versioned `subscription_settled_v1`
+reservation-journal entries. Existing journals remain readable. After such a
+settlement, a binary without that event type cannot replay the journal; rollback
+must retain a compatible reader and preserve the accounting journal.
 
 On Unix the cost ledger and lock reject symlinks, shared hard links, non-regular
 files and files/directories writable by other accounts. Appends sync the ledger

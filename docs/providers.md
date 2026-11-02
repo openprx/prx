@@ -122,8 +122,12 @@ catalog does not cover have no catalog allowlist.
 A catalog row may set `billing` to `subscription`. The field is optional;
 omitted rows are per-token. A subscription row must not include a `pricing`
 object. G6 admits the row and records no per-token charge. Admission logs
-`subscription-billed, no per-token cost recorded`. The turn cost ledger status
-is `subscription`, not `unknown_pricing` and not a zero-dollar usage row.
+`subscription-billed, no per-token cost recorded`. The cost ledger status is
+`subscription`, not `unknown_pricing` and not a zero-dollar usage row. The
+settlement names the provider, the model, and the token counts, and it carries
+no price. A turn and a decision attempt record
+that same settlement. The decision attempt also reconciles its reserved hold
+at zero micro-USD and does not write a priced row.
 `prx doctor` and `prx providers test` show the same line.
 
 Kimi Code, OpenAI Codex, and GitHub Copilot rows are subscription-billed.
