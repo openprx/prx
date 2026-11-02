@@ -2555,6 +2555,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn selecting_unpriced_default_warns_without_changing_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = loaded(dir.path(), |_| {}).await;
+        let service = service_for(config);
+        let unpriced = service
+            .plan(
+                &ManagedChange::SetDefault {
+                    operation: SelectionOperation::Chat,
+                    provider: "openrouter".into(),
+                    model: "deepseek/deepseek-v3.2".into(),
+                    settings: None,
+                    root_credential: RootCredential::Refuse,
+                },
+                ConfigActor::Cli,
+            )
+            .await
+            .unwrap();
+        assert!(unpriced.warnings().iter().any(|warning| {
+            warning.contains("G6 budget admission refuses unpriced model")
+                && warning.contains(r#"[cost.prices."deepseek/deepseek-v3.2"]"#)
+        }));
+    }
+
     #[test]
     fn an_unresolvable_provider_is_refused_without_echoing_it() {
         let config = Config::default();

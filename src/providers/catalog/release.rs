@@ -536,9 +536,10 @@ impl ReleaseCatalog {
 
     /// Active model spellings for one provider: `api_model` plus aliases.
     ///
-    /// `None` when the catalog does not cover `provider`. Server-defined
-    /// placeholders (`default`, `*`) stay in the set when they are active
-    /// rows; they are not a closed list of every id the server can run.
+    /// `None` when the catalog does not cover `provider`. An active row whose
+    /// `api_model` is `default` stays in the set. A wildcard `api_model` of
+    /// `*` is not active and is left out. The set is not every id the server
+    /// can run.
     #[must_use]
     pub fn active_allowlist(&self, provider: &str) -> Option<BTreeSet<String>> {
         let provider_name = self.provider_name(provider)?;
