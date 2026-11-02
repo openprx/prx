@@ -1630,46 +1630,62 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancel_kills_descendant_process_group() {
-        let temp = TempDir::new().unwrap();
-        let state = test_state(&temp);
-        let cancellation = CancellationToken::new();
-        let cancellation_for_task = cancellation.clone();
-        let state_for_task = state.clone();
-        let task = tokio::spawn(async move {
-            let command = parse_command("sh -c 'sleep 30 & echo $! > descendant.pid; wait'").unwrap();
-            execute_shell_command(
-                &state_for_task,
-                &command,
-                Some(state_for_task.sandbox_root.path.clone()),
-                None,
-                Duration::from_secs(30),
-                "process-tree",
-                cancellation_for_task,
-            )
-            .await
-        });
-        let pid_path = state.sandbox_root.path.join("descendant.pid");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !pid_path.exists() {
+        // Whole-test safety net only: PID publication and OS reaping decide readiness.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let temp = TempDir::new().unwrap();
+            let state = test_state(&temp);
+            let cancellation = CancellationToken::new();
+            let cancellation_for_task = cancellation.clone();
+            let state_for_task = state.clone();
+            let task = tokio::spawn(async move {
+                // Outlive the safety net so natural exit cannot substitute for cancellation.
+                let command = parse_command(
+                    "sh -c 'sleep 300 & echo $! > descendant.pid.tmp && mv descendant.pid.tmp descendant.pid; wait'",
+                )
+                .unwrap();
+                execute_shell_command(
+                    &state_for_task,
+                    &command,
+                    Some(state_for_task.sandbox_root.path.clone()),
+                    None,
+                    Duration::from_secs(30),
+                    "process-tree",
+                    cancellation_for_task,
+                )
+                .await
+            });
+            let pid_path = state.sandbox_root.path.join("descendant.pid");
+            let descendant_pid = loop {
+                match std::fs::read_to_string(&pid_path) {
+                    Ok(line) => {
+                        if line.ends_with('\n')
+                            && let Ok(pid) = line.trim().parse::<u32>()
+                            && pid > 0
+                        {
+                            break pid;
+                        }
+                    }
+                    Err(error) => assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound,
+                        "test: read published descendant pid: {error}"
+                    ),
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+
+            cancellation.cancel();
+            let result = task.await.unwrap();
+
+            assert!(result.cancelled);
+            // execute_shell_command awaited the leader's terminate_and_reap. Init
+            // owns descendant reaping, so observe /proc without a second phase budget.
+            while Path::new("/proc").join(descendant_pid.to_string()).exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .unwrap();
-        let descendant_pid = std::fs::read_to_string(&pid_path).unwrap();
-        let descendant_pid = descendant_pid.trim();
-
-        cancellation.cancel();
-        let result = task.await.unwrap();
-
-        assert!(result.cancelled);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while Path::new("/proc").join(descendant_pid).exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        .expect("test: node process cancellation whole-test safety net expired");
     }
 
     #[cfg(unix)]

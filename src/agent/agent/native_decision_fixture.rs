@@ -18,12 +18,19 @@ struct State {
     child_target: Option<&'static str>,
     requests: parking_lot::Mutex<Vec<Value>>,
     replies: parking_lot::Mutex<Vec<Result<Value, String>>>,
+    response_wall_stall: parking_lot::Mutex<Option<std::time::Duration>>,
 }
 async fn reply(
     axum::extract::State(state): axum::extract::State<Arc<State>>,
     axum::Json(body): axum::Json<Value>,
 ) -> axum::response::Response {
     state.requests.lock().push(body.clone());
+    let stall = state.response_wall_stall.lock().take();
+    if let Some(delay) = stall {
+        // Simulate OS preemption after the actual request arrives. Paused fixture
+        // clocks must not charge this wall stall to admission or transport time.
+        std::thread::sleep(delay);
+    }
     let result = (|| {
         let (action, target) = if let Some(child_target) = state.child_target {
             let candidates = body
@@ -88,6 +95,7 @@ impl Driver {
             child_target,
             requests: parking_lot::Mutex::new(Vec::new()),
             replies: parking_lot::Mutex::new(Vec::new()),
+            response_wall_stall: parking_lot::Mutex::new(None),
         });
         let stop = CancellationToken::new();
         let shutdown = stop.clone();
@@ -111,6 +119,9 @@ impl Driver {
     pub(crate) fn retain_evidence_at(mut self, directory: std::path::PathBuf) -> Self {
         self.diagnostics_dir = Some(directory);
         self
+    }
+    pub(crate) fn stall_next_response(&self, delay: std::time::Duration) {
+        *self.state.response_wall_stall.lock() = Some(delay);
     }
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint

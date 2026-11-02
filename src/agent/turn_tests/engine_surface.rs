@@ -1249,6 +1249,14 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
     let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
         .await
         .expect("owned mechanics decision listener");
+
+    driver.stall_next_response(Duration::from_millis(
+        mechanics_config
+            .causal_tree
+            .policy
+            .extra_latency_budget_ms
+            .saturating_add(1),
+    ));
     let endpoint = driver.endpoint().to_owned();
     driver
         .run_factory(true, || async {
@@ -1260,19 +1268,35 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
             let drained = cleanup
                 .run(q79_boxed_fixture_work(async {
                     let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
-                        // Admission uses a real compatible loopback endpoint; restore the
-                        // virtual clock only after that I/O, before the watchdog is armed.
-                        tokio::time::resume();
-                        let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
-                            mechanics_config,
-                            input,
-                            Arc::clone(&tools_registry),
-                            mechanics_memory,
-                            &endpoint,
-                            &provider,
-                        )
+                        // Admission owns real TCP/SQLite work. Keep Tokio runnable until
+                        // that future is ready so paused time cannot auto-advance its
+                        // transport timers while I/O is pending. The decision clock
+                        // independently keeps wall preemption out of its policy budget.
+                        let admission_started = tokio::time::Instant::now();
+                        let decision_clock = crate::causal_tree::logical_clock::ManualClock::new();
+                        let admission = crate::causal_tree::logical_clock::scope(decision_clock, async {
+                            let admitting = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
+                                mechanics_config,
+                                input,
+                                Arc::clone(&tools_registry),
+                                mechanics_memory,
+                                &endpoint,
+                                &provider,
+                            );
+                            tokio::pin!(admitting);
+                            loop {
+                                if let std::task::Poll::Ready(admitted) = futures::poll!(&mut admitting) {
+                                    break admitted;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        })
                         .await;
-                        tokio::time::pause();
+                        assert_eq!(
+                            tokio::time::Instant::now(),
+                            admission_started,
+                            "real admission I/O must finish before virtual watchdog time advances"
+                        );
                         admission.assert_core_specs(&tool_specs_of(&tools_registry));
                         let observer = NoopObserver;
 
@@ -1323,11 +1347,6 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
                         })
                         .await
                         .expect_err("a turn silent for longer than the whole window must be terminated");
-                        // The watchdog assertion above uses virtual time. Queue
-                        // shutdown below awaits real SQLite / blocking work; do
-                        // not let an idle virtual clock skip its drain deadline.
-                        tokio::time::resume();
-
                         assert!(
                             crate::agent::idle::is_hang_termination(&error),
                             "the stall must surface as a hang termination, got: {error}"
@@ -1344,6 +1363,9 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
                     }))
                     .catch_unwind()
                     .await;
+                    // Drain real writes on real time after either the watchdog
+                    // verdict or a fixture panic; the 15-second drain is unchanged.
+                    tokio::time::resume();
                     if let Err(panic) = caught {
                         original_panic = Some(panic);
                     }

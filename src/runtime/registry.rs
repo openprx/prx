@@ -1809,43 +1809,56 @@ mod tests {
 
     #[tokio::test]
     async fn kill_reaches_grandchildren_through_the_process_group() {
-        let dir = tempfile::tempdir().expect("test: tempdir");
-        let pid_file = dir.path().join("grandchild.pid");
-        // `sh` forks `sleep` and then waits: killing only the direct child
-        // would leave the grandchild running, which is exactly what `killpg`
-        // is here to prevent.
-        let script = format!("sleep 300 & echo $! > '{}'; wait", pid_file.display());
-        let mut child = spawn_registered("sh", &["-c", &script]);
+        // Whole-test safety net only: PID publication and OS reaping decide readiness.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().expect("test: tempdir");
+            let pid_file = dir.path().join("grandchild.pid");
+            // `sh` forks `sleep` and then waits: killing only the direct child
+            // would leave the grandchild running, which is exactly what `killpg`
+            // is here to prevent.
+            let script = format!(
+                "sleep 300 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; wait",
+                pid_file.display()
+            );
+            let mut child = spawn_registered("sh", &["-c", &script]);
 
-        assert!(
-            eventually(|| pid_file.exists()).await,
-            "test: grandchild pid file must appear"
-        );
-        let grandchild: u32 = std::fs::read_to_string(&pid_file)
-            .expect("test: read pid file")
-            .trim()
-            .parse()
-            .expect("test: parse grandchild pid");
-        assert!(pid_exists(grandchild), "test: grandchild should be alive to start with");
+            let grandchild = loop {
+                match std::fs::read_to_string(&pid_file) {
+                    Ok(line) => {
+                        if line.ends_with('\n')
+                            && let Ok(pid) = line.trim().parse::<u32>()
+                            && pid > 0
+                        {
+                            break pid;
+                        }
+                    }
+                    Err(error) => assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound,
+                        "test: read published descendant pid: {error}"
+                    ),
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(pid_exists(grandchild), "test: grandchild should be alive to start with");
 
-        let leader = snapshot_all()
-            .into_iter()
-            .find(|snapshot| snapshot.name.starts_with("sh -c sleep 300 &"))
-            .expect("test: leader must be registered");
-        assert!(leader.pgid.is_some(), "the leader must lead its own process group");
+            let leader = find_by_name(&format!("sh -c {script}")).expect("test: leader must be registered");
+            assert!(leader.pgid.is_some(), "the leader must lead its own process group");
 
-        let results = kill(leader.id, false).await;
-        assert_eq!(results.first().map(|result| result.outcome), Some(KillOutcome::Killed));
+            let results = kill(leader.id, false).await;
+            assert_eq!(results.first().map(|result| result.outcome), Some(KillOutcome::Killed));
 
-        // The grandchild is reparented to init on death, so it disappears
-        // outright rather than lingering as our zombie.
-        assert!(
-            eventually(|| !pid_exists(grandchild)).await,
-            "killing the group must take the grandchild with it"
-        );
+            child.wait().await.expect("test: reap killed group leader");
 
-        let _ = child.wait().await;
-        child.mark_complete();
+            // The leader's wait cannot reap its child: init owns the grandchild now.
+            // Observe that independent OS signal under the same whole-test safety net.
+            while pid_exists(grandchild) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            child.mark_complete();
+        })
+        .await
+        .expect("test: process-group kill whole-test safety net expired");
     }
 
     #[tokio::test]
