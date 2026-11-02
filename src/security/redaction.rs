@@ -24,6 +24,9 @@
 //! - nested credential pairs after plain context names, including anyhow
 //!   error chains, and URL credential query values (with decoded names),
 //!   found before generic pair scanning using original input offsets;
+//!   this fails safe by also masking credential-like prose/path values:
+//!   `error: Token: expired` and `path=/var/run/token:abc` lose `expired`
+//!   and `abc`, respectively, even when they are not credentials;
 //! - the credential after any `Authorization:` / `Proxy-Authorization:`
 //!   scheme (`Bearer`, `Basic`, `Bot`, `SSWS`, `ApiKey`, `AWS4-HMAC-SHA256`,
 //!   ...) and after a bare `Bearer`, at any length;
@@ -1680,7 +1683,7 @@ mod tests {
         );
     }
 
-    /// Mutation: stop scanning at an outer value, truncate a value, or return normalized offsets.
+    /// Mutation: skip nested/URL spans, redact a plain context value, or discard a URL's page parameter.
     #[test]
     fn generated_nested_pairs_cover_every_secret_value() {
         let mut state = 0x6a09_e667_f3bc_c909_u64;
@@ -1740,6 +1743,51 @@ mod tests {
                 "case {case}, depth {depth}: {text:?} -> {spans:?}"
             );
             assert!(!redact_secrets(&text).contains(&secret), "case {case}: {text:?}");
+
+            let plain_names = ["context", "tokenizer", "secretary", "author", "sort_key", "public_key"];
+            let plain_name = plain_names
+                .get(usize::try_from(next()).unwrap_or(0) % plain_names.len())
+                .copied()
+                .expect("test: generated plain name");
+            let mut plain =
+                format!("{name_quote}{plain_name}{name_quote}{separator}{value_quote}{secret}{value_quote}");
+            for level in 0..depth {
+                plain = format!("context{level}: {plain}");
+            }
+            plain = format!("é context: {plain} https://example.com/path/{case}?page=2");
+            assert_eq!(redact_secrets(&plain), plain, "plain case {case}");
+
+            let query_name = if (next() >> 32) & 1 == 0 {
+                name.replace('_', "%5F")
+            } else {
+                name.to_owned()
+            };
+            let query_secret = format!("prx7query{:016x}end", next());
+            let userinfo_secret = format!("prx7password{:016x}end", next());
+            let url = format!(
+                "https://prx_user:{userinfo_secret}@example.com/path/{case}?page=2&{query_name}={query_secret}&region=eu"
+            );
+            let text = format!("é context{depth}: redirect={url}");
+            let spans = find_secrets(&text);
+            for secret in [&userinfo_secret, &query_secret] {
+                let start = text.find(secret).expect("test: generated URL secret");
+                assert!(
+                    spans
+                        .iter()
+                        .any(|span| span.start <= start && span.end >= start + secret.len()),
+                    "URL case {case}: {text:?} -> {spans:?}"
+                );
+            }
+            let redacted = redact_secrets(&text);
+            assert!(!redacted.contains(&userinfo_secret), "URL case {case}: {redacted}");
+            assert!(!redacted.contains(&query_secret), "URL case {case}: {redacted}");
+            assert_eq!(
+                redacted,
+                format!(
+                    "é context{depth}: redirect=https://[redacted]@example.com/path/{case}?page=2&{query_name}=[REDACTED]&region=eu"
+                ),
+                "URL case {case}"
+            );
         }
     }
 

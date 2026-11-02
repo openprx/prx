@@ -467,8 +467,9 @@ impl Channel for DingTalkChannel {
         self.send_proactive(&route, title, &message.content).await.map_err(|e| {
             tracing::error!(
                 recipient = %message.recipient,
+                error = %crate::security::redaction::redact_provider_text(&format!("{e:#}")),
                 "DingTalk reply could not be delivered: the session webhook is unusable and \
-                 the proactive message API failed: {e:#}"
+                 the proactive message API failed"
             );
             e.context(format!(
                 "DingTalk reply to {} could not be delivered by either the session webhook or the proactive API",
@@ -759,6 +760,7 @@ client_secret = "secret"
         token_hits: Arc<AtomicUsize>,
         proactive_hits: Arc<AtomicUsize>,
         proactive_fails: bool,
+        proactive_error: Option<&'static str>,
     }
 
     /// Local stand-in for DingTalk: one session-webhook endpoint, the OpenAPI
@@ -777,7 +779,7 @@ client_secret = "secret"
             if fake.proactive_fails {
                 return (
                     axum::http::StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({"code": "Forbidden.AccessDenied"})),
+                    Json(serde_json::json!({"code": "Forbidden.AccessDenied", "message": fake.proactive_error})),
                 );
             }
             (
@@ -887,6 +889,7 @@ client_secret = "secret"
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn expired_session_webhook_reply_is_delivered_proactively() {
         let fake = FakeDingTalk::default();
         let base = spawn_fake_dingtalk(fake.clone()).await;
@@ -909,6 +912,7 @@ client_secret = "secret"
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn live_session_webhook_is_still_the_fast_path() {
         let fake = FakeDingTalk::default();
         let base = spawn_fake_dingtalk(fake.clone()).await;
@@ -926,6 +930,7 @@ client_secret = "secret"
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn undeliverable_reply_fails_loudly_instead_of_vanishing() {
         let fake = FakeDingTalk {
             proactive_fails: true,
@@ -952,7 +957,60 @@ client_secret = "secret"
         assert_eq!(fake.proactive_hits.load(Ordering::SeqCst), 1);
     }
 
+    /// Mutation: replace the redacted error field in send with `error = %format!("{e:#}")`.
     #[tokio::test]
+    #[serial_test::serial]
+    async fn proactive_send_error_chain_is_redacted_before_logging() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let fake = FakeDingTalk {
+            proactive_fails: true,
+            proactive_error: Some("token=opaque7credentialvalue"),
+            ..FakeDingTalk::default()
+        };
+        let base = spawn_fake_dingtalk(fake.clone()).await;
+        let channel = channel_with_route(&base, route_expiring_at(&base, Some(0))).await;
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        // This current-thread test keeps the subscriber installed across HTTP awaits.
+        // The other send fixtures share the callsite cache and use the same serial lock.
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let error = channel
+            .send(&SendMessage::new("the answer", "chat-1"))
+            .await
+            .expect_err("test: provider refusal must reach the error log");
+
+        assert!(format!("{error:#}").contains("token=opaque7credentialvalue"));
+        assert_eq!(fake.proactive_hits.load(Ordering::SeqCst), 1);
+        let logged = String::from_utf8_lossy(&sink.0.lock()).into_owned();
+        assert!(logged.contains("DingTalk reply could not be delivered"), "{logged}");
+        assert!(logged.contains("[REDACTED]"), "{logged}");
+        assert!(!logged.contains("opaque7credentialvalue"), "{logged}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn session_webhook_refusal_with_http_200_still_falls_back() {
         // The legacy `oapi.dingtalk.com` surface reports a refusal as HTTP 200
         // plus an `errcode`, so a status-only check would call a lost reply

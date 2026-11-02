@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including URL userinfo and credential query values in plain-text secret
   scans. Apply shared redaction before error chains reach diagnostic logs,
   runtime records, tool errors, or operator notices.
+  This deliberately fails safe for credential-like prose and paths:
+  `error: Token: expired` and `path=/var/run/token:abc` also mask the value
+  after `token`, even when it is not a credential.
 
 ### Changed
 
