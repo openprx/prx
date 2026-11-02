@@ -213,8 +213,18 @@ impl Memory for EncryptedScope {
         let session = self
             .crypto
             .mac(&self.account_id, "memory-session", self.scope.as_bytes())?;
+        let owner = self
+            .crypto
+            .mac(&self.account_id, "memory-owner", self.account_id.as_bytes())?;
+        let context = crate::memory::MemoryWriteContext {
+            channel: Some("ramflux".to_owned()),
+            chat_id: Some(session.clone()),
+            sender_id: Some(owner.clone()),
+            owner_id: Some(owner),
+            ..crate::memory::MemoryWriteContext::default()
+        };
         self.inner
-            .store(&self.stored_key(key), &sealed, category, Some(&session))
+            .store_with_context(&self.stored_key(key), &sealed, category, Some(&session), Some(&context))
             .await
     }
 

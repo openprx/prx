@@ -556,3 +556,127 @@ async fn later_trash_and_draft_merge_copies_keep_the_original_erase_origin() {
     backend.finish_delete(&original).unwrap();
     assert_no_canary_in_any_table(&memory);
 }
+
+#[tokio::test]
+async fn r5_scoped_core_memory_never_enters_operator_snapshot() {
+    for encryption in [false, true] {
+        let (dir, memory, view, origin) = populated(encryption).await;
+        view.store("scoped-core", CANARY, MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        memory
+            .store(
+                "operator-control",
+                "operator snapshot positive control",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let stored = memory
+            .list(None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.key.starts_with("rf:") && entry.category == MemoryCategory::Core)
+            .unwrap();
+        let attribution: (Option<String>, Option<String>, Option<String>) = memory
+            .pool
+            .read()
+            .unwrap()
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT channel,owner_id,chat_id FROM memories WHERE key=?1",
+                [&stored.key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(attribution.0.as_deref(), Some("ramflux"));
+        assert!(attribution.1.as_ref().is_some_and(|value| !value.is_empty()));
+        assert!(attribution.2.as_ref().is_some_and(|value| !value.is_empty()));
+        assert_ne!(attribution.1.as_deref(), Some("account"));
+        assert_ne!(attribution.2.as_deref(), Some("account/conversation"));
+        crate::memory::snapshot::export_snapshot(dir.path()).unwrap();
+        let snapshot = std::fs::read_to_string(dir.path().join("MEMORY_SNAPSHOT.md")).unwrap();
+        assert!(snapshot.contains("operator snapshot positive control"));
+        assert!(!snapshot.contains(&stored.key), "scoped key escaped to snapshot");
+        assert!(!snapshot.contains(&stored.content), "scoped bytes escaped to snapshot");
+        assert!(!snapshot.contains(CANARY));
+        let store = memory.erasure_store().unwrap();
+        store.begin_delete(&origin).unwrap();
+        store.erase_rows(&origin).unwrap();
+        memory.checkpoint_wal().await.unwrap();
+        store.finish_delete(&origin).unwrap();
+        assert!(view.get("scoped-core").await.unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("MEMORY_SNAPSHOT.md")).unwrap(),
+            snapshot
+        );
+        let conn = memory.pool.read().unwrap();
+        let conn = conn.connection().unwrap();
+        let attribution: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT channel, chat_id FROM memories WHERE key='operator-control'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attribution, (None, None));
+    }
+}
+
+#[test]
+fn r5_legacy_scoped_snapshot_cannot_resurrect_after_cold_hydration() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("MEMORY_SNAPSHOT.md"),
+        "# Memory Snapshot\n\n### 🔑 `rf:legacy-scope:legacy-record`\n\nscoped legacy bytes\n\n---\n\n### 🔑 `operator-control`\n\noperator survivor\n").unwrap();
+    assert_eq!(crate::memory::snapshot::hydrate_from_snapshot(dir.path()).unwrap(), 1);
+    let conn = rusqlite::Connection::open(dir.path().join("memory/brain.db")).unwrap();
+    let keys = conn
+        .prepare("SELECT key FROM memories ORDER BY key")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(keys, ["operator-control"]);
+}
+
+#[tokio::test]
+async fn r5_legacy_unattributed_scoped_rows_are_excluded_from_snapshot_export() {
+    for operator_row in [true, false] {
+        let (dir, memory) = temp_sqlite();
+        memory
+            .store(
+                "rf:legacy-scope:legacy-record",
+                "legacy scoped bytes",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        if operator_row {
+            memory
+                .store(
+                    "operator-control",
+                    "operator positive control",
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let path = dir.path().join("MEMORY_SNAPSHOT.md");
+        std::fs::write(&path, "### 🔑 `rf:legacy-scope:legacy-record`\n\nlegacy scoped bytes\n").unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("legacy scoped bytes"));
+        assert_eq!(
+            crate::memory::snapshot::export_snapshot(dir.path()).unwrap(),
+            usize::from(operator_row)
+        );
+        let snapshot = std::fs::read_to_string(path).unwrap();
+        assert_eq!(snapshot.contains("operator positive control"), operator_row);
+        assert!(!snapshot.contains("rf:legacy-scope:legacy-record"));
+        assert!(!snapshot.contains("legacy scoped bytes"));
+    }
+}

@@ -260,3 +260,26 @@ backend produce a JSON-RPC error instead of `{erased:true}`.
 | Distinct `turn_timeout` error | Deferred | Budget cancellation currently uses `cancelled`. |
 | Replay across process restart | Deferred | Unacknowledged replay is currently process-local. |
 | Remaining low-priority review findings | Deferred | Cursor/action deduplication, metadata hardening, and bounded-resource refinements remain separate followups. |
+
+### Admission recovery and snapshots
+
+Surface actions enter the same conversation admission policy as messages. An
+immediately admitted action is delivered at its position in the bridge event
+stream; queued actions retain conversation queue order. The forwarder never
+sends an action back into its own bounded input channel.
+
+An erase refusal does not suspend or cancel input. Once an erase is accepted,
+queued work stays suspended until that job succeeds or reports an error. Every
+error releases the admission barrier and deletion marker before the host receives
+the error, so later inputs can run. A begun deletion retains its durable tombstone
+and retry metadata on failure; the host must retry to complete the erasure. Only
+a completed erase returns `erased:true`. A stopped worker follows the same error
+and admission recovery path.
+
+Scoped core memories carry a Ramflux channel, keyed account owner and keyed chat
+identity. They are excluded from the operator snapshot. Export and cold hydration
+also exclude legacy `rf:` keys; hydration rejects Ramflux origin markers. An
+existing snapshot is rewritten even when no operator rows remain, so an older
+scoped-only export cannot survive the next export. Deleting
+a scoped row therefore needs no snapshot mutation. Operator snapshots keep their
+existing operator-only attribution rules.

@@ -72,6 +72,7 @@ const OPERATOR_ROWS_SQL: &str = "SELECT key, content, category, created_at, upda
             owner_id, channel, raw_sender, chat_id
      FROM memories
      WHERE category = 'core'
+       AND key NOT LIKE 'rf:%'
        AND (
             (channel = 'terminal' AND raw_sender = 'user' AND chat_id = 'terminal:user')
             OR (channel = 'cli' AND raw_sender = 'agent' AND chat_id = 'agent:local')
@@ -85,6 +86,7 @@ const LEGACY_ROWS_SQL: &str = "SELECT key, content, category, created_at, update
             NULL, NULL, NULL, NULL
      FROM memories
      WHERE category = 'core'
+       AND key NOT LIKE 'rf:%'
      ORDER BY updated_at DESC";
 
 fn memories_columns(conn: &Connection) -> Result<HashSet<String>> {
@@ -202,7 +204,7 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
         .filter_map(|r| r.ok())
         .collect();
 
-    if rows.is_empty() {
+    if rows.is_empty() && !snapshot_path(workspace_dir).exists() {
         tracing::debug!("snapshot export: no core memories to export");
         return Ok(0);
     }
@@ -727,6 +729,15 @@ fn collect_hydration_entries(workspace_dir: &Path) -> Result<Vec<(String, String
         }
     }
 
+    // Scoped rows have durable message ownership in their source database.
+    // A snapshot cannot recreate that index, so never hydrate these copies,
+    // including old exports written before scope attribution existed.
+    hydrated.retain(|(key, _, _, origin)| {
+        !key.starts_with("rf:")
+            && origin
+                .as_ref()
+                .is_none_or(|origin| origin.channel.as_deref() != Some("ramflux"))
+    });
     Ok(hydrated)
 }
 
