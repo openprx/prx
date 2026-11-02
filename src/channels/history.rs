@@ -142,6 +142,11 @@ pub(super) async fn append_sender_turn(
     record_message_event: bool,
     memory: &Arc<dyn Memory>,
 ) -> Option<crate::memory::MessageEvent> {
+    let generated_timestamp = chrono::Utc::now().to_rfc3339();
+    let timestamp = timestamp.or(Some(generated_timestamp.as_str()));
+    if let Some(rich) = ctx.channels_by_name.get(channel).and_then(|channel| channel.as_rich()) {
+        rich.record_history_session(recipient.unwrap_or(sender), &key.canonical);
+    }
     let role = turn.role.clone();
     // The reply is persisted (conversation turn and message event) redacted like
     // the terminal commit (D-053); the live history keeps the delivered text.
@@ -222,7 +227,13 @@ pub(super) async fn append_sender_turn(
             .record_inbound_user_message(
                 scope,
                 content,
-                message_id.map(|id| format!("channel:{channel}:{id}")),
+                message_id.map(|id| {
+                    ctx.channels_by_name
+                        .get(channel)
+                        .and_then(|channel| channel.as_rich())
+                        .and_then(|rich| rich.inbound_idempotency_key(recipient.unwrap_or(sender), id))
+                        .unwrap_or_else(|| format!("channel:{channel}:{id}"))
+                }),
                 None,
             )
             .await

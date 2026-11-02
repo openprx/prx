@@ -654,6 +654,7 @@ pub(crate) enum AgentTurnKind {
 /// The immutable result of one source-bound decision chain. Only the service
 /// constructs it; later record and execution streams consume these facts.
 pub(crate) struct TurnDecisionContext {
+    _event_memory: Arc<super::causal_events::routes::EventMemory>,
     model_catalog: Option<Arc<crate::providers::catalog::ReleaseCatalog>>,
     owner_filesystem: Option<Arc<crate::tools::owner_filesystem::OwnerFilesystem>>,
     accounting: Option<Arc<crate::runtime::decision_accounting::AccountingScope>>,
@@ -1341,6 +1342,8 @@ pub(crate) enum AgentDecisionError {
     DelegationStorage(#[source] anyhow::Error),
     #[error("ordinary delegation scope could not be verified")]
     DelegationScope(#[source] anyhow::Error),
+    #[error("decision event memory could not be bound to its source")]
+    EventMemory(#[source] anyhow::Error),
     #[error("durable ingress recovery is not ready")]
     IngressRecovery(#[source] anyhow::Error),
     #[cfg(feature = "llm-router")]
@@ -2275,6 +2278,19 @@ impl TurnDecisionService {
         if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
         }
+        let event_namespace = self
+            .store
+            .workspace_id()
+            .unwrap_or_else(|| Arc::from(self.generation.effective.workspace_dir.to_string_lossy().as_ref()));
+        let event_memory = super::causal_events::routes::register(
+            &event_namespace,
+            proof.workspace_id(),
+            proof.run_id(),
+            Arc::clone(&self.memory),
+            self.generation.id.0,
+            &self.generation.source_revision.fingerprint_sha256,
+        )
+        .map_err(AgentDecisionError::EventMemory)?;
         let model = self.resolve_agent_model(proof)?;
         super::ingress_recovery::service_ready(self)
             .await
@@ -2618,6 +2634,7 @@ impl TurnDecisionService {
                 return Err(AgentDecisionError::Cancelled);
             }
             Ok(Arc::new(TurnDecisionContext {
+                _event_memory: Arc::clone(&event_memory),
                 model_catalog: self.provider_catalog.release_pin(),
                 resume: None,
                 accounting: accounting.retained_scope(),
@@ -2675,6 +2692,7 @@ impl TurnDecisionService {
                 };
                 return Ok((
                     Arc::new(TurnDecisionContext {
+                        _event_memory: Arc::clone(&event_memory),
                         model_catalog: self.provider_catalog.release_pin(),
                         resume: None,
                         accounting: accounting.retained_scope(),
@@ -2950,6 +2968,7 @@ impl TurnDecisionService {
                     }
                     return Ok((
                         Arc::new(TurnDecisionContext {
+                            _event_memory: Arc::clone(&event_memory),
                             model_catalog: self.provider_catalog.release_pin(),
                             resume: None,
                             accounting: accounting.retained_scope(),
@@ -2995,6 +3014,7 @@ impl TurnDecisionService {
                     }
                     return Ok((
                         Arc::new(TurnDecisionContext {
+                            _event_memory: Arc::clone(&event_memory),
                             model_catalog: self.provider_catalog.release_pin(),
                             resume: None,
                             accounting: accounting.retained_scope(),
@@ -3051,6 +3071,7 @@ impl TurnDecisionService {
                     }
                     return Ok((
                         Arc::new(TurnDecisionContext {
+                            _event_memory: Arc::clone(&event_memory),
                             model_catalog: self.provider_catalog.release_pin(),
                             resume: None,
                             accounting: accounting.retained_scope(),
@@ -3522,6 +3543,11 @@ pub(crate) async fn build_turn_decision_service(
         durable_key,
     )
     .await?;
+    if let (Some(events), Some(namespace)) = (&durable_events, store.workspace_id()) {
+        events
+            .bind_store_namespace(namespace)
+            .map_err(TurnServiceBuildError::EventNamespace)?;
+    }
     let state_key = workspace_key.clone().unwrap_or_else(DecisionKey::ephemeral);
     let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
         .map_err(TurnServiceBuildError::PolicyFingerprint)?;

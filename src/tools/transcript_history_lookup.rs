@@ -97,6 +97,7 @@ impl Tool for TranscriptHistoryLookupTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let memory_view = crate::memory::active_view::select(&self.memory);
         let principal = Self::trusted_principal(&args)?;
         let session_key = principal.session_key.clone().unwrap_or_default();
         let ids = args
@@ -139,8 +140,7 @@ impl Tool for TranscriptHistoryLookupTool {
         let mut found = HashMap::new();
         let mut cursor = first_row_id.saturating_sub(1);
         while cursor < last_row_id && found.len() < wanted.len() {
-            let page = self
-                .memory
+            let page = memory_view
                 .list_message_events_since(&principal, cursor, PAGE_SIZE)
                 .await?;
             if page.is_empty() {

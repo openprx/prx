@@ -91,6 +91,7 @@ impl Tool for MemoryRecallTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let memory = crate::memory::active_view::current().unwrap_or_else(|| Arc::clone(&self.memory));
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
@@ -143,11 +144,11 @@ impl Tool for MemoryRecallTool {
                 require_owner_match: false,
             });
             scope_ctx.require_owner_match = isolated;
-            self.memory
+            memory
                 .recall_with_context(query, limit, session_id, Some(&scope_ctx))
                 .await
         } else {
-            self.memory.recall(query, limit, session_id).await
+            memory.recall(query, limit, session_id).await
         };
 
         match recall_result {

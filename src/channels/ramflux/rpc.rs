@@ -32,6 +32,7 @@ pub enum RpcFailure {
 
 struct Pending {
     method: String,
+    turn_id: String,
     body: Vec<u8>,
     waiter: Option<oneshot::Sender<Result<Value, RpcFailure>>>,
 }
@@ -48,6 +49,7 @@ pub struct RpcHub {
     writer: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     pending: Mutex<HashMap<String, Pending>>,
     replay: Mutex<VecDeque<String>>,
+    erased_turns: Mutex<std::collections::HashSet<String>>,
     dedupe: Mutex<VecDeque<DedupeEntry>>,
     #[cfg(test)]
     writer_hold: Mutex<Option<crate::memory::sqlite::WriterHold>>,
@@ -65,6 +67,7 @@ impl RpcHub {
             writer: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             replay: Mutex::new(VecDeque::new()),
+            erased_turns: Mutex::new(std::collections::HashSet::new()),
             dedupe: Mutex::new(VecDeque::new()),
             #[cfg(test)]
             writer_hold: Mutex::new(None),
@@ -144,11 +147,16 @@ impl RpcHub {
         let body = encode_bridge_call(&id, method, &params)?;
         let (tx, rx) = oneshot::channel();
         {
+            let erased = self.erased_turns.lock();
+            if erased.contains(turn_id) {
+                return Err(RpcFailure::ConnectionLost);
+            }
             let mut pending = self.pending.lock();
             pending.insert(
                 key.clone(),
                 Pending {
                     method: method.to_string(),
+                    turn_id: turn_id.to_owned(),
                     body: body.clone(),
                     waiter: Some(tx),
                 },
@@ -215,6 +223,27 @@ impl RpcHub {
         }
     }
 
+    /// Remove reply bodies and prevent later emissions for erased turns.
+    pub fn fence_turns(&self, runs: &[String]) {
+        if runs.is_empty() {
+            return;
+        }
+        let mut erased = self.erased_turns.lock();
+        tracing::debug!(?runs, "ramflux turn replay fence");
+        erased.extend(runs.iter().cloned());
+        let mut pending = self.pending.lock();
+        pending.retain(|_, entry| {
+            if !erased.contains(&entry.turn_id) {
+                return true;
+            }
+            if let Some(waiter) = entry.waiter.take() {
+                let _ = waiter.send(Err(RpcFailure::ConnectionLost));
+            }
+            false
+        });
+        self.replay.lock().retain(|id| pending.contains_key(id));
+    }
+
     /// Resend unacknowledged `reply.*` frames after a new hello.
     pub async fn flush_replay(&self) {
         let bodies: Vec<Vec<u8>> = {
@@ -277,7 +306,19 @@ impl RpcHub {
         let Some(writer) = writer else {
             return Err(RpcFailure::ConnectionLost);
         };
-        writer.send(body).await.map_err(|_| RpcFailure::ConnectionLost)
+        let permit = writer.reserve().await.map_err(|_| RpcFailure::ConnectionLost)?;
+        let value: Value = serde_json::from_slice(&body).map_err(ProtocolError::Json)?;
+        let erased = self.erased_turns.lock();
+        if value
+            .get("params")
+            .and_then(|params| params.get("turn_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|turn| erased.contains(turn))
+        {
+            return Err(RpcFailure::ConnectionLost);
+        }
+        permit.send(body);
+        Ok(())
     }
 
     fn fail_emit(&self, key: &str, method: &str) {

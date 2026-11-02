@@ -116,6 +116,7 @@ impl Tool for MemoryForgetTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let memory = crate::memory::active_view::current().unwrap_or_else(|| Arc::clone(&self.memory));
         let key = args
             .get("key")
             .and_then(|v| v.as_str())
@@ -155,7 +156,7 @@ impl Tool for MemoryForgetTool {
             context.require_owner_match = isolated;
             scope_ctx = Some(context);
         }
-        match self.memory.forget_with_context(key, scope_ctx.as_ref()).await {
+        match memory.forget_with_context(key, scope_ctx.as_ref()).await {
             Ok(true) => Ok(ToolResult {
                 success: true,
                 output: format!("Forgot memory: {key}"),

@@ -49,7 +49,8 @@ impl NodesTool {
     }
 
     fn memory_fabric(&self) -> Option<MemoryFabric> {
-        self.memory.as_ref().map(|memory| {
+        let memory_view = crate::memory::active_view::select_optional(&self.memory);
+        memory_view.as_ref().map(|memory| {
             MemoryFabric::new(memory.clone(), self.security.workspace_dir.to_string_lossy())
                 .with_event_recording(self.event_recording)
         })

@@ -28,11 +28,18 @@ pub enum ApprovalOutcome {
 }
 
 /// Waits for `approval.decision` and implements [`ApprovalResolver`].
+struct Pending {
+    sender: super::super::rich::Sender,
+    conversation: String,
+    tx: oneshot::Sender<ApprovalOutcome>,
+}
+
 pub struct ApprovalGate {
     rpc: Arc<RpcHub>,
     auth: Arc<Authority>,
     wait_ms: u64,
-    waiters: Mutex<HashMap<String, oneshot::Sender<ApprovalOutcome>>>,
+    waiters: Mutex<HashMap<String, Pending>>,
+    senders: Mutex<HashMap<String, super::super::rich::Sender>>,
 }
 
 impl ApprovalGate {
@@ -43,20 +50,48 @@ impl ApprovalGate {
             auth,
             wait_ms: wait_ms.max(1),
             waiters: Mutex::new(HashMap::new()),
+            senders: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Deliver a host decision. Returns false when no request is waiting.
-    pub fn decide(&self, approval_id: &str, decision: ApprovalDecisionKind) -> bool {
-        let Some(waiter) = self.waiters.lock().remove(approval_id) else {
+    pub fn bind_sender(&self, turn: &str, sender: super::super::rich::Sender) {
+        self.senders.lock().insert(turn.to_owned(), sender);
+    }
+    pub fn unbind_sender(&self, turn: &str) {
+        self.senders.lock().remove(turn);
+    }
+
+    /// Only the host's explicit decision from the initiating principal/device
+    /// in this conversation can resolve the outstanding request.
+    pub fn decide(
+        &self,
+        approval_id: &str,
+        decision: ApprovalDecisionKind,
+        conversation: &str,
+        sender: &super::super::rich::Sender,
+    ) -> bool {
+        let mut waiters = self.waiters.lock();
+        let Some(pending) = waiters.get(approval_id) else {
             return false;
         };
+        if pending.conversation != conversation
+            || pending.sender.principal_id != sender.principal_id
+            || pending.sender.device_id != sender.device_id
+            || sender.kind != super::super::rich::SenderKind::Human
+            || sender.trust != super::super::rich::Trust::Verified
+        {
+            return false;
+        }
+        let Some(pending) = waiters.remove(approval_id) else {
+            return false;
+        };
+        drop(waiters);
         let outcome = match decision {
             ApprovalDecisionKind::Approved => ApprovalOutcome::Approved,
             ApprovalDecisionKind::Denied => ApprovalOutcome::Denied,
             ApprovalDecisionKind::Expired => ApprovalOutcome::Cancelled,
         };
-        waiter.send(outcome).is_ok()
+        pending.tx.send(outcome).is_ok()
     }
 
     /// Resolve one tool call to the three-way bridge outcome.
@@ -69,6 +104,10 @@ impl ApprovalGate {
             return ApprovalOutcome::Cancelled;
         };
         let turn = (active.conversation_id, active.turn_id);
+        let Some(sender) = self.senders.lock().get(&turn.1).cloned() else {
+            tracing::warn!("ramflux approval has no bound initiating sender");
+            return ApprovalOutcome::Cancelled;
+        };
         let approval_id = Uuid::new_v4().to_string();
         let expires_at_ms = request
             .expires_at_ms
@@ -105,12 +144,30 @@ impl ApprovalGate {
             }
         };
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().insert(approval_id.clone(), tx);
+        self.waiters.lock().insert(
+            approval_id.clone(),
+            Pending {
+                sender,
+                conversation: turn.0.clone(),
+                tx,
+            },
+        );
         let mut guard = WaiterGuard {
             gate: self,
             id: approval_id.clone(),
             armed: true,
         };
+        let status = super::super::rich::TurnStatus {
+            conversation_id: turn.0.clone(),
+            turn_id: turn.1.clone(),
+            state: super::super::rich::TurnState::AwaitingApproval,
+            error: None,
+            approval_id: Some(approval_id.clone()),
+        };
+        if let Err(error) = super::outbound::send_status(&self.rpc, &status).await {
+            tracing::warn!(%error, "ramflux approval status was not sent");
+            return ApprovalOutcome::Cancelled;
+        }
         let ack = self
             .rpc
             .request(protocol::METHOD_APPROVAL_REQUEST, &payload, Duration::from_secs(10))

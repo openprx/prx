@@ -1,10 +1,6 @@
-//! Message-event erase off the socket reader.
-//!
-//! The reader enqueues an [`EraseJob`] and keeps reading. A later task sends
-//! the JSON-RPC result when the oneshot fires. The eraser task is the one
-//! that takes the sqlite writer, so an ingress turn can still finish its ack.
-
+//! Indexed erasure off the socket reader, including its blocking SQLite IO.
 use super::Inner;
+use crate::memory::erasure::{ErasureOrigin, SharedErasureStore};
 use tokio::sync::{mpsc, oneshot};
 
 pub(super) const QUEUE_CAP: usize = 64;
@@ -13,7 +9,6 @@ pub(super) struct EraseJob {
     pub account: String,
     pub conversation: String,
     pub message_ids: Vec<String>,
-    pub run_ids: Vec<String>,
     pub done: oneshot::Sender<Result<(), String>>,
 }
 
@@ -24,57 +19,47 @@ pub(super) async fn run(inner: std::sync::Arc<Inner>, mut jobs: mpsc::Receiver<E
     }
 }
 
-async fn perform(inner: &Inner, job: &EraseJob) -> Result<(), String> {
-    let mut memory_keys = Vec::new();
-    for message_id in &job.message_ids {
-        if let Some(entry) =
-            super::erase_index::load(&inner.store, &inner.crypto, &job.account, &job.conversation, message_id)
-        {
-            memory_keys.extend(entry.memory_keys);
-        }
-        super::hooks::erase_local(inner, &job.account, &job.conversation, message_id).await?;
-    }
-    let attached = inner.attached_memory.lock().clone();
-    let Some(attached) = attached else {
-        return Ok(());
-    };
-    let scoped = inner.scoped_memory(std::sync::Arc::clone(&attached), &job.account, &job.conversation);
-    for key in &memory_keys {
-        scoped.forget(key).await.map_err(|error| error.to_string())?;
-    }
-    for message_id in &job.message_ids {
-        attached
-            .forget_message_idempotency(&format!("channel:ramflux:{message_id}"))
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    for run_id in &job.run_ids {
-        for suffix in ["assistant", "final"] {
-            attached
-                .forget_message_idempotency(&format!("turn:{run_id}:{suffix}"))
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-    }
-    attached.checkpoint_wal().await.map_err(|error| error.to_string())?;
+pub(super) async fn storage<T, F>(store: SharedErasureStore, operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(SharedErasureStore) -> anyhow::Result<T> + Send + 'static,
+{
+    crate::runtime::blocking::spawn_blocking(move || operation(store))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+pub(super) async fn fence_runs(inner: &Inner, store: SharedErasureStore, origin: ErasureOrigin) -> Result<(), String> {
+    let runs = storage(store, move |store| store.run_ids(&origin)).await?;
+    inner.rpc.fence_turns(&runs);
     Ok(())
 }
 
-/// Run ids recorded as `turn:{run}:assistant` or `turn:{run}:final`.
-pub(super) fn run_ids_from_keys(keys: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    for key in keys {
-        let Some(rest) = key.strip_prefix("turn:") else {
-            continue;
-        };
-        let Some((run, suffix)) = rest.rsplit_once(':') else {
-            continue;
-        };
-        if suffix == "assistant" || suffix == "final" {
-            if !out.iter().any(|existing| existing == run) {
-                out.push(run.to_string());
-            }
-        }
+pub(super) async fn perform(inner: &Inner, job: &EraseJob) -> Result<(), String> {
+    let backend = inner.store.backend().map_err(|error| error.to_string())?;
+    let attached = inner
+        .attached_memory
+        .lock()
+        .clone()
+        .ok_or_else(|| "memory is not attached".to_string())?;
+    for message_id in &job.message_ids {
+        let origin = ErasureOrigin::new(&job.account, &job.conversation, message_id);
+        let begin = origin.clone();
+        storage(backend.clone(), move |store| store.begin_delete(&begin)).await?;
+        inner.cancel_message(&job.conversation, message_id);
+        fence_runs(inner, backend.clone(), origin.clone()).await?;
+        inner.wait_message(&job.conversation, message_id).await;
+        fence_runs(inner, backend.clone(), origin.clone()).await?;
+        let erase = origin.clone();
+        storage(backend.clone(), move |store| store.erase_rows(&erase)).await?;
+        super::hooks::erase_local(inner, &job.account, &job.conversation, message_id).await?;
+        attached.checkpoint_wal().await.map_err(|error| error.to_string())?;
+        // Content-free retry metadata is removed only after the data checkpoint.
+        super::erase_index::remove(&inner.store, &job.account, &job.conversation, message_id)
+            .map_err(|error| error.to_string())?;
+        storage(backend.clone(), move |store| store.finish_delete(&origin)).await?;
+        inner.resume_delete(&job.conversation, message_id);
     }
-    out
+    Ok(())
 }

@@ -5,41 +5,19 @@
 
 use super::Inner;
 use crate::channels::rich::{RichReply, SurfaceBlock, SurfaceOp, SurfaceReply};
-use crate::channels::traits::{ChannelMessage, ChatKind};
-
-/// Surface action and task event projected onto the existing channel message.
-pub(super) fn inbound_as_message(
-    id: &str,
-    sender: &str,
-    conversation_id: &str,
-    content: &str,
-    display: Option<String>,
-) -> ChannelMessage {
-    ChannelMessage {
-        id: id.to_string(),
-        sender: sender.to_string(),
-        reply_target: conversation_id.to_string(),
-        content: content.to_string(),
-        channel: "ramflux".to_string(),
-        timestamp: super::socket::unix_ms(),
-        chat_kind: ChatKind::Dm,
-        chat_title: None,
-        sender_display: display,
-        thread_ts: None,
-        mentioned_uuids: Vec::new(),
-        mentioned: false,
-        is_group_hint: false,
-        sender_is_bot: false,
-    }
-}
 
 /// Fetch structured attachments for `message_id` and append multimodal parts.
 ///
 /// Ids come from the inbound attachment list, never from free text. Image
 /// bytes become an `[IMAGE:data:…]` part. Text-like bytes become a named text
 /// part. Anything else is a typed stub with size and sha256.
-pub(super) async fn enrich_inbound(channel: &super::RamfluxChannel, content: &str, message_id: &str) -> String {
-    let attachments = channel.take_attachments(message_id);
+pub(super) async fn enrich_inbound(
+    channel: &super::RamfluxChannel,
+    content: &str,
+    conversation_id: &str,
+    message_id: &str,
+) -> String {
+    let attachments = channel.take_attachments(conversation_id, message_id);
     if attachments.is_empty() {
         return content.to_string();
     }
@@ -54,7 +32,7 @@ pub(super) async fn enrich_inbound(channel: &super::RamfluxChannel, content: &st
         fetched = fetched.saturating_add(1);
         match channel.fetch_attachment(&attachment.object_id, limits.max_bytes).await {
             Ok(bytes) => {
-                channel.note_media(message_id, &attachment.object_id);
+                channel.note_media(conversation_id, message_id, &attachment.object_id);
                 parts.push(render_attachment(&attachment, &bytes));
             }
             Err(error) => {
@@ -155,68 +133,171 @@ pub(super) async fn erase_local(
 ) -> Result<(), String> {
     let persona = inner.persona.lock().clone();
     let scope = super::accounts::memory_scope(persona.as_ref(), account_id, conversation_id);
-    let entry = super::erase_index::load(&inner.store, &inner.crypto, &account_id, conversation_id, message_id);
-    super::erase::erase_message(&inner.store, &account_id, &scope, message_id).map_err(|error| error.to_string())?;
+    let entry = super::erase_index::load(&inner.store, &inner.crypto, account_id, conversation_id, message_id)?;
+    super::erase::erase_message(&inner.store, account_id, &scope, message_id).map_err(|error| error.to_string())?;
     if let Some(entry) = entry {
         for object_id in &entry.media_ids {
-            super::erase::erase_media(&inner.store, &account_id, conversation_id, object_id)
+            super::erase::erase_media(&inner.store, account_id, conversation_id, object_id)
                 .map_err(|error| error.to_string())?;
         }
-        prune_history(inner, &entry.history_keys);
     }
-    super::erase_index::remove(&inner.store, &account_id, conversation_id, message_id)
-        .map_err(|error| error.to_string())?;
-    if let Some(tracked) = inner.take_tracked(message_id) {
+    if let Some(tracked) = inner.take_tracked(conversation_id, message_id) {
         for object_id in &tracked.objects {
-            super::erase::erase_media(&inner.store, &account_id, conversation_id, object_id)
+            super::erase::erase_media(&inner.store, account_id, conversation_id, object_id)
                 .map_err(|error| error.to_string())?;
         }
     }
+    refresh_history(inner, account_id, conversation_id).await?;
     Ok(())
 }
 
-/// Erase every indexed message in one conversation, plus its media and rows.
-pub(super) async fn erase_conversation_scope(inner: &Inner, conversation_id: &str) -> Result<(), String> {
-    let account_id = inner.account_id.lock().clone().unwrap_or_default();
-    let entries = super::erase_index::entries(&inner.store, &inner.crypto, &account_id, conversation_id);
-    for entry in &entries {
-        let account_id = inner.account_id.lock().clone().unwrap_or_default();
-        erase_local(inner, &account_id, conversation_id, &entry.message_id).await?;
-    }
-    let persona = inner.persona.lock().clone();
-    let scope = super::accounts::memory_scope(persona.as_ref(), &account_id, conversation_id);
-    super::erase::erase_conversation(&inner.store, &account_id, &scope).map_err(|error| error.to_string())?;
-    super::erase::erase_conversation(&inner.store, &account_id, conversation_id).map_err(|error| error.to_string())?;
-    let memory = inner.attached_memory.lock().clone();
-    if let Some(memory) = memory {
-        let scoped = inner.scoped_memory(memory, &account_id, conversation_id);
-        let _ = scoped.forget_key_prefix("").await;
-    }
-    Ok(())
-}
-
-fn prune_history(inner: &Inner, keys: &[String]) {
-    if keys.is_empty() {
-        return;
-    }
-    let Some(histories) = inner.histories.lock().clone() else {
-        return;
+/// Reload by persisted row identity after erasure, never by vector offsets.
+pub(super) async fn refresh_history(inner: &Inner, account: &str, conversation: &str) -> Result<(), String> {
+    let Some(memory) = inner.attached_memory.lock().clone() else {
+        return Err("memory is not attached".to_owned());
     };
-    let mut histories = histories.lock();
-    let mut index = inner.history_keys.lock();
-    for (session, turns) in histories.iter_mut() {
-        let recorded = index.entry(session.clone()).or_default();
-        let mut kept_turns = Vec::new();
-        let mut kept_keys = Vec::new();
-        for (offset, turn) in turns.drain(..).enumerate() {
-            let key = recorded.get(offset).cloned().unwrap_or_default();
-            if keys.iter().any(|wanted| wanted == &key) {
-                continue;
-            }
-            kept_keys.push(key);
-            kept_turns.push(turn);
+    let scoped = inner.scoped_memory(memory, account, conversation);
+    let principal = crate::memory::MemoryPrincipal {
+        workspace_id: inner.workspace.to_string_lossy().into_owned(),
+        agent_id: None,
+        persona_id: None,
+        session_key: None,
+        channel: Some("ramflux".to_owned()),
+        sender: None,
+        owner_id: None,
+        require_owner_match: false,
+        legacy_session_key: None,
+    };
+    let loaded = scoped
+        .load_recent_conversation_histories(
+            &principal,
+            super::super::MAX_CHANNEL_HISTORY,
+            super::super::MAX_HYDRATED_SESSIONS,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let old = inner.history_sessions.lock().remove(conversation).unwrap_or_default();
+    let current = loaded.keys().cloned().collect();
+    inner.history_sessions.lock().insert(conversation.to_owned(), current);
+    let histories = inner.histories.lock().clone();
+    if let Some(histories) = histories {
+        let mut histories = histories.lock();
+        for session in old {
+            histories.remove(&session);
         }
-        *recorded = kept_keys;
-        *turns = kept_turns;
+        for (session, turns) in loaded {
+            histories.insert(
+                session,
+                turns
+                    .into_iter()
+                    .map(|turn| crate::agent::turn_contracts::stored_turn_message(turn.role, turn.content))
+                    .collect(),
+            );
+        }
     }
+    Ok(())
+}
+
+struct RevocationPause<'a>(&'a std::sync::atomic::AtomicU64);
+impl Drop for RevocationPause<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Revoke the configured retrieval scope, including events and ingress receipts.
+pub(super) async fn erase_conversation_scope(
+    inner: &Inner,
+    conversation: &str,
+    whole_account: bool,
+) -> Result<(), String> {
+    let account = inner
+        .account_id
+        .lock()
+        .clone()
+        .ok_or_else(|| "bridge account missing".to_owned())?;
+    let backend = inner.store.backend().map_err(|error| error.to_string())?;
+    let memory = inner
+        .attached_memory
+        .lock()
+        .clone()
+        .ok_or_else(|| "memory is not attached".to_owned())?;
+    let across = whole_account
+        || inner
+            .persona
+            .lock()
+            .as_ref()
+            .is_some_and(|persona| persona.cross_conversation_retrieval);
+    let conversations = {
+        let _admission = inner.admission.lock();
+        inner.revocations.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let conversations: Vec<String> = if across {
+            inner
+                .tracked
+                .lock()
+                .values()
+                .map(|tracked| tracked.conversation_id.clone())
+                .chain(inner.turns.lock().keys().cloned())
+                .chain(inner.history_sessions.lock().keys().cloned())
+                .collect()
+        } else {
+            vec![conversation.to_owned()]
+        };
+        conversations
+    };
+    let _pause = RevocationPause(&inner.revocations);
+    for conv in &conversations {
+        let runs = inner
+            .turns
+            .lock()
+            .get(conv)
+            .map(|slots| slots.iter().map(|slot| slot.turn_id.clone()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        inner.rpc.fence_turns(&runs);
+        inner.cancel_conversation(conv);
+    }
+    loop {
+        let changed = inner.turns_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if !conversations.iter().any(|conv| {
+            inner
+                .slot_turns
+                .lock()
+                .values()
+                .any(|key| &key.key.conversation == conv)
+        }) {
+            break;
+        }
+        changed.await;
+    }
+    let origin = crate::memory::erasure::ErasureOrigin::new(&account, conversation, "");
+    let origins = super::eraser::storage(backend.clone(), move |store| {
+        store.origins(
+            &origin.account,
+            if across {
+                None
+            } else {
+                Some(origin.conversation.as_str())
+            },
+        )
+    })
+    .await?;
+    for origin in &origins {
+        super::eraser::fence_runs(inner, backend.clone(), origin.clone()).await?;
+        let origin = origin.clone();
+        super::eraser::storage(backend.clone(), move |store| {
+            store.begin_delete(&origin).and_then(|()| store.erase_rows(&origin))
+        })
+        .await?;
+    }
+    memory.checkpoint_wal().await.map_err(|error| error.to_string())?;
+    for conv in &conversations {
+        refresh_history(inner, &account, conv).await?;
+        super::erase::erase_conversation(&inner.store, &account, conv).map_err(|error| error.to_string())?;
+    }
+    for origin in origins {
+        super::eraser::storage(backend.clone(), move |store| store.finish_delete(&origin)).await?;
+    }
+    Ok(())
 }

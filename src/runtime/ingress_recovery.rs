@@ -98,6 +98,14 @@ impl IngressRecorder {
     pub(crate) fn duplicate(&self) -> bool {
         self.duplicate.load(std::sync::atomic::Ordering::Acquire)
     }
+    fn input_digest(&self, input: &MessageEventInput) -> anyhow::Result<String> {
+        // A durable unkeyed digest would permit offline guesses of message text.
+        Ok(hex::encode(self.key.hmac(
+            KeyDomain::IngressRecovery,
+            &[b"input-digest-v2", digest(input)?.as_bytes()],
+        )))
+    }
+
     fn sign(&self, capsule: &IngressCapsule) -> anyhow::Result<String> {
         serialized_within(capsule, MAX_CAPSULE_BYTES - 64)?;
         let mut unsigned = capsule.clone();
@@ -123,7 +131,15 @@ impl IngressRecorder {
         );
         let normalized = original_input(input, capsule)?;
         anyhow::ensure!(
-            digest(&normalized)? == capsule.input_digest,
+            (if capsule.version == 1 {
+                anyhow::ensure!(
+                    !self.memory.requires_scoped_execution(),
+                    "legacy unkeyed ingress capsule cannot be recovered in a protected scope"
+                );
+                digest(&normalized)?
+            } else {
+                self.input_digest(&normalized)?
+            }) == capsule.input_digest,
             "ingress input digest differs from its capsule"
         );
         Ok(normalized)
@@ -150,7 +166,7 @@ impl IngressRecorder {
         self.boxed_recover(&scope, None, self.deadline).await?;
         input.event_id = Some(uuid::Uuid::new_v4().to_string());
         let mut capsule = IngressCapsule {
-            version: 1,
+            version: 2,
             backend_namespace: self.lifetime.namespace().to_owned(),
             scope,
             lifetime: self.lifetime.token().to_owned(),
@@ -160,7 +176,7 @@ impl IngressRecorder {
                 .clone()
                 .context("durable ingress requires stable input key")?,
             run_id: input.run_id.clone().context("durable ingress requires run identity")?,
-            input_digest: digest(&input)?,
+            input_digest: self.input_digest(&input)?,
             authentication: String::new(),
         };
         capsule.authentication = self.sign(&capsule)?;

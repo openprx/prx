@@ -1,9 +1,11 @@
+pub(crate) mod active_view;
 pub mod backend;
 pub mod chunker;
 pub mod compaction;
 pub mod document;
 pub mod embeddings;
 pub mod encrypted_scope;
+pub mod erasure;
 pub mod fabric;
 pub mod filter;
 pub mod hygiene;

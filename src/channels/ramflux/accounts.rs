@@ -108,7 +108,10 @@ pub fn is_removed(store: &ChannelStore, account_id: &str, conversation_id: &str)
 ///
 /// Returns [`StorageError`] when the marker cannot be written.
 pub fn mark_account_removed(store: &ChannelStore, account_id: &str) -> Result<(), StorageError> {
-    let path = store.marker_path(account_id, "account");
+    let path = store
+        .root()
+        .join("removed_accounts")
+        .join(super::crypto::id_hash(account_id));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| StorageError::Io(error.to_string()))?;
     }
@@ -117,7 +120,20 @@ pub fn mark_account_removed(store: &ChannelStore, account_id: &str) -> Result<()
 
 #[must_use]
 pub fn is_account_removed(store: &ChannelStore, account_id: &str) -> bool {
-    store.marker_path(account_id, "account").is_file()
+    store
+        .root()
+        .join("removed_accounts")
+        .join(super::crypto::id_hash(account_id))
+        .is_file()
+}
+
+pub fn clear_account_removed(store: &ChannelStore, account_id: &str) -> Result<(), StorageError> {
+    storage::secure_remove(
+        &store
+            .root()
+            .join("removed_accounts")
+            .join(super::crypto::id_hash(account_id)),
+    )
 }
 
 fn read_prompt(account: &RamfluxAccountConfig, workspace: &Path) -> Option<String> {

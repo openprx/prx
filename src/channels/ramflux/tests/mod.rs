@@ -46,6 +46,11 @@ impl Host {
         let path = dir.path().join("ramflux.sock");
         config.socket_path = Some(path.clone());
         let channel = RamfluxChannel::new(config, dir.path()).expect("test: channel");
+        let memory = std::sync::Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("test: memory"));
+        channel.attach_stores(
+            memory,
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        );
         channel.start().await.expect("test: start socket");
         let listening = channel.clone();
         let (tx, inbound) = tokio::sync::mpsc::channel(32);

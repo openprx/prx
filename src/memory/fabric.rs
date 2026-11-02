@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub fn fail_fast(backend: &str, method: &str) -> anyhow::Error {
-    anyhow::anyhow!("memory backend {backend} does not implement fabric::{method} (fail_fast)")
+    anyhow::Error::new(crate::memory::erasure::Unsupported("fabric operation")).context(format!(
+        "memory backend {backend} does not implement fabric::{method} (fail_fast)"
+    ))
 }
 
 /// FIX-P1-20: extract the `document_id` of every `[document_ingest_ref] ...

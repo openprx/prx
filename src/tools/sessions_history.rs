@@ -81,6 +81,7 @@ impl Tool for SessionsHistoryTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let memory_view = crate::memory::active_view::select_optional(&self.memory);
         let run_id = match args.get("run_id").and_then(|v| v.as_str()) {
             Some(v) if !v.trim().is_empty() => v,
             _ => {
@@ -105,7 +106,7 @@ impl Tool for SessionsHistoryTool {
         else {
             drop(runs);
             if let Some(history) = sessions_read_model::recover_run_history(
-                self.memory.as_ref(),
+                memory_view.as_ref(),
                 self.workspace_id(),
                 &args,
                 run_id,

@@ -8,7 +8,14 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnContext {
+    pub conversation_id: String,
+    pub turn_id: String,
+}
+
 pub(crate) struct Installed {
+    turn_context: Option<TurnContext>,
     resolver: Arc<dyn ApprovalResolver>,
     force_ask: bool,
     effective_full: bool,
@@ -25,10 +32,12 @@ tokio::task_local! {
 }
 
 /// Remember that `run_id` must ask `resolver` before a tool runs.
+#[cfg(test)]
 pub fn install(run_id: &str, resolver: Arc<dyn ApprovalResolver>, force_ask: bool, effective_full: bool) {
     registry().lock().insert(
         run_id.to_string(),
         Installed {
+            turn_context: None,
             resolver,
             force_ask,
             effective_full,
@@ -53,14 +62,33 @@ where
     ACTIVE.scope(installed, fut).await
 }
 
-/// Build the installed record the turn scopes and the registry share.
-pub fn installed(resolver: Arc<dyn ApprovalResolver>, force_ask: bool, effective_full: bool) -> Arc<Installed> {
-    Arc::new(Installed {
-        resolver,
+/// Install explicit context before entering any spawned delegation tasks.
+pub fn install_for_turn(
+    run_id: &str,
+    conversation_id: &str,
+    resolver: Arc<dyn ApprovalResolver>,
+    force_ask: bool,
+    effective_full: bool,
+) -> Arc<Installed> {
+    let make = || Installed {
+        resolver: Arc::clone(&resolver),
         force_ask,
         effective_full,
         parent_run_id: None,
-    })
+        turn_context: Some(TurnContext {
+            conversation_id: conversation_id.to_owned(),
+            turn_id: run_id.to_owned(),
+        }),
+    };
+    registry().lock().insert(run_id.to_owned(), make());
+    Arc::new(make())
+}
+
+pub fn active_turn() -> Option<TurnContext> {
+    ACTIVE
+        .try_with(|installed| installed.turn_context.clone())
+        .ok()
+        .flatten()
 }
 
 /// Drop the resolver when the turn ends.
@@ -145,4 +173,30 @@ pub async fn resolve_tool(
     let resolver = lookup_for_call(run_id, None)?.resolver;
     let request = crate::approval::ApprovalRequest::new(tool_name, arguments.clone());
     Some(resolver.resolve(&request, channel).await)
+}
+
+/// Capture runtime-owned capabilities before crossing a task boundary.
+/// Boxing also keeps nested delegation state off the worker's poll stack.
+pub(crate) fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let installed = current_installed();
+    let memory = crate::memory::active_view::current();
+    let future = Box::pin(future);
+    tokio::spawn(async move {
+        let work = Box::pin(async move {
+            if let Some(installed) = installed {
+                scope_installed(installed, future).await
+            } else {
+                future.await
+            }
+        });
+        if let Some(memory) = memory {
+            crate::memory::active_view::scope(memory, work).await
+        } else {
+            work.await
+        }
+    })
 }

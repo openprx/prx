@@ -33,6 +33,8 @@ pub enum InboundError {
     BadParams(#[from] serde_json::Error),
     #[error("{0}")]
     Failed(String),
+    #[error("memory capability unsupported")]
+    Unsupported,
     #[error("not authorized")]
     NotAuthorized,
     #[error("queue_full depth={0}")]
@@ -45,7 +47,7 @@ pub enum InboundError {
 ///
 /// Returns [`InboundError`] when the frame is not valid JSON-RPC or the
 /// method is rejected. A response has already been written for requests.
-pub async fn on_frame(inner: &Inner, bytes: &[u8]) -> Result<(), InboundError> {
+pub async fn on_frame(inner: &std::sync::Arc<Inner>, bytes: &[u8]) -> Result<(), InboundError> {
     let envelope = match inner.rpc.parse(bytes) {
         Ok(envelope) => envelope,
         Err(error) => {
@@ -60,12 +62,39 @@ pub async fn on_frame(inner: &Inner, bytes: &[u8]) -> Result<(), InboundError> {
             Ok(())
         }
         Envelope::Notification { method, params } => {
+            if needs_background_control(&method, &params) {
+                let inner = std::sync::Arc::clone(inner);
+                tokio::spawn(async move {
+                    if let Err(error) = dispatch(&inner, &method, &params).await {
+                        tracing::warn!(%error, "ramflux control failed");
+                    }
+                });
+                return Ok(());
+            }
             let _ = dispatch(inner, &method, &params).await?;
             Ok(())
         }
         Envelope::Request { id, method, params } => {
+            if needs_background_control(&method, &params) {
+                let inner = std::sync::Arc::clone(inner);
+                tokio::spawn(async move {
+                    match dispatch(&inner, &method, &params).await {
+                        Ok(result) => {
+                            let _ = inner.rpc.respond(&id, &result).await;
+                        }
+                        Err(error) => {
+                            let _ = inner.rpc.respond_error(&id, &error_body(&error)).await;
+                        }
+                    }
+                });
+                return Ok(());
+            }
             if method == protocol::METHOD_INBOUND_DELETED {
-                return schedule_delete(inner, id, &params).await;
+                if let Err(error) = schedule_delete(inner, id.clone(), &params).await {
+                    let _ = inner.rpc.respond_error(&id, &error_body(&error)).await;
+                    return Err(error);
+                }
+                return Ok(());
             }
             if let Some(cached) = protocol::idempotency_key(&params).and_then(|key| inner.rpc.cached(&key)) {
                 inner
@@ -101,9 +130,21 @@ pub async fn on_frame(inner: &Inner, bytes: &[u8]) -> Result<(), InboundError> {
     }
 }
 
+fn needs_background_control(method: &str, params: &Value) -> bool {
+    method == protocol::METHOD_INBOUND_CONTROL
+        && matches!(
+            params.get("kind").and_then(Value::as_str),
+            Some("agent_revoked" | "agent_removed")
+        )
+}
+
 async fn dispatch(inner: &Inner, method: &str, params: &Value) -> Result<Value, InboundError> {
     if method != protocol::METHOD_HELLO && !inner.hello_done.load(Ordering::Acquire) {
-        return Err(InboundError::HelloRequired);
+        let readd = method == protocol::METHOD_INBOUND_CONTROL
+            && params.get("kind").and_then(Value::as_str) == Some("agent_added");
+        if !readd {
+            return Err(InboundError::HelloRequired);
+        }
     }
     match method {
         protocol::METHOD_HELLO => on_hello(inner, params),
@@ -129,7 +170,18 @@ fn on_hello(inner: &Inner, params: &Value) -> Result<Value, InboundError> {
     if hello.agent_account_id.is_empty() {
         return Err(InboundError::Failed("agent_account_id is empty".to_string()));
     }
+    if inner
+        .account_id
+        .lock()
+        .as_ref()
+        .is_some_and(|account| account != &hello.agent_account_id)
+    {
+        return Err(InboundError::NotAuthorized);
+    }
     if super::accounts::is_account_removed(&inner.store, &hello.agent_account_id) {
+        // Remember the identified account so the authenticated socket peer can
+        // deliver agent_added before a successful hello after a restart.
+        inner.set_account(&hello.agent_account_id);
         return Err(InboundError::NotAuthorized);
     }
     if let Err(error) = inner.crypto.unlock(&hello.agent_account_id) {
@@ -169,7 +221,8 @@ fn on_ping(inner: &Inner) -> Result<Value, InboundError> {
     Ok(json!({"ok": true}))
 }
 
-async fn on_message(inner: &Inner, params: &Value) -> Result<Value, InboundError> {
+fn prepare_message(inner: &Inner, params: &Value) -> Result<Option<super::turn_queue::Admission>, InboundError> {
+    let _admission_guard = inner.admission.lock();
     ensure_running(inner)?;
     let message: InboundMessageParams = parse(params)?;
     tracing::debug!(
@@ -187,19 +240,26 @@ async fn on_message(inner: &Inner, params: &Value) -> Result<Value, InboundError
             );
             return Err(InboundError::NotAuthorized);
         }
-        let persona = inner.persona.lock().clone();
-        let scope = super::accounts::memory_scope(persona.as_ref(), &account_id, &message.conversation_id);
-        inner
-            .store
-            .put_message(
-                &inner.crypto,
-                &account_id,
-                &scope,
-                &message.message_id,
-                message.text.as_bytes(),
-            )
-            .map_err(|error| InboundError::Failed(error.to_string()))?;
+        let backend = inner.store.backend().map_err(|_| InboundError::Unsupported)?;
+        let source = inner.source_message_id(&message.conversation_id, &message.message_id);
+        let origin = crate::memory::erasure::ErasureOrigin::new(&account_id, &message.conversation_id, &source);
+        if inner
+            .deleting
+            .lock()
+            .contains(&(account_id, message.conversation_id.clone(), source))
+            || backend
+                .is_deleted(&origin)
+                .map_err(|error| InboundError::Failed(error.to_string()))?
+        {
+            return Ok(None);
+        }
+        // The indexed inbound event is the durable content copy. Queued input
+        // remains in the identity-owned queue until that transaction commits.
     }
+    inner
+        .conversations
+        .lock()
+        .insert(message.conversation_id.clone(), message.chat.clone());
     let rich = RichMessage {
         conversation_id: message.conversation_id,
         message_id: message.message_id,
@@ -219,16 +279,27 @@ async fn on_message(inner: &Inner, params: &Value) -> Result<Value, InboundError
         super::TrackedMessage {
             conversation_id: rich.conversation_id.clone(),
             objects,
+            sender: rich.sender.clone(),
         },
     );
-    match inner.queue.admit(rich) {
+    let admission = inner.queue.admit(rich);
+    if let super::turn_queue::Admission::Start(message) | super::turn_queue::Admission::Interrupt(message) = &admission
+    {
+        inner.note_slot_message(&message.conversation_id, &message.message_id);
+    }
+    Ok(Some(admission))
+}
+
+pub(super) async fn on_message(inner: &Inner, params: &Value) -> Result<Value, InboundError> {
+    let Some(admission) = prepare_message(inner, params)? else {
+        return Ok(json!({"ok":true,"deleted":true}));
+    };
+    match admission {
         super::turn_queue::Admission::Interrupt(message) => {
-            inner.note_slot_message(&message.message_id);
             inner.cancel_tokens(&message.conversation_id);
             inner.emit_inbound(RichInbound::Message(message)).await?;
         }
         super::turn_queue::Admission::Start(message) => {
-            inner.note_slot_message(&message.message_id);
             inner.emit_inbound(RichInbound::Message(message)).await?;
         }
         super::turn_queue::Admission::Queued => {}
@@ -242,6 +313,10 @@ async fn on_message(inner: &Inner, params: &Value) -> Result<Value, InboundError
 async fn on_surface(inner: &Inner, params: &Value) -> Result<Value, InboundError> {
     ensure_running(inner)?;
     let action: SurfaceActionParams = parse(params)?;
+    if action.values.get("approval_id").is_some() {
+        // Grants are authenticated through approval.decision, never card values.
+        return Err(InboundError::NotAuthorized);
+    }
     tracing::debug!(
         conversation_id = %action.conversation_id,
         surface_id = %action.surface_id,
@@ -287,9 +362,25 @@ async fn on_control(inner: &Inner, params: &Value) -> Result<Value, InboundError
         kind = ?control.kind,
         "ramflux control event"
     );
-    let account_id = inner.account_id.lock().clone().unwrap_or_default();
+    let account_id = inner
+        .account_id
+        .lock()
+        .clone()
+        .or_else(|| {
+            (inner.config.accounts.len() == 1)
+                .then(|| inner.config.accounts.keys().next().cloned())
+                .flatten()
+        })
+        .ok_or(InboundError::HelloRequired)?;
+    inner.set_account(&account_id);
     match control.kind {
         ControlKind::AgentRemoved => {
+            super::accounts::mark_account_removed(&inner.store, &account_id)
+                .map_err(|error| InboundError::Failed(error.to_string()))?;
+            inner.paused.store(true, Ordering::Release);
+            super::hooks::erase_conversation_scope(inner, &control.conversation_id, true)
+                .await
+                .map_err(InboundError::Failed)?;
             inner.cancel_conversation(&control.conversation_id);
             super::erase::erase_account(&inner.store, &inner.crypto, &account_id)
                 .map_err(|error| InboundError::Failed(error.to_string()))?;
@@ -297,10 +388,6 @@ async fn on_control(inner: &Inner, params: &Value) -> Result<Value, InboundError
                 .map_err(|error| InboundError::Failed(error.to_string()))?;
         }
         ControlKind::AgentRevoked => {
-            inner.cancel_conversation(&control.conversation_id);
-            super::hooks::erase_conversation_scope(inner, &control.conversation_id)
-                .await
-                .map_err(InboundError::Failed)?;
             super::accounts::mark_removed(
                 &inner.store,
                 &account_id,
@@ -308,6 +395,9 @@ async fn on_control(inner: &Inner, params: &Value) -> Result<Value, InboundError
                 control.timestamp_ms,
             )
             .map_err(|error| InboundError::Failed(error.to_string()))?;
+            super::hooks::erase_conversation_scope(inner, &control.conversation_id, false)
+                .await
+                .map_err(InboundError::Failed)?;
         }
         ControlKind::AgentOffline => {
             inner.crypto.lock(&account_id);
@@ -322,6 +412,8 @@ async fn on_control(inner: &Inner, params: &Value) -> Result<Value, InboundError
             inner.paused.store(false, Ordering::Release);
         }
         ControlKind::AgentAdded => {
+            super::accounts::clear_account_removed(&inner.store, &account_id)
+                .map_err(|error| InboundError::Failed(error.to_string()))?;
             super::accounts::clear_removed(&inner.store, &account_id, &control.conversation_id)
                 .map_err(|error| InboundError::Failed(error.to_string()))?;
         }
@@ -342,30 +434,35 @@ async fn on_control(inner: &Inner, params: &Value) -> Result<Value, InboundError
 /// by a separate task after the eraser finishes, so this task can still read
 /// an ingress ack.
 async fn schedule_delete(inner: &Inner, id: super::protocol::RpcId, params: &Value) -> Result<(), InboundError> {
+    if !inner.hello_done.load(Ordering::Acquire) {
+        return Err(InboundError::HelloRequired);
+    }
+    ensure_running(inner)?;
     let deleted: MessageDeletedParams = parse(params)?;
+    inner.store.backend().map_err(|_| InboundError::Unsupported)?;
     tracing::info!(
         conversation_id = %deleted.conversation_id,
         message_id = %deleted.message_id,
         "ramflux message deleted"
     );
     let account = inner.account_id.lock().clone().unwrap_or_default();
-    let entry = super::erase_index::load(
-        &inner.store,
-        &inner.crypto,
-        &account,
-        &deleted.conversation_id,
-        &deleted.message_id,
-    );
-    let run_ids = entry
-        .as_ref()
-        .map(|entry| super::eraser::run_ids_from_keys(&entry.memory_keys))
-        .unwrap_or_default();
+    {
+        let _admission = inner.admission.lock();
+        inner.deleting.lock().insert((
+            account.clone(),
+            deleted.conversation_id.clone(),
+            deleted.message_id.clone(),
+        ));
+        inner
+            .queue
+            .suspend_delete(&deleted.conversation_id, &deleted.message_id);
+        inner.cancel_message(&deleted.conversation_id, &deleted.message_id);
+    }
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let job = super::eraser::EraseJob {
         account,
         conversation: deleted.conversation_id.clone(),
         message_ids: vec![deleted.message_id.clone()],
-        run_ids,
         done: done_tx,
     };
     let sender = inner.erase_tx.lock().clone();
@@ -417,7 +514,12 @@ fn on_decision(inner: &Inner, params: &Value) -> Result<Value, InboundError> {
         decision = ?decision.decision,
         "ramflux approval decision"
     );
-    let matched = inner.approvals.decide(&decision.approval_id, decision.decision);
+    let matched = inner.approvals.decide(
+        &decision.approval_id,
+        decision.decision,
+        &decision.conversation_id,
+        &decision.decided_by,
+    );
     Ok(json!({"ok": matched}))
 }
 
@@ -433,7 +535,7 @@ fn on_cancel(inner: &Inner, params: &Value) -> Result<Value, InboundError> {
 }
 
 fn ensure_running(inner: &Inner) -> Result<(), InboundError> {
-    if inner.paused.load(Ordering::Acquire) {
+    if inner.paused.load(Ordering::Acquire) || inner.revocations.load(Ordering::Acquire) != 0 {
         Err(InboundError::Paused)
     } else {
         Ok(())
@@ -450,6 +552,7 @@ fn error_body(error: &InboundError) -> RpcErrorBody {
         InboundError::Paused => (-32001, error.to_string()),
         InboundError::Version(_) | InboundError::NotAuthorized => (-32003, error.to_string()),
         InboundError::QueueFull(_) => (-32005, error.to_string()),
+        InboundError::Unsupported => (-32601, error.to_string()),
         InboundError::UnknownMethod(_) => (-32601, error.to_string()),
         InboundError::BadParams(_) => (-32602, "invalid bridge params".to_string()),
         InboundError::Failed(message) => (-32603, message.clone()),

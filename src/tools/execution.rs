@@ -2735,13 +2735,19 @@ impl ToolExecutionService {
             && context.decision_resume.is_none()
             && channel_gate.is_some()
         {
-            let resolved = crate::agent::channel_approval::resolve_tool(
+            let approval_resolution: std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Option<crate::agent::turn_contracts::ApprovalDecision>>
+                        + Send
+                        + '_,
+                >,
+            > = Box::pin(crate::agent::channel_approval::resolve_tool(
                 &approval_run,
                 &descriptor.public_name,
                 &command.arguments,
                 &approval_channel,
-            )
-            .await;
+            ));
+            let resolved = approval_resolution.await;
             if !matches!(resolved, Some(crate::agent::turn_contracts::ApprovalDecision::Grant)) {
                 let reason = "approval denied".to_string();
                 return self.finish(

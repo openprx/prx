@@ -192,6 +192,7 @@ impl Tool for DocumentSearchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let memory_view = crate::memory::active_view::select(&self.memory);
         let query = args
             .get("query")
             .and_then(serde_json::Value::as_str)
@@ -199,13 +200,12 @@ impl Tool for DocumentSearchTool {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing non-empty 'query' parameter"))?;
         let principal = parse_scope_principal(&args, self.workspace_id());
-        let results = self
-            .memory
+        let results = memory_view
             .search_document_chunks(&principal, query, parse_limit(&args))
             .await?;
         let selected = results.iter().map(document_result_to_context_item).collect::<Vec<_>>();
         let trace_id = append_document_tool_retrieval_trace(
-            self.memory.as_ref(),
+            memory_view.as_ref(),
             &principal,
             "tool.document_search",
             query,

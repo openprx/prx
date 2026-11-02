@@ -99,7 +99,7 @@ pub const MAX_ID_BYTES: usize = 4096;
 
 impl IngressCapsule {
     pub fn validate_bounds(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.version == 1, "unsupported ingress capsule version");
+        anyhow::ensure!(matches!(self.version, 1 | 2), "unsupported ingress capsule version");
         for value in [
             &self.scope.workspace_id,
             &self.scope.owner_id,

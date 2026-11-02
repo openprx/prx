@@ -79,7 +79,7 @@ fn scope_bounds(scope: &IngressRecoveryScope) -> anyhow::Result<()> {
 }
 
 /// Lazy migration: ordinary/off message writers never call this function.
-fn schema(connection: &Connection) -> anyhow::Result<String> {
+pub(super) fn schema(connection: &Connection) -> anyhow::Result<String> {
     let exists: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'ingress_recovery_schema')",
         [],
@@ -121,6 +121,7 @@ fn schema(connection: &Connection) -> anyhow::Result<String> {
         uuid::Uuid::parse_str(&namespace)?.to_string() == namespace,
         "invalid SQLite ingress backend namespace"
     );
+    super::erasure_pool::install_table_triggers(connection, "ingress_recovery")?;
     Ok(namespace)
 }
 

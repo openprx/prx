@@ -82,9 +82,6 @@ impl AccountCrypto {
     ///
     /// Returns [`CryptoError`] when the wrapped key cannot be read or unwrapped.
     pub fn unlock(&self, account_id: &str) -> Result<(), CryptoError> {
-        if !self.enabled {
-            return Ok(());
-        }
         if self.deks.lock().contains_key(account_id) {
             return Ok(());
         }
@@ -98,6 +95,19 @@ impl AccountCrypto {
         };
         self.deks.lock().insert(account_id.to_string(), dek);
         Ok(())
+    }
+
+    /// Domain-separated keyed identifier; also used when content encryption is off.
+    pub fn mac(&self, account_id: &str, domain: &str, value: &[u8]) -> Result<String, CryptoError> {
+        use hmac::{Hmac, Mac};
+        let deks = self.deks.lock();
+        let dek = deks.get(account_id).ok_or(CryptoError::Locked)?;
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(dek.as_ref())
+            .map_err(|error| CryptoError::Store(error.to_string()))?;
+        mac.update(domain.as_bytes());
+        mac.update(&[0]);
+        mac.update(value);
+        Ok(hex::encode(mac.finalize().into_bytes()))
     }
 
     /// Drop the in-memory DEK. Wrapped key material on disk stays.

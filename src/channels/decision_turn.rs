@@ -92,7 +92,8 @@ impl ChannelDecisionTurn {
             .channels_by_name
             .get(&channel_name)
             .and_then(|channel| channel.as_rich())
-            .map(|rich| rich.memory_for_turn(Arc::clone(&ctx.memory), &conversation_id))
+            .map(|rich| rich.memory_for_message(Arc::clone(&ctx.memory), &conversation_id, &source.message_id))
+            .transpose()?
             .unwrap_or_else(|| Arc::clone(&ctx.memory));
         let service = ctx
             .decisions

@@ -315,6 +315,11 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
         );
 
         let answer_context = TurnDecisionContext {
+            _event_memory: crate::runtime::causal_events::routes::EventMemory::fallback(
+                Arc::clone(&service.memory),
+                service.generation.id.0,
+                &service.generation.source_revision.fingerprint_sha256,
+            ),
             model_catalog: service.provider_catalog.release_pin(),
             resume: None,
             accounting: None,

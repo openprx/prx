@@ -1145,7 +1145,9 @@ impl DelegateTool {
         };
         #[cfg(all(test, unix))]
         let work = delegate_diagnostic::inherit(work);
-        let mut task = DelegateTask(tokio::spawn(boxed_delegate_field(|| work.with_current_subscriber())));
+        let mut task = DelegateTask(crate::agent::channel_approval::spawn(boxed_delegate_field(|| {
+            work.with_current_subscriber()
+        })));
         match (&mut task.0).await {
             Ok(result) => result,
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
@@ -1865,7 +1867,7 @@ mod task_boundary_tests {
             .scope(async {
                 let context = DelegateTaskContext::new().expect("child task context");
                 let entered_child = Arc::clone(&entered);
-                let task = DelegateTask(tokio::spawn(async move {
+                let task = DelegateTask(crate::agent::channel_approval::spawn(async move {
                     let _context = context;
                     entered_child.store(true, std::sync::atomic::Ordering::SeqCst);
                     std::future::pending().await
@@ -1896,7 +1898,7 @@ mod task_boundary_tests {
                 let context = DelegateTaskContext::new().expect("child task context");
                 let work_dropped = WorkDropped(Arc::clone(&dropped));
                 let (entered, started) = tokio::sync::oneshot::channel();
-                let task = DelegateTask(tokio::spawn(async move {
+                let task = DelegateTask(crate::agent::channel_approval::spawn(async move {
                     context
                         .loop_cleanup
                         .run(async move {

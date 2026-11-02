@@ -34,6 +34,18 @@ fn checkpoint_truncate(conn: &rusqlite::Connection) -> anyhow::Result<i64> {
 
 #[async_trait]
 impl Memory for SqliteMemory {
+    fn with_erasure_origin(
+        &self,
+        origin: crate::memory::erasure::ErasureOrigin,
+    ) -> anyhow::Result<std::sync::Arc<dyn Memory>> {
+        let mut view = self.clone();
+        view.pool = std::sync::Arc::new(self.pool.with_origin(origin));
+        Ok(std::sync::Arc::new(view))
+    }
+    fn erasure_store(&self) -> anyhow::Result<crate::memory::erasure::SharedErasureStore> {
+        Ok(self.pool.clone())
+    }
+
     fn name(&self) -> &str {
         "sqlite"
     }
@@ -333,22 +345,22 @@ impl Memory for SqliteMemory {
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = pool.write();
             conn.execute_batch("PRAGMA secure_delete = ON")?;
-            conn.execute(
-                "DELETE FROM ingress_recovery WHERE input_key = ?1
-                    OR input_event_id IN (SELECT event_id FROM message_events WHERE idempotency_key = ?1)
-                    OR evidence_event_id IN (SELECT event_id FROM message_events WHERE idempotency_key = ?1)",
-                params![key],
+            let tx = conn.unchecked_transaction()?;
+            let has_ingress: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ingress_recovery')",
+                [],
+                |row| row.get(0),
             )?;
-            let affected = conn.execute(
-                "DELETE FROM message_events WHERE idempotency_key = ?1
-                    OR instr(ifnull(content, ''), ?1) > 0
-                    OR instr(ifnull(raw_payload_json, ''), ?1) > 0",
-                params![key],
-            )?;
-            conn.execute(
-                "DELETE FROM memories WHERE instr(ifnull(content, ''), ?1) > 0 OR instr(ifnull(key, ''), ?1) > 0",
-                params![key],
-            )?;
+            if has_ingress {
+                tx.execute(
+                    "DELETE FROM ingress_recovery WHERE input_key = ?1
+                OR input_event_id IN (SELECT event_id FROM message_events WHERE idempotency_key=?1)
+                OR evidence_event_id IN (SELECT event_id FROM message_events WHERE idempotency_key=?1)",
+                    params![key],
+                )?;
+            }
+            let affected = tx.execute("DELETE FROM message_events WHERE idempotency_key=?1", params![key])?;
+            tx.commit()?;
             Ok(affected)
         })
         .await?
@@ -357,9 +369,8 @@ impl Memory for SqliteMemory {
     async fn checkpoint_wal(&self) -> anyhow::Result<()> {
         let pool = self.pool.clone();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            // TRUNCATE is the last step. VACUUM in WAL mode writes the rebuilt
-            // image into the WAL and leaves the previous pages in the main
-            // file, so a raw read of brain.db still sees deleted rows.
+            // secure_delete clears freed pages and TRUNCATE empties the WAL.
+            // VACUUM is unnecessary: deleted content is already overwritten.
             // Drop the writer between attempts so a turn that holds a read
             // snapshot can finish and release it.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);

@@ -63,6 +63,9 @@ pub(super) async fn run_sub_agent_process(
     batch_id: Option<&str>,
     #[cfg(test)] test_worker_executable: Option<&TestWorkerExecutable>,
 ) -> anyhow::Result<ProcessWorkerOutcome> {
+    if source_fabric.is_some_and(|fabric| fabric.memory().requires_scoped_execution()) {
+        return Err(crate::memory::erasure::Unsupported("process worker cannot preserve scoped memory erasure").into());
+    }
     let process_generation = source_launch.as_ref().map(|launch| Arc::clone(launch.generation()));
     let ordinary_generation = source_launch
         .as_ref()

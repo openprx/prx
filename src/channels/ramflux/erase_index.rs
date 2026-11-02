@@ -26,7 +26,14 @@ pub fn note(
     media_id: Option<&str>,
     history_key: Option<&str>,
 ) {
-    let mut entry = load(store, crypto, account_id, conversation_id, message_id).unwrap_or_else(|| EraseEntry {
+    let mut entry = match load(store, crypto, account_id, conversation_id, message_id) {
+        Ok(entry) => entry,
+        Err(error) => {
+            tracing::warn!(%error, "ramflux erase metadata could not be read");
+            return;
+        }
+    }
+    .unwrap_or_else(|| EraseEntry {
         message_id: message_id.to_string(),
         ..EraseEntry::default()
     });
@@ -60,25 +67,16 @@ pub fn load(
     account_id: &str,
     conversation_id: &str,
     message_id: &str,
-) -> Option<EraseEntry> {
-    let bytes = store.read_index(crypto, account_id, conversation_id, message_id).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-pub fn entries(
-    store: &ChannelStore,
-    crypto: &AccountCrypto,
-    account_id: &str,
-    conversation_id: &str,
-) -> Vec<EraseEntry> {
-    store
-        .index_files(account_id, conversation_id)
-        .into_iter()
-        .filter_map(|path| {
-            let bytes = store.read_index_file(crypto, account_id, conversation_id, &path).ok()?;
-            serde_json::from_slice(&bytes).ok()
-        })
-        .collect()
+) -> Result<Option<EraseEntry>, String> {
+    if !store.index_path(account_id, conversation_id, message_id).exists() {
+        return Ok(None);
+    }
+    let bytes = store
+        .read_index(crypto, account_id, conversation_id, message_id)
+        .map_err(|error| error.to_string())?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 /// Remove the index file after its keys have been erased.

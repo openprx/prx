@@ -114,6 +114,7 @@ impl Tool for MemoryStoreTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let memory = crate::memory::active_view::current().unwrap_or_else(|| Arc::clone(&self.memory));
         let key = args
             .get("key")
             .and_then(|v| v.as_str())
@@ -193,26 +194,24 @@ impl Tool for MemoryStoreTool {
         // owner-scoped store, and a backend whose store *is* those files is
         // refused to them.
         let local_operator = crate::tools::execution::scope_is_local_process_operator(&args);
-        if !local_operator && self.memory.stores_into_shared_prompt_files() {
+        if !local_operator && memory.stores_into_shared_prompt_files() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
                     "Failed to store memory: memory backend '{}' keeps memory in the shared prompt files; \
                      only the local operator may write to it",
-                    self.memory.name()
+                    memory.name()
                 )),
             });
         }
         let mirror_category = category.clone();
-        match self
-            .memory
+        match memory
             .store_with_context(key, content, category, None, scope_ctx.as_ref())
             .await
         {
             Ok(()) => {
-                if local_operator
-                    && let Err(error) = self.memory.mirror_operator_write(key, content, &mirror_category).await
+                if local_operator && let Err(error) = memory.mirror_operator_write(key, content, &mirror_category).await
                 {
                     // The row is stored; only the convenience copy failed.
                     tracing::warn!(error = %error, "memory_store: workspace Markdown mirror failed");
@@ -796,5 +795,51 @@ mod tests {
         let mut in_process = r9_args("operator-conversation", "operator text", OWNER_A, false);
         in_process["category"] = json!("conversation");
         assert!(r9_store(&tool, in_process).await.success);
+    }
+    #[tokio::test]
+    async fn a_channel_memory_capability_encrypts_and_indexes_native_tool_writes() {
+        let (tmp, base) = test_mem();
+        let crypto = Arc::new(crate::security::ramflux_aead::AccountCrypto::new(
+            tmp.path().join("secrets"),
+            &tmp.path().join("ramflux"),
+            true,
+        ));
+        crypto.unlock("account").unwrap();
+        let origin = crate::memory::erasure::ErasureOrigin::new("account", "conv", "message");
+        let scope =
+            crate::memory::encrypted_scope::EncryptedScope::new(base.clone(), crypto, "account", "account/conv");
+        let scoped = scope.with_erasure_origin(origin.clone()).unwrap();
+        let tool = MemoryStoreTool::new(base.clone(), test_security());
+        let result = crate::memory::active_view::scope(
+            scoped.clone(),
+            tool.execute(approved_store_args(
+                "native-note",
+                "channel private native memory body",
+                None,
+            )),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            base.get("native-note").await.unwrap().is_none(),
+            "native tool escaped to a plaintext global key"
+        );
+        assert_eq!(
+            scoped.get("native-note").await.unwrap().unwrap().content,
+            "channel private native memory body"
+        );
+        let store = base.erasure_store().unwrap();
+        assert!(
+            store
+                .origins(&origin.account, Some(&origin.conversation))
+                .unwrap()
+                .contains(&origin)
+        );
+        store.begin_delete(&origin).unwrap();
+        store.erase_rows(&origin).unwrap();
+        base.checkpoint_wal().await.unwrap();
+        store.finish_delete(&origin).unwrap();
+        assert!(scoped.get("native-note").await.unwrap().is_none());
     }
 }

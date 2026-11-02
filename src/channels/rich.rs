@@ -401,16 +401,41 @@ pub trait RichChannel: Channel {
         inner
     }
 
+    fn record_history_session(&self, _conversation_id: &str, _session: &str) {}
+
+    async fn hydrate_history(&self, _conversation_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Optional transport namespace for durable input receipts.
+    fn inbound_idempotency_key(&self, _conversation_id: &str, _message_id: &str) -> Option<String> {
+        None
+    }
+
+    /// Bind all derived writes to the input's transactional erase origin.
+    fn memory_for_message(
+        &self,
+        inner: std::sync::Arc<dyn crate::memory::Memory>,
+        conversation_id: &str,
+        _message_id: &str,
+    ) -> anyhow::Result<std::sync::Arc<dyn crate::memory::Memory>> {
+        Ok(self.memory_for_turn(inner, conversation_id))
+    }
+
     /// Fetch inbound attachments for `message_id` and append multimodal parts.
     async fn enrich_inbound(&self, content: &str, _conversation_id: &str, _message_id: &str) -> String {
         content.to_string()
     }
 
     /// Record a key so a later delete can forget it. The default keeps nothing.
-    fn record_erasure(&self, _message_id: &str, _memory_key: &str, _history_key: &str) {}
+    fn record_erasure(&self, _conversation_id: &str, _message_id: &str, _memory_key: &str, _history_key: &str) {}
+
+    fn accepts_message(&self, _conversation_id: &str, _message_id: &str) -> bool {
+        true
+    }
 
     /// Mark that this turn owns the queue slot admitted for `message_id`.
-    fn claim_slot(&self, _message_id: &str, _turn_id: &str) {}
+    fn claim_slot(&self, _conversation_id: &str, _message_id: &str, _turn_id: &str) {}
 
     /// Project the final answer as one markdown surface. Invalid surfaces are skipped.
     async fn project_final_surface(&self, _conversation_id: &str, _turn_id: &str, _text: &str) -> anyhow::Result<()> {

@@ -13,17 +13,31 @@ tokio::task_local! {
     static ACTIVE_TURN: ActiveTurn;
 }
 
-/// Conversation and turn the current task is serving.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveTurn {
-    pub conversation_id: String,
-    pub turn_id: String,
-}
+pub use crate::agent::channel_approval::TurnContext as ActiveTurn;
 
 /// The turn scope, when this task was entered through [`scope`].
 #[must_use]
 pub fn active_turn() -> Option<ActiveTurn> {
-    ACTIVE_TURN.try_with(Clone::clone).ok()
+    ACTIVE_TURN
+        .try_with(Clone::clone)
+        .ok()
+        .or_else(crate::agent::channel_approval::active_turn)
+}
+
+/// Project a lifecycle transition owned by the runtime.
+pub async fn emit_status(channel: &dyn Channel, conversation_id: &str, turn_id: &str, state: super::rich::TurnState) {
+    if let Some(rich) = channel.as_rich() {
+        let status = super::rich::TurnStatus {
+            conversation_id: conversation_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            state,
+            error: None,
+            approval_id: None,
+        };
+        if let Err(error) = rich.send_rich(&super::rich::RichReply::Status(status)).await {
+            tracing::warn!(%error, "rich lifecycle status was not sent");
+        }
+    }
 }
 
 /// Resolver supplied by a rich channel, if any.
@@ -246,12 +260,13 @@ impl Drop for TurnGuard {
 
 static BUDGET_TASKS: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+> = std::sync::LazyLock::new(parking_lot::Mutex::default);
 static BUDGET_EXPIRED: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+    std::sync::LazyLock::new(parking_lot::Mutex::default);
 
 pub fn remember_budget_task(turn_id: &str, task: tokio::task::JoinHandle<()>) {
-    if let Some(previous) = BUDGET_TASKS.lock().insert(turn_id.to_string(), task) {
+    let previous = BUDGET_TASKS.lock().insert(turn_id.to_string(), task);
+    if let Some(previous) = previous {
         previous.abort();
     }
 }
@@ -265,7 +280,8 @@ fn budget_expired(turn_id: &str) -> bool {
 }
 
 fn abort_budget_task(turn_id: &str) {
-    if let Some(task) = BUDGET_TASKS.lock().remove(turn_id) {
+    let task = BUDGET_TASKS.lock().remove(turn_id);
+    if let Some(task) = task {
         task.abort();
     }
 }
@@ -293,6 +309,11 @@ pub async fn complete_turn(
             on: false,
         }))
         .await;
+    if matches!(state, super::rich::TurnState::Done) {
+        if let Err(error) = rich.project_final_surface(conversation_id, turn_id, text).await {
+            tracing::warn!(%error, "rich final surface was not sent");
+        }
+    }
     let awaiting = matches!(state, super::rich::TurnState::AwaitingApproval);
     let status = super::rich::TurnStatus {
         conversation_id: conversation_id.to_string(),

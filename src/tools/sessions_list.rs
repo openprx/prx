@@ -83,6 +83,7 @@ impl Tool for SessionsListTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let memory_view = crate::memory::active_view::select_optional(&self.memory);
         let status_filter = args.get("status").and_then(|v| v.as_str()).unwrap_or("all");
         let limit = super::limits::bounded_limit(&args, "limit", DEFAULT_LIMIT, MAX_LIMIT);
 
@@ -106,7 +107,7 @@ impl Tool for SessionsListTool {
         let active_ids = filtered.iter().map(|run| run.id.as_str()).collect::<HashSet<_>>();
         let remaining = limit.saturating_sub(filtered.len());
         let recovered = if remaining > 0 {
-            sessions_read_model::recover_task_runs(self.memory.as_ref(), self.workspace_id(), &args, limit)
+            sessions_read_model::recover_task_runs(memory_view.as_ref(), self.workspace_id(), &args, limit)
                 .await?
                 .into_iter()
                 .filter(|run| !active_ids.contains(run.run_id.as_str()))

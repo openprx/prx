@@ -7,11 +7,23 @@ use crate::runtime::envelope::RuntimeEnvelope;
 use anyhow::Context;
 use std::sync::Arc;
 
+// A bridge conversation is an independent runtime session even when its
+// sender has another conversation open in the same account.
+fn source_session_key(message: &super::traits::ChannelMessage) -> String {
+    let key = super::ConversationKey::from_message(message);
+    if message.channel == "ramflux" {
+        key.canonical
+    } else {
+        key.legacy
+    }
+}
+
 pub(super) struct ChannelSourceReceipt {
     envelope: RuntimeEnvelope,
     input: Arc<str>,
     generation: Arc<ConfigGeneration>,
     chat_type: String,
+    pub(super) message_id: String,
 }
 
 pub(super) struct ChannelAdmissionGuard {
@@ -90,7 +102,10 @@ impl ChannelSourceReceipt {
             .channels_by_name
             .get(&message.channel)
             .and_then(|channel| channel.as_rich())
-            .map(|rich| RichChannel::memory_for_turn(rich, Arc::clone(&ctx.memory), &message.reply_target))
+            .map(|rich| {
+                RichChannel::memory_for_message(rich, Arc::clone(&ctx.memory), &message.reply_target, &message.id)
+            })
+            .transpose()?
             .unwrap_or_else(|| Arc::clone(&ctx.memory));
         let fabric = crate::memory::MemoryFabric::new(
             Arc::clone(&persist_memory),
@@ -102,9 +117,10 @@ impl ChannelSourceReceipt {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let key = super::ConversationKey::from_message(&message);
+            let session_key = source_session_key(&message);
             let envelope = RuntimeEnvelope::channel_with_session(
                 fabric.workspace_id(),
-                key.legacy.clone(),
+                session_key,
                 message.channel.clone(),
                 message.sender.clone(),
                 message.reply_target.clone(),
@@ -112,7 +128,12 @@ impl ChannelSourceReceipt {
             )
             .with_run_id(&run)
             .with_config_generation(&generation);
-            let input_key = format!("channel:{}:{}", message.channel, message.id);
+            let input_key = ctx
+                .channels_by_name
+                .get(&message.channel)
+                .and_then(|channel| channel.as_rich())
+                .and_then(|rich| rich.inbound_idempotency_key(&message.reply_target, &message.id))
+                .unwrap_or_else(|| format!("channel:{}:{}", message.channel, message.id));
             let mut ticket = Some(ticket);
             let mut admission = None;
             let operation = async {
@@ -167,9 +188,9 @@ impl ChannelSourceReceipt {
                 if let Some(channel) = ctx.channels_by_name.get(&message.channel) {
                     if let Some(rich) = channel.as_rich() {
                         let stored = format!("convturn:{}:user:{}", key.canonical, message.id);
-                        rich.record_erasure(&message.id, &stored, &stored);
-                        let event_key = format!("channel:{}:{}", message.channel, message.id);
-                        rich.record_erasure(&message.id, &event_key, &event_key);
+                        rich.record_erasure(&message.reply_target, &message.id, &stored, &stored);
+                        let event_key = input_key.clone();
+                        rich.record_erasure(&message.reply_target, &message.id, &event_key, &event_key);
                     }
                 }
                 Ok::<_, anyhow::Error>((event, source))
@@ -408,6 +429,7 @@ impl ChannelSourceReceipt {
             );
         }
         Ok(Self {
+            message_id: message.id.clone(),
             envelope,
             input: Arc::from(message.content.as_str()),
             generation: Arc::clone(generation),
@@ -424,10 +446,10 @@ impl ChannelSourceReceipt {
             !message.channel.is_empty() && !message.sender.is_empty() && !run_id.is_empty(),
             "channel source has incomplete transport identity"
         );
-        let key = super::ConversationKey::from_message(message);
+        let session_key = source_session_key(message);
         let mut envelope = RuntimeEnvelope::channel_with_session(
             generation.effective.workspace_dir.to_string_lossy().to_string(),
-            key.legacy,
+            session_key,
             message.channel.clone(),
             message.sender.clone(),
             message.reply_target.clone(),

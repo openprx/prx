@@ -57,7 +57,6 @@ fn decision_id_from_approval_reply(reply: &str) -> Option<String> {
 /// The guard is owned by the awaited future rather than by this scope, so the
 /// row disappears with the turn however the turn ends — normal return, panic,
 /// or a dropped future.
-
 pub(super) async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
@@ -71,7 +70,10 @@ pub(super) async fn process_channel_message(
     let turn_run_id = uuid::Uuid::new_v4().to_string();
     if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
         if let Some(rich) = channel.as_rich() {
-            rich.claim_slot(&msg.id, &turn_run_id);
+            if !rich.accepts_message(&msg.reply_target, &msg.id) {
+                return;
+            }
+            rich.claim_slot(&msg.reply_target, &msg.id, &turn_run_id);
         }
     }
     let guard = crate::runtime::registry::register_turn(
@@ -86,8 +88,9 @@ pub(super) async fn process_channel_message(
         let resolver = rich.approval_resolver()?;
         let force_ask = rich.forces_tool_approval();
         let effective_full = !force_ask;
-        crate::agent::channel_approval::install(&turn_run_id, Arc::clone(&resolver), force_ask, effective_full);
-        Some(crate::agent::channel_approval::installed(
+        Some(crate::agent::channel_approval::install_for_turn(
+            &turn_run_id,
+            &conversation_id,
             resolver,
             force_ask,
             effective_full,
@@ -113,6 +116,11 @@ pub(super) async fn process_channel_message(
             cancellation_token.clone(),
         )
     });
+    let memory = rich_channel
+        .as_ref()
+        .and_then(|channel| channel.as_rich())
+        .map(|rich| rich.memory_for_message(Arc::clone(&ctx.memory), &conversation_id, &msg.id))
+        .transpose();
     let work = crate::channels::rich_turn::scope_if_rich(
         rich_channel.as_ref(),
         &conversation_id,
@@ -122,10 +130,17 @@ pub(super) async fn process_channel_message(
             boxed_channel_work(ctx, msg, cancellation_token, turn_run_id.clone()),
         ),
     );
-    if let Some(installed) = installed_approval {
-        crate::agent::channel_approval::scope_installed(installed, work).await;
-    } else {
-        work.await;
+    let work = Box::pin(async move {
+        if let Some(installed) = installed_approval {
+            crate::agent::channel_approval::scope_installed(installed, work).await;
+        } else {
+            work.await;
+        }
+    });
+    match memory {
+        Ok(Some(memory)) => crate::memory::active_view::scope(memory, work).await,
+        Ok(None) => work.await,
+        Err(error) => tracing::error!(%error, "channel memory scope refused"),
     }
 }
 
@@ -157,6 +172,34 @@ pub(super) async fn run_channel_turn(
             )
         })
     });
+    if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
+        crate::channels::rich_turn::emit_status(
+            channel.as_ref(),
+            &msg.reply_target,
+            &turn_run_id,
+            crate::channels::rich::TurnState::Started,
+        )
+        .await;
+    }
+    if let Some(rich) = ctx
+        .channels_by_name
+        .get(&msg.channel)
+        .and_then(|channel| channel.as_rich())
+    {
+        if let Err(error) = rich.hydrate_history(&msg.reply_target).await {
+            tracing::error!(%error, "channel history hydration failed");
+            return;
+        }
+    }
+    if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
+        crate::channels::rich_turn::emit_status(
+            channel.as_ref(),
+            &msg.reply_target,
+            &turn_run_id,
+            crate::channels::rich::TurnState::Thinking,
+        )
+        .await;
+    }
     if cancellation_token.is_cancelled() {
         return;
     }
@@ -217,8 +260,15 @@ pub(super) async fn run_channel_turn(
     let turn_memory = target_channel
         .as_ref()
         .and_then(|channel| channel.as_rich())
-        .map(|rich| rich.memory_for_turn(Arc::clone(&ctx.memory), &msg.reply_target))
-        .unwrap_or_else(|| Arc::clone(&ctx.memory));
+        .map(|rich| rich.memory_for_message(Arc::clone(&ctx.memory), &msg.reply_target, &msg.id))
+        .transpose();
+    let turn_memory = match turn_memory {
+        Ok(memory) => memory.unwrap_or_else(|| Arc::clone(&ctx.memory)),
+        Err(error) => {
+            tracing::error!(%error, "channel memory unavailable");
+            return;
+        }
+    };
     let msg = if let Some(rich) = target_channel.as_ref().and_then(|channel| channel.as_rich()) {
         let mut msg = msg;
         msg.content = rich.enrich_inbound(&msg.content, &msg.reply_target, &msg.id).await;
@@ -271,8 +321,7 @@ pub(super) async fn run_channel_turn(
         return;
     }
 
-    if let Err(error) = ctx
-        .memory
+    if let Err(error) = turn_memory
         .upsert_chat_profile_metadata(
             &msg.channel,
             &msg.reply_target,
@@ -740,7 +789,7 @@ pub(super) async fn run_channel_turn(
             return;
         }
     };
-    let chat_profile = match ctx.memory.get_chat_profile(&msg.channel, &msg.reply_target).await {
+    let chat_profile = match turn_memory.get_chat_profile(&msg.channel, &msg.reply_target).await {
         Ok(profile) => profile,
         Err(error) => {
             tracing::warn!(
@@ -1371,13 +1420,15 @@ pub(super) async fn run_channel_turn(
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(rich) = channel.as_rich() {
                     let stored = format!("convturn:{}:assistant:{turn_run_id}", history_key.canonical);
-                    rich.record_erasure(&msg.id, &stored, &stored);
+                    rich.record_erasure(&msg.reply_target, &msg.id, &stored, &stored);
                     rich.record_erasure(
+                        &msg.reply_target,
                         &msg.id,
                         &format!("turn:{turn_run_id}:assistant"),
                         &format!("turn:{turn_run_id}:assistant"),
                     );
                     rich.record_erasure(
+                        &msg.reply_target,
                         &msg.id,
                         &format!("turn:{turn_run_id}:final"),
                         &format!("turn:{turn_run_id}:final"),
@@ -1426,11 +1477,6 @@ pub(super) async fn run_channel_turn(
                         terminal_code,
                     )
                     .await;
-                    if let Some(rich) = channel.as_rich() {
-                        let _ = rich
-                            .project_final_surface(&msg.reply_target, &turn_run_id, &delivered_response)
-                            .await;
-                    }
                 }
             } else if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
@@ -1609,9 +1655,10 @@ pub(super) async fn ensure_notice_before_channel_output(
     let Some(channel) = target_channel else {
         return true;
     };
+    let memory = crate::memory::active_view::select(&ctx.memory);
     if let Err(error) = crate::compliance::interaction_notice::ensure_interaction_notice(
         &config_generation.effective.compliance.interaction_notice,
-        &ctx.memory,
+        &memory,
         channel,
         &msg.channel,
         &msg.reply_target,

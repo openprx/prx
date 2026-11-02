@@ -91,13 +91,10 @@ pub fn erase_conversation(
     }
     let index = store.index_path(account_id, conversation_id, "placeholder");
     if let Some(index_dir) = index.parent() {
-        let _ = remove_tree_files(index_dir);
+        remove_tree_files(index_dir)?;
     }
-    let marker = store.marker_path(account_id, conversation_id);
-    if marker.exists() {
-        storage::secure_remove(&marker)?;
-        report.drafts = 1;
-    }
+    // A content erase never restores authorization. Only agent_added clears
+    // the independent conversation revocation marker.
     Ok(report)
 }
 
@@ -117,6 +114,7 @@ pub fn erase_account(
     report.tool_events = remove_tree_files(&store.root().join("events").join(&account))?;
     report.media_files = remove_tree_files(&store.root().join("media").join(&account))?;
     report.drafts = remove_tree_files(&store.root().join("markers").join(&account))?;
+    remove_tree_files(&store.root().join("index").join(&account))?;
     crypto
         .destroy(account_id)
         .map_err(|error| StorageError::Io(error.to_string()))?;

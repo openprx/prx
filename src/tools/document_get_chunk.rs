@@ -69,6 +69,7 @@ impl Tool for DocumentGetChunkTool {
     }
 
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let memory_view = crate::memory::active_view::select(&self.memory);
         crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         let chunk_id = args
             .get("chunk_id")
@@ -78,10 +79,10 @@ impl Tool for DocumentGetChunkTool {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing non-empty 'chunk_id' parameter"))?;
         let principal = parse_scope_principal(&args, self.workspace_id());
-        let Some(chunk) = self.memory.get_document_chunk(chunk_id).await? else {
+        let Some(chunk) = memory_view.get_document_chunk(chunk_id).await? else {
             let dropped = vec![dropped_chunk_item(chunk_id, "not_found")];
             let trace_id = append_document_tool_retrieval_trace(
-                self.memory.as_ref(),
+                memory_view.as_ref(),
                 &principal,
                 "tool.document_get_chunk",
                 chunk_id,
@@ -124,7 +125,7 @@ impl Tool for DocumentGetChunkTool {
                 ),
             }];
             let trace_id = append_document_tool_retrieval_trace(
-                self.memory.as_ref(),
+                memory_view.as_ref(),
                 &principal,
                 "tool.document_get_chunk",
                 chunk_id,
@@ -160,7 +161,7 @@ impl Tool for DocumentGetChunkTool {
         };
         let selected = vec![document_result_to_context_item(&selected_result)];
         let trace_id = append_document_tool_retrieval_trace(
-            self.memory.as_ref(),
+            memory_view.as_ref(),
             &principal,
             "tool.document_get_chunk",
             chunk_id,

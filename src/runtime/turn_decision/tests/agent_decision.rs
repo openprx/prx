@@ -50,6 +50,11 @@ fn record_builder_distinguishes_local_terminal_from_failed_compiled_request() {
         outgoing_parent_allowed: None,
     };
     let mut context = TurnDecisionContext {
+        _event_memory: crate::runtime::causal_events::routes::EventMemory::fallback(
+            Arc::new(crate::memory::NoneMemory),
+            0,
+            "",
+        ),
         model_catalog: None,
         resume: None,
         accounting: None,

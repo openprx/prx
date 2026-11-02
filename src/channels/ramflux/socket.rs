@@ -7,14 +7,22 @@
 //! listener fd is a socket. A second concurrent connection is rejected.
 //! Frames are newline-delimited and capped.
 
+#[cfg(unix)]
 use super::protocol::{self, RpcErrorBody, RpcId};
+#[cfg(unix)]
 use super::{Inner, inbound};
-use std::io::{self, ErrorKind};
+use std::io;
+#[cfg(unix)]
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 pub const PING_FRESH_MS: u64 = 30_000;
@@ -96,21 +104,13 @@ pub fn inspect(path: &Path) -> PermissionCheck {
 ///
 /// Returns [`SocketError`] when the path is a symlink, has the wrong mode or
 /// owner, or the bind fails.
+#[cfg(unix)]
 pub fn bind(path: &Path) -> Result<tokio::net::UnixListener, SocketError> {
-    #[cfg(unix)]
-    {
-        bind_unix(path)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Err(SocketError::Invalid(
-            "ramflux channel requires a unix domain socket".to_string(),
-        ))
-    }
+    bind_unix(path)
 }
 
 /// Accept one connection at a time until shutdown.
+#[cfg(unix)]
 pub async fn accept_loop(inner: Arc<Inner>, listener: tokio::net::UnixListener) {
     loop {
         tokio::select! {
@@ -134,7 +134,6 @@ pub async fn accept_loop(inner: Arc<Inner>, listener: tokio::net::UnixListener) 
                                 tracing::warn!(error = %error, "ramflux connection ended");
                             }
                             session.release_connection();
-                            session.on_bridge_lost();
                         });
                     }
                     Err(error) => {
@@ -149,6 +148,7 @@ pub async fn accept_loop(inner: Arc<Inner>, listener: tokio::net::UnixListener) 
     }
 }
 
+#[cfg(unix)]
 async fn reject_peer(mut stream: UnixStream) {
     let body = protocol::encode_null_error(-32006, "peer uid refused");
     if !body.is_empty() {
@@ -157,6 +157,7 @@ async fn reject_peer(mut stream: UnixStream) {
     }
 }
 
+#[cfg(unix)]
 async fn reject_second(mut stream: UnixStream) {
     let error = RpcErrorBody::new(-32004, "second bridge connection rejected");
     let id = RpcId::Number(0);
@@ -167,6 +168,7 @@ async fn reject_second(mut stream: UnixStream) {
     tracing::warn!("rejected a second ramflux bridge connection");
 }
 
+#[cfg(unix)]
 async fn connection(inner: Arc<Inner>, stream: UnixStream) -> Result<(), SocketError> {
     let (read, mut write) = stream.into_split();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
@@ -207,6 +209,9 @@ async fn connection(inner: Arc<Inner>, stream: UnixStream) -> Result<(), SocketE
             }
         }
     }
+    // Snapshot lost turns before releasing RPC waiters: their guards may
+    // otherwise unbind before reconnect status can be recorded.
+    inner.on_bridge_lost();
     inner.rpc.clear_writer();
     inner.writer_ready.store(false, Ordering::Release);
     // Queued frames, including the error for an oversize or truncated read,
@@ -222,6 +227,7 @@ async fn connection(inner: Arc<Inner>, stream: UnixStream) -> Result<(), SocketE
     Ok(())
 }
 
+#[cfg(unix)]
 async fn read_frame<R>(read: &mut R, max: usize) -> Result<Option<Vec<u8>>, SocketError>
 where
     R: tokio::io::AsyncBufRead + Unpin,

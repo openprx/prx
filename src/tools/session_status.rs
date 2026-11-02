@@ -99,6 +99,7 @@ impl Tool for SessionStatusTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let memory_view = crate::memory::active_view::select_optional(&self.memory);
         let uptime_secs = self.started_at.elapsed().as_secs();
         let uptime_str = Self::format_uptime(uptime_secs);
 
@@ -144,7 +145,7 @@ impl Tool for SessionStatusTool {
         drop(runs);
         drop(all_runs);
 
-        let recovered = sessions_read_model::recover_task_runs(self.memory.as_ref(), self.workspace_id(), &args, 100)
+        let recovered = sessions_read_model::recover_task_runs(memory_view.as_ref(), self.workspace_id(), &args, 100)
             .await?
             .into_iter()
             .filter(|run| !active_ids.contains(&run.run_id))

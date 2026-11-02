@@ -156,6 +156,7 @@ impl Tool for ChatProfileUpdateTool {
     }
 
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let memory_view = crate::memory::active_view::select(&self.memory);
         crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         // Gemini removes additionalProperties and bounds, so its service calls
         // still reach the target and truncation checks. Required alternatives
@@ -224,8 +225,7 @@ impl Tool for ChatProfileUpdateTool {
         }
 
         let tags_ref = tags.as_deref();
-        match self
-            .memory
+        match memory_view
             .update_chat_profile(
                 channel,
                 chat_id,

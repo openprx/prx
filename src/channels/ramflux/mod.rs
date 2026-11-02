@@ -50,13 +50,36 @@ struct LostTurn {
     turn_id: String,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MessageKey {
+    conversation: String,
+    message: String,
+}
+impl MessageKey {
+    fn new(conversation: &str, message: &str) -> Self {
+        Self {
+            conversation: conversation.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TurnMessage {
+    key: MessageKey,
+    source: String,
+}
+
 pub(crate) struct TrackedMessage {
     pub conversation_id: String,
     pub objects: Vec<String>,
+    pub sender: super::rich::Sender,
 }
 
 pub(crate) struct Inner {
     config: RamfluxConfig,
+    admission: Mutex<()>,
+    revocations: AtomicU64,
     socket_path: PathBuf,
     auth: Arc<Authority>,
     rpc: Arc<RpcHub>,
@@ -72,17 +95,22 @@ pub(crate) struct Inner {
     account_id: Mutex<Option<String>>,
     inbound_tx: Mutex<Option<mpsc::Sender<RichInbound>>>,
     turns: Mutex<HashMap<String, Vec<TurnSlot>>>,
-    tracked: Mutex<HashMap<String, TrackedMessage>>,
+    turns_changed: tokio::sync::Notify,
+    tracked: Mutex<HashMap<MessageKey, TrackedMessage>>,
+    derived_messages: Mutex<HashMap<MessageKey, String>>,
+    deleting: Mutex<std::collections::HashSet<(String, String, String)>>,
+    conversations: Mutex<HashMap<String, super::rich::Chat>>,
     reply_targets: Mutex<HashMap<String, String>>,
     attached_memory: Mutex<Option<Arc<dyn crate::memory::Memory>>>,
     histories: Mutex<Option<super::ConversationHistoryMap>>,
-    history_keys: Mutex<HashMap<String, Vec<String>>>,
-    attachments: Mutex<HashMap<String, Vec<super::rich::AttachmentRef>>>,
+    history_sessions: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    attachments: Mutex<HashMap<MessageKey, Vec<super::rich::AttachmentRef>>>,
     task_versions: Mutex<HashMap<String, u64>>,
-    slot_messages: Mutex<std::collections::HashSet<String>>,
-    slot_turns: Mutex<std::collections::HashSet<String>>,
+    slot_messages: Mutex<std::collections::HashSet<MessageKey>>,
+    slot_turns: Mutex<HashMap<String, TurnMessage>>,
     expected_peer: Mutex<Option<u32>>,
     scopes: Mutex<HashMap<(String, String), Arc<dyn crate::memory::Memory>>>,
+    message_memories: Mutex<HashMap<MessageKey, Arc<dyn crate::memory::Memory>>>,
     erase_tx: Mutex<Option<mpsc::Sender<eraser::EraseJob>>>,
     eraser: Mutex<Option<tokio::task::JoinHandle<()>>>,
     eraser_started: AtomicBool,
@@ -137,17 +165,16 @@ impl Inner {
     }
 
     fn track_message(&self, message_id: &str, tracked: TrackedMessage) {
-        let mut tracked_map = self.tracked.lock();
-        if tracked_map.len() >= 256 {
-            if let Some(oldest) = tracked_map.keys().next().cloned() {
-                tracked_map.remove(&oldest);
-            }
-        }
-        tracked_map.insert(message_id.to_string(), tracked);
+        self.tracked
+            .lock()
+            .entry(MessageKey::new(&tracked.conversation_id, message_id))
+            .or_insert(tracked);
     }
 
-    fn take_tracked(&self, message_id: &str) -> Option<TrackedMessage> {
-        self.tracked.lock().remove(message_id)
+    fn take_tracked(&self, conversation_id: &str, message_id: &str) -> Option<TrackedMessage> {
+        self.tracked
+            .lock()
+            .remove(&MessageKey::new(conversation_id, message_id))
     }
 
     fn remember_reply_target(&self, conversation_id: &str, target: &str) {
@@ -178,23 +205,24 @@ impl Inner {
 
     fn unbind_turn(&self, conversation_id: &str, turn_id: &str) {
         let mut turns = self.turns.lock();
-        let Some(slots) = turns.get_mut(conversation_id) else {
-            return;
-        };
-        slots.retain(|slot| slot.turn_id != turn_id);
-        if slots.is_empty() {
-            turns.remove(conversation_id);
+        if let Some(slots) = turns.get_mut(conversation_id) {
+            slots.retain(|slot| slot.turn_id != turn_id);
+            if slots.is_empty() {
+                turns.remove(conversation_id);
+            }
         }
-        let owned = self.slot_turns.lock().remove(turn_id);
+        let message_id = self.slot_turns.lock().remove(turn_id);
         drop(turns);
-        if owned {
-            self.pump_next(conversation_id);
+        self.turns_changed.notify_waiters();
+        if let Some(message_id) = message_id {
+            self.message_memories.lock().remove(&message_id.key);
+            self.pump_next(conversation_id, &message_id.key.message);
         }
     }
 
     fn cancel_tokens(&self, conversation_id: &str) {
-        let slots = self.turns.lock().remove(conversation_id);
-        if let Some(slots) = slots {
+        let slots = self.turns.lock();
+        if let Some(slots) = slots.get(conversation_id) {
             for slot in slots {
                 slot.token.cancel();
             }
@@ -204,30 +232,29 @@ impl Inner {
     fn cancel_conversation(&self, conversation_id: &str) {
         self.cancel_tokens(conversation_id);
         self.queue.drain(conversation_id);
+        self.slot_messages
+            .lock()
+            .retain(|key| key.conversation != conversation_id);
     }
 
     fn cancel_turn(&self, conversation_id: &str, turn_id: &str) -> bool {
-        let mut turns = self.turns.lock();
-        let Some(slots) = turns.get_mut(conversation_id) else {
+        let turns = self.turns.lock();
+        let Some(slot) = turns
+            .get(conversation_id)
+            .and_then(|slots| slots.iter().find(|slot| slot.turn_id == turn_id))
+        else {
             return false;
         };
-        let Some(index) = slots.iter().position(|slot| slot.turn_id == turn_id) else {
-            return false;
-        };
-        let slot = slots.remove(index);
         slot.token.cancel();
-        if slots.is_empty() {
-            turns.remove(conversation_id);
-        }
-        drop(turns);
-        self.pump_next(conversation_id);
+        // The guard releases ownership after the last write has completed.
         true
     }
 
-    fn pump_next(&self, conversation_id: &str) {
-        let Some(next) = self.queue.finish(conversation_id) else {
+    fn pump_next(&self, conversation_id: &str, message_id: &str) {
+        let Some(next) = self.queue.finish_owned(conversation_id, message_id) else {
             return;
         };
+        self.note_slot_message(&next.conversation_id, &next.message_id);
         let tx = self.inbound_tx.lock().clone();
         if let Some(tx) = tx {
             tokio::spawn(async move {
@@ -238,12 +265,90 @@ impl Inner {
         }
     }
 
+    fn source_message_id(&self, conversation: &str, message: &str) -> String {
+        self.derived_messages
+            .lock()
+            .get(&MessageKey::new(conversation, message))
+            .cloned()
+            .unwrap_or_else(|| message.to_owned())
+    }
+
+    fn resume_delete(&self, conversation: &str, message: &str) {
+        let ready = {
+            let _admission = self.admission.lock();
+            let ready = self.queue.resume_delete(conversation, message);
+            for next in &ready {
+                self.note_slot_message(&next.conversation_id, &next.message_id);
+            }
+            ready
+        };
+        let tx = self.inbound_tx.lock().clone();
+        if let Some(tx) = tx {
+            tokio::spawn(async move {
+                for next in ready {
+                    if tx.send(RichInbound::Message(next)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    fn cancel_message(&self, conversation_id: &str, message_id: &str) {
+        let mut family = vec![MessageKey::new(conversation_id, message_id)];
+        family.extend(
+            self.derived_messages
+                .lock()
+                .iter()
+                .filter(|(key, source)| key.conversation == conversation_id && source.as_str() == message_id)
+                .map(|(key, _)| key.clone()),
+        );
+        for key in &family {
+            self.queue.remove_queued(conversation_id, &key.message);
+        }
+        let run_ids: Vec<String> = self
+            .slot_turns
+            .lock()
+            .iter()
+            .filter(|(_, id)| id.key.conversation == conversation_id && id.source == message_id)
+            .map(|(run, _)| run.clone())
+            .collect();
+        self.rpc.fence_turns(&run_ids);
+        for run in run_ids {
+            self.cancel_turn(conversation_id, &run);
+        }
+        for key in family {
+            let pending = self.slot_messages.lock().remove(&key);
+            if pending {
+                self.pump_next(conversation_id, &key.message);
+            }
+        }
+    }
+
+    async fn wait_message(&self, conversation_id: &str, message_id: &str) {
+        loop {
+            let notified = self.turns_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self
+                .slot_turns
+                .lock()
+                .values()
+                .any(|id| id.key.conversation == conversation_id && id.source == message_id)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     fn cancel_all(&self) {
         let slots = self.drain_turns();
         for slot in slots {
             slot.token.cancel();
         }
         self.queue.drain_all();
+        self.slot_messages.lock().clear();
     }
 
     fn drain_turns(&self) -> Vec<TurnSlot> {
@@ -268,6 +373,7 @@ impl Inner {
         self.hello_done.store(false, Ordering::Release);
         self.auth.clear_hello();
         self.queue.drain_all();
+        self.slot_messages.lock().clear();
     }
 
     fn memory_scope(&self, account_id: &str, conversation_id: &str) -> String {
@@ -280,7 +386,12 @@ impl Inner {
         let Some(account_id) = account_id else {
             return;
         };
-        let scope = self.memory_scope(&account_id, conversation_id);
+        let Some(active) = crate::channels::rich_turn::active_turn() else {
+            return;
+        };
+        let Some(message_id) = self.slot_turns.lock().get(&active.turn_id).cloned() else {
+            return;
+        };
         let event_id = format!("{}-{}", event.tool_call_id, event.iteration);
         let record = serde_json::json!({
             "tool_call_id": event.tool_call_id,
@@ -292,10 +403,14 @@ impl Inner {
             tracing::warn!("ramflux tool event record could not be encoded");
             return;
         };
-        if let Err(error) = self
-            .store
-            .put_tool_event(&self.crypto, &account_id, &scope, &event_id, &bytes)
-        {
+        if let Err(error) = self.store.put_tool_event(
+            &self.crypto,
+            &account_id,
+            conversation_id,
+            &event_id,
+            &message_id.source,
+            &bytes,
+        ) {
             tracing::warn!(error = %error, "ramflux tool event was not stored");
         }
     }
@@ -305,31 +420,45 @@ impl Inner {
         let Some(account_id) = account_id else {
             return;
         };
-        if let Err(error) = self
-            .store
-            .put_media(&self.crypto, &account_id, conversation_id, object_id, bytes)
-        {
+        let Some(active) = crate::channels::rich_turn::active_turn() else {
+            return;
+        };
+        let Some(message_id) = self.slot_turns.lock().get(&active.turn_id).cloned() else {
+            return;
+        };
+        if let Err(error) = self.store.put_media(
+            &self.crypto,
+            &account_id,
+            conversation_id,
+            object_id,
+            &message_id.source,
+            bytes,
+        ) {
             tracing::warn!(error = %error, "ramflux attachment was not cached");
         }
     }
 
-    fn conversation_is_open(&self, conversation_id: &str) -> bool {
-        self.turns
+    fn note_slot_message(&self, conversation_id: &str, message_id: &str) {
+        self.slot_messages
             .lock()
-            .get(conversation_id)
-            .is_some_and(|slots| !slots.is_empty())
+            .insert(MessageKey::new(conversation_id, message_id));
     }
 
-    fn note_slot_message(&self, message_id: &str) {
-        self.slot_messages.lock().insert(message_id.to_string());
+    fn claim_slot_message(&self, conversation_id: &str, message_id: &str) -> bool {
+        self.slot_messages
+            .lock()
+            .remove(&MessageKey::new(conversation_id, message_id))
     }
 
-    fn claim_slot_message(&self, message_id: &str) -> bool {
-        self.slot_messages.lock().remove(message_id)
-    }
-
-    fn note_slot_turn(&self, turn_id: &str) {
-        self.slot_turns.lock().insert(turn_id.to_string());
+    fn note_slot_turn(&self, conversation_id: &str, message_id: &str, turn_id: &str) {
+        let source = self.source_message_id(conversation_id, message_id);
+        self.slot_turns.lock().insert(
+            turn_id.to_owned(),
+            TurnMessage {
+                key: MessageKey::new(conversation_id, message_id),
+                source,
+            },
+        );
     }
 
     fn scoped_memory(
@@ -353,29 +482,13 @@ impl Inner {
             .clone()
     }
 
-    async fn deliver_open_action(&self, action: &super::rich::SurfaceActionInbound) {
-        let decision = action
-            .values
-            .get("decision")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(action.action_id.as_str());
-        let Some(approval_id) = action.values.get("approval_id").and_then(serde_json::Value::as_str) else {
-            return;
-        };
-        let Ok(kind) =
-            serde_json::from_value::<protocol::ApprovalDecisionKind>(serde_json::Value::String(decision.to_string()))
-        else {
-            return;
-        };
-        let _ = self.approvals.decide(approval_id, kind);
-    }
-
     async fn project_task_event(&self, event: &super::rich::TaskEventInbound) {
-        let version = {
-            let mut versions = self.task_versions.lock();
-            let next = versions.entry(event.task_id.clone()).or_insert(0);
-            *next = next.saturating_add(1);
-            *next
+        let (state, cancel) = match event.kind.as_str() {
+            "start" | "accept" => ("running", false),
+            "decline" => ("rejected", true),
+            "cancel" => ("cancelled", true),
+            "resolve" => ("done", false),
+            _ => return,
         };
         let Some(turn_id) = self
             .turns
@@ -385,36 +498,29 @@ impl Inner {
         else {
             return;
         };
+        let version = {
+            let mut versions = self.task_versions.lock();
+            let next = versions.entry(event.task_id.clone()).or_insert(0);
+            *next = next.saturating_add(1);
+            *next
+        };
+        if cancel {
+            self.cancel_turn(&event.conversation_id, &turn_id);
+        }
         let update = super::rich::TaskUpdateReply {
             conversation_id: event.conversation_id.clone(),
-            turn_id: turn_id.clone(),
+            turn_id,
             task_id: event.task_id.clone(),
             version,
-            state: event.kind.clone(),
+            state: state.to_owned(),
             steps: Vec::new(),
             result_ref: None,
             result_summary: None,
         };
         if let Err(error) = outbound::send_task_update(&self.rpc, &update).await {
-            tracing::debug!(error = %error, "ramflux task event was not sent");
+            tracing::warn!(%error, "ramflux task intent was not projected");
         }
-        let state = match event.kind.as_str() {
-            "started" => super::rich::TurnState::Started,
-            "thinking" => super::rich::TurnState::Thinking,
-            "tool_running" => super::rich::TurnState::ToolRunning,
-            "awaiting_approval" => super::rich::TurnState::AwaitingApproval,
-            _ => return,
-        };
-        let status = super::rich::TurnStatus {
-            conversation_id: event.conversation_id.clone(),
-            turn_id,
-            state,
-            error: None,
-            approval_id: None,
-        };
-        if let Err(error) = outbound::send_reply(self, &super::rich::RichReply::Status(status)).await {
-            tracing::debug!(error = %error, "ramflux task status was not sent");
-        }
+        // Host intent does not manufacture parent turn lifecycle transitions.
     }
 
     async fn flush_lost_status(&self) {
@@ -491,6 +597,8 @@ impl RamfluxChannel {
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
+                admission: Mutex::new(()),
+                revocations: AtomicU64::new(0),
                 socket_path,
                 auth,
                 rpc,
@@ -506,17 +614,22 @@ impl RamfluxChannel {
                 account_id: Mutex::new(None),
                 inbound_tx: Mutex::new(None),
                 turns: Mutex::new(HashMap::new()),
+                turns_changed: tokio::sync::Notify::new(),
                 tracked: Mutex::new(HashMap::new()),
+                derived_messages: Mutex::new(HashMap::new()),
+                deleting: Mutex::new(std::collections::HashSet::new()),
+                conversations: Mutex::new(HashMap::new()),
                 reply_targets: Mutex::new(HashMap::new()),
                 attached_memory: Mutex::new(None),
                 histories: Mutex::new(None),
-                history_keys: Mutex::new(HashMap::new()),
+                history_sessions: Mutex::new(HashMap::new()),
                 attachments: Mutex::new(HashMap::new()),
                 task_versions: Mutex::new(HashMap::new()),
                 slot_messages: Mutex::new(std::collections::HashSet::new()),
-                slot_turns: Mutex::new(std::collections::HashSet::new()),
+                slot_turns: Mutex::new(HashMap::new()),
                 expected_peer: Mutex::new(None),
                 scopes: Mutex::new(HashMap::new()),
+                message_memories: Mutex::new(HashMap::new()),
                 erase_tx: Mutex::new(None),
                 eraser: Mutex::new(None),
                 eraser_started: AtomicBool::new(false),
@@ -543,37 +656,39 @@ impl RamfluxChannel {
         self.inner.shutdown.cancel();
     }
 
-    pub(crate) fn stash_attachments(&self, message_id: &str, attachments: Vec<super::rich::AttachmentRef>) {
+    pub(crate) fn stash_attachments(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        attachments: Vec<super::rich::AttachmentRef>,
+    ) {
         if attachments.is_empty() {
             return;
         }
         self.inner
             .attachments
             .lock()
-            .insert(message_id.to_string(), attachments);
+            .insert(MessageKey::new(conversation_id, message_id), attachments);
     }
 
-    pub(crate) fn take_attachments(&self, message_id: &str) -> Vec<super::rich::AttachmentRef> {
-        self.inner.attachments.lock().remove(message_id).unwrap_or_default()
+    pub(crate) fn take_attachments(&self, conversation_id: &str, message_id: &str) -> Vec<super::rich::AttachmentRef> {
+        self.inner
+            .attachments
+            .lock()
+            .remove(&MessageKey::new(conversation_id, message_id))
+            .unwrap_or_default()
     }
 
-    pub(crate) fn note_media(&self, message_id: &str, object_id: &str) {
+    pub(crate) fn note_media(&self, conversation_id: &str, message_id: &str, object_id: &str) {
         let Some(account_id) = self.inner.account_id.lock().clone() else {
             return;
         };
-        let conversation_id = self
-            .inner
-            .tracked
-            .lock()
-            .get(message_id)
-            .map(|tracked| tracked.conversation_id.clone())
-            .unwrap_or_default();
         erase_index::note(
             &self.inner.store,
             &self.inner.crypto,
             &account_id,
             &conversation_id,
-            message_id,
+            &self.inner.source_message_id(conversation_id, message_id),
             None,
             Some(object_id),
             None,
@@ -585,9 +700,17 @@ impl RamfluxChannel {
         *self.inner.expected_peer.lock() = uid;
     }
 
-    pub(crate) fn claim_admitted(&self, message_id: &str, turn_id: &str) {
-        if self.inner.claim_slot_message(message_id) {
-            self.inner.note_slot_turn(turn_id);
+    pub(crate) fn claim_admitted(&self, conversation_id: &str, message_id: &str, turn_id: &str) {
+        if self.inner.claim_slot_message(conversation_id, message_id) {
+            self.inner.note_slot_turn(conversation_id, message_id, turn_id);
+            if let Some(tracked) = self
+                .inner
+                .tracked
+                .lock()
+                .get(&MessageKey::new(conversation_id, message_id))
+            {
+                self.inner.approvals.bind_sender(turn_id, tracked.sender.clone());
+            }
         }
     }
 
@@ -657,13 +780,18 @@ impl RamfluxChannel {
         if self.inner.started.load(Ordering::Acquire) {
             return Ok(());
         }
-        let listener = socket::bind(&self.inner.socket_path)?;
-        let inner = Arc::clone(&self.inner);
-        tokio::spawn(async move {
-            socket::accept_loop(inner, listener).await;
-        });
-        self.inner.started.store(true, Ordering::Release);
-        Ok(())
+        #[cfg(not(unix))]
+        return Err(socket::SocketError::Invalid("ramflux channel requires a Unix domain socket".to_string()).into());
+        #[cfg(unix)]
+        {
+            let listener = socket::bind(&self.inner.socket_path)?;
+            let inner = Arc::clone(&self.inner);
+            tokio::spawn(async move {
+                socket::accept_loop(inner, listener).await;
+            });
+            self.inner.started.store(true, Ordering::Release);
+            Ok(())
+        }
     }
 }
 
@@ -694,23 +822,36 @@ impl Channel for RamfluxChannel {
             while let Some(event) = rich_rx.recv().await {
                 let message = match event {
                     RichInbound::Message(message) => {
-                        self.stash_attachments(&message.message_id, message.attachments.clone());
+                        self.stash_attachments(
+                            &message.conversation_id,
+                            &message.message_id,
+                            message.attachments.clone(),
+                        );
                         message.to_channel_message()
                     }
                     RichInbound::SurfaceAction(action) => {
-                        if self.inner.conversation_is_open(&action.conversation_id) {
-                            self.inner.deliver_open_action(&action).await;
+                        let chat = self.inner.conversations.lock().get(&action.conversation_id).cloned();
+                        let Some(chat) = chat else {
+                            tracing::warn!("ramflux action has no conversation metadata");
                             continue;
+                        };
+                        // Surface values are user input, never approval authority.
+                        // Only the dedicated host decision can resolve a waiter.
+                        let content = serde_json::json!({"event":"surface_action", "message_id":action.message_id, "surface_id":action.surface_id, "action_id":action.action_id, "values":action.values}).to_string();
+                        let derived_id = format!("{}:{}:{}", action.message_id, action.action_id, uuid::Uuid::new_v4());
+                        self.inner.derived_messages.lock().insert(
+                            MessageKey::new(&action.conversation_id, &derived_id),
+                            action.message_id.clone(),
+                        );
+                        let params = serde_json::json!({
+                            "conversation_id":action.conversation_id,
+                            "message_id":derived_id,
+                            "sender":action.sender, "chat":chat, "text":content, "timestamp_ms":unix_ms(),
+                        });
+                        if let Err(error) = inbound::on_message(&self.inner, &params).await {
+                            tracing::warn!(%error, "ramflux action was not admitted");
                         }
-                        let nonce = uuid::Uuid::new_v4();
-                        let id = format!("{}:{}:{nonce}", action.message_id, action.action_id);
-                        hooks::inbound_as_message(
-                            &id,
-                            &action.sender.principal_id,
-                            &action.conversation_id,
-                            &format!("user action {} {}", action.message_id, action.action_id),
-                            action.sender.display_name.clone(),
-                        )
+                        continue;
                     }
                     RichInbound::TaskEvent(event) => {
                         self.inner.project_task_event(&event).await;
@@ -750,8 +891,8 @@ impl Channel for RamfluxChannel {
 impl RichChannel for RamfluxChannel {
     async fn listen_rich(&self, tx: mpsc::Sender<RichInbound>) -> anyhow::Result<()> {
         self.ensure_eraser();
-        self.start().await?;
         *self.inner.inbound_tx.lock() = Some(tx);
+        self.start().await?;
         self.inner.shutdown.cancelled().await;
         self.join_eraser().await;
         Ok(())
@@ -771,6 +912,7 @@ impl RichChannel for RamfluxChannel {
 
     fn unbind_turn(&self, conversation_id: &str, turn_id: &str) {
         self.inner.unbind_turn(conversation_id, turn_id);
+        self.inner.approvals.unbind_sender(turn_id);
     }
 
     async fn on_tool_event(&self, event: &super::rich::ToolEvent) {
@@ -779,6 +921,20 @@ impl RichChannel for RamfluxChannel {
             return;
         };
         let turn = (active.conversation_id, active.turn_id);
+        let state = match event.kind {
+            super::rich::ToolEventKind::Started | super::rich::ToolEventKind::Progress => TurnState::ToolRunning,
+            super::rich::ToolEventKind::Finished | super::rich::ToolEventKind::Failed => TurnState::Thinking,
+        };
+        let status = TurnStatus {
+            conversation_id: turn.0.clone(),
+            turn_id: turn.1.clone(),
+            state,
+            error: None,
+            approval_id: None,
+        };
+        if let Err(error) = outbound::send_status(&self.inner.rpc, &status).await {
+            tracing::warn!(%error, "ramflux tool lifecycle status was not sent");
+        }
         self.inner.store_tool_event(&turn.0, event);
         if let Err(error) = outbound::send_tool_event(&self.inner.rpc, &turn.0, &turn.1, event).await {
             tracing::warn!(error = %error, tool = %event.tool_name, "ramflux tool event was not sent");
@@ -858,51 +1014,107 @@ impl RichChannel for RamfluxChannel {
         self.inner.scoped_memory(inner, &account_id, conversation_id)
     }
 
-    fn claim_slot(&self, message_id: &str, turn_id: &str) {
-        self.claim_admitted(message_id, turn_id);
+    fn inbound_idempotency_key(&self, conversation_id: &str, message_id: &str) -> Option<String> {
+        let account = self.inner.account_id.lock().clone()?;
+        Some(format!(
+            "channel:ramflux:{}:{}:{message_id}",
+            crypto::id_hash(&account),
+            crypto::id_hash(conversation_id)
+        ))
     }
 
-    fn record_erasure(&self, message_id: &str, memory_key: &str, history_key: &str) {
+    fn memory_for_message(
+        &self,
+        inner: Arc<dyn crate::memory::Memory>,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<Arc<dyn crate::memory::Memory>> {
+        let account = self
+            .inner
+            .account_id
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("bridge hello required"))?;
+        let key = MessageKey::new(conversation_id, message_id);
+        let cached = self.inner.message_memories.lock().get(&key).cloned();
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
+        let memory = self
+            .inner
+            .scoped_memory(inner, &account, conversation_id)
+            .with_erasure_origin(crate::memory::erasure::ErasureOrigin::new(
+                &account,
+                conversation_id,
+                &self.inner.source_message_id(conversation_id, message_id),
+            ))?;
+        Ok(self.inner.message_memories.lock().entry(key).or_insert(memory).clone())
+    }
+
+    fn accepts_message(&self, conversation_id: &str, message_id: &str) -> bool {
+        let Some(account) = self.inner.account_id.lock().clone() else {
+            return false;
+        };
+        let origin = crate::memory::erasure::ErasureOrigin::new(
+            &account,
+            conversation_id,
+            &self.inner.source_message_id(conversation_id, message_id),
+        );
+        match self.inner.store.backend().and_then(|store| store.is_deleted(&origin)) {
+            Ok(deleted) => !deleted && self.inner.queue.owns(conversation_id, message_id),
+            Err(error) => {
+                tracing::warn!(%error, "ramflux input admission refused");
+                false
+            }
+        }
+    }
+
+    fn claim_slot(&self, conversation_id: &str, message_id: &str, turn_id: &str) {
+        self.claim_admitted(conversation_id, message_id, turn_id);
+    }
+
+    fn record_erasure(&self, conversation_id: &str, message_id: &str, memory_key: &str, history_key: &str) {
         let Some(account_id) = self.inner.account_id.lock().clone() else {
             return;
         };
-        let conversation_id = self
-            .inner
-            .tracked
-            .lock()
-            .get(message_id)
-            .map(|tracked| tracked.conversation_id.clone())
-            .unwrap_or_default();
         erase_index::note(
             &self.inner.store,
             &self.inner.crypto,
             &account_id,
             &conversation_id,
-            message_id,
+            &self.inner.source_message_id(conversation_id, message_id),
             Some(memory_key),
             None,
             Some(history_key),
         );
-        if let Some(histories) = self.inner.histories.lock().clone() {
-            let session = history_key
-                .strip_prefix("convturn:")
-                .and_then(|rest| rest.rsplit_once(':'))
-                .and_then(|(head, _)| head.rsplit_once(':'))
-                .map(|(session, _)| session.to_string());
-            if let Some(session) = session {
-                let len = histories.lock().get(&session).map(Vec::len).unwrap_or(0);
-                let mut keys = self.inner.history_keys.lock();
-                let recorded = keys.entry(session).or_default();
-                recorded.push(history_key.to_string());
-                while recorded.len() > len && !recorded.is_empty() {
-                    recorded.remove(0);
-                }
-            }
-        }
     }
 
-    async fn enrich_inbound(&self, content: &str, _conversation_id: &str, message_id: &str) -> String {
-        hooks::enrich_inbound(self, content, message_id).await
+    fn record_history_session(&self, conversation_id: &str, session: &str) {
+        self.inner
+            .history_sessions
+            .lock()
+            .entry(conversation_id.to_owned())
+            .or_default()
+            .insert(session.to_owned());
+    }
+
+    async fn hydrate_history(&self, conversation_id: &str) -> anyhow::Result<()> {
+        let account = self
+            .inner
+            .account_id
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("bridge hello required"))?;
+        if !self.inner.history_sessions.lock().contains_key(conversation_id) {
+            hooks::refresh_history(&self.inner, &account, conversation_id)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
+
+    async fn enrich_inbound(&self, content: &str, conversation_id: &str, message_id: &str) -> String {
+        hooks::enrich_inbound(self, content, conversation_id, message_id).await
     }
 
     async fn project_final_surface(&self, conversation_id: &str, turn_id: &str, text: &str) -> anyhow::Result<()> {
@@ -914,6 +1126,13 @@ impl RichChannel for RamfluxChannel {
         memory: Arc<dyn crate::memory::Memory>,
         histories: Arc<parking_lot::Mutex<HashMap<String, Vec<crate::providers::ChatMessage>>>>,
     ) {
+        match memory.erasure_store() {
+            Ok(store) => self.inner.store.attach(store),
+            Err(error) => {
+                self.inner.store.detach();
+                tracing::debug!(%error, "ramflux transactional retention unavailable");
+            }
+        }
         *self.inner.attached_memory.lock() = Some(memory);
         *self.inner.histories.lock() = Some(histories);
     }

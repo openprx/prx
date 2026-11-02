@@ -17,9 +17,11 @@ use super::embeddings::EmbeddingProvider;
 use super::principal::{ChatType, MemoryWriteContext, Principal, Role, Visibility, resolve_principal};
 use super::traits::{MemoryPrincipal, MessageEvent, MessageEventInput};
 use super::vector;
-use crate::runtime::sqlite_pool::SqliteConnectionPool;
+use crate::runtime::sqlite_pool::SqliteConnectionPool as RawSqliteConnectionPool;
+mod erasure_pool;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use erasure_pool::MemoryPool as SqliteConnectionPool;
 use recall::VECTOR_CANDIDATE_CAP;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
@@ -129,6 +131,7 @@ const SQLITE_WRITER_PRAGMAS: &str = "PRAGMA synchronous   = NORMAL;
 pub use crate::runtime::sqlite_pool::SqlitePoolStats;
 
 /// Make `path` and its parent owner-only, plus any sqlite wal siblings.
+#[cfg(unix)]
 fn restrict_owner_mode(db_path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let restrict = |path: &Path, mode: u32| -> anyhow::Result<()> {
@@ -150,6 +153,12 @@ fn restrict_owner_mode(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn restrict_owner_mode(_db_path: &Path) -> anyhow::Result<()> {
+    // Unix mode bits have no Windows equivalent. Native filesystem ACLs apply.
+    Ok(())
+}
+
 /// SQLite-backed persistent memory — the brain
 ///
 /// Full-stack search engine:
@@ -158,9 +167,10 @@ fn restrict_owner_mode(db_path: &Path) -> anyhow::Result<()> {
 /// - **Hybrid Merge**: weighted fusion of vector + keyword results
 /// - **Embedding Cache**: LRU-evicted cache to avoid redundant API calls
 /// - **Safe Reindex**: temp DB → seed → sync → atomic swap → rollback
+#[derive(Clone)]
 pub struct SqliteMemory {
     pool: Arc<SqliteConnectionPool>,
-    ingress_owners: super::ingress_recovery::IngressOwnerCache,
+    ingress_owners: Arc<super::ingress_recovery::IngressOwnerCache>,
     db_path: PathBuf,
     acl_enabled: bool,
     embedder: Arc<dyn EmbeddingProvider>,
@@ -340,7 +350,7 @@ impl SqliteMemory {
         // would clean up after itself, a bare `BEGIN` would not, and a leftover
         // transaction stalls every later write (writer) or pins a stale WAL
         // snapshot for every later caller (reader).
-        let pool = SqliteConnectionPool::builder(db_path.clone())
+        let pool = RawSqliteConnectionPool::builder(db_path.clone())
             .max_readers(read_pool_size.unwrap_or_else(crate::runtime::sqlite_pool::default_read_pool_size))
             .open_timeout_secs(open_timeout_secs)
             .writer_pragmas(SQLITE_WRITER_PRAGMAS)
@@ -355,7 +365,8 @@ impl SqliteMemory {
         Self::init_schema(&pool.write())?;
 
         let pool = Arc::new(pool);
-        SqliteConnectionPool::publish_metrics(&pool);
+        RawSqliteConnectionPool::publish_metrics(&pool);
+        let pool = Arc::new(SqliteConnectionPool::new(pool)?);
 
         Ok(Self {
             pool,

@@ -82,11 +82,32 @@ impl Worker {
     }
 
     async fn persist(&self, batch: Vec<QueuedEvent>) {
+        let mut events = batch.into_iter().peekable();
+        while let Some(first) = events.next() {
+            let memory = Arc::clone(&first.memory);
+            let mut group = vec![first];
+            while events.peek().is_some_and(|next| memory.same_context(&next.memory)) {
+                if let Some(next) = events.next() {
+                    group.push(next);
+                }
+            }
+            self.persist_group(memory, group).await;
+        }
+    }
+
+    async fn persist_group(&self, memory: Arc<super::routes::EventMemory>, batch: Vec<QueuedEvent>) {
         let inputs = batch
             .iter()
-            .map(|queued| to_message_input(&queued.event, &self.workspace, self.generation, &self.revision))
+            .map(|queued| {
+                to_message_input(
+                    &queued.event,
+                    memory.workspace.as_deref().unwrap_or(&self.workspace),
+                    memory.generation,
+                    &memory.revision,
+                )
+            })
             .collect();
-        let results = self.memory.append_message_events(inputs).await;
+        let results = memory.memory.append_message_events(inputs).await;
         if results.len() != batch.len() {
             for queued in batch {
                 report_incomplete(

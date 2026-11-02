@@ -90,13 +90,14 @@ impl DocumentIngestRuntime {
     }
 
     async fn ingest(&self, tool_name: &str, args: serde_json::Value, require_path: bool) -> anyhow::Result<ToolResult> {
-        if !self.memory.supports_document_ingest() {
+        let memory_view = crate::memory::active_view::select(&self.memory);
+        if !memory_view.supports_document_ingest() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
                     "Memory backend '{}' does not support document ingestion",
-                    self.memory.name()
+                    memory_view.name()
                 )),
             });
         }
@@ -188,8 +189,7 @@ impl DocumentIngestRuntime {
             "synced_at": chrono::Utc::now().to_rfc3339(),
         }))?;
 
-        let record = self
-            .memory
+        let record = memory_view
             .ingest_document(DocumentIngestInput {
                 document_id,
                 workspace_id: principal.workspace_id,

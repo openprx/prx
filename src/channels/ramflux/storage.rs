@@ -1,7 +1,7 @@
-//! At-rest files for the ramflux channel.
+//! Indexed content objects and encrypted recovery metadata.
 //!
-//! Content is ciphertext from [`super::crypto`]. File names are
-//! `hex(sha256(id))`, which is injective: distinct ids never share a path.
+//! Production content uses the transactional database store and ciphertext
+//! from [`super::crypto`]. Legacy file names use collision-resistant hashed ids.
 //! A first open deletes any pre-existing plaintext left in this directory.
 
 use super::crypto::{self, AccountCrypto, CryptoError};
@@ -18,6 +18,7 @@ pub enum StorageError {
 /// Channel files under `<workspace>/ramflux`.
 pub struct ChannelStore {
     root: PathBuf,
+    backend: parking_lot::Mutex<Option<crate::memory::erasure::SharedErasureStore>>,
 }
 
 impl ChannelStore {
@@ -30,7 +31,44 @@ impl ChannelStore {
         let root = workspace.join("ramflux");
         std::fs::create_dir_all(&root).map_err(|error| StorageError::Io(error.to_string()))?;
         delete_legacy_plaintext(&root);
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            backend: parking_lot::Mutex::new(None),
+        })
+    }
+
+    pub fn attach(&self, backend: crate::memory::erasure::SharedErasureStore) {
+        *self.backend.lock() = Some(backend);
+    }
+
+    pub fn detach(&self) {
+        self.backend.lock().take();
+    }
+
+    pub fn backend(&self) -> anyhow::Result<crate::memory::erasure::SharedErasureStore> {
+        self.backend
+            .lock()
+            .clone()
+            .ok_or_else(|| crate::memory::erasure::Unsupported("transactional erasure").into())
+    }
+
+    fn put_content(
+        &self,
+        origin: crate::memory::erasure::ErasureOrigin,
+        kind: &str,
+        key: &str,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        let backend = self.backend.lock().clone();
+        backend.map_or_else(
+            || write_file(path, bytes),
+            |backend| {
+                backend
+                    .put_blob(&origin, kind, &name(key), bytes)
+                    .map_err(|error| StorageError::Io(error.to_string()))
+            },
+        )
     }
 
     #[must_use]
@@ -43,6 +81,7 @@ impl ChannelStore {
     /// # Errors
     ///
     /// Returns [`StorageError`] when sealing or the write fails.
+    #[cfg(test)]
     pub fn put_message(
         &self,
         crypto: &AccountCrypto,
@@ -53,7 +92,13 @@ impl ChannelStore {
     ) -> Result<PathBuf, StorageError> {
         let blob = crypto.seal(account_id, conversation_id, message_id, plaintext)?;
         let path = self.message_path(account_id, conversation_id, message_id);
-        write_file(&path, &blob)?;
+        self.put_content(
+            crate::memory::erasure::ErasureOrigin::new(account_id, conversation_id, message_id),
+            "message",
+            message_id,
+            &path,
+            &blob,
+        )?;
         Ok(path)
     }
 
@@ -71,7 +116,16 @@ impl ChannelStore {
         message_id: &str,
     ) -> Result<Vec<u8>, StorageError> {
         let path = self.message_path(account_id, conversation_id, message_id);
-        let blob = std::fs::read(&path).map_err(|error| StorageError::Io(error.to_string()))?;
+        let backend = self.backend.lock().clone();
+        let blob = if let Some(backend) = backend {
+            let origin = crate::memory::erasure::ErasureOrigin::new(account_id, conversation_id, message_id);
+            backend
+                .get_blob(&origin.account, &origin.conversation, "message", &name(message_id))
+                .map_err(|error| StorageError::Io(error.to_string()))?
+                .ok_or_else(|| StorageError::Io("message missing".to_string()))?
+        } else {
+            std::fs::read(&path).map_err(|error| StorageError::Io(error.to_string()))?
+        };
         Ok(crypto.open(account_id, conversation_id, message_id, &blob)?)
     }
 
@@ -81,11 +135,18 @@ impl ChannelStore {
         account_id: &str,
         conversation_id: &str,
         event_id: &str,
+        message_id: &str,
         plaintext: &[u8],
     ) -> Result<PathBuf, StorageError> {
         let blob = crypto.seal(account_id, conversation_id, event_id, plaintext)?;
         let path = self.event_path(account_id, conversation_id, event_id);
-        write_file(&path, &blob)?;
+        self.put_content(
+            crate::memory::erasure::ErasureOrigin::new(account_id, conversation_id, message_id),
+            "event",
+            event_id,
+            &path,
+            &blob,
+        )?;
         Ok(path)
     }
 
@@ -95,11 +156,18 @@ impl ChannelStore {
         account_id: &str,
         conversation_id: &str,
         object_id: &str,
+        message_id: &str,
         plaintext: &[u8],
     ) -> Result<PathBuf, StorageError> {
         let blob = crypto.seal(account_id, conversation_id, object_id, plaintext)?;
         let path = self.media_path(account_id, conversation_id, object_id);
-        write_file(&path, &blob)?;
+        self.put_content(
+            crate::memory::erasure::ErasureOrigin::new(account_id, conversation_id, message_id),
+            "media",
+            object_id,
+            &path,
+            &blob,
+        )?;
         Ok(path)
     }
 
@@ -183,26 +251,6 @@ impl ChannelStore {
     /// Message ids are the file names, which are hashes. Callers that need the
     /// original id read the sealed entry. This lists the hashed file stems so
     /// a conversation erase can open each one.
-    #[must_use]
-    pub fn index_files(&self, account_id: &str, conversation_id: &str) -> Vec<PathBuf> {
-        let dir = self
-            .root
-            .join("index")
-            .join(name(account_id))
-            .join(name(conversation_id));
-        let mut files = Vec::new();
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return files;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                files.push(path);
-            }
-        }
-        files
-    }
-
     #[must_use]
     pub fn marker_path(&self, account_id: &str, conversation_id: &str) -> PathBuf {
         self.root

@@ -1282,6 +1282,23 @@ const fn enforced_read_mode(context: Option<&MemoryWriteContext>, requested: Mem
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
+    /// Whether execution requires this exact in-process memory capability.
+    fn requires_scoped_execution(&self) -> bool {
+        false
+    }
+
+    /// Return a view that attributes every subsequent write to one input.
+    fn with_erasure_origin(
+        &self,
+        _origin: crate::memory::erasure::ErasureOrigin,
+    ) -> anyhow::Result<std::sync::Arc<dyn Memory>> {
+        Err(crate::memory::erasure::Unsupported("transactional erasure").into())
+    }
+
+    fn erasure_store(&self) -> anyhow::Result<crate::memory::erasure::SharedErasureStore> {
+        Err(crate::memory::erasure::Unsupported("transactional erasure").into())
+    }
+
     /// Backend name
     fn name(&self) -> &str;
 
@@ -1547,7 +1564,7 @@ pub trait Memory: Send + Sync {
     /// terminal payload without listing the table.
     async fn forget_message_idempotency(&self, idempotency_key: &str) -> anyhow::Result<usize> {
         let _ = idempotency_key;
-        Ok(0)
+        Err(crate::memory::erasure::Unsupported("forget_message_idempotency").into())
     }
 
     /// Key as stored in the backend. Encrypting scopes hash it.

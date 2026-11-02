@@ -351,6 +351,9 @@ async fn execute_one_unrecorded(
     })
 }
 
+type ToolExecutionFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = crate::tools::ToolExecutionOutcome> + Send>>;
+
 /// Delegation backends contain another complete agent loop. Start their fixed
 /// execution pipeline in a separate task so the backend gets a fresh worker
 /// stack instead of extending the caller's already-deep turn stack. The
@@ -367,19 +370,28 @@ fn spawn_delegation_tool(
     let parent_work = crate::runtime::registry::current_work_id();
     let progress = crate::agent::idle::current_beat();
     let approval = crate::agent::channel_approval::current_installed();
+    let memory = crate::memory::active_view::current();
     let spawn_context = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
         .try_with(Clone::clone)
         .ok();
     let work: std::pin::Pin<Box<dyn std::future::Future<Output = crate::tools::ToolExecutionOutcome> + Send>> =
         Box::pin(async move {
-            let execute = async move { service.execute(command, context, cancellation).await };
-            let execute = async move {
+            let execute: ToolExecutionFuture =
+                Box::pin(async move { service.execute(command, context, cancellation).await });
+            let execute: ToolExecutionFuture = Box::pin(async move {
                 if let Some(approval) = approval {
                     crate::agent::channel_approval::scope_installed(approval, execute).await
                 } else {
                     execute.await
                 }
-            };
+            });
+            let execute: ToolExecutionFuture = Box::pin(async move {
+                if let Some(memory) = memory {
+                    crate::memory::active_view::scope(memory, execute).await
+                } else {
+                    execute.await
+                }
+            });
             let execute = async move {
                 match spawn_context {
                     Some(spawn_context) => {

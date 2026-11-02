@@ -17,6 +17,8 @@ pub(crate) enum TurnServiceBuildError {
     Factory(#[from] FactoryBuildError),
     #[error("pinned decision policy cannot be fingerprinted")]
     PolicyFingerprint(#[source] serde_json::Error),
+    #[error("causal event memory could not bind the store namespace")]
+    EventNamespace(#[source] anyhow::Error),
     #[error("durable causal events require an active runtime")]
     EventRuntime(#[from] tokio::runtime::TryCurrentError),
     #[error("decision service storage preparation task failed")]

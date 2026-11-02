@@ -1120,6 +1120,7 @@ impl SqliteMemory {
             [],
         )?;
 
+        super::erasure_pool::init_schema(conn)?;
         Self::run_memory_schema_migrations(conn)?;
 
         Ok(())
@@ -1454,6 +1455,11 @@ impl SqliteMemory {
                 // refused another owner's `session`/`private` rows. Added by an
                 // idempotent ALTER; legacy rows keep NULL (unattributed).
                 "memory_events + owner_id + idx_memory_events_owner",
+            ),
+            (
+                17,
+                "ramflux_transactional_erasure",
+                "ramflux_erase_index(account,conversation,message,table_name,record_rowid) + ramflux_erase_origin + ramflux_erase_record + ramflux_tombstones(account,conversation,message,sealed) + ramflux_blobs(id,account,conversation,kind,object_key,bytes)",
             ),
         ]
     }

@@ -24,10 +24,12 @@ const EVENT_QUEUE_CAPACITY: usize = 256;
 const ORDINARY_QUEUE_CAPACITY: usize = EVENT_QUEUE_CAPACITY - 1;
 
 mod deferral;
+pub(crate) mod routes;
 mod worker;
 pub(super) use deferral::PersistenceGuard;
 
 struct QueuedEvent {
+    memory: Arc<routes::EventMemory>,
     event: Box<CausalEvent>,
     deferral: Option<Arc<deferral::AdmissionDeferral>>,
     _permit: OwnedSemaphorePermit,
@@ -46,6 +48,7 @@ enum QueueItem {
 /// The decision service owns this sink only while the plane has a durable key
 /// and writable store. Call `drain` before stopping its runtime.
 pub(crate) struct DurableCausalEventSink {
+    store_namespace: std::sync::OnceLock<Arc<str>>,
     memory: Arc<dyn Memory>,
     workspace_id: String,
     generation_id: u64,
@@ -89,6 +92,7 @@ impl DurableCausalEventSink {
             .run(),
         );
         Ok(Self {
+            store_namespace: Default::default(),
             ordinary_slots: Arc::new(Semaphore::new(ORDINARY_QUEUE_CAPACITY)),
             deferral,
             observer,
@@ -99,6 +103,16 @@ impl DurableCausalEventSink {
             generation_id: config_generation_id,
             revision: replay_revision,
         })
+    }
+
+    pub(crate) fn bind_store_namespace(&self, namespace: Arc<str>) -> anyhow::Result<()> {
+        if self.store_namespace.set(Arc::clone(&namespace)).is_err() {
+            anyhow::ensure!(
+                self.store_namespace.get() == Some(&namespace),
+                "event store namespace changed"
+            );
+        }
+        Ok(())
     }
 
     /// A source-bound admission may defer only its own ordinary events. Drain
@@ -241,8 +255,25 @@ impl CausalEventSink for DurableCausalEventSink {
             report_incomplete(self.observer.as_ref(), event.lineage, IncompleteReason::StoreDropped);
             return;
         };
+        // The store's writer is shared across services. Its first sink must
+        // never persist another run through the first turn's memory scope.
+        let routed = self
+            .store_namespace
+            .get()
+            .and_then(|namespace| routes::lookup(namespace, event.lineage.run_id.as_deref()));
+        let memory = if let Some(memory) = routed {
+            memory
+        } else if self.memory.requires_scoped_execution()
+            || (event.lineage.run_id.is_some() && event.lineage.source_event_id.is_some())
+        {
+            report_incomplete(self.observer.as_ref(), event.lineage, IncompleteReason::UnknownDecision);
+            return;
+        } else {
+            routes::EventMemory::fallback(Arc::clone(&self.memory), self.generation_id, &self.revision)
+        };
         let deferred = self.deferral.for_event(&event.lineage);
         let queued = QueuedEvent {
+            memory,
             event: Box::new(event),
             deferral: deferred,
             _permit: permit,
@@ -369,6 +400,115 @@ mod tests {
                 .iter()
                 .any(|entry| entry.fields.incomplete == Some(IncompleteReason::StoreFailed))
         );
+    }
+
+    #[tokio::test]
+    async fn shared_writer_events_use_their_runs_memory_scope_and_generation() {
+        for first_scoped in [false, true] {
+            let workspace = tempfile::tempdir().expect("test: workspace");
+            let mut config = crate::config::Config::default();
+            config.workspace_dir = workspace.path().to_path_buf();
+            let generation = crate::config::new_shared(config).pin();
+            let base = Arc::new(SqliteMemory::new(workspace.path()).expect("test: memory"));
+            let crypto = Arc::new(crate::security::ramflux_aead::AccountCrypto::new(
+                workspace.path().join("secrets"),
+                &workspace.path().join("ramflux"),
+                true,
+            ));
+            crypto.unlock("account").expect("test: key");
+            let first_origin = crate::memory::erasure::ErasureOrigin::new("account", "first", "message");
+            let second_origin = crate::memory::erasure::ErasureOrigin::new("account", "second", "message");
+            let first = crate::memory::encrypted_scope::EncryptedScope::new(
+                base.clone(),
+                crypto.clone(),
+                "account",
+                "account/first",
+            )
+            .with_erasure_origin(first_origin.clone())
+            .expect("test: first scope");
+            let second =
+                crate::memory::encrypted_scope::EncryptedScope::new(base.clone(), crypto, "account", "account/second")
+                    .with_erasure_origin(second_origin.clone())
+                    .expect("test: second scope");
+            let observer = Arc::new(RecordingSink::default());
+            let first_sink_memory = if first_scoped {
+                first
+            } else {
+                base.clone() as Arc<dyn Memory>
+            };
+            let sink = DurableCausalEventSink::new(&generation, first_sink_memory, observer.clone())
+                .expect("test: first writer sink");
+            let namespace: Arc<str> = Arc::from(uuid::Uuid::new_v4().to_string());
+            sink.bind_store_namespace(namespace.clone())
+                .expect("test: writer namespace");
+            let run = uuid::Uuid::new_v4().to_string();
+            let revision = "b".repeat(64);
+            let route = routes::register(
+                &namespace,
+                &workspace.path().to_string_lossy(),
+                &run,
+                second.clone(),
+                42,
+                &revision,
+            )
+            .expect("test: source binding");
+            let mut emitted = CausalEvent {
+                kind: CausalEventKind::PredictionFailed,
+                lineage: CausalLineage {
+                    workspace_id: Arc::from(workspace.path().to_string_lossy().as_ref()),
+                    run_id: Some(Arc::from(run.as_str())),
+                    source_event_id: Some(Arc::from("source")),
+                    owner_id: Some(Arc::from("owner")),
+                    ..CausalLineage::default()
+                },
+                fields: CausalEventFields::default(),
+            };
+            sink.emit(emitted.clone());
+            emitted.lineage.workspace_id = Arc::from("store-workspace");
+            sink.emit(emitted.clone());
+            assert!(sink.drain(Instant::now() + std::time::Duration::from_secs(2)).await);
+            let backend = base.erasure_store().expect("test: index");
+            assert_eq!(
+                backend.run_ids(&first_origin).expect("test: first origin"),
+                Vec::<String>::new()
+            );
+            assert_eq!(
+                backend.run_ids(&second_origin).expect("test: second origin"),
+                vec![run.clone()]
+            );
+            let principal = MemoryPrincipal {
+                workspace_id: workspace.path().to_string_lossy().into_owned(),
+                owner_id: Some("owner".to_owned()),
+                ..MemoryPrincipal::default()
+            };
+            let events = second
+                .list_message_events_since(&principal, 0, 10)
+                .await
+                .expect("test: scoped telemetry");
+            assert_eq!(events.len(), 2);
+            for event in &events {
+                assert_eq!(event.config_generation_id, Some(42));
+                assert_eq!(event.config_source_revision.as_deref(), Some(revision.as_str()));
+            }
+            drop(route);
+            sink.emit(emitted);
+            assert!(sink.drain(Instant::now() + std::time::Duration::from_secs(2)).await);
+            assert_eq!(
+                second
+                    .list_message_events_since(&principal, 0, 10)
+                    .await
+                    .expect("test: closed source")
+                    .len(),
+                2
+            );
+            assert!(
+                observer
+                    .events
+                    .lock()
+                    .iter()
+                    .any(|event| event.fields.incomplete == Some(IncompleteReason::UnknownDecision))
+            );
+        }
     }
 
     #[tokio::test]
@@ -541,6 +681,26 @@ mod tests {
         );
     }
 
+    fn bind_fixture_source(
+        sink: &DurableCausalEventSink,
+        memory: Arc<dyn Memory>,
+        generation: &ConfigGeneration,
+        event: &CausalEvent,
+    ) -> Arc<routes::EventMemory> {
+        let namespace: Arc<str> = Arc::from(uuid::Uuid::new_v4().to_string());
+        sink.bind_store_namespace(namespace.clone())
+            .expect("test: event namespace");
+        routes::register(
+            &namespace,
+            &generation.effective.workspace_dir.to_string_lossy(),
+            event.lineage.run_id.as_deref().expect("test: run identity"),
+            memory,
+            generation.id.0,
+            &generation.source_revision.fingerprint_sha256,
+        )
+        .expect("test: source route")
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_full_ordinary_quota_keeps_an_applied_control_entry_available() {
         let workspace = tempfile::tempdir().expect("test workspace");
@@ -551,6 +711,7 @@ mod tests {
         let observer = Arc::new(RecordingSink::default());
         let sink = DurableCausalEventSink::new(&generation, memory.clone(), observer.clone()).expect("sink");
         let event = applied_fixture(&workspace.path().to_string_lossy(), "prx_terminal");
+        let _route = bind_fixture_source(&sink, memory.clone(), &generation, &event);
         let key = "causal:prx_decision:directive-applied".to_owned();
         // No await: the single-thread worker cannot consume a queued entry.
         for _ in 0..ORDINARY_QUEUE_CAPACITY {
@@ -669,6 +830,7 @@ mod tests {
         let observer = Arc::new(RecordingSink::default());
         let sink = DurableCausalEventSink::new(&generation, memory.clone(), observer.clone()).unwrap();
         let event = applied_fixture(&workspace.path().to_string_lossy(), "prx_terminal");
+        let _route = bind_fixture_source(&sink, memory.clone(), &generation, &event);
         for _ in 0..ORDINARY_QUEUE_CAPACITY {
             sink.emit(CausalEvent {
                 kind: CausalEventKind::SnapshotCreated,

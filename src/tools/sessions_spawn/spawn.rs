@@ -410,6 +410,11 @@ impl SessionsSpawnTool {
             .or_else(|| ordinary_publication.map(|publication| publication.source_fabric()))
             .or_else(|| operator_source.as_ref().map(|source| source.fabric().clone()))
             .context("spawn admitted memory fabric missing")?;
+        if mode == "process" && memory_fabric.memory().requires_scoped_execution() {
+            return Err(
+                crate::memory::erasure::Unsupported("process worker cannot preserve scoped memory erasure").into(),
+            );
+        }
         let process_memory_backend = memory_fabric.memory().name().to_owned();
         let child_model_catalog = child_grant
             .as_ref()
@@ -990,7 +995,7 @@ impl SessionsSpawnTool {
             let monitor_operator_terminal = Arc::clone(&operator_terminal);
             let monitor_active_runs = active_runs.clone();
             let monitor_progress = Arc::clone(&process_progress);
-            let jh = tokio::spawn(crate::runtime::registry::scope_current(
+            let jh = crate::agent::channel_approval::spawn(crate::runtime::registry::scope_current(
                 process_work_id,
                 SPAWN_EXECUTION_CONTEXT.scope(
                     process_execution_ctx,
@@ -1678,7 +1683,7 @@ impl SessionsSpawnTool {
         ));
         let driver_terminal_journal = Arc::clone(&terminal_journal);
         // Spawn async task (fire-and-forget); capture handle to support kill
-        let jh = tokio::spawn(crate::runtime::registry::scope_current(
+        let jh = crate::agent::channel_approval::spawn(crate::runtime::registry::scope_current(
             sub_agent_work_id,
             SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
                 tracing::info!(run_id = %rid, "Sub-agent task starting");

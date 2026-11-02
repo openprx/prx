@@ -36,6 +36,7 @@ impl Tool for MemoryReindexTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let memory_view = crate::memory::active_view::select(&self.memory);
         let operation_name = "memory_reindex:rebuild";
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
         if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
@@ -51,8 +52,8 @@ impl Tool for MemoryReindexTool {
             });
         }
 
-        let backend = self.memory.name().to_string();
-        match self.memory.reindex().await {
+        let backend = memory_view.name().to_string();
+        match memory_view.reindex().await {
             Ok(count) => Ok(ToolResult {
                 success: true,
                 output: format!("Memory reindex complete for {backend}: {count} stale vectors rebuilt"),

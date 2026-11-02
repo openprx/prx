@@ -14,8 +14,9 @@ use serde_json::json;
 
 impl SessionsSpawnTool {
     pub(super) fn memory_fabric(&self) -> Option<MemoryFabric> {
+        let memory_view = crate::memory::active_view::select_optional(&self.memory);
         self.source_fabric.clone().or_else(|| {
-            self.memory.as_ref().map(|memory| {
+            memory_view.as_ref().map(|memory| {
                 MemoryFabric::new(memory.clone(), self.workspace_dir.to_string_lossy())
                     .with_event_recording(self.event_recording)
             })

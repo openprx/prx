@@ -123,6 +123,12 @@ async fn control_cancel_and_pause() {
         .as_rich()
         .expect("test: rich")
         .bind_turn("conv-9", "turn-9", removed.clone());
+    let finish_channel = host.channel.clone();
+    let finish_token = removed.clone();
+    tokio::spawn(async move {
+        finish_token.cancelled().await;
+        finish_channel.unbind_turn("conv-9", "turn-9");
+    });
     host.send(&json!({
         "jsonrpc": "2.0",
         "id": 6,
@@ -211,4 +217,96 @@ async fn message_deleted_acks_erased() {
     .await;
     let ack = host.recv().await;
     assert_eq!(ack["result"]["erased"], true);
+}
+
+#[tokio::test]
+async fn delete_requires_hello_valid_params_and_a_running_eraser() {
+    let mut host = Host::connect(RamfluxConfig::default()).await;
+    let deleted = json!({"jsonrpc":"2.0","id":100,"method":"inbound.message_deleted","params":{"conversation_id":"conv-1","message_id":"m1","deleted_by":sender(),"timestamp_ms":1}});
+    host.send(&deleted).await;
+    assert_eq!(host.recv().await["error"]["code"], -32002);
+    host.hello("full").await;
+    host.send(&json!({"jsonrpc":"2.0","id":101,"method":"inbound.message_deleted","params":{}}))
+        .await;
+    assert_eq!(host.recv().await["error"]["code"], -32602);
+    let eraser = host.channel.inner.erase_tx.lock().take();
+    host.send(&deleted).await;
+    assert_eq!(host.recv().await["error"]["code"], -32603);
+    *host.channel.inner.erase_tx.lock() = eraser;
+}
+
+#[tokio::test]
+async fn unsupported_backend_refuses_erasure_instead_of_acknowledging_success() {
+    let mut host = Host::connect(RamfluxConfig::default()).await;
+    host.channel.attach_stores(
+        std::sync::Arc::new(crate::memory::NoneMemory::new()),
+        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+    );
+    host.hello("full").await;
+    host.send(&json!({"jsonrpc":"2.0","id":102,"method":"inbound.message_deleted","params":{"conversation_id":"conv-1","message_id":"m1","deleted_by":sender(),"timestamp_ms":1}})).await;
+    assert_eq!(host.recv().await["error"]["code"], -32601);
+}
+
+#[tokio::test]
+async fn account_removal_marker_is_distinct_and_readd_is_accepted_before_hello() {
+    let mut host = Host::connect(RamfluxConfig::default()).await;
+    host.hello("full").await;
+    // A conversation literally named account must not remove the account.
+    super::super::accounts::mark_removed(&host.channel.inner.store, "agent-a", "account", 1).expect("test: marker");
+    assert!(!super::super::accounts::is_account_removed(
+        &host.channel.inner.store,
+        "agent-a"
+    ));
+    host.send(&json!({"jsonrpc":"2.0","id":110,"method":"inbound.control","params":{"conversation_id":"conv-1","kind":"agent_removed","timestamp_ms":2}})).await;
+    assert_eq!(host.recv().await["result"]["ok"], true);
+    host.channel
+        .inner
+        .hello_done
+        .store(false, std::sync::atomic::Ordering::Release);
+    host.send(&json!({"jsonrpc":"2.0","id":111,"method":"inbound.control","params":{"conversation_id":"conv-1","kind":"agent_added","timestamp_ms":3}})).await;
+    assert_eq!(host.recv().await["result"]["ok"], true);
+    assert_eq!(host.hello("full").await["result"]["ok"], true);
+}
+
+#[tokio::test]
+async fn a_closed_turns_surface_action_keeps_values_and_group_kind() {
+    let mut host = Host::connect(RamfluxConfig::default()).await;
+    host.hello("full").await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let channel = host.channel.clone();
+    tokio::spawn(async move {
+        let _ = Channel::listen(&channel, tx).await;
+    });
+    host.send(&json!({"jsonrpc":"2.0","id":130,"method":"inbound.message","params":{
+        "conversation_id":"group-1","message_id":"initial","sender":sender(),
+        "chat":{"conversation_id":"group-1","kind":"group","member_count":3,"mentioned":true},
+        "text":"initial group message","timestamp_ms":1
+    }}))
+    .await;
+    let initial = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("test: initial message")
+        .expect("test: channel open");
+    assert!(initial.is_group_hint);
+    host.channel.claim_slot("group-1", "initial", "closed-turn");
+    host.channel
+        .bind_turn("group-1", "closed-turn", CancellationToken::new());
+    host.channel.unbind_turn("group-1", "closed-turn");
+    host.send(
+        &json!({"jsonrpc":"2.0","id":131,"method":"inbound.surface_action","params":{
+            "conversation_id":"group-1","sender":sender(),"surface_id":"card","version":1,
+            "surface_hash":"hash","action_id":"choose","args_hash":"args","message_id":"initial",
+            "values":{"flavor":"mint","count":2}
+        }}),
+    )
+    .await;
+    let action = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("test: action message")
+        .expect("test: channel open");
+    assert!(action.is_group_hint);
+    assert_eq!(action.chat_kind, crate::channels::traits::ChatKind::Group);
+    let content: serde_json::Value = serde_json::from_str(&action.content).expect("test: structured action");
+    assert_eq!(content["action_id"], "choose");
+    assert_eq!(content["values"], json!({"flavor":"mint","count":2}));
 }

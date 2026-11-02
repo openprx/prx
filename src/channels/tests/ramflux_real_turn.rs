@@ -182,7 +182,7 @@ fn runtime_autonomy(
         workspace_dir: dir.to_path_buf(),
         ..crate::config::Config::default()
     };
-    Arc::new(ChannelRuntimeContext {
+    let runtime = Arc::new(ChannelRuntimeContext {
         decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
         config: crate::config::new_shared(config.clone()),
         config_generation: crate::config::new_shared(config).pin(),
@@ -226,7 +226,13 @@ fn runtime_autonomy(
         group_reply_mode_by_channel: HashMap::new(),
         smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         test_inbound_authorizer: None,
-    })
+    });
+    for channel in runtime.channels_by_name.values() {
+        if let Some(rich) = channel.as_rich() {
+            rich.attach_stores(Arc::clone(&runtime.memory), Arc::clone(&runtime.conversation_histories));
+        }
+    }
+    runtime
 }
 
 fn spawn_turns(channel: Arc<RamfluxChannel>, ctx: Arc<ChannelRuntimeContext>) {
@@ -277,10 +283,8 @@ fn find_hit(root: &std::path::Path, needle: &[u8]) -> Option<std::path::PathBuf>
                 stack.push(child);
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(&child) {
-                if bytes.windows(needle.len()).any(|window| window == needle) {
-                    return Some(child);
-                }
+            if std::fs::read(&child).is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle)) {
+                return Some(child);
             }
         }
     }
@@ -291,9 +295,7 @@ fn file_contains(path: &std::path::Path, needle: &[u8]) -> bool {
     if needle.is_empty() {
         return false;
     }
-    std::fs::read(path)
-        .ok()
-        .is_some_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+    std::fs::read(path).is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
 }
 
 fn dir_has(root: &std::path::Path, needle: &[u8]) -> bool {
@@ -369,8 +371,6 @@ async fn real_turn_streams_text_then_erase_scans_the_store() {
         .expect("test: channel"),
     );
     let memory = Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("test: memory"));
-    let histories = Arc::new(Mutex::new(HashMap::new()));
-    channel.attach_stores(Arc::clone(&memory) as Arc<dyn Memory>, Arc::clone(&histories));
     channel.start().await.expect("test: start socket");
     let ctx = runtime(
         dir.path(),
@@ -380,6 +380,7 @@ async fn real_turn_streams_text_then_erase_scans_the_store() {
         Arc::clone(&memory) as Arc<dyn Memory>,
         crate::config::ToolTieringConfig::default(),
     );
+    let histories = Arc::clone(&ctx.conversation_histories);
     spawn_turns(channel.clone(), ctx);
     let mut host = Host::connect(channel.socket_path()).await;
     let greeted = hello(&mut host, "full").await;
@@ -392,7 +393,7 @@ async fn real_turn_streams_text_then_erase_scans_the_store() {
     }))
     .await;
     let _ = host.recv().await;
-    let marker = "ramflux-plaintext-marker";
+    let marker = "ramflux-plaintext-marker-with-autosave-length";
     host.send(&json!({
         "jsonrpc": "2.0",
         "id": 3,
@@ -446,9 +447,7 @@ async fn real_turn_streams_text_then_erase_scans_the_store() {
         }
         if method == "turn.status" {
             saw_done = frame["params"]["state"].as_str() == Some("done");
-            if !saw_done {
-                break;
-            }
+            assert_ne!(frame["params"]["state"].as_str(), Some("failed"), "{frame}");
         }
         ack(&mut host, &frame).await;
         if saw_text && saw_done {
@@ -464,7 +463,21 @@ async fn real_turn_streams_text_then_erase_scans_the_store() {
     assert!(idempotency.is_some(), "reply.text has no idempotency_key");
     let scoped = RichChannel::memory_for_turn(channel.as_ref(), Arc::clone(&memory) as Arc<dyn Memory>, "conv-1");
     let stored = scoped.list(None, None).await.expect("test: stored turns");
+    assert!(
+        stored
+            .iter()
+            .any(|entry| entry.key == "ramflux_alice_m1" && entry.content == marker),
+        "the fixture must create the autosave row"
+    );
     let stored_blob = stored.iter().map(|entry| entry.content.clone()).collect::<String>();
+    assert!(
+        histories
+            .lock()
+            .values()
+            .flatten()
+            .any(|turn| turn.content.contains(marker)),
+        "the channel and turn must share populated history"
+    );
     assert!(
         stored_blob.contains(marker),
         "message text was not stored before delete"
@@ -528,6 +541,14 @@ async fn real_turn_streams_text_then_erase_scans_the_store() {
     assert!(
         !after_blob.contains("alpha beta gamma delta"),
         "reply text survived delete"
+    );
+    assert!(
+        !histories
+            .lock()
+            .values()
+            .flatten()
+            .any(|turn| turn.content.contains(marker) || turn.content.contains("alpha beta gamma delta")),
+        "deleted history survived in the actual turn cache"
     );
     assert!(!dir_has(dir.path(), marker.as_bytes()));
     assert!(!dir_has(dir.path(), b"alpha beta gamma delta"));
@@ -781,10 +802,11 @@ async fn delete_while_the_writer_is_held_finishes_off_the_reader() {
         Arc::new(Mutex::new(HashMap::new())),
     );
     channel.start().await.expect("test: start socket");
+    let (provider, hits, _texts, release, mut provider_entered) = HoldProvider::new();
     let ctx = runtime(
         dir.path(),
         Arc::clone(&channel) as Arc<dyn Channel>,
-        Arc::new(WordsProvider),
+        provider,
         Vec::new(),
         Arc::clone(&memory) as Arc<dyn Memory>,
         crate::config::ToolTieringConfig::default(),
@@ -795,7 +817,6 @@ async fn delete_while_the_writer_is_held_finishes_off_the_reader() {
     host.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "bridge.ping", "params": {}}))
         .await;
     let _ = host.recv().await;
-    let entered = channel.arm_writer_hold(memory.as_ref());
     host.send(&json!({
         "jsonrpc": "2.0",
         "id": 3,
@@ -811,6 +832,16 @@ async fn delete_while_the_writer_is_held_finishes_off_the_reader() {
         }
     }))
     .await;
+    wait_hits(&mut host, &hits, 1, &mut provider_entered).await;
+    let input_key =
+        RichChannel::inbound_idempotency_key(channel.as_ref(), "conv-1", "m-hold").expect("test: input key");
+    assert!(
+        file_contains(&dir.path().join("memory/brain.db"), input_key.as_bytes())
+            || file_contains(&dir.path().join("memory/brain.db-wal"), input_key.as_bytes()),
+        "input key must be physically present before deletion"
+    );
+    let entered = channel.arm_writer_hold(memory.as_ref());
+    release.send(true).expect("test: release provider");
     let held = tokio::time::timeout(Duration::from_secs(5), entered)
         .await
         .expect("test: writer hold did not start");
@@ -870,12 +901,22 @@ async fn delete_while_the_writer_is_held_finishes_off_the_reader() {
     let db = dir.path().join("memory").join("brain.db");
     let wal = dir.path().join("memory").join("brain.db-wal");
     assert!(
-        !file_contains(&db, b"channel:ramflux:m-hold"),
+        !file_contains(
+            &db,
+            RichChannel::inbound_idempotency_key(channel.as_ref(), "conv-1", "m-hold")
+                .expect("test: input key")
+                .as_bytes()
+        ),
         "message id is still in {}",
         db.display()
     );
     assert!(
-        !file_contains(&wal, b"channel:ramflux:m-hold"),
+        !file_contains(
+            &wal,
+            RichChannel::inbound_idempotency_key(channel.as_ref(), "conv-1", "m-hold")
+                .expect("test: input key")
+                .as_bytes()
+        ),
         "message id is still in {}",
         wal.display()
     );
@@ -886,6 +927,7 @@ struct ScriptProvider {
     model: Arc<Mutex<Option<String>>>,
     system: Arc<Mutex<Option<String>>>,
     users: Arc<Mutex<Vec<String>>>,
+    history: Mutex<Vec<ChatMessage>>,
 }
 
 impl ScriptProvider {
@@ -902,11 +944,13 @@ impl ScriptProvider {
             model: Arc::clone(&model),
             system: Arc::clone(&system),
             users: Arc::clone(&users),
+            history: Mutex::new(Vec::new()),
         });
         (provider, model, system, users)
     }
 
     fn remember(&self, messages: &[ChatMessage], model: &str) {
+        *self.history.lock() = messages.to_vec();
         *self.model.lock() = Some(model.to_string());
         *self.system.lock() = messages
             .iter()
@@ -1089,7 +1133,7 @@ async fn boot(
         Arc::new(Mutex::new(HashMap::new())),
     );
     channel.start().await.expect("test: start socket");
-    let ctx = runtime_autonomy(
+    let mut ctx = runtime_autonomy(
         dir.path(),
         Arc::clone(&channel) as Arc<dyn Channel>,
         provider,
@@ -1098,6 +1142,30 @@ async fn boot(
         tiering,
         autonomy,
     );
+    // Declare persona selections independently of the runtime default, so
+    // the real model admission path resolves the fake transport's catalog.
+    let mut config = ctx.config.load_full().as_ref().clone();
+    let identity = Arc::as_ptr(&ctx.provider).cast::<()>() as usize;
+    for account in channel.config().accounts.values() {
+        if let Some(model) = &account.model {
+            config.providers.models.push(
+                toml::from_str(&format!(
+                    "provider = \"test-provider\"\nmodel = {model:?}\noperations = [\"chat\"]\nvision_input = true\n"
+                ))
+                .expect("test: persona catalog"),
+            );
+            config.cost.prices.insert(
+                format!("custom:http://127.0.0.1/prx-channel-fixture-{identity:x}/{model}"),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 1.0,
+                    cache_read: 1.0,
+                },
+            );
+        }
+    }
+    Arc::make_mut(&mut ctx).config = crate::config::new_shared(config);
     spawn_turns(channel.clone(), ctx);
     let mut host = Host::connect(channel.socket_path()).await;
     let _ = hello(&mut host, authorization).await;
@@ -1129,7 +1197,16 @@ async fn drive_until(host: &mut Host, needle: &str) {
             ack(host, &frame).await;
         }
     }
-    assert!(saw_text && saw_done, "turn did not finish with {needle}: {seen:?}");
+    assert!(
+        saw_text && saw_done,
+        "turn did not finish with {needle}: {seen:?}; logs: {}",
+        recent_logs()
+    );
+}
+
+fn recent_logs() -> String {
+    let logs = captured_logs().lock().expect("test: log capture").clone();
+    String::from_utf8_lossy(logs.get(logs.len().saturating_sub(16_384)..).unwrap_or_default()).into_owned()
 }
 
 /// Read until the socket is quiet so the turn guard can drop before the next message.
@@ -1276,7 +1353,7 @@ async fn recv_id(host: &mut Host, id: i64, ack_methods: bool) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn surface_action_on_an_open_turn_does_not_start_another_and_a_closed_turn_gets_a_fresh_id() {
+async fn surface_actions_queue_preserve_values_and_erase_by_the_host_message_id() {
     let (provider, hits, texts, release, mut entered) = HoldProvider::new();
     let (_dir, channel, memory, mut host) = boot(
         |_| RamfluxConfig::default(),
@@ -1300,7 +1377,7 @@ async fn surface_action_on_an_open_turn_does_not_start_another_and_a_closed_turn
             "version": 1,
             "surface_hash": "abc",
             "action_id": "act",
-            "values": {},
+            "values": {"choice":"open-action-independent-value-over-thirty-bytes"},
             "args_hash": "def",
             "message_id": "m-open"
         }
@@ -1324,7 +1401,7 @@ async fn surface_action_on_an_open_turn_does_not_start_another_and_a_closed_turn
                 "version": 1,
                 "surface_hash": "abc",
                 "action_id": "act",
-                "values": {},
+                "values": {"choice":"closed-action-secret-value-over-thirty-bytes"},
                 "args_hash": "def",
                 "message_id": "m-closed"
             }
@@ -1337,7 +1414,7 @@ async fn surface_action_on_an_open_turn_does_not_start_another_and_a_closed_turn
     let stored = scoped.list(None, None).await.expect("test: stored");
     let action_keys: Vec<&str> = stored
         .iter()
-        .filter(|entry| entry.key.contains("m-closed:act:"))
+        .filter(|entry| entry.key.starts_with("ramflux_alice_m-closed:act:"))
         .map(|entry| entry.key.as_str())
         .collect();
     assert_eq!(
@@ -1348,16 +1425,35 @@ async fn surface_action_on_an_open_turn_does_not_start_another_and_a_closed_turn
     );
     assert_ne!(action_keys[0], action_keys[1]);
     assert!(
-        !texts.lock().iter().any(|text| text.contains("user action m-open")),
-        "open action was delivered as a new turn: {:?}",
+        texts
+            .lock()
+            .iter()
+            .any(|text| text.contains("m-open") && text.contains("surface_action")),
+        "queued action was lost: {:?}",
         texts.lock()
     );
     assert!(
         texts
             .lock()
             .iter()
-            .any(|text| text.contains("user action m-closed act"))
+            .any(|text| text.contains("m-closed") && text.contains("closed-action-secret-value-over-thirty-bytes"))
     );
+    let before = hits.load(Ordering::SeqCst);
+    host.send(&json!({"jsonrpc":"2.0","id":7,"method":"inbound.message_deleted","params":{"conversation_id":"conv-1","message_id":"m-closed","deleted_by":sender(),"timestamp_ms":3}})).await;
+    assert_eq!(recv_id(&mut host, 7, true).await["result"]["erased"], true);
+    assert!(
+        !scoped
+            .list(None, None)
+            .await
+            .expect("test: erased")
+            .iter()
+            .any(|entry| entry.key.contains("m-closed:act:")
+                || entry.content.contains("closed-action-secret-value-over-thirty-bytes"))
+    );
+    host.send(&json!({"jsonrpc":"2.0","id":8,"method":"inbound.surface_action","params":{"conversation_id":"conv-1","sender":sender(),"surface_id":"surface-1","version":1,"surface_hash":"abc","action_id":"act","values":{"choice":"closed-action-secret-value-over-thirty-bytes"},"args_hash":"def","message_id":"m-closed"}})).await;
+    assert_eq!(recv_id(&mut host, 8, true).await["result"]["ok"], true);
+    settle(&mut host).await;
+    assert_eq!(hits.load(Ordering::SeqCst), before, "deleted action replay executed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1376,7 +1472,8 @@ async fn task_events_emit_monotonic_versions_and_turn_status() {
     wait_hits(&mut host, &hits, 1, &mut entered).await;
     let mut versions = Vec::new();
     let mut states = Vec::new();
-    for (rpc_id, kind) in [(4_i64, "started"), (5, "thinking"), (6, "tool_running")] {
+    let mut task_states = Vec::new();
+    for (rpc_id, kind) in [(4_i64, "start"), (5, "accept"), (6, "resolve")] {
         host.send(&json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -1398,6 +1495,9 @@ async fn task_events_emit_monotonic_versions_and_turn_status() {
             let Ok(frame) = tokio::time::timeout(remain, host.recv()).await else {
                 break;
             };
+            if frame["method"] == "reply.task_update" && frame["params"]["task_id"] == "task-1" {
+                task_states.push(frame["params"]["state"].clone());
+            }
             note_task(&frame, &mut versions, &mut states);
             if frame.get("id").and_then(Value::as_i64) == Some(rpc_id) {
                 saw_result = true;
@@ -1409,22 +1509,24 @@ async fn task_events_emit_monotonic_versions_and_turn_status() {
         assert!(saw_result, "task event {kind} was not accepted");
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline
-        && (versions.len() < 3 || !states.iter().any(|state| state == "tool_running"))
-    {
+    while tokio::time::Instant::now() < deadline && versions.len() < 3 {
         let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
         let Ok(frame) = tokio::time::timeout(remain, host.recv()).await else {
             break;
         };
+        if frame["method"] == "reply.task_update" && frame["params"]["task_id"] == "task-1" {
+            task_states.push(frame["params"]["state"].clone());
+        }
         note_task(&frame, &mut versions, &mut states);
         if frame.get("method").is_some() {
             ack(&mut host, &frame).await;
         }
     }
     assert_eq!(versions, vec![1, 2, 3], "versions {versions:?} states {states:?}");
-    assert!(states.contains(&"started".to_string()), "{states:?}");
-    assert!(states.contains(&"thinking".to_string()), "{states:?}");
-    assert!(states.contains(&"tool_running".to_string()), "{states:?}");
+    assert_eq!(task_states, vec![json!("running"), json!("running"), json!("done")]);
+    // The runtime emitted these before the provider entered its wait. Host
+    // intent must not fabricate a tool transition for this tool-free turn.
+    assert!(!states.contains(&"tool_running".to_string()), "{states:?}");
     release.send(true).expect("test: release");
 }
 
@@ -1512,7 +1614,7 @@ async fn persona_system_prompt_and_model_reach_the_provider() {
                     "agent-a".to_string(),
                     crate::config::RamfluxAccountConfig {
                         system_prompt_file: Some(std::path::PathBuf::from("persona.txt")),
-                        model: Some("test-model".to_string()),
+                        model: Some("persona-distinct-model".to_string()),
                         ..crate::config::RamfluxAccountConfig::default()
                     },
                 )]),
@@ -1529,7 +1631,7 @@ async fn persona_system_prompt_and_model_reach_the_provider() {
     host.send(&inbound_message(3, "conv-1", "m-persona", "hello persona", 1))
         .await;
     drive_until(&mut host, "alpha").await;
-    assert_eq!(model.lock().clone().as_deref(), Some("test-model"));
+    assert_eq!(model.lock().clone().as_deref(), Some("persona-distinct-model"));
     let prompt = system.lock().clone().unwrap_or_default();
     assert!(prompt.contains("PERSONA-CANARY-PROMPT"), "{prompt}");
 }
@@ -1551,11 +1653,18 @@ async fn restart_reloads_three_assistant_replies_in_order() {
         (4, "m-b", "turn-two", "reply-two"),
         (5, "m-c", "turn-three", "reply-three"),
     ] {
-        host.send(&inbound_message(id, "conv-1", message_id, text, id as u64))
-            .await;
+        host.send(&inbound_message(
+            id,
+            "conv-1",
+            message_id,
+            text,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).expect("test: timestamp"),
+        ))
+        .await;
         drive_until(&mut host, needle).await;
         settle(&mut host).await;
     }
+    channel.shutdown();
     drop(host);
     drop(channel);
     let restarted = Arc::new(
@@ -1568,6 +1677,16 @@ async fn restart_reloads_three_assistant_replies_in_order() {
         )
         .expect("test: restart channel"),
     );
+    let (restart_provider, _, _, _) = ScriptProvider::new();
+    let ctx = runtime(
+        dir.path(),
+        restarted.clone() as Arc<dyn Channel>,
+        restart_provider.clone(),
+        Vec::new(),
+        memory.clone() as Arc<dyn Memory>,
+        crate::config::ToolTieringConfig::default(),
+    );
+    spawn_turns(restarted.clone(), ctx);
     restarted.start().await.expect("test: restart socket");
     let mut host = Host::connect(restarted.socket_path()).await;
     let _ = hello(&mut host, "full").await;
@@ -1576,23 +1695,43 @@ async fn restart_reloads_three_assistant_replies_in_order() {
         .load_recent_conversation_histories(&memory_principal(), 20, 10)
         .await
         .expect("test: history");
-    let mut replies = Vec::new();
-    for turns in histories.values() {
-        for turn in turns {
-            if turn.role == "assistant" {
-                replies.push(turn.content.clone());
-            }
-        }
+    assert_eq!(histories.len(), 1, "{histories:?}");
+    let turns = histories.values().next().expect("test: hydrated session");
+    let expected = [
+        ("user", "turn-one"),
+        ("assistant", "reply-one"),
+        ("user", "turn-two"),
+        ("assistant", "reply-two"),
+        ("user", "turn-three"),
+        ("assistant", "reply-three"),
+    ];
+    assert_eq!(turns.len(), expected.len(), "{turns:?}");
+    for (turn, (role, text)) in turns.iter().zip(expected) {
+        assert_eq!(turn.role, role);
+        assert_eq!(turn.content, text);
+        assert_ne!(turn.timestamp, "");
     }
-    assert_eq!(
-        replies,
-        vec![
-            "reply-one".to_string(),
-            "reply-two".to_string(),
-            "reply-three".to_string()
-        ],
-        "{histories:?}"
-    );
+    host.send(&inbound_message(
+        90,
+        "conv-1",
+        "after-restart",
+        "new input after restart",
+        4,
+    ))
+    .await;
+    drive_until(&mut host, "alpha").await;
+    let presented = restart_provider.history.lock().clone();
+    let mut previous = None;
+    for (role, text) in expected {
+        let index = presented
+            .iter()
+            .position(|turn| turn.role == role && turn.content.contains(text))
+            .expect("test: interleaved transcript reaches model after restart");
+        if let Some(previous) = previous {
+            assert!(previous < index, "{presented:?}");
+        }
+        previous = Some(index);
+    }
 }
 
 fn memory_principal() -> crate::memory::MemoryPrincipal {
@@ -1621,9 +1760,42 @@ async fn revoke_erases_the_conversation_and_remove_refuses_with_32003() {
         "full",
     )
     .await;
-    host.send(&inbound_message(3, "conv-1", "m-revoke", "revoke-canary-text", 1))
-        .await;
+    host.send(&inbound_message(
+        3,
+        "conv-1",
+        "m-revoke",
+        "revoke-canary-text-with-real-autosave-over-thirty-bytes",
+        1,
+    ))
+    .await;
     drive_until(&mut host, "alpha").await;
+    settle(&mut host).await;
+    let scoped_before =
+        RichChannel::memory_for_turn(channel.as_ref(), Arc::clone(&memory) as Arc<dyn Memory>, "conv-1");
+    let before = scoped_before.list(None, None).await.expect("test: before revoke");
+    assert!(
+        before.iter().any(|entry| entry.content.contains("revoke-canary-text")),
+        "revoke fixture must contain data"
+    );
+    host.send(&inbound_message(
+        7,
+        "conv-2",
+        "m-keep",
+        "second-session-must-survive-revoke",
+        2,
+    ))
+    .await;
+    drive_until(&mut host, "alpha").await;
+    settle(&mut host).await;
+    let other = RichChannel::memory_for_turn(channel.as_ref(), Arc::clone(&memory) as Arc<dyn Memory>, "conv-2");
+    assert!(
+        other
+            .list(None, None)
+            .await
+            .expect("test: other before")
+            .iter()
+            .any(|entry| entry.content.contains("second-session-must-survive-revoke"))
+    );
     host.send(&json!({
         "jsonrpc": "2.0",
         "id": 8,
@@ -1637,6 +1809,14 @@ async fn revoke_erases_the_conversation_and_remove_refuses_with_32003() {
     let blob = after.iter().map(|entry| entry.content.clone()).collect::<String>();
     assert!(!blob.contains("revoke-canary-text"), "{blob}");
     assert!(!dir_has(dir.path(), b"revoke-canary-text"));
+    assert!(
+        other
+            .list(None, None)
+            .await
+            .expect("test: other after")
+            .iter()
+            .any(|entry| entry.content.contains("second-session-must-survive-revoke"))
+    );
     host.send(&inbound_message(9, "conv-1", "m-after", "again", 3)).await;
     let refused = recv_id(&mut host, 9, true).await;
     assert_eq!(refused["error"]["code"], -32003, "{refused}");
@@ -1668,8 +1848,39 @@ async fn revoke_erases_the_conversation_and_remove_refuses_with_32003() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canary_text_is_absent_from_captured_logs() {
+    if std::env::var_os("PRX_ALIGN_CANARY_CHILD").is_none() {
+        let module = module_path!().split_once("::").expect("test: module").1;
+        let output = tokio::process::Command::new(std::env::current_exe().expect("test: executable"))
+            .args([
+                "--exact",
+                &format!("{module}::canary_text_is_absent_from_captured_logs"),
+                "--nocapture",
+            ])
+            .env("PRX_ALIGN_CANARY_CHILD", "1")
+            .output()
+            .await
+            .expect("test: child capture");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout} {stderr}");
+        assert!(
+            stdout.contains("STDOUT-CONTROL-r4"),
+            "capture did not run child: {stdout}"
+        );
+        for canary in ["CANARY-7f3a-plaintext-with-autosave-length", "reply-canary-9c2e"] {
+            assert!(!stdout.contains(canary), "stdout leaked {canary}: {stdout}");
+            assert!(!stderr.contains(canary), "stderr leaked {canary}: {stderr}");
+        }
+        return;
+    }
+    use std::io::Write as _;
+    std::io::stdout()
+        .write_all(b"STDOUT-CONTROL-r4\n")
+        .expect("test: stdout control");
+
     install_log_capture();
     captured_logs().lock().expect("test: logs").clear();
+    tracing::info!("LOG-CONTROL-r4");
     let (provider, _model, _system, _users) = ScriptProvider::new();
     let (_dir, _channel, _memory, mut host) = boot(
         |_| RamfluxConfig::default(),
@@ -1680,32 +1891,74 @@ async fn canary_text_is_absent_from_captured_logs() {
         "full",
     )
     .await;
-    host.send(&inbound_message(3, "conv-1", "m-canary", "CANARY-7f3a-plaintext", 1))
-        .await;
+    host.send(&inbound_message(
+        3,
+        "conv-1",
+        "m-canary",
+        "CANARY-7f3a-plaintext-with-autosave-length",
+        1,
+    ))
+    .await;
     drive_until(&mut host, "reply-canary-9c2e").await;
     let logs = captured_logs().lock().expect("test: logs").clone();
     let text = String::from_utf8_lossy(&logs);
-    assert!(!text.contains("CANARY-7f3a-plaintext"), "{text}");
+    assert!(
+        text.contains("LOG-CONTROL-r4"),
+        "log capture did not receive its positive control"
+    );
+    assert!(!text.contains("CANARY-7f3a-plaintext-with-autosave-length"), "{text}");
     assert!(!text.contains("reply-canary-9c2e"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prx_ask_emits_awaiting_approval_with_the_decision_id() {
-    let executions = Arc::new(AtomicUsize::new(0));
-    let (_dir, _channel, _memory, mut host) = boot(
-        |_| RamfluxConfig::default(),
-        Arc::new(ToolThenText),
-        vec![Box::new(CountingTool {
-            executions: Arc::clone(&executions),
-        })],
+    struct StoreProvider;
+    #[async_trait::async_trait]
+    impl Provider for StoreProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("<tool_call>\n{\"name\":\"memory_store\",\"arguments\":{\"key\":\"approval-probe\",\"content\":\"durable approval must precede this write\"}}\n</tool_call>".to_owned())
+        }
+    }
+    let dir = tempfile::tempdir().expect("test: temp");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("test: mode");
+    let channel = Arc::new(
+        RamfluxChannel::new(
+            RamfluxConfig {
+                socket_path: Some(dir.path().join("ramflux.sock")),
+                ..RamfluxConfig::default()
+            },
+            dir.path(),
+        )
+        .expect("test: channel"),
+    );
+    let memory = Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("test: memory"));
+    let security = Arc::new(crate::security::SecurityPolicy {
+        workspace_dir: dir.path().to_path_buf(),
+        autonomy: crate::security::AutonomyLevel::Supervised,
+        ..crate::security::SecurityPolicy::default()
+    });
+    let ctx = runtime_autonomy(
+        dir.path(),
+        channel.clone() as Arc<dyn Channel>,
+        Arc::new(StoreProvider),
+        vec![Box::new(crate::tools::MemoryStoreTool::new(memory.clone(), security))],
+        memory.clone(),
         crate::config::ToolTieringConfig {
-            always_include: vec!["mock_price".to_string()],
+            always_include: vec!["memory_store".to_owned()],
             ..crate::config::ToolTieringConfig::default()
         },
         crate::security::AutonomyLevel::Supervised,
-        "full",
-    )
-    .await;
+    );
+    channel.start().await.expect("test: start");
+    spawn_turns(channel.clone(), ctx);
+    let mut host = Host::connect(channel.socket_path()).await;
+    assert_eq!(hello(&mut host, "full").await["result"]["effective_autonomy"], "full");
     host.send(&inbound_message(3, "conv-1", "m-ask", "what is the price", 1))
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -1739,10 +1992,21 @@ async fn prx_ask_emits_awaiting_approval_with_the_decision_id() {
     }
     assert!(terminal, "prx ask did not finish: {seen:?}");
     assert!(!saw_request, "durable ask used the bridge grant path: {seen:?}");
-    if let Some(approval_id) = approval_id {
-        assert!(!approval_id.is_empty(), "{seen:?}");
-    }
-    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    let approval_id = approval_id.unwrap_or_else(|| {
+        panic!(
+            "test: awaiting_approval must actually occur: {seen:?}; logs: {}",
+            recent_logs()
+        )
+    });
+    assert!(!approval_id.is_empty(), "{seen:?}");
+    let scoped = RichChannel::memory_for_turn(channel.as_ref(), memory as Arc<dyn Memory>, "conv-1");
+    assert!(
+        scoped
+            .get("approval-probe")
+            .await
+            .expect("test: no unapproved write")
+            .is_none()
+    );
 }
 
 fn note_task(frame: &Value, versions: &mut Vec<u64>, states: &mut Vec<String>) {
@@ -1789,5 +2053,402 @@ async fn result_and_reply(host: &mut Host, id: i64, needle: &str) {
     assert!(
         saw_result && saw_text && saw_done,
         "action {id} did not finish: {seen:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_pumps_four_turns_and_deleted_queued_input_never_executes() {
+    let (provider, hits, texts, release, mut entered) = HoldProvider::new();
+    let (_dir, channel, memory, mut host) = boot(
+        |_| RamfluxConfig::default(),
+        provider,
+        Vec::new(),
+        crate::config::ToolTieringConfig::default(),
+        crate::security::AutonomyLevel::Full,
+        "full",
+    )
+    .await;
+    host.send(&inbound_message(40, "conv-1", "live", "first", 1)).await;
+    wait_hits(&mut host, &hits, 1, &mut entered).await;
+    for (rpc, id, text) in [
+        (41, "q1", "next-one"),
+        (42, "q2", "deleted-queued-input"),
+        (43, "q3", "next-three"),
+        (44, "q4", "next-four"),
+    ] {
+        host.send(&inbound_message(rpc, "conv-1", id, text, 2)).await;
+        assert_eq!(recv_id(&mut host, rpc, true).await["result"]["ok"], true);
+    }
+    host.send(&json!({"jsonrpc":"2.0","id":45,"method":"inbound.message_deleted","params":{"conversation_id":"conv-1","message_id":"q2","deleted_by":sender(),"timestamp_ms":3}})).await;
+    assert_eq!(recv_id(&mut host, 45, true).await["result"]["erased"], true);
+    release.send(true).expect("test: release");
+    wait_hits(&mut host, &hits, 4, &mut entered).await;
+    settle(&mut host).await;
+    let seen = texts.lock().clone();
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    assert!(
+        !seen.iter().any(|text| text.contains("deleted-queued-input")),
+        "{seen:?}"
+    );
+    // Replay has no idempotency key: the durable tombstone must stop it.
+    host.send(&inbound_message(46, "conv-1", "q2", "deleted-queued-input", 4))
+        .await;
+    assert_eq!(recv_id(&mut host, 46, true).await["result"]["deleted"], true);
+    settle(&mut host).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    let scoped = RichChannel::memory_for_turn(channel.as_ref(), memory as Arc<dyn Memory>, "conv-1");
+    assert!(
+        !scoped
+            .list(None, None)
+            .await
+            .expect("test: remaining")
+            .iter()
+            .any(|entry| entry.content.contains("deleted-queued-input"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_flight_delete_waits_for_writes_and_prevents_replay() {
+    let (provider, hits, _texts, _release, mut entered) = HoldProvider::new();
+    let (_dir, channel, memory, mut host) = boot(
+        |_| RamfluxConfig::default(),
+        provider,
+        Vec::new(),
+        crate::config::ToolTieringConfig::default(),
+        crate::security::AutonomyLevel::Full,
+        "full",
+    )
+    .await;
+    host.send(&inbound_message(
+        50,
+        "conv-1",
+        "slow",
+        "inflight-autosave-positive-control-over-thirty-bytes",
+        1,
+    ))
+    .await;
+    wait_hits(&mut host, &hits, 1, &mut entered).await;
+    let scoped = RichChannel::memory_for_turn(channel.as_ref(), Arc::clone(&memory) as Arc<dyn Memory>, "conv-1");
+    assert!(
+        scoped
+            .list(None, None)
+            .await
+            .expect("test: before")
+            .iter()
+            .any(|entry| entry.content.contains("inflight-autosave-positive-control"))
+    );
+    host.send(&json!({"jsonrpc":"2.0","id":51,"method":"inbound.message_deleted","params":{"conversation_id":"conv-1","message_id":"slow","deleted_by":sender(),"timestamp_ms":2}})).await;
+    assert_eq!(recv_id(&mut host, 51, true).await["result"]["erased"], true);
+    assert!(scoped.list(None, None).await.expect("test: after").is_empty());
+    host.send(&inbound_message(
+        52,
+        "conv-1",
+        "slow",
+        "inflight-autosave-positive-control-over-thirty-bytes",
+        3,
+    ))
+    .await;
+    assert_eq!(recv_id(&mut host, 52, true).await["result"]["deleted"], true);
+    settle(&mut host).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_turn_releases_one_slot_after_queued_messages() {
+    let (provider, hits, _texts, release, mut entered) = HoldProvider::new();
+    let (_dir, _channel, _memory, mut host) = boot(
+        |_| RamfluxConfig::default(),
+        provider,
+        Vec::new(),
+        crate::config::ToolTieringConfig::default(),
+        crate::security::AutonomyLevel::Full,
+        "full",
+    )
+    .await;
+    host.send(&inbound_message(60, "conv-1", "cancel-first", "cancel first", 1))
+        .await;
+    let turn_id = loop {
+        let frame = host.recv().await;
+        let started = frame["method"] == "turn.status" && frame["params"]["state"] == "started";
+        if frame.get("method").is_some() {
+            ack(&mut host, &frame).await;
+        }
+        if started {
+            break frame["params"]["turn_id"].as_str().expect("test: turn id").to_owned();
+        }
+    };
+    wait_hits(&mut host, &hits, 1, &mut entered).await;
+    for (rpc, id) in [(61, "after-cancel-1"), (62, "after-cancel-2"), (63, "after-cancel-3")] {
+        host.send(&inbound_message(rpc, "conv-1", id, id, 2)).await;
+        assert_eq!(recv_id(&mut host, rpc, true).await["result"]["ok"], true);
+    }
+    host.send(&json!({"jsonrpc":"2.0","id":64,"method":"turn.cancel","params":{"conversation_id":"conv-1","turn_id":turn_id,"reason":"user cancel"}})).await;
+    assert_eq!(recv_id(&mut host, 64, true).await["result"]["ok"], true);
+    wait_hits(&mut host, &hits, 2, &mut entered).await;
+    settle(&mut host).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "cancel released more than its owned slot"
+    );
+    release.send(true).expect("test: release");
+    wait_hits(&mut host, &hits, 4, &mut entered).await;
+    settle(&mut host).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_emits_tool_lifecycle_and_final_surface_before_done() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (_dir, _channel, _memory, mut host) = boot(
+        |_| RamfluxConfig::default(),
+        Arc::new(ToolThenText),
+        vec![Box::new(CountingTool {
+            executions: Arc::clone(&executions),
+        })],
+        crate::config::ToolTieringConfig {
+            always_include: vec!["mock_price".to_owned()],
+            ..crate::config::ToolTieringConfig::default()
+        },
+        crate::security::AutonomyLevel::Full,
+        "full",
+    )
+    .await;
+    host.send(&inbound_message(70, "conv-1", "lifecycle", "what is the price", 1))
+        .await;
+    let mut states = Vec::new();
+    let mut final_surface = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut done = false;
+    while tokio::time::Instant::now() < deadline && !done {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = tokio::time::timeout(remaining, host.recv())
+            .await
+            .expect("test: lifecycle frame");
+        if frame["method"] == "reply.surface" && frame["params"]["op"] == "create" && frame["params"]["final"] == true {
+            final_surface = true;
+        }
+        if frame["method"] == "turn.status" {
+            let state = frame["params"]["state"].as_str().expect("test: state").to_owned();
+            done = state == "done";
+            if done {
+                assert!(final_surface, "done preceded final surface: {frame}");
+            }
+            states.push(state);
+        }
+        if frame.get("method").is_some() {
+            ack(&mut host, &frame).await;
+        }
+    }
+    assert!(done, "{states:?}");
+    for state in ["started", "thinking", "tool_running", "done"] {
+        assert!(
+            states.iter().any(|seen| seen == state),
+            "missing runtime state {state}: {states:?}"
+        );
+    }
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+}
+
+struct DecisionReadProbe {
+    seen: Mutex<Vec<crate::memory::traits::DecisionMemoryHit>>,
+}
+impl DecisionReadProbe {
+    async fn probe(&self) -> anyhow::Result<String> {
+        let memory =
+            crate::memory::active_view::current().ok_or_else(|| anyhow::anyhow!("turn memory capability missing"))?;
+        let hits = memory
+            .retrieve_decision_memory(
+                "retrievalneedle",
+                5,
+                &crate::memory::MemoryWriteContext::default(),
+                None,
+                std::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await?;
+        *self.seen.lock() = hits;
+        Ok("probe-complete".to_owned())
+    }
+}
+#[async_trait::async_trait]
+impl Provider for DecisionReadProbe {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        self.probe().await
+    }
+    async fn chat_with_history(
+        &self,
+        _messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        self.probe().await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_turn_decision_memory_reads_own_plaintext_and_excludes_foreign_workspace_memory() {
+    let provider = Arc::new(DecisionReadProbe {
+        seen: Mutex::new(Vec::new()),
+    });
+    let (dir, channel, memory, mut host) = boot(
+        |_| RamfluxConfig::default(),
+        provider.clone(),
+        Vec::new(),
+        crate::config::ToolTieringConfig::default(),
+        crate::security::AutonomyLevel::Full,
+        "full",
+    )
+    .await;
+    let view = RichChannel::memory_for_message(channel.as_ref(), memory.clone() as Arc<dyn Memory>, "conv-1", "seed")
+        .expect("test: scoped memory");
+    view.store(
+        "own-note",
+        "retrievalneedle OWN-SCOPE-PLAINTEXT",
+        crate::memory::MemoryCategory::Core,
+        None,
+    )
+    .await
+    .expect("test: own seed");
+    let context = crate::memory::MemoryWriteContext {
+        workspace_id: Some(dir.path().to_string_lossy().into_owned()),
+        channel: Some("ramflux".to_owned()),
+        chat_id: Some("conv-1".to_owned()),
+        chat_type: Some("dm".to_owned()),
+        raw_sender: Some("alice".to_owned()),
+        ..crate::memory::MemoryWriteContext::default()
+    };
+    memory
+        .store_with_context_and_metadata(
+            "foreign-note",
+            "retrievalneedle FOREIGN-WORKSPACE-PLAINTEXT",
+            crate::memory::MemoryCategory::Core,
+            None,
+            Some(&context),
+            crate::memory::MemoryStoreMetadata {
+                workspace_id: Some(dir.path().to_string_lossy().into_owned()),
+                ..crate::memory::MemoryStoreMetadata::default()
+            },
+        )
+        .await
+        .expect("test: foreign seed");
+    let visible = memory
+        .retrieve_decision_memory(
+            "retrievalneedle",
+            5,
+            &context,
+            None,
+            std::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("test: foreign positive control");
+    assert!(
+        visible.iter().any(|hit| hit.key == "foreign-note"),
+        "foreign fixture must be visible to the unscoped backend"
+    );
+    host.send(&inbound_message(80, "conv-1", "probe", "inspect scoped recall", 1))
+        .await;
+    drive_until(&mut host, "probe-complete").await;
+    let hits = provider.seen.lock();
+    assert!(
+        hits.iter()
+            .any(|hit| hit.key == "own-note" && hit.content.contains("OWN-SCOPE-PLAINTEXT"))
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.key != "foreign-note" && !hit.content.contains("FOREIGN-WORKSPACE-PLAINTEXT"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identical_message_ids_in_two_conversations_erase_independently() {
+    let (provider, hits, _texts, release, mut entered) = HoldProvider::new();
+    let (_dir, channel, memory, mut host) = boot(
+        |_| RamfluxConfig::default(),
+        provider,
+        Vec::new(),
+        crate::config::ToolTieringConfig::default(),
+        crate::security::AutonomyLevel::Full,
+        "full",
+    )
+    .await;
+    host.send(&inbound_message(
+        120,
+        "conv-1",
+        "same-id",
+        "first conversation private content over thirty bytes",
+        1,
+    ))
+    .await;
+    wait_hits(&mut host, &hits, 1, &mut entered).await;
+    host.send(&inbound_message(
+        121,
+        "conv-2",
+        "same-id",
+        "second conversation private content over thirty bytes",
+        2,
+    ))
+    .await;
+    wait_hits(&mut host, &hits, 2, &mut entered).await;
+    let first = RichChannel::memory_for_turn(channel.as_ref(), memory.clone() as Arc<dyn Memory>, "conv-1");
+    let second = RichChannel::memory_for_turn(channel.as_ref(), memory.clone() as Arc<dyn Memory>, "conv-2");
+    assert!(
+        first
+            .list(None, None)
+            .await
+            .expect("test: first before")
+            .iter()
+            .any(|row| row.content.contains("first conversation private"))
+    );
+    assert!(
+        second
+            .list(None, None)
+            .await
+            .expect("test: second before")
+            .iter()
+            .any(|row| row.content.contains("second conversation private"))
+    );
+    let backend = memory.erasure_store().expect("test: erasure store");
+    let first_runs = backend
+        .run_ids(&crate::memory::erasure::ErasureOrigin::new(
+            "agent-a", "conv-1", "same-id",
+        ))
+        .expect("test: first runs");
+    let second_runs = backend
+        .run_ids(&crate::memory::erasure::ErasureOrigin::new(
+            "agent-a", "conv-2", "same-id",
+        ))
+        .expect("test: second runs");
+    assert_ne!(first_runs, Vec::<String>::new());
+    assert_ne!(second_runs, Vec::<String>::new());
+    assert!(
+        first_runs.iter().all(|run| !second_runs.contains(run)),
+        "cross-conversation ownership: {first_runs:?} {second_runs:?}"
+    );
+    host.send(&json!({"jsonrpc":"2.0","id":122,"method":"inbound.message_deleted","params":{"conversation_id":"conv-1","message_id":"same-id","deleted_by":sender(),"timestamp_ms":3}})).await;
+    assert_eq!(recv_id(&mut host, 122, true).await["result"]["erased"], true);
+    assert!(first.list(None, None).await.expect("test: first after").is_empty());
+    assert!(
+        second
+            .list(None, None)
+            .await
+            .expect("test: second after")
+            .iter()
+            .any(|row| row.content.contains("second conversation private"))
+    );
+    release.send(true).expect("test: release surviving turn");
+    drive_until(&mut host, "held-reply").await;
+    assert!(
+        second
+            .list(None, None)
+            .await
+            .expect("test: surviving reply")
+            .iter()
+            .any(|row| row.content.contains("held-reply"))
     );
 }

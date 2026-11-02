@@ -123,6 +123,7 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
     "approval_grants.rs",
     "documents.rs",
     "drafts.rs",
+    "erasure_pool.rs",
     "events.rs",
     "evolution.rs",
     "fixture_readback.rs",
@@ -283,6 +284,10 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
         ),
         ("documents.rs", include_str!("../../src/memory/sqlite/documents.rs")),
         ("drafts.rs", include_str!("../../src/memory/sqlite/drafts.rs")),
+        (
+            "erasure_pool.rs",
+            include_str!("../../src/memory/sqlite/erasure_pool.rs"),
+        ),
         ("events.rs", include_str!("../../src/memory/sqlite/events.rs")),
         ("evolution.rs", include_str!("../../src/memory/sqlite/evolution.rs")),
         ("memory_impl.rs", include_str!("../../src/memory/sqlite/memory_impl.rs")),
