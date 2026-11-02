@@ -1,4 +1,15 @@
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+
+vi.mock('./auth.js', () => ({
+  getToken: () => 'prx_test_token',
+  clearToken: vi.fn()
+}));
+
+vi.mock('./router.js', () => ({
+  navigate: vi.fn(),
+  currentPath: () => '/'
+}));
+
 import { api } from './api';
 
 afterEach(() => {
@@ -76,4 +87,53 @@ test('refuses a job path that is not a same-origin API path', async () => {
   vi.stubGlobal('fetch', vi.fn());
   await expect(api.getJobByPath('https://example.com/api/jobs/1')).rejects.toMatchObject({ status: 400 });
   await expect(api.postByApiPath('//example.com/api/jobs/1/cancel')).rejects.toMatchObject({ status: 400 });
+});
+
+beforeEach(() => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({ ok: true })
+    }))
+  );
+});
+
+const calls = [
+  ['listCronJobs', [], '/api/cron/jobs', 'GET'],
+  ['getCronJob', ['job/1'], '/api/cron/jobs/job%2F1', 'GET'],
+  ['listCronRuns', ['job 1'], '/api/cron/jobs/job%201/runs', 'GET'],
+  ['getCronStatus', [], '/api/cron/status', 'GET'],
+  ['createCronJob', [{ command: 'true', every_ms: 60000 }], '/api/cron/jobs', 'POST'],
+  ['updateCronJob', ['job-1', { command: 'true' }], '/api/cron/jobs/job-1', 'PATCH'],
+  ['pauseCronJob', ['job-1'], '/api/cron/jobs/job-1/pause', 'POST'],
+  ['resumeCronJob', ['job-1'], '/api/cron/jobs/job-1/resume', 'POST'],
+  ['deleteCronJob', ['job-1'], '/api/cron/jobs/job-1', 'DELETE'],
+  ['runCronJob', ['job-1'], '/api/cron/jobs/job-1/run', 'POST'],
+  ['searchMemory', [{ query: 'notes' }], '/api/memory/search', 'POST'],
+  ['recallMemory', [{ query: 'notes' }], '/api/memory/recall', 'POST'],
+  ['storeMemory', [{ key: 'k', content: 'c' }], '/api/memory/store', 'POST'],
+  ['forgetMemory', [{ key: 'k' }], '/api/memory/forget', 'POST'],
+  ['getCost', ['today'], '/api/cost?window=today', 'GET'],
+  ['getLifecycleStatus', [], '/api/skills/lifecycle/status', 'GET'],
+  ['listLifecycleProposals', ['skill a'], '/api/skills/lifecycle/proposals?skill_id=skill+a', 'GET'],
+  ['getLifecycleProposal', ['p/1'], '/api/skills/lifecycle/proposals/p%2F1', 'GET'],
+  ['publishLifecycleProposal', ['p1'], '/api/skills/lifecycle/proposals/p1/publish', 'POST'],
+  ['cancelLifecycleProposal', ['p1', 'done'], '/api/skills/lifecycle/proposals/p1/cancel', 'POST'],
+  ['rollbackLifecycle', [{ skill_id: 's', revision_id: 'r', expected_generation: 2 }], '/api/skills/lifecycle/rollback', 'POST'],
+  ['postLifecycleExperiment', ['lifecycle_experiment_catalog', { sample: true }], '/api/skills/lifecycle/h2', 'POST']
+];
+
+test.each(calls)('%s uses its route and does not send owner_id', async (method, args, path, verb) => {
+  await api[method](...args);
+  const [url, init] = fetch.mock.calls.at(-1);
+  expect(url).toContain(path);
+  expect(init.method ?? 'GET').toBe(verb);
+  const serialized = typeof init.body === 'string' ? init.body : '';
+  expect(serialized).not.toContain('owner_id');
+  if (serialized) {
+    expect(JSON.parse(serialized).owner_id).toBeUndefined();
+  }
 });

@@ -168,7 +168,7 @@
 
 <section class="space-y-6">
   <div class="flex items-center justify-between">
-    <PageHeader title={t('hooks.title')} />
+    <PageHeader title={t('hooks.title')} description={t('operations.hooks.note')} />
     <button
       type="button"
       onclick={() => {

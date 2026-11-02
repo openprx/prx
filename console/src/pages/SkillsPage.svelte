@@ -2,6 +2,7 @@
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
   import { loadFailureVariant } from '../lib/load-state';
+  import { navigate } from '../lib/router';
   import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
 
@@ -185,6 +186,15 @@
       {t('common.refresh')}
     </button>
   </div>
+  <div class="flex flex-wrap gap-2">
+    <button type="button" onclick={() => navigate('/skills/lifecycle')} class="rounded-lg border border-gray-300 px-3 py-2 text-sm">
+      {t('operations.lifecycle.title')}
+    </button>
+    <button type="button" onclick={() => navigate('/skills/h2')} class="rounded-lg border border-gray-300 px-3 py-2 text-sm">
+      {t('operations.h2.title')}
+    </button>
+  </div>
+  <p class="text-sm text-gray-600 dark:text-gray-300">{t('operations.lifecycle.cli')}</p>
 
   <div class="flex gap-1 rounded-lg border border-gray-200 bg-gray-100/50 p-1 dark:border-gray-700 dark:bg-gray-800/50">
     <button

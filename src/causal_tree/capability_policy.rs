@@ -67,6 +67,9 @@ pub const OWNER_ISOLATION_AWARE_TOOLS: &[&str] = &[
     // The tool restricts isolated callers to owner-bound proposal reads/cancellation.
     // Shared projection, executable import and legacy workspace actions are refused.
     "skills_manage",
+    // `cron` stays off this list. Visibility filtering does not make a shell
+    // command safe for an owner-isolated origin. The HTTP cron routes are a
+    // restricted subset: they call the store and the scheduler directly.
 ];
 
 /// Both public identity and actual backend must name the audited implementation.

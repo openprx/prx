@@ -3,6 +3,7 @@
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
   import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
 
   let from = $state(new Date(Date.now() - 86400000).toISOString().slice(0, 16));
   let to = $state(new Date().toISOString().slice(0, 16));
@@ -116,7 +117,13 @@
     <label class="min-w-0 flex-1">{t('decisionApproval.id')}<input bind:value={id} disabled={busy} autocomplete="off" spellcheck="false" class="mt-1 block w-full rounded border border-gray-400 bg-transparent p-2 font-mono text-xs" /></label>
     <button disabled={busy} class="rounded-lg border border-gray-400 px-4 py-2 disabled:opacity-50">{t('decisionApproval.inspect')}</button>
   </form>
-  {#if error}<p role="alert" class="text-red-700 dark:text-red-300">{error}</p>{/if}
+  {#if busy && !loadedWindow}
+    <StateBlock variant="loading" />
+  {:else if error}
+    <StateBlock variant="error" message={error} />
+  {:else if loadedWindow && rows.length === 0}
+    <StateBlock variant="empty" />
+  {/if}
   <p aria-live="polite" class="text-sm text-gray-500 dark:text-gray-400">{busy ? t('common.loading') : t('decisionInspect.limit')}</p>
   {#if selected}
     <article class="space-y-3 rounded-xl border border-sky-300 bg-white p-4 dark:border-sky-800 dark:bg-gray-800">

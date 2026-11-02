@@ -9,6 +9,7 @@
   import ErrorNotice from '../lib/ErrorNotice.svelte';
   import { t } from '../lib/i18n';
   import PageHeader from '../lib/ui/PageHeader.svelte';
+  import StateBlock from '../lib/ui/StateBlock.svelte';
 
   let status = $state(null);
   let loading = $state(false);
@@ -71,10 +72,16 @@
 
 <section class="space-y-5">
   <header class="flex flex-wrap items-center justify-between gap-3">
-    <PageHeader title={t('decisionPlane.title')} />
+    <PageHeader title={t('decisionPlane.title')} description={t('operations.decision.cli')} />
     <button disabled={busy} onclick={load} class="rounded-lg border border-gray-400 px-3 py-2 disabled:opacity-50">{t('decisionPlane.refresh')}</button>
   </header>
-  <ErrorNotice {error} />
+  {#if loading && !status}
+    <StateBlock variant="loading" />
+  {:else if error && !status}
+    <StateBlock variant="error" message={error instanceof Error ? error.message : t('state.error')} />
+  {:else}
+    <ErrorNotice {error} />
+  {/if}
   {#if status}
     <div class="space-y-3 rounded-xl border border-gray-200 p-4 dark:border-gray-700">
       <p>{t('decisionPlane.enabled')}: {String(status.enabled)} · {t('decisionPlane.key')}: {String(status.key_available)}</p>
