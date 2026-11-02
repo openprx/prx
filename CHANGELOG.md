@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are quarantined with authenticated markers and diagnostics naming the stores
   and run. Inbound write failures name `brain.db` and suggest a recovery step.
   `chat.log` honours both `--config-dir` and `OPENPRX_CONFIG_DIR`.
+  Recovery failures retain the run and store filenames in the chat reply and
+  the full redacted error chain in `chat.log`. Unauthenticated quarantine
+  markers warn once per marker per run with recovery guidance.
 
 ### Changed
 

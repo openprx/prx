@@ -15,6 +15,28 @@ use std::time::{Duration, Instant};
 #[error("input already accepted; execution was not repeated and its outcome remains unconfirmed")]
 pub(crate) struct AlreadyAccepted;
 
+/// Store/run metadata for diagnostics only; recovery classification is unchanged.
+#[derive(Debug)]
+pub(crate) struct IngressRecoveryDiagnostic {
+    pub(crate) run_id: String,
+    pub(crate) memory_store: std::path::PathBuf,
+    pub(crate) decision_store: std::path::PathBuf,
+}
+
+impl std::fmt::Display for IngressRecoveryDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "ingress recovery run={} memory_store={} decision_store={}",
+            self.run_id,
+            self.memory_store.display(),
+            self.decision_store.display()
+        )
+    }
+}
+
+impl std::error::Error for IngressRecoveryDiagnostic {}
+
 pub(crate) struct IngressRecorder {
     memory: Arc<dyn Memory>,
     key: Arc<DecisionKey>,
@@ -24,6 +46,7 @@ pub(crate) struct IngressRecorder {
     duplicate: std::sync::atomic::AtomicBool,
     workspace: std::path::PathBuf,
     run_id: std::sync::OnceLock<String>,
+    warned_markers: parking_lot::Mutex<std::collections::HashSet<String>>,
     barrier: Arc<tokio::sync::Mutex<()>>,
     source: std::sync::OnceLock<(IngressRecoveryScope, crate::causal_tree::state::TurnSurfaceKind)>,
 }
@@ -63,6 +86,7 @@ impl IngressRecorder {
             duplicate: Default::default(),
             workspace: config.workspace_dir.clone(),
             run_id: Default::default(),
+            warned_markers: Default::default(),
             barrier,
             source: Default::default(),
         })))
@@ -346,9 +370,13 @@ impl IngressRecorder {
         deadline: Instant,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.recover(scope, service, deadline)
-                .await
-                .with_context(|| self.diagnostic(self.run_id.get().map(String::as_str).unwrap_or("unassigned")))
+            self.recover(scope, service, deadline).await.map_err(|error| {
+                if error.downcast_ref::<IngressRecoveryDiagnostic>().is_some() {
+                    error
+                } else {
+                    error.context(self.diagnostic(self.run_id.get().map(String::as_str).unwrap_or("unassigned")))
+                }
+            })
         })
     }
 
@@ -376,12 +404,12 @@ impl IngressRecorder {
         format!("ingress:{}:quarantine", capsule.input_event_id)
     }
 
-    fn diagnostic(&self, run: &str) -> String {
-        format!(
-            "ingress recovery run={run} memory_store={} decision_store={}",
-            self.workspace.join("memory/brain.db").display(),
-            crate::causal_tree::store::db_path(&self.workspace).display()
-        )
+    fn diagnostic(&self, run: &str) -> IngressRecoveryDiagnostic {
+        IngressRecoveryDiagnostic {
+            run_id: run.to_owned(),
+            memory_store: self.workspace.join("memory/brain.db"),
+            decision_store: crate::causal_tree::store::db_path(&self.workspace),
+        }
     }
 
     fn authenticated_quarantine_key(&self, capsule: &IngressCapsule) -> anyhow::Result<String> {
@@ -441,10 +469,14 @@ impl IngressRecorder {
                 if self.verify_quarantine_marker(&event, capsule)? {
                     return Ok(true);
                 }
-                tracing::error!(run_id = %capsule.run_id,
-                    brain_db = %self.workspace.join("memory/brain.db").display(),
-                    decisions_db = %crate::causal_tree::store::db_path(&self.workspace).display(),
-                    "ignored unauthenticated ingress quarantine marker; recovery will proceed");
+                let should_warn = self.warned_markers.lock().insert(event.event_id.clone());
+                if should_warn {
+                    tracing::warn!(run_id = %capsule.run_id,
+                        marker_id = %event.event_id,
+                        brain_db = %self.workspace.join("memory/brain.db").display(),
+                        decisions_db = %crate::causal_tree::store::db_path(&self.workspace).display(),
+                        "ignored unauthenticated ingress quarantine marker; recovery will proceed; remove the unauthenticated marker row or rerun ingress recovery");
+                }
             }
         }
         Ok(false)

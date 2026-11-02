@@ -9,12 +9,31 @@ use std::sync::Arc;
 
 /// Resume admission stays opaque: its sources may contain private identifiers.
 /// An inbound persistence failure is different. The operator needs the cause,
-/// so the user-facing line names a public error class and drops everything else.
+/// so the user-facing line keeps a public cause and recovery identifiers while
+/// full store paths stay in the redacted log chain.
 pub(super) fn chat_input_persistence_failure(error: &anyhow::Error) -> anyhow::Error {
     let cause = safe_persistence_cause(error);
-    tracing::error!(store = "brain.db", cause = %cause, "chat input persistence failed; restart to retry ingress recovery");
+    let diagnostic = error.downcast_ref::<crate::runtime::ingress_recovery::IngressRecoveryDiagnostic>();
+    let decision_store = diagnostic
+        .and_then(|context| context.decision_store.file_name())
+        .and_then(std::ffi::OsStr::to_str);
+    let run_id = diagnostic.map(|context| {
+        let run = context.run_id.as_str();
+        if persistence_cause_is_public(run) {
+            run
+        } else {
+            "[redacted]"
+        }
+    });
+    let detail = crate::security::redaction::redact_provider_text(&format!("{error:#}"));
+    tracing::error!(store = "brain.db", decision_store, run_id, error = %detail, cause = %cause,
+        "chat input persistence failed; restart to retry ingress recovery");
+    let identifiers = match (decision_store, run_id) {
+        (Some(store), Some(run)) => format!("; decision_store={store}; run_id={run}"),
+        _ => String::new(),
+    };
     anyhow::anyhow!(
-        "chat input persistence failed (brain.db): {cause}. Restart to retry ingress recovery; if it persists, inspect the store error in chat.log."
+        "chat input persistence failed (brain.db{identifiers}): {cause}. Restart to retry ingress recovery; if it persists, inspect the store error in chat.log."
     )
 }
 

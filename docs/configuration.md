@@ -881,6 +881,12 @@ workers, and one request spends **one** contention budget however many rows it
 touches. A database another process is holding therefore slows the chat sessions
 using it and leaves the rest of the API answering.
 
+### Chat recovery diagnostics
+
+Local recovery failures show the run and store filenames in the chat reply.
+Full store paths stay in the redacted error chain in `chat.log`. Invalid
+quarantine markers warn once per marker per run with recovery guidance.
+
 ### `[chat.daemon]`
 
 `prx chat` deliberately opens no IM connection: a second listener on the same

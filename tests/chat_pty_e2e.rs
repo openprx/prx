@@ -1098,8 +1098,12 @@ fn test_chat_redirects_startup_tracing_before_tui() {
         "full-screen chat did not exit after Ctrl-D"
     );
 
-    let log_path = guard.home_dir.join(".openprx/chat.log");
+    let log_path = guard.config_dir.join("chat.log");
     let log = std::fs::read_to_string(&log_path).expect("read redirected chat.log");
+    assert!(
+        !guard.home_dir.join(".openprx/chat.log").exists(),
+        "an explicit config directory must not write the default HOME log"
+    );
     assert!(
         log.contains("Config loaded"),
         "startup tracing should be retained in chat.log, got:\n{log}"

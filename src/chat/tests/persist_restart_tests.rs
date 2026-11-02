@@ -87,6 +87,10 @@ enum Fault {
 
 async fn completed_chat(workspace: &Path, fault: Fault) -> MessageEvent {
     let cleanup = CleanupScope::new(None, CancellationToken::new()).unwrap();
+    completed_chat_under_cleanup(workspace, fault, &cleanup).await
+}
+
+async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &CleanupScope) -> MessageEvent {
     cleanup
         .scope_admission(async {
             let memory = Arc::new(SqliteMemory::new(workspace).unwrap());
@@ -176,6 +180,24 @@ async fn marker(workspace: &Path, source: &MessageEvent) -> MessageEvent {
         .expect("quarantine evidence")
 }
 
+fn run_in_isolated_process(test: &str, child_flag: &str) -> bool {
+    if std::env::var_os(child_flag).is_some() {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture"])
+        .env(child_flag, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 #[tokio::test]
 async fn chat_recovers_a_real_seal_that_failed_verification_before_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -202,18 +224,7 @@ async fn empty_decision_store_beside_populated_memory_recovers_with_named_diagno
     // and its callsite cache while retaining the real restart and log assertions.
     const CHILD_FLAG: &str = "PRX_TEST_INGRESS_DIAGNOSTICS_CHILD";
     const TEST: &str = "chat::tests::persist_restart_tests::empty_decision_store_beside_populated_memory_recovers_with_named_diagnostics";
-    if std::env::var_os(CHILD_FLAG).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([TEST, "--exact", "--nocapture"])
-            .env(CHILD_FLAG, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if run_in_isolated_process(TEST, CHILD_FLAG) {
         return;
     }
 
@@ -336,4 +347,166 @@ async fn missing_terminal_source_is_quarantined_on_restart() {
             .content
             .contains("original terminal source event is missing")
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
+    const TEST: &str =
+        "chat::tests::persist_restart_tests::recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log";
+    if run_in_isolated_process(TEST, "PRX_TEST_RECOVERY_LOG_CHILD") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // A second chat cannot claim this live lifetime. Replace only the decision
+    // database, as in O12, while retaining the real completed source and owner.
+    let first_cleanup = CleanupScope::new(None, CancellationToken::new()).unwrap();
+    let first = completed_chat_under_cleanup(dir.path(), Fault::None, &first_cleanup).await;
+    let saved = dir.path().join("previous-decisions");
+    std::fs::create_dir(&saved).unwrap();
+    for name in ["decisions.db", "decisions.db-wal", "decisions.db-shm"] {
+        let file = dir.path().join("self/causal_tree").join(name);
+        if file.exists() {
+            std::fs::rename(&file, saved.join(name)).unwrap();
+        }
+    }
+    let log_path = dir.path().join("chat.log");
+    let file = std::fs::File::create(&log_path).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || file.try_clone().unwrap())
+        .finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+    let memory = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+    let generation = crate::config::new_shared(config_at(dir.path())).pin();
+    let error = match guarded_input(memory, &generation, "prx-current-run").await {
+        Err(error) => error,
+        Ok(_) => panic!("a live prior lifetime must refuse recovery"),
+    };
+    let reply = error.to_string();
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let line = log
+        .lines()
+        .find(|line| line.contains("chat input persistence failed"))
+        .unwrap();
+    for expected in [
+        first.run_id.as_deref().unwrap(),
+        "brain.db",
+        "decisions.db",
+        "another ingress lifetime remains active",
+    ] {
+        assert!(reply.contains(expected), "missing {expected}: {reply}");
+        assert!(line.contains(expected), "missing {expected}: {line}");
+    }
+    assert!(!reply.contains('/'), "full paths must stay out of the reply: {reply}");
+    for store in [
+        dir.path().join("memory/brain.db"),
+        crate::causal_tree::store::db_path(dir.path()),
+    ] {
+        assert!(
+            line.contains(store.to_str().unwrap()),
+            "missing full store path: {line}"
+        );
+    }
+    assert!(line.contains("run_id="), "missing structured run field: {line}");
+
+    let private_error = anyhow::anyhow!("permission denied")
+        .context("https://prx_user:prx_fixture_password@example.com/v1?key=prx_fixture_query")
+        .context(crate::runtime::ingress_recovery::IngressRecoveryDiagnostic {
+            run_id: "/prx-private-run".into(),
+            memory_store: dir.path().join("memory/brain.db"),
+            decision_store: crate::causal_tree::store::db_path(dir.path()),
+        });
+    let private_reply = crate::chat::decision_source::chat_input_persistence_failure(&private_error).to_string();
+    assert!(!private_reply.contains('/'), "{private_reply}");
+    assert!(!private_reply.contains("prx-private-run"), "{private_reply}");
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(!log.contains("prx_fixture_password"), "credential reached chat.log");
+    assert!(!log.contains("prx_fixture_query"), "URL query secret reached chat.log");
+    assert!(log.to_ascii_lowercase().contains("[redacted]"), "{log}");
+    first_cleanup.run(async { Ok(()) }).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unauthenticated_marker_warns_once_per_run_with_recovery_hint() {
+    const TEST: &str =
+        "chat::tests::persist_restart_tests::unauthenticated_marker_warns_once_per_run_with_recovery_hint";
+    if run_in_isolated_process(TEST, "PRX_TEST_MARKER_WARNING_CHILD") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let first = completed_chat(dir.path(), Fault::FloatDrift).await;
+    let memory = SqliteMemory::new(dir.path()).unwrap();
+    let capsule: crate::memory::ingress_recovery::IngressCapsule = serde_json::from_value(
+        serde_json::from_str::<serde_json::Value>(first.raw_payload_json.as_deref().unwrap())
+            .unwrap()
+            .get("prx_ingress_capsule")
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+    let mut legacy: MessageEventInput = serde_json::from_value(serde_json::to_value(&first).unwrap()).unwrap();
+    legacy.event_id = None;
+    legacy.role = "event".into();
+    legacy.event_type = "turn.ingress.quarantined".into();
+    legacy.idempotency_key = Some(format!("ingress:{}:quarantine", first.event_id));
+    legacy.causation_event_id = Some(first.event_id.clone());
+    legacy.content = "turn.ingress.quarantined legacy marker".into();
+    legacy.raw_payload_json = Some(serde_json::json!({"capsule": capsule, "reason": "legacy marker"}).to_string());
+    let legacy = memory.append_message_event(legacy).await.unwrap();
+    drop(memory);
+    let log_path = dir.path().join("chat.log");
+    let file = std::fs::File::create(&log_path).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || file.try_clone().unwrap())
+        .finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+    restarted_chat(dir.path(), "prx-marker-warning-run").await;
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let warnings: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("ignored unauthenticated ingress quarantine marker"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "duplicate warning within a run: {log}");
+    let warning = warnings.first().unwrap();
+    for expected in [
+        "WARN",
+        &legacy.event_id,
+        "remove the unauthenticated marker row",
+        "rerun ingress recovery",
+    ] {
+        assert!(warning.contains(expected), "missing {expected}: {warning}");
+    }
+    assert!(!warning.contains("ERROR"), "{warning}");
+    let key = crate::decision::DecisionKey::load_or_create(dir.path()).unwrap();
+    let tag = key.hmac(
+        crate::decision::KeyDomain::IngressRecovery,
+        &[b"quarantine-key-v1", &serde_json::to_vec(&capsule).unwrap()],
+    );
+    let memory = SqliteMemory::new(dir.path()).unwrap();
+    assert!(
+        memory
+            .find_owned_message_event_by_idempotency_key(
+                &first.workspace_id,
+                first.owner_id.as_deref().unwrap(),
+                &format!("ingress:{}:quarantine:{}", first.event_id, hex::encode(tag)),
+            )
+            .await
+            .unwrap()
+            .is_some(),
+        "the invalid marker must not suppress genuine quarantine recovery"
+    );
+    drop(memory);
+    restarted_chat(dir.path(), "prx-marker-warning-next-run").await;
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("ignored unauthenticated ingress quarantine marker"))
+            .count(),
+        2,
+        "a new run may emit one warning for the retained legacy marker: {log}"
+    );
+    assert_eq!(marker(dir.path(), &first).await.event_id, legacy.event_id);
 }
