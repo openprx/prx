@@ -105,7 +105,6 @@ impl<P: PredictionPort> PredictionPort for ScoringPrediction<P> {
 
 enum FixtureTools {
     None,
-    ReadOnlyFilesystem,
     Filesystem,
     Named(&'static str),
 }
@@ -141,10 +140,6 @@ async fn decide_turn(
     let mut security = SecurityPolicy::default();
     security.autonomy = AutonomyLevel::Full;
     let registry: Vec<Box<dyn crate::tools::Tool>> = match tools {
-        FixtureTools::ReadOnlyFilesystem => vec![Box::new(crate::tools::file_read::FileReadTool::new(
-            Arc::new(security.clone()),
-            false,
-        ))],
         FixtureTools::Filesystem => vec![
             Box::new(crate::tools::file_read::FileReadTool::new(
                 Arc::new(security.clone()),
@@ -400,7 +395,7 @@ async fn failed_tool_cannot_execute_on_the_next_hop() {
     let first = decide_turn(
         "Use file_read on /tmp/prx_fixture/input.md",
         None,
-        FixtureTools::ReadOnlyFilesystem,
+        FixtureTools::Filesystem,
         None,
         Some("filesystem"),
     )
@@ -411,9 +406,9 @@ async fn failed_tool_cannot_execute_on_the_next_hop() {
     let tool = candidates
         .iter()
         .find(|candidate| candidate.action() == CausalActionKind::UseTool)
-        .unwrap()
-        .candidate_id()
-        .clone();
+        .unwrap();
+    let failed_refs = tool.required_capabilities().to_vec();
+    let tool = tool.candidate_id().clone();
     assert!(
         matches!(&first.selection, Selection::Commit { candidate_id, .. } if candidate_id == &tool),
         "first-hop tool must be above every bar"
@@ -421,11 +416,25 @@ async fn failed_tool_cannot_execute_on_the_next_hop() {
     let second = decide_turn(
         "Use file_read on /tmp/prx_fixture/input.md",
         None,
-        FixtureTools::ReadOnlyFilesystem,
+        FixtureTools::Filesystem,
         Some((ObservedStepStatus::Failed, tool.clone())),
         Some("filesystem"),
     )
     .await;
+    let CandidateSet::Legal { candidates, .. } = &second.candidates else {
+        panic!("legal retry set")
+    };
+    assert!(
+        candidates.iter().any(|candidate| {
+            candidate.action() == CausalActionKind::UseTool
+                && candidate.candidate_id() != &tool
+                && candidate
+                    .required_capabilities()
+                    .iter()
+                    .any(|reference| failed_refs.contains(reference))
+        }),
+        "the fixture must retain a family plan that aliases the failed read"
+    );
     assert!(
         !matches!(second.selection, Selection::Commit { ref candidate_id, .. } | Selection::Recover { ref candidate_id, .. } if candidate_id == &tool)
     );

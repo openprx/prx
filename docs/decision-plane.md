@@ -83,7 +83,8 @@ artifact. This applies to the first message and later ordinary conversation.
 An earlier failed provider attempt is not an unsuccessful action step, so it
 does not make a later ordinary message require external evidence. Empty input
 and turns made undecidable by failed or repeated tool work use the reason-aware
-terminal path below; a failed tool cannot be selected again in the same turn. Brief
+terminal path below; a failed tool cannot be selected again in the same turn,
+including through another plan with the same pinned capability reference. Brief
 ordinary requests (builtin request weight at most two), continued conversation,
 and turns with no viable read/recovery candidate receive the direct-answer
 preference. Longer unrouted text may take one bounded discovery hop. After that

@@ -1735,6 +1735,32 @@ fn selector_context_for_state(
         routing_input,
     );
     context.failed_candidates = state.observed.failed_candidates().into_iter().cloned().collect();
+    if !context.failed_candidates.is_empty()
+        && let CandidateSet::Legal { candidates, .. } = set
+    {
+        // Exact and family plans can have different IDs while sharing the
+        // same pinned tool. A failed tool cannot re-enter through that alias.
+        let failed_tools = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.action() == CausalActionKind::UseTool
+                    && context.failed_candidates.contains(candidate.candidate_id())
+            })
+            .flat_map(CausalCandidate::required_capabilities)
+            .collect::<BTreeSet<_>>();
+        context.failed_candidates.extend(
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.action() == CausalActionKind::UseTool
+                        && candidate
+                            .required_capabilities()
+                            .iter()
+                            .any(|reference| failed_tools.contains(reference))
+                })
+                .map(|candidate| candidate.candidate_id().clone()),
+        );
+    }
     context
 }
 

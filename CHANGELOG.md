@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evidence, side-effect thresholds and margin checks even for exact names.
 - Interrupted scoring retains commits only after complete scoring. Cancelled
   work does not count as failure or success calibration; failed tools are not
-  selected again in the same turn. Corrective replies recheck execution intent
+  selected again in the same turn, including through an aliasing plan.
+  Corrective replies recheck execution intent
   without bypassing the unverified-execution guard.
 
 - **Breaking:** provider auth and API requests identify as `User-Agent: prx/<version>`.
