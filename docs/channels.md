@@ -30,7 +30,7 @@ Protocol, config keys, encryption, and erase behavior are in
 ```toml
 [channels_config.ramflux]
 authorization_mode = "follow_rf"
-# socket_path = "/tmp/prx/ramflux.sock"  # default: $XDG_RUNTIME_DIR/prx/ramflux.sock
+# socket_path = "/tmp/prx/ramflux.sock"  # default: <workspace>/ramflux/run/ramflux.sock
 ```
 
 ## Policies

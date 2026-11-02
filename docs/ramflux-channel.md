@@ -23,6 +23,8 @@ That file key is the current custody boundary. Overwriting a file with zeros
 cannot promise erasure on a copy-on-write filesystem such as APFS or btrfs;
 destroying the DEK is what makes a leftover ciphertext unreadable.
 
+A channel instance remains bound to its first account; changing accounts
+requires a new instance. This also keeps queued work and replay in that account.
 One connection is active. A second connection is rejected. After a disconnect
 the host handshakes again. prx replays unacknowledged `reply.*` frames and
 marks turns that were still running as `failed` with code `bridge_lost`.
@@ -77,7 +79,9 @@ Bridge errors:
 | -32004 | A second bridge connection was rejected. |
 | -32005 | `queue_full`. The message says `queue_full depth=N`. |
 | -32006 | The peer uid was refused. |
-| -32603 | No longer used for a removed account. Removal returns -32003. |
+| -32601 | Unknown method or a backend capability that cannot enforce transactional erasure. |
+| -32602 | Missing or invalid method parameters. |
+| -32603 | Internal storage, eraser, or transport failure; no successful erase is acknowledged. |
 
 `prx channel doctor` prints the socket path, the permission check, and the
 effective mode, for example `follow_rf→supervised`.
@@ -89,7 +93,9 @@ was seen in the last 30 seconds.
 
 Newline-delimited JSON-RPC 2.0. Frames larger than 1 MiB are rejected.
 Requests should carry `idempotency_key` inside `params`. prx deduplicates
-inbound keys for ten minutes. Every outbound frame carries `turn_id`.
+inbound request keys for ten minutes. Durable input receipts use
+`channel:ramflux:{hash(account)}:{hash(conversation)}:{message_id}`, so a
+message id reused by another account or conversation cannot collide. Every outbound frame carries `turn_id`.
 
 ### Host to prx
 
@@ -99,7 +105,7 @@ inbound keys for ten minutes. Every outbound frame carries `turn_id`.
 | `bridge.ping` | Liveness. |
 | `inbound.message` | User message. `sender` is a principal, `chat.conversation_id` is the reply target. |
 | `inbound.surface_action` | A person activated a card. Not a tool approval. |
-| `inbound.task_event` | Task event passthrough. |
+| `inbound.task_event` | Host task intent: `start`, `accept`, `decline`, `cancel`, or `resolve`; see lifecycle mapping below. |
 | `inbound.control` | Membership and presence. `agent_revoked` erases that conversation and keeps the account key. `agent_removed` erases the account, destroys the data key, and leaves a removal marker until `agent_added`. `agent_offline` pauses the account. `agent_online` resumes it. |
 | `inbound.message_deleted` | Hard-delete that message's stored bytes. Reply `{erased: true}`. |
 | `approval.decision` | `approved`, `denied`, or `expired`. |
@@ -111,8 +117,9 @@ inbound keys for ten minutes. Every outbound frame carries `turn_id`.
 | --- | --- |
 | `reply.text` | Text. `final` marks the last segment. |
 | `reply.surface` | `create`, `patch`, `stream_append`, or `close`. Blocks are declarative. `fallback_text` is required when blocks are present. |
-| `reply.task_update` / `reply.task_propose` | Task state and proposals. |
-| `reply.attachment` | Bytes instead of an `[IMAGE:path]` marker. |
+| `reply.task_update` | Runtime task and tool state. |
+| `reply.task_propose` | Deferred runtime producer; see FOLLOWUPS. |
+| `reply.attachment` | Deferred runtime producer; see FOLLOWUPS. |
 | `reply.typing` | Typing indicator. |
 | `tool.event` | `started`, `progress`, `finished`, or `failed`. |
 | `approval.request` | Redacted arguments plus `args_hash` (SHA-256 of canonical JSON of the full arguments), `risk`, and `expires_at_ms`. |
@@ -169,7 +176,7 @@ When `encrypt_at_rest` is true (the default), this channel's memory content,
 media files, and tool-event records are sealed with ChaCha20-Poly1305. Each
 account has a data key wrapped by the prx `SecretStore` master key. The data
 key lives only in process memory. `agent_offline` and shutdown zeroize it;
-the next `bridge.hello` unwraps it again. Associated data is the account id
+the next `bridge.hello` unwraps it again. The wrapped key stays on disk until account removal. Associated data is the account id
 and the conversation id, so ciphertext cannot be moved between conversations.
 
 The vector index is not given plaintext. If a backend cannot store an
@@ -178,7 +185,78 @@ encrypted vector, this namespace is not indexed.
 The first time the channel opens a directory that still holds pre-existing
 plaintext for this channel, that plaintext is deleted and a notice is logged.
 
-`inbound.message_deleted` and `agent_revoked` overwrite and remove the
-ciphertext, media, drafts, tool events, and, for revocation, the wrapped key.
-`agent_removed` keeps the bytes and records `agent_removed_at` so later turns
-do not retrieve that conversation until the agent is added again.
+`inbound.message_deleted` removes the message and all indexed derived data,
+including autosaves, message events, ingress receipts, drafts, and tool/media
+objects. The SQLite writer records ownership in the same transaction as each
+data row. A content-free, durable tombstone prevents deleted input from being
+executed again. Queued input is removed; active work is cancelled and its
+writer fence is closed before erasure is acknowledged. The index remains
+retryable through checkpoint failure. Erasure also rebuilds the remaining FTS index to discard obsolete segments.
+`secure_delete` overwrites freed pages;
+a TRUNCATE checkpoint empties the WAL, so VACUUM is unnecessary.
+
+`agent_revoked` removes one conversation's data and keeps the wrapped account
+key. Explicit cross-conversation retrieval configuration widens that revocation
+to the account's retrieval scope. `agent_removed` erases all account data,
+destroys the wrapped key, and records an account removal marker. The same-user
+host can deliver `agent_added` before a successful hello to clear that marker.
+After a restart, a rejected hello identifies the removed account; with exactly
+one configured account, an add can identify it directly. A new hello then
+unlocks a fresh key. Account removal markers cannot collide with a conversation
+named `account`.
+
+Process workers cannot carry the in-process memory capability; scoped turns
+refuse that execution mode before creating worker storage. In-process
+delegation retains the approval context and indexed memory capability.
+
+The live channel requires SQLite transactional erasure. Other backends return
+an unsupported capability error rather than claiming erasure. Channel content
+objects reside in the same database as their ownership index. Native memory, session and document tools select the same per-message
+capability. Conversation metadata and notices use this view as well. Queued
+causal telemetry retains its run's memory capability and configuration
+generation across a shared decision writer. Unsupported scoped operations fail
+with a typed capability error.
+Memory event payloads and drafts use the same encryption view; `session_id` is keyed, and
+new version-2 ingress capsules use a keyed input MAC. Legacy version-1
+capsules are accepted only outside protected scopes. Sender, session key,
+conversation id, timestamps and chat-profile metadata remain visible; content
+length also remains observable. Restart hydration reads that scope and
+keeps the newest timestamped turns. Erasure rebuilds cached history from the
+remaining persisted message identities, without positional matching.
+
+## Lifecycle and actions
+
+prx emits `started` on turn entry, `thinking` before model work,
+`tool_running` while tools run, `awaiting_approval` at a real approval wait,
+and `done` after the final surface. Terminal errors emit `failed`.
+
+| Host task kind | Task update state / action |
+| --- | --- |
+| `start` | `running` |
+| `accept` | `running` |
+| `decline` | `rejected`; cancel active work |
+| `cancel` | `cancelled`; cancel active work |
+| `resolve` | Task `done`; the parent turn retains its own lifecycle |
+
+`tool_running` and `awaiting_approval` come from prx execution and approval
+state, not invented host event kinds. Final surfaces precede `done`.
+Surface actions retain their structured `values` and original conversation
+kind, including after a turn has closed, and enter the normal input queue.
+They never grant tool authority. The host validates ramflux grants and sends
+the dedicated `approval.decision`; its pending conversation and initiating
+principal/device must match. A forged `approval_id` in surface values cannot
+approve anything. Delegated tasks carry the explicit active-turn context.
+
+Deletion requires a completed hello and an unpaused, unlocked account. Invalid
+parameters, an unavailable eraser, a failed checkpoint, or an unsupported
+backend produce a JSON-RPC error instead of `{erased:true}`.
+
+## FOLLOWUPS
+
+| Item | Status | Boundary |
+| --- | --- | --- |
+| Runtime `reply.task_propose` producer | Deferred | Wire encoding exists; the turn loop does not autonomously propose tasks. |
+| Runtime `reply.attachment` producer | Deferred | Wire encoding exists; generated attachments are not sent by the turn loop. |
+| Distinct `turn_timeout` error | Deferred | Budget cancellation currently uses `cancelled`. |
+| Replay across process restart | Deferred | Unacknowledged replay is currently process-local. |
+| Remaining low-priority review findings | Deferred | Cursor/action deduplication, metadata hardening, and bounded-resource refinements remain separate followups. |
