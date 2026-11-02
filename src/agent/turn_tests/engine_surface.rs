@@ -481,451 +481,463 @@ async fn run_tool_call_loop_keeps_stateful_tools_strictly_serial() {
 
 #[tokio::test]
 async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
-    let skill_refreshes = Arc::new(AtomicUsize::new(0));
-    let mcp_refreshes = Arc::new(AtomicUsize::new(0));
-    let tools_registry: Vec<Box<dyn Tool>> = vec![
-        Box::new(RefreshCountingTool {
-            name: "skill_read",
-            category: ToolCategory::System,
-            refreshes: Arc::clone(&skill_refreshes),
-        }),
-        Box::new(RefreshCountingTool {
-            name: "mcp_status",
-            category: ToolCategory::Automation,
-            refreshes: Arc::clone(&mcp_refreshes),
-        }),
-    ];
-    let provider = ScriptedProvider::from_text_responses(vec!["done"]);
-    let routing_input = "use skill_read to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
-    let mut history = vec![
-        ChatMessage::system("test-system"),
-        ChatMessage::user(format!(
-            "Relevant memory from an older turn: use MCP to operate the browser.\n\n{routing_input}"
-        )),
-    ];
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let skill_refreshes = Arc::new(AtomicUsize::new(0));
+        let mcp_refreshes = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(RefreshCountingTool {
+                name: "skill_read",
+                category: ToolCategory::System,
+                refreshes: Arc::clone(&skill_refreshes),
+            }),
+            Box::new(RefreshCountingTool {
+                name: "mcp_status",
+                category: ToolCategory::Automation,
+                refreshes: Arc::clone(&mcp_refreshes),
+            }),
+        ];
+        let provider = ScriptedProvider::from_text_responses(vec!["done"]);
+        let routing_input = "use skill_read to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(format!(
+                "Relevant memory from an older turn: use MCP to operate the browser.\n\n{routing_input}"
+            )),
+        ];
 
-    let workspace = TempDir::new().expect("surface fixture workspace");
-    let expected_specs = tool_specs_of(&tools_registry)
-        .into_iter()
-        .filter(|spec| spec.name == "skill_read")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        expected_specs.len(),
-        1,
-        "selected fixture capability must be registered"
-    );
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
-        workspace.path(),
-        routing_input,
-        Arc::clone(&tools_registry),
-    )
-    .await;
-    admission.assert_selected_specs(&expected_specs);
+        let workspace = TempDir::new().expect("surface fixture workspace");
+        let expected_specs = tool_specs_of(&tools_registry)
+            .into_iter()
+            .filter(|spec| spec.name == "skill_read")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected_specs.len(),
+            1,
+            "selected fixture capability must be registered"
+        );
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+            workspace.path(),
+            routing_input,
+            Arc::clone(&tools_registry),
+        )
+        .await;
+        admission.assert_selected_specs(&expected_specs);
 
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "wacli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "wacli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(workspace.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .unwrap();
-
-    assert_eq!(result, "done");
-    assert_eq!(skill_refreshes.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        mcp_refreshes.load(Ordering::SeqCst),
-        0,
-        "an unrelated skill/PDF turn must not cold-start MCP"
-    );
-
-    let skill_refreshes = Arc::new(AtomicUsize::new(0));
-    let mcp_refreshes = Arc::new(AtomicUsize::new(0));
-    let tools_registry: Vec<Box<dyn Tool>> = vec![
-        Box::new(RefreshCountingTool {
-            name: "skill_read",
-            category: ToolCategory::System,
-            refreshes: Arc::clone(&skill_refreshes),
-        }),
-        Box::new(RefreshCountingTool {
-            name: "mcp_status",
-            category: ToolCategory::Automation,
-            refreshes: Arc::clone(&mcp_refreshes),
-        }),
-    ];
-    let provider = ScriptedProvider::from_text_responses(vec!["done"]);
-    let routing_input = "use mcp_status to inspect MCP availability";
-    let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user(routing_input)];
-
-    let workspace = TempDir::new().expect("surface fixture workspace");
-    let expected_specs = tool_specs_of(&tools_registry)
-        .into_iter()
-        .filter(|spec| spec.name == "mcp_status")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        expected_specs.len(),
-        1,
-        "selected fixture capability must be registered"
-    );
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
-        workspace.path(),
-        routing_input,
-        Arc::clone(&tools_registry),
-    )
-    .await;
-    admission.assert_selected_specs(&expected_specs);
-
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "gateway",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: ToolLoopMemory::none(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(workspace.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .unwrap();
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .unwrap();
 
-    assert_eq!(result, "done");
-    assert_eq!(skill_refreshes.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        mcp_refreshes.load(Ordering::SeqCst),
-        1,
-        "an explicit MCP/browser turn must still refresh MCP before schema exposure"
-    );
+        assert_eq!(result, "done");
+        assert_eq!(skill_refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mcp_refreshes.load(Ordering::SeqCst),
+            0,
+            "an unrelated skill/PDF turn must not cold-start MCP"
+        );
+
+        let skill_refreshes = Arc::new(AtomicUsize::new(0));
+        let mcp_refreshes = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(RefreshCountingTool {
+                name: "skill_read",
+                category: ToolCategory::System,
+                refreshes: Arc::clone(&skill_refreshes),
+            }),
+            Box::new(RefreshCountingTool {
+                name: "mcp_status",
+                category: ToolCategory::Automation,
+                refreshes: Arc::clone(&mcp_refreshes),
+            }),
+        ];
+        let provider = ScriptedProvider::from_text_responses(vec!["done"]);
+        let routing_input = "use mcp_status to inspect MCP availability";
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user(routing_input)];
+
+        let workspace = TempDir::new().expect("surface fixture workspace");
+        let expected_specs = tool_specs_of(&tools_registry)
+            .into_iter()
+            .filter(|spec| spec.name == "mcp_status")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected_specs.len(),
+            1,
+            "selected fixture capability must be registered"
+        );
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+            workspace.path(),
+            routing_input,
+            Arc::clone(&tools_registry),
+        )
+        .await;
+        admission.assert_selected_specs(&expected_specs);
+
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "gateway",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
+            },
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(skill_refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            mcp_refreshes.load(Ordering::SeqCst),
+            1,
+            "an explicit MCP/browser turn must still refresh MCP before schema exposure"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn prompt_guided_provider_receives_only_the_compiled_turn_tool_snapshot() {
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let provider = PayloadCapturingProvider {
-        captured: Arc::clone(&captured),
-    };
-    let tools_registry: Vec<Box<dyn Tool>> = vec![
-        Box::new(RefreshCountingTool {
-            name: "skill_read",
-            category: ToolCategory::System,
-            refreshes: Arc::new(AtomicUsize::new(0)),
-        }),
-        Box::new(RefreshCountingTool {
-            name: "mcp_status",
-            category: ToolCategory::Automation,
-            refreshes: Arc::new(AtomicUsize::new(0)),
-        }),
-    ];
-    let routing_input = "use skill_read to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
-    let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = PayloadCapturingProvider {
+            captured: Arc::clone(&captured),
+        };
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(RefreshCountingTool {
+                name: "skill_read",
+                category: ToolCategory::System,
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(RefreshCountingTool {
+                name: "mcp_status",
+                category: ToolCategory::Automation,
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            }),
+        ];
+        let routing_input = "use skill_read to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
+        let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
 
-    let workspace = TempDir::new().expect("surface fixture workspace");
-    let expected_specs = tool_specs_of(&tools_registry)
-        .into_iter()
-        .filter(|spec| spec.name == "skill_read")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        expected_specs.len(),
-        1,
-        "selected fixture capability must be registered"
-    );
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
-        workspace.path(),
-        routing_input,
-        Arc::clone(&tools_registry),
-    )
-    .await;
-    admission.assert_selected_specs(&expected_specs);
+        let workspace = TempDir::new().expect("surface fixture workspace");
+        let expected_specs = tool_specs_of(&tools_registry)
+            .into_iter()
+            .filter(|spec| spec.name == "skill_read")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected_specs.len(),
+            1,
+            "selected fixture capability must be registered"
+        );
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+            workspace.path(),
+            routing_input,
+            Arc::clone(&tools_registry),
+        )
+        .await;
+        admission.assert_selected_specs(&expected_specs);
 
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "gateway",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "gateway",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(workspace.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("prompt-guided turn should complete");
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect("prompt-guided turn should complete");
 
-    assert_eq!(result, "answered");
-    let payload = captured.lock().expect("captured payload should be available");
-    let system = payload
-        .iter()
-        .find(|message| message.role == "system")
-        .expect("request should contain a system message");
-    assert_eq!(system.content.matches("## Runtime Capabilities").count(), 1);
-    assert!(system.content.contains("`skill_read`"));
-    assert!(!system.content.contains("`mcp_status`"));
-    assert_eq!(system.content.matches("## Tool Use Protocol").count(), 1);
-    assert!(system.content.contains("**skill_read**"));
-    assert!(
-        !system.content.contains("**mcp_status**"),
-        "prompt-guided instructions must not advertise a tool excluded by turn intent"
-    );
+        assert_eq!(result, "answered");
+        let payload = captured.lock().expect("captured payload should be available");
+        let system = payload
+            .iter()
+            .find(|message| message.role == "system")
+            .expect("request should contain a system message");
+        assert_eq!(system.content.matches("## Runtime Capabilities").count(), 1);
+        assert!(system.content.contains("`skill_read`"));
+        assert!(!system.content.contains("`mcp_status`"));
+        assert_eq!(system.content.matches("## Tool Use Protocol").count(), 1);
+        assert!(system.content.contains("**skill_read**"));
+        assert!(
+            !system.content.contains("**mcp_status**"),
+            "prompt-guided instructions must not advertise a tool excluded by turn intent"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn tool_loop_rejects_a_registered_tool_not_exposed_for_the_turn() {
-    let provider = ScriptedProvider::from_text_responses(vec![
-        "<tool_call>\n{\"name\":\"mcp_status\",\"arguments\":{}}\n</tool_call>",
-        "done",
-    ]);
-    let tools_registry: Vec<Box<dyn Tool>> = vec![
-        Box::new(RefreshCountingTool {
-            name: "skill_read",
-            category: ToolCategory::System,
-            refreshes: Arc::new(AtomicUsize::new(0)),
-        }),
-        Box::new(RefreshCountingTool {
-            name: "mcp_status",
-            category: ToolCategory::Automation,
-            refreshes: Arc::new(AtomicUsize::new(0)),
-        }),
-    ];
-    let routing_input = "use skill_read to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
-    let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "<tool_call>\n{\"name\":\"mcp_status\",\"arguments\":{}}\n</tool_call>",
+            "done",
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(RefreshCountingTool {
+                name: "skill_read",
+                category: ToolCategory::System,
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            }),
+            Box::new(RefreshCountingTool {
+                name: "mcp_status",
+                category: ToolCategory::Automation,
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            }),
+        ];
+        let routing_input = "use skill_read to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
+        let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
 
-    let workspace = TempDir::new().expect("surface fixture workspace");
-    let expected_specs = tool_specs_of(&tools_registry)
-        .into_iter()
-        .filter(|spec| spec.name == "skill_read")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        expected_specs.len(),
-        1,
-        "selected fixture capability must be registered"
-    );
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
-        workspace.path(),
-        routing_input,
-        Arc::clone(&tools_registry),
-    )
-    .await;
-    admission.assert_selected_specs(&expected_specs);
+        let workspace = TempDir::new().expect("surface fixture workspace");
+        let expected_specs = tool_specs_of(&tools_registry)
+            .into_iter()
+            .filter(|spec| spec.name == "skill_read")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected_specs.len(),
+            1,
+            "selected fixture capability must be registered"
+        );
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+            workspace.path(),
+            routing_input,
+            Arc::clone(&tools_registry),
+        )
+        .await;
+        admission.assert_selected_specs(&expected_specs);
 
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "gateway",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "gateway",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(workspace.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("turn should recover after rejecting an unexposed tool");
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect("turn should recover after rejecting an unexposed tool");
 
-    assert_eq!(result, "done");
-    assert!(history.iter().any(|message| {
-        message
-            .content
-            .contains("tool 'mcp_status' was not exposed for this turn and was not executed")
-    }));
+        assert_eq!(result, "done");
+        assert!(history.iter().any(|message| {
+            message
+                .content
+                .contains("tool 'mcp_status' was not exposed for this turn and was not executed")
+        }));
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn turn_exposure_guard_preserves_unknown_tool_diagnostics() {
-    let provider = ScriptedProvider::from_text_responses(vec![
-        "<tool_call>\n{\"name\":\"invented_probe\",\"arguments\":{}}\n</tool_call>",
-        "done",
-    ]);
-    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RefreshCountingTool {
-        name: "skill_read",
-        category: ToolCategory::System,
-        refreshes: Arc::new(AtomicUsize::new(0)),
-    })];
-    let routing_input = "use skill_read to inspect the PDF skill";
-    let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "<tool_call>\n{\"name\":\"invented_probe\",\"arguments\":{}}\n</tool_call>",
+            "done",
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RefreshCountingTool {
+            name: "skill_read",
+            category: ToolCategory::System,
+            refreshes: Arc::new(AtomicUsize::new(0)),
+        })];
+        let routing_input = "use skill_read to inspect the PDF skill";
+        let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
 
-    let workspace = TempDir::new().expect("surface fixture workspace");
-    let expected_specs = tool_specs_of(&tools_registry)
-        .into_iter()
-        .filter(|spec| spec.name == "skill_read")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        expected_specs.len(),
-        1,
-        "selected fixture capability must be registered"
-    );
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
-        workspace.path(),
-        routing_input,
-        Arc::clone(&tools_registry),
-    )
-    .await;
-    admission.assert_selected_specs(&expected_specs);
+        let workspace = TempDir::new().expect("surface fixture workspace");
+        let expected_specs = tool_specs_of(&tools_registry)
+            .into_iter()
+            .filter(|spec| spec.name == "skill_read")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected_specs.len(),
+            1,
+            "selected fixture capability must be registered"
+        );
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+            workspace.path(),
+            routing_input,
+            Arc::clone(&tools_registry),
+        )
+        .await;
+        admission.assert_selected_specs(&expected_specs);
 
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "gateway",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "gateway",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
             },
-            compaction: None,
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(workspace.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("turn should recover after reporting an unknown tool");
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect("turn should recover after reporting an unknown tool");
 
-    assert_eq!(result, "done");
-    assert!(
-        history
-            .iter()
-            .any(|message| message.content.contains("unknown tool 'invented_probe'"))
-    );
-    assert!(history.iter().all(|message| {
-        !message
-            .content
-            .contains("tool 'invented_probe' was not exposed for this turn")
-    }));
+        assert_eq!(result, "done");
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content.contains("unknown tool 'invented_probe'"))
+        );
+        assert!(history.iter().all(|message| {
+            !message
+                .content
+                .contains("tool 'invented_probe' was not exposed for this turn")
+        }));
+    })
+    .await;
 }
 
 /// A provider whose call never returns and never errors — the exact shape
@@ -1774,9 +1786,8 @@ impl Tool for ChildSurfaceProbe {
             .expect("durable child input");
         let source = binding.ordinary_execution_source(&provider, &caller, &scope, input, Some(&receipt))?;
         let mut service = publication.child_service(caller.context(), None)?;
-        crate::runtime::turn_decision::TurnDecisionService::install_ordinary_child_fixture(
+        crate::runtime::turn_decision::TurnDecisionService::install_ordinary_publication_fixture(
             &mut service,
-            "use_tool",
             self.controlled_family,
         )?;
         let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
@@ -1817,8 +1828,16 @@ impl Tool for ChildSurfaceProbe {
                 });
             assert!(
                 child_selection.specs.iter().any(|spec| spec.name == input),
-                "child must select its requested allowed capability: {:?}",
-                child_selection.specs
+                "child must publish its requested allowed capability: {:?}; hops={:?}",
+                child_selection.specs,
+                child_routing
+                    .context
+                    .audit_hops()
+                    .map(|hop| format!(
+                        "selection={:?}; scores={:?}; gates={:?}",
+                        hop.selection, hop.scores, hop.pre_commit
+                    ))
+                    .collect::<Vec<_>>()
             );
             let registry = self
                 .registry

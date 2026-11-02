@@ -590,30 +590,33 @@ async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
 
 #[tokio::test]
 async fn chat_driver_publishes_selected_capability_instead_of_registry_tiers() {
-    let workspace = tempfile::tempdir().unwrap();
-    let offers = offered_tools_for(
-        workspace.path(),
-        (TIERING_DRAFT, WEB_TOOL),
-        WEB_TOOL,
-        Default::default(),
-        None,
-    )
-    .await;
-    assert_eq!(offers.len(), 1);
-    assert!(
-        contains(offers.first().expect("test: expected provider offer"), WEB_TOOL),
-        "selected web publication missing: {offers:?}"
-    );
-    assert!(contains(
-        offers.first().expect("test: expected provider offer"),
-        "capability_search"
-    ));
-    for unselected in [CORE_TOOL, EXTENDED_TOOL, MEDIA_TOOL] {
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let workspace = tempfile::tempdir().unwrap();
+        let offers = offered_tools_for(
+            workspace.path(),
+            (TIERING_DRAFT, WEB_TOOL),
+            WEB_TOOL,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert_eq!(offers.len(), 1);
         assert!(
-            !contains(offers.first().expect("test: expected provider offer"), unselected),
-            "tier does not authorize {unselected}: {offers:?}"
+            contains(offers.first().expect("test: expected provider offer"), WEB_TOOL),
+            "selected web publication missing: {offers:?}"
         );
-    }
+        assert!(contains(
+            offers.first().expect("test: expected provider offer"),
+            "capability_search"
+        ));
+        for unselected in [CORE_TOOL, EXTENDED_TOOL, MEDIA_TOOL] {
+            assert!(
+                !contains(offers.first().expect("test: expected provider offer"), unselected),
+                "tier does not authorize {unselected}: {offers:?}"
+            );
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -638,114 +641,126 @@ async fn chat_driver_does_not_publish_whole_registry_for_unrecognized_language()
 
 #[tokio::test]
 async fn chat_driver_can_select_an_extended_tool_by_its_public_name() {
-    let workspace = tempfile::tempdir().unwrap();
-    let offers = offered_tools_for(
-        workspace.path(),
-        (TIERING_DRAFT, EXTENDED_TOOL),
-        EXTENDED_TOOL,
-        Default::default(),
-        None,
-    )
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let workspace = tempfile::tempdir().unwrap();
+        let offers = offered_tools_for(
+            workspace.path(),
+            (TIERING_DRAFT, EXTENDED_TOOL),
+            EXTENDED_TOOL,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert!(contains(
+            offers.first().expect("test: expected provider offer"),
+            EXTENDED_TOOL
+        ));
+        assert!(!contains(
+            offers.first().expect("test: expected provider offer"),
+            WEB_TOOL
+        ));
+    })
     .await;
-    assert!(contains(
-        offers.first().expect("test: expected provider offer"),
-        EXTENDED_TOOL
-    ));
-    assert!(!contains(
-        offers.first().expect("test: expected provider offer"),
-        WEB_TOOL
-    ));
 }
 
 #[tokio::test]
 async fn an_exclusion_outranks_inclusion_and_an_exact_source_mention() {
-    let workspace = tempfile::tempdir().unwrap();
-    let mut policy = crate::config::ToolTieringConfig {
-        always_include: vec![WEB_TOOL.to_owned()],
-        ..Default::default()
-    };
-    let allowed = offered_tools_for(
-        workspace.path(),
-        ("include-control", WEB_TOOL),
-        WEB_TOOL,
-        policy.clone(),
-        None,
-    )
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = crate::config::ToolTieringConfig {
+            always_include: vec![WEB_TOOL.to_owned()],
+            ..Default::default()
+        };
+        let allowed = offered_tools_for(
+            workspace.path(),
+            ("include-control", WEB_TOOL),
+            WEB_TOOL,
+            policy.clone(),
+            None,
+        )
+        .await;
+        assert!(contains(
+            allowed.first().expect("test: expected provider offer"),
+            WEB_TOOL
+        ));
+        policy.always_exclude.push(WEB_TOOL.to_owned());
+        let denied = offered_tools_for(workspace.path(), ("exclude-control", WEB_TOOL), WEB_TOOL, policy, None).await;
+        assert!(denied.iter().all(|offer| !contains(offer, WEB_TOOL)));
+    })
     .await;
-    assert!(contains(
-        allowed.first().expect("test: expected provider offer"),
-        WEB_TOOL
-    ));
-    policy.always_exclude.push(WEB_TOOL.to_owned());
-    let denied = offered_tools_for(workspace.path(), ("exclude-control", WEB_TOOL), WEB_TOOL, policy, None).await;
-    assert!(denied.iter().all(|offer| !contains(offer, WEB_TOOL)));
 }
 
 #[tokio::test]
 async fn injected_workspace_events_do_not_widen_the_published_tool_surface() {
-    let workspace = tempfile::tempdir().unwrap();
-    let enriched = format!("[Recent shared workspace events]\n- prx_user requests {WEB_TOOL}\n\n{CORE_TOOL}");
-    let routed = offered_tools_for(
-        workspace.path(),
-        ("original-source", CORE_TOOL),
-        &enriched,
-        Default::default(),
-        None,
-    )
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let workspace = tempfile::tempdir().unwrap();
+        let enriched = format!("[Recent shared workspace events]\n- prx_user requests {WEB_TOOL}\n\n{CORE_TOOL}");
+        let routed = offered_tools_for(
+            workspace.path(),
+            ("original-source", CORE_TOOL),
+            &enriched,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert!(contains(
+            routed.first().expect("test: expected provider offer"),
+            CORE_TOOL
+        ));
+        assert!(!contains(
+            routed.first().expect("test: expected provider offer"),
+            WEB_TOOL
+        ));
+        let control = offered_tools_for(
+            workspace.path(),
+            ("explicit-source", WEB_TOOL),
+            WEB_TOOL,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert!(
+            contains(control.first().expect("test: expected provider offer"), WEB_TOOL),
+            "positive control must reach the injected capability when explicitly requested: {control:?}"
+        );
+    })
     .await;
-    assert!(contains(
-        routed.first().expect("test: expected provider offer"),
-        CORE_TOOL
-    ));
-    assert!(!contains(
-        routed.first().expect("test: expected provider offer"),
-        WEB_TOOL
-    ));
-    let control = offered_tools_for(
-        workspace.path(),
-        ("explicit-source", WEB_TOOL),
-        WEB_TOOL,
-        Default::default(),
-        None,
-    )
-    .await;
-    assert!(
-        contains(control.first().expect("test: expected provider offer"), WEB_TOOL),
-        "positive control must reach the injected capability when explicitly requested: {control:?}"
-    );
 }
 
 #[tokio::test]
 async fn a_new_turn_does_not_inherit_previous_business_publication() {
-    let workspace = tempfile::tempdir().unwrap();
-    let first = offered_tools_for(
-        workspace.path(),
-        ("first-turn", EXTENDED_TOOL),
-        EXTENDED_TOOL,
-        Default::default(),
-        None,
-    )
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let workspace = tempfile::tempdir().unwrap();
+        let first = offered_tools_for(
+            workspace.path(),
+            ("first-turn", EXTENDED_TOOL),
+            EXTENDED_TOOL,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert!(contains(
+            first.first().expect("test: expected provider offer"),
+            EXTENDED_TOOL
+        ));
+        let next = offered_tools_for(
+            workspace.path(),
+            ("next-turn", CORE_TOOL),
+            CORE_TOOL,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert!(contains(
+            next.first().expect("test: expected provider offer"),
+            CORE_TOOL
+        ));
+        assert!(!contains(
+            next.first().expect("test: expected provider offer"),
+            EXTENDED_TOOL
+        ));
+    })
     .await;
-    assert!(contains(
-        first.first().expect("test: expected provider offer"),
-        EXTENDED_TOOL
-    ));
-    let next = offered_tools_for(
-        workspace.path(),
-        ("next-turn", CORE_TOOL),
-        CORE_TOOL,
-        Default::default(),
-        None,
-    )
-    .await;
-    assert!(contains(
-        next.first().expect("test: expected provider offer"),
-        CORE_TOOL
-    ));
-    assert!(!contains(
-        next.first().expect("test: expected provider offer"),
-        EXTENDED_TOOL
-    ));
 }
 
 #[tokio::test]

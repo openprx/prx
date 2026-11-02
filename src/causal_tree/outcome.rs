@@ -376,6 +376,7 @@ fn selection_fields(hop: &EngineDecision) -> Result<(Option<String>, String, Opt
         Selection::Commit {
             candidate_id,
             propensity,
+            ..
         } => (
             Some(candidate_id.clone()),
             candidate_id.action().as_str(),
@@ -537,20 +538,28 @@ fn audit_fields(hop: &EngineDecision) -> Result<(RecordedDistributions, Value), 
             }),
         );
     }
-    Ok((
-        distributions,
-        json!({
-            "answers":answer_fields,
-            "omitted_questions":omitted,
-            "forced_choices":forced,
-            "scores":scores,
-            "fallback_cause":hop.fallback_cause.map(fallback_code),
-            "fallback": (matches!(hop.selection, Selection::Abstain { action: CausalActionKind::Answer, .. })
-                || matches!(&hop.selection, Selection::Commit { candidate_id, .. } if candidate_id.action() == CausalActionKind::Answer && hop.fallback_cause == Some(FallbackCause::HopStopped)))
-                .then_some("answer_on_abstention"),
-            "factory_reason":hop.prediction.as_ref().and_then(|prediction| prediction.reason.map(factory_reason)),
-        }),
-    ))
+    let mut features = json!({
+        "answers":answer_fields,
+        "omitted_questions":omitted,
+        "forced_choices":forced,
+        "scores":scores,
+        "fallback_cause":hop.fallback_cause.map(fallback_code),
+        "fallback": (matches!(hop.selection, Selection::Abstain { action: CausalActionKind::Answer, .. })
+            || matches!(&hop.selection, Selection::Commit { candidate_id, .. } if candidate_id.action() == CausalActionKind::Answer && hop.fallback_cause == Some(FallbackCause::HopStopped)))
+            .then_some("answer_on_abstention"),
+        "factory_reason":hop.prediction.as_ref().and_then(|prediction| prediction.reason.map(factory_reason)),
+    });
+    if let Selection::Commit {
+        reason_code: Some(reason),
+        ..
+    } = &hop.selection
+    {
+        features
+            .as_object_mut()
+            .ok_or(RecordBuildError::Binding)?
+            .insert("selection_reason".to_owned(), json!(reason));
+    }
+    Ok((distributions, features))
 }
 
 fn check_numbers(values: impl IntoIterator<Item = f64>) -> Result<(), RecordBuildError> {
@@ -1667,6 +1676,7 @@ mod tests {
             selection: Selection::Commit {
                 candidate_id: candidate_id.clone(),
                 propensity: 1.0,
+                reason_code: None,
             },
             exploration_propensities: BTreeMap::new(),
             prediction: None,
@@ -1692,6 +1702,7 @@ mod tests {
         decision.selection = Selection::Commit {
             candidate_id,
             propensity: 0.75,
+            reason_code: None,
         };
         let sampled =
             DecisionRecordBuilder::build_hop(&decision, &key, None, true, false).expect("recorded sampling metadata");

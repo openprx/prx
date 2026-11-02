@@ -464,8 +464,7 @@ async fn advancing_the_logical_latency_budget_refuses_before_a_plain_answer() {
         .run_plain_after_logical_budget(&config)
         .await
         .expect("test: a spent logical budget completes as a refusal");
-    // The spent budget skips Answer. This CLI turn is not interactive, so the
-    // terminal is Refuse. `render_terminal_directive` renders that as the
-    // policy sentence. The wall-stall sibling still receives `plain answer`.
-    assert_eq!(reply, "I can't complete this request under the current policy.");
+    // Deadline exhaustion closes locally with Clarify on text-capable CLI.
+    // The wall-stall sibling still receives the model answer.
+    assert_eq!(reply, "Could you narrow your request so I can finish it in time?");
 }

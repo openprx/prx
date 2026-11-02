@@ -895,10 +895,35 @@ async fn fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once() {
             .unwrap();
         assert!(
             matches!(resumed.directive(), TurnExecutionDirective::Execute { .. }),
-            "approved resume must clear ordinary selection: selection={:?}; scores={:?}; gates={:?}",
+            "verified owner approval authorizes the exact call: selection={:?}; scores={:?}; gates={:?}",
             resumed.engine().selection,
             resumed.engine().scores,
             resumed.engine().pre_commit,
+        );
+        let crate::causal_tree::decision_select::Selection::Commit {
+            candidate_id,
+            reason_code,
+            ..
+        } = &resumed.engine().selection
+        else {
+            panic!("exact approved Commit")
+        };
+        assert_eq!(*reason_code, Some("approved_resume"));
+        let CandidateSet::Legal { candidates, .. } = &resumed.engine().candidates else {
+            panic!("legal resume")
+        };
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id() == candidate_id)
+            .unwrap();
+        assert_eq!(
+            candidate.side_effect(),
+            crate::causal_tree::branch::SideEffectClass::Destructive
+        );
+        assert_eq!(candidate.required_capabilities(), std::slice::from_ref(&reference));
+        assert!(
+            resumed.engine().scores.get(candidate_id).unwrap().execution_utility < 0.87,
+            "approval must exercise the otherwise unreachable default bar"
         );
         let selected = service.agent_execution_specs(resume.as_ref(), &resumed).unwrap();
         assert_eq!(

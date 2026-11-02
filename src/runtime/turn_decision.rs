@@ -6,6 +6,8 @@
 
 #[cfg(test)]
 mod ordinary_child_fixture;
+#[cfg(test)]
+pub(crate) use ordinary_child_fixture::{with_scored_action, with_scored_prediction};
 
 #[cfg(test)]
 use crate::causal_tree::state::ConstraintCode;
@@ -961,7 +963,14 @@ fn direct_answer_refs(
     gates: &GateInputs<'_>,
     selected_discovery_refs: &BTreeSet<CapabilityRef>,
 ) -> BTreeSet<CapabilityRef> {
-    if !gates.model_can_call_tools {
+    let fallback_answer = matches!(
+        decision.selection,
+        crate::causal_tree::decision_select::Selection::Abstain {
+            action: CausalActionKind::Answer,
+            ..
+        }
+    );
+    if fallback_answer || !gates.model_can_call_tools {
         return BTreeSet::new();
     }
     let trusted = decision.state.trusted.parts();
@@ -1015,18 +1024,7 @@ fn direct_answer_refs(
                 },
             );
             let publication = HardGates::check_capability_publication(&decision.state, catalog, &candidate, gates);
-            let fallback_answer = matches!(
-                &decision.selection,
-                crate::causal_tree::decision_select::Selection::Abstain {
-                    action: CausalActionKind::Answer,
-                    ..
-                }
-            );
-            // Explaining an unapproved delegation must not turn its
-            // publication-only approval outcome into a child grant.
-            if matches!(publication, GateOutcome::Blocked { .. })
-                || (delegation && fallback_answer && !matches!(publication, GateOutcome::Passed))
-            {
+            if matches!(publication, GateOutcome::Blocked { .. }) {
                 return None;
             }
             Some(reference)
@@ -3598,6 +3596,8 @@ pub(crate) async fn build_turn_decision_service(
     let factory = evidence_fixture::wrap_factory(factory, config, Arc::clone(&state_key), Arc::clone(&events));
     #[cfg(test)]
     let factory = selected_loader_fixture::wrap_factory(factory, config, Arc::clone(&state_key), Arc::clone(&events));
+    #[cfg(test)]
+    let factory = ordinary_child_fixture::wrap_factory(factory, Arc::clone(&state_key), Arc::clone(&events));
     let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
     Ok(Arc::new(TurnDecisionService {
         child_recovery: Default::default(),

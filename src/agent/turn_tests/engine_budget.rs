@@ -214,7 +214,7 @@ async fn small_native_tool_schemas_leave_the_turn_on_the_unchanged_provider_path
 }
 
 #[tokio::test]
-async fn excluded_native_tool_schema_does_not_admit_provider_work() {
+async fn excluded_native_tool_schema_is_not_published_by_a_fallback_answer() {
     small_native_schema_fixture(true).await;
 }
 
@@ -298,11 +298,14 @@ async fn small_native_schema_fixture(excluded: bool) {
                     decision
                         .service
                         .agent_execution_specs(decision.proof, decision.context)
-                        .is_err()
+                        .unwrap()
+                        .specs
+                        .is_empty()
                 );
+                assert!(decision.context.execution_refs().is_empty());
                 assert!(matches!(
                     decision.context.disposition().unwrap(),
-                    crate::runtime::turn_decision::TurnDisposition::Close { .. }
+                    crate::runtime::turn_decision::TurnDisposition::Run
                 ));
             } else {
                 let diagnostic = decision.context.audit_hops().map(|hop| serde_json::json!({
@@ -367,12 +370,12 @@ async fn small_native_schema_fixture(excluded: bool) {
             .map(|(outcome, _trace)| outcome.into_text());
 
             if excluded {
-                assert_eq!(calls.load(Ordering::SeqCst), 0, "excluded tool admits no provider work");
-                let error = result.expect_err("the low-level engine must reject a closed admission");
-                assert!(
-                    error.to_string().contains("decision has no executable selection"),
-                    "{error:#}"
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "a text-only confidence Answer remains permitted"
                 );
+                assert_eq!(result.expect("fallback Answer uses no excluded schema"), "done");
                 return Ok(());
             }
             let result = result.expect("a request that fits must reach the provider untouched");
@@ -666,142 +669,145 @@ async fn configured_small_native_schema_fixture() {
 /// actually left is a number an operator can read.
 #[tokio::test]
 async fn the_compiled_request_event_reports_the_budgeted_and_the_prepared_totals() {
-    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NarrowSchemaTool { name: "file_read" })];
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = business_tool_specs_of(&tools_registry);
-    let tool_surface = crate::agent::turn_context::measure_request_tool_surface(true, &tool_specs);
-    let native_tokens = budgeted_tokens(tool_surface.native_payload.measurement);
-    let instruction_tokens = budgeted_tokens(tool_surface.instructions);
-    assert!(
-        instruction_tokens > 0,
-        "the fixture must publish sections that are appended after the budget"
-    );
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NarrowSchemaTool { name: "file_read" })];
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        let tool_specs = business_tool_specs_of(&tools_registry);
+        let tool_surface = crate::agent::turn_context::measure_request_tool_surface(true, &tool_specs);
+        let native_tokens = budgeted_tokens(tool_surface.native_payload.measurement);
+        let instruction_tokens = budgeted_tokens(tool_surface.instructions);
+        assert!(
+            instruction_tokens > 0,
+            "the fixture must publish sections that are appended after the budget"
+        );
 
-    let mut history = context_budget_fixture_history(instruction_tokens.saturating_mul(8).max(4096));
-    history
-        .last_mut()
-        .expect("current fixture input")
-        .content
-        .push_str(" Use file_read.");
-    let config = decision_sized_fixture_config(context_budget_fixture_config(
-        &history,
-        instruction_tokens.saturating_mul(4),
-    ));
-    let main_compaction = fixture_main_compaction(&config);
-    let history_tokens = budgeted_tokens(estimate_history_tokens_with_source(&history));
-    assert!(
-        !plan_context_budget(&history, &main_compaction, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,
-        "nothing may be trimmed, so the budgeted figures stay comparable with the fixture"
-    );
+        let mut history = context_budget_fixture_history(instruction_tokens.saturating_mul(8).max(4096));
+        history
+            .last_mut()
+            .expect("current fixture input")
+            .content
+            .push_str(" Use file_read.");
+        let config = decision_sized_fixture_config(context_budget_fixture_config(
+            &history,
+            instruction_tokens.saturating_mul(4),
+        ));
+        let main_compaction = fixture_main_compaction(&config);
+        let history_tokens = budgeted_tokens(estimate_history_tokens_with_source(&history));
+        assert!(
+            !plan_context_budget(&history, &main_compaction, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,
+            "nothing may be trimmed, so the budgeted figures stay comparable with the fixture"
+        );
 
-    let tmp = TempDir::new().expect("test: temporary directory");
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
-    let mut admission_config = crate::config::Config::default();
-    admission_config.workspace_dir = tmp.path().to_path_buf();
-    admission_config.agent.compaction = config.clone();
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
-        admission_config,
-        &history.last().expect("current fixture input").content,
-        Arc::clone(&tools_registry),
-        Arc::clone(&memory),
-    )
-    .await;
-    admission.assert_core_specs(&tool_specs);
-    let runtime = admission.memory_runtime();
-
-    let calls = Arc::new(AtomicUsize::new(0));
-    let max_request_tokens = Arc::new(AtomicUsize::new(0));
-    let provider = NativeToolProvider::recording("done", &calls, &max_request_tokens);
-
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "terminal",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: Some(admission.compaction()),
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: runtime,
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("a request that fits must reach the provider");
-    assert_eq!(result, "done");
-
-    let principal = admission.principal();
-    let events = memory
-        .list_message_events_since(&principal, 0, 10)
-        .await
-        .expect("test: message events");
-    let payload: serde_json::Value = serde_json::from_str(
-        events
-            .iter()
-            .find(|event| event.event_type == "llm.request.context.compiled")
-            .and_then(|event| event.raw_payload_json.as_deref())
-            .expect("test: compiled request context payload"),
-    )
-    .expect("test: payload json");
-    let estimate = &payload["request_estimate"];
-
-    assert_eq!(
-        estimate["budgeted_messages_tokens"].as_u64(),
-        u64::try_from(history_tokens).ok(),
-        "the budgeted message figure is the history the preflight measured"
-    );
-    assert_eq!(
-        estimate["budgeted_total_tokens"].as_u64(),
-        u64::try_from(
-            history_tokens
-                .saturating_add(native_tokens)
-                .saturating_add(instruction_tokens)
-                .saturating_add(APPENDED_SECTION_FRAMING_TOKENS)
+        let tmp = TempDir::new().expect("test: temporary directory");
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
+        let mut admission_config = crate::config::Config::default();
+        admission_config.workspace_dir = tmp.path().to_path_buf();
+        admission_config.agent.compaction = config.clone();
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+            admission_config,
+            &history.last().expect("current fixture input").content,
+            Arc::clone(&tools_registry),
+            Arc::clone(&memory),
         )
-        .ok(),
-        "the budgeted total is that history plus everything the tool surface adds, framing included"
-    );
-    assert_eq!(
-        estimate["instruction_tokens"].as_u64(),
-        u64::try_from(instruction_tokens).ok(),
-        "the appended sections are reported on their own so the delta is attributable"
-    );
-    assert_eq!(
-        estimate["total_tokens"].as_u64(),
-        u64::try_from(max_request_tokens.load(Ordering::SeqCst)).ok(),
-        "the prepared total is the total that was sent"
-    );
-    assert_ne!(
-        estimate["total_tokens"].as_u64(),
-        estimate["budgeted_messages_tokens"]
-            .as_u64()
-            .map(|tokens| tokens.saturating_add(u64::try_from(native_tokens).unwrap_or(u64::MAX))),
-        "the prepared request carries the appended sections the budgeted message figure does not"
-    );
+        .await;
+        admission.assert_core_specs(&tool_specs);
+        let runtime = admission.memory_runtime();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let max_request_tokens = Arc::new(AtomicUsize::new(0));
+        let provider = NativeToolProvider::recording("done", &calls, &max_request_tokens);
+
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "terminal",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: Some(admission.compaction()),
+                decision: admission.decision(),
+            },
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(tmp.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: runtime,
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect("a request that fits must reach the provider");
+        assert_eq!(result, "done");
+
+        let principal = admission.principal();
+        let events = memory
+            .list_message_events_since(&principal, 0, 10)
+            .await
+            .expect("test: message events");
+        let payload: serde_json::Value = serde_json::from_str(
+            events
+                .iter()
+                .find(|event| event.event_type == "llm.request.context.compiled")
+                .and_then(|event| event.raw_payload_json.as_deref())
+                .expect("test: compiled request context payload"),
+        )
+        .expect("test: payload json");
+        let estimate = &payload["request_estimate"];
+
+        assert_eq!(
+            estimate["budgeted_messages_tokens"].as_u64(),
+            u64::try_from(history_tokens).ok(),
+            "the budgeted message figure is the history the preflight measured"
+        );
+        assert_eq!(
+            estimate["budgeted_total_tokens"].as_u64(),
+            u64::try_from(
+                history_tokens
+                    .saturating_add(native_tokens)
+                    .saturating_add(instruction_tokens)
+                    .saturating_add(APPENDED_SECTION_FRAMING_TOKENS)
+            )
+            .ok(),
+            "the budgeted total is that history plus everything the tool surface adds, framing included"
+        );
+        assert_eq!(
+            estimate["instruction_tokens"].as_u64(),
+            u64::try_from(instruction_tokens).ok(),
+            "the appended sections are reported on their own so the delta is attributable"
+        );
+        assert_eq!(
+            estimate["total_tokens"].as_u64(),
+            u64::try_from(max_request_tokens.load(Ordering::SeqCst)).ok(),
+            "the prepared total is the total that was sent"
+        );
+        assert_ne!(
+            estimate["total_tokens"].as_u64(),
+            estimate["budgeted_messages_tokens"]
+                .as_u64()
+                .map(|tokens| tokens.saturating_add(u64::try_from(native_tokens).unwrap_or(u64::MAX))),
+            "the prepared request carries the appended sections the budgeted message figure does not"
+        );
+    })
+    .await;
 }
 
 /// The compiled snapshot appends its prompt sections to the system message
@@ -815,106 +821,110 @@ async fn the_compiled_request_event_reports_the_budgeted_and_the_prepared_totals
 /// prompt, not schema.
 #[tokio::test]
 async fn context_budget_counts_the_appended_prompt_sections_before_the_provider_call() {
-    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NarrowSchemaTool { name: "gpio_read" })];
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    // This structural request retains the separately gated search control on
-    // its terminal provider hop, so the budget must include that exact schema.
-    let tool_specs = tool_specs_of(&tools_registry);
-    let appended_tokens = compiled_instruction_tokens(&tool_specs);
-    let payload_tokens =
-        budgeted_tokens(crate::agent::turn_context::measure_native_tool_payload(&tool_specs).measurement);
-    assert!(
-        payload_tokens < appended_tokens,
-        "the appended sections, not the schemas, must be what overruns this fixture: \
-             {payload_tokens} payload tokens against {appended_tokens} appended tokens"
-    );
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NarrowSchemaTool { name: "gpio_read" })];
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        // This structural request retains the separately gated search control on
+        // its terminal provider hop, so the budget must include that exact schema.
+        let tool_specs = tool_specs_of(&tools_registry);
+        let appended_tokens = compiled_instruction_tokens(&tool_specs);
+        let payload_tokens =
+            budgeted_tokens(crate::agent::turn_context::measure_native_tool_payload(&tool_specs).measurement);
+        assert!(
+            payload_tokens < appended_tokens,
+            "the appended sections, not the schemas, must be what overruns this fixture: \
+                 {payload_tokens} payload tokens against {appended_tokens} appended tokens"
+        );
 
-    let mut history = context_budget_fixture_history(appended_tokens.saturating_mul(8).max(4096));
-    history
-        .last_mut()
-        .expect("current fixture input")
-        .content
-        .push_str(" Use gpio_read.");
-    let oldest_turn = history.get(1).map(|message| message.content.clone());
-    assert!(oldest_turn.is_some(), "the fixture must have a message to give up");
-    let config = decision_sized_fixture_config(context_budget_fixture_config(&history, appended_tokens));
-    let main_compaction = fixture_main_compaction(&config);
-    let usable_window = main_compaction
-        .max_context_tokens
-        .saturating_sub(main_compaction.reserve_tokens);
-    assert!(
-        !plan_context_budget(&history, &main_compaction, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,
-        "the fixture history must fit the window on its own"
-    );
+        let mut history = context_budget_fixture_history(appended_tokens.saturating_mul(8).max(4096));
+        history
+            .last_mut()
+            .expect("current fixture input")
+            .content
+            .push_str(" Use gpio_read.");
+        let oldest_turn = history.get(1).map(|message| message.content.clone());
+        assert!(oldest_turn.is_some(), "the fixture must have a message to give up");
+        let config = decision_sized_fixture_config(context_budget_fixture_config(&history, appended_tokens));
+        let main_compaction = fixture_main_compaction(&config);
+        let usable_window = main_compaction
+            .max_context_tokens
+            .saturating_sub(main_compaction.reserve_tokens);
+        assert!(
+            !plan_context_budget(&history, &main_compaction, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,
+            "the fixture history must fit the window on its own"
+        );
 
-    let calls = Arc::new(AtomicUsize::new(0));
-    let max_request_tokens = Arc::new(AtomicUsize::new(0));
-    let provider = NativeToolProvider::recording("done", &calls, &max_request_tokens);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let max_request_tokens = Arc::new(AtomicUsize::new(0));
+        let provider = NativeToolProvider::recording("done", &calls, &max_request_tokens);
 
-    let workspace = TempDir::new().expect("budget fixture workspace");
-    let mut admission_config = crate::config::Config::default();
-    admission_config.workspace_dir = workspace.path().to_path_buf();
-    admission_config.agent.compaction = config.clone();
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_config(
-        admission_config,
-        &history.last().expect("current fixture input").content,
-        Arc::clone(&tools_registry),
-    )
-    .await;
-    admission.assert_core_specs(&tool_specs);
+        let workspace = TempDir::new().expect("budget fixture workspace");
+        let mut admission_config = crate::config::Config::default();
+        admission_config.workspace_dir = workspace.path().to_path_buf();
+        admission_config.agent.compaction = config.clone();
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_config(
+            admission_config,
+            &history.last().expect("current fixture input").content,
+            Arc::clone(&tools_registry),
+        )
+        .await;
+        admission.assert_core_specs(&tool_specs);
 
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "cli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: Some(admission.compaction()),
+                decision: admission.decision(),
             },
-            compaction: Some(admission.compaction()),
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(std::env::temp_dir()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("the preflight must keep the turn inside the window, not fail it");
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(std::env::temp_dir()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect("the preflight must keep the turn inside the window, not fail it");
 
-    assert_eq!(result, "done");
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "one provider round-trip");
-    assert_ne!(
-        history.get(1).map(|message| message.content.clone()),
-        oldest_turn,
-        "the appended prompt sections must be budgeted, so the oldest turn has to give way to them"
-    );
-    assert!(
-        max_request_tokens.load(Ordering::SeqCst) <= usable_window.saturating_add(APPENDED_SECTION_JOIN_SLACK_TOKENS),
-        "the provider must not be called with a request the window cannot hold: {} tokens against {usable_window}",
-        max_request_tokens.load(Ordering::SeqCst)
-    );
+        assert_eq!(result, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one provider round-trip");
+        assert_ne!(
+            history.get(1).map(|message| message.content.clone()),
+            oldest_turn,
+            "the appended prompt sections must be budgeted, so the oldest turn has to give way to them"
+        );
+        assert!(
+            max_request_tokens.load(Ordering::SeqCst)
+                <= usable_window.saturating_add(APPENDED_SECTION_JOIN_SLACK_TOKENS),
+            "the provider must not be called with a request the window cannot hold: {} tokens against {usable_window}",
+            max_request_tokens.load(Ordering::SeqCst)
+        );
+    })
+    .await;
 }
 
 /// The mid-turn trim that runs after a tool round has to aim at the same
@@ -1436,298 +1446,9 @@ fn scripted_text_response(text: &str) -> ChatResponse {
 /// no later floor can reconstruct it.
 #[tokio::test]
 async fn the_mid_turn_trim_keeps_a_prompt_guided_request_for_the_next_iteration() {
-    const QUESTION_MARKER: &str = "mid-turn-prompt-guided-request-marker";
-    const OLDER_TURN_MARKER: &str = "mid-turn-prompt-guided-older-turn-marker";
-
-    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedLargeOutputTool {
-        name: "file_read".to_string(),
-        output: "mid turn tool output ".repeat(8),
-    })];
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = business_tool_specs_of(&tools_registry);
-    let tool_surface = crate::agent::turn_context::measure_request_tool_surface(false, &tool_specs);
-
-    let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
-    // A small older exchange ahead of the question. The trim frees it before
-    // it reaches the question, so its absence from the second request is what
-    // proves the window really saturated and the trim really ran.
-    let mut history = vec![
-        ChatMessage::system("stable base system prompt"),
-        ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
-        ChatMessage::assistant("settled"),
-        ChatMessage::user(question.clone()),
-    ];
-    let config = decision_sized_fixture_config(mid_turn_floor_fixture_config(
-        &history,
-        tool_surface,
-        MID_TURN_SATURATED_SLACK_TOKENS,
-    ));
-    let reserved = reserve_request_tool_surface(&fixture_main_compaction(&config), tool_surface);
-    assert!(
-        !plan_context_budget(&history, &reserved, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,
-        "the fixture's first iteration must fit the reserved window, or the trim under test \
-             never has a request to protect"
-    );
-
-    let provider = RequestRecordingProvider::new(
-        false,
-        vec![
-            prompt_guided_tool_call_response("file_read"),
-            scripted_text_response("done"),
-        ],
-    );
-
-    // Reuse the actual memory backend for admission and the tool result,
-    // so the round is produced in the same source-owned execution scope.
-    let tmp = TempDir::new().expect("test: temporary directory");
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
-    let mut admission_config = crate::config::Config::default();
-    admission_config.workspace_dir = tmp.path().to_path_buf();
-    admission_config.agent.compaction = config.clone();
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
-        admission_config,
-        &question,
-        Arc::clone(&tools_registry),
-        Arc::clone(&memory),
-    )
-    .await;
-    admission.assert_core_specs(&tool_specs);
-    let runtime = admission.memory_runtime();
-
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: Some(admission.compaction()),
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: runtime,
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("test: the turn must complete");
-
-    assert_eq!(result, "done");
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "the fixture must reach a second iteration");
-    let first = requests.first().expect("test: the first request was recorded");
-    assert!(
-        first
-            .iter()
-            .any(|message| message.role == "user" && message.content.contains(QUESTION_MARKER)),
-        "premise: the first iteration carried the question"
-    );
-
-    let second = requests.get(1).expect("test: the second request was recorded");
-    assert!(
-        !second.iter().any(|message| message.content.contains(OLDER_TURN_MARKER)),
-        "premise: the window must really have saturated. The older exchange is what the trim \
-             frees before it reaches the question, so if it is still in the second request no trim \
-             ran and this fixture proves nothing about the floor"
-    );
-    assert_the_trim_had_to_reach_the_question(second, &reserved);
-    assert_eq!(
-        second
-            .iter()
-            .filter(|message| message.role == "user" && message.content.contains(QUESTION_MARKER))
-            .count(),
-        1,
-        "the mid-turn trim deleted the turn's question, so the second iteration asks the model to \
-             continue a turn whose request is no longer in the transcript — and it must come back \
-             exactly once, never duplicated by a second floor"
-    );
-    assert!(
-        second.iter().any(|message| message
-            .content
-            .contains(crate::agent::turn_contracts::TOOL_RESULTS_PREFIX)),
-        "the round the model just paid for must still be in the request beside the question"
-    );
-}
-
-/// The native-mode twin. Here the round is an assistant `tool_calls`
-/// envelope followed by `tool` results, so beside the question the request
-/// has a pairing invariant to keep: no restored message may fall between an
-/// envelope and the results answering it.
-#[tokio::test]
-async fn the_mid_turn_trim_keeps_a_native_request_and_its_tool_round_paired() {
-    const QUESTION_MARKER: &str = "mid-turn-native-request-marker";
-    const OLDER_TURN_MARKER: &str = "mid-turn-native-older-turn-marker";
-
-    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedLargeOutputTool {
-        name: "file_read".to_string(),
-        output: "mid turn tool output ".repeat(8),
-    })];
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = business_tool_specs_of(&tools_registry);
-    let tool_surface = crate::agent::turn_context::measure_request_tool_surface(true, &tool_specs);
-
-    let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
-    // Same older exchange as the prompt-guided twin, for the same reason: it
-    // is freed before the question, so its absence proves the trim ran.
-    let mut history = vec![
-        ChatMessage::system("stable base system prompt"),
-        ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
-        ChatMessage::assistant("settled"),
-        ChatMessage::user(question.clone()),
-    ];
-    let config = decision_sized_fixture_config(mid_turn_floor_fixture_config(
-        &history,
-        tool_surface,
-        MID_TURN_SATURATED_SLACK_TOKENS,
-    ));
-    let reserved = reserve_request_tool_surface(&fixture_main_compaction(&config), tool_surface);
-    assert!(
-        !plan_context_budget(&history, &reserved, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,
-        "the fixture's first iteration must fit the reserved window, or the trim under test \
-             never has a request to protect"
-    );
-
-    let provider = RequestRecordingProvider::new(
-        true,
-        vec![
-            ChatResponse {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: "call-1".to_string(),
-                    name: "file_read".to_string(),
-                    arguments: "{}".to_string(),
-                }],
-                reasoning_content: None,
-            },
-            scripted_text_response("done"),
-        ],
-    );
-
-    let tmp = TempDir::new().expect("test: temporary directory");
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
-    let mut admission_config = crate::config::Config::default();
-    admission_config.workspace_dir = tmp.path().to_path_buf();
-    admission_config.agent.compaction = config.clone();
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
-        admission_config,
-        &question,
-        Arc::clone(&tools_registry),
-        Arc::clone(&memory),
-    )
-    .await;
-    admission.assert_core_specs(&tool_specs);
-    let runtime = admission.memory_runtime();
-
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: Some(admission.compaction()),
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: runtime,
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("test: the turn must complete");
-
-    assert_eq!(result, "done");
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "the fixture must reach a second iteration");
-    let second = requests.get(1).expect("test: the second request was recorded");
-    assert!(
-        !second.iter().any(|message| message.content.contains(OLDER_TURN_MARKER)),
-        "premise: the window must really have saturated. The older exchange is what the trim \
-             frees before it reaches the question, so if it is still in the second request no trim \
-             ran and this fixture proves nothing about the floor"
-    );
-    assert_the_trim_had_to_reach_the_question(second, &reserved);
-    assert_eq!(
-        second
-            .iter()
-            .filter(|message| message.content.contains(QUESTION_MARKER))
-            .count(),
-        1,
-        "the turn's question must reach the second iteration exactly once"
-    );
-    assert!(
-        second.iter().any(|message| message.role == "tool"),
-        "the round the model just paid for must still be in the request beside the question"
-    );
-    assert_eq!(
-        first_orphan_tool_index(second),
-        None,
-        "no restored message may strand a tool result from the envelope that requested it"
-    );
-    let envelope_index = second
-        .iter()
-        .position(|message| message.role == "assistant" && is_tool_roundtrip_companion(message))
-        .expect("test: the assistant tool_calls envelope must still be in the request");
-    assert_eq!(
-        second.get(envelope_index.saturating_add(1)).map(|m| m.role.as_str()),
-        Some("tool"),
-        "the assistant tool_calls envelope must be immediately followed by its results"
-    );
-}
-
-/// The control. On a window with room to spare the mid-turn trim does not
-/// run, and the floor must therefore change nothing at all: no second copy
-/// of the request, no message moved, nothing freed.
-#[tokio::test]
-async fn an_unsaturated_mid_turn_window_leaves_history_exactly_as_it_was() {
-    // Q45: Unsaturated context window preserves history unchanged.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
-        const QUESTION_MARKER: &str = "mid-turn-control-request-marker";
-        const OLDER_TURN_MARKER: &str = "mid-turn-control-older-turn-marker";
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        const QUESTION_MARKER: &str = "mid-turn-prompt-guided-request-marker";
+        const OLDER_TURN_MARKER: &str = "mid-turn-prompt-guided-older-turn-marker";
 
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedLargeOutputTool {
             name: "file_read".to_string(),
@@ -1737,16 +1458,465 @@ async fn an_unsaturated_mid_turn_window_leaves_history_exactly_as_it_was() {
         let tool_specs = business_tool_specs_of(&tools_registry);
         let tool_surface = crate::agent::turn_context::measure_request_tool_surface(false, &tool_specs);
 
-        let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(200));
-        // The same fixture the two saturated tests use, so the contrast is the
-        // window and nothing else: here the older exchange must still be there.
+        let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
+        // A small older exchange ahead of the question. The trim frees it before
+        // it reaches the question, so its absence from the second request is what
+        // proves the window really saturated and the trim really ran.
         let mut history = vec![
             ChatMessage::system("stable base system prompt"),
             ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
             ChatMessage::assistant("settled"),
             ChatMessage::user(question.clone()),
         ];
-        let config = mid_turn_floor_fixture_config(&history, tool_surface, MID_TURN_UNSATURATED_SLACK_TOKENS);
+        let config = decision_sized_fixture_config(mid_turn_floor_fixture_config(
+            &history,
+            tool_surface,
+            MID_TURN_SATURATED_SLACK_TOKENS,
+        ));
+        let reserved = reserve_request_tool_surface(&fixture_main_compaction(&config), tool_surface);
+        assert!(
+            !plan_context_budget(&history, &reserved, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,
+            "the fixture's first iteration must fit the reserved window, or the trim under test \
+                 never has a request to protect"
+        );
+
+        let provider = RequestRecordingProvider::new(
+            false,
+            vec![
+                prompt_guided_tool_call_response("file_read"),
+                scripted_text_response("done"),
+            ],
+        );
+
+        // Reuse the actual memory backend for admission and the tool result,
+        // so the round is produced in the same source-owned execution scope.
+        let tmp = TempDir::new().expect("test: temporary directory");
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
+        let mut admission_config = crate::config::Config::default();
+        admission_config.workspace_dir = tmp.path().to_path_buf();
+        admission_config.agent.compaction = config.clone();
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+            admission_config,
+            &question,
+            Arc::clone(&tools_registry),
+            Arc::clone(&memory),
+        )
+        .await;
+        admission.assert_core_specs(&tool_specs);
+        let runtime = admission.memory_runtime();
+
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "cli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: Some(admission.compaction()),
+                decision: admission.decision(),
+            },
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(tmp.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: runtime,
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect("test: the turn must complete");
+
+        assert_eq!(result, "done");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "the fixture must reach a second iteration");
+        let first = requests.first().expect("test: the first request was recorded");
+        assert!(
+            first
+                .iter()
+                .any(|message| message.role == "user" && message.content.contains(QUESTION_MARKER)),
+            "premise: the first iteration carried the question"
+        );
+
+        let second = requests.get(1).expect("test: the second request was recorded");
+        assert!(
+            !second.iter().any(|message| message.content.contains(OLDER_TURN_MARKER)),
+            "premise: the window must really have saturated. The older exchange is what the trim \
+                 frees before it reaches the question, so if it is still in the second request no trim \
+                 ran and this fixture proves nothing about the floor"
+        );
+        assert_the_trim_had_to_reach_the_question(second, &reserved);
+        assert_eq!(
+            second
+                .iter()
+                .filter(|message| message.role == "user" && message.content.contains(QUESTION_MARKER))
+                .count(),
+            1,
+            "the mid-turn trim deleted the turn's question, so the second iteration asks the model to \
+                 continue a turn whose request is no longer in the transcript — and it must come back \
+                 exactly once, never duplicated by a second floor"
+        );
+        assert!(
+            second.iter().any(|message| message
+                .content
+                .contains(crate::agent::turn_contracts::TOOL_RESULTS_PREFIX)),
+            "the round the model just paid for must still be in the request beside the question"
+        );
+    })
+    .await;
+}
+
+/// The native-mode twin. Here the round is an assistant `tool_calls`
+/// envelope followed by `tool` results, so beside the question the request
+/// has a pairing invariant to keep: no restored message may fall between an
+/// envelope and the results answering it.
+#[tokio::test]
+async fn the_mid_turn_trim_keeps_a_native_request_and_its_tool_round_paired() {
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        const QUESTION_MARKER: &str = "mid-turn-native-request-marker";
+        const OLDER_TURN_MARKER: &str = "mid-turn-native-older-turn-marker";
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedLargeOutputTool {
+            name: "file_read".to_string(),
+            output: "mid turn tool output ".repeat(8),
+        })];
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        let tool_specs = business_tool_specs_of(&tools_registry);
+        let tool_surface = crate::agent::turn_context::measure_request_tool_surface(true, &tool_specs);
+
+        let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
+        // Same older exchange as the prompt-guided twin, for the same reason: it
+        // is freed before the question, so its absence proves the trim ran.
+        let mut history = vec![
+            ChatMessage::system("stable base system prompt"),
+            ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
+            ChatMessage::assistant("settled"),
+            ChatMessage::user(question.clone()),
+        ];
+        let config = decision_sized_fixture_config(mid_turn_floor_fixture_config(
+            &history,
+            tool_surface,
+            MID_TURN_SATURATED_SLACK_TOKENS,
+        ));
+        let reserved = reserve_request_tool_surface(&fixture_main_compaction(&config), tool_surface);
+        assert!(
+            !plan_context_budget(&history, &reserved, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,
+            "the fixture's first iteration must fit the reserved window, or the trim under test \
+                 never has a request to protect"
+        );
+
+        let provider = RequestRecordingProvider::new(
+            true,
+            vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "file_read".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    reasoning_content: None,
+                },
+                scripted_text_response("done"),
+            ],
+        );
+
+        let tmp = TempDir::new().expect("test: temporary directory");
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
+        let mut admission_config = crate::config::Config::default();
+        admission_config.workspace_dir = tmp.path().to_path_buf();
+        admission_config.agent.compaction = config.clone();
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+            admission_config,
+            &question,
+            Arc::clone(&tools_registry),
+            Arc::clone(&memory),
+        )
+        .await;
+        admission.assert_core_specs(&tool_specs);
+        let runtime = admission.memory_runtime();
+
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "cli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: Some(admission.compaction()),
+                decision: admission.decision(),
+            },
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(tmp.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: runtime,
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect("test: the turn must complete");
+
+        assert_eq!(result, "done");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "the fixture must reach a second iteration");
+        let second = requests.get(1).expect("test: the second request was recorded");
+        assert!(
+            !second.iter().any(|message| message.content.contains(OLDER_TURN_MARKER)),
+            "premise: the window must really have saturated. The older exchange is what the trim \
+                 frees before it reaches the question, so if it is still in the second request no trim \
+                 ran and this fixture proves nothing about the floor"
+        );
+        assert_the_trim_had_to_reach_the_question(second, &reserved);
+        assert_eq!(
+            second
+                .iter()
+                .filter(|message| message.content.contains(QUESTION_MARKER))
+                .count(),
+            1,
+            "the turn's question must reach the second iteration exactly once"
+        );
+        assert!(
+            second.iter().any(|message| message.role == "tool"),
+            "the round the model just paid for must still be in the request beside the question"
+        );
+        assert_eq!(
+            first_orphan_tool_index(second),
+            None,
+            "no restored message may strand a tool result from the envelope that requested it"
+        );
+        let envelope_index = second
+            .iter()
+            .position(|message| message.role == "assistant" && is_tool_roundtrip_companion(message))
+            .expect("test: the assistant tool_calls envelope must still be in the request");
+        assert_eq!(
+            second.get(envelope_index.saturating_add(1)).map(|m| m.role.as_str()),
+            Some("tool"),
+            "the assistant tool_calls envelope must be immediately followed by its results"
+        );
+    })
+    .await;
+}
+
+/// The control. On a window with room to spare the mid-turn trim does not
+/// run, and the floor must therefore change nothing at all: no second copy
+/// of the request, no message moved, nothing freed.
+#[tokio::test]
+async fn an_unsaturated_mid_turn_window_leaves_history_exactly_as_it_was() {
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        // Q45: Unsaturated context window preserves history unchanged.
+        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+            const QUESTION_MARKER: &str = "mid-turn-control-request-marker";
+            const OLDER_TURN_MARKER: &str = "mid-turn-control-older-turn-marker";
+
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedLargeOutputTool {
+                name: "file_read".to_string(),
+                output: "mid turn tool output ".repeat(8),
+            })];
+            let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+            let tool_specs = business_tool_specs_of(&tools_registry);
+            let tool_surface = crate::agent::turn_context::measure_request_tool_surface(false, &tool_specs);
+
+            let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(200));
+            // The same fixture the two saturated tests use, so the contrast is the
+            // window and nothing else: here the older exchange must still be there.
+            let mut history = vec![
+                ChatMessage::system("stable base system prompt"),
+                ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
+                ChatMessage::assistant("settled"),
+                ChatMessage::user(question.clone()),
+            ];
+            let config = mid_turn_floor_fixture_config(&history, tool_surface, MID_TURN_UNSATURATED_SLACK_TOKENS);
+
+            let provider = RequestRecordingProvider::new(
+                false,
+                vec![
+                    prompt_guided_tool_call_response("file_read"),
+                    scripted_text_response("done"),
+                ],
+            );
+
+            let tmp = TempDir::new().expect("test: temporary directory");
+            let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
+            let mut admission_config = crate::config::Config::default();
+            admission_config.workspace_dir = tmp.path().to_path_buf();
+            admission_config.agent.compaction = config.clone();
+            let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+                admission_config,
+                &question,
+                Arc::clone(&tools_registry),
+                Arc::clone(&memory),
+            )
+            .await;
+            admission.assert_core_specs(&tool_specs);
+            let runtime = admission.memory_runtime();
+
+            let result = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    channel_name: "cli",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: Some(admission.compaction()),
+                    decision: admission.decision(),
+                },
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry,
+                    observer: &NoopObserver,
+                    hooks: &HookManager::new(tmp.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: runtime,
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .map(|(outcome, _trace)| outcome.into_text())
+            .expect("test: the turn must complete");
+
+            assert_eq!(result, "done");
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|message| message.content.contains(QUESTION_MARKER))
+                    .count(),
+                1,
+                "an untriggered trim must not leave a second copy of the request behind"
+            );
+            assert_eq!(
+                history.first().map(|message| message.role.as_str()),
+                Some("system"),
+                "nothing may be inserted above the system prompt"
+            );
+            assert!(
+                history
+                    .iter()
+                    .any(|message| message.content.contains(OLDER_TURN_MARKER)),
+                "an untriggered trim frees nothing, so the older exchange the saturated fixtures lose \
+                     must still be here"
+            );
+            assert_eq!(
+                history.get(3).map(|message| message.content.as_str()),
+                Some(question.as_str()),
+                "the request must still be exactly where the turn put it"
+            );
+            assert_eq!(
+                history.get(4).map(|message| message.role.as_str()),
+                Some("assistant"),
+                "the round must follow the request in the order the loop wrote it"
+            );
+            assert!(
+                history.get(5).is_some_and(|message| message.role == "user"
+                    && message
+                        .content
+                        .starts_with(crate::agent::turn_contracts::TOOL_RESULTS_PREFIX)),
+                "the tool results must still follow the assistant turn that asked for them"
+            );
+        })
+        .await;
+    })
+    .await;
+}
+
+/// The role sequence of a recorded request, which is what a provider
+/// template sees before it sees any content.
+fn role_sequence(messages: &[ChatMessage]) -> Vec<&str> {
+    messages.iter().map(|message| message.role.as_str()).collect()
+}
+
+/// The preflight runs at the top of *every* iteration, so from the second
+/// one on it edits a history that ends in the round just executed — and it,
+/// not the mid-turn trim, decides the shape of the request the provider
+/// actually receives. With compaction off its only removal is a delete-only
+/// trim, and putting the request back at the tail there opens the transcript
+/// with the round's `assistant` turn and trails the question behind the
+/// results it triggered.
+///
+/// Prompt-guided half: the results block is itself a `user` message, so the
+/// tail restore also lands two `user` turns side by side — the alternation
+/// break [`append_corrective_aside`] folds away rather than create, and that
+/// strict chat templates reject outright.
+#[tokio::test]
+async fn a_trim_only_preflight_opens_the_prompt_guided_second_request_on_the_question() {
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        const QUESTION_MARKER: &str = "preflight-position-prompt-guided-marker";
+        const OLDER_TURN_MARKER: &str = "preflight-position-prompt-guided-older-turn-marker";
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedLargeOutputTool {
+            name: "file_read".to_string(),
+            output: "mid turn tool output ".repeat(8),
+        })];
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        let tool_specs = business_tool_specs_of(&tools_registry);
+        let tool_surface = crate::agent::turn_context::measure_request_tool_surface(false, &tool_specs);
+
+        let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
+        let mut history = vec![
+            ChatMessage::system("stable base system prompt"),
+            ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
+            ChatMessage::assistant("settled"),
+            ChatMessage::user(question.clone()),
+        ];
+        let config = decision_sized_fixture_config(mid_turn_floor_fixture_config(
+            &history,
+            tool_surface,
+            MID_TURN_SATURATED_SLACK_TOKENS,
+        ));
+        let reserved = reserve_request_tool_surface(&fixture_main_compaction(&config), tool_surface);
 
         let provider = RequestRecordingProvider::new(
             false,
@@ -1812,184 +1982,36 @@ async fn an_unsaturated_mid_turn_window_leaves_history_exactly_as_it_was() {
         .expect("test: the turn must complete");
 
         assert_eq!(result, "done");
-        assert_eq!(
-            history
-                .iter()
-                .filter(|message| message.content.contains(QUESTION_MARKER))
-                .count(),
-            1,
-            "an untriggered trim must not leave a second copy of the request behind"
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "the fixture must reach a second iteration");
+        let second = requests.get(1).expect("test: the second request was recorded");
+        assert!(
+            !second.iter().any(|message| message.content.contains(OLDER_TURN_MARKER)),
+            "premise: the window must really have saturated, or no trim ran and this fixture says \
+                 nothing about where a restore puts the request"
         );
+        assert_the_trim_had_to_reach_the_question(second, &reserved);
         assert_eq!(
-            history.first().map(|message| message.role.as_str()),
-            Some("system"),
-            "nothing may be inserted above the system prompt"
+            role_sequence(second),
+            vec!["system", "user", "assistant", "user"],
+            "the question belongs above the round it triggered: the transcript must open on the \
+                 user's question, not on the assistant turn that answered it"
         );
         assert!(
-            history
-                .iter()
-                .any(|message| message.content.contains(OLDER_TURN_MARKER)),
-            "an untriggered trim frees nothing, so the older exchange the saturated fixtures lose \
-                 must still be here"
-        );
-        assert_eq!(
-            history.get(3).map(|message| message.content.as_str()),
-            Some(question.as_str()),
-            "the request must still be exactly where the turn put it"
-        );
-        assert_eq!(
-            history.get(4).map(|message| message.role.as_str()),
-            Some("assistant"),
-            "the round must follow the request in the order the loop wrote it"
+            second
+                .get(1)
+                .is_some_and(|message| message.content.contains(QUESTION_MARKER)),
+            "the `user` turn opening the transcript must be the question itself"
         );
         assert!(
-            history.get(5).is_some_and(|message| message.role == "user"
-                && message
-                    .content
-                    .starts_with(crate::agent::turn_contracts::TOOL_RESULTS_PREFIX)),
-            "the tool results must still follow the assistant turn that asked for them"
+            !second
+                .windows(2)
+                .any(|pair| pair.iter().all(|message| message.role == "user")),
+            "no two adjacent `user` turns: no provider in this crate coalesces them and strict chat \
+                 templates reject the alternation break"
         );
     })
     .await;
-}
-
-/// The role sequence of a recorded request, which is what a provider
-/// template sees before it sees any content.
-fn role_sequence(messages: &[ChatMessage]) -> Vec<&str> {
-    messages.iter().map(|message| message.role.as_str()).collect()
-}
-
-/// The preflight runs at the top of *every* iteration, so from the second
-/// one on it edits a history that ends in the round just executed — and it,
-/// not the mid-turn trim, decides the shape of the request the provider
-/// actually receives. With compaction off its only removal is a delete-only
-/// trim, and putting the request back at the tail there opens the transcript
-/// with the round's `assistant` turn and trails the question behind the
-/// results it triggered.
-///
-/// Prompt-guided half: the results block is itself a `user` message, so the
-/// tail restore also lands two `user` turns side by side — the alternation
-/// break [`append_corrective_aside`] folds away rather than create, and that
-/// strict chat templates reject outright.
-#[tokio::test]
-async fn a_trim_only_preflight_opens_the_prompt_guided_second_request_on_the_question() {
-    const QUESTION_MARKER: &str = "preflight-position-prompt-guided-marker";
-    const OLDER_TURN_MARKER: &str = "preflight-position-prompt-guided-older-turn-marker";
-
-    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedLargeOutputTool {
-        name: "file_read".to_string(),
-        output: "mid turn tool output ".repeat(8),
-    })];
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = business_tool_specs_of(&tools_registry);
-    let tool_surface = crate::agent::turn_context::measure_request_tool_surface(false, &tool_specs);
-
-    let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
-    let mut history = vec![
-        ChatMessage::system("stable base system prompt"),
-        ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
-        ChatMessage::assistant("settled"),
-        ChatMessage::user(question.clone()),
-    ];
-    let config = decision_sized_fixture_config(mid_turn_floor_fixture_config(
-        &history,
-        tool_surface,
-        MID_TURN_SATURATED_SLACK_TOKENS,
-    ));
-    let reserved = reserve_request_tool_surface(&fixture_main_compaction(&config), tool_surface);
-
-    let provider = RequestRecordingProvider::new(
-        false,
-        vec![
-            prompt_guided_tool_call_response("file_read"),
-            scripted_text_response("done"),
-        ],
-    );
-
-    let tmp = TempDir::new().expect("test: temporary directory");
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
-    let mut admission_config = crate::config::Config::default();
-    admission_config.workspace_dir = tmp.path().to_path_buf();
-    admission_config.agent.compaction = config.clone();
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
-        admission_config,
-        &question,
-        Arc::clone(&tools_registry),
-        Arc::clone(&memory),
-    )
-    .await;
-    admission.assert_core_specs(&tool_specs);
-    let runtime = admission.memory_runtime();
-
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: Some(admission.compaction()),
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: runtime,
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("test: the turn must complete");
-
-    assert_eq!(result, "done");
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "the fixture must reach a second iteration");
-    let second = requests.get(1).expect("test: the second request was recorded");
-    assert!(
-        !second.iter().any(|message| message.content.contains(OLDER_TURN_MARKER)),
-        "premise: the window must really have saturated, or no trim ran and this fixture says \
-             nothing about where a restore puts the request"
-    );
-    assert_the_trim_had_to_reach_the_question(second, &reserved);
-    assert_eq!(
-        role_sequence(second),
-        vec!["system", "user", "assistant", "user"],
-        "the question belongs above the round it triggered: the transcript must open on the \
-             user's question, not on the assistant turn that answered it"
-    );
-    assert!(
-        second
-            .get(1)
-            .is_some_and(|message| message.content.contains(QUESTION_MARKER)),
-        "the `user` turn opening the transcript must be the question itself"
-    );
-    assert!(
-        !second
-            .windows(2)
-            .any(|pair| pair.iter().all(|message| message.role == "user")),
-        "no two adjacent `user` turns: no provider in this crate coalesces them and strict chat \
-             templates reject the alternation break"
-    );
 }
 
 /// The native twin. Here the round is an assistant `tool_calls` envelope
@@ -1998,129 +2020,132 @@ async fn a_trim_only_preflight_opens_the_prompt_guided_second_request_on_the_que
 /// reject — rather than an adjacent `user` pair.
 #[tokio::test]
 async fn a_trim_only_preflight_opens_the_native_second_request_on_the_question() {
-    const QUESTION_MARKER: &str = "preflight-position-native-marker";
-    const OLDER_TURN_MARKER: &str = "preflight-position-native-older-turn-marker";
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        const QUESTION_MARKER: &str = "preflight-position-native-marker";
+        const OLDER_TURN_MARKER: &str = "preflight-position-native-older-turn-marker";
 
-    let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedLargeOutputTool {
-        name: "file_read".to_string(),
-        output: "mid turn tool output ".repeat(8),
-    })];
-    let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-    let tool_specs = business_tool_specs_of(&tools_registry);
-    let tool_surface = crate::agent::turn_context::measure_request_tool_surface(true, &tool_specs);
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedLargeOutputTool {
+            name: "file_read".to_string(),
+            output: "mid turn tool output ".repeat(8),
+        })];
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        let tool_specs = business_tool_specs_of(&tools_registry);
+        let tool_surface = crate::agent::turn_context::measure_request_tool_surface(true, &tool_specs);
 
-    let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
-    let mut history = vec![
-        ChatMessage::system("stable base system prompt"),
-        ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
-        ChatMessage::assistant("settled"),
-        ChatMessage::user(question.clone()),
-    ];
-    let config = decision_sized_fixture_config(mid_turn_floor_fixture_config(
-        &history,
-        tool_surface,
-        MID_TURN_SATURATED_SLACK_TOKENS,
-    ));
-    let reserved = reserve_request_tool_surface(&fixture_main_compaction(&config), tool_surface);
+        let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
+        let mut history = vec![
+            ChatMessage::system("stable base system prompt"),
+            ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
+            ChatMessage::assistant("settled"),
+            ChatMessage::user(question.clone()),
+        ];
+        let config = decision_sized_fixture_config(mid_turn_floor_fixture_config(
+            &history,
+            tool_surface,
+            MID_TURN_SATURATED_SLACK_TOKENS,
+        ));
+        let reserved = reserve_request_tool_surface(&fixture_main_compaction(&config), tool_surface);
 
-    let provider = RequestRecordingProvider::new(
-        true,
-        vec![
-            ChatResponse {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: "call-1".to_string(),
-                    name: "file_read".to_string(),
-                    arguments: "{}".to_string(),
-                }],
-                reasoning_content: None,
+        let provider = RequestRecordingProvider::new(
+            true,
+            vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "file_read".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    reasoning_content: None,
+                },
+                scripted_text_response("done"),
+            ],
+        );
+
+        let tmp = TempDir::new().expect("test: temporary directory");
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
+        let mut admission_config = crate::config::Config::default();
+        admission_config.workspace_dir = tmp.path().to_path_buf();
+        admission_config.agent.compaction = config.clone();
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+            admission_config,
+            &question,
+            Arc::clone(&tools_registry),
+            Arc::clone(&memory),
+        )
+        .await;
+        admission.assert_core_specs(&tool_specs);
+        let runtime = admission.memory_runtime();
+
+        let result = run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                channel_name: "cli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: Some(admission.compaction()),
+                decision: admission.decision(),
             },
-            scripted_text_response("done"),
-        ],
-    );
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &HookManager::new(tmp.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: runtime,
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome.into_text())
+        .expect("test: the turn must complete");
 
-    let tmp = TempDir::new().expect("test: temporary directory");
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
-    let mut admission_config = crate::config::Config::default();
-    admission_config.workspace_dir = tmp.path().to_path_buf();
-    admission_config.agent.compaction = config.clone();
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
-        admission_config,
-        &question,
-        Arc::clone(&tools_registry),
-        Arc::clone(&memory),
-    )
+        assert_eq!(result, "done");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "the fixture must reach a second iteration");
+        let second = requests.get(1).expect("test: the second request was recorded");
+        assert!(
+            !second.iter().any(|message| message.content.contains(OLDER_TURN_MARKER)),
+            "premise: the window must really have saturated, or no trim ran and this fixture says \
+                 nothing about where a restore puts the request"
+        );
+        assert_the_trim_had_to_reach_the_question(second, &reserved);
+        assert_eq!(
+            role_sequence(second),
+            vec!["system", "user", "assistant", "tool"],
+            "the question belongs above the round it triggered: the transcript must open on the \
+                 user's question, not on the assistant envelope that requested the tool"
+        );
+        assert!(
+            second
+                .get(1)
+                .is_some_and(|message| message.content.contains(QUESTION_MARKER)),
+            "the `user` turn opening the transcript must be the question itself"
+        );
+        assert_eq!(
+            first_orphan_tool_index(second),
+            None,
+            "moving the request off the tail must not strand a tool result from its envelope"
+        );
+    })
     .await;
-    admission.assert_core_specs(&tool_specs);
-    let runtime = admission.memory_runtime();
-
-    let result = run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            channel_name: "cli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: crate::agent::turn_request::TurnSchedule {
-                read_only_tool_concurrency_window: 2,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: Some(admission.compaction()),
-            decision: admission.decision(),
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry,
-            observer: &NoopObserver,
-            hooks: &HookManager::new(tmp.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admission.adapter()),
-            memory: runtime,
-        },
-        crate::agent::turn_request::TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .map(|(outcome, _trace)| outcome.into_text())
-    .expect("test: the turn must complete");
-
-    assert_eq!(result, "done");
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "the fixture must reach a second iteration");
-    let second = requests.get(1).expect("test: the second request was recorded");
-    assert!(
-        !second.iter().any(|message| message.content.contains(OLDER_TURN_MARKER)),
-        "premise: the window must really have saturated, or no trim ran and this fixture says \
-             nothing about where a restore puts the request"
-    );
-    assert_the_trim_had_to_reach_the_question(second, &reserved);
-    assert_eq!(
-        role_sequence(second),
-        vec!["system", "user", "assistant", "tool"],
-        "the question belongs above the round it triggered: the transcript must open on the \
-             user's question, not on the assistant envelope that requested the tool"
-    );
-    assert!(
-        second
-            .get(1)
-            .is_some_and(|message| message.content.contains(QUESTION_MARKER)),
-        "the `user` turn opening the transcript must be the question itself"
-    );
-    assert_eq!(
-        first_orphan_tool_index(second),
-        None,
-        "moving the request off the tail must not strand a tool result from its envelope"
-    );
 }
 
 #[tokio::test]

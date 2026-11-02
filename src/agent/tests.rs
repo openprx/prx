@@ -810,43 +810,46 @@ async fn default_causal_embedded_turn_runs_sealed_spawn_child_and_confirms_clean
 
 #[tokio::test]
 async fn turn_delegates_heavy_task_to_sessions_spawn_tool() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let provider = Box::new(FailingProvider);
-    let (memory, workspace) = make_sqlite_memory();
-    let mut config = fixture_runtime_config(workspace.path());
-    config.autonomy.level = crate::security::AutonomyLevel::Full;
-    let mut agent = Agent::builder()
-        .runtime_config(config, "ollama")
-        .provider(provider)
-        .tools(vec![Box::new(MockSessionsSpawnTool { calls: calls.clone() })])
-        .memory(memory)
-        .observer(make_observer())
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .task_routing_config(TaskRoutingConfig {
-            default_intent: TaskRoutingIntentConfig::Simple,
-            rules: vec![TaskRoutingRule {
-                keywords: vec!["fix".into(), "deploy".into()],
-                intent: TaskRoutingIntentConfig::Delegate,
-                model_hint: None,
-                sub_agent_model: Some("claude-opus-4-6".into()),
-                priority: 10,
-            }],
-        })
-        .build()
-        .unwrap();
+    crate::runtime::turn_decision::with_scored_action("delegate", "session", async {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(FailingProvider);
+        let (memory, workspace) = make_sqlite_memory();
+        let mut config = fixture_runtime_config(workspace.path());
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        let mut agent = Agent::builder()
+            .runtime_config(config, "ollama")
+            .provider(provider)
+            .tools(vec![Box::new(MockSessionsSpawnTool { calls: calls.clone() })])
+            .memory(memory)
+            .observer(make_observer())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .task_routing_config(TaskRoutingConfig {
+                default_intent: TaskRoutingIntentConfig::Simple,
+                rules: vec![TaskRoutingRule {
+                    keywords: vec!["fix".into(), "deploy".into()],
+                    intent: TaskRoutingIntentConfig::Delegate,
+                    model_hint: None,
+                    sub_agent_model: Some("claude-opus-4-6".into()),
+                    priority: 10,
+                }],
+            })
+            .build()
+            .unwrap();
 
-    let response = agent.turn("please fix this bug for me").await.unwrap();
+        let response = agent.turn("please fix this bug for me").await.unwrap();
 
-    assert!(
-        response.contains("task run-123"),
-        "configured delegation response: {response:?}; history: {:?}",
-        agent.history()
-    );
-    let calls = calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0]["action"], "spawn");
-    assert_eq!(calls[0]["mode"], "process");
-    assert_eq!(calls[0]["model"], "claude-opus-4-6");
+        assert!(
+            response.contains("task run-123"),
+            "configured delegation response: {response:?}; history: {:?}",
+            agent.history()
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["action"], "spawn");
+        assert_eq!(calls[0]["mode"], "process");
+        assert_eq!(calls[0]["model"], "claude-opus-4-6");
+    })
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

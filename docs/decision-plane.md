@@ -98,17 +98,18 @@ closed even when the builtin shadow completes discovery. Transport, 5xx,
 circuit-open and local decision-budget failures fall back to the builtin; a
 later configured attempt that serves also keeps the normal terminal path.
 
-Structural path, URL and code shapes identify candidates, never execution
-intent or authority. Every tool selection requires the effective side-effect
-commit threshold, choice-confidence floor, top margin and sufficient evidence.
+Structural path, URL and code shapes identify candidates, never execution intent or
+authority. Every autonomous tool selection requires the effective side-effect commit
+threshold, choice-confidence floor and top margin. Evidence must be sufficient unless
+the selected exact single ReadOnly call is itself the evidence step (`exact_read`).
+Authenticated exact resumes use the separate owner-approval authority described below.
 Recovery can retrieve evidence or inspect metadata; it cannot execute a tool.
 
 When a deadline interrupts scoring, an executable Commit is retained only after
 all candidates were scored and normal selection passed every execution bar.
 An unscored utility is bounded above by one, never treated as zero for the
 margin. An incomplete ranking takes the reason-aware terminal path with
-`deadline_exceeded`. The deadline is unchanged. The terminal Answer remains a
-normal serving-model turn, with ordinary context and all per-call execution checks.
+`deadline_exceeded`. The deadline is unchanged. Deadline closure is local Clarify when text is deliverable, otherwise Refuse; it does not call the serving model.
 
 Exactly named native file operations can form one bounded file plan instead
 of keeping only the first name in that family. It includes only individually
@@ -667,7 +668,7 @@ These values are fixed constants, not configuration:
 
 | Constant | Value | Meaning |
 |---|---|---|
-| Evidence threshold | 0.5, inclusive | `evidence_sufficient` at or above it permits an ordinary Commit; below it the selector retrieves, discovers or takes the reason-aware terminal path. A terminal model-backed Answer grants no tool execution. A plain conversational turn is reported by the builtin model at exactly 0.5 (`PLAIN_TURN_EVIDENCE`), so it answers directly |
+| Evidence threshold | 0.5, inclusive | `evidence_sufficient` at or above it permits an ordinary Commit; below it an exact single ReadOnly tool may obtain its own evidence (`features.selection_reason = "exact_read"`, with every autonomous score bar and hard gate still required); other actions retrieve, discover or take the reason-aware terminal path. A confidence fallback Answer publishes no execution references. A plain conversational turn is reported by the builtin model at exactly 0.5 (`PLAIN_TURN_EVIDENCE`), so it answers directly |
 | Freshness threshold | 0.5, exclusive | `needs_fresh_state` above it marks observed artifacts stale and prefers a retrieve |
 | Deterministic propensity | 1.0 | recorded for every non-exploratory selection; only read-only exploration replaces it |
 | Approval lifetime | at most 5 minutes | an approval request whose expiry is later than five minutes after issue is refused |
@@ -682,25 +683,30 @@ non-read-only rehearsal adds zero.
 | Destructive | 0.7 | 0.755 | 0.87 |
 | Credential/config | 0.6 | 0.79 | 0.82 |
 
-Cost, latency and uncertainty only lower those ceilings. When the tool otherwise
-passes its gates, this confidence shortfall ends in a model-backed Answer, or
-Clarify with the reason when Answer is unavailable, never Refuse and never
-Execute. Whether supervised approval should let these classes reach the bar is
-a separate policy decision. The default bars, weights and risk floors remain
-unchanged.
+Cost, latency and uncertainty only lower those ceilings. When an exact current call has
+an available approval scope, it requests owner approval instead of answering. An
+authenticated resume binds the current capability and call fingerprint; that exact call
+may Commit without the autonomous utility, confidence or margin bars. The verified exact
+call supplies its own approval evidence; every hard gate, freshness check and
+idempotency check still applies. Without that approval authority, the confidence
+shortfall ends in a model-backed Answer, or Clarify when text is deliverable; text-less
+surfaces Refuse. The default bars, weights and risk floors remain unchanged.
 
 Confidence abstention (`commit_threshold_or_margin`, `insufficient_evidence`,
-`hop_stopped` or `deadline_exceeded`) selects a
-gated Answer when available. This calls the serving model with normal context;
-it grants no tool execution. Records retain the original abstention reason and
-`features.fallback = "answer_on_abstention"`. If Answer is unavailable, the
-terminal is a reason-specific Clarify on interactive and single-shot surfaces.
-Policy and gate failures (including missing approval and exhausted budgets) may
-Refuse. An explicit choice outside the legal set, or a failed decision, remains
-Clarify without widening the selected surface. Empty input also Clarifies.
-Catalog drift and rejected Router evidence retain a forced local gate closure;
-they do not enter confidence recovery. The interactive flag still governs
-approval collection independently.
+`hop_stopped`) selects a gated Answer when available. This calls the serving model with
+normal context; it publishes no execution references, including ReadOnly tools. An
+ordinary above-bar committed Answer retains its existing gated core and selected-
+discovery publication; the fallback exception grants none. Records retain the original
+abstention reason and `features.fallback = "answer_on_abstention"`. If Answer is
+unavailable, the terminal is a reason-specific Clarify on interactive and single-shot
+surfaces, or Refuse when neither text terminal is legal. Deadline exhaustion selects
+Clarify when text is deliverable, otherwise Refuse; it never calls the serving model
+after the selection budget is spent. Policy and gate failures (including missing
+approval and exhausted budgets) may Refuse. An explicit choice outside the legal set, a
+failed decision or empty input selects Clarify when legal, otherwise Refuse, without
+widening the selected surface. Catalog drift and rejected Router evidence retain a
+forced local gate closure; they do not enter confidence recovery. The interactive flag
+still governs approval collection independently.
 
 Cancelled outcomes provide neither success nor failure evidence, do not mark a
 candidate failed, and do not enter success/margin calibration denominators.

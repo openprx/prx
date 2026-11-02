@@ -1769,10 +1769,7 @@ async fn run_turn_unguarded(
             if verify_chat_completion {
                 use super::completion_review::{CompletionDecision, ReplyAssessment};
                 use super::execution_requirement::{ExecutionRequirement, assessment_messages, parse_assessment};
-                let assessment = if !observed_tool_results
-                    && let Some(requirement) = execution_requirement
-                    && requirement != ExecutionRequirement::ExecutionRequired
-                {
+                let assessment = if !observed_tool_results && let Some(requirement) = execution_requirement {
                     ReplyAssessment::Execution(requirement)
                 } else {
                     // Keep the assessment and persistence future off the turn's

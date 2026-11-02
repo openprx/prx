@@ -23,6 +23,7 @@ pub(crate) enum Selection {
         /// One when exploration is off; the exploration module can replace
         /// this only among eligible read-only candidates.
         propensity: f64,
+        reason_code: Option<&'static str>,
     },
     Recover {
         candidate_id: CandidateId,
@@ -69,6 +70,8 @@ pub(crate) struct SelectorContext {
     pub single_exact_read_capability: bool,
     /// Failed operations in this turn cannot be selected again.
     pub failed_candidates: BTreeSet<CandidateId>,
+    /// Exact current call authenticated by the resume scope and fingerprint.
+    pub approved_resume: Option<CandidateId>,
 }
 
 pub(crate) struct CausalSelector;
@@ -202,6 +205,7 @@ impl CausalSelector {
             Selection::Commit {
                 candidate_id: chosen,
                 propensity,
+                reason_code: None,
             },
             distribution,
         ))
@@ -301,6 +305,23 @@ impl CausalSelector {
                     )?
                 },
             );
+        }
+        // Approval is an independent source of execution authority, not a
+        // prediction boost. Passed gates include schema, scope and replay checks.
+        if let Some((candidate, _, _)) = passed.iter().find(|(candidate, _, _)| {
+            context.approved_resume.as_ref() == Some(candidate.candidate_id())
+                && context.direct_candidates.contains(candidate.candidate_id())
+        }) && !evidence_stale(prediction.needs_fresh_state)
+        {
+            return Ok(Selection::Commit {
+                candidate_id: candidate.candidate_id().clone(),
+                propensity: DETERMINISTIC_PROPENSITY,
+                reason_code: Some("approved_resume"),
+            });
+        }
+        // A bound exact call awaiting owner review is never replaced by an Answer.
+        if let Some(approval) = available_approval(candidates, approval_scopes, pre_commit, Some(exact_mentions)) {
+            return Ok(approval);
         }
         passed.sort_by(|left, right| {
             right
@@ -459,7 +480,7 @@ impl CausalSelector {
         let enough_choice_confidence = completed_discovery_answer
             || (prediction.action_confidence >= policy.minimum_choice_confidence
                 && prediction.target_confidence >= policy.minimum_choice_confidence);
-        let evidence_ok = !insufficient;
+        let evidence_ok = !insufficient || exact_read;
         let fresh_ok = top.action() == CausalActionKind::Retrieve || !stale;
         if top_mass > 0.0
             && top_score.execution_utility >= threshold
@@ -472,6 +493,7 @@ impl CausalSelector {
             return Ok(Selection::Commit {
                 candidate_id: top.candidate_id().clone(),
                 propensity: DETERMINISTIC_PROPENSITY,
+                reason_code: (insufficient && exact_read).then_some("exact_read"),
             });
         }
         // A family's first visible tool need not be the operation the source
@@ -624,16 +646,19 @@ pub(crate) fn terminal_abstain(
 ) -> Result<Selection, SelectError> {
     let confidence_reason = matches!(
         reason_code,
-        "commit_threshold_or_margin" | "insufficient_evidence" | "hop_stopped" | "deadline_exceeded"
+        "commit_threshold_or_margin" | "insufficient_evidence" | "hop_stopped"
     );
     let preferred: &[CausalActionKind] = if confidence_reason {
-        &[CausalActionKind::Answer, CausalActionKind::Clarify]
+        &[
+            CausalActionKind::Answer,
+            CausalActionKind::Clarify,
+            CausalActionKind::Refuse,
+        ]
     } else if matches!(
         reason_code,
-        "decision_failed" | "choice_outside_legal_set" | "empty_input"
-    ) {
-        &[CausalActionKind::Clarify]
-    } else if context.interactive {
+        "decision_failed" | "choice_outside_legal_set" | "empty_input" | "deadline_exceeded"
+    ) || context.interactive
+    {
         &[CausalActionKind::Clarify, CausalActionKind::Refuse]
     } else {
         &[CausalActionKind::Refuse]
@@ -651,6 +676,113 @@ pub(crate) fn terminal_abstain(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r3_textless_surface_closes_every_abstention_with_refuse() {
+        let (set, _, _, gates, _, context) = fixture(1.0);
+        let CandidateSet::Legal { candidates, .. } = set else {
+            panic!("legal set")
+        };
+        let textless: Vec<_> = candidates
+            .into_iter()
+            .filter(|candidate| candidate.action() == CausalActionKind::Refuse)
+            .collect();
+        for reason in [
+            "commit_threshold_or_margin",
+            "insufficient_evidence",
+            "hop_stopped",
+            "decision_failed",
+            "choice_outside_legal_set",
+            "empty_input",
+            "deadline_exceeded",
+        ] {
+            assert_eq!(
+                terminal_abstain(&textless, &gates, &context, reason).unwrap(),
+                Selection::Abstain {
+                    action: CausalActionKind::Refuse,
+                    reason_code: reason
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn r3_below_bar_destructive_asks_and_approved_exact_resume_commits() {
+        let (mut set, mut scores, mut evidence, mut gates, policy, mut context) = fixture(1.0);
+        let tool = CausalCandidate::new(
+            CausalActionKind::UseTool,
+            CapabilityTarget::NativeTool,
+            CandidateSpec {
+                namespace: None,
+                required_capabilities: vec![],
+                side_effect: SideEffectClass::Destructive,
+                approval: ApprovalRequirement::None,
+                estimated_cost: Some(CostEstimate {
+                    tokens: 1,
+                    micro_usd: 0,
+                }),
+                estimated_latency_ms: Some(1),
+            },
+        );
+        let id = tool.candidate_id().clone();
+        let terminal = candidate(CausalActionKind::RequestApproval, CapabilityTarget::NativeTool);
+        let op_ids = vec![OpId::new("prx_destructive_call")];
+        let CandidateSet::Legal {
+            candidates,
+            exact_mentions,
+            approval_scopes,
+            ..
+        } = &mut set
+        else {
+            panic!("legal set")
+        };
+        candidates.extend([tool.clone(), terminal.clone()]);
+        exact_mentions.insert(id.clone());
+        approval_scopes.insert(
+            terminal.candidate_id().clone(),
+            vec![PendingApproval {
+                candidate: tool,
+                op_ids: op_ids.clone(),
+            }],
+        );
+        gates.outcomes.insert(id.clone(), GateOutcome::ApprovalOnly { op_ids });
+        gates
+            .outcomes
+            .insert(terminal.candidate_id().clone(), GateOutcome::Passed);
+        assert!(
+            matches!(CausalSelector::select(&set,&scores,&evidence,&gates,&policy,&context).unwrap(),Selection::RequestApproval { pending_candidate_id, .. } if pending_candidate_id==id)
+        );
+        gates.outcomes.insert(id.clone(), GateOutcome::Passed);
+        scores.insert(
+            id.clone(),
+            CandidateScore {
+                semantic_utility: 0.1,
+                execution_utility: 0.1,
+            },
+        );
+        let mut prediction = evidence.candidates.values().next().unwrap().to_owned();
+        prediction.choice_probability = 0.0;
+        evidence.candidates.insert(id.clone(), prediction);
+        evidence.action_confidence = 0.0;
+        evidence.target_confidence = 0.0;
+        context.direct_candidates.insert(id.clone());
+        let unapproved = CausalSelector::select(&set, &scores, &evidence, &gates, &policy, &context).unwrap();
+        assert!(!matches!(unapproved,Selection::Commit { ref candidate_id, .. } if candidate_id==&id));
+        evidence.evidence_sufficient = 0.0;
+        context.approved_resume = Some(id.clone());
+        assert!(
+            matches!(CausalSelector::select(&set,&scores,&evidence,&gates,&policy,&context).unwrap(),Selection::Commit { candidate_id, reason_code: Some("approved_resume"), .. } if candidate_id==id)
+        );
+        evidence.needs_fresh_state = 1.0;
+        assert!(
+            !matches!(CausalSelector::select(&set,&scores,&evidence,&gates,&policy,&context).unwrap(),Selection::Commit { ref candidate_id, .. } if candidate_id==&id)
+        );
+        evidence.needs_fresh_state = 0.0;
+        context.failed_candidates.insert(id.clone());
+        assert!(
+            !matches!(CausalSelector::select(&set,&scores,&evidence,&gates,&policy,&context).unwrap(),Selection::Commit { ref candidate_id, .. } if candidate_id==&id)
+        );
+    }
+
     #[test]
     fn a_plain_turn_evidence_value_counts_as_sufficient() {
         assert!(crate::decision::builtin::weights::PLAIN_TURN_EVIDENCE >= super::EVIDENCE_THRESHOLD);
@@ -762,6 +894,7 @@ mod tests {
             single_exact_capability: false,
             single_exact_read_capability: false,
             failed_candidates: BTreeSet::new(),
+            approved_resume: None,
         };
         (
             set,
@@ -1022,6 +1155,7 @@ mod tests {
                     .candidate_id()
                     .clone(),
                 propensity: 1.0,
+                reason_code: None,
             }
         );
         let mut reversed = set;
@@ -1068,6 +1202,7 @@ mod tests {
             Selection::Commit {
                 candidate_id: answer.candidate_id().clone(),
                 propensity: 1.0,
+                reason_code: None,
             }
         );
     }
@@ -1358,9 +1493,10 @@ mod tests {
             let expected =
                 if exact && (single || only_read) && effect == SideEffectClass::ReadOnly && !stale && !same_source {
                     if direct {
-                        Selection::Abstain {
-                            action: CausalActionKind::Answer,
-                            reason_code: "commit_threshold_or_margin",
+                        Selection::Commit {
+                            candidate_id: tool.candidate_id().clone(),
+                            propensity: 1.0,
+                            reason_code: Some("exact_read"),
                         }
                     } else {
                         Selection::Recover {
@@ -1962,7 +2098,11 @@ mod tests {
                 assert_eq!(
                     terminal_abstain(candidates, &gates, &context, reason).unwrap(),
                     Selection::Abstain {
-                        action: CausalActionKind::Answer,
+                        action: if reason == "deadline_exceeded" {
+                            CausalActionKind::Clarify
+                        } else {
+                            CausalActionKind::Answer
+                        },
                         reason_code: reason
                     }
                 );
@@ -2040,6 +2180,7 @@ mod tests {
             let mut s = scores.clone();
             let mut c = SelectorContext {
                 failed_candidates: context.failed_candidates.clone(),
+                approved_resume: context.approved_resume.clone(),
                 direct_candidates: context.direct_candidates.clone(),
                 ..context
             };

@@ -260,10 +260,27 @@ pub(crate) fn configure(config: &mut crate::config::Config, endpoint: &str) -> R
     assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
     Ok(())
 }
+pub(crate) fn decision_answers_for_exact(
+    body: &serde_json::Value,
+    action: &str,
+    target: &str,
+) -> anyhow::Result<serde_json::Value> {
+    decision_answers_with_preference(body, action, target, true)
+}
+
 pub(crate) fn decision_answers(
     body: &serde_json::Value,
     action: &str,
     target: &str,
+) -> anyhow::Result<serde_json::Value> {
+    decision_answers_with_preference(body, action, target, false)
+}
+
+fn decision_answers_with_preference(
+    body: &serde_json::Value,
+    action: &str,
+    target: &str,
+    prefer_exact: bool,
 ) -> anyhow::Result<serde_json::Value> {
     use serde_json::{Value, json};
     assert_eq!(body.get("model").and_then(Value::as_str), Some(DECISION_MODEL));
@@ -273,10 +290,15 @@ pub(crate) fn decision_answers(
         .context("actual candidate projection")?;
     let target_index = candidates
         .iter()
-        .position(|candidate| {
+        .enumerate()
+        .filter(|(_, candidate)| {
             candidate.get("action").and_then(Value::as_str) == Some(action)
                 && candidate.get("target").and_then(Value::as_str) == Some(target)
         })
+        .min_by_key(|(_, candidate)| {
+            prefer_exact && candidate.get("exact_mention").and_then(Value::as_bool) != Some(true)
+        })
+        .map(|(index, _)| index)
         .context("actual requested action/family candidate")?;
     let target_path = format!("$.candidates[{target_index}]");
     let questions = body

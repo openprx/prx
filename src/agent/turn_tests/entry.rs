@@ -171,64 +171,77 @@ async fn cli_turn_routing_pins_the_raw_turn_text() {
 
 #[tokio::test]
 async fn cli_single_shot_routes_on_the_raw_message_not_on_recalled_memory() {
-    let (skill_refreshes, mcp_refreshes) = cli_turn_capability_refreshes(RAW_CLI_TURN_TEXT).await;
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let (skill_refreshes, mcp_refreshes) = cli_turn_capability_refreshes(RAW_CLI_TURN_TEXT).await;
 
-    assert_eq!(
-        skill_refreshes, 1,
-        "the raw single-shot message asks for the skill surface, so it must be published"
-    );
-    assert_eq!(
-        mcp_refreshes, 0,
-        "a single-shot turn must not acquire the MCP/browser surface from its recalled memory preamble"
-    );
+        assert_eq!(
+            skill_refreshes, 1,
+            "the raw single-shot message asks for the skill surface, so it must be published"
+        );
+        assert_eq!(
+            mcp_refreshes, 0,
+            "a single-shot turn must not acquire the MCP/browser surface from its recalled memory preamble"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn cli_repl_routes_on_the_raw_input_not_on_recalled_memory() {
-    let (skill_refreshes, mcp_refreshes) = cli_turn_capability_refreshes(&format!("and now {RAW_CLI_TURN_TEXT}")).await;
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        let (skill_refreshes, mcp_refreshes) =
+            cli_turn_capability_refreshes(&format!("and now {RAW_CLI_TURN_TEXT}")).await;
 
-    assert_eq!(
-        skill_refreshes, 1,
-        "the raw REPL input asks for the skill surface, so it must be published"
-    );
-    assert_eq!(
-        mcp_refreshes, 0,
-        "a REPL turn must not acquire the MCP/browser surface from its recalled memory preamble"
-    );
+        assert_eq!(
+            skill_refreshes, 1,
+            "the raw REPL input asks for the skill surface, so it must be published"
+        );
+        assert_eq!(
+            mcp_refreshes, 0,
+            "a REPL turn must not acquire the MCP/browser surface from its recalled memory preamble"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn cron_job_turn_routes_on_the_raw_prefixed_prompt_not_on_recalled_memory() {
-    // A cron agent job enters the single-shot branch with the scheduler's
-    // own `[cron:...]` prefix already on the prompt; that prefix is authored
-    // by the scheduler, not recalled, so it stays part of the routing input.
-    let (skill_refreshes, mcp_refreshes) =
-        cli_turn_capability_refreshes(&format!("[cron:7 nightly-digest] {RAW_CLI_TURN_TEXT}")).await;
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        // A cron agent job enters the single-shot branch with the scheduler's
+        // own `[cron:...]` prefix already on the prompt; that prefix is authored
+        // by the scheduler, not recalled, so it stays part of the routing input.
+        let (skill_refreshes, mcp_refreshes) =
+            cli_turn_capability_refreshes(&format!("[cron:7 nightly-digest] {RAW_CLI_TURN_TEXT}")).await;
 
-    assert_eq!(
-        skill_refreshes, 1,
-        "the raw cron prompt asks for the skill surface, so it must be published"
-    );
-    assert_eq!(
-        mcp_refreshes, 0,
-        "an unattended cron turn must not acquire the MCP/browser surface from recalled memory"
-    );
+        assert_eq!(
+            skill_refreshes, 1,
+            "the raw cron prompt asks for the skill surface, so it must be published"
+        );
+        assert_eq!(
+            mcp_refreshes, 0,
+            "an unattended cron turn must not acquire the MCP/browser surface from recalled memory"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn xin_task_turn_routes_on_the_raw_prefixed_payload_not_on_recalled_memory() {
-    // Same single-shot branch, with the xin runner's `[xin:task:...]` prefix.
-    let (skill_refreshes, mcp_refreshes) =
-        cli_turn_capability_refreshes(&format!("[xin:task:42] {RAW_CLI_TURN_TEXT}")).await;
+    crate::runtime::turn_decision::with_scored_prediction(async {
+        // Same single-shot branch, with the xin runner's `[xin:task:...]` prefix.
+        let (skill_refreshes, mcp_refreshes) =
+            cli_turn_capability_refreshes(&format!("[xin:task:42] {RAW_CLI_TURN_TEXT}")).await;
 
-    assert_eq!(
-        skill_refreshes, 1,
-        "the raw xin payload asks for the skill surface, so it must be published"
-    );
-    assert_eq!(
-        mcp_refreshes, 0,
-        "an unattended xin turn must not acquire the MCP/browser surface from recalled memory"
-    );
+        assert_eq!(
+            skill_refreshes, 1,
+            "the raw xin payload asks for the skill surface, so it must be published"
+        );
+        assert_eq!(
+            mcp_refreshes, 0,
+            "an unattended xin turn must not acquire the MCP/browser surface from recalled memory"
+        );
+    })
+    .await;
 }
 
 /// A configuration whose only provider is `probe`, with every persisted file

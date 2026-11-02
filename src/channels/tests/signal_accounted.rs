@@ -428,7 +428,11 @@ fn assert_decision_path(workspace: &std::path::Path, source_event_id: &str, pric
         assert_eq!(directive, "refuse");
         let candidates: Vec<crate::causal_tree::store::RecordedCandidate> =
             serde_json::from_str(candidates).expect("actual typed kept candidate records");
-        assert!(candidates.iter().all(|candidate| candidate.action == "refuse"));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| matches!(candidate.action.as_str(), "clarify" | "refuse"))
+        );
         let gates: Value = serde_json::from_str(gates).expect("actual gate records");
         // Family selection discards an early blocked Retrieve before the final
         // report. Answer is explicitly proposed and its G6 result remains in

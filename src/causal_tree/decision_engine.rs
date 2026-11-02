@@ -746,6 +746,7 @@ impl CausalDecisionEngine {
             Selection::Commit {
                 candidate_id: answer.candidate_id().clone(),
                 propensity: 1.0,
+                reason_code: None,
             }
         } else if matches!(candidates, CandidateSet::NoLegalPath { .. }) {
             CausalSelector::select(
@@ -1178,6 +1179,7 @@ impl CausalDecisionEngine {
                         inputs.discovered_refs,
                         inputs.config.enabled,
                         state.routing_input.as_str(),
+                        inputs.gates,
                     ),
                     &inputs.config.evaluation,
                     inputs.key,
@@ -1200,6 +1202,7 @@ impl CausalDecisionEngine {
                             inputs.discovered_refs,
                             inputs.config.enabled,
                             state.routing_input.as_str(),
+                            inputs.gates,
                         ),
                     )?,
                     BTreeMap::new(),
@@ -1222,6 +1225,7 @@ impl CausalDecisionEngine {
                         inputs.discovered_refs,
                         inputs.config.enabled,
                         state.routing_input.as_str(),
+                        inputs.gates,
                     ),
                 )?,
                 BTreeMap::new(),
@@ -1265,33 +1269,6 @@ impl CausalDecisionEngine {
                     "deadline_exceeded",
                 )?;
                 exploration_propensities.clear();
-            }
-        }
-        if decision_now() >= inputs.deadline
-            && matches!(
-                selection,
-                Selection::Abstain {
-                    action: CausalActionKind::Answer | CausalActionKind::Clarify,
-                    ..
-                }
-            )
-        {
-            if let CandidateSet::Legal {
-                candidates: admitted, ..
-            } = &candidates
-            {
-                selection = terminal_abstain(
-                    admitted,
-                    &pre_commit,
-                    &selector_context(
-                        &candidates,
-                        inputs.catalog,
-                        trusted.delivery.interactive,
-                        resume_target,
-                        inputs.discovered_refs,
-                    ),
-                    "deadline_exceeded",
-                )?;
             }
         }
         Ok(EngineDecision {
@@ -1700,6 +1677,7 @@ fn selector_context(
         single_exact_capability: false,
         single_exact_read_capability: false,
         failed_candidates: BTreeSet::new(),
+        approved_resume: None,
     }
 }
 
@@ -1724,6 +1702,7 @@ fn selector_context_for_state(
     discovered_refs: &DiscoveredRefs,
     decision_enabled: bool,
     routing_input: &str,
+    gates: &GateInputs<'_>,
 ) -> SelectorContext {
     let mut context = selector_context_for_config(
         set,
@@ -1734,6 +1713,28 @@ fn selector_context_for_state(
         decision_enabled,
         routing_input,
     );
+    if state
+        .trusted
+        .parts()
+        .constraints
+        .iter()
+        .any(|code| code.as_str() == "resume_exact_call")
+        && let Some(target) = resume_target
+        && let CandidateSet::Legal { candidates, .. } = set
+    {
+        context.approved_resume = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.action() == CausalActionKind::UseTool
+                    && candidate.required_capabilities() == std::slice::from_ref(target)
+                    && gates
+                        .call_fingerprints
+                        .get(candidate.candidate_id())
+                        .and_then(|fingerprint| gates.verified_approval_calls.get(fingerprint))
+                        .is_some_and(|approved| approved.len() == 1 && approved.contains(target))
+            })
+            .map(|candidate| candidate.candidate_id().clone());
+    }
     context.failed_candidates = state.observed.failed_candidates().into_iter().cloned().collect();
     if !context.failed_candidates.is_empty()
         && let CandidateSet::Legal { candidates, .. } = set
@@ -2307,6 +2308,7 @@ mod tests {
             selection: Selection::Commit {
                 candidate_id: delegate_id,
                 propensity: 1.0,
+                reason_code: None,
             },
             exploration_propensities: BTreeMap::new(),
             prediction: None,
@@ -2598,6 +2600,7 @@ mod tests {
                 selection: Selection::Commit {
                     candidate_id: id,
                     propensity: 1.0,
+                    reason_code: None,
                 },
                 exploration_propensities: BTreeMap::new(),
                 prediction: None,
@@ -2765,6 +2768,7 @@ mod tests {
             selection: Selection::Commit {
                 candidate_id: id.clone(),
                 propensity: 1.0,
+                reason_code: None,
             },
             exploration_propensities: BTreeMap::new(),
             prediction: None,
@@ -3250,6 +3254,7 @@ mod tests {
         decision.selection = Selection::Commit {
             candidate_id: id,
             propensity: 1.0,
+            reason_code: None,
         };
         decision.deadline = Instant::now();
         assert!(
@@ -3363,7 +3368,7 @@ mod tests {
         assert!(matches!(
             result.selection,
             Selection::Abstain {
-                action: CausalActionKind::Answer,
+                action: CausalActionKind::Clarify,
                 ..
             }
         ));
@@ -3379,7 +3384,7 @@ mod tests {
             matches!(
                 near_deadline.selection,
                 Selection::Abstain {
-                    action: CausalActionKind::Answer,
+                    action: CausalActionKind::Clarify,
                     ..
                 }
             ),
@@ -3568,7 +3573,7 @@ mod tests {
             },
         )
         .expect("expired recovery is gated");
-        assert!(matches!(directive, TurnExecutionDirective::AnswerDirectly));
+        assert!(matches!(directive, TurnExecutionDirective::Clarify { .. }));
 
         let mut blocked = state.clone();
         let mut trusted = blocked.trusted.parts().clone();

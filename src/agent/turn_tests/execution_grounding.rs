@@ -223,19 +223,18 @@ async fn execution_prediction_can_be_corrected_to_informational_answer() {
         let hello = "hello";
         let (result, requests, history, streamed) = exercise_grounding_request(
             explicit_execution,
-            &[
-                hello,
-                r#"{"requirement":"execution_required"}"#,
-                hello,
-                r#"{"requirement":"informational"}"#,
-            ],
+            &[hello, r#"{"requirement":"informational"}"#],
             false,
             "Reply with exactly one word: hello",
         )
         .await;
         let delivered = result.expect("corrected informational assessment permits the answer");
         assert_eq!(delivered, hello);
-        assert_eq!(requests.len(), 4, "the bounded correction must recheck intent");
+        assert_eq!(
+            requests.len(),
+            2,
+            "the first assessor result corrects a prediction miss"
+        );
         assert!(
             history.iter().any(|message| message.content == hello) || streamed.contains(hello),
             "the draft must be delivered on a history or stream sink"
@@ -252,14 +251,14 @@ async fn action_with_exact_reply_contract_cannot_release_unverified_pass() {
                 "PASS",
                 r#"{"requirement":"execution_required"}"#,
                 "PASS",
-                r#"{"requirement":"execution_required"}"#,
+                r#"{"requirement":"informational"}"#,
             ],
             streaming,
             "Run the test suite and reply with exactly one word: PASS or FAIL",
         )
         .await;
         assert!(result.unwrap_err().to_string().contains("execution is unverified"));
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 3, "a cached execution requirement cannot be resampled");
         assert!(!history.iter().any(|message| message.content == "PASS"));
         assert_eq!(streamed, "");
     }
@@ -292,7 +291,11 @@ async fn missing_execution_is_rejected_after_one_correction_in_both_delivery_mod
         )
         .await;
         assert!(result.unwrap_err().to_string().contains("no tool result"));
-        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests.len(),
+            3,
+            "the corrective retry reuses the original execution requirement"
+        );
         assert!(!history.iter().any(|message| message.content == fake));
         assert!(
             streamed.is_empty(),

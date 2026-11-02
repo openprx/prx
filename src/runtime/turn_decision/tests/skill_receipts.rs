@@ -559,7 +559,7 @@ fn an_admission_waiting_for_approval_is_not_an_executable_capability_id() {
 }
 
 #[tokio::test]
-async fn skill_execution_adapter_does_not_require_concrete_prompt_metadata() {
+async fn below_bar_skill_execution_adapter_is_not_published() {
     let turn = selected_skill_target_turn(false, true).await;
     assert!(
         turn.service
@@ -567,7 +567,7 @@ async fn skill_execution_adapter_does_not_require_concrete_prompt_metadata() {
             .expect("execution specs")
             .specs
             .iter()
-            .any(|spec| spec.name == "skill_execute")
+            .all(|spec| spec.name != "skill_execute")
     );
     assert_eq!(
         selected_names(&turn).expect("native skill adapter has no prompt document"),

@@ -77,6 +77,10 @@ impl Fixture {
     }
 
     async fn new() -> Self {
+        Self::with_hop_limit(None).await
+    }
+
+    async fn with_hop_limit(max_hops: Option<u8>) -> Self {
         let workspace = tempfile::tempdir().unwrap();
         let observed = Arc::new(ObservedSqlite::new(SqliteMemory::new(workspace.path()).unwrap()));
         let memory: Arc<dyn Memory> = observed.clone();
@@ -113,6 +117,9 @@ impl Fixture {
         config.config_path = workspace.path().join("config.toml");
         config.default_model = Some(MODEL.into());
         config.causal_tree.enabled = true;
+        if let Some(max_hops) = max_hops {
+            config.causal_tree.policy.max_decision_hops = max_hops;
+        }
         config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
         config.router = policy;
         // The real Router Retrieve hop is subject to G7, including PMM's
@@ -666,4 +673,19 @@ fn snapshot_digest_keeps_v1_bytes_at_batched_float_boundaries() {
             "dimensions={dimensions}"
         );
     }
+}
+
+#[tokio::test]
+async fn r3_textless_router_with_zero_hops_returns_a_typed_close() {
+    let mut fixture = Fixture::with_hop_limit(Some(0)).await;
+    let reply = fixture
+        .turn()
+        .await
+        .expect("a legal Router surface closes without NoTerminalPath");
+    assert_eq!(reply, "I can't complete this request under the current policy.");
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        0,
+        "typed Router close cannot call the serving model"
+    );
 }

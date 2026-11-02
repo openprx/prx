@@ -164,6 +164,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             selection: Selection::Commit {
                 candidate_id: id.clone(),
                 propensity: 1.0,
+                reason_code: None,
             },
             exploration_propensities: BTreeMap::new(),
             prediction: None,
@@ -643,12 +644,12 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
                     discovery_limit: 1,
                 },
             ),
-            Ok(TurnExecutionDirective::AnswerDirectly)
+            Ok(TurnExecutionDirective::Clarify { .. })
         ));
         assert!(matches!(
             cancelled_terminal.selection,
             Selection::Abstain {
-                action: CausalActionKind::Answer,
+                action: CausalActionKind::Clarify,
                 reason_code: "deadline_exceeded",
             }
         ));
@@ -1085,6 +1086,7 @@ async fn selected_discovery_is_source_bound_and_never_dispatches_a_tool() {
             selection: Selection::Commit {
                 candidate_id: id,
                 propensity: 1.0,
+                reason_code: None,
             },
             exploration_propensities: BTreeMap::new(),
             prediction: None,

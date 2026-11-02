@@ -11,7 +11,7 @@ pub(super) fn recovery_cannot_publish_an_executable_tool() {
     let select = function_body(&selector, "select");
     assert!(select.contains("top_score.execution_utility >= threshold"));
     assert!(select.contains("margin >= policy.minimum_top_margin"));
-    assert!(select.contains("let evidence_ok = !insufficient"));
+    assert!(select.contains("let evidence_ok = !insufficient || exact_read"));
     assert!(select.contains("prediction.action_confidence >= policy.minimum_choice_confidence"));
     assert!(select.contains("prediction.target_confidence >= policy.minimum_choice_confidence"));
     for required in [
@@ -43,13 +43,17 @@ pub(super) fn execution_guard_is_unconditional_and_decision_clock_has_one_owner(
 pub(super) fn confidence_terminals_include_answer_and_cli_clarification() {
     let source = read_source(&repository_root().join("src/causal_tree/decision_select.rs"));
     let terminal = function_body(&source, "terminal_abstain");
-    assert!(terminal.contains("&[CausalActionKind::Answer, CausalActionKind::Clarify]"));
+    let compact: String = terminal.split_whitespace().collect();
+    assert!(compact.contains("&[CausalActionKind::Answer,CausalActionKind::Clarify,CausalActionKind::Refuse,]"));
     let generator = read_source(&repository_root().join("src/causal_tree/candidate_generator.rs"));
     assert!(!generator.contains("delivery.interactive && state.trusted.parts().delivery.can_ask_question"));
     let outcome = read_source(&repository_root().join("src/causal_tree/outcome.rs"));
     assert!(outcome.contains("answer_on_abstention"));
     let runtime = read_source(&repository_root().join("src/runtime/turn_decision.rs"));
     let publication = function_body(&runtime, "direct_answer_refs");
-    assert!(publication.contains("delegation && fallback_answer"));
-    assert!(publication.contains("!matches!(publication, GateOutcome::Passed)"));
+    assert!(publication.contains("Selection::Abstain"));
+    assert!(publication.contains("action: CausalActionKind::Answer"));
+    assert!(publication.contains("return BTreeSet::new()"));
+    assert!(publication.contains("if fallback_answer || !gates.model_can_call_tools"));
+    assert!(publication.contains("matches!(publication, GateOutcome::Blocked"));
 }

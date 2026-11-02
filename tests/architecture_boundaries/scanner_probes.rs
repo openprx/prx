@@ -865,13 +865,13 @@ fn mutation_proof_confidence_terminal() {
     assert_reviewed_source_mutation(
         confidence_terminals_include_answer_and_cli_clarification,
         "src/causal_tree/decision_select.rs",
-        "&[CausalActionKind::Answer, CausalActionKind::Clarify]",
-        "&[CausalActionKind::Clarify]",
+        "CausalActionKind::Refuse,\n        ]",
+        "]",
     );
     assert_reviewed_source_mutation(
         confidence_terminals_include_answer_and_cli_clarification,
         "src/runtime/turn_decision.rs",
-        "delegation && fallback_answer",
-        "delegation && false",
+        "if fallback_answer || !gates.model_can_call_tools",
+        "if !gates.model_can_call_tools",
     );
 }

@@ -1313,7 +1313,10 @@ mod tests {
             assert_eq!(*models.lock().unwrap(), ["prx-local-model"]);
             models.lock().unwrap().clear();
         } else {
-            assert_eq!(agent.turn("").await.unwrap(), "Could you clarify the result you want?");
+            assert_eq!(
+                agent.turn("unclear request").await.unwrap(),
+                "Could you clarify the result you want?"
+            );
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             assert!(models.lock().unwrap().is_empty());
         }
@@ -3005,94 +3008,97 @@ mod tests {
 
     #[tokio::test]
     async fn agent_turn_routes_on_the_user_message_parameter() {
-        let workspace = tempfile::TempDir::new().unwrap();
-        let skill_refreshes = Arc::new(AtomicUsize::new(0));
-        let mcp_refreshes = Arc::new(AtomicUsize::new(0));
+        crate::runtime::turn_decision::with_scored_prediction(async {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let skill_refreshes = Arc::new(AtomicUsize::new(0));
+            let mcp_refreshes = Arc::new(AtomicUsize::new(0));
 
-        let memory_cfg = crate::config::MemoryConfig {
-            backend: "sqlite".into(),
-            ..crate::config::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, workspace.path(), None)
-                .expect("test: memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let memory_cfg = crate::config::MemoryConfig {
+                backend: "sqlite".into(),
+                ..crate::config::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                crate::memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("test: memory creation should succeed with valid config"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
 
-        let mut runtime_config = crate::config::Config {
-            workspace_dir: workspace.path().to_path_buf(),
-            config_path: workspace.path().join("config.toml"),
-            default_model: Some("prx-local-model".to_owned()),
-            memory: memory_cfg.clone(),
-            ..crate::config::Config::default()
-        };
-        runtime_config.cost.prices.insert(
-            "prx-local-model".to_owned(),
-            crate::config::schema::ModelPricing {
-                input: 1.0,
-                output: 1.0,
-                cache_write: 1.0,
-                cache_read: 1.0,
-            },
-        );
-        runtime_config
-            .providers
-            .models
-            .push(crate::config::schema::ProviderModelConfig {
-                provider: "ollama".to_owned(),
-                model: Some("prx-local-model".to_owned()),
-                operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
-                native_tools: Some(true),
-                vision_input: None,
-                streaming: None,
-                structured_output: None,
-                tool_schema_dialect: None,
-                tool_call_dialect: None,
-                context_window: None,
-            });
+            let mut runtime_config = crate::config::Config {
+                workspace_dir: workspace.path().to_path_buf(),
+                config_path: workspace.path().join("config.toml"),
+                default_model: Some("prx-local-model".to_owned()),
+                memory: memory_cfg.clone(),
+                ..crate::config::Config::default()
+            };
+            runtime_config.cost.prices.insert(
+                "prx-local-model".to_owned(),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 1.0,
+                    cache_read: 1.0,
+                },
+            );
+            runtime_config
+                .providers
+                .models
+                .push(crate::config::schema::ProviderModelConfig {
+                    provider: "ollama".to_owned(),
+                    model: Some("prx-local-model".to_owned()),
+                    operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+                    native_tools: Some(true),
+                    vision_input: None,
+                    streaming: None,
+                    structured_output: None,
+                    tool_schema_dialect: None,
+                    tool_call_dialect: None,
+                    context_window: None,
+                });
 
-        let mut agent = Agent::builder()
-            .runtime_config(runtime_config, "ollama")
-            .provider(Box::new(MockProvider {
-                responses: Mutex::new(vec![]),
-            }))
-            .tools(vec![
-                Box::new(RefreshCountingTool {
-                    name: "skill_probe",
-                    category: ToolCategory::System,
-                    refreshes: Arc::clone(&skill_refreshes),
-                }),
-                Box::new(RefreshCountingTool {
-                    name: "mcp_probe",
-                    category: ToolCategory::Automation,
-                    refreshes: Arc::clone(&mcp_refreshes),
-                }),
-            ])
-            .memory(mem)
-            .observer(observer)
-            .memory_loader(Box::new(RecalledBrowserContextLoader))
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(workspace.path().to_path_buf())
-            .build()
-            .expect("test: agent builder should succeed with valid config");
+            let mut agent = Agent::builder()
+                .runtime_config(runtime_config, "ollama")
+                .provider(Box::new(MockProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(vec![
+                    Box::new(RefreshCountingTool {
+                        name: "skill_probe",
+                        category: ToolCategory::System,
+                        refreshes: Arc::clone(&skill_refreshes),
+                    }),
+                    Box::new(RefreshCountingTool {
+                        name: "mcp_probe",
+                        category: ToolCategory::Automation,
+                        refreshes: Arc::clone(&mcp_refreshes),
+                    }),
+                ])
+                .memory(mem)
+                .observer(observer)
+                .memory_loader(Box::new(RecalledBrowserContextLoader))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .build()
+                .expect("test: agent builder should succeed with valid config");
 
-        let response = agent
-            .turn("use skill_probe to create a PDF file. Do not use browser, MCP, HTTP, plugins, or WASM.")
-            .await
-            .unwrap();
+            let response = agent
+                .turn("use skill_probe to create a PDF file. Do not use browser, MCP, HTTP, plugins, or WASM.")
+                .await
+                .unwrap();
 
-        assert_eq!(response, "done");
-        assert_eq!(
-            skill_refreshes.load(Ordering::SeqCst),
-            1,
-            "the turn's own text asks for the skill surface, so it must be published"
-        );
-        assert_eq!(
-            mcp_refreshes.load(Ordering::SeqCst),
-            0,
-            "Agent::turn must not acquire the MCP/browser surface from the recalled preamble its own \
-             enrichment pushed into the history"
-        );
+            assert_eq!(response, "done");
+            assert_eq!(
+                skill_refreshes.load(Ordering::SeqCst),
+                1,
+                "the turn's own text asks for the skill surface, so it must be published"
+            );
+            assert_eq!(
+                mcp_refreshes.load(Ordering::SeqCst),
+                0,
+                "Agent::turn must not acquire the MCP/browser surface from the recalled preamble its own \
+                 enrichment pushed into the history"
+            );
+        })
+        .await;
     }
 
     #[cfg(feature = "llm-router")]

@@ -650,7 +650,7 @@ async fn queued_plan_mode_change_fails_before_fixed_reply_and_commits_one_failed
         None,
         config.clone(),
         (FIXTURE_PROVIDER, FIXTURE_MODEL, None),
-        (FIXTURE_DRAFT, "read ./missing-plan-fixture.txt", ChatMode::Plan),
+        (FIXTURE_DRAFT, "", ChatMode::Plan),
         action_tx.clone(),
         cancellation.clone(),
     )

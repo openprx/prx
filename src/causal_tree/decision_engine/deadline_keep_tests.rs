@@ -21,6 +21,7 @@ fn fixture_key() -> Arc<DecisionKey> {
 struct ScoringPrediction<P> {
     inner: P,
     optimistic_target: Option<&'static str>,
+    evidence_sufficient: bool,
 }
 impl<P: PredictionPort> prediction_sealed::Producer for ScoringPrediction<P> {}
 impl<P: PredictionPort> PredictionPort for ScoringPrediction<P> {
@@ -66,7 +67,7 @@ impl<P: PredictionPort> PredictionPort for ScoringPrediction<P> {
                     }
                     DecisionQuestion::Noul { .. } => DecisionAnswer::Noul(NoulAnswer {
                         probability_true: probability(f64::from(
-                            id == &QuestionId::global(GlobalQuestion::EvidenceSufficient)
+                            id == &QuestionId::global(GlobalQuestion::EvidenceSufficient) && self.evidence_sufficient
                                 || id.as_str().starts_with("candidate.use_tool-"),
                         )),
                     }),
@@ -133,6 +134,17 @@ async fn decide_turn(
     tools: FixtureTools,
     prior: Option<(ObservedStepStatus, CandidateId)>,
     optimistic_target: Option<&'static str>,
+) -> EngineDecision {
+    decide_with_evidence(turn, checkpoint, tools, prior, optimistic_target, true).await
+}
+
+async fn decide_with_evidence(
+    turn: &str,
+    checkpoint: Option<(&'static str, usize)>,
+    tools: FixtureTools,
+    prior: Option<(ObservedStepStatus, CandidateId)>,
+    optimistic_target: Option<&'static str>,
+    evidence_sufficient: bool,
 ) -> EngineDecision {
     let key = fixture_key();
     let mut state = fixtures::state(&key, turn);
@@ -251,6 +263,7 @@ async fn decide_turn(
         prediction: ScoringPrediction {
             inner: backend.prediction_port(None),
             optimistic_target,
+            evidence_sufficient,
         },
         rehearsal_ports: &ports,
         request_limits: RequestLimits::default(),
@@ -344,11 +357,11 @@ async fn deadline_keeps_commit_only_after_complete_scoring() {
     assert!(matches!(
         partial.selection,
         Selection::Abstain {
-            action: CausalActionKind::Answer,
+            action: CausalActionKind::Clarify,
             reason_code: "deadline_exceeded"
         }
     ));
-    assert_answer(&partial);
+    assert_eq!(record(&partial).directive_kind, "clarify");
 }
 
 #[tokio::test]
@@ -513,4 +526,27 @@ async fn default_credential_tool_cannot_reach_commit_bar() {
         0.82,
     ))
     .await;
+}
+
+#[tokio::test]
+async fn r3_exact_read_selection_reason_preserves_the_abstention_column() {
+    let decision = decide_with_evidence(
+        "Use file_read on /tmp/prx_fixture/input.md",
+        None,
+        FixtureTools::Filesystem,
+        None,
+        Some("filesystem"),
+        false,
+    )
+    .await;
+    let Selection::Commit { reason_code, .. } = &decision.selection else {
+        panic!("above-bar read control")
+    };
+    assert_eq!(*reason_code, Some("exact_read"));
+    let row = record(&decision);
+    assert!(row.abstention_reason.is_none());
+    assert_eq!(
+        row.features.get("selection_reason").and_then(serde_json::Value::as_str),
+        Some("exact_read")
+    );
 }

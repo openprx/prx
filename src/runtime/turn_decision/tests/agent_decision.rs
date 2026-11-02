@@ -725,7 +725,8 @@ async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
         directive_from_selection(expired.engine(), &directive_context),
         Ok(TurnExecutionDirective::AnswerDirectly)
     ));
-    // The decision deadline bounds selection, not the issued model Answer.
+    // Expiry during selection closes locally; this already-issued conversational
+    // Answer is unchanged by editing its audit deadline after issuance.
     // Actual terminal closure still seals provider and evidence access.
     assert!(
         expired.retrieved().expect("already selected evidence").is_empty(),
@@ -894,4 +895,102 @@ async fn agent_initial_decision_respects_configured_four_kib_wire_limit() {
         Some(crate::decision::factory::ServedBy::Builtin)
     );
     assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
+}
+
+#[tokio::test]
+async fn r3_o9_o14_and_quoted_shell_fallbacks_publish_no_execution_refs() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.causal_tree.enabled = true;
+    config.causal_tree.policy.max_decision_hops = 0;
+    config.autonomy.level = crate::security::AutonomyLevel::Full;
+    config.providers.models.push(
+        toml::from_str(
+            "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+        )
+        .unwrap(),
+    );
+    let generation = crate::config::new_shared(config.clone()).pin();
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+        Box::new(crate::tools::file_read::FileReadTool::new(Arc::clone(&security), false)),
+        Box::new(crate::tools::file_write::FileWriteTool::new(Arc::clone(&security))),
+        Box::new(crate::tools::shell::ShellTool::new(
+            Arc::new(crate::runtime::NativeRuntime::new()),
+            workspace.path().to_owned(),
+        )),
+    ]);
+    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
+        Arc::clone(&registry),
+        Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+        Arc::new(DenyApprovalStrategy),
+        Arc::new(AdapterOwnedPreparation),
+        Arc::new(TracingToolExecutionAudit),
+    ));
+    let provider_catalog = ProviderCatalogView::from_config(&config);
+    let transports = CountingTransports(AtomicUsize::new(0));
+    let service = build_turn_decision_service(
+        TurnSurfaceKind::AgentLoop,
+        TurnServiceBuild {
+            parent_grant: None,
+            generation: Arc::clone(&generation),
+            registry,
+            execution,
+            catalog_sources: sources(&generation, &config),
+            surface_policy: SurfacePolicy {
+                direct_names: ["file_read", "file_write", "shell"].map(str::to_owned).into(),
+                ..SurfacePolicy::default()
+            },
+            provider_catalog: &provider_catalog,
+            transports: &transports,
+            events: Arc::new(SilentEvents),
+            memory: Arc::clone(&memory),
+            security,
+        },
+    )
+    .await
+    .unwrap();
+    for input in [
+        "Read /tmp/prx_fixture/brief.md, /tmp/prx_fixture/src/plan.rs and /tmp/prx_fixture/docs/contract.md. Complete the implementation and write /tmp/prx_fixture/report.md. Include the changed files and verification results. End the report with STATUS: READY_FOR_REVIEW.",
+        "Resume and finish the requested implementation. Do not run git, do not redo completed work, do not deploy, and do not change unrelated files. Inspect /tmp/prx_fixture/a.rs /tmp/prx_fixture/b.rs /tmp/prx_fixture/c.rs /tmp/prx_fixture/d.rs /tmp/prx_fixture/e.rs /tmp/prx_fixture/f.rs /tmp/prx_fixture/g.rs /tmp/prx_fixture/h.rs /tmp/prx_fixture/i.rs /tmp/prx_fixture/j.rs. Write the report with changes, tests and final STATUS.",
+        "what does `rm -rf build/` do?",
+    ] {
+        let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+            &generation,
+            Arc::clone(&memory),
+            input,
+            "prx_fallback_publication",
+            ("ollama", "prx-local-model"),
+        )
+        .await;
+        assert!(
+            service.model_can_call_tools(&proof),
+            "publication fixture requires real tool-operation support"
+        );
+        let context = service
+            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            context.engine().selection,
+            crate::causal_tree::decision_select::Selection::Abstain {
+                action: CausalActionKind::Answer,
+                ..
+            }
+        ));
+        assert!(matches!(context.directive(), TurnExecutionDirective::AnswerDirectly));
+        assert!(context.execution_refs().is_empty());
+        assert!(
+            service
+                .agent_execution_specs(&proof, &context)
+                .unwrap()
+                .specs
+                .is_empty()
+        );
+        context.terminal_execution_trace();
+    }
+    assert_eq!(transports.0.load(Ordering::SeqCst), 0);
+    service.shutdown(Instant::now() + Duration::from_secs(5)).await;
 }

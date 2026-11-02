@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Honor exact approved decision resumes, close expired or text-less decisions locally, and keep confidence fallback answers free of tool execution authority.
+
 - Catalog-backed model checks read the active release rows and aliases at
   runtime. Kimi Code still refuses a spelling outside that set, because its
   endpoint can accept a mistype. Other providers keep an explicitly configured
