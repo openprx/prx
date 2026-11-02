@@ -15,6 +15,11 @@ pub(super) struct EraseJob {
 pub(super) async fn run(inner: std::sync::Arc<Inner>, mut jobs: mpsc::Receiver<EraseJob>) {
     while let Some(job) = jobs.recv().await {
         let result = perform(&inner, &job).await;
+        if result.is_err() {
+            for message in &job.message_ids {
+                inner.resume_delete(&job.account, &job.conversation, message);
+            }
+        }
         let _ = job.done.send(result);
     }
 }
@@ -59,7 +64,7 @@ pub(super) async fn perform(inner: &Inner, job: &EraseJob) -> Result<(), String>
         super::erase_index::remove(&inner.store, &job.account, &job.conversation, message_id)
             .map_err(|error| error.to_string())?;
         storage(backend.clone(), move |store| store.finish_delete(&origin)).await?;
-        inner.resume_delete(&job.conversation, message_id);
+        inner.resume_delete(&job.account, &job.conversation, message_id);
     }
     Ok(())
 }

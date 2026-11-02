@@ -1,4 +1,5 @@
 use super::{HistoryEntry, SPAWN_EXECUTION_CONTEXT, SubAgentRun, SubAgentStatus, steering_instruction};
+use crate::agent::channel_approval::spawn as spawn_scoped;
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::turn_contracts::ScopeContext;
 use crate::hooks::HookManager;
@@ -344,7 +345,7 @@ pub(super) async fn run_sub_agent_task(
         let loop_cleanup =
             crate::runtime::turn_cleanup::CleanupScope::new(cleanup_parent.as_ref(), CancellationToken::new())?
                 .with_acknowledgement(Some(cleanup_ack));
-        let mut loop_handle = tokio::spawn(crate::agent::idle::scope_beat(Some(run_beat), async move {
+        let mut loop_handle = spawn_scoped(crate::agent::idle::scope_beat(Some(run_beat), async move {
             // Carry the segment proof across the spawn boundary explicitly.
             let child_source = child_source_owned;
             let child_service = child_service_owned;

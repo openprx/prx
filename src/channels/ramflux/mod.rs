@@ -273,9 +273,12 @@ impl Inner {
             .unwrap_or_else(|| message.to_owned())
     }
 
-    fn resume_delete(&self, conversation: &str, message: &str) {
+    fn resume_delete(&self, account: &str, conversation: &str, message: &str) {
         let ready = {
             let _admission = self.admission.lock();
+            self.deleting
+                .lock()
+                .remove(&(account.to_owned(), conversation.to_owned(), message.to_owned()));
             let ready = self.queue.resume_delete(conversation, message);
             for next in &ready {
                 self.note_slot_message(&next.conversation_id, &next.message_id);
@@ -848,10 +851,26 @@ impl Channel for RamfluxChannel {
                             "message_id":derived_id,
                             "sender":action.sender, "chat":chat, "text":content, "timestamp_ms":unix_ms(),
                         });
-                        if let Err(error) = inbound::on_message(&self.inner, &params).await {
-                            tracing::warn!(%error, "ramflux action was not admitted");
-                        }
-                        continue;
+                        // Deliver an admitted action at this position in the
+                        // input stream. This loop must never send to rich_tx,
+                        // whose only consumer is this same loop.
+                        let admitted = match inbound::prepare_message(&self.inner, &params) {
+                            Ok(Some(turn_queue::Admission::Interrupt(message))) => {
+                                self.inner.cancel_tokens(&message.conversation_id);
+                                message
+                            }
+                            Ok(Some(turn_queue::Admission::Start(message))) => message,
+                            Ok(Some(turn_queue::Admission::Rejected { depth })) => {
+                                tracing::warn!(depth, "ramflux action queue is full");
+                                continue;
+                            }
+                            Ok(Some(turn_queue::Admission::Queued) | None) => continue,
+                            Err(error) => {
+                                tracing::warn!(%error, "ramflux action was not admitted");
+                                continue;
+                            }
+                        };
+                        admitted.to_channel_message()
                     }
                     RichInbound::TaskEvent(event) => {
                         self.inner.project_task_event(&event).await;

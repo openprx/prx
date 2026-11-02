@@ -12,9 +12,11 @@ use tokio::net::UnixStream;
 mod approval;
 mod crypto;
 mod erase;
+mod erase_failure;
 mod inbound;
 mod protocol;
 mod socket;
+mod surface_burst;
 mod surface_schema;
 mod turn_queue;
 
@@ -35,7 +37,7 @@ struct Host {
     path: PathBuf,
     read: BufReader<tokio::net::unix::OwnedReadHalf>,
     write: tokio::net::unix::OwnedWriteHalf,
-    _inbound: tokio::sync::mpsc::Receiver<crate::channels::rich::RichInbound>,
+    inbound: tokio::sync::mpsc::Receiver<crate::channels::rich::RichInbound>,
     _dir: tempfile::TempDir,
 }
 
@@ -66,7 +68,7 @@ impl Host {
             path,
             read: BufReader::new(read),
             write,
-            _inbound: inbound,
+            inbound,
             _dir: dir,
         }
     }

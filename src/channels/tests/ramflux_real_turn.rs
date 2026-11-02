@@ -17,6 +17,8 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+mod task_mode;
+
 struct WordsProvider;
 
 #[async_trait::async_trait]

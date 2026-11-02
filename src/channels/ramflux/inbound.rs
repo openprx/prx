@@ -90,7 +90,7 @@ pub async fn on_frame(inner: &std::sync::Arc<Inner>, bytes: &[u8]) -> Result<(),
                 return Ok(());
             }
             if method == protocol::METHOD_INBOUND_DELETED {
-                if let Err(error) = schedule_delete(inner, id.clone(), &params).await {
+                if let Err(error) = schedule_delete(inner, id.clone(), &params) {
                     let _ = inner.rpc.respond_error(&id, &error_body(&error)).await;
                     return Err(error);
                 }
@@ -221,7 +221,10 @@ fn on_ping(inner: &Inner) -> Result<Value, InboundError> {
     Ok(json!({"ok": true}))
 }
 
-fn prepare_message(inner: &Inner, params: &Value) -> Result<Option<super::turn_queue::Admission>, InboundError> {
+pub(super) fn prepare_message(
+    inner: &Inner,
+    params: &Value,
+) -> Result<Option<super::turn_queue::Admission>, InboundError> {
     let _admission_guard = inner.admission.lock();
     ensure_running(inner)?;
     let message: InboundMessageParams = parse(params)?;
@@ -433,7 +436,11 @@ async fn on_control(inner: &Inner, params: &Value) -> Result<Value, InboundError
 /// Queue the erase and return to the read loop. The JSON-RPC result is sent
 /// by a separate task after the eraser finishes, so this task can still read
 /// an ingress ack.
-async fn schedule_delete(inner: &Inner, id: super::protocol::RpcId, params: &Value) -> Result<(), InboundError> {
+fn schedule_delete(
+    inner: &std::sync::Arc<Inner>,
+    id: super::protocol::RpcId,
+    params: &Value,
+) -> Result<(), InboundError> {
     if !inner.hello_done.load(Ordering::Acquire) {
         return Err(InboundError::HelloRequired);
     }
@@ -445,6 +452,17 @@ async fn schedule_delete(inner: &Inner, id: super::protocol::RpcId, params: &Val
         message_id = %deleted.message_id,
         "ramflux message deleted"
     );
+    // Refusal must have no admission side effects. Reserve the worker slot
+    // before cancelling input or installing the deletion barrier.
+    let sender = inner
+        .erase_tx
+        .lock()
+        .clone()
+        .ok_or_else(|| InboundError::Failed("eraser is not running".to_owned()))?;
+    let permit = sender.try_reserve_owned().map_err(|error| match error {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => InboundError::QueueFull(super::eraser::QUEUE_CAP),
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => InboundError::Failed("eraser is not running".to_owned()),
+    })?;
     let account = inner.account_id.lock().clone().unwrap_or_default();
     {
         let _admission = inner.admission.lock();
@@ -465,21 +483,11 @@ async fn schedule_delete(inner: &Inner, id: super::protocol::RpcId, params: &Val
         message_ids: vec![deleted.message_id.clone()],
         done: done_tx,
     };
-    let sender = inner.erase_tx.lock().clone();
-    let Some(sender) = sender else {
-        return Err(InboundError::Failed("eraser is not running".to_string()));
-    };
-    match sender.try_send(job) {
-        Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            let body = error_body(&InboundError::QueueFull(super::eraser::QUEUE_CAP));
-            let _ = inner.rpc.respond_error(&id, &body).await;
-            return Ok(());
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            return Err(InboundError::Failed("eraser is not running".to_string()));
-        }
-    }
+    permit.send(job);
+    let recovery = std::sync::Arc::clone(inner);
+    let recovery_account = inner.account_id.lock().clone().unwrap_or_default();
+    let recovery_conversation = deleted.conversation_id.clone();
+    let recovery_message = deleted.message_id.clone();
     let rpc = std::sync::Arc::clone(&inner.rpc);
     let inbound = inner.inbound_tx.lock().clone();
     let notice = MessageDeletedInbound {
@@ -489,7 +497,10 @@ async fn schedule_delete(inner: &Inner, id: super::protocol::RpcId, params: &Val
         timestamp_ms: deleted.timestamp_ms,
     };
     tokio::spawn(async move {
-        let outcome = done_rx.await.unwrap_or_else(|_| Err("eraser stopped".to_string()));
+        let outcome = done_rx.await.unwrap_or_else(|_| {
+            recovery.resume_delete(&recovery_account, &recovery_conversation, &recovery_message);
+            Err("eraser stopped".to_owned())
+        });
         match outcome {
             Ok(()) => {
                 let _ = rpc.respond(&id, &json!({"erased": true})).await;
