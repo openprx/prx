@@ -1098,6 +1098,13 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
     let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
         .await
         .expect("owned mechanics decision listener");
+    driver.stall_next_response(Duration::from_millis(
+        mechanics_config
+            .causal_tree
+            .policy
+            .extra_latency_budget_ms
+            .saturating_add(1),
+    ));
     let endpoint = driver.endpoint().to_owned();
     driver
         .run_factory(true, || async {
@@ -1109,20 +1116,41 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
             let drained = cleanup
                 .run(q79_boxed_fixture_work(async {
                     let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
-                        // The compatible decision endpoint is real loopback I/O. Let that
-                        // admission run on wall time, then restore the paused clock before
-                        // the idle guard starts measuring the production tool loop.
-                        tokio::time::resume();
-                        let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
-                            mechanics_config,
-                            input,
-                            Arc::clone(&tools_registry),
-                            mechanics_memory,
-                            &endpoint,
-                            &provider,
-                        )
+                        // Admission owns real TCP/SQLite work. Keep Tokio runnable until
+                        // that future is ready so paused time cannot auto-advance its
+                        // transport timers while I/O is pending. The decision clock
+                        // independently keeps wall preemption out of its policy budget.
+                        let admission_started = tokio::time::Instant::now();
+                        let decision_clock = crate::causal_tree::logical_clock::ManualClock::new();
+                        let admission = crate::causal_tree::logical_clock::scope(decision_clock, async {
+                            let admitting = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
+                                mechanics_config,
+                                input,
+                                Arc::clone(&tools_registry),
+                                mechanics_memory,
+                                &endpoint,
+                                &provider,
+                            );
+                            tokio::pin!(admitting);
+                            // Safety net only: a paused Tokio timer must fail clearly,
+                            // rather than keeping the readiness driver runnable forever.
+                            let mut polls_left = 10_000_000_u32;
+                            loop {
+                                if let std::task::Poll::Ready(admitted) = futures::poll!(&mut admitting) {
+                                    break admitted;
+                                }
+                                polls_left = polls_left.checked_sub(1).expect(
+                                    "mechanics admission exceeded 10000000 polls; it may be waiting on a paused Tokio timer",
+                                );
+                                tokio::task::yield_now().await;
+                            }
+                        })
                         .await;
-                        tokio::time::pause();
+                        assert_eq!(
+                            tokio::time::Instant::now(),
+                            admission_started,
+                            "real admission I/O must finish before virtual watchdog time advances"
+                        );
                         admission.assert_core_specs(&tool_specs_of(&tools_registry));
                         let observer = NoopObserver;
 
@@ -1193,6 +1221,9 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
                     }))
                     .catch_unwind()
                     .await;
+                    // Drain real writes on real time after either the watchdog
+                    // verdict or a fixture panic; the 15-second drain is unchanged.
+                    tokio::time::resume();
                     if let Err(panic) = caught {
                         original_panic = Some(panic);
                     }
@@ -1284,10 +1315,16 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
                                 &provider,
                             );
                             tokio::pin!(admitting);
+                            // Safety net only: a paused Tokio timer must fail clearly,
+                            // rather than keeping the readiness driver runnable forever.
+                            let mut polls_left = 10_000_000_u32;
                             loop {
                                 if let std::task::Poll::Ready(admitted) = futures::poll!(&mut admitting) {
                                     break admitted;
                                 }
+                                polls_left = polls_left.checked_sub(1).expect(
+                                    "mechanics admission exceeded 10000000 polls; it may be waiting on a paused Tokio timer",
+                                );
                                 tokio::task::yield_now().await;
                             }
                         })

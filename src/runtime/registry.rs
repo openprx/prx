@@ -1842,7 +1842,19 @@ mod tests {
             };
             assert!(pid_exists(grandchild), "test: grandchild should be alive to start with");
 
-            let leader = find_by_name(&format!("sh -c {script}")).expect("test: leader must be registered");
+            // Registry labels may end at a UTF-8 boundary before an ellipsis.
+            // Compare the full command against the registered prefix, including its temp directory.
+            let label = format!("sh -c {script}");
+            let leader = snapshot_all()
+                .into_iter()
+                .find(|row| {
+                    *row.name == label
+                        || row
+                            .name
+                            .strip_suffix('…')
+                            .is_some_and(|prefix| label.starts_with(prefix))
+                })
+                .expect("test: leader must be registered");
             assert!(leader.pgid.is_some(), "the leader must lead its own process group");
 
             let results = kill(leader.id, false).await;
