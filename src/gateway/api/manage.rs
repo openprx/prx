@@ -826,7 +826,7 @@ pub async fn get_history(State(state): State<AppState>) -> Response {
     let records = match read {
         Ok(records) => records,
         Err(error) => {
-            warn!("Failed to read the configuration history: {error:#}");
+            warn!(error = %redact_provider_text(&format!("{error:#}")), "Failed to read the configuration history");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "Failed to read the configuration history"})),

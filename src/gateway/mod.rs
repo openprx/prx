@@ -2226,7 +2226,7 @@ async fn handle_pair(
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
             if let Err(err) = persist_pairing_tokens(&state.config, &state.pairing).await {
-                tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
+                tracing::error!(error = %crate::security::redaction::redact_provider_text(&format!("{err:#}")), "🔐 Pairing succeeded but token persistence failed");
                 let body = serde_json::json!({
                     "paired": true,
                     "persisted": false,
@@ -3530,7 +3530,7 @@ async fn run_channel_webhook_job_work(
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for {channel_key} message: {e:#}");
+                tracing::error!(error = %crate::security::redaction::redact_provider_text(&format!("{e:#}")), "LLM error for {channel_key} message");
                 if let Err((status, body)) = authorize_gateway_resource_mutation(
                     &state,
                     &gateway_channel_webhook_operation(channel_key, "send"),

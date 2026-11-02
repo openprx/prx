@@ -432,7 +432,7 @@ pub fn render_message(report: &MessageReport) -> String {
 /// Render a failed kill/steer: the reason, nothing invented on top of it.
 #[must_use]
 pub fn render_failure(what: &str, error: &anyhow::Error) -> String {
-    format!("{what}: {error:#}")
+    crate::security::redaction::redact_provider_text(&format!("{what}: {error:#}"))
 }
 
 /// Render a failed listing, degrading to this chat's own sessions.
@@ -442,7 +442,7 @@ pub fn render_failure(what: &str, error: &anyhow::Error) -> String {
 /// operator must never read the local list as if it were the daemon's.
 #[must_use]
 pub fn render_listing_failure(error: &anyhow::Error, local_fallback: Option<&str>) -> String {
-    let head = format!("Daemon sessions unavailable: {error:#}");
+    let head = crate::security::redaction::redact_provider_text(&format!("Daemon sessions unavailable: {error:#}"));
     match local_fallback {
         Some(local) if !local.trim().is_empty() => {
             format!("{head}\n\nShowing this chat's own sessions instead:\n{local}")
@@ -1018,5 +1018,17 @@ mod tests {
         .await;
         assert!(rendered.starts_with("Daemon steer failed: "), "{rendered}");
         assert!(rendered.contains("127.0.0.1:1"), "{rendered}");
+    }
+    /// Mutation: return the raw error chain from either daemon notice renderer.
+    #[test]
+    fn daemon_failure_notices_hide_nested_credentials() {
+        let error = anyhow::anyhow!("token=opaque7credential").context("failed");
+        for notice in [
+            render_failure("Daemon request failed", &error),
+            render_listing_failure(&error, None),
+        ] {
+            assert!(notice.contains("failed: token=[REDACTED]"), "{notice}");
+            assert!(!notice.contains("opaque7credential"), "{notice}");
+        }
     }
 }

@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed rich turns, supervised or host-declared full autonomy, and at-rest
   encryption for that channel's memory. prx does not hold ramflux keys.
 
+### Security
+
+- Redact credentials inside nested diagnostic pairs and error context chains,
+  including URL userinfo and credential query values in plain-text secret
+  scans. Apply shared redaction before error chains reach diagnostic logs,
+  runtime records, tool errors, or operator notices.
+
 ### Changed
 
 - **Known behaviour:** with the default builtin decision plane, named-tool chat

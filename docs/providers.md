@@ -506,6 +506,15 @@ tool_call   = "xml_function_tags"                # optional: "native" | "xml_fun
 - **An entry nothing uses** (not the default provider, a fallback, a model
   route, a router model or an agent) still loads, with a warning naming the
   entry: it is usually a mistyped port or path.
+- **Nested credentials in diagnostic text.** The shared secret scanner reads
+  pair headers independently of their values, so a plain outer pair such as
+  `failed: cause: token=value` cannot hide the inner credential. Names and
+  separators stay visible; credential values are replaced at any nesting
+  depth, with bare or quoted names and values. URL userinfo and credential
+  query parameters are detected before pairs, including percent-encoded
+  parameter names, even through plain `redact_secrets`. Noncredential query
+  values remain visible there. Provider diagnostic rendering additionally
+  masks every URL query value and fragment through `redact_provider_text`.
 - **Secrets in the URL.** A `custom:` URL may carry `user:password@`. The
   table then holds that credential, exactly as `default_provider` does. The
   real URL is used only to reach the endpoint. PRX redacts the userinfo, as

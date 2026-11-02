@@ -1498,7 +1498,7 @@ async fn run_internal(
         if model_command.is_some() || level_command.is_some() {
             let (new_model, candidate_options) = match super::model_commands::selection(&user_input, &current_model_owned, provider_name, &provider_runtime_options) {
                 Ok(selection) => selection,
-                Err(error) => { emit_chat_output(&format!("{error:#}")); continue; }
+                Err(error) => { emit_chat_output(&crate::security::redaction::redact_provider_text(&format!("{error:#}"))); continue; }
             };
             let new_model = new_model.as_str();
             let rebuilt = chat_model_switch(&config, provider_name, new_model).and_then(|()| {

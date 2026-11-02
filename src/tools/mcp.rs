@@ -828,7 +828,7 @@ impl McpTool {
                         tracing::warn!(
                             server = %shown,
                             url = %crate::providers::redact_endpoint_userinfo(url),
-                            error = %crate::providers::redact_endpoint_userinfo(&e.to_string()),
+                            error = %crate::security::redaction::redact_provider_text(&e.to_string()),
                             path = %self.mcp_json_path.display(),
                             "Blocked MCP HTTP server from workspace mcp.json: \
                              URL targets a private or local address"
@@ -1454,7 +1454,7 @@ impl McpTool {
                 Err(error) => {
                     // A transport error quotes the server URL, userinfo
                     // included; neither the log nor the status API shows it.
-                    let error = crate::providers::redact_endpoint_userinfo(&error.to_string()).into_owned();
+                    let error = crate::security::redaction::redact_provider_text(&error.to_string());
                     tracing::warn!(server = server_name, error = %error, "MCP tool discovery failed");
                     discovery_errors.insert(server_name.clone(), error);
                 }
@@ -1787,7 +1787,7 @@ impl Tool for McpTool {
             Err(err) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(crate::providers::redact_endpoint_userinfo(&format!("{err:#}")).into_owned()),
+                error: Some(crate::security::redaction::redact_provider_text(&format!("{err:#}"))),
             }),
         }
     }

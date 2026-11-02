@@ -21,6 +21,9 @@
 //!   secret only when it looks like one (D-054 amendment 4). The bare names
 //!   `key` and `auth` count only as JSON object keys or in `key=` /
 //!   `--key=` form, not as `key:` in prose or YAML;
+//! - nested credential pairs after plain context names, including anyhow
+//!   error chains, and URL credential query values (with decoded names),
+//!   found before generic pair scanning using original input offsets;
 //! - the credential after any `Authorization:` / `Proxy-Authorization:`
 //!   scheme (`Bearer`, `Basic`, `Bot`, `SSWS`, `ApiKey`, `AWS4-HMAC-SHA256`,
 //!   ...) and after a bare `Bearer`, at any length;
@@ -45,13 +48,10 @@ use std::sync::LazyLock;
 /// What a redacted secret is replaced with.
 pub const REDACTED: &str = "[REDACTED]";
 
-/// Any `name = value` / `name: value` pair: an opening quote of the name is
-/// capture 1, the name capture 2, the separator capture 3, and the value the
-/// first non-empty of capture 4 (double-quoted), 5 (single-quoted) or 6
-/// (bare). Only a pair whose name is a credential name is a secret.
-static KEYED_PAIR: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    Regex::new(r#"(["']?)([A-Za-z0-9_.-]+)["']?\s*([:=])\s*(?:"([^"]+)"|'([^']+)'|([^\s"',;{}]+))"#).ok()
-});
+/// Pair headers only: optional name quote, name and separator. Consuming a
+/// value here would hide the next header inside an outer pair's value.
+static KEYED_PAIR: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r#"(["']?)([A-Za-z0-9_.-]+)["']?\s*([:=])\s*"#).ok());
 
 /// The credential after an `Authorization:` / `Proxy-Authorization:` scheme
 /// word, whatever the scheme: capture 1, up to the end of the header value.
@@ -382,70 +382,274 @@ fn prefixed_token_spans(text: &str, spans: &mut Vec<Range<usize>>) {
     }
 }
 
-fn keyed_pair_spans(text: &str, spans: &mut Vec<Range<usize>>) {
+/// Cached value boundaries and token-shape summaries. Header positions only
+/// advance, so each quote/bare boundary is searched once per disjoint region.
+#[derive(Default)]
+struct PairValueScan {
+    end: usize,
+    shape: Option<(usize, SecretShape)>,
+}
+
+struct SecretShape {
+    valid_from: usize,
+    last_letter: Option<usize>,
+    last_digit: Option<usize>,
+}
+
+impl PairValueScan {
+    fn value(&mut self, text: &str, start: usize, quote: Option<char>) -> Option<Range<usize>> {
+        let body = start + usize::from(quote.is_some());
+        if self.end <= start {
+            let tail = text.get(body..)?;
+            let offset = tail.find(|character: char| {
+                quote.map_or_else(
+                    || character.is_whitespace() || matches!(character, '"' | '\'' | ',' | ';' | '{' | '}'),
+                    |quote| character == quote,
+                )
+            });
+            self.end = offset.map_or(text.len(), |offset| body + offset);
+            self.shape = None;
+            #[cfg(test)]
+            record_redaction_work(self.end - body + usize::from(offset.is_some()));
+        }
+        if quote.is_some() && self.end == text.len() {
+            return None;
+        }
+        (body < self.end).then_some(body..self.end)
+    }
+
+    fn secret_shaped(&mut self, text: &str, value: &Range<usize>) -> bool {
+        if value.len() < 24 {
+            return false;
+        }
+        // UUID recognition reads at most 36 bytes, independently of nesting.
+        if value.len() == 36 {
+            #[cfg(test)]
+            record_redaction_work(4 * value.len());
+            return text.get(value.clone()).is_some_and(looks_like_a_secret);
+        }
+        if self.shape.as_ref().is_none_or(|(end, _)| *end != value.end) {
+            let Some(source) = text.get(value.clone()) else {
+                return false;
+            };
+            let mut shape = SecretShape {
+                valid_from: value.start,
+                last_letter: None,
+                last_digit: None,
+            };
+            for (offset, byte) in source.bytes().enumerate() {
+                let position = value.start + offset;
+                if !byte.is_ascii_alphanumeric() && !matches!(byte, b'+' | b'/' | b'=' | b'-') {
+                    shape.valid_from = position + 1;
+                }
+                if byte.is_ascii_alphabetic() {
+                    shape.last_letter = Some(position);
+                }
+                if byte.is_ascii_digit() {
+                    shape.last_digit = Some(position);
+                }
+            }
+            #[cfg(test)]
+            record_redaction_work(source.len());
+            self.shape = Some((value.end, shape));
+        }
+        self.shape.as_ref().is_some_and(|(_, shape)| {
+            shape.valid_from <= value.start
+                && shape.last_letter.is_some_and(|last| last >= value.start)
+                && shape.last_digit.is_some_and(|last| last >= value.start)
+        })
+    }
+}
+
+struct UrlPart {
+    range: Range<usize>,
+    value_start: Option<usize>,
+}
+
+fn keyed_pair_spans(text: &str, url_parts: &[UrlPart], spans: &mut Vec<Range<usize>>) {
     let Some(pair) = KEYED_PAIR.as_ref() else {
         return;
     };
-    // One pass of the pattern over the text (`regex` matches in linear time).
     #[cfg(test)]
     record_redaction_work(text.len());
+    let mut values: [PairValueScan; 3] = std::array::from_fn(|_| PairValueScan::default());
+    let mut covered_until = 0;
+    let mut url_part = 0;
+    // Only the header is consumed. In `failed: token = value` the next
+    // header remains visible even when whitespace splits the inner pair.
     for captures in pair.captures_iter(text) {
-        // Each match is read again: its groups, the name's segments (twice
-        // at most: the header check and the classification) and the value.
-        #[cfg(test)]
-        record_redaction_work(
-            captures.get(0).map_or(0, |whole| whole.len()) + captures.get(2).map_or(0, |name| 2 * name.len()),
-        );
-        let (Some(name), Some(separator), Some(value)) = (
-            captures.get(2),
-            captures.get(3),
-            (4..=6).find_map(|group| captures.get(group)),
-        ) else {
+        let (Some(header), Some(name), Some(separator)) = (captures.get(0), captures.get(2), captures.get(3)) else {
             continue;
         };
-        let quoted_name = captures.get(1).is_some_and(|quote| !quote.is_empty());
-        // `Authorization: <scheme> <credential>`: the header rule owns it
-        let before_scheme = text[value.end()..].strip_prefix([' ', '\t']).is_some_and(|rest| {
-            let after_blanks = rest.trim_start_matches([' ', '\t']);
-            #[cfg(test)]
-            record_redaction_work(1 + rest.len() - after_blanks.len());
-            after_blanks.starts_with(|c: char| !c.is_whitespace())
-        });
+        #[cfg(test)]
+        record_redaction_work(header.len() + 2 * name.len());
         let names = name.as_str();
-        let is_header =
-            names.eq_ignore_ascii_case("authorization") || names.eq_ignore_ascii_case("proxy-authorization");
-        // an `Authorization:` that names only its scheme holds no credential
-        if is_header
-            && (before_scheme
-                || AUTH_SCHEMES
-                    .iter()
-                    .any(|scheme| value.as_str().eq_ignore_ascii_case(scheme)))
-        {
+        let quoted_name = captures.get(1).is_some_and(|quote| !quote.is_empty());
+        let bare_key = is_bare_key_or_auth(names);
+        let class = classify_name(names);
+        if (bare_key && !quoted_name && separator.as_str() != "=") || (!bare_key && class == KeyName::Plain) {
             continue;
         }
-        // bare `key` / `auth`: a JSON object key or `key=` / `--key=`, never
-        // `key:` in prose or YAML
-        let credential = if is_bare_key_or_auth(names) {
-            quoted_name || separator.as_str() == "="
-        } else {
-            is_credential_value(names, value.as_str())
+        let (kind, quote) = match text.get(header.end()..).and_then(|tail| tail.chars().next()) {
+            Some('"') => (1, Some('"')),
+            Some('\'') => (2, Some('\'')),
+            Some(_) => (0, None),
+            None => continue,
         };
-        if credential {
-            spans.push(value.range());
+        let Some(scan) = values.get_mut(kind) else {
+            continue;
+        };
+        let Some(mut value) = scan.value(text, header.end(), quote) else {
+            continue;
+        };
+        while url_parts
+            .get(url_part)
+            .is_some_and(|part| part.range.end <= name.start())
+        {
+            url_part += 1;
+        }
+        // A URL query value ends before the next parameter. Keep later names
+        // intact so the provider renderer can still mask every URL component.
+        if let Some(part) = url_parts.get(url_part)
+            && part.range.start <= name.start()
+        {
+            // The URL pass classifies the complete decoded parameter name.
+            // A partial regex name inside `public%5Fkey` must not override it.
+            if part.value_start.is_some_and(|start| name.start() < start) && header.end() <= part.range.end {
+                continue;
+            }
+            if header.end() < part.range.end {
+                value.end = value.end.min(part.range.end);
+            }
+        }
+        if value.is_empty() {
+            continue;
+        }
+        let Some(source) = text.get(value.clone()) else {
+            continue;
+        };
+        let is_header =
+            names.eq_ignore_ascii_case("authorization") || names.eq_ignore_ascii_case("proxy-authorization");
+        if is_header {
+            let scheme_word = source.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                && source
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+            let before_credential = scheme_word
+                && text.get(value.end..).is_some_and(|tail| {
+                    let after = tail.trim_start_matches([' ', '\t']);
+                    #[cfg(test)]
+                    record_redaction_work(tail.len() - after.len() + 1);
+                    after.len() < tail.len() && after.starts_with(|character: char| !character.is_whitespace())
+                });
+            if before_credential || AUTH_SCHEMES.iter().any(|scheme| source.eq_ignore_ascii_case(scheme)) {
+                continue;
+            }
+        }
+        let credential = bare_key
+            || match class {
+                KeyName::Credential => true,
+                KeyName::CredentialIfSecretShaped => scan.secret_shaped(text, &value),
+                KeyName::Plain => false,
+            };
+        if credential && value.end > covered_until {
+            covered_until = value.end;
+            spans.push(value);
         }
     }
 }
 
+/// Discover URL secrets before generic pairs, retaining component boundaries
+/// so a keyed query value cannot consume a later parameter or fragment.
+fn url_secret_spans(text: &str, spans: &mut Vec<Range<usize>>) -> Vec<UrlPart> {
+    #[cfg(test)]
+    record_redaction_work(text.len());
+    spans.extend(crate::providers::endpoint_userinfo_spans(text));
+    let mut parts = Vec::new();
+    let mut offset = 0;
+    while let Some(rest) = text.get(offset..).filter(|rest| !rest.is_empty()) {
+        let length = rest.find(ends_url).unwrap_or(rest.len());
+        let length = if length == 0 {
+            rest.chars().next().map_or(rest.len(), char::len_utf8)
+        } else {
+            length
+        };
+        let Some(token) = rest.get(..length) else {
+            break;
+        };
+        #[cfg(test)]
+        record_redaction_work(2 * token.len());
+        if let Some(colon) = token.find("://") {
+            let start = token.get(..colon).map_or(0, |prefix| {
+                prefix
+                    .char_indices()
+                    .rev()
+                    .find_map(|(at, character)| {
+                        (!(character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')))
+                            .then_some(at + character.len_utf8())
+                    })
+                    .unwrap_or(0)
+            });
+            if let Some(url) = token.get(start..) {
+                let base = offset + start;
+                let (before_fragment, fragment) = url
+                    .split_once('#')
+                    .map_or((url, None), |(head, tail)| (head, Some(tail)));
+                let (head, query) = before_fragment
+                    .split_once('?')
+                    .map_or((before_fragment, None), |(head, tail)| (head, Some(tail)));
+                parts.push(UrlPart {
+                    range: base..base + head.len(),
+                    value_start: None,
+                });
+                if let Some(query) = query {
+                    let mut parameter_start = base + head.len() + 1;
+                    for parameter in query.split('&') {
+                        let value_start = parameter.find('=').map(|at| parameter_start + at + 1);
+                        parts.push(UrlPart {
+                            range: parameter_start..parameter_start + parameter.len(),
+                            value_start,
+                        });
+                        if let Some((name, value)) = parameter.split_once('=') {
+                            // Invalid encodings stay literal; malformed text must
+                            // not prevent the remaining pairs from being scanned.
+                            let name = urlencoding::decode(name).unwrap_or(std::borrow::Cow::Borrowed(name));
+                            let decoded = urlencoding::decode(value).unwrap_or(std::borrow::Cow::Borrowed(value));
+                            #[cfg(test)]
+                            record_redaction_work(4 * parameter.len());
+                            if is_credential_value(&name, &decoded) {
+                                let value_start = parameter_start + parameter.find('=').unwrap_or(parameter.len()) + 1;
+                                spans.push(value_start..parameter_start + parameter.len());
+                            }
+                        }
+                        parameter_start += parameter.len() + 1;
+                    }
+                }
+                if let Some(fragment) = fragment {
+                    let fragment_start = base + before_fragment.len() + 1;
+                    parts.push(UrlPart {
+                        range: fragment_start..fragment_start + fragment.len(),
+                        value_start: None,
+                    });
+                }
+            }
+        }
+        offset += length;
+    }
+    parts
+}
+
 /// The byte ranges of every secret in `text` (values only, never their keys),
-/// sorted and merged where they overlap. URL userinfo is not included: it is
-/// rewritten before detection by [`redact_secrets_with`].
+/// sorted and merged where they overlap. Includes URL userinfo and credential
+/// query values, using offsets in the original text.
 #[must_use]
 pub fn find_secrets(text: &str) -> Vec<Range<usize>> {
     // Every stage records the work it does in the test-only counter: one
     // text-length pass per pattern (`regex` matches in linear time) plus the
     // bytes each match is read again, and the spans sorted and merged.
     let mut spans = Vec::new();
-    keyed_pair_spans(text, &mut spans);
+    let url_parts = url_secret_spans(text, &mut spans);
+    keyed_pair_spans(text, &url_parts, &mut spans);
     for pattern in [AUTHORIZATION_HEADER.as_ref(), BARE_BEARER.as_ref()]
         .into_iter()
         .flatten()
@@ -996,27 +1200,39 @@ mod tests {
         }
     }
 
+    const CREDENTIAL_KEY_NAMES: &[&str] = &[
+        "hmac_key",
+        "jwt_key",
+        "app_key",
+        "consumer_key",
+        "deploy_key",
+        "license_key",
+        "webhook_key",
+        "openai_key",
+        "hmacKey",
+        "licensekey",
+        "monkey",
+    ];
+
+    const NON_SECRET_KEY_NAMES: &[&str] = &[
+        "sort_key",
+        "primary_key",
+        "public_key",
+        "cache_key",
+        "idempotency_key",
+        "primarykey",
+        "partition_key",
+    ];
+
     /// D-054 amendment 4 (R-LOOPD5 R-1): a name ending in `key`, as a segment
     /// or run together, is a credential unless its stem is on the non-secret
     /// list; a `session_key` value is a secret only when it looks like one.
     #[test]
     fn every_key_name_is_a_credential_unless_its_stem_is_not_secret() {
-        for name in [
-            "hmac_key",
-            "jwt_key",
-            "app_key",
-            "consumer_key",
-            "deploy_key",
-            "license_key",
-            "webhook_key",
-            "openai_key",
-            "hmacKey",
-            "licensekey",
-            "monkey",
-        ] {
+        for name in CREDENTIAL_KEY_NAMES {
             let text = format!("{name}=abcdefgh12345678");
             assert_eq!(redact_secrets(&text), format!("{name}=[REDACTED]"), "{name} in text");
-            let mut json = serde_json::json!({ name: "abcdefgh12345678" });
+            let mut json = serde_json::json!({ *name: "abcdefgh12345678" });
             redact_json_value(&mut json);
             assert_eq!(
                 json.get(name).and_then(serde_json::Value::as_str),
@@ -1024,18 +1240,10 @@ mod tests {
                 "{name} in JSON"
             );
         }
-        for name in [
-            "sort_key",
-            "primary_key",
-            "public_key",
-            "cache_key",
-            "idempotency_key",
-            "primarykey",
-            "partition_key",
-        ] {
+        for name in NON_SECRET_KEY_NAMES {
             let text = format!("{name}=abcdefgh12345678");
             assert_eq!(redact_secrets(&text), text, "{name} in text");
-            let mut json = serde_json::json!({ name: "abcdefgh12345678" });
+            let mut json = serde_json::json!({ *name: "abcdefgh12345678" });
             redact_json_value(&mut json);
             assert_eq!(
                 json.get(name).and_then(serde_json::Value::as_str),
@@ -1348,6 +1556,216 @@ mod tests {
             "a tokenizer is not a credential"
         );
         assert_eq!(value.pointer("/count").and_then(serde_json::Value::as_u64), Some(3));
+    }
+
+    /// Mutation: restore a whole-value match, hiding the inner token header.
+    #[test]
+    fn anyhow_context_chains_cannot_hide_inner_credentials() {
+        let secret = "opaque7credentialvalue";
+        let error = anyhow::anyhow!("token={secret}")
+            .context("inner")
+            .context("cause")
+            .context("failed");
+        let chain = format!("{error:#}");
+        assert_eq!(redact_secrets(&chain), "failed: cause: inner: token=[REDACTED]");
+        for text in [
+            format!("failed: token = {secret}"),
+            format!("cause: password: '{secret}'"),
+            format!("reason: Authorization=Bearer {secret}"),
+        ] {
+            assert_redacts(&text, secret);
+        }
+    }
+
+    /// Mutation: skip a nested header whenever it starts inside a detected value.
+    #[test]
+    fn nested_quoted_credentials_can_extend_an_outer_value() {
+        let secret = "opaque7\"credential";
+        let text = format!("password=\"token='{secret}'\"");
+        let start = text.find(secret).expect("test: secret");
+        assert!(
+            find_secrets(&text)
+                .iter()
+                .any(|span| { span.start <= start && span.end >= start + secret.len() })
+        );
+        assert!(!redact_secrets(&text).contains("credential"));
+    }
+
+    /// Mutation: skip a header after a non-credential outer name or misclassify a key stem.
+    #[test]
+    fn nested_pairs_preserve_every_credential_name_class() {
+        let secret = "opaque7credentialvalue123456789";
+        for name in PRE_PROGRAM_CREDENTIAL_NAMES
+            .iter()
+            .chain(CREDENTIAL_KEY_NAMES)
+            .copied()
+            .chain(["key", "auth", "session_key", "sessionKey"])
+        {
+            for separator in ["=", " = ", ":", ": "] {
+                if matches!(name, "key" | "auth") && separator.trim() == ":" {
+                    continue;
+                }
+                let text = format!("k1: k2={name}{separator}{secret}");
+                assert_redacts(&text, secret);
+                let quoted = format!("k1: k2=\"{name}\"{separator}\"{secret}\"");
+                assert_redacts(&quoted, secret);
+            }
+        }
+        for name in NON_SECRET_KEY_NAMES {
+            let text = format!("context: {name}={secret}");
+            assert_eq!(redact_secrets(&text), text);
+        }
+        for text in [
+            "context: key: value",
+            "context: auth: required",
+            "context: session_key=delegate:chat:prx_user",
+        ] {
+            assert_eq!(redact_secrets(text), text);
+        }
+    }
+
+    /// Mutation: omit URL detection or let a query match consume the next parameter.
+    #[test]
+    fn plain_secret_spans_cover_url_userinfo_and_credential_queries() {
+        let secret = "opaque7credentialvalue";
+        let text =
+            format!("request failed for https://prx_user:{secret}@example.com/path?region=eu&key={secret}&next=ok");
+        let spans = find_secrets(&text);
+        for (start, _) in text.match_indices(secret) {
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.start <= start && span.end >= start + secret.len()),
+                "{spans:?}"
+            );
+        }
+        assert_eq!(
+            redact_secrets(&text),
+            "request failed for https://[redacted]@example.com/path?region=eu&key=[REDACTED]&next=ok"
+        );
+        for query in [
+            format!("?token={secret}"),
+            format!("?api%5Fkey={secret}"),
+            format!("?plain=token={secret}"),
+        ] {
+            assert_redacts(&format!("error: https://example.com/path{query}&region=eu"), secret);
+        }
+        for name in ["public_key", "public%5Fkey", "session%5Fkey"] {
+            let text = format!("https://example.com/path?{name}=identifier&region=eu");
+            assert_eq!(redact_secrets(&text), text);
+        }
+        assert_eq!(
+            redact_provider_text(&format!("https://example.com/path?api_key={secret}&region=eu#fragment")),
+            "https://example.com/path?api_key=[redacted]&region=[redacted]#[redacted]"
+        );
+        // The containing credential still owns the whole value, including URL parts.
+        assert_eq!(
+            redact_secrets("token=https://example.com/path?region=opaque7"),
+            "token=[REDACTED]"
+        );
+    }
+
+    /// Mutation: require a nonempty URL value before recognizing its complete parameter name.
+    #[test]
+    fn empty_url_credentials_keep_following_parameters() {
+        let text = "failed: https://example.com/path?token=&region=eu";
+        assert_eq!(redact_secrets(text), text);
+        assert_eq!(
+            redact_provider_text(text),
+            "failed: https://example.com/path?token=[redacted]&region=[redacted]"
+        );
+        assert_redacts(
+            "failed: https://example.com/path?token= opaque7credentialvalue",
+            "opaque7credentialvalue",
+        );
+    }
+
+    /// Mutation: stop scanning at an outer value, truncate a value, or return normalized offsets.
+    #[test]
+    fn generated_nested_pairs_cover_every_secret_value() {
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            state
+        };
+        let names: Vec<_> = PRE_PROGRAM_CREDENTIAL_NAMES
+            .iter()
+            .chain(CREDENTIAL_KEY_NAMES)
+            .copied()
+            .chain(["key", "auth", "session_key", "sessionKey"])
+            .collect();
+        let separators = ["=", " = ", ":", ": ", "\t=\n"];
+        let quotes = ["", "'", "\""];
+        for case in 0..2048 {
+            let index = usize::try_from(next()).unwrap_or(0) % names.len();
+            let name = names.get(index).copied().expect("test: generated name");
+            let name_quote = quotes
+                .get(usize::try_from(next()).unwrap_or(0) % quotes.len())
+                .copied()
+                .unwrap_or("");
+            let separator = separators
+                .get(usize::try_from(next()).unwrap_or(0) % separators.len())
+                .copied()
+                .unwrap_or("=");
+            let separator = if matches!(name, "key" | "auth") && name_quote.is_empty() && separator.trim() == ":" {
+                "="
+            } else {
+                separator
+            };
+            let value_quote = quotes
+                .get(usize::try_from(next()).unwrap_or(0) % quotes.len())
+                .copied()
+                .unwrap_or("");
+            let secret = format!("prx7value{:016x}end", next());
+            let mut text = format!("{name_quote}{name}{name_quote}{separator}{value_quote}{secret}{value_quote}");
+            let depth = usize::try_from(next() % 65).unwrap_or(0);
+            for level in 0..depth {
+                let quote = quotes
+                    .get(usize::try_from(next()).unwrap_or(0) % quotes.len())
+                    .copied()
+                    .unwrap_or("");
+                let separator = separators
+                    .get(usize::try_from(next()).unwrap_or(0) % separators.len())
+                    .copied()
+                    .unwrap_or("=");
+                text = format!("context{level}{separator}{quote}{text}{quote}");
+            }
+            text = format!("é context: {text}");
+            let start = text.find(&secret).expect("test: generated secret");
+            let spans = find_secrets(&text);
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.start <= start && span.end >= start + secret.len()),
+                "case {case}, depth {depth}: {text:?} -> {spans:?}"
+            );
+            assert!(!redact_secrets(&text).contains(&secret), "case {case}: {text:?}");
+        }
+    }
+
+    /// Mutation: search each overlapping value again, including failed session-key shape checks.
+    #[test]
+    fn redaction_work_is_linear_on_nested_pairs() {
+        for (unit, tail) in [
+            ("context=", "token=opaque7credentialvalue"),
+            ("context: ", "password='opaque7credentialvalue'"),
+            ("token=", "opaque7credentialvalue"),
+            ("sessionKey=", "invalid%tail"),
+        ] {
+            let small = format!("{}{tail}", unit.repeat(100 * 1024 / unit.len()));
+            let large = format!("{}{tail}", unit.repeat(1024 * 1024 / unit.len()));
+            let small_work = redaction_work(|| redact_secrets(&small));
+            let large_work = redaction_work(|| redact_secrets(&large));
+            assert!(
+                large_work * small.len() * 10 <= small_work * large.len() * 11,
+                "{unit:?}: {} bytes cost {small_work}, {} bytes cost {large_work}",
+                small.len(),
+                large.len()
+            );
+            if unit == "sessionKey=" {
+                assert_eq!(redact_secrets(&small), small);
+            }
+        }
     }
 
     /// R-C2BUk K-5 guard: the one redactor is linear on repeated short token

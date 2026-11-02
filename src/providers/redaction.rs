@@ -64,9 +64,31 @@ pub fn redact_endpoint_userinfo(provider: &str) -> std::borrow::Cow<'_, str> {
 /// authority's end, whether it holds an `@`, and the next credentialed URL
 /// are each a binary search, never a rescan of the rest of the text.
 pub(super) fn redact_free_text(provider: &str) -> std::borrow::Cow<'_, str> {
-    let index = TextIndex::new(provider);
+    let spans = endpoint_userinfo_spans(provider);
+    if spans.is_empty() {
+        return std::borrow::Cow::Borrowed(provider);
+    }
     let mut output = String::new();
     let mut copied = 0;
+    for span in spans {
+        output.push_str(provider.get(copied..span.start).unwrap_or_default());
+        output.push_str(REDACTED_USERINFO);
+        copied = span.end;
+    }
+    output.push_str(provider.get(copied..).unwrap_or_default());
+    std::borrow::Cow::Owned(output)
+}
+
+/// Original byte ranges of userinfo detected by the shared free-text scanner.
+/// The secret scanner needs these ranges without rewriting its input offsets.
+pub(crate) fn endpoint_userinfo_spans(provider: &str) -> Vec<std::ops::Range<usize>> {
+    #[cfg(test)]
+    record_userinfo_scan_work(provider.len());
+    if !provider.contains('@') {
+        return Vec::new();
+    }
+    let index = TextIndex::new(provider);
+    let mut spans = Vec::new();
     let mut search_from = 0;
     while let Some(found) = next_url_authority(provider, search_from) {
         let authority_end = index.authority_end(found.authority_start, found.special);
@@ -96,17 +118,11 @@ pub(super) fn redact_free_text(provider: &str) -> std::borrow::Cow<'_, str> {
         let userinfo = provider.get(found.authority_start..at).unwrap_or_default();
         // Already redacted, or the placeholder a pasteable declaration prints.
         if !matches!(userinfo, REDACTED_USERINFO | USERINFO_PLACEHOLDER) {
-            output.push_str(provider.get(copied..found.authority_start).unwrap_or_default());
-            output.push_str(REDACTED_USERINFO);
-            copied = at;
+            spans.push(found.authority_start..at);
         }
         search_from = at + 1;
     }
-    if copied == 0 {
-        return std::borrow::Cow::Borrowed(provider);
-    }
-    output.push_str(provider.get(copied..).unwrap_or_default());
-    std::borrow::Cow::Owned(output)
+    spans
 }
 
 // Bytes the userinfo redactor examined on this thread: a deterministic work

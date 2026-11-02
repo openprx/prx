@@ -1006,7 +1006,7 @@ impl ChatSessions {
 
 /// The one log line for a mutation that did not reach the store.
 fn write_through_failed(operation: &'static str, error: &anyhow::Error) {
-    tracing::error!(operation, "chat mailbox write-through failed: {error:#}");
+    tracing::error!(operation, error = %crate::security::redaction::redact_provider_text(&format!("{error:#}")), "chat mailbox write-through failed");
 }
 
 fn unix_ms() -> u64 {
@@ -1087,7 +1087,8 @@ pub fn attach_workspace_store(workspace_dir: &std::path::Path) -> Option<std::pa
         Err(error) => {
             tracing::error!(
                 path = %path.display(),
-                "chat mailbox persistence unavailable, running from memory only: {error:#}"
+                error = %crate::security::redaction::redact_provider_text(&format!("{error:#}")),
+                "chat mailbox persistence unavailable, running from memory only"
             );
             None
         }
@@ -1110,7 +1111,7 @@ impl ChatSessions {
                 // mutations may still be writable even when a read failed, and
                 // a mailbox that silently stopped persisting would be worse
                 // than one that lost a replay.
-                tracing::error!("chat mailbox could not be replayed: {error:#}");
+                tracing::error!(error = %crate::security::redaction::redact_provider_text(&format!("{error:#}")), "chat mailbox could not be replayed");
             }
         }
     }
@@ -4737,5 +4738,15 @@ mod tests {
             );
             previous_at_unix_ms = *at_unix_ms;
         }
+    }
+    /// Mutation: log the raw chain in write_through_failed.
+    #[test]
+    fn mailbox_failure_logs_hide_nested_credentials() {
+        let error = anyhow::anyhow!("token=opaque7credential").context("failed");
+        let (_, logs) = crate::runtime::sqlite_pool::log_capture::capturing_logs(|| {
+            write_through_failed("report", &error);
+        });
+        assert!(logs.contains("failed: token=[REDACTED]"), "{logs}");
+        assert!(!logs.contains("opaque7credential"), "{logs}");
     }
 }

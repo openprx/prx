@@ -1153,7 +1153,7 @@ fn hand_edited_remote_decisions(old: &Config, new: &Config) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_else(|error| {
-            tracing::warn!("could not compare the reloaded configuration: {error:#}");
+            tracing::warn!(error = %crate::security::redaction::redact_provider_text(&format!("{error:#}")), "could not compare the reloaded configuration");
             Vec::new()
         })
 }

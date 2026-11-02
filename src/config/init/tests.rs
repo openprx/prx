@@ -1292,3 +1292,14 @@ fn the_base_full_template_disable_reads_as_unset() {
     assert_eq!(report.dropped, ["enabled"]);
     assert!(root.get("causal_tree").and_then(|table| table.get("enabled")).is_none());
 }
+
+/// Mutation: retain a raw reset reason or post-commit error in InitReport.
+#[test]
+fn init_report_hides_nested_error_credentials() {
+    let error = anyhow::anyhow!("token=opaque7credential").context("failed");
+    let mut report = InitReport::default();
+    report.record_reset(&format!("{error:#}"), None);
+    report.record_post_commit_failure(&error);
+    assert_eq!(report.post_commit_failure(), Some("failed: token=[REDACTED]"));
+    assert!(report.warnings().iter().all(|line| !line.contains("opaque7credential")));
+}

@@ -798,6 +798,7 @@ impl VerdictStage {
         let judge = match judged {
             Ok(judge) => Some(judge),
             Err(err) => {
+                let err = crate::security::redaction::redact_provider_text(&format!("{err:#}"));
                 errors.push(format!(
                     "judge_failed: the model judge gave no verdict ({err:#}), so the verdict is deferred and nothing \
                      is written"
@@ -805,7 +806,7 @@ impl VerdictStage {
                 tracing::warn!(
                     target: "self_system",
                     layer = ?layer,
-                    error = %format!("{err:#}"),
+                    error = %err,
                     "evolution judge failed: the cycle's verdict is deferred"
                 );
                 None
@@ -880,6 +881,7 @@ impl VerdictStage {
                     CommitDecision::Applied
                 }
                 Err(err) => {
+                    let err = crate::security::redaction::redact_provider_text(&format!("{err:#}"));
                     errors.push(format!(
                         "apply_failed: the accepted change could not be written ({err:#})"
                     ));
@@ -904,7 +906,7 @@ impl VerdictStage {
         if appended.is_ok()
             && let Err(err) = writer.enforce_retention().await
         {
-            tracing::warn!(target: "self_system", error = %err, "evolution log retention failed");
+            tracing::warn!(target: "self_system", error = %crate::security::redaction::redact_provider_text(&format!("{err:#}")), "evolution log retention failed");
         }
         let cancelled = cancel
             .is_cancelled()
@@ -927,7 +929,7 @@ impl VerdictStage {
                     experiment_id = %experiment_id,
                     commit = ?commit,
                     errors = ?errors,
-                    error = %err,
+                    error = %crate::security::redaction::redact_provider_text(&format!("{err:#}")),
                     "evolution run was cancelled {what}, and its cycle could not be recorded"
                 ),
             }
@@ -936,6 +938,7 @@ impl VerdictStage {
         // could be written; a lost row is reported, not turned into a failed
         // run that hides an applied change.
         if let Err(err) = appended {
+            let err = crate::security::redaction::redact_provider_text(&format!("{err:#}"));
             // R-PMMCk K-3: a run nobody cancelled has no other log line for
             // this (the cancelled branch logged above).
             if cancelled.is_none() {
@@ -1448,7 +1451,7 @@ mod tests {
     #[async_trait]
     impl JudgeScoringModel for ErroringJudge {
         async fn score(&self, _task: &str, _result: &str, _config: &JudgeConfig) -> Result<String> {
-            anyhow::bail!("model judge provider call failed: connection refused")
+            anyhow::bail!("model judge provider call failed: connection refused; token=opaque7credential")
         }
     }
 
@@ -1629,6 +1632,9 @@ mod tests {
     async fn a_judge_provider_error_writes_nothing() {
         let (report, after) = run_proposing_cycle(Some(Arc::new(ErroringJudge))).await;
         assert_judge_failure_writes_nothing(&report, &after);
+        // Mutation: keep the judge's raw chain in the verdict errors.
+        assert!(report.errors.iter().all(|error| !error.contains("opaque7credential")));
+        assert!(report.errors.iter().any(|error| error.contains("token=[REDACTED]")));
     }
 
     /// R-PMMCg J-1 / D-046: a real judge whose reply is not the score schema.

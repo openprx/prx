@@ -535,7 +535,7 @@ impl Tool for NodesTool {
         // (`error sending request for url (...)`); the model never sees it.
         self.execute_action(args)
             .await
-            .map_err(|error| anyhow!(crate::providers::redact_endpoint_userinfo(&format!("{error:#}")).into_owned()))
+            .map_err(|error| anyhow!(crate::security::redaction::redact_provider_text(&format!("{error:#}"))))
     }
     fn tier(&self) -> ToolTier {
         ToolTier::Extended

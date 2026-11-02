@@ -163,7 +163,7 @@ fn watcher_outcome(
                     |revision| revision.fingerprint_sha256,
                 ),
             outcome: WatcherOutcome::Refused {
-                reason: format!("{error:#}"),
+                reason: crate::security::redaction::redact_provider_text(&format!("{error:#}")),
             },
         }),
     }
@@ -536,5 +536,18 @@ mod tests {
         let cfg: Arc<Config> = shared.load_full();
         // Arc<Config> derefs to Config
         assert!(cfg.default_temperature > 0.0);
+    }
+    /// Mutation: retain the raw refused-reload chain in WatcherOutcome.
+    #[test]
+    fn refused_reload_outcome_hides_nested_credentials() {
+        let shared = new_shared(Config::default());
+        let error = Err(anyhow::anyhow!("token=opaque7credential").context("failed"));
+        let seen = watcher_outcome(&shared, &error, &[0; 32]).expect("test: refused outcome");
+        match seen.outcome {
+            crate::config::manage::WatcherOutcome::Refused { reason } => {
+                assert_eq!(reason, "failed: token=[REDACTED]");
+            }
+            _ => panic!("test: expected refused reload"),
+        }
     }
 }

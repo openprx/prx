@@ -255,7 +255,10 @@ impl ExecutionTrace {
     pub(crate) fn note_error_detail(&self, operation_id: &str, detail: String) {
         let mut state = self.0.lock();
         if state.sealed.is_none() && state.error_details.len() < MAX_CALLS {
-            state.error_details.insert(operation_id.to_owned(), detail);
+            state.error_details.insert(
+                operation_id.to_owned(),
+                crate::security::redaction::redact_provider_text(&detail),
+            );
         }
     }
 
@@ -781,5 +784,15 @@ mod silent_tests {
         assert_eq!(snapshot.unavailable_attempts, Some(1));
         let text = serde_json::to_string(&snapshot).expect("test: serialise");
         assert!(!text.contains("connection refused"));
+    }
+    /// Mutation: store the raw detail before classifying the execution failure.
+    #[test]
+    fn transient_error_details_hide_nested_credentials() {
+        let trace = ExecutionTrace::default();
+        trace.note_error_detail("call", "failed: token=opaque7credential".to_string());
+        assert_eq!(
+            trace.0.lock().error_details.get("call").map(String::as_str),
+            Some("failed: token=[REDACTED]")
+        );
     }
 }

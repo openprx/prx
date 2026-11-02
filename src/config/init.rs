@@ -424,6 +424,7 @@ impl InitReport {
     }
 
     fn record_reset(&mut self, reason: &str, archive: Option<&Path>) {
+        let reason = crate::security::redaction::redact_provider_text(reason);
         let archive = archive.map_or_else(
             || "NOT ARCHIVED - the previous files were not copied".to_string(),
             |path| path.display().to_string(),
@@ -441,7 +442,7 @@ impl InitReport {
     /// Record a failure of a step that ran after the configuration mutation
     /// committed, keeping everything already recorded about that mutation.
     fn record_post_commit_failure(&mut self, error: &anyhow::Error) {
-        let rendered = format!("{error:#}");
+        let rendered = crate::security::redaction::redact_provider_text(&format!("{error:#}"));
         self.warnings.push(format!(
             "ERROR: the configuration above is already written, but this run then failed: {rendered}. \
              Fix the reported cause and run `prx init --force` again; the archive named above is kept."

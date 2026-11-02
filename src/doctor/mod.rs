@@ -66,7 +66,7 @@ impl DiagItem {
     /// safe to print: doctor quotes configured provider labels and endpoint
     /// URLs, and a `custom:` URL may carry `user:password@`.
     fn with_state(severity: Severity, state: DiagnosticState, category: &'static str, msg: impl Into<String>) -> Self {
-        let message = msg.into();
+        let message = crate::security::redaction::redact_secrets(&msg.into());
         let message = match crate::security::redaction::redact_url_components(&message) {
             std::borrow::Cow::Borrowed(_) => message,
             std::borrow::Cow::Owned(redacted) => redacted,
@@ -1279,8 +1279,7 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
                 println!("    ✅ model catalog check passed");
             }
             Err(error) => {
-                let error_text =
-                    crate::security::redaction::redact_url_components(&format_error_chain(&error)).into_owned();
+                let error_text = crate::security::redaction::redact_provider_text(&format_error_chain(&error));
                 match classify_model_probe_error(&error_text) {
                     ModelProbeOutcome::Skipped => {
                         skipped_count += 1;
@@ -4527,5 +4526,12 @@ mod tests {
             before,
             "the file was rewritten"
         );
+    }
+    /// Mutation: remove secret scanning in DiagItem::with_state.
+    #[test]
+    fn diagnostic_items_hide_nested_error_credentials() {
+        let error = anyhow::anyhow!("token=opaque7credential").context("failed");
+        let item = DiagItem::error("runtime", format!("{error:#}"));
+        assert_eq!(item.message, "failed: token=[REDACTED]");
     }
 }

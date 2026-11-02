@@ -1255,7 +1255,7 @@ impl Tool for DaemonMessageSendTool {
             // A refusal, an unreachable daemon and a channel error all arrive
             // here as one error chain. It is reported, not retried and not
             // reinterpreted: the chat turn continues either way.
-            Err(error) => refuse(format!("{error:#}")),
+            Err(error) => refuse(crate::security::redaction::redact_provider_text(&format!("{error:#}"))),
         }
     }
 

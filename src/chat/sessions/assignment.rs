@@ -655,8 +655,9 @@ pub fn reported_notice(assignment_id: &str, status: ResultStatus, seq: u64) -> S
 /// The line shown when a result could not be handed back.
 #[must_use]
 pub fn report_failure_notice(assignment_id: &str, status: ResultStatus, error: &anyhow::Error) -> String {
+    let error = crate::security::redaction::redact_provider_text(&format!("{error:#}"));
     format!(
-        "Could not report {} for daemon assignment {}: {error:#}. The daemon still has it outstanding; \
+        "Could not report {} for daemon assignment {}: {error}. The daemon still has it outstanding; \
          whoever assigned it is waiting.",
         status.as_str(),
         short_id(assignment_id)
@@ -666,8 +667,10 @@ pub fn report_failure_notice(assignment_id: &str, status: ResultStatus, error: &
 /// The line shown when this chat could not enrol.
 #[must_use]
 pub fn enrolment_failure_notice(base_url: &str, error: &anyhow::Error) -> String {
+    let base_url = crate::security::redaction::redact_provider_text(base_url);
+    let error = crate::security::redaction::redact_provider_text(&format!("{error:#}"));
     format!(
-        "This chat could not enrol with the daemon at {base_url}, so it cannot be assigned work: {error:#}\n\
+        "This chat could not enrol with the daemon at {base_url}, so it cannot be assigned work: {error}\n\
          Everything else in this chat is unaffected. Restart chat once the daemon accepts it to become \
          assignable again."
     )
@@ -939,6 +942,8 @@ impl FailureNotices {
     /// Record a failing pull, returning the line to show — or `None` when this
     /// reason has already said everything it is allowed to say.
     pub fn failed(&mut self, reason: &str) -> Option<String> {
+        let reason = crate::security::redaction::redact_provider_text(reason);
+        let reason = reason.as_str();
         if self.episode.as_ref().is_none_or(|episode| episode.reason != reason) {
             self.episode = Some(FailingEpisode {
                 reason: reason.to_string(),
@@ -2116,5 +2121,20 @@ mod tests {
         assert!(label_for(&config).len() <= MAX_LABEL_BYTES);
         config.workspace_dir = std::path::PathBuf::from("/");
         assert_eq!(label_for(&config), "chat");
+    }
+    /// Mutation: retain a raw chain in an assignment notice or repeated-pull episode.
+    #[test]
+    fn assignment_failure_notices_hide_nested_credentials() {
+        let error = anyhow::anyhow!("token=opaque7credential").context("failed");
+        let mut notices = FailureNotices::default();
+        let pull = notices.failed(&format!("{error:#}")).expect("test: first notice");
+        for notice in [
+            report_failure_notice("assignment", ResultStatus::Failed, &error),
+            enrolment_failure_notice("https://example.com?key=opaque7credential", &error),
+            pull,
+        ] {
+            assert!(notice.contains("[REDACTED]"), "{notice}");
+            assert!(!notice.contains("opaque7credential"), "{notice}");
+        }
     }
 }
