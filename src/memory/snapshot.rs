@@ -5,7 +5,14 @@
 //!
 //! **Auto-Hydration**: if `brain.db` is missing but `MEMORY_SNAPSHOT.md` exists,
 //! re-indexes all entries back into a fresh SQLite database.
+//!
+//! Ramflux channel attribution excludes scoped rows first; the case-sensitive
+//! `rf:` key prefix also excludes legacy unattributed copies. Hydration applies
+//! both criteria. An export with no eligible core rows preserves existing
+//! snapshot entries and rewrites the file only when that filter drops entries;
+//! otherwise the file remains byte-for-byte unchanged.
 
+use super::RAMFLUX_MEMORY_KEY_PREFIX;
 use anyhow::Result;
 use chrono::Local;
 use rusqlite::{Connection, params};
@@ -58,6 +65,11 @@ impl SnapshotOrigin {
 /// One entry parsed back from a snapshot.
 type SnapshotEntry = (String, String, Option<SnapshotOrigin>);
 
+fn can_hydrate_entry(key: &str, origin: Option<&SnapshotOrigin>) -> bool {
+    origin.is_none_or(|origin| origin.channel.as_deref() != Some("ramflux"))
+        && !key.starts_with(RAMFLUX_MEMORY_KEY_PREFIX)
+}
+
 /// The `core` rows the snapshot carries (D-026, R-MCPBfg N-1).
 ///
 /// `MEMORY_SNAPSHOT.md` is a workspace-root, Git-visible copy of memory, so it
@@ -68,25 +80,28 @@ type SnapshotEntry = (String, String, Option<SnapshotOrigin>);
 /// written with no caller context at all (no channel, no owner). Rows of
 /// owner-isolated MCP callers and of every network surface (webhook, IM
 /// channels, Console, sub-agents) stay in the owner-scoped table only.
+/// Attribution is the primary exclusion, including `channel = 'ramflux'`;
+/// parameter 1 binds the shared case-sensitive prefix for legacy scoped keys.
 const OPERATOR_ROWS_SQL: &str = "SELECT key, content, category, created_at, updated_at,
             owner_id, channel, raw_sender, chat_id
      FROM memories
      WHERE category = 'core'
-       AND key NOT LIKE 'rf:%'
        AND (
             (channel = 'terminal' AND raw_sender = 'user' AND chat_id = 'terminal:user')
             OR (channel = 'cli' AND raw_sender = 'agent' AND chat_id = 'agent:local')
             OR (channel IS NULL AND owner_id IS NULL)
        )
+       AND substr(key, 1, length(?1)) COLLATE BINARY <> ?1
      ORDER BY updated_at DESC";
 
 /// The pre-origin schema (no owner or channel columns): every row there
-/// predates owner attribution and is exported as before.
+/// predates owner attribution. The same case-sensitive prefix guard excludes
+/// legacy scoped keys even without origin columns.
 const LEGACY_ROWS_SQL: &str = "SELECT key, content, category, created_at, updated_at,
             NULL, NULL, NULL, NULL
      FROM memories
      WHERE category = 'core'
-       AND key NOT LIKE 'rf:%'
+       AND substr(key, 1, length(?1)) COLLATE BINARY <> ?1
      ORDER BY updated_at DESC";
 
 fn memories_columns(conn: &Connection) -> Result<HashSet<String>> {
@@ -162,7 +177,11 @@ fn escape_snapshot_content(content: &str) -> String {
 
 /// Export the operator's `Core` memories from SQLite → `MEMORY_SNAPSHOT.md`.
 ///
-/// Returns the number of entries exported.
+/// Returns the number of SQLite entries exported, excluding preserved backup entries.
+///
+/// # Errors
+///
+/// Returns database and snapshot I/O errors.
 pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let db_path = workspace_dir.join("memory").join("brain.db");
     // NOTE: TOCTOU safe — read-only probe. If the DB disappears between
@@ -185,8 +204,8 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
         LEGACY_ROWS_SQL
     })?;
 
-    let rows: Vec<(String, String, String, String, String, SnapshotOrigin)> = stmt
-        .query_map([], |row| {
+    let mut rows: Vec<(String, String, String, String, String, SnapshotOrigin)> = stmt
+        .query_map([RAMFLUX_MEMORY_KEY_PREFIX], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -204,9 +223,35 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
         .filter_map(|r| r.ok())
         .collect();
 
-    if rows.is_empty() && !snapshot_path(workspace_dir).exists() {
-        tracing::debug!("snapshot export: no core memories to export");
-        return Ok(0);
+    let exported_count = rows.len();
+    if rows.is_empty() {
+        let snapshot = snapshot_path(workspace_dir);
+        if !snapshot.exists() {
+            tracing::debug!("snapshot export: no core memories to export");
+            return Ok(0);
+        }
+        let content = fs::read_to_string(&snapshot)?;
+        let mut entries = parse_snapshot(&content);
+        let parsed_count = entries.len();
+        entries.retain(|(key, _, origin)| can_hydrate_entry(key, origin.as_ref()));
+        if entries.len() == parsed_count {
+            return Ok(0);
+        }
+        let now = Local::now().to_rfc3339();
+        rows = entries
+            .into_iter()
+            .map(|(key, content, origin)| {
+                // Legacy entries retain the ownerless origin hydration uses.
+                (
+                    key,
+                    content,
+                    "core".to_string(),
+                    now.clone(),
+                    now.clone(),
+                    origin.unwrap_or_default(),
+                )
+            })
+            .collect();
     }
 
     let mut output = String::with_capacity(rows.len() * 200);
@@ -237,7 +282,7 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
         snapshot_path.display()
     );
 
-    Ok(rows.len())
+    Ok(exported_count)
 }
 
 /// Import memories from `MEMORY_SNAPSHOT.md` into SQLite.
@@ -732,12 +777,7 @@ fn collect_hydration_entries(workspace_dir: &Path) -> Result<Vec<(String, String
     // Scoped rows have durable message ownership in their source database.
     // A snapshot cannot recreate that index, so never hydrate these copies,
     // including old exports written before scope attribution existed.
-    hydrated.retain(|(key, _, _, origin)| {
-        !key.starts_with("rf:")
-            && origin
-                .as_ref()
-                .is_none_or(|origin| origin.channel.as_deref() != Some("ramflux"))
-    });
+    hydrated.retain(|(key, _, _, origin)| can_hydrate_entry(key, origin.as_ref()));
     Ok(hydrated)
 }
 
@@ -848,6 +888,155 @@ Rule 3: Protect the user.
         let tmp = TempDir::new().unwrap();
         let count = export_snapshot(tmp.path()).unwrap();
         assert_eq!(count, 0);
+    }
+
+    fn empty_snapshot_db(workspace: &Path) -> Connection {
+        let db_dir = workspace.join("memory");
+        fs::create_dir_all(&db_dir).unwrap();
+        let conn = Connection::open(db_dir.join("brain.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, content TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'core', created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, owner_id TEXT, channel TEXT,
+                raw_sender TEXT, chat_id TEXT
+             );
+             CREATE TABLE cron_jobs (id TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn empty_export_preserves_existing_operator_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        drop(empty_snapshot_db(tmp.path()));
+        let input = "# Operator backup\n\n<!-- openprx-memory-snapshot format=2 -->\n\n\
+            Keep this preamble and spacing.\n\n### 🔑 `identity`\n\nOperator identity.\n\n\
+            *Created: original | Updated: original*\n\n---\n\n\
+            ### 🔑 `preferences`\n\nOperator preferences.\n\n";
+        let path = snapshot_path(tmp.path());
+        fs::write(&path, input).unwrap();
+        assert_eq!(parse_snapshot(input).len(), 2);
+        assert!(!should_hydrate(tmp.path()), "another store already created brain.db");
+
+        assert_eq!(export_snapshot(tmp.path()).unwrap(), 0);
+        assert!(
+            fs::read(&path).unwrap() == input.as_bytes(),
+            "an empty export must leave the operator backup byte-for-byte intact"
+        );
+    }
+
+    #[test]
+    fn empty_export_scrubs_only_excluded_snapshot_entries() {
+        let tmp = TempDir::new().unwrap();
+        drop(empty_snapshot_db(tmp.path()));
+        let input = r#"<!-- openprx-memory-snapshot format=2 -->
+
+### 🔑 `operator-control`
+
+operator survivor
+\### 🔑 `quoted`
+
+*Origin: {"owner_id":"prx_user","channel":"terminal","raw_sender":"user","chat_id":"terminal:user"}*
+
+---
+
+### 🔑 `rf:scope:record`
+
+excluded scoped content
+"#;
+        let path = snapshot_path(tmp.path());
+        fs::write(&path, input).unwrap();
+
+        assert_eq!(export_snapshot(tmp.path()).unwrap(), 0);
+        let scrubbed = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            parse_snapshot(&scrubbed),
+            vec![(
+                "operator-control".to_string(),
+                "operator survivor\n### 🔑 `quoted`".to_string(),
+                Some(SnapshotOrigin {
+                    owner_id: Some("prx_user".to_string()),
+                    channel: Some("terminal".to_string()),
+                    raw_sender: Some("user".to_string()),
+                    chat_id: Some("terminal:user".to_string()),
+                }),
+            )]
+        );
+        assert!(!scrubbed.contains("excluded scoped content"));
+        assert_eq!(export_snapshot(tmp.path()).unwrap(), 0);
+        assert_eq!(fs::read(&path).unwrap(), scrubbed.as_bytes());
+    }
+
+    #[test]
+    fn scoped_key_filter_is_case_sensitive_for_export_and_hydration() {
+        let tmp = TempDir::new().unwrap();
+        let conn = empty_snapshot_db(tmp.path());
+        for (key, content) in [
+            ("RF:note", "operator note"),
+            ("rf:scope:record", "scoped legacy content"),
+        ] {
+            conn.execute(
+                "INSERT INTO memories (id, key, content, category, created_at, updated_at)
+                 VALUES (?1, ?1, ?2, 'core', '2026-01-01', '2026-01-01')",
+                params![key, content],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        assert_eq!(export_snapshot(tmp.path()).unwrap(), 1, "RF:note is an operator key");
+        let snapshot = fs::read_to_string(snapshot_path(tmp.path())).unwrap();
+        assert!(snapshot.contains("RF:note"));
+        assert!(!snapshot.contains("rf:scope:record"));
+
+        let restored = TempDir::new().unwrap();
+        fs::write(
+            snapshot_path(restored.path()),
+            format!("{snapshot}\n### 🔑 `rf:scope:record`\n\nscoped legacy content\n"),
+        )
+        .unwrap();
+        assert_eq!(hydrate_from_snapshot(restored.path()).unwrap(), 1);
+        let conn = Connection::open(restored.path().join("memory/brain.db")).unwrap();
+        let note: String = conn
+            .query_row("SELECT content FROM memories WHERE key = 'RF:note'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(note, "operator note");
+        let scoped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE key = 'rf:scope:record'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scoped, 0);
+    }
+
+    #[test]
+    fn hydration_rejects_ramflux_origin_without_scoped_key() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            snapshot_path(tmp.path()),
+            "<!-- openprx-memory-snapshot format=2 -->\n\n\
+             ### 🔑 `operator-control`\n\noperator survivor\n\n---\n\n\
+             ### 🔑 `origin-only`\n\nscoped content\n\n\
+             *Origin: {\"channel\":\"ramflux\"}*\n",
+        )
+        .unwrap();
+
+        assert_eq!(hydrate_from_snapshot(tmp.path()).unwrap(), 1);
+        let conn = Connection::open(tmp.path().join("memory/brain.db")).unwrap();
+        let restored: Vec<String> = conn
+            .prepare("SELECT key FROM memories ORDER BY key")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(restored, ["operator-control"]);
     }
 
     #[test]

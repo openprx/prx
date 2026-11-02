@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** provider auth and API requests identify as `User-Agent: prx/<version>`.
   Provider-specific user agents (`OpenPRX/0.1`, `KimiCLI/0.77`, `QwenCode/1.0`,
   `GithubCopilot/…`) are no longer sent.
+- Preserve operator memory snapshots on empty exports; scrub only Ramflux-attributed or case-sensitive `rf:` entries.
 - **Breaking:** Anthropic subscription credentials are removed. Setup-tokens
   (`sk-ant-oat01`) and Claude Code OAuth in `~/.claude/.credentials.json` are
   not read, refreshed, or sent. Use an Anthropic Console API key. Max, Ultra,

@@ -64,6 +64,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Key prefix shared by Ramflux scoped writers and snapshot exclusion.
+pub(crate) const RAMFLUX_MEMORY_KEY_PREFIX: &str = "rf:";
+
 fn create_memory_with_builders<F, G>(
     backend_name: &str,
     workspace_dir: &Path,

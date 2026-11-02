@@ -920,12 +920,21 @@ neither start a line of its own in `MEMORY.md` nor pass itself off as another
 key's `- [..] **key**:` entry. Lines already in `MEMORY.md` from before this
 change are not rewritten; review the file once after upgrading.
 
-The workspace-root `MEMORY_SNAPSHOT.md` export (rewritten whenever a SQLite or
+The workspace-root `MEMORY_SNAPSHOT.md` export (run whenever a SQLite or
 `lucid` memory backend starts) follows the same rule: it carries only `core`
 rows the local operator wrote through the terminal UI or `prx agent`, and rows
 the operator's own process wrote with no caller context. Rows of MCP callers
 and of every network surface are not exported, nor are rows a WASM plugin
-writes through `memory.store`, which carry the channel `plugin:<name>`. Each entry's content is escaped
+writes through `memory.store`, which carry the channel `plugin:<name>`.
+Ramflux channel attribution is the primary exclusion; the case-sensitive `rf:`
+key prefix also excludes legacy unattributed scoped rows. Operator keys such as
+`RF:note` keep their ordinary export and hydration behaviour. Hydration rejects
+both scoped keys and entries whose recorded channel is `ramflux`.
+When the database has no eligible core rows, export parses the existing snapshot
+with those same hydration rules and preserves every allowed entry. It rewrites
+the file only if an entry was excluded; otherwise it leaves the file
+byte-for-byte unchanged. An empty database never blanks an operator backup.
+Each entry's content is escaped
 line by line, so pasted text can never open another entry, and the entry keeps
 its owner and origin on an `*Origin: {..}*` line. Cold-boot hydration from the
 snapshot restores that owner instead of writing the row unowned, and ignores

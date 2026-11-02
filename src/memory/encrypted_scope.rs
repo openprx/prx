@@ -5,6 +5,7 @@
 //! Bytes that were not sealed for this scope are not returned. Transactional
 //! erasure requires a backend that implements the ownership-index contract.
 
+use crate::memory::RAMFLUX_MEMORY_KEY_PREFIX;
 use crate::memory::traits::{ConversationTurn, Memory, MemoryCategory, MemoryEntry};
 use crate::security::ramflux_aead::{AccountCrypto, CryptoError, id_hash};
 use async_trait::async_trait;
@@ -37,7 +38,7 @@ impl EncryptedScope {
     }
 
     fn prefix(&self) -> String {
-        format!("rf:{}:", id_hash(&self.scope))
+        format!("{RAMFLUX_MEMORY_KEY_PREFIX}{}:", id_hash(&self.scope))
     }
 
     fn stored_key(&self, record_id: &str) -> String {
