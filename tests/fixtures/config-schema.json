@@ -150,6 +150,7 @@
         "mattermost": null,
         "nextcloud_talk": null,
         "qq": null,
+        "ramflux": null,
         "signal": null,
         "slack": null,
         "telegram": null,
@@ -1462,6 +1463,18 @@
               "type": "null"
             }
           ]
+        },
+        "ramflux": {
+          "description": "Local ramflux agent-host bridge.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RamfluxConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "signal": {
           "description": "Signal channel configuration.",
@@ -4399,6 +4412,210 @@
           }
         }
       }
+    },
+    "RamfluxAccountConfig": {
+      "description": "Persona for one ramflux AI account. Missing fields fall back to the global agent.",
+      "type": "object",
+      "properties": {
+        "cross_conversation_retrieval": {
+          "description": "Cross-conversation memory retrieval. Off unless the owner sets it.",
+          "type": "boolean",
+          "default": false
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "scope_profile": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "system_prompt_file": {
+          "description": "Path to a system-prompt file. Relative paths are resolved from the workspace.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "RamfluxAttachmentFetch": {
+      "description": "Per-turn caps for `attachment.fetch`.",
+      "type": "object",
+      "properties": {
+        "max_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 5242880,
+          "minimum": 0
+        },
+        "max_per_turn": {
+          "type": "integer",
+          "format": "uint8",
+          "default": 4,
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "RamfluxAuthorizationMode": {
+      "description": "How prx combines its own setting with `bridge.hello.authorization`.",
+      "oneOf": [
+        {
+          "description": "Use the agent-host value. Until hello arrives, the effective mode is supervised.",
+          "type": "string",
+          "const": "follow_rf"
+        },
+        {
+          "description": "Always supervised, even when the agent-host declares full.",
+          "type": "string",
+          "const": "supervised"
+        },
+        {
+          "description": "Full only when the agent-host also declares full. Config alone never yields full.",
+          "type": "string",
+          "const": "full"
+        }
+      ]
+    },
+    "RamfluxConfig": {
+      "description": "Local ramflux agent-host bridge (`[channels_config.ramflux]`).",
+      "type": "object",
+      "properties": {
+        "accounts": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RamfluxAccountConfig"
+          },
+          "default": {}
+        },
+        "allowed_block_types": {
+          "type": "array",
+          "default": [
+            "Text",
+            "Markdown",
+            "Heading",
+            "KeyValue",
+            "Metric",
+            "List",
+            "TableFallback",
+            "Form",
+            "Input",
+            "Select",
+            "Progress",
+            "LogStream",
+            "Warning",
+            "Error",
+            "Success",
+            "Approval",
+            "ActionGroup",
+            "FilePreview",
+            "Fallback"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "attachment_fetch": {
+          "$ref": "#/$defs/RamfluxAttachmentFetch",
+          "default": {
+            "max_bytes": 5242880,
+            "max_per_turn": 4
+          }
+        },
+        "authorization_mode": {
+          "$ref": "#/$defs/RamfluxAuthorizationMode",
+          "default": "follow_rf"
+        },
+        "encrypt_at_rest": {
+          "type": "boolean",
+          "default": true
+        },
+        "max_in_flight_per_conversation": {
+          "type": "integer",
+          "format": "uint8",
+          "default": 1,
+          "maximum": 255,
+          "minimum": 0
+        },
+        "on_new_message": {
+          "$ref": "#/$defs/RamfluxOnNewMessage",
+          "default": "queue"
+        },
+        "socket_path": {
+          "description": "Unix socket path. `None` uses `<workspace>/ramflux/run/ramflux.sock`.\nThe channel creates `ramflux` and `run` at mode `0700`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "surface_limits": {
+          "$ref": "#/$defs/RamfluxSurfaceLimits",
+          "default": {
+            "max_actions": 16,
+            "max_blocks": 32,
+            "max_bytes": 65536
+          }
+        },
+        "turn_wall_clock_secs": {
+          "description": "Advertised turn wall clock, in seconds. The agent-host enforces it with `turn.cancel`.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 120,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "RamfluxOnNewMessage": {
+      "description": "What to do with a new inbound message while a turn for that conversation is running.",
+      "type": "string",
+      "enum": [
+        "queue",
+        "interrupt"
+      ]
+    },
+    "RamfluxSurfaceLimits": {
+      "description": "Limits for `reply.surface` blocks and actions.",
+      "type": "object",
+      "properties": {
+        "max_actions": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 16,
+          "minimum": 0
+        },
+        "max_blocks": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 32,
+          "minimum": 0
+        },
+        "max_bytes": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 65536,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     },
     "ReadOnlyRehearsal": {
       "description": "Rehearsal is read-only (CDP 9.3): the only accepted mode.",
