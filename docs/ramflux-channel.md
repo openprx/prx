@@ -276,8 +276,9 @@ and retry metadata on failure; the host must retry to complete the erasure. Only
 a completed erase returns `erased:true`. A stopped worker follows the same error
 and admission recovery path.
 
-Scoped core memories carry a Ramflux channel, keyed account owner and keyed chat
-identity. They are excluded from the operator snapshot. Export and cold hydration
+Scoped core memories carry a Ramflux channel, keyed account owner and keyed
+conversation session identity. Metadata attribution keeps the sealed payload out
+of plaintext topic classification and its unindexed copies. They are excluded from the operator snapshot. Export and cold hydration
 also exclude legacy `rf:` keys; hydration rejects Ramflux origin markers. An
 existing snapshot is rewritten even when no operator rows remain, so an older
 scoped-only export cannot survive the next export. Deleting

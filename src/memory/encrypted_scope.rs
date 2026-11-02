@@ -216,15 +216,15 @@ impl Memory for EncryptedScope {
         let owner = self
             .crypto
             .mac(&self.account_id, "memory-owner", self.account_id.as_bytes())?;
-        let context = crate::memory::MemoryWriteContext {
+        // Sealed payloads carry attribution without entering plaintext topic
+        // classification, which would create a copy outside message erasure.
+        let metadata = crate::memory::MemoryStoreMetadata {
             channel: Some("ramflux".to_owned()),
-            chat_id: Some(session.clone()),
-            sender_id: Some(owner.clone()),
             owner_id: Some(owner),
-            ..crate::memory::MemoryWriteContext::default()
+            ..crate::memory::MemoryStoreMetadata::default()
         };
         self.inner
-            .store_with_context(&self.stored_key(key), &sealed, category, Some(&session), Some(&context))
+            .store_with_metadata(&self.stored_key(key), &sealed, category, Some(&session), metadata)
             .await
     }
 

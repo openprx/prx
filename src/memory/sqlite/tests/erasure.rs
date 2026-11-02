@@ -587,7 +587,7 @@ async fn r5_scoped_core_memory_never_enters_operator_snapshot() {
             .connection()
             .unwrap()
             .query_row(
-                "SELECT channel,owner_id,chat_id FROM memories WHERE key=?1",
+                "SELECT channel,owner_id,session_id FROM memories WHERE key=?1",
                 [&stored.key],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
