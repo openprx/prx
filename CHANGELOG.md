@@ -9,17 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `prx chat` shares the memory store created by `prx agent` when a previous
-  terminal record cannot be authenticated. The terminal replay MAC is taken
-  over the JSON spelling a stored payload parses back to. An unverifiable
-  terminal or ingress capsule is quarantined with a log line so chat can
-  start without deleting state. A failed inbound write names that cause.
-  `chat.log` is written under `--config-dir` when the flag is set, and under
-  `~/.openprx` otherwise.
-- A session snapshot that contains a decimal fraction, a numeric run id, or a
-  hexadecimal digest is no longer rejected as an identity number. The safety
-  check still rejects an SSN-shaped token and a bare 15-digit identity number,
-  and a rejection still happens before any memory row is written.
+- Terminal replay signatures preserve floating-point costs across JSON storage
+  and reload in chat and agent mode. Both use the same memory store, with
+  separate recovery scopes for `terminal:local-user` and `cli:local-user`.
+  Unverifiable ingress records and terminals bound to a replaced decision store
+  are quarantined with authenticated markers and diagnostics naming the stores
+  and run. Inbound write failures name `brain.db` and suggest a recovery step.
+  `chat.log` honours both `--config-dir` and `OPENPRX_CONFIG_DIR`.
 
 ### Changed
 

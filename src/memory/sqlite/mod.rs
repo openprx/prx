@@ -433,3 +433,24 @@ mod tests;
 /// No arbitrary SQL or raw connection is exposed to fixture callers.
 #[cfg(test)]
 pub(crate) mod fixture_readback;
+
+#[cfg(test)]
+impl SqliteMemory {
+    /// Seed a historical payload without changing its event identity.
+    pub(crate) fn replace_event_payload_for_test(&self, event_id: &str, payload: &str) -> anyhow::Result<()> {
+        let updated = self.pool.write().execute(
+            "UPDATE message_events SET raw_payload_json = ?1 WHERE event_id = ?2",
+            params![payload, event_id],
+        )?;
+        anyhow::ensure!(updated == 1, "historical event not found");
+        Ok(())
+    }
+
+    pub(crate) fn reject_user_events_for_test(&self) -> anyhow::Result<()> {
+        self.pool.write().execute_batch(
+            "CREATE TRIGGER reject_test_ingress BEFORE INSERT ON message_events
+             WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'inbound write rejected by store'); END;",
+        )?;
+        Ok(())
+    }
+}

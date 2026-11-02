@@ -162,3 +162,5 @@ fn leading_system_prompt_preserves_skill_rag_resumed_turns() {
         ]
     );
 }
+
+mod persist_restart_tests;

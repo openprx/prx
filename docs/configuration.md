@@ -1197,8 +1197,8 @@ embedding_provider not set; defaulting to local vector recall since 0.8.10x,
 set memory.embedding_provider = "none" to disable
 ```
 
-`prx chat` redirects its log to `chat.log`. With `--config-dir` the file is
-`<config-dir>/chat.log`; without that flag it stays `~/.openprx/chat.log`.
+`prx chat` redirects its log to `chat.log`. The directory is selected by
+`--config-dir`, then `OPENPRX_CONFIG_DIR`, then the default `~/.openprx`.
 For that entry point the line is also written to stderr before the TUI takes
 the screen and shown once on the first screen of the session:
 

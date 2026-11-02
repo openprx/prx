@@ -12,13 +12,20 @@ use std::sync::Arc;
 /// so the user-facing line names a public error class and drops everything else.
 pub(super) fn chat_input_persistence_failure(error: &anyhow::Error) -> anyhow::Error {
     let cause = safe_persistence_cause(error);
-    tracing::error!(error = %error, "chat input persistence failed");
-    anyhow::anyhow!("chat input persistence failed: {cause}")
+    tracing::error!(store = "brain.db", cause = %cause, "chat input persistence failed; restart to retry ingress recovery");
+    anyhow::anyhow!(
+        "chat input persistence failed (brain.db): {cause}. Restart to retry ingress recovery; if it persists, inspect the store error in chat.log."
+    )
 }
 
 fn safe_persistence_cause(error: &anyhow::Error) -> String {
     let mut selected = None;
     for cause in error.chain() {
+        if let Some(rusqlite::Error::SqliteFailure(_, Some(detail))) = cause.downcast_ref::<rusqlite::Error>()
+            && persistence_cause_is_public(detail)
+        {
+            return detail.clone();
+        }
         let text = cause.to_string();
         if persistence_cause_is_public(&text) {
             selected = Some(text);
@@ -123,7 +130,8 @@ impl ChatProviderBinding {
     ) -> anyhow::Result<(Option<MessageEvent>, Arc<ChatTurnBinding>, ChatAdmissionGuard)> {
         let fabric = fabric
             .with_ingress_recovery(&self.generation.effective, &ticket)
-            .await?;
+            .await
+            .map_err(|error| chat_input_persistence_failure(&error))?;
         let (scope, session, admission_mode, has_conversation_history) = source;
         let run = scope.run_id.clone().context("chat input run is missing")?;
         let session = session.to_owned();
@@ -195,7 +203,7 @@ impl ChatProviderBinding {
             };
             let result = tokio::time::timeout(std::time::Duration::from_secs(15), operation)
                 .await
-                .map_err(|_| anyhow::anyhow!("chat input persistence timed out"))
+                .map_err(|_| chat_input_persistence_failure(&anyhow::anyhow!("inbound write timed out")))
                 .and_then(std::convert::identity);
             let result = match result {
                 Ok((event, source)) => {

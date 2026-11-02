@@ -2236,7 +2236,7 @@ impl CausalDecisionStore {
     }
 }
 
-fn db_path(workspace_dir: &Path) -> PathBuf {
+pub(crate) fn db_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("self").join("causal_tree").join(DB_FILE)
 }
 

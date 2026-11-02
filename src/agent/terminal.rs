@@ -7,6 +7,8 @@
 
 pub(crate) mod logical;
 mod replay;
+#[cfg(test)]
+pub(crate) use replay::reseal_payload_for_test;
 pub(crate) mod served_auxiliary;
 pub(crate) use replay::{VerifiedTerminalReplay, verify_terminal_replay, verify_terminal_replay_until};
 
@@ -1161,6 +1163,7 @@ pub(crate) mod persistence_probe {
 
 #[cfg(test)]
 mod tests {
+    mod persistence;
     use super::*;
     use crate::llm::route_decision::RouteDecision;
     use crate::memory::{Memory, MemoryPrincipal, MemoryVisibility, SqliteMemory};

@@ -160,7 +160,10 @@ fn turn<'a>(
 async fn fresh_process_ingress_child() {
     let workspace = PathBuf::from(std::env::var_os("PRX_INGRESS_TEST_WORKSPACE").expect("owned child workspace"));
     let mode = std::env::var("PRX_INGRESS_TEST_MODE").expect("owned child mode");
-    assert!(matches!(mode.as_str(), "completed" | "pending" | "probe"));
+    assert!(matches!(
+        mode.as_str(),
+        "completed" | "pending" | "probe" | "float-first" | "float-next"
+    ));
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&workspace).unwrap());
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.clone();
@@ -168,6 +171,17 @@ async fn fresh_process_ingress_child() {
     config.default_model = Some(MODEL.into());
     config.causal_tree.enabled = true;
     config.causal_tree.policy.max_decision_hops = 1;
+    if mode.starts_with("float-") {
+        config.cost.prices.insert(
+            format!("ollama/{MODEL}"),
+            crate::config::schema::ModelPricing {
+                input: 0.002_917_600_000_000_000_2_f64 * 1_000_000.0 / 17.0,
+                output: 0.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+    }
     config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
     config.providers.models.push(
         toml::from_str(&format!(
@@ -194,12 +208,19 @@ async fn fresh_process_ingress_child() {
         .tool_dispatcher(Box::new(XmlToolDispatcher))
         .build()
         .unwrap();
+    let input = if mode == "probe" {
+        PROBE
+    } else if mode == "float-next" {
+        "memory_search: Explain the saved Rust expression `2 + 2` again."
+    } else {
+        INPUT
+    };
     if mode != "probe" {
-        agent.seed_scoped_query_memory_for_test(INPUT).await;
+        agent.seed_scoped_query_memory_for_test(input).await;
     }
-    let result = turn(&mut agent, if mode == "probe" { PROBE } else { INPUT }).await;
+    let result = turn(&mut agent, input).await;
     assert!(result.is_ok(), "actual ingress failed: {result:?}");
-    assert_eq!(calls.load(Ordering::SeqCst), usize::from(mode == "completed"));
+    assert_eq!(calls.load(Ordering::SeqCst), usize::from(mode != "probe"));
     drop(agent);
     acknowledge(&report(&memory, &workspace, calls.load(Ordering::SeqCst)).await);
 }
@@ -440,4 +461,82 @@ fn fresh_process_rejoins_original_signed_final_without_restoring_session_or_rese
 #[test]
 fn killed_process_input_stays_unconfirmed_without_provider_resend_or_fake_terminal() {
     verify_recovery(false);
+}
+
+#[test]
+fn normally_completed_agent_float_turn_restarts_and_accepts_the_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut first = OwnedChild::start(dir.path(), "float-first");
+    let before = first.acknowledgement();
+    first.finish(false);
+    assert_eq!(before.calls, 1);
+    let source = source(&before, INPUT);
+    let receipt = final_for(&before, source).expect("normally completed first turn");
+    let payload: serde_json::Value = serde_json::from_str(receipt.raw_payload_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        payload
+            .pointer("/usage_settlement/cost_usd")
+            .and_then(serde_json::Value::as_f64),
+        Some(0.002_917_600_000_000_000_2_f64)
+    );
+    let mut next = OwnedChild::start(dir.path(), "float-next");
+    let after = next.acknowledgement();
+    next.finish(false);
+    assert_eq!(after.calls, 1, "the next agent turn must reach the provider");
+    assert_ne!(before.pid, after.pid);
+    assert_eq!(before.key_sha256, after.key_sha256);
+    assert_eq!(before.store_workspace_id, after.store_workspace_id);
+    assert!(
+        after
+            .events
+            .iter()
+            .any(|row| row.event_type == "turn.ingress.reconciled"
+                && row.causation_event_id.as_deref() == Some(source.event_id.as_str()))
+    );
+    assert!(
+        !after
+            .events
+            .iter()
+            .any(|row| row.event_type == "turn.ingress.quarantined")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly copied historical workspace"]
+async fn copied_workspace_terminals_verify_through_the_real_store() {
+    let workspace = PathBuf::from(std::env::var_os("PRX_REPLAY_TEST_WORKSPACE").expect("scratch workspace"));
+    let memory = SqliteMemory::new(&workspace).unwrap();
+    let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(&workspace);
+    let namespace = store.workspace_id().expect("preserved decision namespace");
+    let key = DecisionKey::load_existing(&workspace).unwrap();
+    let rows = crate::memory::sqlite::fixture_readback::terminal_rows(&workspace).unwrap();
+    assert!(!rows.is_empty() && rows.len() <= 32, "bounded historical evidence");
+    let verified = rows.len();
+    for row in rows {
+        let payload: serde_json::Value = serde_json::from_str(&row.raw_payload).unwrap();
+        let workspace_id = payload
+            .pointer("/terminal_replay_v1/workspace_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let run = payload.get("terminal_id").and_then(serde_json::Value::as_str).unwrap();
+        let owner = row.owner_id.unwrap();
+        let event = memory
+            .find_owned_message_event_by_idempotency_key(workspace_id, &owner, &format!("turn:{run}:final"))
+            .await
+            .unwrap()
+            .unwrap();
+        crate::agent::terminal::verify_terminal_replay(
+            &memory,
+            &store.reader(),
+            &key,
+            &namespace,
+            workspace_id,
+            &owner,
+            event.run_id.as_deref().unwrap(),
+            &event,
+        )
+        .await
+        .unwrap();
+    }
+    println!("historical terminal replay verified: {verified}");
 }

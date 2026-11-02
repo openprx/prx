@@ -114,3 +114,35 @@ fn resolve_chat_log_dir_yields_an_absolute_path() {
         }
     }
 }
+
+#[test]
+fn environment_config_dir_controls_chat_log_before_config_load() {
+    const CHILD_FLAG: &str = "PRX_TEST_CHAT_LOG_ENV_CHILD";
+    const CHILD_TEST: &str =
+        "chat::tests::tracing_redirect_tests::environment_config_dir_controls_chat_log_before_config_load";
+    if std::env::var_os(CHILD_FLAG).is_some() {
+        let _lock = crate::config::schema::process_config_dir_test_lock();
+        crate::config::schema::swap_process_config_dir_for_tests(None);
+        let expected = std::path::PathBuf::from(std::env::var_os("OPENPRX_CONFIG_DIR").unwrap());
+        assert_eq!(resolve_chat_log_dir().unwrap(), expected);
+        let _ = setup_chat_tracing_to_file();
+        assert!(expected.join("chat.log").is_file());
+        let explicit = expected.join("explicit");
+        crate::config::set_process_config_dir(explicit.clone());
+        assert_eq!(
+            resolve_chat_log_dir().unwrap(),
+            explicit,
+            "the flag still wins over the environment"
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([CHILD_TEST, "--exact", "--nocapture"])
+        .env(CHILD_FLAG, "1")
+        .env("OPENPRX_CONFIG_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+    assert!(dir.path().join("chat.log").is_file());
+}

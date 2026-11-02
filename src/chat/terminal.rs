@@ -1,6 +1,6 @@
 //! Terminal mode guard, panic hook and chat tracing redirection.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -457,18 +457,23 @@ impl Drop for TracingChatGuard {
     }
 }
 
-/// Chat log directory. An explicit `--config-dir` wins; otherwise the
-/// historical default is `~/.openprx/` (or `$HOME/.openprx/`).
+/// Chat log directory. An explicit `--config-dir` wins, then
+/// `OPENPRX_CONFIG_DIR`, then the historical `~/.openprx/` default.
 pub(super) fn resolve_chat_log_dir() -> Result<std::path::PathBuf> {
     if let Some(dir) = crate::config::process_config_dir() {
         return Ok(dir);
+    }
+    if let Ok(dir) = std::env::var("OPENPRX_CONFIG_DIR")
+        && !dir.trim().is_empty()
+    {
+        return std::path::absolute(dir.trim()).context("resolve OPENPRX_CONFIG_DIR for chat.log");
     }
     crate::config::default_openprx_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory for chat.log"))
 }
 
 /// Redirect the global `tracing` writer to `chat.log` so `INFO`/`WARN`/`ERROR`
 /// lines never collide with the ratatui TUI. The file is under `--config-dir`
-/// when that flag was published, and under `~/.openprx/` otherwise.
+/// when that flag was published, then `OPENPRX_CONFIG_DIR`, then `~/.openprx/`.
 ///
 /// Returns a guard that MUST be held for the lifetime of the chat session.
 /// On any failure (no HOME, dir not creatable, file not openable, no global
