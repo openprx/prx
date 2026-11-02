@@ -482,14 +482,16 @@ pub struct CandidateFeatures<'s> {
 pub struct StateFeatures<'s> {
     /// Structural signals of the latest user turn.
     pub text: TextSignals,
+    /// Current hop, zero for a fresh request.
+    pub hop: u64,
     /// Retries so far.
     pub retry_count: u64,
     /// An approval is pending.
     pub approval_pending: bool,
-    /// Query/tool steps that failed, were denied or were cancelled; Router
+    /// Query/tool steps that failed; Router
     /// training-history observations do not predict user-answer evidence.
     pub unsuccessful_steps: u64,
-    /// Failed, denied or cancelled non-provider work. A prior provider attempt
+    /// Failed non-provider work. A prior provider attempt
     /// belongs to the earlier conversation segment and does not make a new
     /// plain user message structurally undecidable.
     pub unsuccessful_action_steps: u64,
@@ -540,16 +542,12 @@ pub fn extract(state: &Value) -> StateFeatures<'_> {
     let artifacts = array(state, "artifacts");
     let unsuccessful_steps = steps
         .iter()
-        .filter(|step| {
-            str_at(step, "kind") != "router_history"
-                && matches!(str_at(step, "status"), "failed" | "denied" | "cancelled")
-        })
+        .filter(|step| str_at(step, "kind") != "router_history" && str_at(step, "status") == "failed")
         .count() as u64;
     let unsuccessful_action_steps = steps
         .iter()
         .filter(|step| {
-            !matches!(str_at(step, "kind"), "provider" | "router_history")
-                && matches!(str_at(step, "status"), "failed" | "denied" | "cancelled")
+            !matches!(str_at(step, "kind"), "provider" | "router_history") && str_at(step, "status") == "failed"
         })
         .count() as u64;
     let successful_lookups = steps
@@ -582,6 +580,7 @@ pub fn extract(state: &Value) -> StateFeatures<'_> {
     }
     StateFeatures {
         text,
+        hop: state.get("hop").and_then(Value::as_u64).unwrap_or(0),
         retry_count: state.get("retry_count").and_then(Value::as_u64).unwrap_or(0),
         approval_pending: state.get("approval_pending").and_then(Value::as_bool).unwrap_or(false),
         unsuccessful_steps,

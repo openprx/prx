@@ -39,6 +39,7 @@ pub(crate) struct ManualClock {
     elapsed_ms: watch::Sender<u64>,
     stall_ms: AtomicU64,
     advance_ms: AtomicU64,
+    checkpoint: parking_lot::Mutex<Option<(&'static str, usize, Duration)>>,
 }
 
 #[cfg(test)]
@@ -51,6 +52,7 @@ impl ManualClock {
             elapsed_ms,
             stall_ms: AtomicU64::new(0),
             advance_ms: AtomicU64::new(0),
+            checkpoint: parking_lot::Mutex::new(None),
         })
     }
 
@@ -86,6 +88,11 @@ impl ManualClock {
     pub(crate) fn arm_logical_advance(&self, delay: Duration) {
         self.advance_ms
             .store(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX), Ordering::Release);
+    }
+
+    /// Spend logical time on the Nth matching engine checkpoint.
+    pub(crate) fn arm_checkpoint(&self, name: &'static str, occurrence: usize, by: Duration) {
+        *self.checkpoint.lock() = Some((name, occurrence, by));
     }
 
     #[cfg(test)]
@@ -192,4 +199,25 @@ pub(crate) fn tokio_deadline_reached(deadline: tokio::time::Instant) -> bool {
         return clock.instant() >= deadline.into_std();
     }
     tokio::time::Instant::now() >= deadline
+}
+
+/// Engine phase hook; only the installed logical test clock can advance time.
+#[cfg(not(test))]
+pub(crate) const fn checkpoint(_name: &'static str) {}
+
+#[cfg(test)]
+pub(crate) fn checkpoint(checkpoint_name: &'static str) {
+    #[cfg(test)]
+    if let Some(clock) = current() {
+        let mut armed = clock.checkpoint.lock();
+        if let Some((name, remaining, by)) = armed.as_mut()
+            && *name == checkpoint_name
+        {
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
+                clock.advance(*by);
+                *armed = None;
+            }
+        }
+    }
 }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::branch::{CandidateId, CapabilityTarget};
+use super::branch::{CandidateId, CapabilityTarget, CausalActionKind};
 use super::candidate_generator::CandidateSet;
 use super::decision_engine::{EngineDecision, FallbackCause, PredictionAuditAnswer};
 use super::decision_score::SCORER_VERSION;
@@ -170,7 +170,7 @@ impl DecisionRecordBuilder {
         Self::build_hop(hop, key, None, true, record_redacted_projection)
     }
 
-    fn build_hop(
+    pub(super) fn build_hop(
         hop: &EngineDecision,
         key: &DecisionKey,
         prior_decision_id: Option<DecisionId>,
@@ -415,7 +415,7 @@ fn selection_fields(hop: &EngineDecision) -> Result<(Option<String>, String, Opt
             if !admitted || !matches!(hop.pre_commit.outcomes.get(&terminal_id), Some(GateOutcome::Passed)) {
                 return Err(RecordBuildError::Binding);
             }
-            (Some(terminal_id), action.as_str(), fallback.or(Some(*reason_code)), 1.0)
+            (Some(terminal_id), action.as_str(), Some(*reason_code), 1.0)
         }
     };
     if !propensity.is_finite() || !(0.0..=1.0).contains(&propensity) {
@@ -545,6 +545,9 @@ fn audit_fields(hop: &EngineDecision) -> Result<(RecordedDistributions, Value), 
             "forced_choices":forced,
             "scores":scores,
             "fallback_cause":hop.fallback_cause.map(fallback_code),
+            "fallback": (matches!(hop.selection, Selection::Abstain { action: CausalActionKind::Answer, .. })
+                || matches!(&hop.selection, Selection::Commit { candidate_id, .. } if candidate_id.action() == CausalActionKind::Answer && hop.fallback_cause == Some(FallbackCause::HopStopped)))
+                .then_some("answer_on_abstention"),
             "factory_reason":hop.prediction.as_ref().and_then(|prediction| prediction.reason.map(factory_reason)),
         }),
     ))

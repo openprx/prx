@@ -207,8 +207,6 @@ const CAUSAL_DOMAIN_CRATE_PATHS: &[&str] = &[
     "decision::RequestLimits",
     "decision::RequestParts",
     "decision::builtin::weights::MODEL_VERSION",
-    // The selector reads the language-neutral text shape. This opens no backend.
-    "decision::builtin::features::text_signals",
     "providers::redact_endpoint_userinfo",
     "runtime::sqlite_pool::install_bounded_busy_handler",
     "security::redaction::redact_json_value",

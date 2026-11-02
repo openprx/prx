@@ -778,6 +778,9 @@ fn calibration(decisions: &[DecisionView]) -> Availability<CalibrationProposal> 
         let Some(outcome) = complete_outcome(decision) else {
             continue;
         };
+        if outcome.classification == "cancelled" {
+            continue;
+        }
         let distribution = &decision.distributions.next_action;
         let Some((predicted, top)) = argmax(distribution) else {
             continue;
@@ -864,11 +867,6 @@ fn report(
             continue;
         };
         coverage.complete_outcomes += 1;
-        rates.outcomes += 1;
-        let success = is_success(&outcome.classification);
-        successes += u64::from(success);
-        fallbacks += u64::from(outcome.classification == "fallback_success");
-        retries += u64::from(outcome.provider_attempts > 1);
         if let Some(micro_usd) = outcome.cost_micro_usd {
             cost = Some(cost.unwrap_or(0).saturating_add(micro_usd));
         }
@@ -888,6 +886,16 @@ fn report(
             narrowing.denied_tool_attempts += denied;
             narrowing.outcomes_with_denials += 1;
         }
+        // Cancellation has real metered costs and execution statistics,
+        // but supplies no success/failure label for calibration.
+        if outcome.classification == "cancelled" {
+            continue;
+        }
+        rates.outcomes += 1;
+        let success = is_success(&outcome.classification);
+        successes += u64::from(success);
+        fallbacks += u64::from(outcome.classification == "fallback_success");
+        retries += u64::from(outcome.provider_attempts > 1);
         let next_action = &decision.distributions.next_action;
         if let (Some(observed), true) = (outcome.executed_action.as_deref(), success) {
             action_pairs.push((next_action, observed));
@@ -1212,6 +1220,34 @@ mod tests {
             );
         }
         store
+    }
+
+    #[tokio::test]
+    async fn cancelled_outcomes_do_not_reduce_success_or_margin_calibration() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let row = |n, at| {
+            let mut row = record(id(n), WS, Some("a"), at);
+            row.distributions.next_action = BTreeMap::from([("answer".to_owned(), 0.8), ("retrieve".to_owned(), 0.2)]);
+            row
+        };
+        let store = store_with(&temp, vec![(row(0, 10), 1.0)]).await;
+        store.writer().unwrap().record_decision(row(1, 20));
+        flushed(&store).await;
+        write_outcome(
+            temp.path(),
+            id(1),
+            &OutcomeFixture {
+                classification: "cancelled",
+                cost_micro_usd: Some(100),
+                ..OutcomeFixture::default()
+            },
+        );
+        let report = evaluate(&store.reader(), &scope(&store), ALL, &options()).unwrap();
+        assert_eq!(report.coverage.complete_outcomes, 2);
+        assert_eq!(report.rates.outcomes, 1);
+        assert_eq!(report.rates.success_rate, Some(1.0));
+        assert_eq!(report.cost_per_successful_turn_micro_usd, Some(100.0));
+        assert_eq!(report.margin.iter().map(|bucket| bucket.decisions).sum::<u64>(), 1);
     }
 
     /// V8.05: with known propensities the IPS and doubly robust estimates

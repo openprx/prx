@@ -12,6 +12,7 @@ mod compaction;
 mod config;
 mod decision_backend;
 mod decision_seals;
+mod decision_terminals;
 mod helpers;
 mod ingress;
 mod labels;

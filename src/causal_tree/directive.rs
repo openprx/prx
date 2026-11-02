@@ -64,10 +64,13 @@ pub(crate) fn render_terminal_directive(
     match directive {
         TurnExecutionDirective::Clarify { reason_code } => Ok(std::borrow::Cow::Borrowed(match reason_code.as_str() {
             "deadline_exceeded" => "Could you narrow your request so I can finish it in time?",
-            "retrieve_evidence" => "I could not obtain enough supporting information. What source should I use?",
+            "insufficient_evidence" | "retrieve_evidence" => {
+                "I could not obtain enough supporting information. What source should I use?"
+            }
             "hop_stopped" => {
                 "Capability selection stopped without a usable next step. Please specify the action or tool you need."
             }
+            "commit_threshold_or_margin" => "Which result and supporting source should I use for this request?",
             "discover_capability" => "Which action would you like me to take?",
             "approval_requires_call" => APPROVAL_UNAVAILABLE_REPLY,
             _ => "Could you clarify the result you want?",
@@ -162,6 +165,14 @@ pub(crate) fn directive_from_selection(
                 .find(|item| item.candidate_id() == candidate_id)
                 .ok_or(DirectiveError::NotAdmitted)?;
             require_pass(candidate_id, decision)?;
+            if matches!(decision.selection, Selection::Recover { .. })
+                && !matches!(
+                    candidate.action(),
+                    CausalActionKind::Answer | CausalActionKind::Retrieve | CausalActionKind::Discover
+                )
+            {
+                return Err(DirectiveError::ActionMismatch);
+            }
             match candidate.action() {
                 CausalActionKind::Answer => Ok(TurnExecutionDirective::AnswerDirectly),
                 CausalActionKind::Retrieve => Ok(TurnExecutionDirective::Retrieve {
@@ -278,6 +289,7 @@ pub(crate) fn directive_from_selection(
             let candidate_id = CandidateId::new(*action, CapabilityTarget::None, None);
             require_pass(&candidate_id, decision)?;
             match action {
+                CausalActionKind::Answer => Ok(TurnExecutionDirective::AnswerDirectly),
                 CausalActionKind::Clarify => Ok(TurnExecutionDirective::Clarify {
                     reason_code: (*reason_code).into(),
                 }),

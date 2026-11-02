@@ -110,7 +110,14 @@ fn record_builder_distinguishes_local_terminal_from_failed_compiled_request() {
         u32::from(crate::decision::PROTOCOL_VERSION)
     );
     assert_eq!(timed_out_row.error_class, None);
-    assert_eq!(timed_out_row.abstention_reason.as_deref(), Some("deadline_exceeded"));
+    assert_eq!(timed_out_row.abstention_reason.as_deref(), Some("hop_stopped"));
+    assert_eq!(
+        timed_out_row
+            .features
+            .get("fallback_cause")
+            .and_then(serde_json::Value::as_str),
+        Some("deadline_exceeded")
+    );
     context.hop_ids.clear();
     assert!(matches!(
         DecisionRecordBuilder::build_enabled_chain(&context, &key, true, false),
@@ -659,7 +666,10 @@ async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
         .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
         .await
         .expect("source-bound builtin decision");
-    assert!(matches!(result.directive(), TurnExecutionDirective::Refuse { .. }));
+    assert!(matches!(result.directive(), TurnExecutionDirective::AnswerDirectly));
+    service
+        .agent_execution_specs(&proof, &result)
+        .expect("confidence Answer uses ordinary model publication");
     assert!(matches!(
         &result.engine().candidates,
         crate::causal_tree::candidate_generator::CandidateSet::Legal { .. }
@@ -691,7 +701,7 @@ async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
         result.retrieved().expect("live selected evidence").is_empty(),
         "expected an empty value"
     );
-    assert!(matches!(result.disposition(), Ok(TurnDisposition::Close { .. })));
+    assert!(matches!(result.disposition(), Ok(TurnDisposition::Run)));
     // Exercise fresh admission with this actual selected engine decision,
     // not a fabricated selection or an already-consumed context getter.
     let directive_context = DirectiveContext {
@@ -701,7 +711,7 @@ async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
     };
     assert!(matches!(
         directive_from_selection(result.engine(), &directive_context),
-        Ok(TurnExecutionDirective::Refuse { .. })
+        Ok(TurnExecutionDirective::AnswerDirectly)
     ));
     let issued_id = result.decision_id();
     let issued_input = result.engine().state.routing_input.clone();
@@ -713,22 +723,22 @@ async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
         .deadline = Instant::now();
     assert!(matches!(
         directive_from_selection(expired.engine(), &directive_context),
-        Ok(TurnExecutionDirective::Refuse { .. })
+        Ok(TurnExecutionDirective::AnswerDirectly)
     ));
-    // Fixed local closure remains valid after the decision deadline; it
-    // grants no provider execution. Actual terminal closure seals access.
+    // The decision deadline bounds selection, not the issued model Answer.
+    // Actual terminal closure still seals provider and evidence access.
     assert!(
         expired.retrieved().expect("already selected evidence").is_empty(),
         "expected an empty value"
     );
-    assert!(matches!(expired.disposition(), Ok(TurnDisposition::Close { .. })));
+    assert!(matches!(expired.disposition(), Ok(TurnDisposition::Run)));
     assert_eq!(expired.decision_id(), issued_id);
     assert_eq!(expired.engine().state.routing_input, issued_input);
     assert_eq!(expired.engine().state.trusted, issued_trusted);
     let _ = expired.terminal_execution_trace();
     assert!(matches!(expired.retrieved(), Err(DirectiveError::NotAdmitted)));
-    // Sealing denies evidence access; rendering a fixed close remains safe.
-    assert!(matches!(expired.disposition(), Ok(TurnDisposition::Close { .. })));
+    // A sealed Answer cannot re-enter the provider loop.
+    assert!(matches!(expired.disposition(), Err(DirectiveError::NotAdmitted)));
     assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
 }
 

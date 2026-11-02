@@ -25,6 +25,10 @@ use super::decision_seals::{
     trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
     validation_requires_the_sealed_request_manifest,
 };
+use super::decision_terminals::{
+    confidence_terminals_include_answer_and_cli_clarification,
+    execution_guard_is_unconditional_and_decision_clock_has_one_owner, recovery_cannot_publish_an_executable_tool,
+};
 use super::helpers::{PLANTED_SOURCES, repository_root};
 use super::ingress::{
     embedded_user_input_cannot_bypass_reserved_marker_neutralization,
@@ -675,6 +679,9 @@ macro_rules! source_mutation_probes {
 }
 
 source_mutation_probes! {
+    recovery_cannot_publish_an_executable_tool => mutation_proof_recovery_execution,
+    execution_guard_is_unconditional_and_decision_clock_has_one_owner => mutation_proof_decision_clock,
+    confidence_terminals_include_answer_and_cli_clarification => mutation_proof_confidence_terminal,
     provider_label_sinks_redact_url_userinfo => terminal_provider_label_guard_rejects_bypass_missing_calls_and_literal_decoys,
     embedded_user_input_cannot_bypass_reserved_marker_neutralization => mutation_proof_embedded_input_guard,
     every_non_tool_execute_call_site_shows_its_type_evidence => mutation_proof_execution_binding_guard,
@@ -836,4 +843,35 @@ fn out_of_line_test_ancestry_preserves_production_violation_probes() {
             "an undeclared file called tests.rs must remain production"
         );
     }
+}
+
+fn mutation_proof_recovery_execution() {
+    assert_reviewed_source_mutation(
+        recovery_cannot_publish_an_executable_tool,
+        "src/causal_tree/directive.rs",
+        "matches!(decision.selection, Selection::Recover { .. })",
+        "false",
+    );
+}
+fn mutation_proof_decision_clock() {
+    assert_reviewed_source_mutation(
+        execution_guard_is_unconditional_and_decision_clock_has_one_owner,
+        "src/causal_tree/decision_engine.rs",
+        "fn decision_now() -> Instant {",
+        "const DECISION_CLOCK: u8 = 0;\nfn decision_now() -> Instant {",
+    );
+}
+fn mutation_proof_confidence_terminal() {
+    assert_reviewed_source_mutation(
+        confidence_terminals_include_answer_and_cli_clarification,
+        "src/causal_tree/decision_select.rs",
+        "&[CausalActionKind::Answer, CausalActionKind::Clarify]",
+        "&[CausalActionKind::Clarify]",
+    );
+    assert_reviewed_source_mutation(
+        confidence_terminals_include_answer_and_cli_clarification,
+        "src/runtime/turn_decision.rs",
+        "delegation && fallback_answer",
+        "delegation && false",
+    );
 }

@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconciles its reserved hold at zero micro-USD. Kimi Code, OpenAI Codex,
   and GitHub Copilot rows use this marker. An operator `[cost.prices]` entry
   still wins. Catalog revision `2026-10-31.3`.
+- Confidence abstention now uses a gated model-backed answer or a reason-specific
+  clarification on every text surface. Tool selection retains confidence,
+  evidence, side-effect thresholds and margin checks even for exact names.
+- Interrupted scoring retains commits only after complete scoring. Cancelled
+  work does not count as failure or success calibration; failed tools are not
+  selected again in the same turn. Corrective replies recheck execution intent
+  without bypassing the unverified-execution guard.
+
 - **Breaking:** provider auth and API requests identify as `User-Agent: prx/<version>`.
   Provider-specific user agents (`OpenPRX/0.1`, `KimiCLI/0.77`, `QwenCode/1.0`,
   `GithubCopilot/…`) are no longer sent.
@@ -98,7 +106,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `config.d/agent.toml`; startup and `prx init --force` remain available.
   Versioned disables and unversioned disables alongside modern settings
   remain explicit, and loading does not rewrite files.
-- Keep an explicit first-hop instruction that names a path, URL, or command from abstaining to Clarify when a matching tool is legal and no retrieve or discover candidate is available (`concrete_artifact`). A pure textual reply such as "reply with exactly one word" is answered, including when an execution check predicted a tool and the corrective retry produced none (`pure_answer_no_tool`). A decision deadline that expires after a legal Commit candidate is already above the commit threshold keeps that candidate and records `deadline_exceeded`.
 
 ## [0.8.171] - 2026-10-31
 

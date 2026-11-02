@@ -134,15 +134,13 @@ async fn exercise_grounding_request(
                         &provider,
                     )
                     .await;
-                    if !crate::causal_tree::decision_select::pure_textual_reply(input) {
-                        assert_eq!(
-                            matches!(
-                                admission.decision().context.directive(),
-                                crate::causal_tree::directive::TurnExecutionDirective::Execute { .. }
-                            ),
-                            explicit_execution
-                        );
-                    }
+                    assert_eq!(
+                        matches!(
+                            admission.decision().context.directive(),
+                            crate::causal_tree::directive::TurnExecutionDirective::Execute { .. }
+                        ),
+                        explicit_execution
+                    );
                     // An old successful-looking assistant message must not count as this turn's execution.
                     let mut history = vec![
                         ChatMessage::system("sys"),
@@ -220,27 +218,51 @@ async fn exercise_grounding_request(
 }
 
 #[tokio::test]
-async fn pure_textual_reply_degrades_failed_execution_prediction_to_answer() {
-    let hello = "hello";
-    let (result, requests, history, streamed) = exercise_grounding_request(
-        true,
-        &[
-            hello,
-            r#"{"requirement":"execution_required"}"#,
-            hello,
-            r#"{"requirement":"execution_required"}"#,
-        ],
-        false,
-        "Reply with exactly one word: hello",
-    )
-    .await;
-    let delivered = result.expect("pure textual reply delivers the draft");
-    assert_eq!(delivered, hello);
-    assert!(!requests.is_empty());
-    assert!(
-        history.iter().any(|message| message.content == hello) || streamed.contains(hello),
-        "the draft must be delivered on a history or stream sink"
-    );
+async fn execution_prediction_can_be_corrected_to_informational_answer() {
+    for explicit_execution in [false, true] {
+        let hello = "hello";
+        let (result, requests, history, streamed) = exercise_grounding_request(
+            explicit_execution,
+            &[
+                hello,
+                r#"{"requirement":"execution_required"}"#,
+                hello,
+                r#"{"requirement":"informational"}"#,
+            ],
+            false,
+            "Reply with exactly one word: hello",
+        )
+        .await;
+        let delivered = result.expect("corrected informational assessment permits the answer");
+        assert_eq!(delivered, hello);
+        assert_eq!(requests.len(), 4, "the bounded correction must recheck intent");
+        assert!(
+            history.iter().any(|message| message.content == hello) || streamed.contains(hello),
+            "the draft must be delivered on a history or stream sink"
+        );
+    }
+}
+
+#[tokio::test]
+async fn action_with_exact_reply_contract_cannot_release_unverified_pass() {
+    for streaming in [false, true] {
+        let (result, requests, history, streamed) = exercise_grounding_request(
+            true,
+            &[
+                "PASS",
+                r#"{"requirement":"execution_required"}"#,
+                "PASS",
+                r#"{"requirement":"execution_required"}"#,
+            ],
+            streaming,
+            "Run the test suite and reply with exactly one word: PASS or FAIL",
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("execution is unverified"));
+        assert_eq!(requests.len(), 4);
+        assert!(!history.iter().any(|message| message.content == "PASS"));
+        assert_eq!(streamed, "");
+    }
 }
 
 #[tokio::test]
@@ -260,12 +282,17 @@ async fn missing_execution_is_rejected_after_one_correction_in_both_delivery_mod
         let fake = "All operations completed successfully; the report is ready.";
         let (result, requests, history, streamed) = exercise_grounding_on_stream(
             true,
-            &[fake, r#"{"requirement":"execution_required"}"#, fake],
+            &[
+                fake,
+                r#"{"requirement":"execution_required"}"#,
+                fake,
+                r#"{"requirement":"execution_required"}"#,
+            ],
             streaming,
         )
         .await;
         assert!(result.unwrap_err().to_string().contains("no tool result"));
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert!(!history.iter().any(|message| message.content == fake));
         assert!(
             streamed.is_empty(),

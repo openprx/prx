@@ -669,7 +669,7 @@ impl CausalCandidateGenerator {
         {
             proposed.push(terminal(CausalActionKind::Answer, policy));
         }
-        if state.trusted.parts().delivery.interactive && state.trusted.parts().delivery.can_ask_question {
+        if policy.can_deliver_text {
             proposed.push(terminal(CausalActionKind::Clarify, policy));
         }
         proposed.push(terminal(CausalActionKind::Refuse, policy));
@@ -1702,7 +1702,7 @@ mod tests {
             let CandidateSet::Legal { candidates, .. } = &generated else {
                 panic!("expected terminal candidates");
             };
-            assert_eq!(candidates.len(), 2);
+            assert_eq!(candidates.len(), 3);
             assert!(
                 candidates
                     .iter()
@@ -1724,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn noninteractive_surface_never_emits_clarify_even_if_question_flag_is_set() {
+    fn single_shot_surface_can_clarify_without_interactive_approval() {
         let key = fixtures::key();
         let mut state = fixtures::state(&key, "neutral request");
         let catalog = CapabilityCatalog::build(&[], &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
@@ -1784,7 +1784,7 @@ mod tests {
         assert!(
             candidates
                 .iter()
-                .all(|candidate| candidate.action() != CausalActionKind::Clarify)
+                .any(|candidate| candidate.action() == CausalActionKind::Clarify)
         );
     }
 

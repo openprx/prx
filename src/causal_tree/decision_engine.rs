@@ -26,17 +26,14 @@ use super::decision_score::{
     CandidatePrediction, CandidateScore, CausalBranchScorer, ExtractionError, PredictionEvidence, ScoreError,
     ScoreInputs, ScorerWeights,
 };
-use super::decision_select::{
-    CausalSelector, SelectError, Selection, SelectorContext, commit_threshold_for, pure_textual_reply,
-    routing_has_concrete_artifact,
-};
+use super::decision_select::{CausalSelector, SelectError, Selection, SelectorContext, terminal_abstain};
 use super::directive::{DirectiveContext, TurnExecutionDirective, directive_from_selection};
 use super::gates::{GateError, GateInputs, GateOutcome, GateReport, HardGates};
 use super::ids::DecisionId;
 use super::questions::{CompileError, CompiledQuestionRequest, CompilerPolicy, QuestionCompiler};
 use super::state::{
-    CausalState, DerivedCandidate, DerivedState, DuplicateCandidate, ObservedArtifactKind, ObservedStepKind,
-    ObservedStepStatus, SideEffectMode, TrustedParts,
+    CausalState, DerivedCandidate, DerivedState, DuplicateCandidate, ObservedStepKind, ObservedStepStatus,
+    SideEffectMode, TrustedParts,
 };
 use crate::capability::CapabilityAvailabilityLevel;
 use crate::decision::DecisionError;
@@ -58,54 +55,8 @@ pub(crate) mod prediction_sealed {
     pub(crate) trait Producer {}
 }
 
-const PHASE_PREDICTION: u8 = 0;
-const PHASE_SCORING: u8 = 1;
-const PHASE_SELECTION: u8 = 2;
-const PHASE_POST_SELECTION: u8 = 3;
-
-#[cfg(test)]
-struct DecisionClock {
-    before: Instant,
-    after: Instant,
-    exceed_at: u8,
-    phase: std::sync::atomic::AtomicU8,
-}
-
-#[cfg(test)]
-impl DecisionClock {
-    fn instant(&self) -> Instant {
-        if self.phase.load(std::sync::atomic::Ordering::Relaxed) >= self.exceed_at {
-            self.after
-        } else {
-            self.before
-        }
-    }
-}
-
-#[cfg(test)]
-tokio::task_local! {
-    static DECISION_CLOCK: Arc<DecisionClock>;
-}
-
 fn decision_now() -> Instant {
-    #[cfg(test)]
-    {
-        if let Ok(now) = DECISION_CLOCK.try_with(|clock| clock.instant()) {
-            return now;
-        }
-    }
-    // No phase clock: share the engine logical clock (wall time unless a test installed one).
     super::logical_clock::now()
-}
-
-#[cfg(not(test))]
-const fn enter_decision_phase(_phase: u8) {}
-
-#[cfg(test)]
-fn enter_decision_phase(phase: u8) {
-    let _ = DECISION_CLOCK.try_with(|clock| {
-        clock.phase.store(phase, std::sync::atomic::Ordering::Relaxed);
-    });
 }
 
 pub(crate) trait PredictionPort: prediction_sealed::Producer + Clone + Send + Sync {
@@ -731,6 +682,21 @@ impl CausalDecisionEngine {
     pub(crate) fn decide_terminal_prepared<P: PredictionPort>(
         prepared: PreparedHop<'_, '_, P>,
     ) -> Result<EngineDecision, EngineError> {
+        let reason = if prepared.state.routing_input.as_str().trim().is_empty() {
+            "empty_input"
+        } else if decision_now() >= prepared.inputs.deadline {
+            "deadline_exceeded"
+        } else {
+            "hop_stopped"
+        };
+        Self::decide_terminal_for_reason(prepared, reason)
+    }
+
+    /// A forced gate closure cannot enter confidence recovery.
+    pub(crate) fn decide_terminal_for_reason<P: PredictionPort>(
+        prepared: PreparedHop<'_, '_, P>,
+        reason: &'static str,
+    ) -> Result<EngineDecision, EngineError> {
         let PreparedHop {
             started_at,
             inputs,
@@ -753,62 +719,46 @@ impl CausalDecisionEngine {
             CandidateSet::Legal { candidates, .. } => candidates,
             CandidateSet::NoLegalPath { terminals, .. } => terminals,
         };
-        let passed = |action| {
-            admitted.iter().find(|candidate| {
-                candidate.action() == action
-                    && matches!(
-                        pre_commit.outcomes.get(candidate.candidate_id()),
-                        Some(GateOutcome::Passed)
-                    )
-            })
-        };
-        let has_retrieved_evidence = state.observed.artifacts().iter().any(|artifact| {
-            matches!(
-                artifact.kind,
-                ObservedArtifactKind::Memory | ObservedArtifactKind::Document | ObservedArtifactKind::Session
-            ) && artifact.age_ms <= crate::decision::builtin::weights::STALE_ARTIFACT_MS
+        let context = selector_context(
+            &candidates,
+            inputs.catalog,
+            inputs.state.trusted.parts().delivery.interactive,
+            None,
+            inputs.discovered_refs,
+        );
+        let completed_read = state.observed.completed_steps().iter().any(|step| {
+            matches!(step.kind(), ObservedStepKind::Retrieve | ObservedStepKind::Discover)
+                && step.status() == ObservedStepStatus::Ok
         });
-        let exhausted_discovery = state
-            .observed
-            .completed_steps()
-            .iter()
-            .any(|step| step.kind() == ObservedStepKind::Discover && step.status() == ObservedStepStatus::Ok);
-        // A completed Ok memory read that found nothing is still a finished
-        // retrieval: the turn may answer directly (G1-G9 still gate every tool
-        // call). Failed or cancelled reads never count.
-        let exhausted_retrieval = state
-            .observed
-            .completed_steps()
-            .iter()
-            .any(|step| step.kind() == ObservedStepKind::Retrieve && step.status() == ObservedStepStatus::Ok);
-        let selection = if inputs.allow_terminal_answer
-            && (has_retrieved_evidence || exhausted_discovery || exhausted_retrieval)
-            && super::logical_clock::now() < inputs.deadline
+        let proven_answer = admitted.iter().find(|candidate| {
+            candidate.action() == CausalActionKind::Answer
+                && matches!(
+                    pre_commit.outcomes.get(candidate.candidate_id()),
+                    Some(GateOutcome::Passed)
+                )
+        });
+        let selection = if matches!(reason, "hop_stopped" | "deadline_exceeded")
+            && inputs.allow_terminal_answer
+            && completed_read
+            && decision_now() < inputs.deadline
+            && let Some(answer) = proven_answer
         {
-            passed(CausalActionKind::Answer).map(|answer| Selection::Commit {
+            Selection::Commit {
                 candidate_id: answer.candidate_id().clone(),
                 propensity: 1.0,
-            })
-        } else {
-            None
-        }
-        .or_else(|| {
-            if state.trusted.parts().delivery.interactive {
-                passed(CausalActionKind::Clarify).map(|_| Selection::Abstain {
-                    action: CausalActionKind::Clarify,
-                    reason_code: "hop_stopped",
-                })
-            } else {
-                None
             }
-        })
-        .or_else(|| {
-            passed(CausalActionKind::Refuse).map(|_| Selection::Abstain {
-                action: CausalActionKind::Refuse,
-                reason_code: "hop_stopped",
-            })
-        })
-        .ok_or(EngineError::Selection(SelectError::NoTerminalPath))?;
+        } else if matches!(candidates, CandidateSet::NoLegalPath { .. }) {
+            CausalSelector::select(
+                &candidates,
+                &BTreeMap::new(),
+                &empty_evidence(),
+                &pre_commit,
+                &inputs.config.policy,
+                &context,
+            )?
+        } else {
+            terminal_abstain(admitted, &pre_commit, &context, reason)?
+        };
         Ok(EngineDecision {
             decision_id: inputs.decision_id,
             deadline: inputs.deadline,
@@ -1026,7 +976,7 @@ impl CausalDecisionEngine {
                 );
             }
         }
-        enter_decision_phase(PHASE_PREDICTION);
+        super::logical_clock::checkpoint("prediction");
         if matches!(candidates, CandidateSet::Legal { .. }) && decision_now() < inputs.deadline {
             let compiled = QuestionCompiler::compile(
                 &state,
@@ -1136,7 +1086,7 @@ impl CausalDecisionEngine {
 
         let mut scores = BTreeMap::new();
         let mut scored_count = 0usize;
-        enter_decision_phase(PHASE_SCORING);
+        super::logical_clock::checkpoint("scoring");
         let (mut selection, mut exploration_propensities) = if let Some(evidence) = evidence.as_ref() {
             let weights = if prediction.is_some() && fallback_cause.is_none() && decision_now() < inputs.deadline {
                 Some(ScorerWeights::effective(&inputs.config.scoring)?)
@@ -1178,32 +1128,49 @@ impl CausalDecisionEngine {
                     );
                     score
                 } else {
-                    CandidateScore {
-                        semantic_utility: 0.0,
-                        execution_utility: 0.0,
-                    }
+                    break;
                 };
                 scores.insert(candidate.candidate_id().clone(), score);
+                super::logical_clock::checkpoint("candidate_scored");
             }
-            enter_decision_phase(PHASE_SELECTION);
-            let selection_evidence = if decision_now() >= inputs.deadline {
+            super::logical_clock::checkpoint("selection");
+            let selection_evidence = evidence.clone();
+            if decision_now() >= inputs.deadline {
                 fallback_cause.get_or_insert(FallbackCause::DeadlineExceeded);
-                if legal_commit_above_threshold(&candidates, &scores, evidence, &inputs.config.policy) {
-                    evidence.clone()
+            }
+            if scored_count < admitted.iter().filter(|item| !is_terminal(item.action())).count() {
+                // Every missing utility has an upper bound of one. Without
+                // complete scoring there is no proven winner/margin, so do
+                // not expose an executable selection or record fake scores.
+                let reason = if decision_now() >= inputs.deadline {
+                    "deadline_exceeded"
                 } else {
-                    terminal_evidence(&candidates)
-                }
-            } else {
-                evidence.clone()
-            };
-            if prediction.is_some() && fallback_cause.is_none() && decision_now() < inputs.deadline {
+                    "decision_failed"
+                };
+                (
+                    terminal_abstain(
+                        admitted,
+                        &pre_commit,
+                        &selector_context(
+                            &candidates,
+                            inputs.catalog,
+                            trusted.delivery.interactive,
+                            resume_target,
+                            inputs.discovered_refs,
+                        ),
+                        reason,
+                    )?,
+                    BTreeMap::new(),
+                )
+            } else if prediction.is_some() && fallback_cause.is_none() && decision_now() < inputs.deadline {
                 CausalSelector::select_with_exploration(
                     &candidates,
                     &scores,
                     &selection_evidence,
                     &pre_commit,
                     &inputs.config.policy,
-                    &selector_context_for_config(
+                    &selector_context_for_state(
+                        &state,
                         &candidates,
                         inputs.catalog,
                         trusted.delivery.interactive,
@@ -1224,7 +1191,8 @@ impl CausalDecisionEngine {
                         &selection_evidence,
                         &pre_commit,
                         &inputs.config.policy,
-                        &selector_context_for_config(
+                        &selector_context_for_state(
+                            &state,
                             &candidates,
                             inputs.catalog,
                             trusted.delivery.interactive,
@@ -1245,7 +1213,8 @@ impl CausalDecisionEngine {
                     &empty_evidence(),
                     &pre_commit,
                     &inputs.config.policy,
-                    &selector_context_for_config(
+                    &selector_context_for_state(
+                        &state,
                         &candidates,
                         inputs.catalog,
                         trusted.delivery.interactive,
@@ -1258,35 +1227,71 @@ impl CausalDecisionEngine {
                 BTreeMap::new(),
             )
         };
-        enter_decision_phase(PHASE_POST_SELECTION);
+        super::logical_clock::checkpoint("post_selection");
         if decision_now() >= inputs.deadline
             && matches!(selection, Selection::Commit { .. } | Selection::Recover { .. })
         {
             fallback_cause.get_or_insert(FallbackCause::DeadlineExceeded);
             let keep_commit = match &selection {
                 Selection::Commit { candidate_id, .. } => {
-                    commit_is_above_threshold(&candidates, &scores, &inputs.config.policy, candidate_id)
+                    let CandidateSet::Legal {
+                        candidates: admitted, ..
+                    } = &candidates
+                    else {
+                        return Err(EngineError::CandidateDrift);
+                    };
+                    scored_count == admitted.iter().filter(|item| !is_terminal(item.action())).count()
+                        && scores.contains_key(candidate_id)
                 }
                 _ => false,
             };
             if !keep_commit {
-                selection = CausalSelector::select(
-                    &candidates,
-                    &scores,
-                    &terminal_evidence(&candidates),
+                let CandidateSet::Legal {
+                    candidates: admitted, ..
+                } = &candidates
+                else {
+                    return Err(EngineError::CandidateDrift);
+                };
+                selection = terminal_abstain(
+                    admitted,
                     &pre_commit,
-                    &inputs.config.policy,
-                    &selector_context_for_config(
+                    &selector_context(
                         &candidates,
                         inputs.catalog,
                         trusted.delivery.interactive,
                         resume_target,
                         inputs.discovered_refs,
-                        inputs.config.enabled,
-                        state.routing_input.as_str(),
                     ),
+                    "deadline_exceeded",
                 )?;
                 exploration_propensities.clear();
+            }
+        }
+        if decision_now() >= inputs.deadline
+            && matches!(
+                selection,
+                Selection::Abstain {
+                    action: CausalActionKind::Answer | CausalActionKind::Clarify,
+                    ..
+                }
+            )
+        {
+            if let CandidateSet::Legal {
+                candidates: admitted, ..
+            } = &candidates
+            {
+                selection = terminal_abstain(
+                    admitted,
+                    &pre_commit,
+                    &selector_context(
+                        &candidates,
+                        inputs.catalog,
+                        trusted.delivery.interactive,
+                        resume_target,
+                        inputs.discovered_refs,
+                    ),
+                    "deadline_exceeded",
+                )?;
             }
         }
         Ok(EngineDecision {
@@ -1421,55 +1426,6 @@ const fn is_terminal(action: CausalActionKind) -> bool {
         action,
         CausalActionKind::Clarify | CausalActionKind::RequestApproval | CausalActionKind::Refuse
     )
-}
-
-fn commit_is_above_threshold(
-    set: &CandidateSet,
-    scores: &BTreeMap<CandidateId, CandidateScore>,
-    policy: &super::config::CausalPolicy,
-    candidate_id: &CandidateId,
-) -> bool {
-    let CandidateSet::Legal { candidates, .. } = set else {
-        return false;
-    };
-    candidates
-        .iter()
-        .find(|candidate| candidate.candidate_id() == candidate_id)
-        .is_some_and(|candidate| scored_above_threshold(scores, policy, candidate))
-}
-
-fn legal_commit_above_threshold(
-    set: &CandidateSet,
-    scores: &BTreeMap<CandidateId, CandidateScore>,
-    evidence: &PredictionEvidence,
-    policy: &super::config::CausalPolicy,
-) -> bool {
-    let CandidateSet::Legal { candidates, .. } = set else {
-        return false;
-    };
-    candidates.iter().any(|candidate| {
-        if is_terminal(candidate.action()) {
-            return false;
-        }
-        let probability = evidence
-            .candidates
-            .get(candidate.candidate_id())
-            .map_or(0.0, |features| features.choice_probability);
-        probability > 0.0 && scored_above_threshold(scores, policy, candidate)
-    })
-}
-
-fn scored_above_threshold(
-    scores: &BTreeMap<CandidateId, CandidateScore>,
-    policy: &super::config::CausalPolicy,
-    candidate: &CausalCandidate,
-) -> bool {
-    if is_terminal(candidate.action()) {
-        return false;
-    }
-    scores.get(candidate.candidate_id()).is_some_and(|score| {
-        score.execution_utility >= commit_threshold_for(f64::from(policy.commit_threshold), candidate.side_effect())
-    })
 }
 
 fn derive_state(set: &CandidateSet, catalog: &CatalogView<'_>) -> Result<DerivedState, DuplicateCandidate> {
@@ -1743,8 +1699,7 @@ fn selector_context(
         discovery_completed: discovered_refs.iter().next().is_some(),
         single_exact_capability: false,
         single_exact_read_capability: false,
-        concrete_artefact: false,
-        pure_textual_reply: false,
+        failed_candidates: BTreeSet::new(),
     }
 }
 
@@ -1760,6 +1715,29 @@ fn single_exact_capability(catalog: &CatalogView<'_>, routing_input: &str) -> bo
         == 1
 }
 
+fn selector_context_for_state(
+    state: &CausalState,
+    set: &CandidateSet,
+    catalog: &CatalogView<'_>,
+    interactive: bool,
+    resume_target: Option<&CapabilityRef>,
+    discovered_refs: &DiscoveredRefs,
+    decision_enabled: bool,
+    routing_input: &str,
+) -> SelectorContext {
+    let mut context = selector_context_for_config(
+        set,
+        catalog,
+        interactive,
+        resume_target,
+        discovered_refs,
+        decision_enabled,
+        routing_input,
+    );
+    context.failed_candidates = state.observed.failed_candidates().into_iter().cloned().collect();
+    context
+}
+
 fn selector_context_for_config(
     set: &CandidateSet,
     catalog: &CatalogView<'_>,
@@ -1770,8 +1748,6 @@ fn selector_context_for_config(
     routing_input: &str,
 ) -> SelectorContext {
     let mut context = selector_context(set, catalog, interactive, resume_target, discovered_refs);
-    context.concrete_artefact = routing_has_concrete_artifact(routing_input);
-    context.pure_textual_reply = pure_textual_reply(routing_input);
     context.single_exact_capability = single_exact_capability(catalog, routing_input);
     let folded = routing_input.to_lowercase();
     context.single_exact_read_capability = catalog
@@ -2983,7 +2959,7 @@ mod tests {
             assert!(matches!(
                 old_terminal.selection,
                 Selection::Abstain {
-                    action: CausalActionKind::Refuse,
+                    action: CausalActionKind::Answer,
                     reason_code: "hop_stopped",
                 }
             ));
@@ -3361,7 +3337,7 @@ mod tests {
         assert!(matches!(
             result.selection,
             Selection::Abstain {
-                action: CausalActionKind::Clarify | CausalActionKind::Refuse,
+                action: CausalActionKind::Answer,
                 ..
             }
         ));
@@ -3377,7 +3353,7 @@ mod tests {
             matches!(
                 near_deadline.selection,
                 Selection::Abstain {
-                    action: CausalActionKind::Clarify | CausalActionKind::Refuse,
+                    action: CausalActionKind::Answer,
                     ..
                 }
             ),
@@ -3474,7 +3450,7 @@ mod tests {
         assert!(late_valid.request_compiled);
         assert_eq!(
             late_valid.scored_count, 0,
-            "expired post-prediction work uses zero placeholders"
+            "expired post-prediction work records no scores"
         );
         assert!(matches!(late_valid.selection, Selection::Abstain { .. }));
         assert!(
@@ -3530,10 +3506,7 @@ mod tests {
             },
         )
         .expect("empty recovery is gated");
-        assert!(matches!(
-            directive,
-            TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }
-        ));
+        assert!(matches!(directive, TurnExecutionDirective::AnswerDirectly));
 
         let mut stale = state.clone();
         let mut artifacts = stale.observed.artifacts().to_vec();
@@ -3551,10 +3524,7 @@ mod tests {
             },
         )
         .expect("stale-only recovery is gated");
-        assert!(matches!(
-            directive,
-            TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }
-        ));
+        assert!(matches!(directive, TurnExecutionDirective::AnswerDirectly));
 
         inputs.state = &state;
         inputs.deadline = Instant::now()
@@ -3572,10 +3542,7 @@ mod tests {
             },
         )
         .expect("expired recovery is gated");
-        assert!(matches!(
-            directive,
-            TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }
-        ));
+        assert!(matches!(directive, TurnExecutionDirective::AnswerDirectly));
 
         let mut blocked = state.clone();
         let mut trusted = blocked.trusted.parts().clone();

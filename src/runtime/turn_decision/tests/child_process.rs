@@ -1142,15 +1142,26 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
             }
         );
     } else {
-        assert!(matches!(context.disposition()?, TurnDisposition::Close { .. }));
-        assert!(service.agent_execution_specs(&proof, &context).is_err());
+        let answer = matches!(context.directive(), TurnExecutionDirective::AnswerDirectly);
+        match context.disposition()? {
+            TurnDisposition::Close { .. } => assert!(service.agent_execution_specs(&proof, &context).is_err()),
+            TurnDisposition::Run => {
+                assert!(answer, "unapproved delegation may only reach the explanatory model");
+                service.agent_execution_specs(&proof, &context)?;
+            }
+            _ => panic!("unapproved delegation cannot dispatch"),
+        }
         assert!(service.issue_child_grant(&proof, &context).is_err());
         assert_eq!(
             match service.verified_delegation_scope(&context) {
-                Ok(_) => panic!("closed turn has no executable scope"),
+                Ok(_) => panic!("unapproved turn has no executable delegation scope"),
                 Err(error) => error.to_string(),
             },
-            "selected decision is not delegation"
+            if answer {
+                "answer surface has no admitted delegator"
+            } else {
+                "selected decision is not delegation"
+            }
         );
         if level == crate::security::AutonomyLevel::ReadOnly {
             assert!(context.engine.outgoing_child.is_none());

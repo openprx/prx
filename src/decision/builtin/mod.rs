@@ -131,6 +131,7 @@ impl BuiltinDecisionBackend {
 fn plain_conversation_turn(state: &StateFeatures<'_>) -> bool {
     state.text.has_text
         && state.undecided()
+        && state.hop == 0
         && state.unsuccessful_action_steps == 0
         && state.retry_count == 0
         && !state.approval_pending
@@ -141,37 +142,6 @@ fn continued_plain_conversation_turn(state: &StateFeatures<'_>) -> bool {
         && state.has_conversation_history
         && state.successful_lookups == 0
         && state.artifact_count == 0
-}
-
-fn tool_matches_structure(state: &StateFeatures<'_>, candidate: &CandidateFeatures<'_>) -> bool {
-    let text = &state.text;
-    candidate.available
-        && candidate.action == Some(Action::UseTool)
-        && ((text.path && matches!(candidate.target, "filesystem" | "document"))
-            || (text.url && candidate.target == "web")
-            || (text.code
-                && (candidate.target == "shell" || (candidate.target == "filesystem" && candidate.executes_process))))
-}
-
-/// A structural first hop with a matching tool and no recovery candidate.
-/// Retrieve and discover stay on the existing evidence path when they are offered.
-fn concrete_artifact_without_recovery(state: &StateFeatures<'_>) -> bool {
-    let text = &state.text;
-    text.has_text
-        && text.structural()
-        && state.retry_count == 0
-        && state.unsuccessful_action_steps == 0
-        && !state.approval_pending
-        && state.fresh_artifacts == 0
-        && state.successful_lookups == 0
-        && !state
-            .candidates
-            .iter()
-            .any(|candidate| matches!(candidate.action, Some(Action::Retrieve | Action::Discover)))
-        && state
-            .candidates
-            .iter()
-            .any(|candidate| tool_matches_structure(state, candidate))
 }
 
 fn plain_turn_has_no_read_recovery(state: &StateFeatures<'_>) -> bool {
@@ -186,13 +156,17 @@ fn model_managed_delegation_turn(state: &StateFeatures<'_>) -> bool {
     // Source-configured delegation can be planned by the serving model. Exact
     // names may be negated or contextual; a path shape cannot decide intent.
     // This opens planning only, never execution or a new capability grant.
-    state.candidates.iter().any(|candidate| {
-        candidate.exact_mention
-            && matches!(candidate.action, Some(Action::Delegate))
-            && candidate.id.rsplit_once('-').is_some_and(|(_, namespace)| {
-                namespace.len() == 8 && namespace.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-    })
+    state.hop == 0
+        && state.retry_count == 0
+        && state.unsuccessful_action_steps == 0
+        && state.candidates.iter().any(|candidate| {
+            !candidate.failed_before
+                && candidate.exact_mention
+                && matches!(candidate.action, Some(Action::Delegate))
+                && candidate.id.rsplit_once('-').is_some_and(|(_, namespace)| {
+                    namespace.len() == 8 && namespace.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        })
 }
 
 /// The log-score of one candidate.
@@ -395,9 +369,6 @@ fn noul(state: &StateFeatures<'_>, meaning: Meaning<'_>) -> f64 {
             // run. Structurally or exactly targeted tool turns retain the
             // existing retrieve-first evidence path. Exact delegation instead
             // serves the model with only the sealed delegator publication.
-            if concrete_artifact_without_recovery(state) {
-                return weights::CONCRETE_ARTIFACT_EVIDENCE;
-            }
             let plain = plain_conversation_turn(state) || model_managed_delegation_turn(state);
             let decisive = if plain {
                 1.0
@@ -2264,90 +2235,6 @@ mod tests {
     }
 
     #[test]
-    fn concrete_artifact_without_recovery_is_sufficient_evidence() {
-        let key = key();
-        let direct_tools = || {
-            vec![
-                candidate_json("use_tool", "filesystem", "use_tool-filesystem"),
-                candidate_json("use_tool", "shell", "use_tool-shell"),
-                candidate_json("use_tool", "web", "use_tool-web"),
-                candidate_json("answer", "none", "answer-none"),
-                candidate_json("clarify", "none", "clarify-none"),
-                candidate_json("refuse", "none", "refuse-none"),
-            ]
-        };
-        let answer = |turn: &str, candidates: Vec<Value>| {
-            let value = state(turn, candidates);
-            let request = seal(&key, value.clone(), compiler_questions(&value));
-            answer_and_validate(&request)
-        };
-        let explicit =
-            "Read /tmp/prx_fixture/input.md and write /tmp/prx_fixture/reports/x.md. End the file with STATUS: A or B.";
-        let direct = answer(explicit, direct_tools());
-        assert_eq!(chosen(&direct, GlobalQuestion::NextAction), "use_tool");
-        assert_eq!(chosen(&direct, GlobalQuestion::CapabilityTarget), "filesystem");
-        assert!(
-            (noul_probability(&direct, GlobalQuestion::EvidenceSufficient) - weights::CONCRETE_ARTIFACT_EVIDENCE).abs()
-                < 1e-12
-        );
-
-        let with_recovery = answer(explicit, typical_candidates());
-        assert!(
-            noul_probability(&with_recovery, GlobalQuestion::EvidenceSufficient) < 0.5,
-            "retrieve or discover still owns the first hop"
-        );
-
-        let terminal = answer(
-            explicit,
-            vec![
-                candidate_json("answer", "none", "answer-none"),
-                candidate_json("clarify", "none", "clarify-none"),
-                candidate_json("refuse", "none", "refuse-none"),
-            ],
-        );
-        assert!(noul_probability(&terminal, GlobalQuestion::EvidenceSufficient) < 0.5);
-
-        let url = answer("look at https://example.com/report and summarize it", direct_tools());
-        assert_eq!(chosen(&url, GlobalQuestion::CapabilityTarget), "web");
-        assert!(
-            (noul_probability(&url, GlobalQuestion::EvidenceSufficient) - weights::CONCRETE_ARTIFACT_EVIDENCE).abs()
-                < 1e-12
-        );
-        let code = answer("run `cargo test` for me", direct_tools());
-        assert_eq!(chosen(&code, GlobalQuestion::CapabilityTarget), "shell");
-        assert!(
-            (noul_probability(&code, GlobalQuestion::EvidenceSufficient) - weights::CONCRETE_ARTIFACT_EVIDENCE).abs()
-                < 1e-12
-        );
-
-        let ambiguous = answer("make this friendlier", direct_tools());
-        assert_eq!(chosen(&ambiguous, GlobalQuestion::NextAction), "answer");
-        assert!(
-            (noul_probability(&ambiguous, GlobalQuestion::EvidenceSufficient) - weights::PLAIN_TURN_EVIDENCE).abs()
-                < 1e-12
-        );
-        let empty = answer("  ", direct_tools());
-        assert_eq!(chosen(&empty, GlobalQuestion::NextAction), "clarify");
-        assert!(noul_probability(&empty, GlobalQuestion::EvidenceSufficient) < 0.5);
-
-        let mut failed = state(explicit, direct_tools());
-        failed["completed_steps"] = json!([{"kind": "tool", "status": "failed"}]);
-        let failed_request = seal(&key, failed.clone(), compiler_questions(&failed));
-        let failed = answer_and_validate(&failed_request);
-        assert!(noul_probability(&failed, GlobalQuestion::EvidenceSufficient) < 0.5);
-
-        let mut retried = state(explicit, direct_tools());
-        retried["retry_count"] = json!(weights::RETRY_THRESHOLD);
-        let retried_request = seal(&key, retried.clone(), compiler_questions(&retried));
-        let retried = answer_and_validate(&retried_request);
-        assert!(noul_probability(&retried, GlobalQuestion::EvidenceSufficient) < 0.5);
-    }
-
-    /// D-061 amendment N-1..N-4: a localized path, an internationalized
-    /// host, a full-width colon before a path, a yen-separated drive path and
-    /// an accented file name choose the same tool as their English forms
-    /// (the reviewer's choice probes, `R-CDP06-probes.log`).
-    #[test]
     fn localized_structure_chooses_like_the_english_form() {
         // Unicode data: Han words (open, download, report), Cyrillic words
         // (example, the .rf domain), the full-width colon, the yen sign,
@@ -2444,6 +2331,67 @@ mod tests {
             format!("Per{}/Chile/Bolivia", word(&U_ACUTE)),
         ] {
             assert_ne!(pick(&prose).0, "use_tool", "{prose:?}");
+        }
+    }
+
+    #[test]
+    fn first_hop_answer_preferences_do_not_apply_after_retry_or_failure() {
+        let plain = state("hello", vec![candidate_json("answer", "none", "answer-none")]);
+        assert!(plain_conversation_turn(&features::extract(&plain)));
+        let mut delegate = candidate_json("delegate", "session", "delegate-session-00000001");
+        delegate["exact_mention"] = json!(true);
+        let delegated = state("delegate", vec![delegate]);
+        assert!(model_managed_delegation_turn(&features::extract(&delegated)));
+        for original in [&plain, &delegated] {
+            for field in ["hop", "retry_count", "completed_steps"] {
+                let mut later = original.clone();
+                later[field] = if field == "completed_steps" {
+                    json!([{ "kind": "tool", "status": "failed" }])
+                } else {
+                    json!(1)
+                };
+                let extracted = features::extract(&later);
+                assert!(!plain_conversation_turn(&extracted));
+                assert!(!model_managed_delegation_turn(&extracted));
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_tool_outcome_leaves_next_request_scores_unchanged() {
+        let mut original = state(
+            "Read /tmp/prx_fixture/input.md",
+            vec![
+                candidate_json("use_tool", "filesystem", "use_tool-filesystem-00000001"),
+                candidate_json("answer", "none", "answer-none"),
+            ],
+        );
+        original["completed_steps"] = json!([]);
+        let mut cancelled = original.clone();
+        cancelled["completed_steps"] = json!([{ "kind": "tool", "status": "cancelled" }]);
+        let before = features::extract(&original);
+        let after = features::extract(&cancelled);
+        assert_eq!(after.unsuccessful_steps, 0);
+        assert_eq!(after.unsuccessful_action_steps, 0);
+        for candidate in &before.candidates {
+            if candidate.action == Some(Action::UseTool) {
+                assert_eq!(
+                    candidate_score(&before, candidate),
+                    candidate_score(&after, after.candidate(candidate.id).unwrap())
+                );
+            }
+        }
+        let key = key();
+        let original_request = seal(&key, original.clone(), compiler_questions(&original));
+        let cancelled_request = seal(&key, cancelled.clone(), compiler_questions(&cancelled));
+        let original_prediction = answer_and_validate(&original_request);
+        let cancelled_prediction = answer_and_validate(&cancelled_request);
+        for question in compiler_questions(&original).keys() {
+            assert_eq!(
+                original_prediction.answers.get(question),
+                cancelled_prediction.answers.get(question),
+                "{question:?}"
+            );
         }
     }
 

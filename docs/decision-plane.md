@@ -82,13 +82,14 @@ best admitted candidate is a direct answer, without requiring a retrieval
 artifact. This applies to the first message and later ordinary conversation.
 An earlier failed provider attempt is not an unsuccessful action step, so it
 does not make a later ordinary message require external evidence. Empty input
-and turns made undecidable by failed or repeated tool work still Clarify. Brief
+and turns made undecidable by failed or repeated tool work use the reason-aware
+terminal path below; a failed tool cannot be selected again in the same turn. Brief
 ordinary requests (builtin request weight at most two), continued conversation,
 and turns with no viable read/recovery candidate receive the direct-answer
 preference. Longer unrouted text may take one bounded discovery hop. After that
 gate-checked local read completes, the terminal fallback may answer even when
-the source contains a path, URL or code shape. An exact capability mention or
-a pending approval remains nonterminal after discovery. Any capability found
+the source contains a path, URL or code shape. A pending approval remains nonterminal after discovery. An exact capability
+mention still needs a fully gated selection before it can execute. Any capability found
 by the read still needs a normal nonterminal selection and all execution gates;
 completion of discovery grants no execution authority. Configured decision
 attempts all rejected for semantic validation remain fail
@@ -96,11 +97,17 @@ closed even when the builtin shadow completes discovery. Transport, 5xx,
 circuit-open and local decision-budget failures fall back to the builtin; a
 later configured attempt that serves also keeps the normal terminal path.
 
-A first hop whose text has a path, URL, or code shape, a matching legal tool, and no retrieve or discover candidate does not Clarify. The builtin reports concrete-artifact evidence at or above the evidence threshold, and the selector recovers that tool with reason `concrete_artifact` even when execution utility or choice confidence is below the commit bar. Retrieve and discover still run first when those candidates are admitted. Empty input, text with no concrete artifact, a terminal-only structural request, and failed or repeated tool work still Clarify.
+Structural path, URL and code shapes identify candidates, never execution
+intent or authority. Every tool selection requires the effective side-effect
+commit threshold, choice-confidence floor, top margin and sufficient evidence.
+Recovery can retrieve evidence or inspect metadata; it cannot execute a tool.
 
-A request whose only instruction is an exact textual reply, such as "reply with exactly one word", is selected as Answer with reason `pure_answer_no_tool`. That check lives in the selector, outside the language-neutral builtin model. If a later execution check still predicts a tool and the corrective retry produces none, the turn delivers that answer instead of an unverified-execution error.
-
-When the decision deadline expires after a legal Commit candidate has already scored at or above the commit threshold for its side-effect class, that candidate is kept and the record stores fallback `deadline_exceeded`. A deadline that expires before scoring, or a selection that is only a recovery hop, still falls back to Clarify. The deadline itself is unchanged.
+When a deadline interrupts scoring, an executable Commit is retained only after
+all candidates were scored and normal selection passed every execution bar.
+An unscored utility is bounded above by one, never treated as zero for the
+margin. An incomplete ranking takes the reason-aware terminal path with
+`deadline_exceeded`. The deadline is unchanged. The terminal Answer remains a
+normal serving-model turn, with ordinary context and all per-call execution checks.
 
 Exactly named native file operations can form one bounded file plan instead
 of keeping only the first name in that family. It includes only individually
@@ -112,17 +119,12 @@ mentions; they never establish positive execution intent or grant permission.
 The normal applicability/source/current-ref checks, execution assessment and
 per-call executor validation remain required.
 
-An exactly named, current Searchable tool, or an exactly named source-configured
-Delegate with a sealed child manifest, uses a narrower selection path. It may
-commit without an external artifact, the evidence-sufficiency abstention, the
-choice-confidence check, the side-effect-scaled commit threshold, or the
-minimum top-candidate margin. It still must be a single exact current reference
-in the catalog generation and pass surface visibility, exclusions, model
-allowlists, readiness, freshness, source authority, and side-effect-mode gates.
-An approval-required tool remains pending in Supervised mode, and execution
-still requires its exact approval/grant and idempotency authority. Delegation
-also retains the source's delegation authority and sealed child-capability
-boundary.
+An exactly named, current Searchable tool or source-configured Delegate may
+identify one current reference, but naming never exempts it from confidence,
+commit, margin or evidence checks. Surface visibility, exclusions, model
+allowlists, readiness, freshness, source authority and side-effect-mode gates
+also apply. Approval-required operations retain exact approval, single-use
+grants and idempotency authority. Delegation retains its sealed child scope.
 
 An Answer turn may publish the bounded Direct core plus `capability_search` when
 the source/model may call tools and an eligible discovery family exists. A brief
@@ -664,10 +666,29 @@ These values are fixed constants, not configuration:
 
 | Constant | Value | Meaning |
 |---|---|---|
-| Evidence threshold | 0.5, inclusive | `evidence_sufficient` at or above it is sufficient to answer; below it the selector retrieves, discovers or abstains. A plain conversational turn is reported by the builtin model at exactly 0.5 (`PLAIN_TURN_EVIDENCE`), so it answers directly |
+| Evidence threshold | 0.5, inclusive | `evidence_sufficient` at or above it permits an ordinary Commit; below it the selector retrieves, discovers or takes the reason-aware terminal path. A terminal model-backed Answer grants no tool execution. A plain conversational turn is reported by the builtin model at exactly 0.5 (`PLAIN_TURN_EVIDENCE`), so it answers directly |
 | Freshness threshold | 0.5, exclusive | `needs_fresh_state` above it marks observed artifacts stale and prefers a retrieve |
 | Deterministic propensity | 1.0 | recorded for every non-exploratory selection; only read-only exploration replaces it |
 | Approval lifetime | at most 5 minutes | an approval request whose expiry is later than five minutes after issue is refused |
+
+Confidence abstention (`commit_threshold_or_margin`, `insufficient_evidence`,
+`hop_stopped` or `deadline_exceeded`) selects a
+gated Answer when available. This calls the serving model with normal context;
+it grants no tool execution. Records retain the original abstention reason and
+`features.fallback = "answer_on_abstention"`. If Answer is unavailable, the
+terminal is a reason-specific Clarify on interactive and single-shot surfaces.
+Policy and gate failures (including missing approval and exhausted budgets) may
+Refuse. An explicit choice outside the legal set, or a failed decision, remains
+Clarify without widening the selected surface. Empty input also Clarifies.
+Catalog drift and rejected Router evidence retain a forced local gate closure;
+they do not enter confidence recovery. The interactive flag still governs
+approval collection independently.
+
+Cancelled outcomes provide neither success nor failure evidence, do not mark a
+candidate failed, and do not enter success/margin calibration denominators.
+Only failed steps count toward failure features. First-hop conversation
+preferences require hop zero, no retry and no failed action. An operation that
+failed in this turn cannot be selected again by the next hop.
 
 ## Terminal authority and logical task completion
 

@@ -497,8 +497,10 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
 
         // A blank message with the same empty OK read has nothing to answer.
         assert!(!read_finishes_retrieval(&empty_observed, " \t\n"));
+        let mut blank_state = empty_next.clone();
+        blank_state.routing_input = RawRoutingInput::new(" \t\n".to_string());
         let blank_inputs = EngineInputs {
-            state: &empty_next,
+            state: &blank_state,
             decision_id: DecisionId::new_runtime(),
             allow_terminal_answer: read_finishes_retrieval(&empty_observed, " \t\n"),
             ..inputs.clone()
@@ -556,7 +558,10 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             .observe_selected_agent_memory(&proof_a, &decision)
             .await
             .expect("backend failure closes through an observed step");
-        assert!(!failed_observation.fresh_read, "prior evidence cannot authorize Answer");
+        assert!(
+            !failed_observation.fresh_read,
+            "a failed read supplies no fresh supporting evidence"
+        );
         assert!(
             !failed_observation.completed_ok,
             "a failed read is not a finished retrieval"
@@ -590,7 +595,14 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
                     discovery_limit: 1,
                 },
             ),
-            Ok(TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. })
+            Ok(TurnExecutionDirective::AnswerDirectly)
+        ));
+        assert!(matches!(
+            failed_terminal.selection,
+            Selection::Abstain {
+                action: CausalActionKind::Answer,
+                reason_code: "hop_stopped",
+            }
         ));
         assert!(
             failed_terminal.prediction.is_none(),
@@ -631,7 +643,14 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
                     discovery_limit: 1,
                 },
             ),
-            Ok(TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. })
+            Ok(TurnExecutionDirective::AnswerDirectly)
+        ));
+        assert!(matches!(
+            cancelled_terminal.selection,
+            Selection::Abstain {
+                action: CausalActionKind::Answer,
+                reason_code: "deadline_exceeded",
+            }
         ));
         assert!(cancelled_terminal.prediction.is_none());
     });

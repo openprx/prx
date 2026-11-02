@@ -525,6 +525,9 @@ async fn exact_file_collection_with_recursive_budget(
             Some(crate::causal_tree::gates::GateOutcome::Passed)
         ));
         assert!(matches!(resumed.disposition().unwrap(), TurnDisposition::Run));
+        assert!(matches!(resumed.directive(), TurnExecutionDirective::Execute { .. }),
+            "approved resume must pass all execution bars: selection={:?} scores={:?} gates={:?}",
+            resumed.engine().selection, resumed.engine().scores, resumed.engine().pre_commit);
         let selected = service.agent_execution_specs(resume.as_ref(), &resumed).unwrap();
         assert_eq!(
             selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
@@ -890,6 +893,13 @@ async fn fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once() {
             .decide_agent_resume(resume.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .unwrap();
+        assert!(
+            matches!(resumed.directive(), TurnExecutionDirective::Execute { .. }),
+            "approved resume must clear ordinary selection: selection={:?}; scores={:?}; gates={:?}",
+            resumed.engine().selection,
+            resumed.engine().scores,
+            resumed.engine().pre_commit,
+        );
         let selected = service.agent_execution_specs(resume.as_ref(), &resumed).unwrap();
         assert_eq!(
             selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),

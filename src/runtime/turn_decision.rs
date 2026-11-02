@@ -1014,11 +1014,22 @@ fn direct_answer_refs(
                     estimated_latency_ms: None,
                 },
             );
-            (!matches!(
-                HardGates::check_capability_publication(&decision.state, catalog, &candidate, gates),
-                GateOutcome::Blocked { .. }
-            ))
-            .then_some(reference)
+            let publication = HardGates::check_capability_publication(&decision.state, catalog, &candidate, gates);
+            let fallback_answer = matches!(
+                &decision.selection,
+                crate::causal_tree::decision_select::Selection::Abstain {
+                    action: CausalActionKind::Answer,
+                    ..
+                }
+            );
+            // Explaining an unapproved delegation must not turn its
+            // publication-only approval outcome into a child grant.
+            if matches!(publication, GateOutcome::Blocked { .. })
+                || (delegation && fallback_answer && !matches!(publication, GateOutcome::Passed))
+            {
+                return None;
+            }
+            Some(reference)
         })
         .collect()
 }
@@ -2609,7 +2620,7 @@ impl TurnDecisionService {
                 CausalEventKind::CandidatesGenerated,
                 Some(prepared.candidate_count()),
             );
-            let decision = CausalDecisionEngine::decide_terminal_prepared(prepared)?;
+            let decision = CausalDecisionEngine::decide_terminal_for_reason(prepared, "catalog_drift")?;
             self.emit_agent_phase(
                 proof,
                 decision_id,
@@ -2739,7 +2750,10 @@ impl TurnDecisionService {
             if self.check_live_parity().is_err() {
                 return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry));
             }
-            let terminal_only = stop_hops || hop == max_hops || crate::causal_tree::logical_clock::now() >= deadline;
+            let terminal_only = state.routing_input.as_str().trim().is_empty()
+                || stop_hops
+                || hop == max_hops
+                || crate::causal_tree::logical_clock::now() >= deadline;
             let decision_id = DecisionId::new_runtime();
             self.emit_agent_phase(proof, decision_id, CausalEventKind::SnapshotCreated, None);
             let delegation = (!terminal_only && resume.is_none())
@@ -2799,6 +2813,8 @@ impl TurnDecisionService {
             let decision = if terminal_only {
                 if hop == max_hops && !stop_hops && crate::causal_tree::logical_clock::now() < deadline {
                     CausalDecisionEngine::decide_terminal_with_collection(prepared, proof.approval_review_adapter())?
+                } else if routing_failed {
+                    CausalDecisionEngine::decide_terminal_for_reason(prepared, "routing_failed")?
                 } else {
                     CausalDecisionEngine::decide_terminal_prepared(prepared)?
                 }

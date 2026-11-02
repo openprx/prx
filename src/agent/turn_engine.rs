@@ -1769,7 +1769,10 @@ async fn run_turn_unguarded(
             if verify_chat_completion {
                 use super::completion_review::{CompletionDecision, ReplyAssessment};
                 use super::execution_requirement::{ExecutionRequirement, assessment_messages, parse_assessment};
-                let assessment = if !observed_tool_results && let Some(requirement) = execution_requirement {
+                let assessment = if !observed_tool_results
+                    && let Some(requirement) = execution_requirement
+                    && requirement != ExecutionRequirement::ExecutionRequired
+                {
                     ReplyAssessment::Execution(requirement)
                 } else {
                     // Keep the assessment and persistence future off the turn's
@@ -1850,17 +1853,13 @@ async fn run_turn_unguarded(
                 };
                 match assessment {
                     ReplyAssessment::Execution(ExecutionRequirement::ExecutionRequired) => {
-                        let textual_reply = execution_requirement.is_some()
-                            && crate::causal_tree::decision_select::pure_textual_reply(proof.routing_input());
-                        if !textual_reply {
-                            anyhow::ensure!(
-                                execution_requirement.is_none(),
-                                "request requires execution but no tool result was produced after one corrective retry; execution is unverified"
-                            );
-                            execution_requirement = Some(ExecutionRequirement::ExecutionRequired);
-                            inject_execution_retry = true;
-                            continue;
-                        }
+                        anyhow::ensure!(
+                            execution_requirement.is_none(),
+                            "request requires execution but no tool result was produced after one corrective retry; execution is unverified"
+                        );
+                        execution_requirement = Some(ExecutionRequirement::ExecutionRequired);
+                        inject_execution_retry = true;
+                        continue;
                     }
                     ReplyAssessment::Execution(ExecutionRequirement::Uncertain) => {
                         // Do not release the unverified draft or claim an action

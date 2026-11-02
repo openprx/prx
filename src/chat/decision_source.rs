@@ -1487,8 +1487,6 @@ pub(crate) mod admission_failure_tests {
             | "choice_outside_legal_set"
             | "approval_only"
             | "deadline_exceeded"
-            | "concrete_artifact"
-            | "pure_answer_no_tool"
             | "not_applicable" => reason,
             _ => "unclassified",
         };
@@ -1615,8 +1613,6 @@ pub(crate) mod admission_failure_tests {
             | "choice_outside_legal_set"
             | "approval_only"
             | "deadline_exceeded"
-            | "concrete_artifact"
-            | "pure_answer_no_tool"
             | "not_applicable" => reason,
             _ => "unclassified",
         };
