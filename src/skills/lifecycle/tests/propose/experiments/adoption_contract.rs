@@ -126,45 +126,82 @@ fn readonly_cost_snapshot_does_not_create_or_migrate_old_storage() -> Result<()>
 
 #[test]
 fn empty_query_rejects_owner_and_caps_without_inventing_eligible_lessons() -> Result<()> {
-    let f = fixture();
-    let now = Utc::now();
-    let query = LessonQuery {
-        owner_scope: f.store.owner_scope().clone(),
-        task_family: "deploy".into(),
-        skill_id: f.pin.skill_id.clone(),
-        baseline_revision: f.pin.revision_id.clone(),
-        baseline_record_sha256: f.pin.record_digest.clone(),
-        compatibility: LessonCompatibility {
-            model_sha256: "a".repeat(64),
-            policy_sha256: "b".repeat(64),
-            source_profile_sha256: "c".repeat(64),
-            tokenizer_profile_sha256: "d".repeat(64),
+    let clock = crate::causal_tree::logical_clock::ManualClock::new();
+    crate::skills::lifecycle::adoption::worker_clock::sync_scope(
+        Some(std::sync::Arc::clone(&clock)),
+        "lesson.lookup-budget",
+        || {
+            crate::causal_tree::logical_clock::sync_scope(std::sync::Arc::clone(&clock), || {
+                let f = fixture();
+                let now = Utc::now();
+                let query = LessonQuery {
+                    owner_scope: f.store.owner_scope().clone(),
+                    task_family: "deploy".into(),
+                    skill_id: f.pin.skill_id.clone(),
+                    baseline_revision: f.pin.revision_id.clone(),
+                    baseline_record_sha256: f.pin.record_digest.clone(),
+                    compatibility: LessonCompatibility {
+                        model_sha256: "a".repeat(64),
+                        policy_sha256: "b".repeat(64),
+                        source_profile_sha256: "c".repeat(64),
+                        tokenizer_profile_sha256: "d".repeat(64),
+                    },
+                    excluded_roots: suite(&f).lesson_root_digests(),
+                    limits: LessonLimits::default(),
+                    planned_at: now,
+                    expires_at: now + chrono::Duration::minutes(5),
+                };
+                clock.arm_site(
+                    "lesson.lookup-budget",
+                    std::time::Duration::from_millis(550),
+                    std::time::Duration::ZERO,
+                );
+                let snapshot = f.store.query_adopted_lessons(&query)?;
+                assert!(
+                    clock.site_hits("lesson.lookup-budget") > 0,
+                    "test: actual lookup consumed its clock hook"
+                );
+                assert_eq!(
+                    snapshot.stats.elapsed_ms, 0,
+                    "test: wall stall spends no logical budget"
+                );
+                clock.arm_site(
+                    "lesson.lookup-budget",
+                    std::time::Duration::ZERO,
+                    std::time::Duration::from_millis(501),
+                );
+                let expired = f
+                    .store
+                    .query_adopted_lessons(&query)
+                    .expect_err("test: unchanged logical lookup budget expires");
+                assert!(
+                    expired
+                        .to_string()
+                        .contains("lesson lookup deadline exhausted; no partial snapshot is usable")
+                );
+                assert_eq!(clock.site_hits("lesson.lookup-budget"), 1);
+                assert_eq!(snapshot.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
+                assert_eq!(
+                    crate::skills::lifecycle::adoption::format_lesson_block(&snapshot, "general-proposal")?,
+                    ""
+                );
+                let mut foreign = query.clone();
+                foreign.owner_scope = crate::skills::lifecycle::OwnerScope::new("fixture-foreign-owner")?;
+                assert!(f.store.query_adopted_lessons(&foreign).is_err());
+                let mut oversized = query.clone();
+                oversized.limits.examined += 1;
+                assert!(f.store.query_adopted_lessons(&oversized).is_err());
+                let mut expired = query;
+                expired.expires_at = expired.planned_at;
+                assert!(f.store.query_adopted_lessons(&expired).is_err());
+                assert!(
+                    !f.store.root().join("adoptions").exists(),
+                    "read-only empty query must not create a library"
+                );
+                Ok(())
+            })
         },
-        excluded_roots: suite(&f).lesson_root_digests(),
-        limits: LessonLimits::default(),
-        planned_at: now,
-        expires_at: now + chrono::Duration::minutes(5),
-    };
-    let snapshot = f.store.query_adopted_lessons(&query)?;
-    assert_eq!(snapshot.entries.as_slice(), &[] as &[LessonSnapshotEntry]);
-    assert_eq!(
-        crate::skills::lifecycle::adoption::format_lesson_block(&snapshot, "general-proposal")?,
-        ""
-    );
-    let mut foreign = query.clone();
-    foreign.owner_scope = crate::skills::lifecycle::OwnerScope::new("fixture-foreign-owner")?;
-    assert!(f.store.query_adopted_lessons(&foreign).is_err());
-    let mut oversized = query.clone();
-    oversized.limits.examined += 1;
-    assert!(f.store.query_adopted_lessons(&oversized).is_err());
-    let mut expired = query;
-    expired.expires_at = expired.planned_at;
-    assert!(f.store.query_adopted_lessons(&expired).is_err());
-    assert!(
-        !f.store.root().join("adoptions").exists(),
-        "read-only empty query must not create a library"
-    );
-    Ok(())
+    )
 }
 
 #[tokio::test]
