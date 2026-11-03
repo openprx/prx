@@ -26,11 +26,11 @@ const COMPATIBILITY: &[(&str, &str)] = &[
     ),
 ];
 
-fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
+fn collect_contract_paths(dir: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read contract tree") {
         let path = entry.expect("contract entry").path();
         if path.is_dir() {
-            collect(&path, files);
+            collect_contract_paths(&path, files);
         } else {
             files.push(path);
         }
@@ -50,7 +50,7 @@ fn removed_reply_feature_has_only_explicit_compatibility_references() {
     let mut paths = rust_source_and_test_files();
     paths.extend(rust_source_files());
     for dir in ["docs", "benches", "tests/fixtures"] {
-        collect(&root.join(dir), &mut paths);
+        collect_contract_paths(&root.join(dir), &mut paths);
     }
     paths.extend(["Cargo.toml", "README.md", "CHANGELOG.md"].map(|path| root.join(path)));
     for path in paths {
