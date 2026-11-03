@@ -87,7 +87,24 @@ enum Fault {
 
 async fn completed_chat(workspace: &Path, fault: Fault) -> MessageEvent {
     let cleanup = CleanupScope::new(None, CancellationToken::new()).unwrap();
-    completed_chat_under_cleanup(workspace, fault, &cleanup).await
+    let lifetime_owner = cleanup
+        .scope_admission(async {
+            Ok(Arc::downgrade(
+                &crate::runtime::turn_cleanup::current_tracker().expect("test: cleanup owner installed"),
+            ))
+        })
+        .await
+        .unwrap();
+    let source = completed_chat_under_cleanup(workspace, fault, &cleanup).await;
+    cleanup
+        .run(async { Ok(()) })
+        .await
+        .expect("test: drain completed ingress lifetime before restart");
+    assert!(
+        lifetime_owner.upgrade().is_none(),
+        "test: completed ingress lifetime owner must be released before restart"
+    );
+    source
 }
 
 async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &CleanupScope) -> MessageEvent {
@@ -152,7 +169,7 @@ async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &
 async fn restarted_chat(workspace: &Path, run: &str) -> MessageEvent {
     let cleanup = CleanupScope::new(None, CancellationToken::new()).unwrap();
     cleanup
-        .scope_admission(async {
+        .run(async {
             let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace).unwrap());
             let generation = crate::config::new_shared(config_at(workspace)).pin();
             let (source, _binding, guard) = guarded_input(memory.clone(), &generation, run).await.unwrap();
