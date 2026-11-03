@@ -350,6 +350,11 @@
     "loadDenied": "此操作员无法查看 MCP 服务器。"
   },
   "skills": {
+    "installedInactive": "已安装（未启用）",
+    "installInactiveSuccess": "已安装为未启用状态。审查后，在「已安装」标签中启用。",
+    "installConfirmTitle": "安装第三方技能？",
+    "installConfirmBody": "第三方、不受信任的代码。星标：{stars}。许可证：{license}。安装后未启用；请先审查再启用。",
+    "discoverRateLimited": "已达到 GitHub 速率限制。",
     "title": "Skills",
     "loading": "正在加载 Skills...",
     "noSkills": "尚未安装任何 Skill。",

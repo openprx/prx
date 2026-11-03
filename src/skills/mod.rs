@@ -10,6 +10,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
+pub mod discovery;
+mod publication;
+pub(crate) use publication::publish_staged_skill_inactive;
 pub mod lifecycle;
 mod lifecycle_cli;
 pub mod lifecycle_runtime;

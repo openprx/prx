@@ -1768,6 +1768,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn r8a_inactive_install_blocks_catalog_schema_alias_and_execution() {
+        let temp = TempDir::new().unwrap();
+        let (staging, target) = crate::skills::skill_staging_paths(&temp.path().join("skills"), "quarantine").unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("SKILL.toml"), "[skill]\nname='quarantine'\ndescription='fixture'\n[[tools]]\nname='run'\ndescription='fixture tool'\nkind='shell'\ncommand='sh run.sh'\n").unwrap();
+        std::fs::write(staging.join("run.sh"), "exit 0\n").unwrap();
+        let state = crate::skills::publish_staged_skill_inactive(
+            &staging,
+            &target,
+            temp.path(),
+            "https://github.com/example/quarantine",
+            |_| {},
+        )
+        .expect("inactive publication must succeed");
+        assert!(!state.enabled);
+        assert!(target.join(".openprx-untrusted-origin.json").is_file());
+        assert!(
+            crate::skills::installed_skill_states(temp.path())
+                .unwrap()
+                .iter()
+                .any(|state| state.name == "quarantine" && !state.enabled)
+        );
+        let config = test_config(temp.path());
+        let tool = SkillExecuteTool::new(
+            temp.path().to_path_buf(),
+            config.clone(),
+            Arc::new(crate::runtime::NativeRuntime::new()),
+            Arc::new(SecurityPolicy::default()),
+            &crate::config::BrowserConfig::default(),
+            &crate::config::HttpRequestConfig::default(),
+        );
+        for enabled in [false, true, false] {
+            crate::skills::set_installed_skill_enabled(temp.path(), "quarantine", enabled).unwrap();
+            crate::skills::invalidate_skill_catalog(temp.path());
+            assert_eq!(
+                crate::skills::load_skills_with_config(temp.path(), &config)
+                    .iter()
+                    .any(|skill| skill.name == "quarantine"),
+                enabled,
+                "catalog exposure must follow disabled marker"
+            );
+            let schema = tool.parameters_schema();
+            assert_eq!(
+                schema["properties"]["skill"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("quarantine")),
+                enabled,
+                "schema exposure must follow disabled marker"
+            );
+            assert_eq!(
+                tool.specs().iter().any(|spec| spec.name == "skill__quarantine__run"),
+                enabled,
+                "alias exposure must follow disabled marker"
+            );
+            if !enabled {
+                let error = tool
+                    .execute(json!({"skill":"quarantine","tool":"run"}))
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("Unknown or disabled skill"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn skill_execute_exports_alias_and_runs_declared_shell_tool() {
         let temp = TempDir::new().unwrap();
         let skill_dir = temp.path().join("skills/demo");

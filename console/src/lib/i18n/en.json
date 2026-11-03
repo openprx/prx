@@ -350,6 +350,11 @@
     "loadDenied": "MCP servers are not available to this operator."
   },
   "skills": {
+    "installedInactive": "Installed (inactive)",
+    "installInactiveSuccess": "Installed as inactive. Review it, then enable it in the Installed tab.",
+    "installConfirmTitle": "Install third-party skill?",
+    "installConfirmBody": "Third-party, untrusted code. Stars: {stars}. License: {license}. It installs inactive; review it before enabling.",
+    "discoverRateLimited": "GitHub rate limit reached.",
     "title": "Skills",
     "loading": "Loading skills...",
     "noSkills": "No skills installed.",

@@ -64,3 +64,9 @@ test('restores focus when the dialog closes', async () => {
   expect(document.activeElement).toBe(anchor);
   anchor.remove();
 });
+
+test('disables confirmation while pending and leaves cancellation available', async () => {
+  render(ConfirmDialog, {props:{...props,confirmDisabled:true}});
+  expect(screen.getByRole('button',{name:'Confirm'})).toBeDisabled();
+  expect(screen.getByRole('button',{name:'Cancel'})).toBeEnabled();
+});

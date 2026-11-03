@@ -27,7 +27,7 @@ prx skills sync
 
 That command is a control-plane operation and may run Git. Normal catalog loads
 never clone or pull. A process-local catalog is invalidated after a successful
-install, uninstall, explicit synchronization, or SkillForge integration.
+install, uninstall, toggle, or explicit synchronization.
 Manual filesystem edits require a process restart or an explicit catalog
 invalidation by the embedding application.
 
@@ -42,7 +42,7 @@ Community repositories are always lazy: PRX loads bounded name, description,
 and location metadata but never preloads their Markdown instructions into the
 system prompt.
 
-Remote installs and SkillForge integrations contain
+Remote installs contain
 `.openprx-untrusted-origin.json`. While that marker exists, any manifest prompt
 or Markdown body is also lazy and cannot be injected into the system prompt.
 An operator may review the files and deliberately remove the marker to trust
@@ -62,12 +62,18 @@ provider/model/dimension namespace and bounded to 2,048 cached entries.
 
 ## Installation lifecycle
 
-CLI Git installs, gateway Git installs, and SkillForge integrations write to a
+CLI Git installs and gateway Git installs write to a
 hidden same-filesystem staging directory. PRX validates that the root contains
 a bounded, parseable `SKILL.toml` or `SKILL.md`, rejects symlink manifests,
 writes the untrusted-origin marker for remote material, and only then exposes
 the skill with an atomic rename. Invalid or failed staging trees are removed;
 an existing active skill is never replaced.
+
+Gateway Git installs (`POST /api/skills/install`, including Console Discover)
+write the disabled marker before the publishing rename. They remain inactive
+until the owner reviews them and enables them with the existing Skills toggle.
+The response includes `skill.enabled: false`. Enabling retains the untrusted
+origin marker and the existing execution policy. CLI installs are unchanged.
 
 Local CLI paths are explicit operator input and remain trusted. They are staged
 as a link/copy, validated, and atomically activated through the same lifecycle.

@@ -137,3 +137,11 @@ test.each(calls)('%s uses its route and does not send owner_id', async (method, 
     expect(JSON.parse(serialized).owner_id).toBeUndefined();
   }
 });
+
+test('r7c discoverSkills preserves typed rate limit wire error', async () => {
+  const reason = 'GitHub search rate limit reached; try again later';
+  const fetchMock = vi.fn(async () => jsonResponse(429,{code:'rate_limited',error:reason}));
+  vi.stubGlobal('fetch',fetchMock);
+  await expect(api.discoverSkills('github','agent skill')).rejects.toMatchObject({status:429,body:{code:'rate_limited',error:reason},message:reason});
+  expect(fetchMock.mock.calls[0][0]).toBe('/api/skills/discover?source=github&query=agent+skill');
+});

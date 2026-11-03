@@ -149,7 +149,6 @@ pub mod security;
 pub mod self_system;
 pub mod service;
 pub mod session_worker;
-pub mod skillforge;
 pub mod skills;
 pub mod tools;
 pub mod tunnel;
@@ -762,7 +761,6 @@ mod module_ownership_tests {
             "mod self_system;",
             "mod service;",
             "mod session_worker;",
-            "mod skillforge;",
             "mod skills;",
             "mod tools;",
             "mod tunnel;",

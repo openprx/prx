@@ -17,6 +17,7 @@
     objectName = '',
     consequence = '',
     confirmLabel = '',
+    confirmDisabled = false,
     cancelLabel = '',
     onConfirm,
     onCancel
@@ -107,7 +108,7 @@
       </p>
       <div class="ui-dialog-actions">
         <button type="button" class="ui-dialog-cancel" onclick={() => onCancel?.()}>{cancelText}</button>
-        <button type="button" class="ui-dialog-confirm" onclick={() => onConfirm?.()}>{confirmText}</button>
+        <button type="button" class="ui-dialog-confirm" disabled={confirmDisabled} onclick={() => onConfirm?.()}>{confirmText}</button>
       </div>
     </div>
   </div>

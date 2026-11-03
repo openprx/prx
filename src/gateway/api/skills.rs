@@ -134,48 +134,40 @@ pub async fn discover_skills(
     State(_state): State<AppState>,
     Query(params): Query<DiscoverQuery>,
 ) -> Result<Json<DiscoverResponse>, (StatusCode, Json<serde_json::Value>)> {
-    use crate::skillforge::scout::{GitHubScout, Scout, ScoutSource};
+    discover_with(
+        params,
+        std::env::var("GITHUB_TOKEN").ok(),
+        crate::skills::discovery::GITHUB_API_BASE,
+    )
+    .await
+}
 
-    let source: ScoutSource = params.source.parse().map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!("Unsupported skill discovery source '{}'", params.source)
-            })),
-        )
-    })?;
-
+pub(super) async fn discover_with(
+    params: DiscoverQuery,
+    token: Option<String>,
+    api_base: &str,
+) -> Result<Json<DiscoverResponse>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::skills::discovery::{GitHubScout, Scout, ScoutSource};
+    let source: ScoutSource = params.source.parse().map_err(discovery_error)?;
     let results = match source {
         ScoutSource::GitHub => {
-            // Try to get github token from env or config
-            let token = std::env::var("GITHUB_TOKEN").ok();
-            let mut scout = match GitHubScout::new(token) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    ));
-                }
-            };
-            if let Some(ref q) = params.query {
-                scout.set_queries(vec![q.clone()]);
+            let mut scout = if api_base == crate::skills::discovery::GITHUB_API_BASE {
+                GitHubScout::new(token)
+            } else {
+                GitHubScout::with_api_base(token, api_base)
             }
-            match scout.discover().await {
-                Ok(items) => items,
-                Err(e) => {
-                    warn!(error = %e, "GitHub scout failed");
-                    return Err((
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({"error": format!("GitHub search failed: {e}")})),
-                    ));
-                }
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                )
+            })?;
+            if let Some(ref query) = params.query {
+                scout.set_queries(vec![query.clone()]);
             }
+            scout.discover().await.map_err(discovery_error)?
         }
-        ScoutSource::ClawHub | ScoutSource::HuggingFace => {
-            // Not yet implemented
-            vec![]
-        }
+        ScoutSource::ClawHub | ScoutSource::HuggingFace => vec![],
     };
 
     let items: Vec<DiscoverResult> = results
@@ -193,6 +185,19 @@ pub async fn discover_skills(
         .collect();
 
     Ok(Json(DiscoverResponse { results: items }))
+}
+
+fn discovery_error(error: crate::skills::discovery::DiscoveryError) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::skills::discovery::DiscoveryError;
+    let (status, code) = match &error {
+        DiscoveryError::UnsupportedSource(_) => (StatusCode::BAD_REQUEST, "unsupported_source"),
+        DiscoveryError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        DiscoveryError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
+    };
+    (
+        status,
+        Json(serde_json::json!({"code": code, "error": error.to_string()})),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +219,7 @@ pub struct InstallResponse {
 
 #[derive(Serialize)]
 pub struct InstalledSkillInfo {
+    enabled: bool,
     name: String,
     description: String,
     location: String,
@@ -238,6 +244,27 @@ pub async fn install_skill(
     State(state): State<AppState>,
     Json(req): Json<InstallRequest>,
 ) -> Result<Json<InstallResponse>, (StatusCode, Json<serde_json::Value>)> {
+    install_skill_with(state, req, |url, staging_dir| async move {
+        match crate::security::git_launch::git_command(crate::security::git_launch::GitScope::NewRepository).await {
+            Ok(mut command) => {
+                command.args(["clone", "--depth", "1", &url]).arg(&staging_dir);
+                crate::runtime::shell_process::run_managed_output(command).await
+            }
+            Err(error) => Err(std::io::Error::other(error.to_string())),
+        }
+    })
+    .await
+}
+
+async fn install_skill_with<F, Fut>(
+    state: AppState,
+    req: InstallRequest,
+    fetch: F,
+) -> Result<Json<InstallResponse>, (StatusCode, Json<serde_json::Value>)>
+where
+    F: FnOnce(String, std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<std::process::Output>>,
+{
     // Validate name (no path traversal)
     if let Err(error) = crate::skills::validate_skill_name(&req.name) {
         return Err((
@@ -282,30 +309,28 @@ pub async fn install_skill(
     // them behind, so the whole process group is torn down with the future.
     // The hardened git launch (GIT-ENV): cleared environment, no hooks, no
     // command-executing configuration.
-    let output =
-        match crate::security::git_launch::git_command(crate::security::git_launch::GitScope::NewRepository).await {
-            Ok(mut command) => {
-                command.args(["clone", "--depth", "1", &req.url]).arg(&staging_dir);
-                crate::runtime::shell_process::run_managed_output(command).await
-            }
-            Err(error) => Err(std::io::Error::other(error.to_string())),
-        };
+    let output = fetch(req.url.clone(), staging_dir.clone()).await;
 
     match output {
         Ok(out) if out.status.success() => {
-            let activation = crate::skills::mark_staged_skill_untrusted(&staging_dir, &req.url)
-                .and_then(|()| crate::skills::activate_staged_skill(&staging_dir, &target_dir, &config.workspace_dir));
-            if let Err(error) = activation {
+            let installed_state = crate::skills::publish_staged_skill_inactive(
+                &staging_dir,
+                &target_dir,
+                &config.workspace_dir,
+                &req.url,
+                |_| {},
+            )
+            .map_err(|error| {
                 crate::skills::cleanup_staged_skill(&staging_dir);
                 warn!(name = req.name.as_str(), error = %error, "staged skill validation or activation failed");
-                return Err((
+                (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(serde_json::json!({"error": error.to_string()})),
-                ));
-            }
+                )
+            })?;
             info!(name = req.name.as_str(), "Skill installed successfully");
 
-            let description = crate::skills::load_skills_with_config(&config.workspace_dir, &config)
+            let description = crate::skills::load_installed_workspace_skills(&config.workspace_dir)
                 .into_iter()
                 .find(|skill| skill.name.eq_ignore_ascii_case(&req.name))
                 .map(|skill| skill.description)
@@ -314,6 +339,7 @@ pub async fn install_skill(
             Ok(Json(InstallResponse {
                 status: "ok".into(),
                 skill: Some(InstalledSkillInfo {
+                    enabled: installed_state.enabled,
                     name: req.name,
                     description,
                     location: target_dir.display().to_string(),
@@ -395,3 +421,7 @@ pub async fn uninstall_skill(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "skills_tests.rs"]
+mod tests;

@@ -1,10 +1,34 @@
 //! Scout — skill discovery from external sources.
 
-use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
+
+/// Production GitHub endpoint; request parameters cannot override it.
+pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// Safe discovery errors suitable for the gateway response.
+#[derive(Debug, thiserror::Error)]
+pub enum DiscoveryError {
+    #[error("Unsupported skill discovery source '{0}'")]
+    UnsupportedSource(String),
+    #[error("GitHub search rate limit reached; try again later")]
+    RateLimited,
+    #[error("GitHub search failed: {0}")]
+    Upstream(UpstreamFailure),
+}
+
+/// Fixed upstream failure reasons never include request or response secrets.
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamFailure {
+    #[error("HTTP {0}")]
+    Http(u16),
+    #[error("request failed")]
+    Request,
+    #[error("invalid response")]
+    InvalidResponse,
+}
 
 // ---------------------------------------------------------------------------
 // ScoutSource
@@ -18,17 +42,14 @@ pub enum ScoutSource {
 }
 
 impl std::str::FromStr for ScoutSource {
-    type Err = std::convert::Infallible;
+    type Err = DiscoveryError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Ok(match s.to_lowercase().as_str() {
             "github" => Self::GitHub,
             "clawhub" => Self::ClawHub,
             "huggingface" | "hf" => Self::HuggingFace,
-            _ => {
-                warn!(source = s, "Unknown scout source, defaulting to GitHub");
-                Self::GitHub
-            }
+            _ => return Err(DiscoveryError::UnsupportedSource(s.to_string())),
         })
     }
 }
@@ -59,7 +80,7 @@ pub struct ScoutResult {
 #[async_trait]
 pub trait Scout: Send + Sync {
     /// Discover candidate skills from the source.
-    async fn discover(&self) -> Result<Vec<ScoutResult>>;
+    async fn discover(&self) -> Result<Vec<ScoutResult>, DiscoveryError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -70,10 +91,15 @@ pub trait Scout: Send + Sync {
 pub struct GitHubScout {
     client: reqwest::Client,
     queries: Vec<String>,
+    api_base: String,
 }
 
 impl GitHubScout {
     pub fn new(token: Option<String>) -> anyhow::Result<Self> {
+        Self::with_api_base(token, GITHUB_API_BASE)
+    }
+
+    pub(crate) fn with_api_base(token: Option<String>, base: &str) -> anyhow::Result<Self> {
         use std::time::Duration;
 
         let mut headers = reqwest::header::HeaderMap::new();
@@ -103,6 +129,7 @@ impl GitHubScout {
 
         Ok(Self {
             client,
+            api_base: base.to_string(),
             queries: vec!["openprx skill".into(), "ai agent skill".into()],
         })
     }
@@ -161,48 +188,43 @@ impl GitHubScout {
 
 #[async_trait]
 impl Scout for GitHubScout {
-    async fn discover(&self) -> Result<Vec<ScoutResult>> {
+    async fn discover(&self) -> Result<Vec<ScoutResult>, DiscoveryError> {
         let mut all: Vec<ScoutResult> = Vec::new();
 
         for query in &self.queries {
             let url = format!(
-                "https://api.github.com/search/repositories?q={}&sort=stars&order=desc&per_page=30",
+                "{}/search/repositories?q={}&sort=stars&order=desc&per_page=30",
+                self.api_base,
                 urlencoding(query)
             );
             debug!(query = query.as_str(), "Searching GitHub");
-
-            let resp = match self.client.get(&url).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(
-                        query = query.as_str(),
-                        error = %e,
-                        "GitHub API request failed, skipping query"
-                    );
-                    continue;
-                }
-            };
-
-            if !resp.status().is_success() {
-                warn!(
-                    status = %resp.status(),
-                    query = query.as_str(),
-                    "GitHub search returned non-200"
-                );
-                continue;
+            let resp = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|_| DiscoveryError::Upstream(UpstreamFailure::Request))?;
+            let status = resp.status();
+            if status.as_u16() == 429
+                || (status.as_u16() == 403
+                    && (resp
+                        .headers()
+                        .get("x-ratelimit-remaining")
+                        .is_some_and(|value| value == "0")
+                        || resp.headers().contains_key("retry-after")))
+            {
+                return Err(DiscoveryError::RateLimited);
             }
-
-            let body: serde_json::Value = match resp.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        query = query.as_str(),
-                        error = %e,
-                        "Failed to parse GitHub response, skipping query"
-                    );
-                    continue;
-                }
-            };
+            if !status.is_success() {
+                return Err(DiscoveryError::Upstream(UpstreamFailure::Http(status.as_u16())));
+            }
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|_| DiscoveryError::Upstream(UpstreamFailure::InvalidResponse))?;
+            if !body.get("items").is_some_and(serde_json::Value::is_array) {
+                return Err(DiscoveryError::Upstream(UpstreamFailure::InvalidResponse));
+            }
 
             let mut items = Self::parse_items(&body);
             debug!(count = items.len(), query = query.as_str(), "Parsed items");
@@ -245,8 +267,7 @@ mod tests {
         assert_eq!("clawhub".parse::<ScoutSource>().unwrap(), ScoutSource::ClawHub);
         assert_eq!("huggingface".parse::<ScoutSource>().unwrap(), ScoutSource::HuggingFace);
         assert_eq!("hf".parse::<ScoutSource>().unwrap(), ScoutSource::HuggingFace);
-        // unknown falls back to GitHub
-        assert_eq!("unknown".parse::<ScoutSource>().unwrap(), ScoutSource::GitHub);
+        assert!("unknown".parse::<ScoutSource>().is_err());
     }
 
     #[test]
@@ -315,6 +336,11 @@ mod tests {
         assert_eq!(items[0].stars, 42);
         assert!(items[0].has_license);
         assert_eq!(items[0].owner, "user");
+    }
+
+    #[test]
+    fn r1d_production_api_base() {
+        assert_eq!(GITHUB_API_BASE, "https://api.github.com");
     }
 
     #[test]

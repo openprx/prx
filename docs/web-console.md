@@ -566,3 +566,11 @@ Overview reads the existing status payload. Generation, the active and desired c
 ### Still on the CLI
 
 Identity, health, metrics, pairing, CLI evaluate, skill import, operator lifecycle, the skill-file tool, H2 study, xin, evolution, fitness, approval grants, EU audit, doctor, and OS service install are not console CRUD screens. A deployment that lacks a route shows an explicit unavailable state rather than a control that pretends to succeed.
+
+### Skill discovery and installation
+
+GitHub discovery reports upstream failures explicitly, including rate limits.
+Installing a result requires confirmation showing its URL, star count, license
+presence, and untrusted-code warning. These metadata do not establish trust.
+Gateway installs arrive inactive. Review the files, then use the existing
+Installed-tab toggle to enable them. CLI installation behavior is unchanged.

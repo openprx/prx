@@ -3,6 +3,7 @@
   import { t } from '../lib/i18n';
   import { loadFailureVariant } from '../lib/load-state';
   import { navigate } from '../lib/router';
+  import ConfirmDialog from '../lib/ui/ConfirmDialog.svelte';
   import PageHeader from '../lib/ui/PageHeader.svelte';
   import StateBlock from '../lib/ui/StateBlock.svelte';
 
@@ -22,6 +23,7 @@
   let discoverSearched = $state(false);
 
   let installingUrl = $state('');
+  let installTarget = $state(null);
   let uninstallingName = $state('');
   let confirmUninstall = $state('');
   let togglingId = $state('');
@@ -130,7 +132,8 @@
       discoverResults = Array.isArray(response?.results) ? response.results : [];
     } catch (error) {
       discoverResults = [];
-      discoverError = error instanceof Error ? error.message : t('skills.searchFailed');
+      discoverError = (error?.body?.code === 'rate_limited' ? `${t('skills.discoverRateLimited')} ` : '')
+        + (error instanceof Error ? error.message : t('skills.searchFailed'));
     } finally {
       discoverLoading = false;
     }
@@ -141,18 +144,20 @@
   }
 
   async function installSkill(url, name) {
+    if (installingUrl) return;
     installingUrl = url;
 
     try {
       const response = await api.installSkill(url, name);
       if (response?.skill) {
-        skills = [...skills, { ...response.skill, enabled: true }];
+        skills = [...skills, { ...response.skill }];
       }
-      showToast(t('skills.installSuccess'));
+      showToast(t('skills.installInactiveSuccess'));
     } catch (error) {
       showToast(t('skills.installFailed') + (error?.message ? `: ${error.message}` : ''), 'error');
     } finally {
       installingUrl = '';
+      installTarget = null;
     }
   }
 
@@ -395,12 +400,12 @@
               </a>
               {#if alreadyInstalled}
                 <span class="rounded-full border border-green-500/50 bg-green-500/20 px-2 py-1 text-xs font-medium text-green-700 dark:text-green-300">
-                  {t('skills.installed')}
+                  {t(skills.find((skill) => skill.name === result.name)?.enabled === false ? 'skills.installedInactive' : 'skills.installed')}
                 </span>
               {:else}
                 <button
                   type="button"
-                  onclick={() => installSkill(result.url, result.name)}
+                  onclick={() => { installTarget = result; }}
                   disabled={installingUrl === result.url}
                   class="rounded-lg bg-sky-600 px-3 py-1 text-xs font-medium text-white transition hover:bg-sky-500 disabled:opacity-50"
                 >
@@ -414,3 +419,17 @@
     {/if}
   {/if}
 </section>
+
+<ConfirmDialog
+  open={installTarget !== null}
+  title={t('skills.installConfirmTitle')}
+  objectName={installTarget?.url ?? ''}
+  consequence={t('skills.installConfirmBody', {
+    stars: installTarget?.stars ?? 0,
+    license: t(installTarget?.has_license ? 'skills.licensed' : 'skills.unlicensed')
+  })}
+  confirmLabel={t('skills.install')}
+  confirmDisabled={installingUrl !== ''}
+  onConfirm={() => installTarget && installSkill(installTarget.url, installTarget.name)}
+  onCancel={() => { if (!installingUrl) installTarget = null; }}
+/>
