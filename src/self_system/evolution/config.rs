@@ -107,54 +107,11 @@ pub struct EvolutionConfig {
     #[serde(default)]
     pub runtime: EvolutionRuntimeConfig,
     #[serde(default)]
-    pub retrieval: EvolutionRetrievalConfig,
-    #[serde(default)]
     pub gate: EvolutionGateConfig,
-    #[serde(default)]
-    pub memory: MemoryEvolutionConfig,
     #[serde(default)]
     pub prompt: PromptEvolutionConfig,
     #[serde(default)]
-    pub strategy: StrategyEvolutionConfig,
-    #[serde(default)]
     pub rollback: RollbackConfig,
-}
-
-/// L1 memory evolution tuning config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MemoryEvolutionConfig {
-    pub max_tokens: usize,
-    #[serde(default)]
-    pub retrieval_fusion: RetrievalFusionWeights,
-}
-
-impl Default for MemoryEvolutionConfig {
-    fn default() -> Self {
-        Self {
-            max_tokens: 2_048,
-            retrieval_fusion: RetrievalFusionWeights::default(),
-        }
-    }
-}
-
-/// Fusion weights used for retrieval signal merge.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RetrievalFusionWeights {
-    pub bm25: f64,
-    pub vector: f64,
-    pub metadata: f64,
-}
-
-impl Default for RetrievalFusionWeights {
-    fn default() -> Self {
-        Self {
-            bm25: 0.4,
-            vector: 0.4,
-            metadata: 0.2,
-        }
-    }
 }
 
 /// L2 prompt evolution guardrails and rollout policy.
@@ -190,23 +147,6 @@ fn default_blocked_keywords() -> Vec<String> {
         "ignore security".to_string(),
         "remove guardrail".to_string(),
     ]
-}
-
-/// L3 strategy evolution config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct StrategyEvolutionConfig {
-    pub decision_policy_path: String,
-    pub param_mutation_range: f64,
-}
-
-impl Default for StrategyEvolutionConfig {
-    fn default() -> Self {
-        Self {
-            decision_policy_path: "decision_policy.toml".to_string(),
-            param_mutation_range: 0.15,
-        }
-    }
 }
 
 /// Rollback and circuit-breaker controls.
@@ -250,45 +190,33 @@ impl Default for EvolutionGateConfig {
     }
 }
 
-/// Scoring weights for evolution-aware memory retrieval.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RetrievalScoreWeights {
-    pub recency: f64,
-    pub access_freq: f64,
-    pub category_weight: f64,
-    pub useful_ratio: f64,
-    pub source_confidence: f64,
-}
-
-impl Default for RetrievalScoreWeights {
-    fn default() -> Self {
-        Self {
-            recency: 0.30,
-            access_freq: 0.20,
-            category_weight: 0.15,
-            useful_ratio: 0.20,
-            source_confidence: 0.15,
+/// Identify retired inputs without loading the main operator configuration.
+pub fn removed_evolution_keys(raw: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<toml::Value>(raw) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    for path in ["strategy", "memory.max_tokens", "memory.retrieval_fusion", "retrieval"] {
+        if path.split('.').try_fold(&value, |v, part| v.get(part)).is_some() {
+            keys.push(path.to_string());
         }
     }
-}
-
-/// Retrieval tuning knobs used by memory evolution pipeline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct EvolutionRetrievalConfig {
-    pub vector_retrieval_threshold: usize,
-    #[serde(default)]
-    pub score_weights: RetrievalScoreWeights,
-}
-
-impl Default for EvolutionRetrievalConfig {
-    fn default() -> Self {
-        Self {
-            vector_retrieval_threshold: 2_000,
-            score_weights: RetrievalScoreWeights::default(),
+    if let Some(entries) = value
+        .get("prompt")
+        .and_then(|v| v.get("mutable_files"))
+        .and_then(toml::Value::as_array)
+    {
+        for entry in entries.iter().filter_map(toml::Value::as_str) {
+            let managed = entry
+                .strip_prefix("skills/")
+                .and_then(|path| path.strip_suffix("/SKILL.md"))
+                .is_some_and(|name| !name.is_empty() && !name.contains('/'));
+            if !managed {
+                keys.push(format!("prompt.mutable_files: {entry}"));
+            }
         }
     }
+    keys
 }
 
 impl EvolutionConfig {
@@ -300,6 +228,10 @@ impl EvolutionConfig {
             .with_context(|| format!("failed to read evolution config: {}", path.display()))?;
         let cfg = toml::from_str::<Self>(&content)
             .with_context(|| format!("failed to parse evolution config: {}", path.display()))?;
+        for key in removed_evolution_keys(&content) {
+            tracing::warn!(path = %path.display(), key = %key,
+                "configuration key is ignored: evolution adopts only through the skills lifecycle");
+        }
         Ok(cfg)
     }
 }
@@ -333,23 +265,11 @@ mod tests {
         assert_eq!(cfg.runtime.data_thresholds.decision_log, 200);
         assert_eq!(cfg.runtime.data_thresholds.memory_access, 800);
         assert_eq!(cfg.runtime.data_thresholds.same_failure, 25);
-        assert_eq!(cfg.retrieval.vector_retrieval_threshold, 2_000);
         assert_eq!(cfg.gate.min_improvement, 0.03);
         assert_eq!(cfg.gate.max_regression, -0.05);
         assert_eq!(cfg.gate.max_token_degradation, 0.10);
-        assert_eq!(cfg.retrieval.score_weights.recency, 0.30);
-        assert_eq!(cfg.retrieval.score_weights.access_freq, 0.20);
-        assert_eq!(cfg.retrieval.score_weights.category_weight, 0.15);
-        assert_eq!(cfg.retrieval.score_weights.useful_ratio, 0.20);
-        assert_eq!(cfg.retrieval.score_weights.source_confidence, 0.15);
-        assert_eq!(cfg.memory.max_tokens, 2_048);
-        assert_eq!(cfg.memory.retrieval_fusion.bm25, 0.4);
-        assert_eq!(cfg.memory.retrieval_fusion.vector, 0.4);
-        assert_eq!(cfg.memory.retrieval_fusion.metadata, 0.2);
         assert_eq!(cfg.prompt.human_approval_severity, 3);
         assert_eq!(cfg.prompt.max_rollback_versions, 10);
-        assert_eq!(cfg.strategy.decision_policy_path, "decision_policy.toml");
-        assert_eq!(cfg.strategy.param_mutation_range, 0.15);
         assert_eq!(cfg.rollback.max_versions, 10);
         assert_eq!(cfg.rollback.circuit_breaker_threshold, 5);
         assert_eq!(cfg.rollback.cooldown_after_rollback_hours, 24);
@@ -380,10 +300,6 @@ max_tokens = 4096
         assert_eq!(parsed.runtime.retention.hot_days, 7);
         assert_eq!(parsed.runtime.retention.warm_days, 90);
         assert_eq!(parsed.runtime.data_thresholds.decision_log, 200);
-        assert_eq!(parsed.retrieval.vector_retrieval_threshold, 123);
-        assert_eq!(parsed.retrieval.score_weights.recency, 0.30);
-        assert_eq!(parsed.memory.max_tokens, 4096);
-        assert_eq!(parsed.memory.retrieval_fusion.bm25, 0.4);
     }
 
     #[test]
@@ -423,5 +339,60 @@ mode = "draft_only"
         assert_eq!(parsed.runtime.data_thresholds.memory_access, 800);
         assert_eq!(parsed.gate.min_improvement, 0.08);
         assert_eq!(parsed.gate.max_regression, -0.05);
+    }
+    #[test]
+    fn legacy_keys_load_and_are_reported_once_each() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("evolution_config.toml");
+        let raw = r#"
+[prompt]
+mutable_files = ["AGENTS.md", "skills/a/SKILL.md"]
+[strategy]
+decision_policy_path = "legacy.toml"
+[memory]
+max_tokens = 4096
+[memory.retrieval_fusion]
+bm25 = 0.9
+[retrieval]
+vector_retrieval_threshold = 100
+[retrieval.score_weights]
+recency = 0.5
+"#;
+        std::fs::write(&path, raw).unwrap();
+        let expected = vec![
+            "strategy",
+            "memory.max_tokens",
+            "memory.retrieval_fusion",
+            "retrieval",
+            "prompt.mutable_files: AGENTS.md",
+        ];
+        assert_eq!(removed_evolution_keys(raw), expected);
+        let warnings = dir.path().join("warnings.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::fs::File::create(&warnings).unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let cfg = rt.block_on(EvolutionConfig::load_from_path(&path)).unwrap();
+            assert_eq!(cfg.runtime.mode, EvolutionMode::DraftOnly);
+            assert_eq!(
+                cfg.gate.min_improvement,
+                EvolutionConfig::default().gate.min_improvement
+            );
+            assert_eq!(cfg.prompt.mutable_files.len(), 2);
+        });
+        let log = std::fs::read_to_string(warnings).unwrap();
+        assert_eq!(log.lines().count(), 5, "{log}");
+        for key in expected {
+            let field = format!("key={key}");
+            assert_eq!(log.lines().filter(|line| line.ends_with(&field)).count(), 1, "{log}");
+        }
+        assert!(!log.contains("legacy.toml"));
+        assert!(!log.contains("4096"));
     }
 }

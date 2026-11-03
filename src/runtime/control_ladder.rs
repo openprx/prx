@@ -533,9 +533,9 @@ fn xin_layer(_config: &Config) -> ControlLayerTrace {
     }
 }
 
-fn self_system_layer(_config: &Config) -> ControlLayerTrace {
+fn self_system_layer(config: &Config) -> ControlLayerTrace {
     let fitness_enabled = true;
-    let evolution_enabled = true;
+    let evolution_enabled = config.skills_lifecycle.enabled;
     let enabled = true;
     ControlLayerTrace {
         level: 4,
@@ -947,5 +947,19 @@ mod tests {
         let parsed: ControlLadderTrace = serde_json::from_str(&json).expect("test: trace round-trips");
         assert_eq!(parsed.decision_id.as_deref(), Some("dec-agent-42"));
         assert_eq!(parsed.run_id.as_deref(), Some("turn-1"));
+    }
+    #[test]
+    fn evolution_runtime_enabled_follows_the_skills_lifecycle() {
+        let mut config = Config::default();
+        for enabled in [false, true] {
+            config.skills_lifecycle.enabled = enabled;
+            assert_eq!(
+                self_system_layer(&config)
+                    .detail
+                    .get("evolution_runtime_enabled")
+                    .and_then(Value::as_bool),
+                Some(enabled)
+            );
+        }
     }
 }

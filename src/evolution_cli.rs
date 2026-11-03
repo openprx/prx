@@ -5,8 +5,8 @@ use crate::config::Config;
 use crate::self_system::evolution::{
     AsyncJsonlWriter, CircuitBreakerState, EvolutionAnalyzer, EvolutionConfig, EvolutionLayer, EvolutionLog,
     EvolutionMode, EvolutionPipeline, EvolutionResult, EvolutionRetentionConfig, EvolutionRuntimeConfig,
-    EvolutionTrigger, JsonlRetentionPolicy, JsonlStoragePaths, MemoryAccessLog, MemoryEvolutionEngine,
-    PromptEvolutionEngine, StrategyEvolutionEngine, new_shared_evolution_config,
+    EvolutionTrigger, JsonlRetentionPolicy, JsonlStoragePaths, MemoryAccessLog, PromptEvolutionEngine,
+    new_shared_evolution_config,
 };
 use crate::{EvolutionCommands, EvolutionLayerArg};
 use anyhow::{Context, Result};
@@ -175,7 +175,7 @@ async fn handle_status(as_json: bool, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn handle_history(as_json: bool, config: &Config, limit: usize) -> Result<()> {
+async fn history_items(config: &Config, limit: usize) -> Result<Vec<EvolutionLog>> {
     let (cfg, _, _) = load_evolution_config(config).await?;
     let storage_root = resolve_storage_root(config, &cfg.runtime);
 
@@ -183,6 +183,11 @@ async fn handle_history(as_json: bool, config: &Config, limit: usize) -> Result<
     items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     items.truncate(limit.max(1));
 
+    Ok(items)
+}
+
+async fn handle_history(as_json: bool, config: &Config, limit: usize) -> Result<()> {
+    let items = history_items(config, limit).await?;
     let payload = HistoryOutput { items };
     if as_json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -279,6 +284,9 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
 }
 
 async fn handle_trigger_owned(as_json: bool, config: &Config, layer: Option<EvolutionLayerArg>) -> Result<()> {
+    let selected_layer = map_layer(layer)?;
+    let lifecycle = crate::skills::lifecycle_runtime::open_service(&config.workspace_dir, &config.skills_lifecycle)?
+        .context("evolution proposes through the skills lifecycle; enable [skills_lifecycle] to run it")?;
     let (cfg, cfg_path, _exists) = load_evolution_config(config).await?;
     let shared = new_shared_evolution_config(cfg.clone());
 
@@ -295,7 +303,6 @@ async fn handle_trigger_owned(as_json: bool, config: &Config, layer: Option<Evol
     let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
     let writer_for_engine = writer.clone();
 
-    let selected_layer = map_layer(layer);
     // FIX-P0-40: the manual `prx evolution trigger` path is a production entry
     // point that drives the same engines (config/strategy/prompt writes +
     // `append_evolution`) as the daemon scheduler. It MUST pass every commit
@@ -320,39 +327,19 @@ async fn handle_trigger_owned(as_json: bool, config: &Config, layer: Option<Evol
         ));
 
     let report = match selected_layer {
-        EvolutionLayer::Memory => {
-            let memory: Arc<dyn crate::memory::Memory> =
-                Arc::from(crate::memory::create_memory_with_storage_and_routes_with_acl(
-                    &config.memory,
-                    &config.embedding_routes_with_references(),
-                    Some(&config.storage.provider.config),
-                    &config.workspace_dir,
-                    crate::memory::EmbeddingRootCredential::from_config(&config),
-                    &config.identity_bindings,
-                    &config.user_policies,
-                )?);
-            let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path)?.with_memory(memory);
-            pipeline
-                .run_for_layer(
-                    EvolutionTrigger::Manual,
-                    EvolutionLayer::Memory,
-                    &mut engine,
-                    Utc::now(),
-                )
-                .await?
-        }
         EvolutionLayer::Prompt => {
             let mut engine = PromptEvolutionEngine::new(shared, &config.workspace_dir, Some(writer_for_engine.clone()))
                 .with_debug_raw(config.self_system.evolution_debug_raw)
-                .with_lifecycle(crate::skills::lifecycle_runtime::open_service(
-                    &config.workspace_dir,
-                    &config.skills_lifecycle,
-                )?);
+                .with_lifecycle(Some(lifecycle));
             if let Ok(model) = crate::runtime::evolution_model::EvolutionModel::from_config(
                 config,
                 crate::runtime::evolution_model::EvolutionPurpose::Proposer,
             ) {
                 engine = engine.with_proposer(model);
+            }
+            #[cfg(test)]
+            {
+                engine = engine.with_proposer(crate::self_system::evolution::prompt_evolution::test_proposer());
             }
             pipeline
                 .run_for_layer(
@@ -363,18 +350,7 @@ async fn handle_trigger_owned(as_json: bool, config: &Config, layer: Option<Evol
                 )
                 .await?
         }
-        EvolutionLayer::Policy => {
-            let mut engine = StrategyEvolutionEngine::new(shared, &config.workspace_dir, writer_for_engine)?;
-            pipeline
-                .run_for_layer(
-                    EvolutionTrigger::Manual,
-                    EvolutionLayer::Policy,
-                    &mut engine,
-                    Utc::now(),
-                )
-                .await?
-        }
-        other => anyhow::bail!("manual trigger only supports L1/L2/L3, got: {other:?}"),
+        other => anyhow::bail!("manual trigger only supports L2, got: {other:?}"),
     };
 
     // FIX-P0-40: the side-effect gate may have denied this commit (e.g. Supervised
@@ -452,11 +428,15 @@ fn gate_denied_error(autonomy_level: &str) -> anyhow::Error {
     )
 }
 
-const fn map_layer(layer: Option<EvolutionLayerArg>) -> EvolutionLayer {
+#[derive(Debug, thiserror::Error)]
+#[error("evolution layer {0} was removed; evolution proposes prompts through the skills lifecycle (L2)")]
+struct RemovedEvolutionLayer(&'static str);
+
+fn map_layer(layer: Option<EvolutionLayerArg>) -> Result<EvolutionLayer> {
     match layer {
-        Some(EvolutionLayerArg::L1) | None => EvolutionLayer::Memory,
-        Some(EvolutionLayerArg::L2) => EvolutionLayer::Prompt,
-        Some(EvolutionLayerArg::L3) => EvolutionLayer::Policy,
+        Some(EvolutionLayerArg::L1) => Err(RemovedEvolutionLayer("L1").into()),
+        Some(EvolutionLayerArg::L3) => Err(RemovedEvolutionLayer("L3").into()),
+        Some(EvolutionLayerArg::L2) | None => Ok(EvolutionLayer::Prompt),
     }
 }
 
@@ -616,8 +596,17 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.skills_lifecycle.enabled = true;
+        config.skills_lifecycle.owner_scope = Some("owner:ws:cli:prx_user".into());
         config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         std::fs::create_dir_all(&config.workspace_dir).expect("test: create workspace dir");
+        let _service =
+            crate::skills::lifecycle::test_support::managed_prompt_fixture(&config.workspace_dir, &[("a", true)]);
+        std::fs::write(
+            config.workspace_dir.join("evolution_config.toml"),
+            "[prompt]\nmutable_files = [\"skills/a/SKILL.md\"]\n",
+        )
+        .unwrap();
         config
     }
 
@@ -733,7 +722,7 @@ mod tests {
             "test fixture must select Supervised autonomy"
         );
 
-        let result = handle_trigger(false, &config, Some(EvolutionLayerArg::L1)).await;
+        let result = handle_trigger(false, &config, Some(EvolutionLayerArg::L2)).await;
 
         // The manual trigger must fail (non-zero exit) because the gate denied it.
         let err = result.expect_err("supervised manual trigger must be denied by the side-effect gate");
@@ -742,6 +731,11 @@ mod tests {
             msg.contains("side-effect gate") || msg.contains("blocked"),
             "deny error must explain the gate blocked the trigger: {msg}"
         );
+
+        let lifecycle = crate::skills::lifecycle_runtime::open_service(&config.workspace_dir, &config.skills_lifecycle)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lifecycle.list_proposals(None).unwrap().len(), 0);
 
         // Fail-closed: no evolution log line may have been written.
         assert_eq!(
@@ -764,7 +758,7 @@ mod tests {
         let now = Utc::now();
         seed_candidate_inputs(&storage_root, now).await;
 
-        let result = handle_trigger(false, &config, Some(EvolutionLayerArg::L1)).await;
+        let result = handle_trigger(false, &config, Some(EvolutionLayerArg::L2)).await;
 
         // Full autonomy does not gate medium-risk commits, so the trigger runs to
         // completion (Ok) regardless of whether a candidate was ultimately applied.
@@ -773,5 +767,55 @@ mod tests {
             "Full autonomy must not be blocked by the side-effect gate: {:?}",
             result.err()
         );
+    }
+    #[tokio::test]
+    async fn manual_trigger_refuses_without_the_skills_lifecycle() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = supervised_config(&tmp);
+        config.skills_lifecycle.enabled = false;
+        let error = handle_trigger(false, &config, None).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("evolution proposes through the skills lifecycle; enable [skills_lifecycle] to run it")
+        );
+        assert_eq!(
+            evolution_log_lines(&config.workspace_dir.join("self/evolution")).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_layer_l1_and_l3_are_refused_as_removed() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = supervised_config(&tmp);
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        for (layer, name) in [(EvolutionLayerArg::L1, "L1"), (EvolutionLayerArg::L3, "L3")] {
+            let error = handle_trigger(false, &config, Some(layer)).await.unwrap_err();
+            assert!(error.downcast_ref::<RemovedEvolutionLayer>().is_some());
+            assert!(error.to_string().contains(&format!("{name} was removed")));
+        }
+        assert_eq!(map_layer(None).unwrap(), EvolutionLayer::Prompt);
+    }
+
+    #[tokio::test]
+    async fn history_lists_legacy_memory_and_policy_layer_rows() {
+        let tmp = TempDir::new().unwrap();
+        let config = supervised_config(&tmp);
+        let folder = config.workspace_dir.join("self/evolution/evolution/hot");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut raw = String::new();
+        for layer in ["memory", "policy"] {
+            raw.push_str(&serde_json::json!({"experiment_id": layer, "timestamp": Utc::now().to_rfc3339(), "layer": layer,
+                "change_type": "update", "before_value": "a", "after_value": "b", "trigger_reason": "legacy",
+                "data_basis": {"sample_count": 1, "time_range_days": 1, "key_metrics": {}, "patterns_found": []}, "result": null}).to_string());
+            raw.push('\n');
+        }
+        std::fs::write(folder.join("legacy.jsonl"), raw).unwrap();
+        let rows = history_items(&config, 10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.layer == EvolutionLayer::Memory));
+        assert!(rows.iter().any(|row| row.layer == EvolutionLayer::Policy));
+        handle_history(true, &config, 10).await.unwrap();
     }
 }

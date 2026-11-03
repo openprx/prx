@@ -30,4 +30,5 @@ mod tool_scanner;
 mod tool_tables;
 mod tool_tests;
 
+mod removed_evolution_layers;
 mod retired_feature;

@@ -876,9 +876,7 @@ carries an owner guard, so a key that belongs to another owner — or to no owne
 `Failed to store memory: key '<key>' is not available to this caller`. The
 refusal names no owner, but it does tell the caller that the key is in use.
 An owner-isolated caller is refused the `conversation` category — the one the
-runtime keeps transcripts and autosaves in, and whose near-duplicate rows the
-self-system's memory evolution moves to trash workspace-wide — so it cannot get
-other owners' conversation memories trashed as redundant; `core`, `daily` and
+runtime keeps transcripts and autosaves in; `core`, `daily` and
 custom categories work. A caller that is owner-isolated but carries no owner id writes nothing, and
 the backends that store no owner (`markdown`, `none`, `wasm:*`) refuse
 an owner-isolated write instead of overwriting. `lucid` accepts it into its

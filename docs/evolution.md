@@ -1,6 +1,6 @@
 # Self-Evolution System
 
-Autonomous improvement without LLM weight training — evolves prompts, memory, and strategies based on interaction data.
+Autonomous prompt improvement without LLM weight training, staged through the skills lifecycle using interaction evidence.
 
 ## Pipeline
 
@@ -11,10 +11,10 @@ Record (realtime) → Analyze (daily) → Evolve (every 3 days)
 ## Components
 
 - **Record layer**: Trace every interaction, tool call, and outcome
-- **Memory system**: Retrieval, safety filtering, compression, anti-pattern detection
+- **Evidence**: Decision and memory-access records feed the analyzer; memory safety filtering remains available.
 - **Analysis**: Automated evaluation with judge model and test suites
-- **Evolution engines**: Memory evolution, prompt evolution, strategy evolution
-- **Safety**: pre-write snapshots (restored by hand), gate checks, shadow mode for first rounds
+- **Prompt proposer**: Stages managed skill revisions through the skills lifecycle.
+- **Safety**: Autonomy checks, immutable sections, blocked keywords, judge review and lifecycle publication gates.
 - **Pipeline**: Scheduler, pipeline orchestration, annotation system
 - **Integrated runtime**: evolution state, history, configuration, and manual
   trigger commands are exposed through the main CLI
@@ -43,8 +43,7 @@ paired evaluation, the governing holdout suite and publication authorization
 remain prerequisites of the lifecycle's existing publication and projection
 transaction, even when the general evolution judge approves a proposal.
 An unavailable lifecycle or insufficient evidence refuses the managed proposal.
-Other allowlisted prompt files retain the legacy prompt workflow; they are not
-silently imported or advertised as lifecycle-evaluated skills.
+Non-skill entries in `prompt.mutable_files` are ignored with a warning; evolution never writes workspace files directly or moves memories to trash.
 
 ### Model calls
 
@@ -68,19 +67,20 @@ Model calls use `[self_system] evolution_model_max_tokens`,
 an explicit nonzero monetary allowance. Set the token allowance to zero to
 disable these calls without enabling a synthetic fallback.
 
-A layer engine only **proposes** its change. The evolution judge (the resolved
-default model) scores the proposal, and in `auto` mode the change is written
-only after the judge accepts it:
+The prompt engine only **proposes** its change. The evolution judge scores the
+staged revision; adoption always requires the skills lifecycle's publication
+checks, including in `auto` mode.
 
-| Layer | Change | Written when |
+| Layer | Target | Adoption |
 | --- | --- | --- |
-| prompt | the first `prompt.mutable_files` entry | a model judge scores the proposal at or above the pass threshold |
-| strategy | `strategy.decision_policy_path` | the strategy gate passes, then a model judge accepts |
-| memory | `evolution_config.toml` (and redundant conversation memories moved to trash) | the memory gate passes, then a model judge accepts; while the memory engine scores with its built-in mock (as it does today) it defers first, so memory evolution does not apply in `auto` mode |
+| prompt | the first `skills/<name>/SKILL.md` entry of `prompt.mutable_files`, otherwise the first lifecycle-enabled skill (active enabled binding, suite registered, usable proposal evidence, no live proposal, not immutable, projection present) in skill-id order | staged as a lifecycle proposal; publication requires the skills lifecycle |
 
-Before a change is written, the previous version of its target is kept as a
-JSON snapshot under `.evolution/rollback/<layer>/`. There is no rollback
-command; restore a snapshot's `content` by hand if needed.
+An explicitly configured managed entry that is also immutable is refused without
+falling through to another skill. Automatic discovery skips immutable skills.
+The scheduler runs only with `[skills_lifecycle]` enabled. A cycle with no managed
+target proposes nothing and does not count against the breaker. Each due cycle
+uses at most one proposer call under the existing model token and cost limits.
+Existing lifecycle rollback and projection recovery govern published revisions.
 
 - A score below the pass threshold writes nothing; the cycle is logged with
   result `rejected`.
@@ -110,10 +110,6 @@ command; restore a snapshot's `content` by hand if needed.
   `rejected` entries; `deferred` entries are skipped. The running scheduler's
   own breaker still counts a deferred cycle as a failed run, so the two can
   disagree.
-- The strategy layer could not read any decision policy file before this
-  release, so it never proposed a change. In `auto` mode it now proposes
-  changes to `strategy.decision_policy_path` (`decision_policy.toml`), written
-  only after the judge accepts them.
 - `prx evolution trigger` prints `commit : …` (what became of the proposed
   change) instead of `rolled : …`; its JSON report has `commit` and
   `judge_outcome` instead of `rolled_back`.
@@ -122,3 +118,9 @@ command; restore a snapshot's `content` by hand if needed.
   scheduler counts the layer run as a failure for its circuit breaker, as it
   does for a rejected or deferred change. The next scored verdict, or a
   restart or reload that builds a model judge, marks the component ok again.
+
+Manual triggers default to L2. `--layer L1` and `--layer L3` return removal errors.
+When loading `evolution_config.toml`, retired strategy and memory tuning tables,
+retrieval settings and each non-skill mutable entry produce a warning on every
+load. Unknown keys remain readable; remove retired inputs from operator files.
+The main configuration schema and existing model budgets are unchanged.
