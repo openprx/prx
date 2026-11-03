@@ -3505,7 +3505,7 @@ Retry with a compatible model: /provider {shown} <model>",
         let mut effective_compaction = admitted_binding.effective_compaction()?;
         effective_compaction.config = admitted_binding.main_compaction()
             .ok_or_else(|| anyhow::anyhow!("chat compaction requires an admitted decision"))?.clone();
-        crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
+        crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
         #[cfg(feature = "terminal-tui")]
         refresh_context_budget_for_tui(
             &history_for_provider,

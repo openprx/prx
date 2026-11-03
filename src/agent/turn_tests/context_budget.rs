@@ -268,7 +268,6 @@ fn count_tokens_nonempty_is_positive() {
     assert!(count_tokens("hello world") > 0);
 }
 
-#[cfg(feature = "llm-router")]
 #[test]
 fn count_tokens_matches_known_cl100k_count() {
     // Under cl100k_base, "hello world" tokenizes to exactly 2 tokens, while
@@ -278,7 +277,6 @@ fn count_tokens_matches_known_cl100k_count() {
     assert_eq!(count_tokens("hello world"), 2);
 }
 
-#[cfg(feature = "llm-router")]
 #[test]
 fn count_tokens_subword_split_beats_char_heuristic() {
     // "tiktoken" is one 8-char word, so the crude chars/4 heuristic yields
@@ -289,7 +287,6 @@ fn count_tokens_subword_split_beats_char_heuristic() {
     assert_ne!(count_tokens("tiktoken"), "tiktoken".chars().count() / 4);
 }
 
-#[cfg(feature = "llm-router")]
 #[test]
 fn plan_context_budget_uses_cl100k_proxy_for_hard_budget() {
     let config = crate::config::AgentCompactionConfig {

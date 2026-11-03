@@ -1739,11 +1739,11 @@ async fn insufficient_retry_money_refuses_second_decision_socket() {
         let status = plane.factory.inner.status();
         let slot = status.order.first().expect("configured loopback slot");
         let provider = slot.identity.provider.as_ref().expect("resolved provider");
-        let effective = crate::router::resolve_effective_compaction_config(
+        let effective = crate::providers::context_window::resolve_effective_compaction_config(
             &plane.factory.config.agent.compaction,
             provider.as_str(),
             &slot.identity.configured_model,
-            &plane.factory.config.router,
+            crate::providers::context_window::ContextWindowSources::from_config(&plane.factory.config),
             &plane.factory.config.model_routes,
         );
         let reserve = crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(

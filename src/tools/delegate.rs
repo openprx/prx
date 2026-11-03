@@ -1007,13 +1007,13 @@ fn resolve_pinned_child_compaction(
     config: &crate::config::Config,
     provider: &str,
     model: &str,
-) -> crate::router::context::EffectiveCompactionConfig {
+) -> crate::providers::context_window::EffectiveCompactionConfig {
     let catalog = crate::providers::selection::catalog_for(config);
-    crate::router::context::resolve_effective_compaction_config_with_catalog(
+    crate::providers::context_window::resolve_effective_compaction_config_with_catalog(
         &config.agent.compaction,
         provider,
         model,
-        &config.router,
+        crate::providers::context_window::ContextWindowSources::from_config(config),
         &config.model_routes,
         &catalog,
     )
@@ -3531,7 +3531,7 @@ mod tests {
         assert_eq!(after.config.max_context_tokens, 64_000);
         assert_eq!(
             after.max_context_source,
-            crate::router::context::ContextWindowSource::Catalog
+            crate::providers::context_window::ContextWindowSource::Catalog
         );
     }
 

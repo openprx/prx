@@ -157,7 +157,7 @@ fn sessions_spawn_child_model_route_200k_beats_1m_parent() {
     assert_eq!(resolved.config.max_context_tokens, 200_000);
     assert_eq!(
         resolved.max_context_source,
-        crate::router::context::ContextWindowSource::RouterModelConfig
+        crate::providers::context_window::ContextWindowSource::RouterModelConfig
     );
 }
 

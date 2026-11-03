@@ -29,14 +29,12 @@ mod output_allowance;
 mod provider_receipt;
 mod settlement;
 
-#[cfg(feature = "llm-router")]
 mod cl100k_prefix_bound;
 
 /// Initialize local CPU-heavy accounting tables at runtime construction,
 /// before a source starts its fixed admission clock.
 pub(crate) fn initialize_tokenizers() {
     let _ = crate::agent::context_budget::count_tokens_with_source("");
-    #[cfg(feature = "llm-router")]
     cl100k_prefix_bound::initialize();
 }
 
@@ -982,7 +980,6 @@ struct PreparedInput {
 impl PreparedInput {
     fn new(text: &str, allowance: u64) -> Self {
         let upper = input_token_upper_bound(text);
-        #[cfg(feature = "llm-router")]
         let upper = if u64::try_from(upper).is_ok_and(|upper| upper >= allowance)
             && text.len() >= cl100k_prefix_bound::MIN_INPUT_BYTES
         {
@@ -990,8 +987,6 @@ impl PreparedInput {
         } else {
             upper
         };
-        #[cfg(not(feature = "llm-router"))]
-        let _ = allowance;
         Self { upper, measured: None }
     }
 

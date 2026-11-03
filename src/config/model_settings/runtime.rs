@@ -119,7 +119,7 @@ pub(crate) fn warnings(config: &crate::config::Config) -> anyhow::Result<Vec<Str
     for (id, settings) in &config.model_settings {
         if let Some(model) = release.models.iter().find(|model| model.id == *id) {
             notes.extend(prepare(model, &[settings]).1);
-        } else {
+        } else if !settings.is_window_only() {
             notes.push("saved settings for a model absent from the release are ignored".into());
         }
     }

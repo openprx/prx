@@ -3735,6 +3735,15 @@
           ],
           "default": null
         },
+        "context_window": {
+          "description": "Context window in tokens for this model; only honoured under `[model_settings]`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "credential_ref": {
           "description": "A credential reference (`cred-<name>`, `prx providers credential\nset`) issued for this route's provider, used instead of an inline\n`api_key`. The reference is resolved from the encrypted auth-profile\nstore only when its owner is this provider; setting both is refused.",
           "type": [
@@ -3759,6 +3768,15 @@
         "provider": {
           "description": "Provider to route to (must match a known provider name)",
           "type": "string"
+        },
+        "reserved_output_tokens": {
+          "description": "Reserved output tokens for this model; only honoured under `[model_settings]`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "additionalProperties": true,
@@ -3772,11 +3790,29 @@
       "description": "A model level plus explicit parameter overrides in `[model_settings.\"<id>\"]`.",
       "type": "object",
       "properties": {
+        "context_window": {
+          "description": "Context window in tokens for this model; only honoured under `[model_settings]`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "level": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "reserved_output_tokens": {
+          "description": "Reserved output tokens for this model; only honoured under `[model_settings]`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "additionalProperties": true

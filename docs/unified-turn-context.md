@@ -117,7 +117,9 @@ history lookup without copying prompt text into the database:
   Gateway webhook turn (`POST /webhook` and the WhatsApp, Linq and Nextcloud
   Talk webhooks) is budgeted like the CLI, TUI, chat, IM channels and Console
   sessions. It budgets against the effective window of the model it serves
-  (`[[router.models]]` or built-in `max_context` / `reserved_output_tokens`),
+  (explicit agent compaction, then `[model_settings]` windows and reserves,
+  deprecated `[[router.models]]` window metadata, catalog limits, and finally
+  the built-in fallback),
   as the CLI and TUI do. The native tool payload it reserves is the document
   the provider's tool-schema dialect puts on the wire, not always the
   published one: the Anthropic and Gemini cleaning inlines every `$ref`, so a

@@ -1399,11 +1399,7 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
             );
             assert_eq!(
                 estimate["token_source"].as_str(),
-                Some(if cfg!(feature = "llm-router") {
-                    "cl100k_proxy"
-                } else {
-                    "heuristic"
-                }),
+                Some("cl100k_proxy"),
                 "the event must name the estimator it used"
             );
 

@@ -31,7 +31,7 @@ const LABEL_LOG_FILES: &[&str] = &[
     "src/chat/terminal.rs",
     "src/chat/tui_loop.rs",
     "src/chat/views.rs",
-    "src/router/context.rs",
+    "src/providers/context_window.rs",
     "src/router/mod.rs",
     "src/tools/delegate.rs",
     "src/tools/sessions_spawn/actions.rs",
@@ -360,7 +360,7 @@ pub(super) fn provider_label_sinks_redact_url_userinfo() {
             "redact_endpoint_userinfo(&candidate.provider)",
         ),
         (
-            "src/router/context.rs",
+            "src/providers/context_window.rs",
             "pub fn shown_provider(",
             "redact_endpoint_userinfo(&self.selected_provider)",
         ),

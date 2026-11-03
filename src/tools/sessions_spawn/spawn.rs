@@ -63,12 +63,12 @@ pub(super) fn resolve_pinned_child_compaction(
     catalog: &providers::catalog::CatalogView,
     provider: &str,
     model: &str,
-) -> crate::router::context::EffectiveCompactionConfig {
-    crate::router::context::resolve_effective_compaction_config_with_catalog(
+) -> crate::providers::context_window::EffectiveCompactionConfig {
+    crate::providers::context_window::resolve_effective_compaction_config_with_catalog(
         &config.agent.compaction,
         provider,
         model,
-        &config.router,
+        crate::providers::context_window::ContextWindowSources::from_config(config),
         &config.model_routes,
         catalog,
     )

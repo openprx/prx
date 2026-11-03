@@ -103,7 +103,6 @@ fn large_compressible_body_keeps_original_estimator_acceptance() -> anyhow::Resu
     Ok(())
 }
 
-#[cfg(feature = "llm-router")]
 #[test]
 fn large_ascii_prefix_bound_skips_the_exact_tokenizer() -> anyhow::Result<()> {
     let text = "the ".repeat(1024);

@@ -115,6 +115,14 @@ pub(super) const TEST_INCLUSIVE_TREE_SCANNERS: &[(&str, &str)] = &[
         "Removal applies to production, tests and documentation alike; no test stripping is intended.",
     ),
     (
+        "token_counting_is_not_feature_gated",
+        "tokenizer initialization and its regression tests must both compile independently of optional routing",
+    ),
+    (
+        "context_window_resolution_lives_in_providers",
+        "old context-window paths are forbidden in test callers and source-scan literals too",
+    ),
+    (
         "runtime_and_message_events_preserve_typed_config_generation_columns",
         "it requires column names to be present in the whole PostgreSQL adapter directory, tests included; it prohibits nothing, so there is no violation to plant",
     ),
@@ -378,7 +386,7 @@ planted_violation_probes! {
         "src/tools/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "type D0Spawn = crate::tools::SessionsSpawnTool;\npub fn d0_planted_type(a: A) -> D0Spawn {\n    D0Spawn::new_with_registry(a)\n}\n";
     probe_raw_label_log_field: provider_labels_never_reach_a_log_field_raw,
-        "src/router/context.rs", Planted::AppendedTo, Reads::ProductionText,
+        "src/providers/context_window.rs", Planted::AppendedTo, Reads::ProductionText,
         "pub fn d0_planted_label(provider: &str) {\n    tracing::warn!(provider, \"planted\");\n}\n";
     probe_sub_agent_resolver: sub_agent_tools_resolve_compaction_from_the_whole_configuration,
         "src/tools/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,

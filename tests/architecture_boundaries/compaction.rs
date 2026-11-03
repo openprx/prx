@@ -453,8 +453,8 @@ pub(super) fn forwarded_compaction_values_are_produced_from_the_effective_window
             "src/runtime/turn_decision/routing.rs",
             "router_history_hop_inner",
             compact_rust_tokens(
-                "let effective = crate::router::context::resolve_effective_compaction_config_with_catalog(\
-                    &config.agent.compaction, admitted.provider_name(), admitted.model_name(), &config.router, \
+                "let effective = crate::providers::context_window::resolve_effective_compaction_config_with_catalog(\
+                    &config.agent.compaction, admitted.provider_name(), admitted.model_name(), crate::providers::context_window::ContextWindowSources::from_config(config), \
                     &config.model_routes, &self.provider_catalog,);",
             ),
         ),
@@ -521,8 +521,8 @@ pub(super) fn forwarded_compaction_values_are_produced_from_the_effective_window
 /// Every production turn budgets on the served model's effective window
 /// (OQ-23 / R5).
 ///
-/// `resolve_effective_compaction_config` applies the `[[router.models]]` or
-/// built-in `max_context` and `reserved_output_tokens` of the model a turn
+/// `resolve_effective_compaction_config` applies operator model settings,
+/// legacy router metadata or catalog window and reserve values for the model a turn
 /// actually serves. A turn that hands the loop the raw `[agent.compaction]`
 /// table instead budgets on the 128,000-token default whatever the model's
 /// window, so two surfaces of one process trim the same request differently.

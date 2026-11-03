@@ -22,6 +22,7 @@ pub mod bedrock;
 pub mod catalog;
 pub mod compatible;
 pub mod connection_test;
+pub mod context_window;
 pub mod copilot;
 pub mod credentials;
 pub mod gemini;

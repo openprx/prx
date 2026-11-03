@@ -159,7 +159,7 @@ pub fn provider_runtime_options_from_config(config: &crate::config::Config) -> P
         codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
         codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
         ollama_num_ctx: config.providers.ollama.num_ctx,
-        ollama_model_num_ctx: ollama_model_num_ctx_from_router(&config.router),
+        ollama_model_num_ctx: ollama_model_num_ctx(config),
         // `[[providers.tool_dialects]]`. An endpoint with no entry keeps the
         // published document (`Raw`) and native tool calls only; nothing is
         // inferred from its URL.
@@ -295,16 +295,63 @@ pub(crate) fn accepts_tool_dialect_declarations(name: &str) -> bool {
     }
 }
 
-pub(super) fn ollama_model_num_ctx_from_router(router: &crate::config::RouterConfig) -> Vec<(String, usize)> {
+pub(super) fn ollama_model_num_ctx(config: &crate::config::Config) -> Vec<(String, usize)> {
+    let catalog = super::catalog::CatalogView::release_only();
+    let mut windows = std::collections::BTreeMap::new();
+    for (key, settings) in &config.model_settings {
+        let Some((provider, model)) = key.split_once('/') else {
+            continue;
+        };
+        if super::ProviderId::of(provider).catalog_name() == Some("ollama")
+            && super::context_window::model_settings_window_key(&catalog, provider, model) == *key
+            && let Some(window) = settings.context_window
+        {
+            windows.insert(model.to_owned(), usize::try_from(window).unwrap_or(usize::MAX));
+        }
+    }
     const ROUTER_DEFAULT_MAX_CONTEXT_SENTINEL: usize = 1_000_000;
-    router
-        .models
-        .iter()
-        .filter(|model| {
-            model.provider.eq_ignore_ascii_case("ollama")
-                && model.max_context > 0
-                && model.max_context < ROUTER_DEFAULT_MAX_CONTEXT_SENTINEL
-        })
-        .map(|model| (model.model_id.clone(), model.max_context))
-        .collect()
+    for model in config.router.models.iter().filter(|model| {
+        model.provider.eq_ignore_ascii_case("ollama")
+            && model.max_context > 0
+            && model.max_context < ROUTER_DEFAULT_MAX_CONTEXT_SENTINEL
+    }) {
+        windows.entry(model.model_id.clone()).or_insert(model.max_context);
+    }
+    windows.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ollama_model_windows_prefer_model_settings_and_keep_legacy_sentinel() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[model_settings."ollama/my-local-model:latest"]
+context_window = 32768
+[[router.models]]
+provider = "ollama"
+model_id = "my-local-model:latest"
+max_context = 16384
+[[router.models]]
+provider = "OLLAMA"
+model_id = "prx_router_only"
+max_context = 8192
+[[router.models]]
+provider = "ollama"
+model_id = "prx_default_window"
+[[router.models]]
+provider = "openai"
+model_id = "prx_other_provider"
+max_context = 8192
+"#,
+        )
+        .unwrap();
+        let windows = provider_runtime_options_from_config(&config).ollama_model_num_ctx;
+        assert_eq!(windows.len(), 2);
+        assert!(windows.contains(&("my-local-model:latest".into(), 32_768)));
+        assert!(windows.contains(&("prx_router_only".into(), 8_192)));
+        assert!(!windows.iter().any(|(model, _)| model == "prx_default_window"));
+    }
 }

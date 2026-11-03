@@ -76,6 +76,7 @@ impl Config {
             );
         }
         crate::config::model_settings::validate_keys(&config)?;
+        crate::providers::context_window::warn_legacy_router_windows(&config);
         for note in crate::config::manage::lifecycle::diagnostics(&config)? {
             if note.warning {
                 tracing::warn!(warning = %note.message, "configured model lifecycle warning");

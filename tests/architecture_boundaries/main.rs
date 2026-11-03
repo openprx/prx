@@ -27,6 +27,7 @@ mod scanner_meta;
 mod scanner_probes;
 mod strip_tests;
 mod structure;
+mod token_count;
 mod tool_scanner;
 mod tool_tables;
 mod tool_tests;

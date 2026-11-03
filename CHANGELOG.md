@@ -127,6 +127,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deprecated; dated price changes are in the embedded catalog baseline in
   `docs/providers.md`.
 
+- **BREAKING (operators):** `router.models[].max_context/reserved_output_tokens`
+  are deprecated as context-window sources (still read, with a WARN once per
+  process). Use `[model_settings."<id>"]` with `context_window` and
+  `reserved_output_tokens` instead. cl100k token counting no longer depends on
+  the `llm-router` feature.
+
 ### Fixed
 
 - Partial configuration settings inherit their documented defaults, including

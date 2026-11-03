@@ -13,6 +13,12 @@ pub(crate) use runtime::{runtime_layers, warnings};
 pub struct ModelSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
+    /// Context window in tokens for this model; only honoured under `[model_settings]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// Reserved output tokens for this model; only honoured under `[model_settings]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_output_tokens: Option<u64>,
     #[serde(flatten)]
     pub overrides: BTreeMap<String, Value>,
 }
@@ -29,7 +35,23 @@ impl<'de> Deserialize<'de> for ModelSettings {
         if level.is_some() || overrides.get("level").is_some_and(Value::is_null) {
             overrides.remove("level");
         }
-        Ok(Self { level, overrides })
+        // Keep invalid values only until validate_keys can name the full path,
+        // including the settings key, without rendering the offending value.
+        let mut take_window = |name: &str| {
+            let value = overrides.get(name).and_then(Value::as_u64).filter(|value| *value > 0);
+            if value.is_some() {
+                overrides.remove(name);
+            }
+            value
+        };
+        let context_window = take_window("context_window");
+        let reserved_output_tokens = take_window("reserved_output_tokens");
+        Ok(Self {
+            level,
+            context_window,
+            reserved_output_tokens,
+            overrides,
+        })
     }
 }
 
@@ -42,6 +64,13 @@ impl std::fmt::Debug for ModelSettings {
 impl ModelSettings {
     /// Refuse unsupported, malformed and out-of-range durable choices.
     pub fn validate(&self, id: &str) -> anyhow::Result<ParameterLayer> {
+        self.validate_window(&format!(
+            "model_settings.{}",
+            crate::security::redaction::redact_provider_text(id)
+        ))?;
+        if self.is_window_only() {
+            return Ok(ParameterLayer::default());
+        }
         let layer = self.parameter_layer(id)?;
         let release = ReleaseCatalog::embedded_ref()?;
         let model = release
@@ -55,6 +84,32 @@ impl ModelSettings {
         );
         crate::providers::catalog::parameters::resolve(model, &release.revision, std::slice::from_ref(&layer))?;
         Ok(layer)
+    }
+
+    pub(crate) fn is_window_only(&self) -> bool {
+        self.context_window.is_some() && self.level.is_none() && self.overrides.is_empty()
+    }
+
+    fn validate_window(&self, path: &str) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("context_window", self.context_window),
+            ("reserved_output_tokens", self.reserved_output_tokens),
+        ] {
+            anyhow::ensure!(
+                !self.overrides.contains_key(name) && value != Some(0),
+                "{path}.{name} requires a positive integer"
+            );
+        }
+        if let Some(reserved) = self.reserved_output_tokens {
+            let window = self.context_window.ok_or_else(|| {
+                anyhow::anyhow!("{path}.reserved_output_tokens requires context_window in the same entry")
+            })?;
+            anyhow::ensure!(
+                reserved < window,
+                "{path}.reserved_output_tokens must be less than context_window"
+            );
+        }
+        Ok(())
     }
 
     fn parameter_layer(&self, id: &str) -> anyhow::Result<ParameterLayer> {
@@ -136,6 +191,18 @@ impl ModelSettings {
 /// Values remain available for runtime compatibility with an older catalog.
 pub(crate) fn validate_keys(config: &crate::config::Config) -> anyhow::Result<()> {
     for (index, route) in config.model_routes.iter().enumerate() {
+        for (name, present) in [
+            ("context_window", route.settings.context_window.is_some()),
+            (
+                "reserved_output_tokens",
+                route.settings.reserved_output_tokens.is_some(),
+            ),
+        ] {
+            anyhow::ensure!(
+                !present && !route.settings.overrides.contains_key(name),
+                "model_routes.{index}.{name} is not supported; set [model_settings.\"<id>\"] instead"
+            );
+        }
         for name in route.settings.overrides.keys() {
             anyhow::ensure!(
                 name == "level" || ModelParameter::parse(name).is_some(),
@@ -144,6 +211,8 @@ pub(crate) fn validate_keys(config: &crate::config::Config) -> anyhow::Result<()
         }
     }
     for (id, settings) in &config.model_settings {
+        let id = crate::security::redaction::redact_provider_text(id);
+        settings.validate_window(&format!("model_settings.{id}"))?;
         for name in settings.overrides.keys() {
             anyhow::ensure!(
                 name == "level" || ModelParameter::parse(name).is_some(),
@@ -195,6 +264,7 @@ pub(crate) fn validate_existing(candidate: &crate::config::Config) -> Result<(),
 }
 
 fn validate_settings(current: Option<&crate::config::Config>, candidate: &crate::config::Config) -> Result<(), String> {
+    validate_keys(candidate).map_err(|error| error.to_string())?;
     let release = ReleaseCatalog::embedded_ref().map_err(|error| error.to_string())?;
     for route in &candidate.model_routes {
         let row = release.model(&crate::providers::ProviderId::of(&route.provider), &route.model);
@@ -244,6 +314,7 @@ mod tests {
             let settings = ModelSettings {
                 level: None,
                 overrides: [("api_keyy".into(), json!(secret))].into(),
+                ..Default::default()
             };
             if model_settings {
                 config.model_settings.insert("openai/gpt-5.6".into(), settings);
@@ -307,6 +378,7 @@ mod tests {
         let settings = ModelSettings {
             level: Some("high".into()),
             overrides: [("max_output_tokens".into(), json!(64000))].into(),
+            ..Default::default()
         };
         config.model_settings.insert("openai/gpt-5.6".into(), settings.clone());
         let text = toml::to_string(&config).unwrap();
@@ -348,5 +420,85 @@ mod tests {
         let rendered = format!("{settings:?}");
         assert!(!rendered.contains("prx_parameter_debug_secret"), "{rendered}");
         assert!(rendered.contains("high"), "valid non-secret choices remain visible");
+    }
+    fn load_settings_text(text: &str) -> anyhow::Result<crate::config::Config> {
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text)?;
+        crate::config::Config::load_from_path(&path, dir.path().join("workspace"))
+    }
+
+    #[test]
+    fn model_settings_route_windows_are_refused_at_load() {
+        for field in ["context_window", "reserved_output_tokens"] {
+            let error = load_settings_text(&format!(
+                "[[model_routes]]\nhint='prx_route'\nprovider='openai'\nmodel='gpt-5.6'\n{field}=16384\n"
+            ))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(&format!(
+                    "model_routes.0.{field} is not supported; set [model_settings.\"<id>\"] instead"
+                )),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_settings_windows_refuse_invalid_values_and_reservations_at_load() {
+        for field in ["context_window", "reserved_output_tokens"] {
+            for value in ["0", "-1", "1.5", "'invalid'", "true"] {
+                let error = load_settings_text(&format!("[model_settings.\"ollama/prx_model\"]\n{field}={value}\n"))
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains(&format!(
+                        "model_settings.ollama/prx_model.{field} requires a positive integer"
+                    )),
+                    "{error:#}"
+                );
+            }
+        }
+        for (text, expected) in [
+            (
+                "reserved_output_tokens=8000",
+                "requires context_window in the same entry",
+            ),
+            (
+                "context_window=8000\nreserved_output_tokens=8000",
+                "must be less than context_window",
+            ),
+            (
+                "context_window=8000\nreserved_output_tokens=8001",
+                "must be less than context_window",
+            ),
+        ] {
+            let error = load_settings_text(&format!("[model_settings.\"ollama/prx_model\"]\n{text}\n")).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+        let raw = "custom:https://user:USERSECRET@host.test/v1?key=QUERYSECRET#FRAGSECRET/prx_model";
+        let error = load_settings_text(&format!("[model_settings.\"{raw}\"]\ncontext_window=0\n")).unwrap_err();
+        let shown = format!("{error:#}");
+        for secret in ["USERSECRET", "QUERYSECRET", "FRAGSECRET", "user:"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+    }
+
+    #[test]
+    fn model_settings_window_and_level_roundtrip_preserves_named_fields() {
+        let config = load_settings_text(
+            r#"[model_settings."openai/gpt-5.6"]
+level = "high"
+context_window = 200000
+reserved_output_tokens = 8000"#,
+        )
+        .unwrap();
+        let settings = config.model_settings.get("openai/gpt-5.6").unwrap();
+        settings.validate("openai/gpt-5.6").unwrap();
+        assert!(settings.overrides.is_empty());
+        assert_eq!(settings.context_window, Some(200_000));
+        assert_eq!(settings.reserved_output_tokens, Some(8_000));
+        assert_eq!(settings.level.as_deref(), Some("high"));
+        let loaded = load_settings_text(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(loaded.model_settings, config.model_settings);
     }
 }

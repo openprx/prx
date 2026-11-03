@@ -929,11 +929,11 @@ async fn admin_accounting_scope(
             .provider
             .as_ref()
             .context("admin backend provider unavailable")?;
-        let effective = crate::router::context::resolve_effective_compaction_config_with_catalog(
+        let effective = crate::providers::context_window::resolve_effective_compaction_config_with_catalog(
             &config.agent.compaction,
             provider.as_str(),
             &slot.identity.configured_model,
-            &config.router,
+            crate::providers::context_window::ContextWindowSources::from_config(config),
             &config.model_routes,
             &catalog,
         );
@@ -1362,11 +1362,11 @@ mod tests {
             .provider
             .as_ref()
             .expect("actual physical provider");
-        let effective = crate::router::resolve_effective_compaction_config(
+        let effective = crate::providers::context_window::resolve_effective_compaction_config(
             &config.agent.compaction,
             provider.as_str(),
             &slots.first().expect("actual physical slot").identity.configured_model,
-            &config.router,
+            crate::providers::context_window::ContextWindowSources::from_config(&config),
             &config.model_routes,
         );
         let expected_tokens = u64::try_from(

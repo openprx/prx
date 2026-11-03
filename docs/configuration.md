@@ -3107,6 +3107,26 @@ are validated and written through PMM transactions; invalid values are refused
 before writing. See [model levels and selection commands](model-catalog.md#saving-a-model-level)
 for examples, precedence, session-only chat choices and rollback.
 
+Model entries also accept positive integer `context_window` and
+`reserved_output_tokens` keys. The reserve requires a window in the same entry
+and must be smaller. These keys are TOML-only and are refused under
+`[[model_routes]]`. Use the catalog row ID when the selected provider/model has
+one; otherwise use `<canonical provider>/<model>` (or the trimmed provider
+string when there is no catalog identity). For a local model absent from the
+catalog:
+
+```toml
+[model_settings."ollama/my-local-model:latest"]
+context_window = 32768
+```
+
+Window-only entries need no catalog row; entries with levels or parameters keep
+strict validation.
+Explicit agent compaction wins over model settings, followed by deprecated
+router window metadata, catalog limits and the existing fallback. Legacy
+`router.models[].max_context/reserved_output_tokens` remain readable with a
+migration warning once per process.
+
 ## Release catalog lifecycle
 
 `prx models catalog status` shows the embedded revision, digest and lifecycle

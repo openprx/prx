@@ -114,13 +114,13 @@ pub(super) struct ChatProviderBinding {
 }
 
 impl ChatProviderBinding {
-    pub(super) fn effective_compaction(&self) -> crate::router::context::EffectiveCompactionConfig {
+    pub(super) fn effective_compaction(&self) -> crate::providers::context_window::EffectiveCompactionConfig {
         let config = &self.generation.effective;
-        crate::router::context::resolve_effective_compaction_config_with_catalog(
+        crate::providers::context_window::resolve_effective_compaction_config_with_catalog(
             &config.agent.compaction,
             self.choice.provider_name(),
             self.choice.model_name(),
-            &config.router,
+            crate::providers::context_window::ContextWindowSources::from_config(config),
             &config.model_routes,
             self.choice.catalog(),
         )
@@ -935,7 +935,9 @@ impl ChatTurnBinding {
         self.decision.get().map(|decided| decided.context.main_compaction())
     }
 
-    pub(super) fn effective_compaction(&self) -> anyhow::Result<crate::router::context::EffectiveCompactionConfig> {
+    pub(super) fn effective_compaction(
+        &self,
+    ) -> anyhow::Result<crate::providers::context_window::EffectiveCompactionConfig> {
         let decided = self
             .decision
             .get()

@@ -2703,7 +2703,7 @@ async fn run_gateway_chat_with_multimodal(
             // CLI and TUI do.
             let mut effective_compaction = service.effective_compaction(provider_label, &turn_runtime.model);
             effective_compaction.config = context.main_compaction().clone();
-            crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
+            crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
 
             let provider_started_at = chrono::Utc::now();
             let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(

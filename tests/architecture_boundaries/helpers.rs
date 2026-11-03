@@ -276,3 +276,59 @@ pub(super) fn struct_literal_count(production: &str, name: &str) -> usize {
         })
         .count()
 }
+
+/// Locate a top-level method inside its exact impl, ignoring literal/comment braces.
+pub(super) fn impl_method_body(source: &str, implementation: &str, name: &str) -> String {
+    let masked = blank_comments_and_literals(source);
+    let start_byte = masked
+        .match_indices(implementation)
+        .find_map(|(offset, _)| {
+            masked[offset + implementation.len()..]
+                .trim_start()
+                .starts_with('{')
+                .then_some(offset)
+        })
+        .unwrap_or_else(|| panic!("missing {implementation}"));
+    let chars: Vec<char> = masked.chars().collect();
+    let start = masked[..start_byte].chars().count();
+    let open = (start..chars.len())
+        .find(|index| chars[*index] == '{')
+        .expect("impl body");
+    let close = close_of_group(&chars, open);
+    let needle: Vec<char> = format!("fn {name}(").chars().collect();
+    let mut depth = 0usize;
+    let method_start = (open..close)
+        .find(|index| {
+            match chars[*index] {
+                '{' => depth += 1,
+                '}' => depth = depth.checked_sub(1).expect("impl brace depth"),
+                _ => {}
+            }
+            depth == 1
+                && chars
+                    .get(*index..*index + needle.len())
+                    .is_some_and(|text| text == needle.as_slice())
+        })
+        .unwrap_or_else(|| panic!("missing {implementation}::{name}"));
+    let method_open = (method_start..close)
+        .find(|index| chars[*index] == '{')
+        .expect("method body");
+    let method_close = close_of_group(&chars, method_open);
+    let original: Vec<char> = source.chars().collect();
+    original[method_start..method_close].iter().collect()
+}
+
+#[test]
+fn impl_method_lookup_stays_inside_the_exact_impl_and_method_scope() {
+    let source = r#"
+impl PreparedInputOther { fn new() { prefix_constructor(); } }
+impl PreparedInput {
+    fn before() { fn new() { nested_constructor(); } }
+    fn new() { let brace = "}"; /* { */ intended_constructor(); }
+}
+"#;
+    let method = impl_method_body(source, "impl PreparedInput", "new");
+    assert!(method.contains("intended_constructor()"), "{method}");
+    assert!(!method.contains("prefix_constructor()"), "{method}");
+    assert!(!method.contains("nested_constructor()"), "{method}");
+}

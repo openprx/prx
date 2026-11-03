@@ -462,7 +462,7 @@ async fn run_console_runtime_turn(
         .service
         .effective_compaction(&provider_label, &turn_runtime.model);
     effective_compaction.config = decision.context.main_compaction().clone();
-    crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
+    crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
     let provider_started_at = chrono::Utc::now();
     let loop_result = run_turn(
         &mut history,

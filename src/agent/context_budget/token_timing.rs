@@ -31,11 +31,8 @@ impl Drop for Scope {
 #[derive(Clone, Copy)]
 pub(crate) enum Kind {
     Whole,
-    #[cfg(feature = "llm-router")]
     Init,
-    #[cfg(feature = "llm-router")]
     Lookup,
-    #[cfg(feature = "llm-router")]
     Encode,
 }
 pub(crate) struct Span {
@@ -59,14 +56,11 @@ impl Drop for Span {
                     timing.calls += 1;
                     timing.whole_ns = Some(elapsed);
                 }
-                #[cfg(feature = "llm-router")]
                 Kind::Init => {
                     timing.init_calls += 1;
                     timing.init_ns = Some(elapsed);
                 }
-                #[cfg(feature = "llm-router")]
                 Kind::Lookup => timing.lookup_including_init_or_wait_ns = Some(elapsed),
-                #[cfg(feature = "llm-router")]
                 Kind::Encode => timing.encoding_ns = Some(elapsed),
             }
             CURRENT.set(Some(timing));

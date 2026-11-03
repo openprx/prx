@@ -194,9 +194,9 @@ slash-containing model ID such as `[cost.prices."deepseek/deepseek-v3.2"]`.
 Set `input`, `output`, `cache_read` and `cache_write` in USD per million
 tokens; these are operator accounting rates, not invented catalog prices.
 
-Compaction reads the effective
-descriptor's context window after explicit agent and `[[router.models]]`
-overrides. The default Router candidate list uses active rows with `router`
+Compaction uses explicit `[agent.compaction]` overrides first, then
+`[model_settings]` windows, legacy `[[router.models]]` windows (deprecated),
+the effective catalog descriptor, and finally the built-in fallback. The default Router candidate list uses active rows with `router`
 hints and an effective billing tariff, including configured `[cost.prices]`
 overrides. Doctor applies the same configured-price filter. A price override
 does not revive a retired row or add absent Router metadata.
@@ -275,6 +275,12 @@ Model choices remain in TOML. Use a canonical catalog ID as the settings key:
 [model_settings."openai/gpt-5.6"]
 level = "high"
 max_output_tokens = 64000
+context_window = 200000
+reserved_output_tokens = 8000
+
+# Window-only settings also support models absent from the release catalog.
+[model_settings."ollama/my-local-model:latest"]
+context_window = 32768
 
 [[model_routes]]
 hint = "quick"
@@ -282,6 +288,13 @@ provider = "openai"
 model = "gpt-5.6"
 level = "low"
 ```
+
+Window keys accept positive integers only. `reserved_output_tokens` requires a
+`context_window` in the same entry and must be smaller. For catalog models, use
+the catalog row ID. Otherwise use `<canonical provider>/<model>`, or the trimmed
+provider string when it has no catalog identity. Window-only entries need no
+catalog row; levels and parameter overrides keep strict catalog validation.
+Window keys are TOML settings and are refused under `[[model_routes]]`.
 
 Inspect the catalog and plan a change before applying it:
 

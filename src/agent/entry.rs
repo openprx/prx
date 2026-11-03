@@ -1669,15 +1669,15 @@ pub(crate) async fn run_with_runtime_envelope(
         let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
         let provider: Box<dyn Provider> = selection.build_provider(&config, &provider_runtime_options)?;
-        let effective_compaction = crate::router::context::resolve_effective_compaction_config_with_catalog(
+        let effective_compaction = crate::providers::context_window::resolve_effective_compaction_config_with_catalog(
             &config.agent.compaction,
             provider_name,
             model_name,
-            &config.router,
+            crate::providers::context_window::ContextWindowSources::from_config(&config),
             &config.model_routes,
             choice.catalog(),
         );
-        crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
+        crate::providers::context_window::trace_effective_compaction_resolution(&effective_compaction);
 
         observer.record_event(&ObserverEvent::AgentStart {
             provider: provider_name.to_string(),

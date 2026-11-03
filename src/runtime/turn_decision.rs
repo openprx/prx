@@ -213,13 +213,13 @@ impl TurnDecisionService {
         &self,
         provider: &str,
         model: &str,
-    ) -> crate::router::context::EffectiveCompactionConfig {
+    ) -> crate::providers::context_window::EffectiveCompactionConfig {
         let config = &self.generation.effective;
-        crate::router::context::resolve_effective_compaction_config_with_catalog(
+        crate::providers::context_window::resolve_effective_compaction_config_with_catalog(
             &config.agent.compaction,
             provider,
             model,
-            &config.router,
+            crate::providers::context_window::ContextWindowSources::from_config(config),
             &config.model_routes,
             &self.provider_catalog,
         )

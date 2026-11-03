@@ -1,6 +1,6 @@
 #[cfg(feature = "llm-router")]
 pub mod capability;
-pub mod context;
+pub use crate::providers::context_window as context; // Compatibility until router removal.
 #[cfg(feature = "llm-router")]
 pub mod elo;
 #[cfg(feature = "llm-router")]
@@ -49,7 +49,7 @@ use self::knn::KnnStore;
 pub use self::scorer::RouterResult;
 #[cfg(feature = "llm-router")]
 use self::scorer::rank_models;
-pub use context::resolve_effective_compaction_config;
+pub use crate::providers::context_window::resolve_effective_compaction_config;
 // RouterResult remains the scorer output; RouteDecision is the durable
 // timeline projection used by ingress/provider execution paths.
 

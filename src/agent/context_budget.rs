@@ -352,14 +352,14 @@ pub fn trim_history_to_context_budget_preserving_compaction_replacement_with_flo
 
 /// Count the number of tokens in `text`.
 ///
-/// When the `llm-router` feature is enabled this uses the `cl100k_base`
+/// This uses the `cl100k_base`
 /// encoding (the tokenizer used by GPT-3.5/4 and a close proxy for most modern
 /// chat models), giving an accurate count. The encoder is expensive to build,
 /// so it is constructed once and cached in a [`std::sync::LazyLock`].
 ///
 /// This compatibility helper is used by tests. Production callers measure
-/// through `count_tokens_with_source`, which without `llm-router` falls
-/// back to the `chars / 4` heuristic (rounded up) and reports that source.
+/// through `count_tokens_with_source`, which falls back to the `chars / 4`
+/// heuristic (rounded up) only if the encoder fails to initialize.
 #[cfg(test)]
 pub fn count_tokens(text: &str) -> usize {
     count_tokens_with_source(text).tokens
@@ -371,7 +371,6 @@ pub(crate) mod token_timing;
 pub(crate) fn count_tokens_with_source(text: &str) -> TokenMeasurement {
     #[cfg(test)]
     let _whole_timing = token_timing::Span::start(token_timing::Kind::Whole);
-    #[cfg(feature = "llm-router")]
     {
         use std::sync::LazyLock;
         use tiktoken_rs::CoreBPE;

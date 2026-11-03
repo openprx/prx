@@ -93,7 +93,8 @@ a live read grant or model-execution authority.
 
 ## Feature Switches
 
-- Build-time: `llm-router` feature is enabled by default (`cargo build`).
+- Build-time: `llm-router` feature is enabled by default (`cargo build`). Token
+  counting uses cl100k independently of this feature.
 - Local heuristic ranking requires an admitted source and reachable model binding.
 - KNN requires the scoped history and concrete embedding authority described above.
 
@@ -154,7 +155,7 @@ knn_k = 7
 model_id = "gpt-4o-mini"
 provider = "openrouter"
 cost_per_million_tokens = 0.60
-max_context = 128000
+max_context = 128000 # Deprecated window source; use model_settings below.
 latency_ms = 1200
 categories = ["conversation", "code", "analysis"]
 elo_rating = 1000.0
@@ -163,10 +164,20 @@ elo_rating = 1000.0
 model_id = "gpt-4.1"
 provider = "openai"
 cost_per_million_tokens = 10.0
-max_context = 128000
+max_context = 128000 # Deprecated window source; use model_settings below.
 latency_ms = 2200
 categories = ["analysis", "code"]
 elo_rating = 1000.0
+```
+
+The legacy `max_context` and `reserved_output_tokens` window sources remain
+readable and emit one migration warning per process. Move their values to
+`[model_settings]` (see [model settings](model-catalog.md#saving-a-model-level)):
+
+```toml
+[model_settings."openai/gpt-4.1"]
+context_window = 128000
+reserved_output_tokens = 8192
 ```
 
 ## Minimum Viable Configuration
@@ -211,7 +222,10 @@ Operational note:
 - `model_id`: model identifier (without provider prefix)
 - `provider`: provider id
 - `cost_per_million_tokens`: USD cost estimate
-- `max_context`: max prompt context tokens
+- `max_context`: deprecated context-window source; use
+  `[model_settings."<id>"].context_window` instead
+- `reserved_output_tokens`: deprecated output reserve source; use
+  `[model_settings."<id>"].reserved_output_tokens` instead
 - `latency_ms`: baseline latency estimate
 - `categories`: model capability categories used by intent match
 - `elo_rating`: initial Elo baseline
