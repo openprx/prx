@@ -279,7 +279,16 @@ async fn check_legacy_input(recording: bool, turns: usize) -> anyhow::Result<()>
             let reader = crate::memory::sqlite::fixture_readback::RouterReadback::open(workspace.path())?;
             assert_eq!(reader.auxiliary_count()?, 0);
             assert_eq!(reader.learning_receipt_count()?, i64::try_from(turns)?);
+            let journal = workspace.path().join("state/costs.reservations.jsonl");
+            if journal.exists() {
+                assert!(
+                    std::fs::read_to_string(journal)?.trim().is_empty(),
+                    "no premium hold or dispatch"
+                );
+            }
             let (domain, snapshot) = reader.learning_state()?;
+            assert_eq!(domain.len(), 64);
+            assert!(domain.bytes().all(|byte| byte.is_ascii_hexdigit()));
             for terminal in &terminals {
                 assert_eq!(
                     reader.learning_terminal_count(
@@ -291,27 +300,23 @@ async fn check_legacy_input(recording: bool, turns: usize) -> anyhow::Result<()>
                 );
             }
             let snapshot: crate::memory::traits::RouterLearningSnapshot = serde_json::from_str(&snapshot)?;
-            assert_eq!(
-                snapshot
-                    .models
-                    .iter()
-                    .find(|m| m.model == CHEAP)
-                    .context("cheap learning")?
-                    .successes
-                    .iter()
-                    .copied()
-                    .collect::<Vec<_>>(),
-                vec![true; turns]
-            );
-            assert!(
-                snapshot
-                    .models
-                    .iter()
-                    .find(|m| m.model == PREMIUM)
-                    .context("premium prior")?
-                    .successes
-                    .is_empty()
-            );
+            assert_eq!(snapshot.version, i64::try_from(turns)?);
+            let cheap = snapshot
+                .models
+                .iter()
+                .find(|model| model.model == CHEAP)
+                .context("cheap learning")?;
+            let premium = snapshot
+                .models
+                .iter()
+                .find(|model| model.model == PREMIUM)
+                .context("premium prior")?;
+            assert_eq!(cheap.provider, format!("custom:http://{}", listener.address));
+            assert_eq!(premium.provider, cheap.provider);
+            assert!(cheap.elo > 2000.0);
+            assert_eq!(cheap.successes.iter().copied().collect::<Vec<_>>(), vec![true; turns]);
+            assert_eq!(premium.elo, 1000.0);
+            assert!(premium.successes.is_empty());
             Ok::<_, anyhow::Error>(())
         })
         .catch_unwind(),
