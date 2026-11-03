@@ -145,9 +145,6 @@ pub(super) fn candidate(config: &Config) -> anyhow::Result<Config> {
     }
     let is_hint =
         |model: &str| model.starts_with("hint:") || config.model_routes.iter().any(|route| route.hint == model);
-    if !is_hint(&next.router.automix.premium_model_id) {
-        replace(release, provider, &mut next.router.automix.premium_model_id)?;
-    }
     for rule in &mut next.task_routing.rules {
         if let Some(model) = &mut rule.model_hint
             && !is_hint(model)

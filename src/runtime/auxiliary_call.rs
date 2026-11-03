@@ -7,16 +7,12 @@ use std::sync::Arc;
 pub(crate) enum AuxiliaryPurpose {
     SignalVision,
     SmartGroupClassifier,
-    #[cfg(feature = "llm-router")]
-    AutomixPremium,
 }
 impl AuxiliaryPurpose {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::SignalVision => "signal_vision",
             Self::SmartGroupClassifier => "smart_group_classifier",
-            #[cfg(feature = "llm-router")]
-            Self::AutomixPremium => "automix_premium",
         }
     }
 }
@@ -33,8 +29,6 @@ struct State {
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     outcome: Option<ProviderExecutionOutcome>,
     uncertain: bool,
-    completed_reply_sha256: Option<[u8; 32]>,
-    served_reply_sha256: Option<[u8; 32]>,
 }
 impl AuxiliaryProviderCall {
     pub(crate) fn new_accounted(
@@ -101,52 +95,8 @@ impl AuxiliaryProviderCall {
             trace.tokens_used.clone(),
         );
         outcome.redact_provider_labels();
-        use sha2::{Digest, Sha256};
-        state.completed_reply_sha256 = Some(Sha256::digest(trace.response.text_or_empty().as_bytes()).into());
         state.outcome = Some(outcome);
         Ok(())
-    }
-    #[cfg(feature = "llm-router")]
-    pub(crate) fn mark_served(&self, reply: &str) -> anyhow::Result<()> {
-        use crate::llm::route_decision::{AttemptStatus, ExecutionStatus};
-        use sha2::{Digest, Sha256};
-        let mut state = self.state.lock();
-        anyhow::ensure!(
-            self.purpose == AuxiliaryPurpose::AutomixPremium,
-            "only premium auxiliary reply can be served"
-        );
-        let outcome = state
-            .outcome
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("auxiliary response is not completed"))?;
-        let last = outcome
-            .attempts
-            .iter()
-            .rev()
-            .find(|attempt| attempt.status != AttemptStatus::Skipped);
-        anyhow::ensure!(
-            matches!(
-                outcome.status,
-                ExecutionStatus::Success | ExecutionStatus::FallbackSuccess
-            ) && last.is_some_and(|attempt| attempt.status == AttemptStatus::Success
-                && attempt.provider == outcome.final_provider
-                && attempt.model == outcome.final_model),
-            "auxiliary response lacks an actual serving attempt"
-        );
-        let digest: [u8; 32] = Sha256::digest(reply.as_bytes()).into();
-        anyhow::ensure!(
-            !reply.trim().is_empty() && state.completed_reply_sha256 == Some(digest),
-            "auxiliary served reply differs from actual response"
-        );
-        anyhow::ensure!(
-            state.served_reply_sha256.is_none_or(|prior| prior == digest),
-            "auxiliary serving observation already differs"
-        );
-        state.served_reply_sha256 = Some(digest);
-        Ok(())
-    }
-    pub(crate) fn served_reply_sha256(&self) -> Option<[u8; 32]> {
-        self.state.lock().served_reply_sha256
     }
     pub(crate) const fn purpose_label(&self) -> &'static str {
         self.purpose.label()
@@ -158,17 +108,12 @@ impl AuxiliaryProviderCall {
         config: &crate::config::Config,
         proposal: &mut crate::agent::terminal::TurnTerminalDraft,
     ) -> anyhow::Result<Option<crate::memory::MessageEvent>> {
-        let (started_at, outcome, uncertain, served_reply_sha256) = {
+        let (started_at, outcome, uncertain) = {
             let state = self.state.lock();
             let Some(started_at) = state.started_at else {
                 return Ok(None);
             };
-            (
-                started_at,
-                state.outcome.clone(),
-                state.uncertain,
-                state.served_reply_sha256.map(hex::encode),
-            )
+            (started_at, state.outcome.clone(), state.uncertain)
         };
         anyhow::ensure!(
             self.accounting_scope_id.len() == 64
@@ -180,12 +125,11 @@ impl AuxiliaryProviderCall {
         // This is evidence of the logical auxiliary call. The keyed scope ID
         // joins its physical reservation/settlement ledger, restricted to
         // attempt IDs prefixed by this exact purpose plus ':'. This separates
-        // decision/router/vision/premium calls sharing a source budget.
+        // decision/router/vision/classifier calls sharing a source budget.
         // No aggregate debit is emitted.
         let payload = crate::security::redaction::redact_json_structure(&serde_json::json!({
             "version": 2, "purpose": purpose, "accounting_scope_id": self.accounting_scope_id,
             "started_at": started_at, "provider_outcome": outcome, "usage_uncertain": uncertain,
-            "served_reply_sha256": served_reply_sha256,
             "prepared_parameters": self.parameters.snapshot(),
         }))?;
         let payload = serde_json::to_string(&payload)?;

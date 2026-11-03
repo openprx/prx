@@ -27,9 +27,6 @@ bench = false
 [[bench]]
 name = "router_decision"
 harness = false
-# The bench imports `openprx::router::automix`, which only exists with the
-# router (D-047: every feature set builds with --all-targets).
-required-features = ["llm-router"]
 
 [[bench]]
 name = "prompt_render"

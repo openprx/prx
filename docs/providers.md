@@ -1007,20 +1007,13 @@ preserves that historical result without granting new execution authority.
 See the [cost lifecycle](provider-routing-cost-lifecycle.md#embedded-local-routing)
 for domain, retention and session limits.
 
-Separately billed Router embeddings, Signal vision summaries and AutoMix
-premium attempts require a source-owned token, money and deadline allowance.
+Separately billed Router embeddings, Signal vision summaries and smart-group
+classification calls require a source-owned token, money and deadline allowance.
 The supported OpenAI/compatible chat and OpenAI-compatible embedding transports
 reserve before each physical send and settle reported usage separately. Their
 actual endpoint, credential and model must match the captured factory targets;
 provider display labels do not grant accounting authority. Other transports
 refuse the auxiliary call before dispatch until their real sends are instrumented.
-
-AutoMix preserves the main cheap-call outcome and its existing settlement. A
-served premium reply has a separate verified auxiliary outcome/reply link and
-physical accounting scope; it is not charged again as aggregate main usage or
-trained as a cheap-model answer. Recording-disabled execution does not acquire
-synthetic durable replay evidence. Candidate compilation, behavior, cancellation,
-replay and performance acceptance remain separate gates.
 
 ## Rate limiting (HTTP 429)
 

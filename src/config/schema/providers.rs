@@ -91,56 +91,6 @@ pub(super) const fn default_router_elo() -> f32 {
     1_000.0
 }
 
-pub(super) const fn default_automix_confidence_threshold() -> f32 {
-    0.7
-}
-
-pub(super) const fn default_automix_escalation_window_ms() -> u64 {
-    30_000
-}
-
-/// Adaptive escalation policy for cheap-first routing.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AutomixConfig {
-    /// Escalate when confidence falls below this threshold. Default: `0.7`.
-    #[serde(default = "default_automix_confidence_threshold")]
-    pub confidence_threshold: f32,
-    /// Tier markers that identify cheap-first models.
-    #[serde(default)]
-    pub cheap_model_tiers: Vec<String>,
-    /// Premium model target used for escalation.
-    #[serde(default)]
-    pub premium_model_id: String,
-    /// Premium escalation window after the cheap reply, including settlement.
-    /// Default: 30,000 ms; allowed range: 1..=120,000 ms.
-    #[serde(default = "default_automix_escalation_window_ms")]
-    pub escalation_window_ms: u64,
-}
-
-impl Default for AutomixConfig {
-    fn default() -> Self {
-        Self {
-            confidence_threshold: default_automix_confidence_threshold(),
-            cheap_model_tiers: Vec::new(),
-            premium_model_id: String::new(),
-            escalation_window_ms: default_automix_escalation_window_ms(),
-        }
-    }
-}
-
-impl AutomixConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if !(0.0..=1.0).contains(&self.confidence_threshold) {
-            anyhow::bail!("automix.confidence_threshold must be in [0,1]");
-        }
-        anyhow::ensure!(
-            (1..=120_000).contains(&self.escalation_window_ms),
-            "automix.escalation_window_ms must be in [1,120000]"
-        );
-        Ok(())
-    }
-}
-
 /// Heuristic LLM router configuration (`[router]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RouterConfig {
@@ -165,9 +115,6 @@ pub struct RouterConfig {
     /// Number of nearest neighbors considered for voting. Default: `7`.
     #[serde(default = "default_router_knn_k")]
     pub knn_k: usize,
-    /// Cheap-first adaptive escalation policy.
-    #[serde(default)]
-    pub automix: AutomixConfig,
     /// Candidate model registry.
     #[serde(default)]
     pub models: Vec<RouterModelConfig>,
@@ -183,7 +130,6 @@ impl Default for RouterConfig {
             epsilon: default_router_epsilon(),
             knn_min_records: default_router_knn_min_records(),
             knn_k: default_router_knn_k(),
-            automix: AutomixConfig::default(),
             models: Vec::new(),
         }
     }
@@ -191,7 +137,6 @@ impl Default for RouterConfig {
 
 impl RouterConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        self.automix.validate()?;
         for (name, weight) in [
             ("alpha", self.alpha),
             ("beta", self.beta),

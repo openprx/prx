@@ -18,12 +18,7 @@ impl Drop for Server {
 
 #[tokio::test]
 async fn every_auxiliary_purpose_retains_prepared_parameters_after_success_or_failure() -> anyhow::Result<()> {
-    for purpose in [
-        AuxiliaryPurpose::SignalVision,
-        AuxiliaryPurpose::SmartGroupClassifier,
-        #[cfg(feature = "llm-router")]
-        AuxiliaryPurpose::AutomixPremium,
-    ] {
+    for purpose in [AuxiliaryPurpose::SignalVision, AuxiliaryPurpose::SmartGroupClassifier] {
         for fails in [false, true] {
             let workspace = tempfile::tempdir()?;
             let (sender, receiver) = tokio::sync::oneshot::channel();

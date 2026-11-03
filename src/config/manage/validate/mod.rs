@@ -8,7 +8,7 @@
 //!   default model, each route's model, and each model fallback of a
 //!   primary the default or a route serves) and each `reliability.model_fallbacks` entry (on the
 //!   provider of the primary it falls back from); each `[[router.models]]`
-//!   candidate; the automix premium model and each task-routing
+//!   candidate; each task-routing
 //!   `model_hint`/`sub_agent_model` (a route hint or a model on the default
 //!   provider); the smart-group classifier;
 //! - embeddings: each `[[embedding_routes]]` destination and the memory
@@ -22,7 +22,7 @@
 //! every selection when it changes the operator's declarations
 //! (`[providers]`), and every selection that names a route (`hint:<x>`) when
 //! it changes the routes, since both are evidence the resolver reads. A
-//! task-routing hint or the automix premium tier that named a route the
+//! task-routing hint that named a route the
 //! change removes is refused too, not read as a raw model (D-080 N-1).
 //!
 //! Every affected selection is resolved through the one shared check
@@ -83,7 +83,7 @@ struct SelectionSite {
     provider: String,
     model: String,
     kind: SiteKind,
-    /// A task-routing hint or the automix premium tier: a route hint when a
+    /// A task-routing hint: a route hint when a
     /// route carries it, else a model on the default provider.
     routed: bool,
 }
@@ -113,7 +113,7 @@ impl SelectionSite {
     }
 }
 
-/// A model a task-routing rule or the automix premium tier names: a route
+/// A model a task-routing rule names: a route
 /// hint when a route carries it (the agent sends it as `hint:<x>`), a model
 /// on the default provider otherwise.
 fn routed_target(config: &Config, target: &str) -> (String, String) {
@@ -235,13 +235,6 @@ fn selections(config: &Config) -> Vec<SelectionSite> {
             &candidate.provider,
             &candidate.model_id,
             SiteKind::Chat,
-        ));
-    }
-    let premium = config.router.automix.premium_model_id.trim();
-    if !premium.is_empty() {
-        sites.push(SelectionSite::routed(
-            "automix premium model",
-            routed_target(config, premium),
         ));
     }
     for (index, rule) in config.task_routing.rules.iter().enumerate() {
@@ -805,7 +798,7 @@ mod tests {
     }
 
     /// RED before PMMDtail-f (D-078 T-3): fallbacks, router candidates, the
-    /// automix premium model, task routing and the smart-group classifier
+    /// task routing and the smart-group classifier
     /// are selections too.
     #[test]
     fn every_selection_bearing_field_is_checked() {
@@ -844,13 +837,6 @@ mod tests {
                 }),
             ),
             (
-                "automix premium model",
-                Box::new(|config: &mut Config| {
-                    config.default_provider = Some(ENDPOINT.into());
-                    config.router.automix.premium_model_id = "embed-only".into();
-                }),
-            ),
-            (
                 "sub_agent_model",
                 Box::new(|config: &mut Config| {
                     config.default_provider = Some(ENDPOINT.into());
@@ -882,7 +868,7 @@ mod tests {
     }
 
     /// RED before PMMDtail-g (D-080 N-1): removing the route a task-routing
-    /// `model_hint` (or the automix premium tier) names turned the hint into
+    /// `model_hint` names turned the hint into
     /// a raw model on the default provider, accepted as unverified. It is
     /// refused like every other selection that names the route.
     #[test]
@@ -893,7 +879,6 @@ mod tests {
             serde_json::from_value(serde_json::json!({"keywords": ["x"], "model_hint": "trx"}))
                 .expect("test: task routing rule"),
         );
-        current.router.automix.premium_model_id = "trx".into();
         let mut candidate = current.clone();
         candidate.model_routes.clear();
 
@@ -901,14 +886,12 @@ mod tests {
             .expect_err("test: the rule's route was removed");
 
         assert!(refusal.contains("task routing rule 0 model_hint refused"), "{refusal}");
-        assert!(refusal.contains("automix premium model refused"), "{refusal}");
         assert!(refusal.contains("hint:trx"), "{refusal}");
 
         // A rule that names a model, not a route, is not affected.
         let mut raw = current.clone();
         raw.model_routes.clear();
         raw.task_routing.rules.clear();
-        raw.router.automix.premium_model_id = String::new();
         raw.default_provider = Some("openrouter".into());
         let mut raw_candidate = raw.clone();
         raw_candidate.task_routing.rules.push(

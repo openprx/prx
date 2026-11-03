@@ -80,13 +80,18 @@ const REASON_ROLLOUT_RETIRED: &str = "read-only tool scheduling is no longer sta
 const REASON_NEVER_READ: &str = "this setting was never read: prx picks the tool-call wire form from the provider's \
                                  capabilities, so the value had no effect";
 
-/// Every configuration path removed by the unbounded-runtime work.
+/// Every retired runtime configuration path accepted during upgrade.
 ///
 /// Ordered by section so a reader can check it against a `config.toml` by eye.
 /// Adding an entry is what makes an upgrade survivable; removing one turns the
 /// key back into a hard "unknown configuration path" error, which is the right
 /// end state once no deployment can still be carrying it.
 pub(crate) const DEPRECATED_CONFIG_KEYS: &[DeprecatedKey] = &[
+    DeprecatedKey {
+        path: &["router", "automix"],
+        shape: DeprecatedShape::Section,
+        reason: "router.automix was removed in 0.8.171; the section is ignored",
+    },
     DeprecatedKey {
         path: &["agent", "max_tool_iterations"],
         shape: DeprecatedShape::Field,
@@ -254,6 +259,11 @@ pub(crate) fn strip_deprecated_keys(root: &mut toml::Value, config_path: Option<
             continue;
         }
         let dotted = key.path.join(".");
+        if key.path == ["router", "automix"] {
+            tracing::warn!("router.automix was removed in 0.8.171; the section is ignored");
+            stripped.push(dotted);
+            continue;
+        }
         let site = config_path.and_then(|path| locate(path, key));
         match site {
             Some(site) => tracing::warn!(

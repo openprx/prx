@@ -22,12 +22,12 @@ pub(crate) use schema::set_runtime_proxy_config;
 
 #[allow(unused_imports)]
 pub use schema::{
-    A2aConfig, AgentCompactionConfig, AgentCompactionMode, AgentConfig, AuditConfig, AuthConfig, AutomixConfig,
-    AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, ChannelsConfig, ChatConfig, ClassificationRule,
-    ComposioConfig, Config, CostConfig, CronConfig, DEFAULT_CHANNEL_EXCLUDED_TOOLS, DelegateAgentConfig, DiscordConfig,
-    DmPolicy, DockerRuntimeConfig, EMBEDDING_DEFAULT_UPGRADE_NOTICE, EmbeddingRouteConfig, FitnessConfig,
-    GatewayConfig, GroupPolicy, GroupReplyMode, HYBRID_PROCESS_MEMORY_UNAVAILABLE, HeartbeatConfig, HttpRequestConfig,
-    IMessageConfig, IdentityBindingConfig, IdentityConfig, LarkConfig, MatrixConfig, McpConfig, McpServerConfig,
+    A2aConfig, AgentCompactionConfig, AgentCompactionMode, AgentConfig, AuditConfig, AuthConfig, AutonomyConfig,
+    BrowserComputerUseConfig, BrowserConfig, ChannelsConfig, ChatConfig, ClassificationRule, ComposioConfig, Config,
+    CostConfig, CronConfig, DEFAULT_CHANNEL_EXCLUDED_TOOLS, DelegateAgentConfig, DiscordConfig, DmPolicy,
+    DockerRuntimeConfig, EMBEDDING_DEFAULT_UPGRADE_NOTICE, EmbeddingRouteConfig, FitnessConfig, GatewayConfig,
+    GroupPolicy, GroupReplyMode, HYBRID_PROCESS_MEMORY_UNAVAILABLE, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
+    IdentityBindingConfig, IdentityConfig, LarkConfig, MatrixConfig, McpConfig, McpServerConfig,
     McpServerRuntimeConfig, McpTransport, MediaConfig, MemoryConfig, MemoryEventsConfig, MemorySemanticConfig,
     MemoryWebhookConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, NodeServerConfig, NodesConfig,
     ObservabilityConfig, OllamaProviderConfig, OsPagingConfig, ProvidersConfig, ProxyConfig, ProxyScope,

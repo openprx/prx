@@ -1,6 +1,4 @@
 #[cfg(feature = "llm-router")]
-pub mod automix;
-#[cfg(feature = "llm-router")]
 pub mod capability;
 pub mod context;
 #[cfg(feature = "llm-router")]
@@ -524,10 +522,6 @@ impl RouterEngine {
         );
 
         result
-    }
-
-    pub const fn automix_config(&self) -> Option<&crate::config::AutomixConfig> {
-        Some(&self.config.automix)
     }
 
     pub fn model_cost_per_million_tokens(&self, model_id: &str) -> Option<f32> {
@@ -1054,7 +1048,6 @@ mod tests {
             epsilon: 0.1,
             knn_min_records: 10,
             knn_k: 7,
-            automix: crate::config::AutomixConfig::default(),
             models: vec![
                 RouterModelConfig {
                     model_id: "model-a".to_string(),
@@ -1367,7 +1360,6 @@ mod tests {
             epsilon: 0.1,
             knn_min_records: 10,
             knn_k: 7,
-            automix: crate::config::AutomixConfig::default(),
             models: vec![
                 RouterModelConfig {
                     model_id: "claude-sonnet".into(),
@@ -1635,7 +1627,6 @@ mod tests {
             epsilon: 0.1,
             knn_min_records: 10,
             knn_k: 7,
-            automix: crate::config::AutomixConfig::default(),
             models: vec![
                 RouterModelConfig {
                     model_id: "claude-sonnet".into(),
@@ -1692,12 +1683,6 @@ mod tests {
             epsilon: 0.3,
             knn_min_records: 10,
             knn_k: 7,
-            automix: crate::config::AutomixConfig {
-                confidence_threshold: 0.7,
-                cheap_model_tiers: vec!["cheap".into()],
-                premium_model_id: "openai/model-premium".into(),
-                ..Default::default()
-            },
             models: vec![
                 RouterModelConfig {
                     model_id: "model-cheap".into(),

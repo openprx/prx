@@ -201,7 +201,7 @@ fn nested_workspace_dir_creation() {
     assert!(nested_dir.exists(), "nested workspace dir should exist");
 }
 
-/// Full CLI JSON captured before the finding-103 schema moves.
+/// Full public CLI JSON, updated when an accepted config contract changes.
 #[test]
 fn config_schema_matches_the_pre_split_golden_snapshot() -> anyhow::Result<()> {
     let temp = tempfile::TempDir::new()?;
@@ -223,7 +223,7 @@ fn config_schema_matches_the_pre_split_golden_snapshot() -> anyhow::Result<()> {
     let expected: serde_json::Value = serde_json::from_str(include_str!("fixtures/config-schema.json"))?;
     assert_eq!(
         actual, expected,
-        "the full public CLI schema must survive the split unchanged"
+        "the full public CLI schema must match the checked-in contract"
     );
     Ok(())
 }

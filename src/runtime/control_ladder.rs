@@ -405,7 +405,6 @@ fn router_layer(config: &Config) -> ControlLayerTrace {
             "model_routes": config.model_routes.len(),
             "candidate_models": config.router.models.len(),
             "knn_enabled": true,
-            "automix_configured": !config.router.automix.premium_model_id.trim().is_empty(),
         }),
     }
 }

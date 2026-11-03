@@ -90,7 +90,7 @@ not create an attempt, serving attribution or usage settlement. All entrypoints,
 including terminal Chat, use this common finalizer. Nonempty parameter records
 are included in the terminal claim and replay authentication; empty records
 preserve the existing payload shape.
-Signal vision, smart-group classification and Automix premium calls retain their
+Signal vision and smart-group classification calls retain their
 own prepared values in the existing `provider.auxiliary.settled` receipt, including
 on failure. Their accounting owners use independent capture scopes; an outer
 turn cannot absorb an auxiliary call's records. The classifier's silence outcome

@@ -1,6 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use openprx::llm::route_decision::RouteDecision;
-use openprx::router::automix::ConfidenceChecker;
 
 fn bench_route_decision_single_candidate(c: &mut Criterion) {
     c.bench_function("route_decision_single_candidate_for_context", |b| {
@@ -21,16 +20,5 @@ fn bench_route_decision_single_candidate(c: &mut Criterion) {
     });
 }
 
-fn bench_confidence_rules(c: &mut Criterion) {
-    c.bench_function("router_confidence_rules_code_answer", |b| {
-        b.iter(|| {
-            ConfidenceChecker::check_rules(
-                "```rust\nfn main() { println!(\"ok\"); }\n```\nThis compiles.",
-                "Please fix this Rust code and explain why it works.",
-            )
-        });
-    });
-}
-
-criterion_group!(benches, bench_route_decision_single_candidate, bench_confidence_rules);
+criterion_group!(benches, bench_route_decision_single_candidate);
 criterion_main!(benches);

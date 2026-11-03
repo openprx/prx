@@ -535,12 +535,6 @@
       "$ref": "#/$defs/RouterConfig",
       "default": {
         "alpha": 0.0,
-        "automix": {
-          "cheap_model_tiers": [],
-          "confidence_threshold": 0.699999988079071,
-          "escalation_window_ms": 30000,
-          "premium_model_id": ""
-        },
         "beta": 0.5,
         "delta": 0.10000000149011612,
         "epsilon": 0.10000000149011612,
@@ -1016,38 +1010,6 @@
           "description": "Source path for Codex CLI auth.json import.",
           "type": "string",
           "default": "~/.codex/auth.json"
-        }
-      }
-    },
-    "AutomixConfig": {
-      "description": "Adaptive escalation policy for cheap-first routing.",
-      "type": "object",
-      "properties": {
-        "cheap_model_tiers": {
-          "description": "Tier markers that identify cheap-first models.",
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "confidence_threshold": {
-          "description": "Escalate when confidence falls below this threshold. Default: `0.7`.",
-          "type": "number",
-          "format": "float",
-          "default": 0.699999988079071
-        },
-        "escalation_window_ms": {
-          "description": "Premium escalation window after the cheap reply, including settlement.\nDefault: 30,000 ms; allowed range: 1..=120,000 ms.",
-          "type": "integer",
-          "format": "uint64",
-          "default": 30000,
-          "minimum": 0
-        },
-        "premium_model_id": {
-          "description": "Premium model target used for escalation.",
-          "type": "string",
-          "default": ""
         }
       }
     },
@@ -4799,16 +4761,6 @@
           "format": "float",
           "default": 0.0
         },
-        "automix": {
-          "description": "Cheap-first adaptive escalation policy.",
-          "$ref": "#/$defs/AutomixConfig",
-          "default": {
-            "cheap_model_tiers": [],
-            "confidence_threshold": 0.699999988079071,
-            "escalation_window_ms": 30000,
-            "premium_model_id": ""
-          }
-        },
         "beta": {
           "description": "Capability score weight.",
           "type": "number",
@@ -5682,7 +5634,7 @@
           "minimum": 0
         },
         "classifier_model": {
-          "description": "Model id for the Tier-2 classifier. When empty, the admitted channel\nroute's model is resolved. Set this to a cheap-tier model id (e.g. one listed in\n`router.automix.cheap_model_tiers`) to minimize cost.",
+          "description": "Model id for the Tier-2 classifier. When empty, the admitted channel\nroute's model is resolved. Set a lower-cost model id to minimize cost.",
           "type": "string",
           "default": ""
         },

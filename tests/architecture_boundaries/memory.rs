@@ -7,12 +7,10 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     // Architecture review Q73B/Q74: exact test-owned read-only ACL and generation-scoped Retrieve witnesses.
     "src/channels/tests/factory_reload_fixture.rs::run::let connection = rusqlite::Connection::open_with_flags(",
     "src/channels/tests/factory_reload_fixture.rs::run::let decisions = rusqlite::Connection::open_with_flags(tmp.path().join(\"self/causal_tree/decisions.db\"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).expect(\"durable decision evidence\");",
-    // Reviewed isolated paid Router/Automix test observers; exact callsites only.
+    // Reviewed isolated paid Router test observers; exact callsites only.
     "src/runtime/turn_decision/routing/tests/paid_embedding.rs::embedding::let database = Connection::open_with_flags(",
     "src/runtime/turn_decision/routing/tests/paid_embedding.rs::run::let db = Connection::open(workspace.path().join(\"memory/brain.db\")).unwrap();",
     "src/runtime/turn_decision/routing/tests/paid_embedding.rs::run::let decisions = Connection::open(workspace.path().join(\"self/causal_tree/decisions.db\")).unwrap();",
-    "src/agent/agent/automix_integration_tests.rs::verify_result_work::let database = rusqlite::Connection::open_with_flags(",
-    "src/agent/agent/automix_integration_tests.rs::run_dropped_premium_work::let database = rusqlite::Connection::open_with_flags(workspace.path().join(\"memory/brain.db\"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;",
     // Isolated child-process AUT: consistent snapshot and one copied completion tamper.
     "src/runtime/turn_decision/tests/child_process.rs::actual_parent_process_case::let logical_db = rusqlite::Connection::open(workspace.join(\"memory/brain.db\"))?;",
     "src/runtime/turn_decision/tests/child_process.rs::actual_parent_process_case::let copy = rusqlite::Connection::open(&copied_db)?;",

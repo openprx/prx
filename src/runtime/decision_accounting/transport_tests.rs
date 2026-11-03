@@ -660,38 +660,6 @@ async fn real_nested_responses_fallback_accounts_both_physical_sends() {
         .expect("actual nested endpoint fallback");
 }
 
-#[cfg(feature = "llm-router")]
-#[test]
-fn automix_window_shares_spend_balance_and_failed_settlement_after_decision_deadline() {
-    let cleanup = Arc::new(CleanupTracker::default());
-    let original_deadline = Instant::now();
-    let scope = AccountingScope::new(
-        Arc::new(Config::default()),
-        DecisionKey::ephemeral(),
-        cleanup,
-        [31; 32],
-        TurnBudgets {
-            tokens: 1024,
-            micro_usd: 5000,
-            latency_ms: 500,
-        },
-        original_deadline,
-    );
-    let premium_deadline = Instant::now() + Duration::from_secs(30);
-    let premium = scope.automix_window(premium_deadline);
-    let original = scope.remaining.get().expect("original balance initialized");
-    let continued = premium.remaining.get().expect("premium shares balance");
-    assert!(Arc::ptr_eq(original, continued));
-    original.tokens.store(512, Ordering::Release);
-    original.micro_usd.store(2300, Ordering::Release);
-    assert_eq!(premium.remaining_budgets().tokens, 512);
-    assert_eq!(premium.remaining_budgets().micro_usd, 2300);
-    assert_eq!(scope.deadline(), original_deadline);
-    assert_eq!(premium.deadline(), premium_deadline);
-    original.settlement_failed.store(true, Ordering::Release);
-    assert_eq!(premium.remaining_budgets().micro_usd, 0);
-}
-
 #[tokio::test]
 async fn recursive_parent_child_and_leaf_reservations_share_the_original_money() -> anyhow::Result<()> {
     use crate::runtime::turn_decision::recursive_allowance::RecursiveAllowance;

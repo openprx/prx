@@ -583,15 +583,6 @@ pub(crate) struct EmbeddedAgentSource {
     issued_input: Option<Arc<VerifiedEmbeddedInputMetadata>>,
 }
 impl EmbeddedAgentSource {
-    /// Resolve only the requested spelling returned by the source-bound PMM
-    /// auxiliary scope; the accounting service rechecks the selected binding.
-    #[cfg(feature = "llm-router")]
-    pub(crate) fn select_auxiliary_model(&self, provider: &str, model: &str) -> anyhow::Result<SelectedEmbeddedModel> {
-        let selected =
-            super::entry::resolve_agent_model_choice(&self.binding.generation.effective, Some(provider), Some(model))?;
-        self.binding.bind_selected_model(selected)
-    }
-
     #[cfg(feature = "llm-router")]
     pub(crate) fn input_metadata(&self) -> anyhow::Result<&VerifiedEmbeddedInputMetadata> {
         self.issued_input
@@ -710,79 +701,6 @@ impl EmbeddedAgentSource {
             fabric: self.fabric.clone(),
             issued_input: self.issued_input.clone(),
         }))
-    }
-
-    #[cfg(feature = "llm-router")]
-    pub(super) async fn record_automix_budget_refusal(&self, premium: &str) -> anyhow::Result<()> {
-        let scope = self.envelope.message_scope();
-        let summary = "premium attempt not dispatched: local admission not confirmed";
-        let payload = serde_json::json!({
-            "source_event_id": self.source_event_id(), "run_id": self.run_id(),
-            "reason": "admission_not_confirmed", "attempt_dispatched": false,
-            "premium_model": crate::providers::redact_endpoint_userinfo(premium),
-        });
-        let key = format!("turn:{}:automix-budget-refused", self.run_id());
-        let event = self
-            .fabric
-            .record_runtime_event_idempotent(
-                scope.clone(),
-                "router.automix.refused",
-                summary,
-                Some(serde_json::to_string(&payload)?),
-                key.clone(),
-            )
-            .await?;
-        if event.id <= 0 && !self.binding.generation.effective.causal_tree.enabled {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            event.id > 0
-                && !event.event_id.is_empty()
-                && event.workspace_id == self.workspace_id()
-                && event.owner_id == scope.owner_id
-                && event.source == scope.source
-                && event.channel == scope.channel
-                && event.sender == scope.sender
-                && event.recipient == scope.recipient
-                && event.session_key == scope.session_key
-                && event.run_id == scope.run_id
-                && event.parent_run_id == scope.parent_run_id
-                && event.parent_session_key == scope.parent_session_key
-                && event.agent_id == scope.agent_id
-                && event.persona_id == scope.persona_id
-                && event.attempt_id == scope.attempt_id
-                && event.lease_epoch == scope.lease_epoch
-                && event.subject == scope.subject
-                && event.causation_event_id == scope.causation_event_id
-                && event.goal_id == scope.goal_id
-                && event.correlation_id == scope.correlation_id
-                && event.config_generation_id == scope.config_generation_id
-                && event.config_source_revision == scope.config_source_revision
-                && event.visibility == scope.visibility
-                && event.role == "event"
-                && event.event_type == "router.automix.refused"
-                && event.content == format!("router.automix.refused {summary}")
-                && event.idempotency_key.as_deref() == Some(key.as_str())
-                && event
-                    .raw_payload_json
-                    .as_deref()
-                    .map(serde_json::from_str::<serde_json::Value>)
-                    .transpose()?
-                    .as_ref()
-                    == Some(&payload),
-            "automix refusal receipt conflicts with its source"
-        );
-        let stored = self
-            .binding
-            .memory
-            .find_owned_message_event(self.workspace_id(), self.owner_id(), &event.event_id)
-            .await?
-            .context("automix refusal receipt is not durable")?;
-        anyhow::ensure!(
-            serde_json::to_value(&stored)? == serde_json::to_value(&event)?,
-            "automix refusal readback differs from its receipt"
-        );
-        Ok(())
     }
 
     async fn record_admission_failure(&self, cancelled: bool) -> anyhow::Result<()> {
