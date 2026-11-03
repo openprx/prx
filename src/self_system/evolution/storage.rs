@@ -853,4 +853,33 @@ mod tests {
 
         retention_task.await.unwrap().unwrap();
     }
+    #[tokio::test]
+    async fn legacy_memory_and_policy_layer_rows_still_read() {
+        let dir = tempdir().unwrap();
+        let writer = AsyncJsonlWriter::new(
+            JsonlStoragePaths::new(dir.path().into()),
+            JsonlRetentionPolicy::default(),
+            1,
+        )
+        .await
+        .unwrap();
+        let folder = dir.path().join("evolution/hot");
+        std::fs::create_dir_all(&folder).unwrap();
+        let now = Utc::now();
+        let mut rows = String::new();
+        for layer in ["memory", "policy"] {
+            rows.push_str(&serde_json::json!({"experiment_id": layer, "timestamp": now.to_rfc3339(), "layer": layer,
+                "change_type": "update", "before_value": "a", "after_value": "b", "trigger_reason": "legacy",
+                "data_basis": {"sample_count": 1, "time_range_days": 1, "key_metrics": {}, "patterns_found": []}, "result": null}).to_string());
+            rows.push('\n');
+        }
+        std::fs::write(folder.join(format!("{}.jsonl", now.format("%Y-%m-%d"))), rows).unwrap();
+        let rows = writer
+            .read_evolution_since(now - chrono::Duration::days(1))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].layer, EvolutionLayer::Memory);
+        assert_eq!(rows[1].layer, EvolutionLayer::Policy);
+    }
 }

@@ -8,7 +8,40 @@ use crate::skills::lifecycle::{
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// A display name authenticated by an active binding's pinned revision.
+pub(crate) struct ManagedPromptTarget {
+    pub(crate) name: String,
+}
+
 impl SkillsLifecycleService {
+    /// Discover eligible prompts in the store's stable skill-id order.
+    pub(crate) fn managed_prompt_targets(&self) -> Result<Vec<ManagedPromptTarget>, ServiceError> {
+        self.require_enabled()?;
+        let (proposals, _) = self.store.list_proposals_lenient()?;
+        let patterns = self.store.active_patterns()?;
+        let mut targets = Vec::new();
+        for binding in self.store.list_active_bindings()? {
+            if !binding.enabled
+                || self.settings.suites.suite_for(&binding.skill_id).is_none()
+                || proposals
+                    .iter()
+                    .any(|p| p.skill_id == binding.skill_id && p.status.is_live())
+                || !patterns
+                    .iter()
+                    .any(|p| p.skill_id.as_ref() == Some(&binding.skill_id) && p.usable_for_proposal())
+            {
+                continue;
+            }
+            let revision =
+                self.store
+                    .pinned_revision_record(&binding.skill_id, &binding.revision_id, &binding.record_digest)?;
+            targets.push(ManagedPromptTarget {
+                name: revision.display_name,
+            });
+        }
+        Ok(targets)
+    }
+
     /// Retain terminal recording and the physical/cleanup owners across a
     /// dropped foreground call. Both ordinary evolution and M1 use this seam.
     pub(super) async fn owned_propose_revision(

@@ -2,17 +2,16 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use openprx::self_system::evolution::{
-    Actor, AsyncJsonlWriter, CandidatePriority, ChangeType, CircuitBreaker, CircuitBreakerState, CommitDecision,
-    DataBasis, DecisionLog, DecisionType, EngineCycleInput, EvolutionAnalyzer, EvolutionCandidate, EvolutionConfig,
-    EvolutionEngine, EvolutionLayer, EvolutionLog, EvolutionMode, EvolutionPipeline, EvolutionResult, EvolutionTrigger,
-    FileChange, JsonlRetentionPolicy, JsonlStoragePaths, MemoryAccessLog, MemoryAction, MemoryEvolutionEngine, Outcome,
-    RollbackManager, TaskType, with_trace,
+    Actor, AsyncJsonlWriter, ChangeType, CircuitBreaker, CircuitBreakerState, CommitDecision, DataBasis, DecisionLog,
+    DecisionType, EngineCycleInput, EvolutionAnalyzer, EvolutionConfig, EvolutionEngine, EvolutionLayer, EvolutionLog,
+    EvolutionMode, EvolutionPipeline, EvolutionResult, EvolutionTrigger, FileChange, JsonlRetentionPolicy,
+    JsonlStoragePaths, MemoryAccessLog, MemoryAction, Outcome, RollbackManager, TaskType, with_trace,
 };
 use openprx::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
     EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -68,11 +67,11 @@ async fn seed_three_day_digests(analyzer: &EvolutionAnalyzer, now: chrono::DateT
 async fn trace_id_end_to_end_pipeline_to_evolution_log() -> Result<()> {
     let dir = tempdir()?;
     let storage_root = dir.path().join("logs");
-    let cfg_path = dir.path().join("evolution_config.toml");
+    let target_path = dir.path().join("target.toml");
 
     let mut cfg = base_config(&storage_root);
     cfg.runtime.mode = EvolutionMode::Shadow;
-    tokio::fs::write(&cfg_path, toml::to_string_pretty(&cfg)?).await?;
+    tokio::fs::write(&target_path, toml::to_string_pretty(&cfg)?).await?;
 
     let writer = Arc::new(
         AsyncJsonlWriter::new(
@@ -98,12 +97,17 @@ async fn trace_id_end_to_end_pipeline_to_evolution_log() -> Result<()> {
     let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
     seed_three_day_digests(analyzer.as_ref(), now).await;
 
+    let shadow_mode = cfg.runtime.mode.is_draft_like();
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path)?;
+    let mut engine = ProposingEngine {
+        workspace: dir.path().into(),
+        target_path: target_path.clone(),
+        shadow_mode,
+    };
 
     let report = pipeline
-        .run_for_layer(EvolutionTrigger::Manual, EvolutionLayer::Memory, &mut engine, now)
+        .run_for_layer(EvolutionTrigger::Manual, EvolutionLayer::Prompt, &mut engine, now)
         .await?;
 
     assert!(report.selected_candidate.is_some());
@@ -121,11 +125,11 @@ async fn trace_id_end_to_end_pipeline_to_evolution_log() -> Result<()> {
 async fn record_analyze_evolve_closed_loop_produces_candidate() -> Result<()> {
     let dir = tempdir()?;
     let storage_root = dir.path().join("logs");
-    let cfg_path = dir.path().join("evolution_config.toml");
+    let target_path = dir.path().join("target.toml");
 
     let mut cfg = base_config(&storage_root);
     cfg.runtime.mode = EvolutionMode::Auto;
-    tokio::fs::write(&cfg_path, toml::to_string_pretty(&cfg)?).await?;
+    tokio::fs::write(&target_path, toml::to_string_pretty(&cfg)?).await?;
 
     let writer = Arc::new(
         AsyncJsonlWriter::new(
@@ -148,14 +152,19 @@ async fn record_analyze_evolve_closed_loop_produces_candidate() -> Result<()> {
     let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
     seed_three_day_digests(analyzer.as_ref(), Utc::now()).await;
 
+    let shadow_mode = cfg.runtime.mode.is_draft_like();
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path)?;
+    let mut engine = ProposingEngine {
+        workspace: dir.path().into(),
+        target_path: target_path.clone(),
+        shadow_mode,
+    };
 
     let report = pipeline
         .run_for_layer(
             EvolutionTrigger::Manual,
-            EvolutionLayer::Memory,
+            EvolutionLayer::Prompt,
             &mut engine,
             Utc::now(),
         )
@@ -169,12 +178,12 @@ async fn record_analyze_evolve_closed_loop_produces_candidate() -> Result<()> {
 async fn shadow_mode_generates_recommendation_without_applying_change() -> Result<()> {
     let dir = tempdir()?;
     let storage_root = dir.path().join("logs");
-    let cfg_path = dir.path().join("evolution_config.toml");
+    let target_path = dir.path().join("target.toml");
 
     let mut cfg = base_config(&storage_root);
     cfg.runtime.mode = EvolutionMode::Shadow;
     let original = toml::to_string_pretty(&cfg)?;
-    tokio::fs::write(&cfg_path, &original).await?;
+    tokio::fs::write(&target_path, &original).await?;
 
     let writer = Arc::new(
         AsyncJsonlWriter::new(
@@ -197,62 +206,28 @@ async fn shadow_mode_generates_recommendation_without_applying_change() -> Resul
     let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
     seed_three_day_digests(analyzer.as_ref(), Utc::now()).await;
 
+    let shadow_mode = cfg.runtime.mode.is_draft_like();
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path)?;
+    let mut engine = ProposingEngine {
+        workspace: dir.path().into(),
+        target_path: target_path.clone(),
+        shadow_mode,
+    };
 
     let report = pipeline
         .run_for_layer(
             EvolutionTrigger::Manual,
-            EvolutionLayer::Memory,
+            EvolutionLayer::Prompt,
             &mut engine,
             Utc::now(),
         )
         .await?;
 
-    let after = tokio::fs::read_to_string(&cfg_path).await?;
+    let after = tokio::fs::read_to_string(&target_path).await?;
     assert_eq!(after, original);
     assert!(report.shadow_mode);
     assert!(report.selected_candidate.is_some());
-    Ok(())
-}
-
-#[tokio::test]
-async fn gate_rejects_candidate_when_threshold_not_met() -> Result<()> {
-    let dir = tempdir()?;
-    let storage_root = dir.path().join("logs");
-    let cfg_path = dir.path().join("evolution_config.toml");
-
-    let mut cfg = base_config(&storage_root);
-    cfg.runtime.mode = EvolutionMode::Auto;
-    cfg.gate.min_improvement = 1.0;
-    tokio::fs::write(&cfg_path, toml::to_string_pretty(&cfg)?).await?;
-
-    let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path)?;
-
-    let mut target = BTreeMap::new();
-    target.insert("task_type".to_string(), "planning".to_string());
-    let result = engine
-        .run_cycle(EngineCycleInput {
-            cycle_id: "cycle-gate-reject".to_string(),
-            analyzer_candidates: vec![EvolutionCandidate {
-                target,
-                current_value: "failure_rate=0.6".to_string(),
-                suggested_value: "increase_validation".to_string(),
-                evidence_ids: vec!["trace-gate".to_string()],
-                priority: CandidatePriority::High,
-                backfill_after_days: 3,
-            }],
-            fitness_trend: None,
-        })
-        .await?;
-
-    assert!(matches!(result.cycle.outcome, CycleOutcome::Failed));
-    assert!(matches!(
-        result.evolution_log.as_ref().and_then(|v| v.result.clone()),
-        Some(EvolutionResult::Rejected)
-    ));
     Ok(())
 }
 
@@ -261,6 +236,7 @@ async fn gate_rejects_candidate_when_threshold_not_met() -> Result<()> {
 struct ProposingEngine {
     workspace: std::path::PathBuf,
     target_path: std::path::PathBuf,
+    shadow_mode: bool,
 }
 
 #[async_trait]
@@ -270,7 +246,7 @@ impl EvolutionEngine for ProposingEngine {
     }
 
     fn layer(&self) -> EvolutionLayer {
-        EvolutionLayer::Memory
+        EvolutionLayer::Prompt
     }
 
     async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<openprx::self_system::evolution::CycleResult> {
@@ -289,7 +265,7 @@ impl EvolutionEngine for ProposingEngine {
 
         Ok(openprx::self_system::evolution::CycleResult {
             review_data: None,
-            layer: EvolutionLayer::Memory,
+            layer: EvolutionLayer::Prompt,
             proposal: Some(proposal),
             cycle: EvolutionCycle {
                 id: input.cycle_id,
@@ -324,7 +300,7 @@ impl EvolutionEngine for ProposingEngine {
             evolution_log: Some(EvolutionLog {
                 experiment_id: "placeholder".to_string(),
                 timestamp: Utc::now().to_rfc3339(),
-                layer: EvolutionLayer::Memory,
+                layer: EvolutionLayer::Prompt,
                 change_type: ChangeType::Tune,
                 before_value: "value=1".to_string(),
                 after_value: "value=2".to_string(),
@@ -338,18 +314,22 @@ impl EvolutionEngine for ProposingEngine {
                 result: None,
             }),
             needs_human_approval: false,
-            shadow_mode: false,
-            pending: Some(Arc::new(FileChange::new(
-                self.workspace.clone(),
-                self.target_path.clone(),
-                "value = 99\n".to_string(),
-                RollbackManager::new(
-                    &self.workspace,
-                    &self.target_path,
-                    self.workspace.join(".evolution/rollback/memory"),
-                    5,
-                )?,
-            ))),
+            shadow_mode: self.shadow_mode,
+            pending: if self.shadow_mode {
+                None
+            } else {
+                Some(Arc::new(FileChange::new(
+                    self.workspace.clone(),
+                    self.target_path.clone(),
+                    "value = 99\n".to_string(),
+                    RollbackManager::new(
+                        &self.workspace,
+                        &self.target_path,
+                        self.workspace.join(".evolution/rollback/prompt"),
+                        5,
+                    )?,
+                )))
+            },
         })
     }
 }
@@ -390,12 +370,13 @@ async fn a_change_without_an_accepted_verdict_is_never_written() -> Result<()> {
     let mut engine = ProposingEngine {
         workspace: dir.path().to_path_buf(),
         target_path: target.clone(),
+        shadow_mode: false,
     };
 
     let report = pipeline
         .run_for_layer(
             EvolutionTrigger::Manual,
-            EvolutionLayer::Memory,
+            EvolutionLayer::Prompt,
             &mut engine,
             Utc::now(),
         )

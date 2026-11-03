@@ -176,6 +176,11 @@ impl CircuitBreaker {
         self.state.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) const fn failure_count(&self) -> u32 {
+        self.failures
+    }
+
     pub const fn record_failure(&mut self, now: DateTime<Utc>) {
         self.failures = self.failures.saturating_add(1);
         if self.failures >= self.threshold {
@@ -277,10 +282,10 @@ mod tests {
     #[test]
     fn layer_freeze_window_blocks_other_layers() {
         let mut breaker = CircuitBreaker::new(5, 24);
-        breaker.begin_layer_evaluation(EvolutionLayer::Memory);
-        assert!(breaker.can_mutate_layer(EvolutionLayer::Memory));
-        assert!(!breaker.can_mutate_layer(EvolutionLayer::Prompt));
-        breaker.end_layer_evaluation();
+        breaker.begin_layer_evaluation(EvolutionLayer::Prompt);
         assert!(breaker.can_mutate_layer(EvolutionLayer::Prompt));
+        assert!(!breaker.can_mutate_layer(EvolutionLayer::Tooling));
+        breaker.end_layer_evaluation();
+        assert!(breaker.can_mutate_layer(EvolutionLayer::Tooling));
     }
 }

@@ -3,8 +3,8 @@
 use crate::config::{Config, HotReloadManager, new_shared};
 use crate::self_system::evolution::{
     AsyncJsonlWriter, EvolutionAnalyzer, EvolutionConfig, EvolutionPipeline, EvolutionRetentionConfig,
-    EvolutionRuntimeConfig, EvolutionScheduler, JsonlRetentionPolicy, JsonlStoragePaths, MemoryEvolutionEngine,
-    PromptEvolutionEngine, StrategyEvolutionEngine, new_shared_evolution_config,
+    EvolutionRuntimeConfig, EvolutionScheduler, JsonlRetentionPolicy, JsonlStoragePaths, PromptEvolutionEngine,
+    new_shared_evolution_config,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -260,7 +260,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         fitness_ttl,
         Arc::clone(&initial_generation),
         Arc::new(|field| field == "self_system" || crate::config::generation::is_rebuild_and_swap(field)),
-        Arc::new(|_| true),
+        evolution_scheduler_enable_predicate(),
         {
             let shared = Arc::clone(&shared_config);
             let cleanup_owner = Arc::clone(&runtime_cleanup);
@@ -1462,8 +1462,16 @@ async fn wait_for_active_generation(
     }
 }
 
+const fn evolution_scheduler_enabled(config: &Config) -> bool {
+    config.skills_lifecycle.enabled
+}
+
+fn evolution_scheduler_enable_predicate() -> GenerationComponentEnabled {
+    Arc::new(evolution_scheduler_enabled)
+}
+
 async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionScheduler, u64)> {
-    let (cfg, cfg_path) = load_evolution_config(config).await?;
+    let (cfg, _cfg_path) = load_evolution_config(config).await?;
     tokio::fs::create_dir_all(&config.workspace_dir)
         .await
         .with_context(|| {
@@ -1474,7 +1482,7 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
         })?;
 
     #[cfg(feature = "wasm-plugins")]
-    let wasm_early_runtime = if config
+    let _wasm_early_runtime = if config
         .default_provider
         .as_deref()
         .is_some_and(|provider| provider.starts_with("wasm:"))
@@ -1518,29 +1526,7 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
     .with_judge_timeout(Duration::from_secs(config.self_system.evolution_judge_timeout_secs))
     .with_commit_tracker(crate::self_system::evolution::commit::daemon_commits().clone());
 
-    let evolution_memory: Arc<dyn crate::memory::Memory> =
-        Arc::from(crate::memory::create_memory_with_storage_and_routes_with_acl(
-            &config.memory,
-            &config.embedding_routes_with_references(),
-            Some(&config.storage.provider.config),
-            &config.workspace_dir,
-            crate::memory::EmbeddingRootCredential::from_config(&config),
-            &config.identity_bindings,
-            &config.user_policies,
-        )?);
-    #[cfg(feature = "wasm-plugins")]
-    if let Some(runtime) = wasm_early_runtime {
-        runtime
-            .attach_memory(Arc::clone(&evolution_memory))
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to attach WASM memory backend for evolution: {error}"))?;
-    }
-    let memory_engine = Box::new(
-        MemoryEvolutionEngine::new(shared.clone(), &cfg_path)
-            .with_context(|| format!("failed to initialize memory evolution engine: {}", cfg_path.display()))?
-            .with_memory(evolution_memory),
-    );
-    let mut prompt_engine = PromptEvolutionEngine::new(shared.clone(), &config.workspace_dir, Some(writer.clone()))
+    let mut prompt_engine = PromptEvolutionEngine::new(shared.clone(), &config.workspace_dir, Some(writer))
         .with_debug_raw(config.self_system.evolution_debug_raw)
         .with_lifecycle(crate::skills::lifecycle_runtime::open_service(
             &config.workspace_dir,
@@ -1558,20 +1544,12 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
         }
     }
     let prompt_engine = Box::new(prompt_engine);
-    let strategy_engine = Box::new(StrategyEvolutionEngine::new(
-        shared.clone(),
-        &config.workspace_dir,
-        writer,
-    )?);
-
     let scheduler = EvolutionScheduler::new(
         shared,
         analyzer,
         pipeline,
         config.workspace_dir.join(".evolution/scheduler_state.json"),
-        memory_engine,
         prompt_engine,
-        strategy_engine,
     );
 
     Ok((scheduler, u64::from(config.self_system.evolution_interval_hours.max(1))))
@@ -3187,5 +3165,42 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+    #[tokio::test]
+    async fn evolution_scheduler_is_disabled_without_the_skills_lifecycle() {
+        let name = "daemon-test-evolution-gate";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner: GenerationComponentRunner = {
+            let calls = calls.clone();
+            Arc::new(move |_, shutdown| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    crate::health::mark_component_ok(name);
+                    shutdown.cancelled().await;
+                    Ok(())
+                })
+            })
+        };
+        let enabled = evolution_scheduler_enable_predicate();
+        let mut config = Config::default();
+        config.skills_lifecycle.enabled = false;
+        let generation = crate::config::new_shared(config.clone()).pin();
+        let (handle, token) = start_generation_component(name, "test", 60, generation, &enabled, &runner)
+            .await
+            .unwrap();
+        assert!(handle.is_none());
+        assert!(token.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(crate::health::snapshot_json()["components"][name]["status"], "disabled");
+        config.skills_lifecycle.enabled = true;
+        config.skills_lifecycle.owner_scope = Some("owner:ws:cli:prx_user".into());
+        let generation = crate::config::new_shared(config).pin();
+        let (handle, token) = start_generation_component(name, "test", 60, generation, &enabled, &runner)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        token.unwrap().cancel();
+        handle.unwrap().await.unwrap().unwrap();
     }
 }

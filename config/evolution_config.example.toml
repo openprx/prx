@@ -2,7 +2,7 @@
 # Copy to workspace/evolution_config.toml and adjust as needed.
 
 [runtime]
-# Evolution mode: shadow (suggestions only) / auto (auto-execute)
+# Evolution mode: shadow (suggestions only) / auto (stage for lifecycle adoption)
 mode = "shadow"
 # Evolution log root directory (relative paths resolve against workspace_dir)
 storage_dir = "self/evolution"
@@ -25,22 +25,6 @@ memory_access = 800
 # Same-failure threshold (for degradation/circuit-breaker strategies)
 same_failure = 25
 
-[retrieval]
-# Sample size threshold to enable vector-enhanced retrieval
-vector_retrieval_threshold = 2000
-
-[retrieval.score_weights]
-# Memory retrieval score weight: recency
-recency = 0.3
-# Memory retrieval score weight: access frequency
-access_freq = 0.2
-# Memory retrieval score weight: category match
-category_weight = 0.15
-# Memory retrieval score weight: usefulness ratio
-useful_ratio = 0.2
-# Memory retrieval score weight: source confidence
-source_confidence = 0.15
-
 [gate]
 # Minimum improvement threshold (reject if average improvement is below this)
 min_improvement = 0.03
@@ -49,20 +33,8 @@ max_regression = -0.05
 # Maximum allowed token degradation ratio
 max_token_degradation = 0.10
 
-[memory]
-# L1 memory layer output token limit
-max_tokens = 2048
-
-[memory.retrieval_fusion]
-# L1 fusion weight: bm25
-bm25 = 0.4
-# L1 fusion weight: vector
-vector = 0.4
-# L1 fusion weight: metadata
-metadata = 0.2
-
 [prompt]
-# L2 mutable prompt files (relative to workspace)
+# Managed targets use skills/<name>/SKILL.md; empty selects an eligible lifecycle skill.
 mutable_files = []
 # L2 immutable prompt files (relative to workspace)
 immutable_files = []
@@ -77,12 +49,6 @@ blocked_keywords = [
   "ignore security",
   "remove guardrail",
 ]
-
-[strategy]
-# L3 strategy file path (relative to workspace)
-decision_policy_path = "decision_policy.toml"
-# L3 parameter mutation range (0.15 = ±15%)
-param_mutation_range = 0.15
 
 [rollback]
 # Max rollback snapshot versions

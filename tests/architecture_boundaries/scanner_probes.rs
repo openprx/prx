@@ -87,6 +87,10 @@ pub(super) const TEST_INCLUSIVE_TREE_SCANNERS: &[(&str, &str)] = &[
         "the Markdown contract reads README and CHANGELOG in full; negative controls restore feature claims and remove the operator breaking note",
     ),
     (
+        "removed_layers_have_no_files_or_memory_trash_calls",
+        "removed evolution files and memory trash calls are forbidden in test code as well as production",
+    ),
+    (
         "runtime_and_message_events_preserve_typed_config_generation_columns",
         "it requires column names to be present in the whole PostgreSQL adapter directory, tests included; it prohibits nothing, so there is no violation to plant",
     ),

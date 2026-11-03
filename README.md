@@ -14,7 +14,7 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 - **Xin (心) task engine** — autonomous heartbeat scheduler with 3 execution modes (Rust/LLM/Shell), 3 built-in maintenance tasks, durable Goal/Step execution, and SQLite persistence
 - **Web Console** — browser-based management interface (`console/`)
 - **Remote Nodes** — control macOS/Linux/Pi devices via `prx-node` agent
-- **Self-Evolution** — autonomous prompt/memory/strategy improvement with dedicated self-system scheduling
+- **Self-Evolution** — autonomous prompt improvement staged through the skills lifecycle
 - **Subagent Spawning** — ordinary fan-out without a global concurrency cap, config inheritance, and explicit bounded recursive grants; live runs listed and ended with `prx tasks`
 - **Extensive automated test suite** — unit, integration, PTY, gateway, migration, and security coverage
 

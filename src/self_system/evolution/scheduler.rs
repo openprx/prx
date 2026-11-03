@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 
+const SCHEDULED_LAYERS: [EvolutionLayer; 1] = [EvolutionLayer::Prompt];
+
 const DAILY_DIGEST_CRON: &str = "0 2 * * *";
 const EVOLUTION_CYCLE_CRON: &str = "0 3 */3 * *";
 
@@ -44,22 +46,17 @@ pub struct EvolutionScheduler {
     pipeline: EvolutionPipeline,
     state_path: PathBuf,
     circuit_breaker: CircuitBreaker,
-    memory_engine: Box<dyn EvolutionEngine>,
     prompt_engine: Box<dyn EvolutionEngine>,
-    strategy_engine: Box<dyn EvolutionEngine>,
 }
 
 impl EvolutionScheduler {
-    #[allow(clippy::too_many_arguments)]
-    /// Create a scheduler with dedicated engines for memory, prompt and policy layers.
+    /// Create a scheduler with the lifecycle prompt proposer.
     pub fn new(
         shared_config: SharedEvolutionConfig,
         analyzer: Arc<EvolutionAnalyzer>,
         pipeline: EvolutionPipeline,
         state_path: impl AsRef<Path>,
-        memory_engine: Box<dyn EvolutionEngine>,
         prompt_engine: Box<dyn EvolutionEngine>,
-        strategy_engine: Box<dyn EvolutionEngine>,
     ) -> Self {
         let cfg = shared_config.load_full();
         let breaker = CircuitBreaker::new(
@@ -73,9 +70,7 @@ impl EvolutionScheduler {
             pipeline,
             state_path: state_path.as_ref().to_path_buf(),
             circuit_breaker: breaker,
-            memory_engine,
             prompt_engine,
-            strategy_engine,
         }
     }
 
@@ -84,7 +79,7 @@ impl EvolutionScheduler {
         self.shared_config.load_full().runtime.retention.clone()
     }
 
-    /// Run daily digest and/or three-layer evolution cycle when schedules are due.
+    /// Run daily digest and/or prompt proposal cycle when schedules are due.
     pub async fn run_scheduled(&mut self, now: DateTime<Utc>) -> Result<SchedulerRunSummary> {
         let mut state = match self.load_state().await {
             Ok(s) => s,
@@ -111,7 +106,7 @@ impl EvolutionScheduler {
             state.next_cycle_at = Some(next_cycle(now)?.to_rfc3339());
 
             if self.circuit_breaker.can_execute(now) {
-                for layer in [EvolutionLayer::Memory, EvolutionLayer::Prompt, EvolutionLayer::Policy] {
+                for layer in SCHEDULED_LAYERS {
                     self.enter_freeze_window(layer.clone());
 
                     let mode = self.shared_config.load_full().runtime.mode.clone();
@@ -194,7 +189,7 @@ impl EvolutionScheduler {
 
     fn enter_freeze_window(&mut self, active_layer: EvolutionLayer) {
         self.circuit_breaker.begin_layer_evaluation(active_layer.clone());
-        for layer in [EvolutionLayer::Memory, EvolutionLayer::Prompt, EvolutionLayer::Policy] {
+        for layer in SCHEDULED_LAYERS {
             if layer != active_layer {
                 self.circuit_breaker.freeze_layer(layer);
             }
@@ -202,7 +197,7 @@ impl EvolutionScheduler {
     }
 
     fn exit_freeze_window(&mut self, active_layer: EvolutionLayer) {
-        for layer in [EvolutionLayer::Memory, EvolutionLayer::Prompt, EvolutionLayer::Policy] {
+        for layer in SCHEDULED_LAYERS {
             if layer != active_layer {
                 self.circuit_breaker.unfreeze_layer(layer);
             }
@@ -212,19 +207,9 @@ impl EvolutionScheduler {
 
     async fn run_layer(&mut self, layer: EvolutionLayer, now: DateTime<Utc>) -> Result<PipelineRunReport> {
         match layer {
-            EvolutionLayer::Memory => {
-                self.pipeline
-                    .run_for_layer(EvolutionTrigger::CronTick, layer, self.memory_engine.as_mut(), now)
-                    .await
-            }
             EvolutionLayer::Prompt => {
                 self.pipeline
                     .run_for_layer(EvolutionTrigger::CronTick, layer, self.prompt_engine.as_mut(), now)
-                    .await
-            }
-            EvolutionLayer::Policy => {
-                self.pipeline
-                    .run_for_layer(EvolutionTrigger::CronTick, layer, self.strategy_engine.as_mut(), now)
                     .await
             }
             _ => bail!("unsupported evolution layer for scheduler run: {:?}", layer),
@@ -314,7 +299,7 @@ fn parse_ts(raw: &str) -> Option<DateTime<Utc>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode, new_shared_evolution_config};
     use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput};
@@ -518,9 +503,7 @@ mod tests {
             analyzer,
             pipeline,
             dir.path().join("scheduler_state.json"),
-            Box::new(DraftEngine(EvolutionLayer::Memory)),
             Box::new(DraftEngine(EvolutionLayer::Prompt)),
-            Box::new(DraftEngine(EvolutionLayer::Policy)),
         );
         let state = SchedulerState {
             next_cycle_at: Some((now - Duration::minutes(1)).to_rfc3339()),
@@ -614,9 +597,7 @@ mod tests {
             analyzer,
             pipeline,
             dir.path().join("scheduler_state.json"),
-            Box::new(NoopEngine(EvolutionLayer::Memory)),
             Box::new(NoopEngine(EvolutionLayer::Prompt)),
-            Box::new(NoopEngine(EvolutionLayer::Policy)),
         );
 
         let mut state = SchedulerState::default();
@@ -654,5 +635,232 @@ mod tests {
         assert!(state.next_digest_at.is_none());
         assert!(state.last_cycle_at.is_none());
         assert!(state.next_cycle_at.is_none());
+    }
+    #[derive(Default)]
+    pub(crate) struct CountingJudge {
+        pub(crate) calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl crate::self_system::evolution::judge::JudgeScoringModel for CountingJudge {
+        async fn score(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::self_system::evolution::judge::JudgeConfig,
+        ) -> Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(r#"{"task_completion":0.9,"correctness":0.9,"efficiency":0.9,"safety_compliance":0.9,"reasoning":"verified"}"#.into())
+        }
+    }
+
+    pub(crate) async fn seeded_analysis(dir: &Path) -> (Arc<AsyncJsonlWriter>, Arc<EvolutionAnalyzer>) {
+        seeded_analysis_at(dir, Utc::now()).await
+    }
+
+    async fn seeded_analysis_at(dir: &Path, now: DateTime<Utc>) -> (Arc<AsyncJsonlWriter>, Arc<EvolutionAnalyzer>) {
+        let logs = dir.join("logs");
+        let writer = Arc::new(
+            AsyncJsonlWriter::new(JsonlStoragePaths::new(logs), JsonlRetentionPolicy::default(), 1)
+                .await
+                .unwrap(),
+        );
+        writer
+            .append_memory_access(&crate::self_system::evolution::record::MemoryAccessLog {
+                timestamp: now.to_rfc3339(),
+                experiment_id: "seed".into(),
+                trace_id: "seed".into(),
+                action: MemoryAction::Read,
+                memory_id: "m1".into(),
+                task_context: "ctx".into(),
+                task_type: TaskType::ToolCall,
+                actor: Actor::Agent,
+                was_useful: Some(true),
+                useful_annotation_source: Some(AnnotationSource::AutoEvaluator),
+                annotation_confidence: Some(0.8),
+                tokens_consumed: 1,
+            })
+            .await
+            .unwrap();
+        writer
+            .append_decision(&crate::self_system::evolution::record::DecisionLog {
+                timestamp: now.to_rfc3339(),
+                experiment_id: "seed".into(),
+                trace_id: "seed".into(),
+                decision_type: crate::self_system::evolution::record::DecisionType::ToolSelection,
+                task_type: TaskType::ToolCall,
+                risk_level: 1,
+                actor: Actor::Agent,
+                input_context: "ctx".into(),
+                action_taken: "act".into(),
+                outcome: Outcome::Success,
+                tokens_used: 1,
+                latency_ms: 1,
+                user_correction: None,
+                config_snapshot_hash: "cfg".into(),
+            })
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.join("analysis")));
+        for days in [2, 1, 0] {
+            analyzer
+                .generate_daily_digest(now - Duration::days(days))
+                .await
+                .unwrap();
+        }
+        (writer, analyzer)
+    }
+
+    pub(crate) async fn prompt_scheduler(
+        dir: &Path,
+        shared: SharedEvolutionConfig,
+        engine: Box<dyn EvolutionEngine>,
+    ) -> EvolutionScheduler {
+        let (writer, analyzer) = seeded_analysis(dir).await;
+        let pipeline = EvolutionPipeline::with_judge_model(
+            shared.clone(),
+            analyzer.clone(),
+            writer,
+            dir,
+            Arc::new(CountingJudge::default()),
+        );
+        EvolutionScheduler::new(shared, analyzer, pipeline, dir.join("scheduler_state.json"), engine)
+    }
+
+    pub(crate) async fn due_cycle(
+        scheduler: &mut EvolutionScheduler,
+        dir: &Path,
+        now: DateTime<Utc>,
+    ) -> SchedulerRunSummary {
+        // Fresh evidence follows the scheduler's simulated time. Lifecycle
+        // evidence and proposal persistence still use the real store clock.
+        let _ = seeded_analysis_at(dir, now).await;
+        let state = SchedulerState {
+            next_cycle_at: Some((now - Duration::minutes(1)).to_rfc3339()),
+            next_digest_at: Some((now + Duration::days(1)).to_rfc3339()),
+            ..Default::default()
+        };
+        fs::write(dir.join("scheduler_state.json"), serde_json::to_vec(&state).unwrap())
+            .await
+            .unwrap();
+        scheduler.run_scheduled(now).await.unwrap()
+    }
+
+    pub(crate) async fn next_due_time(dir: &Path) -> DateTime<Utc> {
+        let state: SchedulerState =
+            serde_json::from_slice(&fs::read(dir.join("scheduler_state.json")).await.unwrap()).unwrap();
+        DateTime::parse_from_rfc3339(state.next_cycle_at.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc)
+            + Duration::seconds(1)
+    }
+
+    #[tokio::test]
+    async fn scheduler_runs_only_the_prompt_layer_and_leaves_legacy_targets_alone() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("decision_policy.toml"), "legacy policy")
+            .await
+            .unwrap();
+        fs::write(dir.path().join("evolution_config.toml"), "legacy config")
+            .await
+            .unwrap();
+        let mut scheduler = prompt_scheduler(
+            dir.path(),
+            new_shared_evolution_config(EvolutionConfig::default()),
+            Box::new(NoopEngine(EvolutionLayer::Prompt)),
+        )
+        .await;
+        let summary = due_cycle(&mut scheduler, dir.path(), Utc::now()).await;
+        assert_eq!(summary.layer_reports.len(), 1);
+        assert_eq!(summary.layer_reports.first().unwrap().layer, EvolutionLayer::Prompt);
+        assert!(summary.layer_reports.first().unwrap().selected_candidate.is_some());
+        assert_eq!(
+            fs::read(dir.path().join("decision_policy.toml")).await.unwrap(),
+            b"legacy policy"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("evolution_config.toml")).await.unwrap(),
+            b"legacy config"
+        );
+    }
+
+    async fn no_target_cycles(skills: &[(&str, bool)]) {
+        struct CountedEngine {
+            inner: crate::self_system::evolution::PromptEvolutionEngine,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl EvolutionEngine for CountedEngine {
+            fn name(&self) -> &'static str {
+                "counted_managed_proposer"
+            }
+            fn layer(&self) -> EvolutionLayer {
+                EvolutionLayer::Prompt
+            }
+            async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.run_cycle(input).await
+            }
+        }
+        let dir = tempdir().unwrap();
+        let service = crate::skills::lifecycle::test_support::managed_prompt_fixture(dir.path(), skills);
+        let model = crate::skills::lifecycle::test_support::ManagedPromptModel::new("Verify the result.");
+        let shared = new_shared_evolution_config(EvolutionConfig::default());
+        let engine = crate::self_system::evolution::PromptEvolutionEngine::new(shared.clone(), dir.path(), None)
+            .with_lifecycle(Some(service.clone()))
+            .with_proposer(model.clone());
+        let (writer, analyzer) = seeded_analysis(dir.path()).await;
+        let judge = Arc::new(CountingJudge::default());
+        let pipeline = EvolutionPipeline::with_judge_model(
+            shared.clone(),
+            analyzer.clone(),
+            writer.clone(),
+            dir.path(),
+            judge.clone(),
+        );
+        let engine_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = CountedEngine {
+            inner: engine,
+            calls: engine_calls.clone(),
+        };
+        let mut scheduler = EvolutionScheduler::new(
+            shared,
+            analyzer,
+            pipeline,
+            dir.path().join("scheduler_state.json"),
+            Box::new(engine),
+        );
+        let mut now = Utc::now();
+        let since = now - Duration::days(1);
+        for _ in 0..6 {
+            // Advance beyond the actual checkpoint chosen by the scheduler.
+            let summary = due_cycle(&mut scheduler, dir.path(), now).await;
+            now = next_due_time(dir.path()).await;
+            assert_eq!(summary.layer_reports.len(), 1);
+            let report = &summary.layer_reports.first().unwrap();
+            assert_eq!(report.commit, CommitDecision::NothingProposed);
+            assert_eq!(report.judge_outcome, JudgeOutcome::NotRun);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(
+                scheduler.circuit_breaker.state(),
+                super::super::rollback::CircuitBreakerState::Closed
+            );
+            assert_eq!(scheduler.circuit_breaker.failure_count(), 0);
+        }
+        assert_eq!(engine_calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+        assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(judge.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(service.list_proposals(None).unwrap().len(), 0);
+        assert!(writer.read_evolution_since(since).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_managed_target_never_trips_the_breaker() {
+        no_target_cycles(&[]).await;
+    }
+
+    #[tokio::test]
+    async fn skills_without_usable_evidence_never_trip_the_breaker() {
+        no_target_cycles(&[("a", false), ("b", false)]).await;
     }
 }

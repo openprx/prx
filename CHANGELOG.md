@@ -135,6 +135,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Versioned disables and unversioned disables alongside modern settings
   remain explicit, and loading does not rewrite files.
 
+- **BREAKING (operators):** Evolution now proposes prompt revisions exclusively
+  through the skills lifecycle. Strategy and memory evolution layers are removed.
+  In `evolution_config.toml`, `strategy.*`, `memory.max_tokens`,
+  `memory.retrieval_fusion.*`, `retrieval.*` and non-skill `prompt.mutable_files`
+  entries are ignored with a WARN on each load. Evolution no longer trashes
+  memories or writes workspace files directly. The scheduler runs only with
+  `[skills_lifecycle]` enabled; an eligible managed target needs usable evidence.
+  Manual triggers default to L2; `prx evolution trigger --layer L1/L3` is removed.
+  Existing stored history and proposal drafts remain readable. The main config
+  schema is unchanged. Rollback: revert this change; existing target files and
+  legacy rollback directories remain on disk.
+
 ## [0.8.171] - 2026-10-31
 
 ### Added

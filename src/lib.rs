@@ -836,7 +836,7 @@ pub enum EvolutionCommands {
     Config,
     /// Manually trigger one evolution cycle
     Trigger {
-        /// Layer choice: L1 (memory), L2 (prompt), L3 (strategy/policy)
+        /// Layer choice: L2 (managed prompt proposal, default); L1 and L3 were removed
         #[arg(long, value_enum)]
         layer: Option<EvolutionLayerArg>,
     },
@@ -866,10 +866,13 @@ pub enum FitnessCommands {
 /// Evolution layer selected by the CLI.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, clap::ValueEnum, Serialize, Deserialize)]
 pub enum EvolutionLayerArg {
+    /// Removed memory layer; retained to return an explicit migration error.
     #[value(name = "L1")]
     L1,
+    /// Managed prompt proposals through the skills lifecycle.
     #[value(name = "L2")]
     L2,
+    /// Removed strategy layer; retained to return an explicit migration error.
     #[value(name = "L3")]
     L3,
 }

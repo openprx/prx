@@ -391,7 +391,7 @@ impl EvolutionPipeline {
             });
         }
         let envelope = crate::runtime::evolution_model::EvolutionEnvelope::new(experiment_id.clone());
-        let cycle_result = envelope
+        let cycle_result = match envelope
             .scope(engine.run_cycle_with_cancellation(
                 EngineCycleInput {
                     cycle_id: experiment_id.clone(),
@@ -400,7 +400,33 @@ impl EvolutionPipeline {
                 },
                 &cancel,
             ))
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error)
+                if error
+                    .downcast_ref::<super::prompt_evolution::NoManagedTarget>()
+                    .is_some() =>
+            {
+                return Ok(PipelineRunReport {
+                    experiment_id,
+                    layer,
+                    trigger,
+                    digest,
+                    trend,
+                    selected_candidate: None,
+                    gate_rejections,
+                    judge_result: None,
+                    evolution_log: None,
+                    shadow_mode: self.shared_config.load_full().runtime.mode.is_proposal_only(),
+                    commit: CommitDecision::NothingProposed,
+                    gate_denied: false,
+                    judge_outcome: JudgeOutcome::NotRun,
+                    errors,
+                });
+            }
+            Err(error) => return Err(error),
+        };
 
         let mut evolution_log = cycle_result.evolution_log.clone().unwrap_or_else(|| {
             build_log(
@@ -1158,13 +1184,13 @@ mod tests {
         }
 
         fn layer(&self) -> EvolutionLayer {
-            EvolutionLayer::Memory
+            EvolutionLayer::Prompt
         }
 
         async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
             Ok(CycleResult {
                 review_data: None,
-                layer: EvolutionLayer::Memory,
+                layer: EvolutionLayer::Prompt,
                 proposal: Some(EvolutionProposal {
                     id: input.cycle_id.clone(),
                     summary: "mock proposal".to_string(),
@@ -1232,7 +1258,7 @@ mod tests {
         }
 
         fn layer(&self) -> EvolutionLayer {
-            EvolutionLayer::Memory
+            EvolutionLayer::Prompt
         }
 
         async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
@@ -1337,7 +1363,7 @@ mod tests {
         };
 
         let report = pipeline
-            .run_for_layer(EvolutionTrigger::CronTick, EvolutionLayer::Memory, &mut engine, now)
+            .run_for_layer(EvolutionTrigger::CronTick, EvolutionLayer::Prompt, &mut engine, now)
             .await
             .unwrap();
 
@@ -1409,7 +1435,7 @@ mod tests {
         }
 
         fn layer(&self) -> EvolutionLayer {
-            EvolutionLayer::Memory
+            EvolutionLayer::Prompt
         }
 
         async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
@@ -1556,7 +1582,7 @@ mod tests {
         let report = pipeline
             .run_for_layer(
                 EvolutionTrigger::Manual,
-                EvolutionLayer::Memory,
+                EvolutionLayer::Prompt,
                 &mut engine,
                 Utc::now(),
             )
@@ -1660,7 +1686,7 @@ mod tests {
         let report = pipeline
             .run_for_layer(
                 EvolutionTrigger::Manual,
-                EvolutionLayer::Memory,
+                EvolutionLayer::Prompt,
                 &mut engine,
                 Utc::now(),
             )
@@ -1735,7 +1761,7 @@ mod tests {
         let pipeline = auto_pipeline(dir, Some(Arc::new(HangingJudge))).await;
         tokio::time::timeout(
             std::time::Duration::from_hours(1),
-            pipeline.run_for_layer(EvolutionTrigger::Manual, EvolutionLayer::Memory, engine, Utc::now()),
+            pipeline.run_for_layer(EvolutionTrigger::Manual, EvolutionLayer::Prompt, engine, Utc::now()),
         )
         .await
         .unwrap_or_else(|_| {
@@ -1802,7 +1828,7 @@ mod tests {
         {
             let run = pipeline.run_for_layer(
                 EvolutionTrigger::Manual,
-                EvolutionLayer::Memory,
+                EvolutionLayer::Prompt,
                 &mut engine,
                 Utc::now(),
             );
@@ -1867,61 +1893,73 @@ mod tests {
         }
     }
 
-    /// Point the pipeline's prompt layer at `p.md` holding [`PROMPT_ORIGINAL`].
-    async fn prompt_layer(
-        dir: &Path,
-        pipeline: &EvolutionPipeline,
-    ) -> crate::self_system::evolution::PromptEvolutionEngine {
-        fs::write(dir.join("p.md"), PROMPT_ORIGINAL).await.unwrap();
-        let mut cfg = (*pipeline.shared_config.load_full()).clone();
-        cfg.prompt.mutable_files = vec!["p.md".to_string()];
-        // The analyzer's candidate asks for a rewrite (severity 4); let it
-        // through without human approval.
-        cfg.prompt.human_approval_severity = 4;
-        pipeline.shared_config.store(Arc::new(cfg));
-        crate::self_system::evolution::PromptEvolutionEngine::new(Arc::clone(&pipeline.shared_config), dir, None)
-            .with_proposer(crate::self_system::evolution::prompt_evolution::test_proposer())
+    /// The generic commit contract stays covered independently of production
+    /// prompt evolution, which only stages lifecycle proposals.
+    struct TestFileEngine {
+        workspace: PathBuf,
+        target: PathBuf,
+        before: String,
     }
 
-    /// Point the pipeline's strategy layer at `decision_policy.toml`.
-    async fn strategy_layer(
-        dir: &Path,
-        pipeline: &EvolutionPipeline,
-    ) -> crate::self_system::evolution::StrategyEvolutionEngine {
+    #[async_trait]
+    impl EvolutionEngine for TestFileEngine {
+        fn name(&self) -> &'static str {
+            "test_file"
+        }
+        fn layer(&self) -> EvolutionLayer {
+            EvolutionLayer::Prompt
+        }
+        async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
+            let after = format!("{}\nVerify the result before reporting completion.\n", self.before);
+            let mut result = MockEngine.run_cycle(input).await?;
+            if let Some(proposal) = result.proposal.as_mut() {
+                proposal.target = crate::self_system::evolution::ChangeTarget::WorkspaceFile {
+                    path: self
+                        .target
+                        .strip_prefix(&self.workspace)?
+                        .to_string_lossy()
+                        .into_owned(),
+                };
+                proposal.operation = crate::self_system::evolution::ChangeOperation::Write { content: after.clone() };
+            }
+            result.review_data = Some(super::super::engine::ReviewData::new(serde_json::to_string(
+                &serde_json::json!({
+                    "before": self.before, "after": after, "provenance": "input_sha256=fixture"
+                }),
+            )?));
+            result.pending = Some(Arc::new(super::super::engine::FileChange::new(
+                self.workspace.clone(),
+                self.target.clone(),
+                after,
+                super::super::rollback::RollbackManager::new(
+                    &self.workspace,
+                    &self.target,
+                    self.workspace.join(".evolution/rollback/prompt"),
+                    10,
+                )?,
+            )));
+            Ok(result)
+        }
+    }
+
+    async fn pending_prompt_file(dir: &Path, _pipeline: &EvolutionPipeline) -> TestFileEngine {
+        fs::write(dir.join("p.md"), PROMPT_ORIGINAL).await.unwrap();
+        TestFileEngine {
+            workspace: dir.into(),
+            target: dir.join("p.md"),
+            before: PROMPT_ORIGINAL.into(),
+        }
+    }
+
+    async fn pending_legacy_policy_file(dir: &Path, _pipeline: &EvolutionPipeline) -> TestFileEngine {
         fs::write(dir.join("decision_policy.toml"), POLICY_ORIGINAL)
             .await
             .unwrap();
-        // Failed decisions give the strategy gate an improvement to aim for,
-        // so the engine proposes a real change.
-        for index in 0..4 {
-            pipeline
-                .writer
-                .append_decision(&crate::self_system::evolution::record::DecisionLog {
-                    timestamp: Utc::now().to_rfc3339(),
-                    experiment_id: format!("exp-fail-{index}"),
-                    trace_id: format!("trace-fail-{index}"),
-                    decision_type: DecisionType::ToolSelection,
-                    task_type: TaskType::ToolCall,
-                    risk_level: 1,
-                    actor: Actor::Agent,
-                    input_context: "ctx".to_string(),
-                    action_taken: "act".to_string(),
-                    outcome: Outcome::Failure,
-                    tokens_used: 1,
-                    latency_ms: 1,
-                    user_correction: None,
-                    config_snapshot_hash: "cfg".to_string(),
-                })
-                .await
-                .unwrap();
+        TestFileEngine {
+            workspace: dir.into(),
+            target: dir.join("decision_policy.toml"),
+            before: POLICY_ORIGINAL.into(),
         }
-        pipeline.writer.flush().await.unwrap();
-        crate::self_system::evolution::StrategyEvolutionEngine::new(
-            Arc::clone(&pipeline.shared_config),
-            dir,
-            Arc::clone(&pipeline.writer),
-        )
-        .unwrap()
     }
 
     fn snapshot_judge(
@@ -1939,14 +1977,14 @@ mod tests {
         )
     }
 
-    /// D-046: the prompt layer's change is not on disk while the judge
+    /// D-046: a generic pending prompt-file change is not on disk while the judge
     /// decides, and a judge that gives no verdict leaves it unwritten.
     #[tokio::test]
-    async fn the_prompt_layer_writes_nothing_before_the_verdict() {
+    async fn generic_prompt_file_change_writes_nothing_before_the_verdict() {
         let dir = tempdir().unwrap();
         let (judge, seen) = snapshot_judge(dir.path().join("p.md"), None);
         let pipeline = auto_pipeline(dir.path(), Some(judge)).await;
-        let mut engine = prompt_layer(dir.path(), &pipeline).await;
+        let mut engine = pending_prompt_file(dir.path(), &pipeline).await;
         let report = pipeline
             .run_for_layer(
                 EvolutionTrigger::Manual,
@@ -1968,13 +2006,13 @@ mod tests {
         );
     }
 
-    /// D-046: an accepted verdict is what writes the prompt change.
+    /// D-046: an accepted verdict is what writes a generic pending file change.
     #[tokio::test]
-    async fn the_prompt_layer_writes_after_an_accepted_verdict() {
+    async fn generic_prompt_file_change_writes_after_an_accepted_verdict() {
         let dir = tempdir().unwrap();
         let (judge, seen) = snapshot_judge(dir.path().join("p.md"), Some(0.9));
         let pipeline = auto_pipeline(dir.path(), Some(judge)).await;
-        let mut engine = prompt_layer(dir.path(), &pipeline).await;
+        let mut engine = pending_prompt_file(dir.path(), &pipeline).await;
         let report = pipeline
             .run_for_layer(
                 EvolutionTrigger::Manual,
@@ -1993,18 +2031,18 @@ mod tests {
         );
     }
 
-    /// D-046: the strategy layer's change is not on disk while the judge
+    /// D-046: a generic pending legacy-policy file is not on disk while the judge
     /// decides.
     #[tokio::test]
-    async fn the_strategy_layer_writes_nothing_before_the_verdict() {
+    async fn generic_file_change_writes_nothing_before_the_verdict() {
         let dir = tempdir().unwrap();
         let (judge, seen) = snapshot_judge(dir.path().join("decision_policy.toml"), None);
         let pipeline = auto_pipeline(dir.path(), Some(judge)).await;
-        let mut engine = strategy_layer(dir.path(), &pipeline).await;
+        let mut engine = pending_legacy_policy_file(dir.path(), &pipeline).await;
         let report = pipeline
             .run_for_layer(
                 EvolutionTrigger::Manual,
-                EvolutionLayer::Policy,
+                EvolutionLayer::Prompt,
                 &mut engine,
                 Utc::now(),
             )
@@ -2032,7 +2070,7 @@ mod tests {
             let dir = tempdir().unwrap();
             let (judge, _seen) = snapshot_judge(dir.path().join("p.md"), reply);
             let pipeline = auto_pipeline_batched(dir.path(), Some(judge), 64).await;
-            let mut engine = prompt_layer(dir.path(), &pipeline).await;
+            let mut engine = pending_prompt_file(dir.path(), &pipeline).await;
             let report = pipeline
                 .run_for_layer(
                     EvolutionTrigger::Manual,
@@ -2064,7 +2102,7 @@ mod tests {
             64,
         )
         .await;
-        let mut engine = prompt_layer(dir.path(), &pipeline).await;
+        let mut engine = pending_prompt_file(dir.path(), &pipeline).await;
         {
             let run = pipeline.run_for_layer(
                 EvolutionTrigger::Manual,
@@ -2141,7 +2179,7 @@ mod tests {
                 )
                 .await
                 .with_commit_tracker(commits.clone());
-                let mut engine = prompt_layer(&root, &pipeline).await;
+                let mut engine = pending_prompt_file(&root, &pipeline).await;
                 let token = CancellationToken::new();
                 let worker_token = token.clone();
                 let worker = tokio::spawn(async move {
@@ -2211,7 +2249,7 @@ mod tests {
         }
 
         fn layer(&self) -> EvolutionLayer {
-            EvolutionLayer::Memory
+            EvolutionLayer::Prompt
         }
 
         async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
@@ -2255,7 +2293,7 @@ mod tests {
                         let _ = pipeline
                             .run_for_layer(
                                 EvolutionTrigger::CronTick,
-                                EvolutionLayer::Memory,
+                                EvolutionLayer::Prompt,
                                 &mut engine,
                                 Utc::now(),
                             )
@@ -2300,7 +2338,7 @@ mod tests {
         };
         let run = pipeline.run_for_layer(
             EvolutionTrigger::Manual,
-            EvolutionLayer::Memory,
+            EvolutionLayer::Prompt,
             &mut engine,
             Utc::now(),
         );
@@ -2353,7 +2391,7 @@ mod tests {
         };
         let run = pipeline.run_for_layer(
             EvolutionTrigger::Manual,
-            EvolutionLayer::Memory,
+            EvolutionLayer::Prompt,
             &mut engine,
             Utc::now(),
         );
@@ -2420,7 +2458,7 @@ mod tests {
                         let _ = pipeline_a
                             .run_for_layer(
                                 EvolutionTrigger::CronTick,
-                                EvolutionLayer::Memory,
+                                EvolutionLayer::Prompt,
                                 &mut engine_a,
                                 Utc::now(),
                             )
@@ -2438,7 +2476,7 @@ mod tests {
                         pipeline_b
                             .run_for_layer(
                                 EvolutionTrigger::CronTick,
-                                EvolutionLayer::Memory,
+                                EvolutionLayer::Prompt,
                                 &mut engine_b,
                                 Utc::now(),
                             )
@@ -2501,7 +2539,7 @@ mod tests {
         let report = pipeline
             .run_for_layer(
                 EvolutionTrigger::Manual,
-                EvolutionLayer::Memory,
+                EvolutionLayer::Prompt,
                 &mut engine,
                 Utc::now(),
             )
@@ -2541,18 +2579,18 @@ mod tests {
         );
     }
 
-    /// Carried from R-PMMCg: a strategy cycle is recorded once, by the
-    /// pipeline, not also by the engine (the orphan `Tune` row).
+    /// Carried from R-PMMCg: a generic pending-file cycle is recorded once,
+    /// by the pipeline, preserving the deleted strategy engine's invariant.
     #[tokio::test]
-    async fn a_strategy_cycle_is_recorded_once() {
+    async fn generic_file_change_cycle_is_recorded_once() {
         let dir = tempdir().unwrap();
         let (judge, _seen) = snapshot_judge(dir.path().join("decision_policy.toml"), Some(0.9));
         let pipeline = auto_pipeline(dir.path(), Some(judge)).await;
-        let mut engine = strategy_layer(dir.path(), &pipeline).await;
+        let mut engine = pending_legacy_policy_file(dir.path(), &pipeline).await;
         pipeline
             .run_for_layer(
                 EvolutionTrigger::Manual,
-                EvolutionLayer::Policy,
+                EvolutionLayer::Prompt,
                 &mut engine,
                 Utc::now(),
             )
@@ -2560,7 +2598,7 @@ mod tests {
             .unwrap();
         let rows = persisted_evolution_rows(&dir.path().join("logs")).await;
         assert_eq!(
-            rows.iter().filter(|row| row.layer == EvolutionLayer::Policy).count(),
+            rows.iter().filter(|row| row.layer == EvolutionLayer::Prompt).count(),
             1,
             "{rows:?}"
         );
@@ -2664,7 +2702,7 @@ mod tests {
         drop(trend);
 
         let report = pipeline
-            .run_for_layer(EvolutionTrigger::Manual, EvolutionLayer::Memory, &mut engine, now)
+            .run_for_layer(EvolutionTrigger::Manual, EvolutionLayer::Prompt, &mut engine, now)
             .await
             .unwrap();
 
@@ -2713,7 +2751,7 @@ mod tests {
         let shared = new_shared_evolution_config(cfg);
         // No policy installed → legacy behaviour, commit authorization is a no-op.
         let pipeline = EvolutionPipeline::new(shared, analyzer, writer, dir.path());
-        assert!(pipeline.authorize_commit(&EvolutionLayer::Memory, "exp-x").is_ok());
+        assert!(pipeline.authorize_commit(&EvolutionLayer::Prompt, "exp-x").is_ok());
     }
 
     #[tokio::test]
@@ -2746,7 +2784,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let pipeline = gated_pipeline(dir.path(), policy).await;
-        assert!(pipeline.authorize_commit(&EvolutionLayer::Memory, "exp-ok").is_ok());
+        assert!(pipeline.authorize_commit(&EvolutionLayer::Prompt, "exp-ok").is_ok());
     }
 
     #[tokio::test]
