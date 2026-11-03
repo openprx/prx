@@ -2474,3 +2474,15 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) fn probe_ledger_lock_contention() -> Result<String> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("costs.jsonl");
+    let _held = acquire_cost_ledger_lock(&path)?;
+    let error = match acquire_cost_ledger_lock(&path) {
+        Ok(_) => anyhow::bail!("test: second ledger owner unexpectedly acquired held lock"),
+        Err(error) => error,
+    };
+    Ok(format!("{error:#}"))
+}

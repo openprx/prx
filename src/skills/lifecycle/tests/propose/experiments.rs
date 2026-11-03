@@ -24,6 +24,7 @@ mod instruction_cycle;
 mod live_fixture;
 mod refinement;
 mod selection_policy;
+mod timeout_probes;
 mod v01_study;
 
 struct Server {
