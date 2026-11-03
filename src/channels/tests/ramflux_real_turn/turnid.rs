@@ -567,6 +567,25 @@ async fn turnid_surface_action_validation_duplicate_and_failed_admission() {
         assert_eq!(recv_id(&mut host, id, true).await["result"]["ok"], true);
         channel.turnid_wait_unreserved("missing-chat", "unbound-action").await;
     }
+    // Reserve an action behind a blocked listener, then erase its source
+    // before that listener can derive/admit the action's message.
+    let paused = channel.turnid_pause_forward();
+    host.send(&message(176, "conv-blocker", "blocker", "blocker-host"))
+        .await;
+    assert_eq!(recv_id(&mut host, 176, true).await["result"]["ok"], true);
+    paused.await.unwrap();
+    let mut pending = action(177, "pending-action", "conv-1");
+    pending["params"]["message_id"] = "pre-listener-source".into();
+    host.send(&pending).await;
+    assert_eq!(recv_id(&mut host, 177, true).await["result"]["ok"], true);
+    host.send(&json!({"jsonrpc":"2.0","id":178,"method":"inbound.message_deleted","params":{"conversation_id":"conv-1","message_id":"pre-listener-source","deleted_by":sender(),"timestamp_ms":3}})).await;
+    assert_eq!(recv_id(&mut host, 178, true).await["result"]["erased"], true);
+    channel.turnid_wait_unreserved("conv-1", "pending-action").await;
+    pending["id"] = 179.into();
+    host.send(&pending).await;
+    assert_eq!(recv_id(&mut host, 179, true).await["result"]["ok"], true);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    channel.turnid_abort_forward();
     release.send(true).unwrap();
     finish(&mut host, "seed-host").await;
     finish(&mut host, "action-host").await;
