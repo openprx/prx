@@ -111,7 +111,9 @@ rejected while reserved, queued, running, or retained by unacknowledged
 outbound frames. Reuse is accepted only after the previous turn and its replay
 are retired; it creates a new internal run. Another conversation can use the
 same host ID independently. Replaying a message with the same message ID and
-turn ID remains a no-op; changing its turn ID is rejected. Reconnect replay
+turn ID remains a no-op; changing its turn ID is rejected within the in-memory
+message replay window (ten minutes, at most 256 messages). Revocation clears
+that conversation's replay checks. Reconnect replay
 keeps the original host ID. Replay and reservations are volatile and empty
 after a process restart; durable UUID records remain readable.
 

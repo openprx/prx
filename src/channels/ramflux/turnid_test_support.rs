@@ -97,6 +97,33 @@ impl RamfluxChannel {
         self.inner.rpc.turn_ids.release_unbound(None);
     }
 
+    pub(crate) fn turnid_detach_store(&self) {
+        self.inner.store.detach();
+    }
+
+    pub(crate) fn turnid_attach_store(&self, backend: crate::memory::erasure::SharedErasureStore) {
+        self.inner.store.attach(backend);
+    }
+
+    pub(crate) async fn turnid_wait_forward_finished(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if self
+                    .inner
+                    .forward_abort
+                    .lock()
+                    .as_ref()
+                    .is_some_and(tokio::task::AbortHandle::is_finished)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test: forwarding task finished");
+    }
+
     pub(crate) fn turnid_volatile_empty(&self) -> bool {
         self.inner.rpc.volatile_empty()
     }
@@ -118,4 +145,57 @@ pub(crate) fn turnid_code_fixture() -> [String; 2] {
     ];
     drop((a, b));
     codes
+}
+
+#[test]
+fn shutdown_pump_does_not_reenter_admission() {
+    let (done, completed) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let dir = tempfile::tempdir().expect("test: workspace");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: runtime");
+        let handle = runtime.handle().clone();
+        drop(runtime);
+        let _entered = handle.enter();
+        for bind_failure in [true, false] {
+            let channel = RamfluxChannel::new(
+                RamfluxConfig {
+                    on_new_message: crate::config::RamfluxOnNewMessage::Queue,
+                    ..Default::default()
+                },
+                dir.path(),
+            )
+            .expect("test: channel");
+            let prepare = |id: &str| {
+                inbound::prepare_message(&channel.inner, &serde_json::json!({
+                    "conversation_id":"conv", "message_id":id, "turn_id":id,
+                    "sender":{"principal_id":"prx_user", "device_id":"prx_node", "kind":"human", "trust":"verified", "is_self":false},
+                    "chat":{"conversation_id":"conv", "kind":"dm", "member_count":2,"mentioned":false},
+                    "text":"request", "timestamp_ms":1
+                })).expect("test: admission").expect("test: admitted")
+            };
+            let first = prepare("first");
+            assert!(matches!(prepare("second"), turn_queue::Admission::Queued));
+            if bind_failure {
+                // Losing the pre-bind owner forces claim_admitted's failure path.
+                drop(first);
+                assert!(!channel.claim_admitted("conv", "first", "internal"));
+            } else {
+                let released = {
+                    let _admission = channel.inner.admission.lock();
+                    channel.inner.cancel_message("conv", "first")
+                };
+                channel.inner.pump_cancelled(released);
+                drop(first);
+            }
+            assert!(!channel.inner.queue.owns("conv", "first"));
+            assert!(!channel.inner.queue.owns("conv", "second"));
+        }
+        done.send(()).expect("test: shutdown completed");
+    });
+    completed
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("test: no admission deadlock on shutdown");
 }

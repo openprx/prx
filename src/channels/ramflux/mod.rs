@@ -364,7 +364,7 @@ impl Inner {
         }
     }
 
-    fn cancel_message(&self, conversation_id: &str, message_id: &str) {
+    fn cancel_message(&self, conversation_id: &str, message_id: &str) -> Vec<MessageKey> {
         let mut family = vec![MessageKey::new(conversation_id, message_id)];
         family.extend(
             self.derived_messages
@@ -388,11 +388,15 @@ impl Inner {
         for run in run_ids {
             self.cancel_turn(conversation_id, &run);
         }
-        for key in family {
-            let pending = self.slot_messages.lock().remove(&key);
-            if pending {
-                self.pump_next(conversation_id, &key.message);
-            }
+        family
+            .into_iter()
+            .filter(|key| self.slot_messages.lock().remove(key))
+            .collect()
+    }
+
+    fn pump_cancelled(&self, released: Vec<MessageKey>) {
+        for key in released {
+            self.pump_next(&key.conversation, &key.message);
         }
     }
 
@@ -781,12 +785,13 @@ impl RamfluxChannel {
     }
 
     pub(crate) fn claim_admitted(&self, conversation_id: &str, message_id: &str, turn_id: &str) -> bool {
-        let _admission = self.inner.admission.lock();
+        let admission = self.inner.admission.lock();
         if !self.inner.queue.owns(conversation_id, message_id) {
             return false;
         }
         if self.inner.claim_slot_message(conversation_id, message_id) {
             if !self.inner.rpc.turn_ids.bind(conversation_id, message_id, turn_id) {
+                drop(admission);
                 self.inner.pump_next(conversation_id, message_id);
                 return false;
             }
@@ -1221,6 +1226,17 @@ impl RichChannel for RamfluxChannel {
                 tracing::warn!(%error, "ramflux input admission refused");
                 false
             }
+        }
+    }
+
+    fn reject_slot(&self, conversation_id: &str, message_id: &str) {
+        let released = {
+            let _admission = self.inner.admission.lock();
+            self.inner.rpc.turn_ids.release_message(conversation_id, message_id);
+            self.inner.claim_slot_message(conversation_id, message_id)
+        };
+        if released {
+            self.inner.pump_next(conversation_id, message_id);
         }
     }
 

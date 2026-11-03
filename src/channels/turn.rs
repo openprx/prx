@@ -71,6 +71,7 @@ pub(super) async fn process_channel_message(
     if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
         if let Some(rich) = channel.as_rich() {
             if !rich.accepts_message(&msg.reply_target, &msg.id) {
+                rich.reject_slot(&msg.reply_target, &msg.id);
                 return;
             }
             if !rich.try_claim_slot(&msg.reply_target, &msg.id, &turn_run_id) {
