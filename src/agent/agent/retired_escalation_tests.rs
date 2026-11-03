@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Embedded ingress with retired operator input must make one physical request.
 use super::Agent;
 use crate::agent::dispatcher::XmlToolDispatcher;

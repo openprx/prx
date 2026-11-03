@@ -1,3 +1,4 @@
+#![cfg(test)]
 use super::{Config, capture_logs};
 
 #[test]
