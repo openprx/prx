@@ -3157,3 +3157,6 @@ fn outcome_matches_on_connection_until(
     recovery_time_left(deadline)?;
     Ok(matches)
 }
+
+#[cfg(test)]
+pub(crate) mod timeout_probes;

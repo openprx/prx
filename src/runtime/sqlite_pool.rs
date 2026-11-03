@@ -1078,3 +1078,19 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) fn probe_bounded_busy_contention() -> anyhow::Result<String> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("probe.db");
+    let held = Connection::open(&path)?;
+    held.execute_batch("CREATE TABLE probe(value); BEGIN IMMEDIATE;")?;
+    let contender = Connection::open(&path)?;
+    install_bounded_busy_handler(&contender)?;
+    let _budget = BoundedBusyBudget::start();
+    let error = contender
+        .execute("INSERT INTO probe VALUES (1)", [])
+        .expect_err("test: held writer must exhaust bounded busy wait");
+    held.execute_batch("ROLLBACK;")?;
+    Ok(format!("{error:#}"))
+}
