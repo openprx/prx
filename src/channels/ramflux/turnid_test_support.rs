@@ -60,7 +60,7 @@ impl RamfluxChannel {
         if suspended {
             self.inner.queue.suspend_delete("conv-1", "barrier");
         } else {
-            assert!(self.inner.queue.resume_delete("conv-1", "barrier").is_empty());
+            assert_eq!(self.inner.queue.resume_delete("conv-1", "barrier"), []);
         }
     }
 
