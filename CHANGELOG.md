@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The ramflux channel honours the host-supplied `turn_id` on outbound frames
+  and cancel, while retaining fresh internal run UUIDs.
+
 - Terminal replay signatures preserve floating-point costs across JSON storage
   and reload in chat and agent mode. Both use the same memory store, with
   separate recovery scopes for `terminal:local-user` and `cli:local-user`.

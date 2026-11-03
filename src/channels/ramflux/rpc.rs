@@ -45,6 +45,7 @@ struct DedupeEntry {
 
 /// Correlates in-flight requests and remembers idempotent inbound results.
 pub struct RpcHub {
+    pub(super) turn_ids: std::sync::Arc<super::turn_ids::TurnIds>,
     next_id: AtomicU64,
     writer: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     pending: Mutex<HashMap<String, Pending>>,
@@ -60,9 +61,17 @@ pub struct RpcHub {
 }
 
 impl RpcHub {
+    #[cfg(test)]
+    pub(super) fn volatile_empty(&self) -> bool {
+        self.pending.lock().is_empty()
+            && self.replay.lock().is_empty()
+            && self.erased_turns.lock().is_empty()
+            && self.turn_ids.is_empty()
+    }
     #[must_use]
     pub fn new() -> Self {
         Self {
+            turn_ids: std::sync::Arc::new(super::turn_ids::TurnIds::default()),
             next_id: AtomicU64::new(1),
             writer: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
@@ -142,7 +151,8 @@ impl RpcHub {
         let id = RpcId::String(rpc_id.clone());
         let turn_id = params.get("turn_id").and_then(Value::as_str).unwrap_or("turn");
         let idempotency = format!("{turn_id}:{number}");
-        let params = reply_params_with_key(method, params, &idempotency);
+        let mut params = reply_params_with_key(method, params, &idempotency);
+        self.turn_ids.translate(&mut params);
         let key = rpc_id;
         let body = encode_bridge_call(&id, method, &params)?;
         let (tx, rx) = oneshot::channel();
@@ -179,6 +189,10 @@ impl RpcHub {
                 Err(RpcFailure::Timeout)
             }
         }
+    }
+
+    pub(super) fn has_pending(&self, internal: &str) -> bool {
+        self.pending.lock().values().any(|entry| entry.turn_id == internal)
     }
 
     /// Send a response frame. Failures are logged by the caller.
@@ -309,11 +323,13 @@ impl RpcHub {
         let permit = writer.reserve().await.map_err(|_| RpcFailure::ConnectionLost)?;
         let value: Value = serde_json::from_slice(&body).map_err(ProtocolError::Json)?;
         let erased = self.erased_turns.lock();
-        if value
-            .get("params")
-            .and_then(|params| params.get("turn_id"))
-            .and_then(Value::as_str)
-            .is_some_and(|turn| erased.contains(turn))
+        let pending = self.pending.lock();
+        if value.get("method").is_some()
+            && value
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| pending.get(id))
+                .is_none_or(|entry| erased.contains(&entry.turn_id))
         {
             return Err(RpcFailure::ConnectionLost);
         }

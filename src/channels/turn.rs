@@ -73,7 +73,9 @@ pub(super) async fn process_channel_message(
             if !rich.accepts_message(&msg.reply_target, &msg.id) {
                 return;
             }
-            rich.claim_slot(&msg.reply_target, &msg.id, &turn_run_id);
+            if !rich.try_claim_slot(&msg.reply_target, &msg.id, &turn_run_id) {
+                return;
+            }
         }
     }
     let guard = crate::runtime::registry::register_turn(

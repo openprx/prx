@@ -4,6 +4,7 @@ use crate::config::RamfluxOnNewMessage;
 
 fn message(id: &str) -> RichMessage {
     RichMessage {
+        reservation: None,
         conversation_id: "conv".into(),
         message_id: id.into(),
         sender: Sender {

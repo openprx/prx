@@ -33,6 +33,8 @@ pub enum InboundError {
     BadParams(#[from] serde_json::Error),
     #[error("{0}")]
     Failed(String),
+    #[error("{0}")]
+    TurnId(String),
     #[error("memory capability unsupported")]
     Unsupported,
     #[error("not authorized")]
@@ -96,6 +98,30 @@ pub async fn on_frame(inner: &std::sync::Arc<Inner>, bytes: &[u8]) -> Result<(),
                 }
                 return Ok(());
             }
+            if method == protocol::METHOD_INBOUND_MESSAGE || method == protocol::METHOD_INBOUND_SURFACE {
+                let checked = if method == protocol::METHOD_INBOUND_MESSAGE {
+                    parse::<InboundMessageParams>(&params).and_then(|message| {
+                        inner
+                            .rpc
+                            .turn_ids
+                            .check_message(
+                                &message.conversation_id,
+                                &message.message_id,
+                                message.turn_id.as_deref(),
+                            )
+                            .map(|_| ())
+                            .map_err(InboundError::TurnId)
+                    })
+                } else {
+                    parse::<SurfaceActionParams>(&params).and_then(|action| {
+                        super::turn_ids::TurnIds::validate(action.turn_id.as_deref()).map_err(InboundError::TurnId)
+                    })
+                };
+                if let Err(error) = checked {
+                    let _ = inner.rpc.respond_error(&id, &error_body(&error)).await;
+                    return Err(error);
+                }
+            }
             if let Some(cached) = protocol::idempotency_key(&params).and_then(|key| inner.rpc.cached(&key)) {
                 inner
                     .rpc
@@ -138,7 +164,7 @@ fn needs_background_control(method: &str, params: &Value) -> bool {
         )
 }
 
-async fn dispatch(inner: &Inner, method: &str, params: &Value) -> Result<Value, InboundError> {
+async fn dispatch(inner: &std::sync::Arc<Inner>, method: &str, params: &Value) -> Result<Value, InboundError> {
     if method != protocol::METHOD_HELLO && !inner.hello_done.load(Ordering::Acquire) {
         let readd = method == protocol::METHOD_INBOUND_CONTROL
             && params.get("kind").and_then(Value::as_str) == Some("agent_added");
@@ -225,9 +251,31 @@ pub(super) fn prepare_message(
     inner: &Inner,
     params: &Value,
 ) -> Result<Option<super::turn_queue::Admission>, InboundError> {
+    prepare_reserved_message(inner, params, None)
+}
+
+pub(super) fn prepare_reserved_message(
+    inner: &Inner,
+    params: &Value,
+    reserved: Option<std::sync::Arc<super::turn_ids::Reservation>>,
+) -> Result<Option<super::turn_queue::Admission>, InboundError> {
     let _admission_guard = inner.admission.lock();
     ensure_running(inner)?;
     let message: InboundMessageParams = parse(params)?;
+    if reserved.is_none()
+        && inner
+            .rpc
+            .turn_ids
+            .check_message(
+                &message.conversation_id,
+                &message.message_id,
+                message.turn_id.as_deref(),
+            )
+            .map_err(InboundError::TurnId)?
+    {
+        return Ok(Some(super::turn_queue::Admission::Queued));
+    }
+    super::turn_ids::TurnIds::validate(message.turn_id.as_deref()).map_err(InboundError::TurnId)?;
     tracing::debug!(
         conversation_id = %message.conversation_id,
         message_id = %message.message_id,
@@ -263,7 +311,24 @@ pub(super) fn prepare_message(
         .conversations
         .lock()
         .insert(message.conversation_id.clone(), message.chat.clone());
+    let reservation = match reserved {
+        Some(reserved) => reserved,
+        None => inner
+            .rpc
+            .turn_ids
+            .reserve(
+                &message.conversation_id,
+                &message.message_id,
+                message.turn_id.as_deref(),
+                |run| inner.rpc.has_pending(run),
+            )
+            .map_err(InboundError::TurnId)?,
+    };
+    let conversation = message.conversation_id.clone();
+    let message_id = message.message_id.clone();
+    let host_id = message.turn_id;
     let rich = RichMessage {
+        reservation: Some(reservation),
         conversation_id: message.conversation_id,
         message_id: message.message_id,
         sender: message.sender,
@@ -286,6 +351,14 @@ pub(super) fn prepare_message(
         },
     );
     let admission = inner.queue.admit(rich);
+    if !matches!(admission, super::turn_queue::Admission::Rejected { .. }) {
+        inner
+            .rpc
+            .turn_ids
+            .remember(&conversation, &message_id, host_id.as_deref());
+    }
+    let pending = inner.queue.pending_messages(&conversation);
+    inner.rpc.turn_ids.release_displaced(&conversation, &pending);
     if let super::turn_queue::Admission::Start(message) | super::turn_queue::Admission::Interrupt(message) = &admission
     {
         inner.note_slot_message(&message.conversation_id, &message.message_id);
@@ -293,17 +366,17 @@ pub(super) fn prepare_message(
     Ok(Some(admission))
 }
 
-pub(super) async fn on_message(inner: &Inner, params: &Value) -> Result<Value, InboundError> {
+pub(super) async fn on_message(inner: &std::sync::Arc<Inner>, params: &Value) -> Result<Value, InboundError> {
     let Some(admission) = prepare_message(inner, params)? else {
         return Ok(json!({"ok":true,"deleted":true}));
     };
     match admission {
         super::turn_queue::Admission::Interrupt(message) => {
             inner.cancel_tokens(&message.conversation_id);
-            inner.emit_inbound(RichInbound::Message(message)).await?;
+            inner.emit_message(message).await?;
         }
         super::turn_queue::Admission::Start(message) => {
-            inner.emit_inbound(RichInbound::Message(message)).await?;
+            inner.emit_message(message).await?;
         }
         super::turn_queue::Admission::Queued => {}
         super::turn_queue::Admission::Rejected { depth } => {
@@ -316,6 +389,7 @@ pub(super) async fn on_message(inner: &Inner, params: &Value) -> Result<Value, I
 async fn on_surface(inner: &Inner, params: &Value) -> Result<Value, InboundError> {
     ensure_running(inner)?;
     let action: SurfaceActionParams = parse(params)?;
+    super::turn_ids::TurnIds::validate(action.turn_id.as_deref()).map_err(InboundError::TurnId)?;
     if action.values.get("approval_id").is_some() {
         // Grants are authenticated through approval.decision, never card values.
         return Err(InboundError::NotAuthorized);
@@ -326,8 +400,25 @@ async fn on_surface(inner: &Inner, params: &Value) -> Result<Value, InboundError
         action_id = %action.action_id,
         "ramflux surface action"
     );
+    let derived_message_id = format!("{}:{}:{}", action.message_id, action.action_id, uuid::Uuid::new_v4());
+    let reservation = {
+        let _admission = inner.admission.lock();
+        ensure_running(inner)?;
+        inner
+            .rpc
+            .turn_ids
+            .reserve(
+                &action.conversation_id,
+                &derived_message_id,
+                action.turn_id.as_deref(),
+                |run| inner.rpc.has_pending(run),
+            )
+            .map_err(InboundError::TurnId)?
+    };
     inner
         .emit_inbound(RichInbound::SurfaceAction(SurfaceActionInbound {
+            derived_message_id,
+            reservation: Some(reservation),
             conversation_id: action.conversation_id,
             sender: action.sender,
             surface_id: action.surface_id,
@@ -541,7 +632,12 @@ fn on_cancel(inner: &Inner, params: &Value) -> Result<Value, InboundError> {
         turn_id = %cancel.turn_id,
         "ramflux turn cancel"
     );
-    let cancelled = inner.cancel_turn(&cancel.conversation_id, &cancel.turn_id);
+    super::turn_ids::TurnIds::validate(Some(&cancel.turn_id)).map_err(InboundError::TurnId)?;
+    let cancelled = inner
+        .rpc
+        .turn_ids
+        .resolve(&cancel.conversation_id, &cancel.turn_id)
+        .is_some_and(|run| inner.cancel_turn(&cancel.conversation_id, &run));
     Ok(json!({"ok": cancelled}))
 }
 
@@ -565,6 +661,7 @@ fn error_body(error: &InboundError) -> RpcErrorBody {
         InboundError::QueueFull(_) => (-32005, error.to_string()),
         InboundError::Unsupported => (-32601, error.to_string()),
         InboundError::UnknownMethod(_) => (-32601, error.to_string()),
+        InboundError::TurnId(message) => (-32602, message.clone()),
         InboundError::BadParams(_) => (-32602, "invalid bridge params".to_string()),
         InboundError::Failed(message) => (-32603, message.clone()),
     };

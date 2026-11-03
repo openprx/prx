@@ -65,9 +65,9 @@ Approval matrix:
 A delegated tool uses the same gate as its parent run. In supervised mode it
 sends `approval.request` and blocks until the host answers.
 
-`idempotency_key` on `reply.*` is `{turn_id}:{seq}`. Replay sends the same
-body, so the key survives a reconnect. A new turn after restart uses a new
-`turn_id`.
+`idempotency_key` on `reply.*` is `{internal_run_id}:{seq}`. Replay sends the same
+body, so the key survives a reconnect. A new turn after restart uses a fresh
+internal run UUID, even if the host reuses its correlation ID.
 
 Bridge errors:
 
@@ -96,6 +96,32 @@ Requests should carry `idempotency_key` inside `params`. prx deduplicates
 inbound request keys for ten minutes. Durable input receipts use
 `channel:ramflux:{hash(account)}:{hash(conversation)}:{message_id}`, so a
 message id reused by another account or conversation cannot collide. Every outbound frame carries `turn_id`.
+
+An optional host `turn_id` on `inbound.message` or `inbound.surface_action`
+is a correlation ID: 1–128 ASCII bytes from `[A-Za-z0-9._:-]`. Invalid IDs
+return JSON-RPC error `-32602` before admission or acknowledgment. PRX still
+mints a fresh internal UUID for each run, used by approval, registry, terminal,
+history, usage, and deletion. Without a host ID, the wire carries that UUID.
+Every outbound turn frame carries the host ID when supplied, including
+approval, attachment fetch, streaming text/surfaces, tool/task frames and the
+final surface's `final-<turn_id>` ID.
+
+Host turn IDs should be unique. A duplicate in the same conversation is
+rejected while reserved, queued, running, or retained by unacknowledged
+outbound frames. Reuse is accepted only after the previous turn and its replay
+are retired; it creates a new internal run. Another conversation can use the
+same host ID independently. Replaying a message with the same message ID and
+turn ID remains a no-op; changing its turn ID is rejected. Reconnect replay
+keeps the original host ID. Replay and reservations are volatile and empty
+after a process restart; durable UUID records remain readable.
+
+`turn.cancel` always targets the current live, bound holder of the host ID in
+that conversation. A delayed cancel after accepted reuse cancels the new
+holder. Unknown, retired, and queued but unbound IDs return `ok:false`.
+Surface actions reserve their host ID before `ok:true`, then pass it to the
+derived turn; asynchronous admission failure releases it. Task events do not
+start a turn and ignore their optional `turn_id`: they target the latest bound
+turn in the conversation, as before.
 
 ### Host to prx
 
