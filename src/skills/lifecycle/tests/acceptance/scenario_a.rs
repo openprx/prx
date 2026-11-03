@@ -457,13 +457,13 @@ async fn a_wall_stall_past_the_latency_budget_still_answers() {
 }
 
 #[tokio::test]
-async fn advancing_the_logical_latency_budget_refuses_before_a_plain_answer() {
+async fn advancing_the_logical_latency_budget_clarifies_before_a_plain_answer() {
     let world = World::new().await;
     let config = world.production_config(SkillsLifecycleModeConfig::Auto, &[]);
     let reply = world
         .run_plain_after_logical_budget(&config)
         .await
-        .expect("test: a spent logical budget completes as a refusal");
+        .expect("test: a spent logical budget completes as a clarification");
     // Deadline exhaustion closes locally with Clarify on text-capable CLI.
     // The wall-stall sibling still receives the model answer.
     assert_eq!(reply, "Could you narrow your request so I can finish it in time?");

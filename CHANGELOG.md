@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Known behaviour:** with the default builtin decision plane, named-tool chat
+  turns, heavy-task delegation to `sessions_spawn`, discovered tools, and skill
+  experiment instruction reads fall back to Answer or Clarify without tool
+  execution. `P-DECISION-SCORER-01` tracks builtin scorer recalibration.
+
 - Honor exact approved decision resumes, close expired or text-less decisions locally, and keep confidence fallback answers free of tool execution authority.
 
 - Catalog-backed model checks read the active release rows and aliases at

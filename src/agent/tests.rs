@@ -809,6 +809,43 @@ async fn default_causal_embedded_turn_runs_sealed_spawn_child_and_confirms_clean
 }
 
 #[tokio::test]
+async fn r4_builtin_heavy_task_clarifies_without_sessions_spawn() {
+    // pinned until P-DECISION-SCORER-01 recalibrates the builtin scorer
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = Box::new(FailingProvider);
+    let (memory, workspace) = make_sqlite_memory();
+    let config = default_causal_runtime_config(workspace.path());
+    let mut agent = Agent::builder()
+        .runtime_config(config, "ollama")
+        .provider(provider)
+        .tools(vec![Box::new(MockSessionsSpawnTool { calls: calls.clone() })])
+        .memory(memory)
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .task_routing_config(TaskRoutingConfig {
+            default_intent: TaskRoutingIntentConfig::Simple,
+            rules: vec![TaskRoutingRule {
+                keywords: vec!["fix".into(), "deploy".into()],
+                intent: TaskRoutingIntentConfig::Delegate,
+                model_hint: None,
+                sub_agent_model: Some("prx-local-model".into()),
+                priority: 10,
+            }],
+        })
+        .build()
+        .unwrap();
+    let response = agent.turn("please fix this bug for me").await.unwrap();
+    assert_eq!(
+        response,
+        "Which result and supporting source should I use for this request?"
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "the builtin must not delegate below its bar"
+    );
+}
+
+#[tokio::test]
 async fn turn_delegates_heavy_task_to_sessions_spawn_tool() {
     crate::runtime::turn_decision::with_scored_action("delegate", "session", async {
         let calls = Arc::new(Mutex::new(Vec::new()));

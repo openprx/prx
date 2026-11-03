@@ -640,6 +640,46 @@ async fn chat_driver_does_not_publish_whole_registry_for_unrecognized_language()
 }
 
 #[tokio::test]
+async fn r4_builtin_named_tool_chat_answers_without_publishing_the_tool() {
+    // pinned until P-DECISION-SCORER-01 recalibrates the builtin scorer
+    let workspace = tempfile::tempdir().unwrap();
+    let provider = Arc::new(CatalogRecordingProvider::new(None, None));
+    let (action_tx, _action_rx) = mpsc::channel::<Action>(128);
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    let admitted = super::turn_characterization_tests::admit_chat_fixture_with_config(
+        provider,
+        Some(probe_registry()),
+        config,
+        ("ollama", "tiering-model", None),
+        ("prx_builtin_named_tool", EXTENDED_TOOL),
+        action_tx,
+        CancellationToken::new(),
+    )
+    .await;
+    let routing = admitted.binding.decision_routing().expect("builtin chat decision");
+    assert!(matches!(
+        routing.context.directive(),
+        crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+    ));
+    assert!(matches!(
+        routing.context.engine().selection,
+        crate::causal_tree::decision_select::Selection::Abstain {
+            action: crate::causal_tree::branch::CausalActionKind::Answer,
+            ..
+        }
+    ));
+    assert!(routing.context.execution_refs().is_empty());
+    assert!(routing.context.audit_hops().any(|hop| {
+        hop.prediction
+            .as_ref()
+            .is_some_and(|p| p.served_by == crate::decision::factory::ServedBy::Builtin)
+    }));
+    assert!(admitted.binding.fixed_reply().expect("model-backed Answer").is_none());
+    routing.context.terminal_execution_trace();
+}
+
+#[tokio::test]
 async fn chat_driver_can_select_an_extended_tool_by_its_public_name() {
     crate::runtime::turn_decision::with_scored_prediction(async {
         let workspace = tempfile::tempdir().unwrap();

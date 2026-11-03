@@ -11,6 +11,121 @@ struct DiscoverySurfaceTool {
 }
 
 #[tokio::test]
+async fn r4_builtin_discovered_tool_answers_without_execution_authority() {
+    // pinned until P-DECISION-SCORER-01 recalibrates the builtin scorer
+    {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        config.causal_tree.enabled = true;
+        config.providers.models.push(
+            toml::from_str(
+                "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
+            )
+            .unwrap(),
+        );
+        let generation = crate::config::new_shared(config.clone()).pin();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+        memory
+            .store(
+                "prx_recall_probe",
+                "durable fixture value",
+                crate::memory::MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            // Production publishes this retrieval source alongside recall.
+            // Omitting it hides the Retrieve -> Discover -> hop-limit failure.
+            Box::new(crate::tools::memory_search::MemorySearchTool::new(
+                workspace.path().to_owned(),
+                Arc::clone(&memory),
+                false,
+            )),
+            Box::new(crate::tools::memory_recall::MemoryRecallTool::new(
+                Arc::clone(&memory),
+                false,
+            )),
+            Box::new(crate::tools::memory_get::MemoryGetTool::new(
+                workspace.path().to_owned(),
+                Arc::clone(&memory),
+                false,
+            )),
+            Box::new(CapabilitySearchTool),
+        ]);
+        let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
+            Arc::clone(&registry),
+            Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+            Arc::new(DenyApprovalStrategy),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        ));
+        let provider_catalog = ProviderCatalogView::from_config(&config);
+        let transports = CountingTransports(AtomicUsize::new(0));
+        let service = build_turn_decision_service(
+            TurnSurfaceKind::AgentLoop,
+            TurnServiceBuild {
+                parent_grant: None,
+                generation: Arc::clone(&generation),
+                registry,
+                execution,
+                catalog_sources: sources(&generation, &config),
+                surface_policy: SurfacePolicy::default(),
+                provider_catalog: &provider_catalog,
+                transports: &transports,
+                events: Arc::new(SilentEvents),
+                memory: Arc::clone(&memory),
+                security,
+            },
+        )
+        .await
+        .unwrap();
+        let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+                &generation,
+                Arc::clone(&memory),
+                "Use memory_recall to search durable memory for prx_recall_probe and quote its stored content. Do not use workspace files or guess.",
+                "prx_named_memory_discovery",
+                ("ollama", "prx-local-model"),
+            ).await;
+        let context = service
+            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .await
+            .unwrap();
+        let published = service.agent_execution_specs(&proof, &context);
+        assert!(matches!(context.directive(), TurnExecutionDirective::AnswerDirectly));
+        assert!(matches!(
+            context.engine().selection,
+            Selection::Abstain {
+                action: CausalActionKind::Answer,
+                ..
+            }
+        ));
+        assert!(context.execution_refs().is_empty());
+        assert!(published.unwrap().specs.is_empty());
+        assert!(context.audit_hops().any(|hop| {
+            hop.prediction
+                .as_ref()
+                .is_some_and(|p| p.served_by == crate::decision::factory::ServedBy::Builtin)
+        }));
+        assert!(
+            context
+                .engine()
+                .state
+                .observed
+                .completed_steps()
+                .iter()
+                .any(|step| step.kind() == ObservedStepKind::Discover && step.status() == ObservedStepStatus::Ok),
+            "the builtin must reach discovery before declining the discovered tool"
+        );
+        assert_eq!(transports.0.load(Ordering::SeqCst), 0);
+        context.terminal_execution_trace();
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+}
+
+#[tokio::test]
 async fn named_memory_recall_becomes_ready_after_selected_discovery_without_publishing_peers() {
     crate::runtime::turn_decision::with_scored_prediction(async {
         for excluded in [false, true] {

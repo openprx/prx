@@ -365,6 +365,44 @@ async fn deadline_keeps_commit_only_after_complete_scoring() {
 }
 
 #[tokio::test]
+async fn r4_deadline_between_scoring_and_selection_closes_without_a_model_answer() {
+    for phase in ["selection", "post_selection"] {
+        let decision = decide_turn(
+            "Read /tmp/prx_fixture/brief.md, /tmp/prx_fixture/src/plan.rs and /tmp/prx_fixture/docs/contract.md. Complete the implementation and write /tmp/prx_fixture/report.md. Include the changed files and verification results. End the report with STATUS: READY_FOR_REVIEW.",
+            Some((phase, 1)),
+            FixtureTools::Filesystem,
+            None,
+            None,
+        ).await;
+        assert!(
+            matches!(
+                decision.selection,
+                Selection::Abstain {
+                    action: CausalActionKind::Clarify,
+                    reason_code: "deadline_exceeded"
+                }
+            ),
+            "{phase}: {:?}",
+            decision.selection
+        );
+        assert_eq!(decision.fallback_cause, Some(FallbackCause::DeadlineExceeded));
+        assert_eq!(record(&decision).directive_kind, "clarify");
+        assert!(matches!(
+            directive_from_selection(
+                &decision,
+                &DirectiveContext {
+                    current_generation: decision.state.trusted.parts().catalog_generation,
+                    approval_expires_at: chrono::Utc::now(),
+                    discovery_limit: 1,
+                }
+            )
+            .unwrap(),
+            TurnExecutionDirective::Clarify { .. }
+        ));
+    }
+}
+
+#[tokio::test]
 async fn o9_long_paths_and_output_contract_reaches_the_model() {
     let decision = decide_turn("Read /tmp/prx_fixture/brief.md, /tmp/prx_fixture/src/plan.rs and /tmp/prx_fixture/docs/contract.md. Complete the implementation and write /tmp/prx_fixture/report.md. Include the changed files and verification results. End the report with STATUS: READY_FOR_REVIEW.", None, FixtureTools::Filesystem, None, None).await;
     assert_answer(&decision);

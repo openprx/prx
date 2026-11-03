@@ -1233,7 +1233,15 @@ impl CausalDecisionEngine {
         };
         super::logical_clock::checkpoint("post_selection");
         if decision_now() >= inputs.deadline
-            && matches!(selection, Selection::Commit { .. } | Selection::Recover { .. })
+            && matches!(
+                selection,
+                Selection::Commit { .. }
+                    | Selection::Recover { .. }
+                    | Selection::Abstain {
+                        action: CausalActionKind::Answer,
+                        ..
+                    }
+            )
         {
             fallback_cause.get_or_insert(FallbackCause::DeadlineExceeded);
             let keep_commit = match &selection {
