@@ -418,8 +418,6 @@ struct TurnTerminalPayload<'a> {
     provider_outcome: &'a Option<ProviderExecutionOutcome>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     prepared_parameters: &'a Vec<crate::providers::catalog::parameters::ResolvedParameters>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    served_auxiliary: Option<&'a served_auxiliary::ServedAuxiliaryProjection>,
     usage_settlement: &'a Option<MeteredTokenUsageRecord>,
     cost_settlement: &'a Option<CostSettlement>,
     telemetry: &'a TurnTerminalTelemetry,
@@ -716,19 +714,6 @@ async fn finalize_turn_impl(
             .decision
             .context
             .validate_silent_terminal(commit.status, commit.provider_outcome.as_ref())?;
-        if let Some(served) = commit.decision.context.served_auxiliary() {
-            anyhow::ensure!(
-                commit.status == TurnTerminalStatus::Completed,
-                "auxiliary reply cannot be attached to an incomplete terminal"
-            );
-            served.validate_reply(
-                &commit
-                    .history
-                    .as_ref()
-                    .context("auxiliary reply projection missing")?
-                    .assistant_content,
-            )?;
-        }
         if commit.decision.is_recorded() {
             let decision = &commit.decision;
             let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
@@ -836,23 +821,6 @@ async fn finalize_turn_impl(
                         .insert(
                             "prepared_parameters".to_owned(),
                             redact_persisted_json(serde_json::to_value(&prepared_parameters)?),
-                        );
-                }
-                if let Some(event) = decision
-                    .context
-                    .served_auxiliary()
-                    .and_then(served_auxiliary::ServedAuxiliaryLink::event)
-                {
-                    use sha2::Digest;
-                    semantic
-                        .as_object_mut()
-                        .context("terminal claim is not an object")?
-                        .insert(
-                            "served_auxiliary".to_owned(),
-                            serde_json::json!({
-                                "event_id": event.event_id,
-                                "sha256": hex::encode(sha2::Sha256::digest(serde_json::to_vec(event)?)),
-                            }),
                         );
                 }
                 semantic
@@ -1001,11 +969,6 @@ async fn finalize_turn_impl(
             assistant_event_id: assistant_event.as_ref().map(|event| event.event_id.as_str()),
             provider_outcome: &commit.provider_outcome,
             prepared_parameters: &prepared_parameters,
-            served_auxiliary: commit
-                .decision
-                .context
-                .served_auxiliary()
-                .and_then(served_auxiliary::ServedAuxiliaryLink::projection),
             usage_settlement: &usage_settlement,
             cost_settlement: &cost_settlement,
             telemetry: &commit.telemetry,

@@ -130,33 +130,6 @@ impl AccountingScope {
         budget
     }
 
-    /// Share the original monetary/token balance and settlement serialization;
-    /// only this premium continuation receives a later transport deadline.
-    #[cfg(feature = "llm-router")]
-    pub(super) fn automix_window(&self, deadline: Instant) -> Self {
-        let remaining = self.remaining.get_or_init(|| {
-            Arc::new(RemainingBudgets {
-                tokens: AtomicU64::new(self.budgets.tokens),
-                micro_usd: Arc::new(AtomicU64::new(self.budgets.micro_usd)),
-                settlement_gate: Arc::new(tokio::sync::Mutex::new(())),
-                settlement_failed: AtomicBool::new(false),
-            })
-        });
-        Self {
-            config: Arc::clone(&self.config),
-            key: Arc::clone(&self.key),
-            cleanup: Arc::clone(&self.cleanup),
-            scope_id: self.scope_id,
-            budgets: self.budgets,
-            deadline,
-            remaining: OnceLock::from(Arc::clone(remaining)),
-            parent: self.parent.clone(),
-            call_limit: self.call_limit,
-            group: self.group.clone(),
-            stage: self.stage.clone(),
-        }
-    }
-
     pub(crate) fn new(
         config: Arc<Config>,
         key: Arc<DecisionKey>,
@@ -336,12 +309,7 @@ impl AccountingScope {
         }
         let auxiliary = matches!(
             attempt.purpose,
-            "signal_vision"
-                | "smart_group_classifier"
-                | "automix_premium"
-                | "router_embedding"
-                | "evolution_proposer"
-                | "evolution_judge"
+            "signal_vision" | "smart_group_classifier" | "router_embedding" | "evolution_proposer" | "evolution_judge"
         );
         let owner_deadline = self.deadline;
         let deadline = owner_deadline.min(attempt.deadline);

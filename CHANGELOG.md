@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- BREAKING (operators): automix reply escalation was removed in 0.8.171.
+  `[router.automix]` is ignored with one warning at load; remove this section
+  from operator configuration. Turns return the serving model's reply without
+  a premium continuation. Authenticated historical v1 replies remain readable.
+
 ### Fixed
 
 - The ramflux channel honours the host-supplied `turn_id` on outbound frames

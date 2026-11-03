@@ -1,9 +1,8 @@
 # LLM Router
 
-The original Router introduced heuristic ranking, semantic history and Automix
-policy. The candidate contract below supersedes its earlier unrestricted
-history and premium-escalation behavior. Candidate assembly and concentrated
-runtime/performance validation are still in progress; this is not release acceptance.
+The Router combines heuristic ranking with scoped semantic history.
+The candidate contract below supersedes its earlier unrestricted history.
+Candidate assembly and concentrated runtime/performance validation are still in progress; this is not release acceptance.
 
 ## Source addendum (2026-10-05)
 
@@ -18,20 +17,10 @@ nothing. The existing history deadline, domain, capacity and model readmission
 rules remain unchanged. Every actual paid attempt uses pinned PMM pricing and
 an owned estimated reservation; missing support, scope, pricing or budget refuses.
 
-Automix rules can request one premium attempt within a separate bounded
-escalation window, starting when the cheap reply returns.
-`router.automix.escalation_window_ms` defaults to 30,000 ms and must be between
-1 and 120,000 ms. Main settlement, premium reservation and premium transport
-all consume this same window; a retry cannot restart it. The original token
-and money balance and settlement gate remain shared. The decision budget
-remains 500 ms and the Router budget remains 100 ms. The actual registered provider instance is
-preserved. Known cheap usage is settled under its unchanged terminal ID before
-premium admission; partial or unknown main usage cannot be treated as zero to
-fund escalation. Premium physical usage settles separately. A failed or unknown
-premium call retains the cheap result and its trace. A successful premium reply
-is bound to its actual auxiliary observation, and recorded replay authenticates
-that event and reply projection. Metrics/history use the actual served model
-within the configured Router learning policy; no unknown-model priors are added.
+Completed turns return the serving model's reply; reply-text confidence does
+not trigger an additional provider request. Authenticated historical v1
+served-auxiliary records remain readable with their original reply, costs and
+serving-model attribution. Historical replay grants no execution authority.
 
 Estimated reservations are not vendor-enforced charge caps. Actual reported
 usage above an estimate is recorded in full; unresolved usage retains liability.
@@ -72,10 +61,9 @@ ports; generic recall is not a fallback.
 Local embedding authority retains the concrete `LocalHashEmbedding` instance.
 A dynamic embedder's name is not evidence of local or uncharged execution.
 The library attachment API is `RouterEngine::with_local_hash_history`; it
-must run before the engine is bound to an Agent source. Paid embeddings and
-Automix premium calls require a proven transport cost contract and currently
-remain `BudgetUnproven`. A low-confidence cheap result is retained with its
-actual trace; configuration alone does not trigger a premium request.
+must run before the engine is bound to an Agent source. Paid embeddings
+require a proven transport cost contract; unsupported transports remain
+`BudgetUnproven`.
 
 Training uses the actual durable terminal receipt and served provider/model,
 with the query vector retained from the admitted history phase. It does not
@@ -108,7 +96,6 @@ a live read grant or model-execution authority.
 - Build-time: `llm-router` feature is enabled by default (`cargo build`).
 - Local heuristic ranking requires an admitted source and reachable model binding.
 - KNN requires the scoped history and concrete embedding authority described above.
-- Premium escalation requires the owned estimated admission described in the October 5 addendum.
 
 ## End-to-End Flow
 
@@ -125,9 +112,6 @@ Step details:
    `alpha*similarity + beta*capability + gamma*elo - delta*cost - epsilon*latency`.
 1. `reliability_fallback`
    If the selected model/provider fails, standard reliability fallback applies.
-1. `automix`
-   Low confidence can record a `BudgetUnproven` refusal; retain the cheap result
-   without making a premium request.
 1. `record_outcome`
    Use the real durable terminal and actual serving member for scoped metrics
    and the retained-vector history write. Nonempty reply text is not success evidence.
@@ -165,12 +149,6 @@ delta = 0.1
 epsilon = 0.1
 knn_min_records = 10
 knn_k = 7
-
-[router.automix]
-confidence_threshold = 0.70
-cheap_model_tiers = ["cheap", "fast", "mini"]
-premium_model_id = "openai/gpt-4.1"
-escalation_window_ms = 30000
 
 [[router.models]]
 model_id = "gpt-4o-mini"
@@ -237,15 +215,6 @@ Operational note:
 - `latency_ms`: baseline latency estimate
 - `categories`: model capability categories used by intent match
 - `elo_rating`: initial Elo baseline
-
-`[router.automix]`
-
-- `confidence_threshold`: escalate when confidence `< threshold`
-- `cheap_model_tiers`: markers used to classify cheap-first targets
-- `premium_model_id`: escalation target model id (`provider/model` supported)
-- `escalation_window_ms`: premium window after the cheap reply, including main
-  settlement and physical reservation; default `30000`, hard maximum `120000`,
-  minimum `1`. Omitting this field in existing configuration uses the default.
 
 ## Security and Boundary Notes
 

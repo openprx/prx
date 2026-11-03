@@ -188,3 +188,5 @@ mod paths;
 mod persistence;
 mod proxy;
 mod security;
+
+mod retired_router;

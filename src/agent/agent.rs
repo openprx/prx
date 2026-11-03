@@ -23,17 +23,11 @@ use crate::providers::{ConversationMessage, Provider};
 #[cfg(feature = "llm-router")]
 use crate::router::RouterEngine;
 use crate::runtime::control_ladder::ControlLadderSnapshot;
-#[cfg(all(test, feature = "llm-router"))]
-use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use crate::tools::Tool;
 use anyhow::Result;
-#[cfg(all(test, feature = "llm-router"))]
-use chrono::Utc;
 use std::sync::Arc;
 #[cfg(test)]
 use std::time::Instant;
-#[cfg(all(test, feature = "llm-router"))]
-use uuid::Uuid;
 
 pub struct Agent {
     provider: Arc<dyn Provider>,
@@ -621,30 +615,6 @@ impl Agent {
         }
     }
 
-    #[cfg(all(test, feature = "llm-router"))]
-    async fn append_router_cost_event(&self, event: &RouterCostEvent) {
-        let date = Utc::now().format("%Y-%m-%d").to_string();
-        let key = format!("router/cost/{date}/{}", Uuid::new_v4());
-
-        if let Ok(payload) = serde_json::to_string(event) {
-            // The model targets may be `<provider label>/<model>`, and a
-            // `custom:` label may carry `user:password@`.
-            let payload = crate::providers::redact_endpoint_userinfo(&payload);
-            if let Err(err) = self
-                .memory
-                .store(
-                    &key,
-                    &payload,
-                    MemoryCategory::Custom("router".to_string()),
-                    Some(SELF_SYSTEM_SESSION_ID),
-                )
-                .await
-            {
-                tracing::warn!("Automix cost tracking store failed: {err}");
-            }
-        }
-    }
-
     // Forward the existing future without another generator/poll frame. All
     // admission, execution and cleanup still begin only when it is polled.
     pub fn turn(&mut self, user_message: &str) -> impl std::future::Future<Output = Result<String>> {
@@ -654,21 +624,6 @@ impl Agent {
     pub fn run_single(&mut self, message: &str) -> impl std::future::Future<Output = Result<String>> {
         self.turn(message)
     }
-}
-
-#[cfg(all(test, feature = "llm-router"))]
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct RouterCostEvent {
-    primary_model: String,
-    escalated: bool,
-    escalation_failed: bool,
-    escalation_model: Option<String>,
-    confidence: f32,
-    primary_prompt_tokens: usize,
-    primary_completion_tokens: usize,
-    escalation_prompt_tokens: usize,
-    escalation_completion_tokens: usize,
-    total_cost_usd: f32,
 }
 
 /// The `RouteDecision` a legacy agent turn stamps on its trace and persists
@@ -693,24 +648,6 @@ fn turn_route_decision(effective_model: &str, turn_id: &str) -> crate::llm::rout
         true,
         false,
     )
-}
-
-#[cfg(all(test, feature = "llm-router"))]
-impl RouterCostEvent {
-    fn new(primary_model: &str) -> Self {
-        Self {
-            primary_model: primary_model.to_string(),
-            escalated: false,
-            escalation_failed: false,
-            escalation_model: None,
-            confidence: 1.0,
-            primary_prompt_tokens: 0,
-            primary_completion_tokens: 0,
-            escalation_prompt_tokens: 0,
-            escalation_completion_tokens: 0,
-            total_cost_usd: 0.0,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1526,7 +1463,7 @@ mod tests {
         let other_workspace = tempfile::tempdir().unwrap();
         for matching in [true, false] {
             let mut builder = embedded_builder(workspace.path());
-            let router_config = automix_router_config(true);
+            let router_config = router_config();
             builder.runtime_config.as_mut().unwrap().0.router = router_config.clone();
             builder.runtime_config.as_mut().unwrap().1 = "openai".to_owned();
             let memory: Arc<dyn Memory> = if matching {
@@ -3102,7 +3039,7 @@ mod tests {
     }
 
     #[cfg(feature = "llm-router")]
-    fn automix_router_config(_enabled: bool) -> crate::config::RouterConfig {
+    fn router_config() -> crate::config::RouterConfig {
         crate::config::RouterConfig {
             alpha: 0.0,
             beta: 0.5,
@@ -3111,12 +3048,6 @@ mod tests {
             epsilon: 0.3,
             knn_min_records: 10,
             knn_k: 7,
-            automix: crate::config::AutomixConfig {
-                confidence_threshold: 0.7,
-                cheap_model_tiers: vec!["mini".into(), "ollama".into()],
-                premium_model_id: "openai/model-premium".into(),
-                ..Default::default()
-            },
             models: vec![
                 crate::config::RouterModelConfig {
                     model_id: "model-mini".into(),
@@ -3141,93 +3072,10 @@ mod tests {
             ],
         }
     }
-
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn test_automix_escalates_on_low_confidence() {
-        super::automix_integration_tests::run_case(true).await.unwrap();
-    }
-
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn test_automix_skips_escalation_on_high_confidence() {
-        super::automix_integration_tests::run_cheap_outcome_case(false, 1)
-            .await
-            .unwrap();
-    }
-
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn test_automix_legacy_disabled_flag_is_ignored() {
-        // No legacy enable flag exists in RouterConfig: configured Automix remains active.
-        super::automix_integration_tests::run_case(false).await.unwrap();
-    }
-
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn test_cost_tracking() {
-        super::automix_integration_tests::run_case(true).await.unwrap();
-    }
-
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn test_automix_escalation_failure_keeps_cheap_attribution() {
-        super::automix_integration_tests::run_cheap_outcome_case(true, 1)
-            .await
-            .unwrap();
-    }
-
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn test_automix_failure_records_elo_on_cheap_model() {
-        super::automix_integration_tests::run_cheap_outcome_case(true, 1)
-            .await
-            .unwrap();
-    }
-
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn repeated_actual_turns_have_unique_cost_and_learning_receipts() {
-        super::automix_integration_tests::run_cheap_outcome_case(false, 5)
-            .await
-            .unwrap();
-    }
-
-    #[cfg(feature = "llm-router")]
-    #[tokio::test]
-    async fn test_multiple_cost_events_no_overwrite() {
-        // Direct helper coverage stays distinct from canonical runtime settlement.
-        let workspace = tempfile::tempdir().unwrap();
-        let builder = embedded_builder(workspace.path());
-        let memory = Arc::clone(builder.memory.as_ref().unwrap());
-        let agent = builder.build().unwrap();
-
-        for index in 0..5 {
-            let mut event = RouterCostEvent::new("openai/model-cheap");
-            event.total_cost_usd = index as f32 + 0.1;
-            agent.append_router_cost_event(&event).await;
-        }
-
-        let prefix = format!("router/cost/{}/", chrono::Utc::now().format("%Y-%m-%d"));
-        let entries: Vec<_> = memory
-            .list(
-                Some(&MemoryCategory::Custom("router".into())),
-                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
-            )
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.key.starts_with(&prefix))
-            .collect();
-        let unique_keys: std::collections::HashSet<_> = entries.iter().map(|entry| entry.key.clone()).collect();
-
-        assert_eq!(entries.len(), 5);
-        assert_eq!(unique_keys.len(), 5);
-    }
 }
 
 #[cfg(all(test, feature = "llm-router"))]
-mod automix_integration_tests;
+mod retired_escalation_tests;
 
 #[cfg(test)]
 pub(crate) mod native_decision_fixture;

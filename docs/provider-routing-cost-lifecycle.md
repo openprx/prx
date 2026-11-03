@@ -159,16 +159,6 @@ turns on the same Agent share its scoped statistics. Reconstructing an Agent or
 restarting its process does not resume an earlier session's statistics, even
 with the same database. There is no public cross-process session restore API.
 
-The 2026-10-04 refusal-only AutoMix state is superseded by the 2026-10-05 source
-addendum. Supported premium calls reuse the actual registered provider instance,
-validate its pinned model binding and obtain separate accounting within the same
-original deadline and allowance. Known main usage is settled first with the same
-terminal settlement ID; main trace and charge are not rewritten as premium usage.
-Failure or unknown premium completion retains the cheap result and the actual
-auxiliary liability. A successful premium reply has a verified served-outcome
-link, with an authenticated event for recorded replay. Recording-off may retain
-only a private current-owner observation, without claiming durable replay.
-
 Supported configured embeddings and Channel vision summaries likewise require
 purpose-specific owned accounting and actual transport matching. An ordinary
 chat decision alone is insufficient. The non-image Channel path needs no

@@ -43,10 +43,9 @@ old session statistics. See [Router](router.md) and
 
 The separate billing-bound transport contract (H1) remains open. Static prices,
 timeouts and post-hoc accounting do not authorize another physical send. Paid
-embedding, premium AutoMix retry and Channel auxiliary vision summaries retain
-`BudgetUnproven`; auxiliary vision summaries are unavailable. AutoMix retains
-the actual cheap response/trace when declining escalation. This is an explicit
-feature limitation, not completion of those paid paths.
+embedding and Channel auxiliary vision summaries retain `BudgetUnproven`;
+auxiliary vision summaries are unavailable. This is an explicit feature
+limitation, not completion of those paid paths.
 
 ## Configuration migration and rollback
 

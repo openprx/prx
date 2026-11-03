@@ -669,9 +669,6 @@ pub(crate) struct TurnDecisionContext {
     recursive_allowance: std::sync::OnceLock<recursive_allowance::ContextAllowance>,
     main_parameters: std::sync::OnceLock<crate::providers::parameter_capture::Capture>,
     execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
-    #[cfg(feature = "llm-router")]
-    automix_deadline: std::sync::OnceLock<std::time::Instant>,
-    served_auxiliary: std::sync::OnceLock<crate::agent::terminal::served_auxiliary::ServedAuxiliaryLink>,
     execution_closed: AtomicBool,
     approval_collection_started: AtomicBool,
     collected_approval_result: std::sync::OnceLock<Box<pending_approval::CollectedApprovalResult>>,
@@ -1125,18 +1122,6 @@ impl TurnDecisionContext {
             );
             Ok(())
         }
-    }
-
-    pub(crate) fn served_auxiliary(&self) -> Option<&crate::agent::terminal::served_auxiliary::ServedAuxiliaryLink> {
-        self.served_auxiliary.get()
-    }
-    pub(crate) fn bind_served_auxiliary(
-        &self,
-        link: crate::agent::terminal::served_auxiliary::ServedAuxiliaryLink,
-    ) -> anyhow::Result<()> {
-        self.served_auxiliary
-            .set(link)
-            .map_err(|_| anyhow::anyhow!("auxiliary reply already bound"))
     }
 
     pub(crate) fn terminal_execution_trace(&self) -> crate::tools::capability::execution_trace::ExecutionTraceSnapshot {
@@ -2656,9 +2641,6 @@ impl TurnDecisionService {
                 recursive_allowance: self.recursive_allowances.retain(proof),
                 main_parameters: Default::default(),
                 execution_trace: std::sync::OnceLock::new(),
-                #[cfg(feature = "llm-router")]
-                automix_deadline: std::sync::OnceLock::new(),
-                served_auxiliary: std::sync::OnceLock::new(),
                 execution_closed: AtomicBool::new(false),
                 approval_collection_started: AtomicBool::new(false),
                 collected_approval_result: std::sync::OnceLock::new(),
@@ -2714,9 +2696,6 @@ impl TurnDecisionService {
                         recursive_allowance: self.recursive_allowances.retain(proof),
                         main_parameters: Default::default(),
                         execution_trace: std::sync::OnceLock::new(),
-                        #[cfg(feature = "llm-router")]
-                        automix_deadline: std::sync::OnceLock::new(),
-                        served_auxiliary: std::sync::OnceLock::new(),
                         execution_closed: AtomicBool::new(false),
                         approval_collection_started: AtomicBool::new(false),
                         collected_approval_result: std::sync::OnceLock::new(),
@@ -2995,9 +2974,6 @@ impl TurnDecisionService {
                             recursive_allowance: self.recursive_allowances.retain(proof),
                             main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
-                            #[cfg(feature = "llm-router")]
-                            automix_deadline: std::sync::OnceLock::new(),
-                            served_auxiliary: std::sync::OnceLock::new(),
                             execution_closed: AtomicBool::new(false),
                             approval_collection_started: AtomicBool::new(false),
                             collected_approval_result: std::sync::OnceLock::new(),
@@ -3041,9 +3017,6 @@ impl TurnDecisionService {
                             recursive_allowance: self.recursive_allowances.retain(proof),
                             main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
-                            #[cfg(feature = "llm-router")]
-                            automix_deadline: std::sync::OnceLock::new(),
-                            served_auxiliary: std::sync::OnceLock::new(),
                             execution_closed: AtomicBool::new(false),
                             approval_collection_started: AtomicBool::new(false),
                             collected_approval_result: std::sync::OnceLock::new(),
@@ -3098,9 +3071,6 @@ impl TurnDecisionService {
                             recursive_allowance: self.recursive_allowances.retain(proof),
                             main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
-                            #[cfg(feature = "llm-router")]
-                            automix_deadline: std::sync::OnceLock::new(),
-                            served_auxiliary: std::sync::OnceLock::new(),
                             execution_closed: AtomicBool::new(false),
                             approval_collection_started: AtomicBool::new(false),
                             collected_approval_result: std::sync::OnceLock::new(),

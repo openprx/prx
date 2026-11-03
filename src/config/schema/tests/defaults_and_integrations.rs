@@ -810,25 +810,10 @@ async fn read_only_defaults_without_a_config_create_nothing() {
 }
 
 #[test]
-async fn test_router_config_rejects_invalid_threshold() {
-    let mut config = RouterConfig::default();
-    config.automix.confidence_threshold = 1.5;
-    config.automix.premium_model_id = "openai/model-premium".to_string();
-    assert!(config.validate().is_err());
-}
-
-#[test]
 async fn test_router_config_rejects_negative_weight() {
     let mut config = RouterConfig::default();
     config.alpha = -0.1;
     assert!(config.validate().is_err());
-}
-
-#[test]
-async fn test_router_config_allows_empty_premium_model_without_automix() {
-    let mut config = RouterConfig::default();
-    config.automix.premium_model_id = String::new();
-    assert!(config.validate().is_ok());
 }
 
 #[test]

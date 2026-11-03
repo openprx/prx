@@ -29,3 +29,5 @@ mod structure;
 mod tool_scanner;
 mod tool_tables;
 mod tool_tests;
+
+mod retired_feature;

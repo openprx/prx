@@ -300,7 +300,7 @@ connection bindings and routes without a matching instance are refused. A
 route-specific credential selection may retain its hint in the source proof,
 while execution uses its resolved provider/model pair. The shared engine checks
 that pair against the proof before calling the selected instance.
-Injected-router escalation and automatic task delegation remain migration gaps;
+Automatic task delegation remains a migration gap;
 delegation is explicitly rejected before input recording until it can use
 admitted child execution.
 

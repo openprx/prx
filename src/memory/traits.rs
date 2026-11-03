@@ -3223,8 +3223,8 @@ impl RouterLearningEvidence {
     }
     fn actual_terminal_outcome(value: &serde_json::Value) -> anyhow::Result<(String, String, bool)> {
         use crate::llm::route_decision::{AttemptStatus, ExecutionStatus, ProviderExecutionOutcome};
-        // The terminal finalizer authenticates an actual auxiliary event and
-        // projects its serving outcome separately from main usage settlement.
+        // Historical v1 records authenticate an auxiliary event and project
+        // its serving outcome separately from main usage settlement.
         let outcome_value = if let Some(served) = value.get("served_auxiliary") {
             served
                 .get("provider_outcome")

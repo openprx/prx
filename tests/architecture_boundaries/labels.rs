@@ -360,11 +360,6 @@ pub(super) fn provider_label_sinks_redact_url_userinfo() {
             "redact_endpoint_userinfo(&candidate.provider)",
         ),
         (
-            "src/agent/embedded_source.rs",
-            "pub(super) async fn record_automix_budget_refusal(",
-            "redact_endpoint_userinfo(premium)",
-        ),
-        (
             "src/router/context.rs",
             "pub fn shown_provider(",
             "redact_endpoint_userinfo(&self.selected_provider)",

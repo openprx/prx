@@ -331,9 +331,6 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             recursive_allowance: Default::default(),
             main_parameters: Default::default(),
             execution_trace: std::sync::OnceLock::new(),
-            #[cfg(feature = "llm-router")]
-            automix_deadline: std::sync::OnceLock::new(),
-            served_auxiliary: std::sync::OnceLock::new(),
             execution_closed: AtomicBool::new(false),
             approval_collection_started: AtomicBool::new(false),
             collected_approval_result: std::sync::OnceLock::new(),

@@ -7,7 +7,7 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 ## Highlights
 
 - **Broad LLM provider catalog** — Anthropic (Console API key), OpenAI, Google Gemini (API key), Ollama, AWS Bedrock, GLM, OpenAI Codex via Sign in with ChatGPT, local runtimes, and compatible endpoints. GitHub Copilot login is disabled. Provider requests send `User-Agent: prx/<version>`.
-- **LLM Router** — heuristic routing (capability + Elo + cost + latency), KNN semantic routing (cold-start guard + 100ms timeout fallback), and Automix low-confidence auto-upgrade
+- **LLM Router** — heuristic routing (capability + Elo + cost + latency), KNN semantic routing (cold-start guard + 100ms timeout fallback)
 - **Causal Tree Engine** — admitted decisions with rehearsal, scoring, and circuit breaker; enabled by default with the built-in backend
 - **Multi-channel messaging** — Signal, WhatsApp, Telegram, Discord, Slack, opt-in Matrix, and more
 - **Built-in tools and integrations** — shell, MCP, memory, scheduling, remote nodes, and an integration catalog
@@ -22,7 +22,6 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 
 - heuristic model routing is always available
 - semantic KNN scoring activates when embeddings and history are available
-- cheap-first, low-confidence upgrade activates when a premium model is configured
 
 ### Causal Tree Engine Flags
 

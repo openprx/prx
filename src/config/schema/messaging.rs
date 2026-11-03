@@ -157,8 +157,7 @@ pub struct SmartGroupConfig {
     #[serde(default)]
     pub classifier_provider: String,
     /// Model id for the Tier-2 classifier. When empty, the admitted channel
-    /// route's model is resolved. Set this to a cheap-tier model id (e.g. one listed in
-    /// `router.automix.cheap_model_tiers`) to minimize cost.
+    /// route's model is resolved. Set a lower-cost model id to minimize cost.
     #[serde(default)]
     pub classifier_model: String,
     /// Per-call timeout (seconds) for the Tier-2 classifier. On timeout the

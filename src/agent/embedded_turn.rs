@@ -563,8 +563,6 @@ async fn run_work(
         ))
         .await;
     // Preserve interrupted tool history even if the terminal reports failure.
-    #[cfg(feature = "llm-router")]
-    let cheap_reply_at = std::time::Instant::now();
     history.finish(agent.tool_dispatcher.as_ref());
     let (outcome, trace) = match result {
         Ok(result) => result,
@@ -573,8 +571,6 @@ async fn run_work(
             return Err(error);
         }
     };
-    #[cfg(feature = "llm-router")]
-    let automix_eligible = matches!(&outcome, ToolLoopOutcome::Text(_));
     let (status, text) = match outcome {
         ToolLoopOutcome::Text(text) | ToolLoopOutcome::AwaitingApproval { reply: text } => {
             (TurnTerminalStatus::Completed, text)
@@ -593,132 +589,6 @@ async fn run_work(
         None
     };
     let provider = crate::agent::terminal::provider_outcome_from_trace(&route, started_at, trace);
-    #[cfg(feature = "llm-router")]
-    let (mut guard, mut text) = (guard, text);
-    #[cfg(feature = "llm-router")]
-    if let (Some(router), Some((served_model, _))) = (&agent.router, &served) {
-        if let Some(automix) = router.automix_config() {
-            if automix_eligible
-                && !automix.premium_model_id.trim().is_empty()
-                && crate::router::automix::is_cheap_model_target(served_model, &automix.cheap_model_tiers)
-                && crate::router::automix::should_escalate(
-                    crate::router::automix::ConfidenceChecker::check_rules(&text, input),
-                    automix.confidence_threshold,
-                )
-                && let Some(continuation) = guard
-                    .settle_main_before_auxiliary(&provider, &cancellation, cheap_reply_at)
-                    .await?
-            {
-                use crate::runtime::auxiliary_call::{AuxiliaryProviderCall, AuxiliaryPurpose};
-                // This read-only selection performs no provider call. Admission
-                // rechecks the selected binding and captures this same actual Arc.
-                #[cfg(test)]
-                let mut admission_stage = "requested_selection";
-                let admission = (|| -> anyhow::Result<_> {
-                    let (provider, model) = service.automix_requested_selection(&continuation, source, &decision)?;
-                    #[cfg(test)]
-                    {
-                        admission_stage = "registered_selection";
-                    }
-                    let selected = source.select_auxiliary_model(&provider, &model)?;
-                    #[cfg(test)]
-                    {
-                        admission_stage = "accounting_selection";
-                    }
-                    let scope =
-                        service.automix_accounting_with_selection(continuation, source, &decision, &selected)?;
-                    Ok((selected, scope))
-                })();
-                if let Ok((selected, scope)) = admission {
-                    let (premium_provider, premium_model) = selected.choice().resolved_selection();
-                    let premium_route = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
-                        premium_provider.to_owned(),
-                        premium_model.to_owned(),
-                        source.owner_id().to_owned(),
-                        source.session_key().to_owned(),
-                        source.source_event_id().map(str::to_owned),
-                        None,
-                        "automix_premium",
-                        u32::try_from(input.chars().count() / 4).unwrap_or(u32::MAX),
-                        false,
-                        false,
-                    );
-                    let call = AuxiliaryProviderCall::new_accounted(
-                        AuxiliaryPurpose::AutomixPremium,
-                        premium_route,
-                        scope.as_ref(),
-                    );
-                    guard.register_auxiliary_call(Arc::clone(&call))?;
-                    let mut messages = agent.tool_dispatcher.to_provider_messages(&agent.history);
-                    // Retry the existing user/tool context, not the cheap answer
-                    // as a new user instruction. No tool capability is supplied.
-                    anyhow::ensure!(
-                        messages
-                            .last()
-                            .is_some_and(|message| message.role == "assistant" && message.content == text),
-                        "Automix main history differs from completed reply"
-                    );
-                    messages.pop();
-                    call.begin()?;
-                    let actual_provider = selected.provider();
-                    let premium = tokio::select! {
-                        biased;
-                        () = cancellation.cancelled() => Err(anyhow::anyhow!("Automix cancelled")),
-                        result = crate::providers::attempt_accounting::chat_traced(
-                            actual_provider.as_ref(), crate::providers::ChatRequest { messages: &messages, tools: None },
-                            premium_model, agent.temperature, scope) => result,
-                    };
-                    if let Ok(premium) = premium {
-                        call.complete(&premium)?;
-                        if !premium.response.has_tool_calls() && !premium.response.text_or_empty().trim().is_empty() {
-                            call.mark_served(premium.response.text_or_empty())?;
-                            text = premium.response.text_or_empty().to_owned();
-                            messages.push(ChatMessage::assistant(&text));
-                            agent.history = agent.tool_dispatcher.restore_history(messages);
-                        }
-                    }
-                    if cancellation.is_cancelled() {
-                        let error = anyhow::anyhow!("Automix cancelled");
-                        guard.finish_failure(&error, true).await?;
-                        return Err(error);
-                    }
-                    // Failure/unknown keeps the cheap answer; the guard still
-                    // owns and persists the actual auxiliary observation.
-                } else {
-                    #[cfg(test)]
-                    if let Err(error) = &admission {
-                        // Only exact static source messages are classified. Never print
-                        // arbitrary errors, endpoints, credentials or guarded body data.
-                        let reason = match error.to_string().as_str() {
-                            "auxiliary call requires a running decision" => "not_running",
-                            "auxiliary decision deadline expired" => "deadline",
-                            "auxiliary source model resolution refused" => "source_model",
-                            "auxiliary configured premium model is unavailable" => "premium_pmm",
-                            "auxiliary premium selection exceeds child model scope" => "child_scope",
-                            "auxiliary registered provider selection differs" => "selected_binding",
-                            "auxiliary call has no cleanup owner" => "cleanup_owner",
-                            "auxiliary provider accounting target is unsupported" => "physical_descriptor",
-                            "enabled auxiliary accounting requires durable source recording" => "durable_source",
-                            "embedded Agent selected credential source differs from the provider factory" => {
-                                "credential_source"
-                            }
-                            "embedded Agent selected route requires a different provider connection; register its actual instance" => {
-                                "registered_connection"
-                            }
-                            "decision has no executable selection" => "decision_selection",
-                            "decision belongs to another service" => "service_identity",
-                            "execution decision belongs to another ingress actor" => "actor_identity",
-                            "decision input changed" => "input_identity",
-                            "decision catalog changed" => "catalog_generation",
-                            _ => "unclassified_redacted",
-                        };
-                        eprintln!("PRX_AUTOMIX_ADMISSION_DIAGNOSTIC stage={admission_stage} reason={reason}");
-                    }
-                    source.record_automix_budget_refusal(&automix.premium_model_id).await?;
-                }
-            }
-        }
-    }
     // The shared engine may compact history or append tool exchanges.
     // Only its completed history is authoritative for this projection.
     let history_commit_len = agent.history.len();

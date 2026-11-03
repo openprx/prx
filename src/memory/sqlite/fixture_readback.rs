@@ -48,13 +48,13 @@ pub(crate) fn router_consumption_count(
     )
 }
 
-/// Fixed observations of the actual Automix receipts; connection stays private.
+/// Fixed observations of the actual Router receipts; connection stays private.
 #[cfg(feature = "llm-router")]
-pub(crate) struct AutomixReadback {
+pub(crate) struct RouterReadback {
     connection: rusqlite::Connection,
 }
 #[cfg(feature = "llm-router")]
-impl AutomixReadback {
+impl RouterReadback {
     pub(crate) fn open(workspace: &std::path::Path) -> rusqlite::Result<Self> {
         Ok(Self {
             connection: rusqlite::Connection::open_with_flags(
@@ -67,25 +67,6 @@ impl AutomixReadback {
         self.connection.query_row(
             "SELECT COUNT(*) FROM message_events WHERE event_type='provider.auxiliary.settled'",
             [],
-            |row| row.get(0),
-        )
-    }
-    pub(crate) fn auxiliary_payload(&self) -> rusqlite::Result<String> {
-        self.connection.query_row(
-            "SELECT raw_payload_json FROM message_events WHERE event_type='provider.auxiliary.settled'",
-            [],
-            |row| row.get(0),
-        )
-    }
-    pub(crate) fn auxiliary_terminal_count(&self, run: &str, workspace: &str) -> rusqlite::Result<i64> {
-        self.connection.query_row(
-            "SELECT COUNT(*) FROM message_events a JOIN message_events t
-             ON a.workspace_id=t.workspace_id AND a.owner_id=t.owner_id
-               AND a.session_key=t.session_key AND a.run_id=t.run_id
-             WHERE a.event_type='provider.auxiliary.settled' AND t.event_type='turn.finalized'
-               AND a.id<t.id AND t.run_id=?1 AND a.workspace_id=?2
-               AND a.idempotency_key=('turn:' || t.run_id || ':automix_premium')",
-            rusqlite::params![run, workspace],
             |row| row.get(0),
         )
     }

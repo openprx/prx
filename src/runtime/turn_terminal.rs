@@ -1,9 +1,5 @@
 //! Exact terminal proposals retained across cancellation and future drop.
-#[cfg(feature = "llm-router")]
-mod automix;
 use crate::runtime::turn_decision::TurnDecisionService;
-#[cfg(feature = "llm-router")]
-pub(crate) use automix::SettledAutomixContinuation;
 use std::sync::Arc;
 
 /// Observer-owned projection of confirmed segment usage, bounded by this task's
@@ -82,7 +78,6 @@ impl TerminalUsageCollector {
     async fn record_with_recovery(
         &self,
         receipt: &crate::agent::terminal::TurnTerminalReceipt,
-        context: &crate::runtime::turn_decision::TurnDecisionContext,
         envelope: &crate::runtime::envelope::RuntimeEnvelope,
     ) -> anyhow::Result<()> {
         self.record(receipt)?;
@@ -289,8 +284,6 @@ pub(crate) struct TurnTerminalGuard {
 
 #[derive(Default)]
 struct TerminalState {
-    #[cfg(feature = "llm-router")]
-    automix_claimed: bool,
     pending: Option<crate::agent::terminal::TurnTerminalDraft>,
     finished: bool,
 }
@@ -336,104 +329,6 @@ impl TurnTerminalGuard {
         ensure_purpose_unclaimed(&self.auxiliary_calls, &call)?;
         self.auxiliary_calls.push(call);
         Ok(())
-    }
-
-    /// Persist the existing main aggregate settlement before an additional
-    /// paid call. This does not reinterpret the main trace as per-attempt usage.
-    #[cfg(feature = "llm-router")]
-    pub(crate) async fn settle_main_before_auxiliary(
-        &self,
-        outcome: &crate::llm::route_decision::ProviderExecutionOutcome,
-        cancellation: &tokio_util::sync::CancellationToken,
-        cheap_reply_at: std::time::Instant,
-    ) -> anyhow::Result<Option<SettledAutomixContinuation>> {
-        use crate::llm::route_decision::TokenUsageSource;
-        if cancellation.is_cancelled() || !self.claim_automix_continuation(outcome)? {
-            return Ok(None);
-        }
-        let usage = &outcome.tokens_used;
-        if !matches!(usage.source, TokenUsageSource::Reported)
-            || usage.prompt_tokens.is_none()
-            || usage.completion_tokens.is_none()
-            || self
-                .provider_trace
-                .as_ref()
-                .is_some_and(|(trace, _)| trace.has_unknown_usage())
-        {
-            return Ok(None);
-        }
-        let terminal_id = self
-            .envelope
-            .run_id
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("main settlement has no issued run"))?;
-        let Some(record) = crate::agent::terminal::usage_settlement(terminal_id, outcome, &self.config.cost)
-            .filter(|record| record.cost_usd.is_some())
-        else {
-            return Ok(None);
-        };
-        let deadline = self
-            .context
-            .begin_automix_window(cheap_reply_at, self.config.router.automix.escalation_window_ms)?;
-        if std::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        let owner = self
-            .cleanup_ticket
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("main settlement cleanup owner missing"))?
-            .owner();
-        let ticket = owner.register(tokio_util::sync::CancellationToken::new())?;
-        let fabric = self.fabric.clone();
-        let scope = self.envelope.message_scope();
-        let cost = self.config.cost.clone();
-        let workspace = self.config.workspace_dir.clone();
-        let terminal_id = terminal_id.to_owned();
-        let job = tokio::spawn(async move {
-            let result = async {
-                let payload = serde_json::to_string(&record)?;
-                let event = fabric
-                    .record_runtime_event_idempotent(
-                        scope,
-                        "usage.settled",
-                        format!("settlement_id={terminal_id}"),
-                        Some(payload.clone()),
-                        format!("turn:{terminal_id}:usage"),
-                    )
-                    .await?;
-                anyhow::ensure!(
-                    event.id <= 0 || event.raw_payload_json.as_deref() == Some(payload.as_str()),
-                    "main usage settlement conflicts"
-                );
-                let settled = crate::runtime::blocking::spawn_blocking(move || {
-                    crate::cost::tracker::CostTracker::for_workspace(cost, &workspace)?.settle_metered(&record)
-                })
-                .await??;
-                anyhow::ensure!(
-                    matches!(
-                        settled,
-                        crate::cost::types::CostSettlement::Recorded { .. }
-                            | crate::cost::types::CostSettlement::Replayed
-                    ),
-                    "main cost settlement is not confirmed"
-                );
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            ticket.finish(result.is_ok());
-            result
-        });
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), job).await {
-            Ok(joined) => {
-                joined??;
-                if cancellation.is_cancelled() || std::time::Instant::now() >= deadline {
-                    return Ok(None);
-                }
-                Ok(Some(self.settled_automix_continuation(cancellation.clone())))
-            }
-            // The owned task and ticket remain alive until real I/O finishes.
-            Err(_) => Ok(None),
-        }
     }
 
     pub(crate) fn with_child_cleanup(
@@ -546,14 +441,7 @@ impl TurnTerminalGuard {
             .pending
             .clone()
             .ok_or_else(|| anyhow::anyhow!("runtime terminal proposal missing"))?;
-        persist_auxiliary_replies(
-            &self.auxiliary_calls,
-            &self.fabric,
-            &self.config,
-            &self.context,
-            &mut proposal,
-        )
-        .await?;
+        persist_auxiliary_replies(&self.auxiliary_calls, &self.fabric, &self.config, &mut proposal).await?;
         // Settling a completed auxiliary call does not assert parent or child
         // completion. Preserve its known cost even when descendant drain fails.
         if let Some(cleanup) = &self.child_cleanup {
@@ -623,21 +511,15 @@ async fn persist_auxiliary_events(
     (receipts, failures)
 }
 
-/// Persist every auxiliary receipt, bind a served reply, and only then report
+/// Persist every auxiliary receipt and only then report
 /// any failure so one bad call never hides another's receipt.
 async fn persist_auxiliary_replies(
     calls: &[Arc<super::auxiliary_call::AuxiliaryProviderCall>],
     fabric: &crate::memory::MemoryFabric,
     config: &crate::config::Config,
-    context: &crate::runtime::turn_decision::TurnDecisionContext,
     proposal: &mut crate::agent::terminal::TurnTerminalDraft,
 ) -> anyhow::Result<()> {
-    let (receipts, mut failures) = persist_auxiliary_events(calls, fabric, config, proposal).await;
-    for (call, event) in receipts {
-        if let Err(error) = bind_served_auxiliary(&call, context, proposal, event) {
-            failures.push(format!("{}: {error:#}", call.purpose_label()));
-        }
-    }
+    let (_, failures) = persist_auxiliary_events(calls, fabric, config, proposal).await;
     anyhow::ensure!(
         failures.is_empty(),
         "auxiliary receipt persistence failed: {}",
@@ -785,26 +667,7 @@ mod auxiliary_registration_tests {
     }
 }
 
-/// Both normal commit and interrupted pending-commit recovery use the same
-/// real receipt binding. A successful auxiliary observation never turns a
-/// Failed/Cancelled parent into a Completed reply.
-fn bind_served_auxiliary(
-    call: &super::auxiliary_call::AuxiliaryProviderCall,
-    context: &crate::runtime::turn_decision::TurnDecisionContext,
-    proposal: &crate::agent::terminal::TurnTerminalDraft,
-    event: Option<crate::memory::MessageEvent>,
-) -> anyhow::Result<()> {
-    if proposal.status == crate::agent::terminal::TurnTerminalStatus::Completed && context.served_auxiliary().is_none()
-    {
-        if let Some(link) =
-            crate::agent::terminal::served_auxiliary::ServedAuxiliaryLink::from_call(call, proposal, event)?
-        {
-            context.bind_served_auxiliary(link)?;
-        }
-    }
-    Ok(())
-}
-
+/// Commit through the shared finalizer before rejoining the decision journal.
 async fn finalize_and_rejoin(
     service: &TurnDecisionService,
     fabric: &crate::memory::MemoryFabric,
@@ -876,7 +739,7 @@ impl Drop for TurnTerminalGuard {
                         super::turn_cleanup::diagnostic::StageName::TerminalDropFinalize,
                     );
                     let result = async {
-                        persist_auxiliary_replies(&auxiliary_calls, &fabric, &config, &context, &mut proposal).await?;
+                        persist_auxiliary_replies(&auxiliary_calls, &fabric, &config, &mut proposal).await?;
                         if let Some(cleanup) = child_cleanup {
                             cleanup.wait().await?;
                         }

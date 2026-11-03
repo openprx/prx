@@ -2080,7 +2080,7 @@ transaction layer (`src/config/manage/`): `POST /api/config`,
    for chat, the default, each `[[model_routes]]` destination, each agent
    binding, each `reliability.fallback_providers` member (serving the
    default model) and `reliability.model_fallbacks` entry, each
-   `[[router.models]]` candidate, the automix premium model, each
+   `[[router.models]]` candidate, each
    task-routing `model_hint` and `sub_agent_model`, and the smart-group
    classifier; for embeddings, each `[[embedding_routes]]` destination and
    the memory embedder (`memory.embedding_provider`/`embedding_model`); for
@@ -2089,10 +2089,9 @@ transaction layer (`src/config/manage/`): `POST /api/config`,
    alters it; every selection is when `[providers]` (the
    `[[providers.models]]` declarations) changes; and every selection that
    names a route (`hint:<x>`) is when the routes change, so removing or
-   renaming a route that the default, an agent, a task-routing `model_hint`
-   or the automix premium model still names is refused (a task rule or the
-   premium tier is not read as a raw model once its route is gone). A
-   fallback provider must be able to serve the default model by name
+   renaming a route that the default, an agent, or a task-routing `model_hint`
+   still names is refused (a task rule is not read as a raw model once
+   its route is gone). A fallback provider must be able to serve the default model by name
    prefix, so changing the default model to one a
    `reliability.fallback_providers` member cannot serve is refused.
    A model the evidence rules out for its operation (for example a route to
@@ -2747,14 +2746,10 @@ The candidate's embedded Agent Router supports local heuristic ranking
 (capability + Elo + cost + latency). Scoped KNN requires an admitted history
 read, an authenticated embedding domain and enough records in the same source
 domain. The 2026-10-05 source addendum wires supported configured paid embeddings
-and AutoMix premium calls through per-physical-attempt accounting. Merely
+through per-physical-attempt accounting. Merely
 configuring a model is insufficient: source/model admission, a supported actual
 transport, pinned prices and remaining original token/money budgets are required.
-Automix uses its own window starting at the cheap reply:
-`router.automix.escalation_window_ms = 30000` by default, with an allowed range
-of `1..=120000` ms. Main settlement and premium reservation consume that window;
-the 500 ms decision and 100 ms Router budgets are unchanged. See the
-[current candidate addendum](router.md#source-addendum-2026-10-05) for scope,
+See the [current candidate addendum](router.md#source-addendum-2026-10-05) for scope,
 unsupported cases and verification status.
 
 Minimum router config (single reachable provider):
@@ -3059,8 +3054,7 @@ shared tool execution service and child cleanup/terminal path. A closed decision
 is honored; a different runnable action cannot silently invoke the parent model
 instead. Successful launch returns its bounded run identity after parent terminal
 commit; it does not claim the child task has completed. Full launch, model scope,
-cancellation and allocation acceptance remain pending. Injected-router escalation
-remains unsupported. See [embedded API admission](unified-turn-context.md#embedded-agent-api-admission)
+cancellation and allocation acceptance remain pending. See [embedded API admission](unified-turn-context.md#embedded-agent-api-admission)
 for remaining compatibility limits; CLI and gateway routing contracts are separate.
 
 Background chat approval waiters bind cleanup to an individual registration,

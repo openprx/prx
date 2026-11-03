@@ -380,45 +380,6 @@ impl PreparedReplay {
             None
         };
         let operator = operator::prepare(link, &source, trusted.task_id.as_deref()).await?;
-        let served_auxiliary = if let Some(served) = link.context.served_auxiliary() {
-            let event = served
-                .event()
-                .context("recorded auxiliary reply has no durable event")?;
-            let stored = link
-                .memory
-                .find_owned_message_event(&trusted.workspace_id, owner, &event.event_id)
-                .await?
-                .context("served auxiliary event is missing")?;
-            anyhow::ensure!(
-                serde_json::to_value(&stored)? == serde_json::to_value(event)?
-                    && event_scope(event) == persisted_scope(&commit.scope)
-                    && event.id > source.id,
-                "served auxiliary event differs from its issued turn"
-            );
-            let reply = &commit
-                .history
-                .as_ref()
-                .context("served auxiliary reply missing")?
-                .assistant_content;
-            served.validate_reply(reply)?;
-            super::served_auxiliary::validate_event(event, reply, &commit.terminal_id)?;
-            let persisted = super::redact_persisted_json(serde_json::json!({ "history": commit.history }));
-            let persisted_reply = persisted
-                .get("history")
-                .and_then(|history| history.get("assistant_content"))
-                .and_then(Value::as_str)
-                .context("persisted auxiliary reply missing")?;
-            Some(ServedAuxiliaryReplay {
-                event: event_binding(&recorded.key, AUXILIARY_DOMAIN, event)?,
-                persisted_reply_sha256: {
-                    use sha2::Digest;
-                    hex::encode(sha2::Sha256::digest(persisted_reply.as_bytes()))
-                },
-            })
-        } else {
-            None
-        };
-
         let collected_pending = link
             .context
             .collected_pending_event()
@@ -460,7 +421,7 @@ impl PreparedReplay {
             collected_declined,
             version: 1,
             router_read,
-            served_auxiliary,
+            served_auxiliary: None,
             parent,
             operator,
             workspace_id: trusted.workspace_id.to_string(),
@@ -1232,3 +1193,6 @@ pub(crate) fn reseal_payload_for_test(
     object.remove(BINDING_FIELD);
     PreparedReplay(binding).seal(key, payload, assistant)
 }
+
+#[cfg(all(test, unix, feature = "llm-router"))]
+mod legacy_tests;

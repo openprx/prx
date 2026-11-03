@@ -239,7 +239,7 @@ fn model_matches(model_id: &str, selected_model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentCompactionConfig, AutomixConfig, RouterModelConfig};
+    use crate::config::{AgentCompactionConfig, RouterModelConfig};
 
     /// INT-2B B4f M-1: the value the per-turn compaction line prints for the
     /// selected provider carries no URL userinfo; the provider itself is kept.
@@ -279,7 +279,6 @@ mod tests {
             epsilon: 0.1,
             knn_min_records: 10,
             knn_k: 7,
-            automix: AutomixConfig::default(),
             models,
         }
     }
