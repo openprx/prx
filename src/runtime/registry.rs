@@ -1812,7 +1812,9 @@ mod tests {
         // Whole-test safety net only: PID publication and OS reaping decide readiness.
         tokio::time::timeout(Duration::from_secs(60), async {
             let dir = tempfile::tempdir().expect("test: tempdir");
-            let pid_file = dir.path().join("grandchild.pid");
+            let long_dir = dir.path().join("process-group-".repeat(12));
+            std::fs::create_dir(&long_dir).expect("test: long PID directory");
+            let pid_file = long_dir.join("grandchild.pid");
             // `sh` forks `sleep` and then waits: killing only the direct child
             // would leave the grandchild running, which is exactly what `killpg`
             // is here to prevent.
@@ -1855,6 +1857,12 @@ mod tests {
                             .is_some_and(|prefix| label.starts_with(prefix))
                 })
                 .expect("test: leader must be registered");
+            assert!(label.len() > 200, "test: command must reach the truncation branch");
+            assert!(
+                leader.name.ends_with('…') && leader.name.len() <= 203 && leader.name.len() < label.len(),
+                "test: registered command must actually be truncated: {} bytes",
+                leader.name.len()
+            );
             assert!(leader.pgid.is_some(), "the leader must lead its own process group");
 
             let results = kill(leader.id, false).await;
