@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 fn check(deadline: Instant) -> anyhow::Result<()> {
-    anyhow::ensure!(Instant::now() < deadline, "Router history deadline expired");
+    anyhow::ensure!(
+        crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
+        "Router history deadline expired"
+    );
     Ok(())
 }
 
@@ -135,58 +138,69 @@ impl SqliteMemory {
     ) -> anyhow::Result<RouterHistoryRead> {
         evidence.validate(deadline)?;
         let pool = Arc::clone(&self.pool);
-        crate::runtime::blocking::spawn_blocking(move || {
-            check(deadline)?;
-            let connection = pool.write_until(deadline)?;
-            let _deadline = super::ingress_recovery::ConnectionDeadline::new(&connection, deadline)?;
-            let tx = connection.unchecked_transaction()?;
-            let sequence = source_sequence(&tx, &evidence)?;
-            // First selected read may observe an empty new history. It does not
-            // create either a mutable record or a history table.
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='router_history_v1')",
-                [],
-                |row| row.get(0),
-            )?;
-            let mut result = RouterHistoryRead {
-                source_sequence: sequence,
-                rows: Vec::new(),
-            };
-            if exists {
-                let key = evidence.domain.key()?;
-                // Count before materializing rows; the guarded projection and
-                // decoder below validate each value once before it is used.
-                let count: i64 = tx.query_row(
-                    "SELECT count(*) FROM (SELECT 1 FROM router_history_v1
-                    WHERE domain=?1 AND source_sequence<?2 AND terminal_sequence<?2 LIMIT ?3)",
-                    params![key, sequence, (ROUTER_HISTORY_MAX_RECORDS + 1) as i64],
+        #[cfg(test)]
+        let hook_clock = crate::causal_tree::logical_clock::capture();
+        {
+            let work = move || {
+                #[cfg(test)]
+                if let Some(clock) = hook_clock {
+                    clock.visit_site("router.sqlite-read");
+                }
+                check(deadline)?;
+                let connection = pool.write_until(deadline)?;
+                let _deadline = super::ingress_recovery::ConnectionDeadline::new(&connection, deadline)?;
+                let tx = connection.unchecked_transaction()?;
+                let sequence = source_sequence(&tx, &evidence)?;
+                // First selected read may observe an empty new history. It does not
+                // create either a mutable record or a history table.
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='router_history_v1')",
+                    [],
                     |row| row.get(0),
                 )?;
-                anyhow::ensure!(
-                    count <= ROUTER_HISTORY_MAX_RECORDS as i64,
-                    "Router history complete domain exceeds capacity"
-                );
-                check(deadline)?;
-                let mut statement = tx.prepare(&format!(
-                    "SELECT {COLUMNS} FROM router_history_v1
-                    WHERE domain=?1 AND source_sequence<?2 AND terminal_sequence<?2
-                    ORDER BY source_sequence,terminal_sequence LIMIT ?3"
-                ))?;
-                let mut rows = statement.query(params![key, sequence, (ROUTER_HISTORY_MAX_RECORDS + 1) as i64])?;
-                while let Some(row) = rows.next()? {
-                    check(deadline)?;
+                let mut result = RouterHistoryRead {
+                    source_sequence: sequence,
+                    rows: Vec::new(),
+                };
+                if exists {
+                    let key = evidence.domain.key()?;
+                    // Count before materializing rows; the guarded projection and
+                    // decoder below validate each value once before it is used.
+                    let count: i64 = tx.query_row(
+                        "SELECT count(*) FROM (SELECT 1 FROM router_history_v1
+                    WHERE domain=?1 AND source_sequence<?2 AND terminal_sequence<?2 LIMIT ?3)",
+                        params![key, sequence, (ROUTER_HISTORY_MAX_RECORDS + 1) as i64],
+                        |row| row.get(0),
+                    )?;
                     anyhow::ensure!(
-                        result.rows.len() < ROUTER_HISTORY_MAX_RECORDS,
+                        count <= ROUTER_HISTORY_MAX_RECORDS as i64,
                         "Router history complete domain exceeds capacity"
                     );
-                    result.rows.push(decode(row, &evidence.domain)?.0);
+                    check(deadline)?;
+                    let mut statement = tx.prepare(&format!(
+                        "SELECT {COLUMNS} FROM router_history_v1
+                    WHERE domain=?1 AND source_sequence<?2 AND terminal_sequence<?2
+                    ORDER BY source_sequence,terminal_sequence LIMIT ?3"
+                    ))?;
+                    let mut rows = statement.query(params![key, sequence, (ROUTER_HISTORY_MAX_RECORDS + 1) as i64])?;
+                    while let Some(row) = rows.next()? {
+                        check(deadline)?;
+                        anyhow::ensure!(
+                            result.rows.len() < ROUTER_HISTORY_MAX_RECORDS,
+                            "Router history complete domain exceeds capacity"
+                        );
+                        result.rows.push(decode(row, &evidence.domain)?.0);
+                    }
                 }
-            }
-            result.validate(&evidence.domain)?;
-            check(deadline)?;
-            tx.commit()?;
-            Ok(result)
-        })
+                result.validate(&evidence.domain)?;
+                check(deadline)?;
+                tx.commit()?;
+                Ok(result)
+            };
+            #[cfg(test)]
+            let work = crate::causal_tree::logical_clock::inherit_sync(work);
+            crate::runtime::blocking::spawn_blocking(work)
+        }
         .await?
     }
 
@@ -203,7 +217,8 @@ impl SqliteMemory {
         let key = domain.key()?;
         let evidence = evidence.terminal.clone();
         let pool = Arc::clone(&self.pool);
-        crate::runtime::blocking::spawn_blocking(move || {
+        {
+            let work = move || {
             check(deadline)?;
             let connection=pool.write_until(deadline)?;
             let _deadline=super::ingress_recovery::ConnectionDeadline::new(&connection,deadline)?;
@@ -245,7 +260,11 @@ impl SqliteMemory {
             anyhow::ensure!(record_sha256==fingerprint,"Router committed receipt conflicts");
             check(deadline)?;tx.commit()?;
             Ok(RouterHistoryCommitReceipt {terminal_event_id:event.event_id.clone(),record_sha256,replayed:false})
-        }).await?
+        };
+            #[cfg(test)]
+            let work = crate::causal_tree::logical_clock::inherit_sync(work);
+            crate::runtime::blocking::spawn_blocking(work)
+        }.await?
     }
 }
 
@@ -285,4 +304,18 @@ fn validate_terminal(tx: &Transaction<'_>, evidence: &RouterLearningEvidence) ->
         "Router history source sequence invalid"
     );
     Ok(sequence)
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn default_read_check_still_expires_on_the_unchanged_wall_deadline() {
+        assert!(!crate::causal_tree::logical_clock::installed());
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let error = check(deadline).expect_err("test: default reader must reject its expired wall deadline");
+        assert_eq!(error.to_string(), "Router history deadline expired");
+    }
 }

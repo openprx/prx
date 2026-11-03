@@ -143,13 +143,24 @@ async fn read_owned(
     cancellation: &CancellationToken,
 ) -> anyhow::Result<RouterHistoryRead> {
     let ticket = owner.register(cancellation.clone())?;
-    tokio::spawn(async move {
-        let result = memory.read_router_history(evidence, deadline).await;
-        // Reads have no ambiguous commit. A returned error still confirms that
-        // the backend completed; panic/drop leaves the ticket unconfirmed.
-        ticket.finish(true);
-        result
-    })
+    #[cfg(test)]
+    let hook_clock = crate::causal_tree::logical_clock::capture();
+    {
+        let work = async move {
+            #[cfg(test)]
+            if let Some(clock) = hook_clock {
+                clock.visit_site("router.read-owner");
+            }
+            let result = memory.read_router_history(evidence, deadline).await;
+            // Reads have no ambiguous commit. A returned error still confirms that
+            // the backend completed; panic/drop leaves the ticket unconfirmed.
+            ticket.finish(true);
+            result
+        };
+        #[cfg(test)]
+        let work = crate::causal_tree::logical_clock::inherit(work);
+        tokio::spawn(work)
+    }
     .await
     .context("Router history read owner task failed")?
 }
@@ -162,13 +173,24 @@ pub(crate) async fn commit_training_owned(
     cancellation: &CancellationToken,
 ) -> anyhow::Result<crate::memory::RouterHistoryCommitReceipt> {
     let ticket = owner.register(cancellation.clone())?;
-    tokio::spawn(async move {
-        let result = memory.commit_router_history(&evidence, deadline).await;
-        // An error during PostgreSQL COMMIT may leave its outcome unknown.
-        // The backend's real commit receipt is the only success acknowledgement.
-        ticket.finish(result.is_ok());
-        result
-    })
+    #[cfg(test)]
+    let hook_clock = crate::causal_tree::logical_clock::capture();
+    {
+        let work = async move {
+            #[cfg(test)]
+            if let Some(clock) = hook_clock {
+                clock.visit_site("router.commit-owner");
+            }
+            let result = memory.commit_router_history(&evidence, deadline).await;
+            // An error during PostgreSQL COMMIT may leave its outcome unknown.
+            // The backend's real commit receipt is the only success acknowledgement.
+            ticket.finish(result.is_ok());
+            result
+        };
+        #[cfg(test)]
+        let work = crate::causal_tree::logical_clock::inherit(work);
+        tokio::spawn(work)
+    }
     .await
     .context("Router history write owner task failed")?
 }
@@ -241,39 +263,50 @@ impl TurnDecisionService {
         let run = source.run_id().to_owned();
         let owner = Arc::clone(owner);
         let ticket = owner.register(cancellation.clone())?;
-        tokio::spawn(async move {
-            let result = async {
-                ensure!(
-                    Instant::now() < deadline,
-                    "Router read recording expired before queue admission"
-                );
-                let writer = store.writer().context("Router decision writer unavailable")?;
-                // Commit and decode the real scoped row in one writer job;
-                // a FIFO drain alone would not prove insertion succeeded.
-                let row = writer
-                    .record_and_replay(record, scope, deadline)
-                    .await?
-                    .context("Router selected read is not durable")?;
-                ensure!(
-                    row.digest == expected_digest
-                        && row.decision.decision_id == id
-                        && row.decision.prior_decision_id.is_none()
-                        && row.decision.has_owner
-                        && row.decision.enabled_snapshot
-                        && !row.decision.legacy_v1
-                        && row.source_event_id.as_deref() == Some(source_id.as_str())
-                        && row.decision.session_key.as_deref() == Some(session.as_str())
-                        && row.decision.run_id.as_deref() == Some(run.as_str()),
-                    "Router selected read differs from its durable owned row"
-                );
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            // A failed/expired write acknowledgement remains unknown; never
-            // clear it just because the caller stopped awaiting this job.
-            ticket.finish(result.is_ok());
-            result
-        })
+        #[cfg(test)]
+        let hook_clock = crate::causal_tree::logical_clock::capture();
+        {
+            let work = async move {
+                #[cfg(test)]
+                if let Some(clock) = hook_clock {
+                    clock.visit_site("router.record-owner");
+                }
+                let result = async {
+                    ensure!(
+                        crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
+                        "Router read recording expired before queue admission"
+                    );
+                    let writer = store.writer().context("Router decision writer unavailable")?;
+                    // Commit and decode the real scoped row in one writer job;
+                    // a FIFO drain alone would not prove insertion succeeded.
+                    let row = writer
+                        .record_and_replay(record, scope, deadline)
+                        .await?
+                        .context("Router selected read is not durable")?;
+                    ensure!(
+                        row.digest == expected_digest
+                            && row.decision.decision_id == id
+                            && row.decision.prior_decision_id.is_none()
+                            && row.decision.has_owner
+                            && row.decision.enabled_snapshot
+                            && !row.decision.legacy_v1
+                            && row.source_event_id.as_deref() == Some(source_id.as_str())
+                            && row.decision.session_key.as_deref() == Some(session.as_str())
+                            && row.decision.run_id.as_deref() == Some(run.as_str()),
+                        "Router selected read differs from its durable owned row"
+                    );
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                // A failed/expired write acknowledgement remains unknown; never
+                // clear it just because the caller stopped awaiting this job.
+                ticket.finish(result.is_ok());
+                result
+            };
+            #[cfg(test)]
+            let work = crate::causal_tree::logical_clock::inherit(work);
+            tokio::spawn(work)
+        }
         .await
         .context("Router selected read record owner task failed")?
     }
@@ -386,7 +419,8 @@ impl TurnDecisionService {
             can_deliver_text: false,
             may_delegate: false,
             delegation_target: None,
-            terminal_only: config.causal_tree.policy.max_decision_hops == 0 || Instant::now() >= deadline,
+            terminal_only: config.causal_tree.policy.max_decision_hops == 0
+                || crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline,
             allow_terminal_answer: false,
             deadline,
             #[cfg(test)]
@@ -481,7 +515,8 @@ impl TurnDecisionService {
             let owner =
                 crate::runtime::turn_cleanup::current_tracker().context("Router history cleanup owner missing")?;
             ensure!(
-                !cancellation.is_cancelled() && Instant::now() < history_deadline,
+                !cancellation.is_cancelled()
+                    && crate::causal_tree::logical_clock::deadline_now(history_deadline) < history_deadline,
                 "Router history read cancelled before dispatch"
             );
             failure_stage = "record";
@@ -496,7 +531,8 @@ impl TurnDecisionService {
                 ));
             }
             ensure!(
-                !cancellation.is_cancelled() && Instant::now() < history_deadline,
+                !cancellation.is_cancelled()
+                    && crate::causal_tree::logical_clock::deadline_now(history_deadline) < history_deadline,
                 "Router history read cancelled after selected-hop recording"
             );
             self.check_live_parity()?;
@@ -518,7 +554,8 @@ impl TurnDecisionService {
                 ));
             }
             ensure!(
-                !cancellation.is_cancelled() && Instant::now() < history_deadline,
+                !cancellation.is_cancelled()
+                    && crate::causal_tree::logical_clock::deadline_now(history_deadline) < history_deadline,
                 "Router history cancelled or expired"
             );
             read.validate(&domain)?;
@@ -590,7 +627,8 @@ impl TurnDecisionService {
             let task = crate::agent::classifier::classify_intent(&config.task_routing, routing_input);
             let ranked = continuation.router.rank_scoped_history(proof, task.intent, &scores)?;
             ensure!(
-                !cancellation.is_cancelled() && Instant::now() < history_deadline,
+                !cancellation.is_cancelled()
+                    && crate::causal_tree::logical_clock::deadline_now(history_deadline) < history_deadline,
                 "Router history ranking expired"
             );
             self.check_live_parity()?;
@@ -729,8 +767,12 @@ impl TurnDecisionService {
                 // The selected read and any completed local work really
                 // happened. Preserve its hop and close without retrying it.
                 let mut parts = state.trusted.parts().clone();
-                parts.budgets.latency_ms =
-                    u64::try_from(deadline.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(0);
+                parts.budgets.latency_ms = u64::try_from(
+                    deadline
+                        .saturating_duration_since(crate::causal_tree::logical_clock::deadline_now(deadline))
+                        .as_millis(),
+                )
+                .unwrap_or(0);
                 let remaining_budget = parts.budgets;
                 let mut next = state.clone();
                 next.trusted = TrustedState::from_runtime(parts);
@@ -788,7 +830,7 @@ fn history_diagnostic_point(
     (
         now.saturating_duration_since(started).as_micros(),
         cancellation.is_cancelled(),
-        now >= deadline,
+        crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline,
     )
 }
 

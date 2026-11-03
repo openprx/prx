@@ -31,6 +31,15 @@ tokio::task_local! {
     static CLOCK: Arc<ManualClock>;
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct SiteHook {
+    stall: Duration,
+    advance: Duration,
+    hits: usize,
+    on_clock: bool,
+}
+
 /// A deadline clock whose elapsed time changes only through [`ManualClock::advance`].
 #[cfg(test)]
 #[derive(Debug)]
@@ -39,6 +48,7 @@ pub(crate) struct ManualClock {
     elapsed_ms: watch::Sender<u64>,
     stall_ms: AtomicU64,
     advance_ms: AtomicU64,
+    sites: parking_lot::Mutex<std::collections::HashMap<&'static str, SiteHook>>,
     checkpoint: parking_lot::Mutex<Option<(&'static str, usize, Duration)>>,
 }
 
@@ -53,6 +63,7 @@ impl ManualClock {
             stall_ms: AtomicU64::new(0),
             advance_ms: AtomicU64::new(0),
             checkpoint: parking_lot::Mutex::new(None),
+            sites: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -93,6 +104,29 @@ impl ManualClock {
     /// Spend logical time on the Nth matching engine checkpoint.
     pub(crate) fn arm_checkpoint(&self, name: &'static str, occurrence: usize, by: Duration) {
         *self.checkpoint.lock() = Some((name, occurrence, by));
+    }
+
+    pub(crate) fn arm_site(&self, name: &'static str, stall: Duration, advance: Duration) {
+        self.sites.lock().insert(
+            name,
+            SiteHook {
+                stall,
+                advance,
+                hits: 0,
+                on_clock: true,
+            },
+        );
+    }
+
+    pub(crate) fn site_hits(&self, name: &'static str) -> usize {
+        self.sites.lock().get(name).map_or(0, |entry| entry.hits)
+    }
+
+    pub(crate) fn site_on_clock(&self, name: &'static str) -> bool {
+        self.sites
+            .lock()
+            .get(name)
+            .is_some_and(|entry| entry.hits > 0 && entry.on_clock)
     }
 
     #[cfg(test)]
@@ -220,4 +254,74 @@ pub(crate) fn checkpoint(checkpoint_name: &'static str) {
             }
         }
     }
+}
+
+/// Run the hook armed on this shared clock, independently of clock re-entry.
+/// Worker regression hooks must still stall when clock propagation is removed.
+#[cfg(test)]
+impl ManualClock {
+    pub(crate) fn visit_site(&self, name: &'static str) {
+        let action = {
+            let mut sites = self.sites.lock();
+            sites.get_mut(name).and_then(|entry| {
+                entry.hits += 1;
+                entry.on_clock &= current().is_some_and(|clock| std::ptr::eq(self, Arc::as_ptr(&clock)));
+                (entry.hits == 1).then_some((entry.stall, entry.advance))
+            })
+        };
+        if let Some((stall, advance)) = action {
+            std::thread::sleep(stall);
+            self.advance(advance);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn visit_site(name: &'static str) {
+    if let Some(clock) = current() {
+        clock.visit_site(name);
+    }
+}
+
+/// Read the installed test clock only for a deadline minted in its epoch.
+/// Other I/O keeps its independent wall deadline, even inside a decision scope.
+pub(crate) fn deadline_now(deadline: Instant) -> Instant {
+    #[cfg(test)]
+    if let Some(clock) = current()
+        && deadline >= clock.origin
+    {
+        return clock.instant();
+    }
+    let _ = deadline;
+    Instant::now()
+}
+
+#[cfg(test)]
+pub(crate) fn is_logical_deadline(deadline: Instant) -> bool {
+    current().is_some_and(|clock| deadline >= clock.origin)
+}
+
+#[cfg(test)]
+pub(crate) fn inherit_sync<F, R>(work: F) -> impl FnOnce() -> R + Send
+where
+    F: FnOnce() -> R + Send,
+{
+    let clock = capture();
+    move || match clock {
+        Some(clock) => sync_scope(clock, work),
+        None => work(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inherit<F: Future + Send + 'static>(
+    work: F,
+) -> std::pin::Pin<Box<dyn Future<Output = F::Output> + Send>> {
+    let clock = capture();
+    Box::pin(async move {
+        match clock {
+            Some(clock) => scope(clock, work).await,
+            None => work.await,
+        }
+    })
 }
