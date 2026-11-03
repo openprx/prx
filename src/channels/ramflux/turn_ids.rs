@@ -29,6 +29,7 @@ pub(super) struct TurnIds(Mutex<State>);
 pub(crate) struct Reservation {
     ids: Arc<TurnIds>,
     key: MessageKey,
+    host_id: Option<String>,
     generation: u64,
     pub(super) transferred: CancellationToken,
 }
@@ -61,7 +62,7 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.ids.release(&self.key, self.generation);
+        self.ids.release(&self.key, self.host_id.as_deref(), self.generation);
     }
 }
 
@@ -136,6 +137,7 @@ impl TurnIds {
         let owner = Arc::new(Reservation {
             ids: Arc::clone(self),
             key: key.clone(),
+            host_id: host.map(str::to_owned),
             generation,
             transferred: CancellationToken::new(),
         });
@@ -217,13 +219,11 @@ impl TurnIds {
         );
     }
 
-    fn release(&self, key: &MessageKey, generation: u64) {
+    fn release(&self, key: &MessageKey, host: Option<&str>, generation: u64) {
         let mut state = self.0.lock();
-        if state
-            .entries
-            .get(key)
-            .is_some_and(|entry| entry.generation == generation && entry.internal.is_none())
-        {
+        if state.entries.get(key).is_some_and(|entry| {
+            entry.generation == generation && entry.internal.is_none() && entry.host.as_deref() == host
+        }) {
             state.entries.remove(key);
         }
     }
