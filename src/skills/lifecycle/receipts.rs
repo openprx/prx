@@ -132,6 +132,11 @@ fn hold_millis(key: &str, before_start: bool) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
+pub(crate) fn before_start_hold_is_armed(workspace: &Path) -> bool {
+    hold_millis(&workspace_hold_key(workspace), true) > 0
+}
+
 /// Parks a blocking-pool thread until this workspace's before-start hold is
 /// cleared. The caller sets `entered` once the thread is inside the hold, so
 /// a test can queue the real worker only after the pool slot is taken.
