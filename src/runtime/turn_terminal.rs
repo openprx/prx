@@ -78,6 +78,7 @@ impl TerminalUsageCollector {
     async fn record_with_recovery(
         &self,
         receipt: &crate::agent::terminal::TurnTerminalReceipt,
+        context: &crate::runtime::turn_decision::TurnDecisionContext,
         envelope: &crate::runtime::envelope::RuntimeEnvelope,
     ) -> anyhow::Result<()> {
         self.record(receipt)?;
