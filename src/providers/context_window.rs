@@ -758,7 +758,10 @@ reserved_output_tokens = 8000"#,
 context_window = 16384"#,
         );
         crate::config::model_settings::validate_changes(None, &config).unwrap();
-        assert_eq!(crate::config::model_settings::warnings(&config).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            crate::config::model_settings::warnings(&config).unwrap(),
+            Vec::<String>::new()
+        );
         let result = settings_resolution(&config, "ollama", "my-local-model:latest");
         assert_eq!(result.config.max_context_tokens, 16_384);
         assert_eq!(result.max_context_source, ContextWindowSource::ModelSettings);
