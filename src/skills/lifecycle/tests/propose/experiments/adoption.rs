@@ -423,6 +423,16 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         let snapshot = f.store.query_adopted_lessons(&q)?;
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.entries[0].reference, reference);
+        let (roots, ancestors) = f.store.study_snapshot_provenance(&snapshot)?;
+        let mut expected_roots = snapshot.exclusions.iter().cloned().collect::<BTreeSet<_>>();
+        expected_roots.extend(serde_json::from_value::<Vec<String>>(record["value"]["excluded_roots"].clone())?);
+        assert_eq!(roots, expected_roots.into_iter().collect::<Vec<_>>());
+        assert!(ancestors.contains(&(journal.plan.spec().id.as_str().into(), journal.plan.digest().into())));
+        if probe_expiry {
+            clock.arm_site("lesson.provenance-lock", Duration::ZERO, Duration::from_millis(501));
+            let expired = f.store.study_snapshot_provenance(&snapshot).unwrap_err();
+            assert!(expired.to_string().contains("lesson lookup deadline exhausted; no partial snapshot is usable"));
+        }
         // Wall stall inside confirm's lookup. This fails when confirm is
         // outside the clock: the 500 ms budget is then real time.
         crate::skills::lifecycle::adoption::arm_lookup_wall_stall(std::time::Duration::from_millis(
@@ -806,6 +816,33 @@ async fn owned_attempts_then_retire(
                 .await?.context("genuine factory returned no context")?;
             assert_eq!(prepared.block(),block);assert_eq!(prepared.refs(),std::slice::from_ref(reference));
             assert_eq!(prepared.expected_user_slot_bytes(),u64::try_from(user.len())?);
+            // A fresh worker captures no decision clock, as in production.
+            // Exercise both handoff validations on that unchanged default path.
+            let default_store = Arc::clone(&f.store);
+            let default_plan = frozen.clone();
+            let default_binding = prepared.binding().clone();
+            let default_user = user.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                assert!(!crate::causal_tree::logical_clock::installed());
+                let default_prepared = default_store.prepare_verified_lesson_context(
+                    &default_plan, default_binding, &default_user, Utc::now())?
+                    .context("test: default factory returned no lesson context")?;
+                let guard = default_prepared.lock_handoff(&default_plan.spec().pins.model, Utc::now())?;
+                guard.recheck_target_locked(Utc::now())?;
+                assert!(!crate::causal_tree::logical_clock::installed(), "test: default handoff cannot install a clock");
+                Ok(())
+            }).await??;
+            if probe_expiry {
+                let before_expiry = server.count.load(Ordering::SeqCst);
+                clock.arm_site("experiment.handoff-lookup", Duration::ZERO, Duration::from_millis(501));
+                let expired = match prepared.lock_handoff(&frozen.spec().pins.model, Utc::now()) {
+                    Err(error) => error,
+                    Ok(_) => panic!("test: handoff must refuse after unchanged logical lookup budget"),
+                };
+                assert!(expired.to_string().contains("lesson lookup deadline exhausted; no partial snapshot is usable"));
+                assert_eq!(server.count.load(Ordering::SeqCst), before_expiry, "test: expired handoff cannot send");
+            }
+            clock.arm_site("experiment.handoff-lookup", Duration::from_millis(550), Duration::ZERO);
             let before=server.count.load(Ordering::SeqCst);
             for _ in 0..2 {
                 let tally=Arc::new(TallyCounters::default());
@@ -815,6 +852,7 @@ async fn owned_attempts_then_retire(
                 assert_eq!((reply.usage.physical_requests,reply.usage.settled_requests),(1,1));
             }
             assert_eq!(server.count.load(Ordering::SeqCst),before+2);
+            assert!(clock.site_hits("experiment.handoff-lookup") > 0, "test: forced stall reached blocking handoff");
             let delivered=delivery_records(f)?.into_iter().filter(|record|record["payload"]["experiment"]["experiment_sha256"]==frozen.digest()).collect::<Vec<_>>();assert_eq!(delivered.len(),2);
             assert_ne!(delivered[0]["payload"]["attempt_id"],delivered[1]["payload"]["attempt_id"]);
             assert_ne!(delivered[0]["payload"]["body_binding_sha256"],delivered[1]["payload"]["body_binding_sha256"]);

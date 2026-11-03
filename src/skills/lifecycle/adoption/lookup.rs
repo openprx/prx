@@ -125,7 +125,11 @@ impl SkillLifecycleStore {
         {
             return Err(refusal("lesson query has invalid actual target pins"));
         }
-        let _store = self.lock_store(true, Duration::from_millis(query.limits.elapsed_ms))?;
+        let _store = self.lock_store_for_lesson(
+            true,
+            Duration::from_millis(query.limits.elapsed_ms),
+            "lesson.lookup-lock",
+        )?;
         budget.check()?;
         let index =
             self.read_adoption_index_bounded_locked(&query.task_family, &query.skill_id, query.limits.index_bytes)?;

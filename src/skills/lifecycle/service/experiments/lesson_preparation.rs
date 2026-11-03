@@ -80,9 +80,11 @@ impl SkillsLifecycleService {
             &plan.spec().pins.policy_sha256,
             &plan.spec().pins.binary_sha256,
         )?;
-        let _guard = self
-            .store
-            .lock_store(true, std::time::Duration::from_millis(snapshot.limits.elapsed_ms))?;
+        let _guard = self.store.lock_store_for_lesson(
+            true,
+            std::time::Duration::from_millis(snapshot.limits.elapsed_ms),
+            "lesson.pins-lock",
+        )?;
         self.store.validate_lesson_snapshot_locked(
             snapshot,
             &plan.spec().pins.skill_id,
