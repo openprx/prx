@@ -200,6 +200,24 @@ impl SkillLifecycleStore {
         Ok(StoreLock { file })
     }
 
+    /// Lesson locks retain the production acquisition path unless a test clock is installed.
+    pub(super) fn lock_store_for_lesson(
+        &self,
+        shared: bool,
+        timeout: Duration,
+        site: &'static str,
+    ) -> Result<StoreLock, LifecycleError> {
+        let _ = site;
+        #[cfg(test)]
+        if crate::causal_tree::logical_clock::installed() {
+            let locks = self.root().join(LOCKS_DIR);
+            ensure_dir_synced(self.root(), &locks)?;
+            return clock_lock::lock_file(&locks.join(STORE_LOCK), shared, timeout, site)
+                .map(|file| StoreLock { file });
+        }
+        self.lock_store(shared, timeout)
+    }
+
     /// Writes `bytes` to a fresh fsynced temporary file in `staging/`.
     /// The name carries `skill` so the staging sweep can tell whose lock
     /// protects the file: `atomic-<skill>-<uuid>.tmp`.
@@ -258,3 +276,6 @@ impl SkillLifecycleStore {
         self.commit_staged(&tmp, &path)
     }
 }
+
+#[cfg(test)]
+mod clock_lock;

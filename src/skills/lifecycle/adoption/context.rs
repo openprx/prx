@@ -105,6 +105,8 @@ pub(crate) enum LessonPlacement {
 /// Opaque runtime data, not serializable authority. Only the actual bound
 /// editor factory below may construct it after signed-source revalidation.
 pub(crate) struct PreparedLessonContext {
+    #[cfg(test)]
+    clock: Option<Arc<crate::causal_tree::logical_clock::ManualClock>>,
     store: Arc<SkillLifecycleStore>,
     skill_id: SkillId,
     binding: ExperimentRunBinding,
@@ -166,6 +168,28 @@ impl PreparedLessonContext {
         actual_model: &ModelBinding,
         now: DateTime<Utc>,
     ) -> Result<LessonHandoffGuard<'_>, LifecycleError> {
+        self.with_lesson_clock(|| self.lock_handoff_inner(actual_model, now))
+    }
+
+    fn with_lesson_clock<R>(&self, work: impl FnOnce() -> R) -> R {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            // The delivery worker is a separate blocking owner. Re-enter only
+            // for lesson validation; the physical write keeps its own clock.
+            return super::lookup::worker_clock::sync_scope(
+                Some(Arc::clone(clock)),
+                "experiment.handoff-lookup",
+                || crate::causal_tree::logical_clock::sync_scope(Arc::clone(clock), work),
+            );
+        }
+        work()
+    }
+
+    fn lock_handoff_inner(
+        &self,
+        actual_model: &ModelBinding,
+        now: DateTime<Utc>,
+    ) -> Result<LessonHandoffGuard<'_>, LifecycleError> {
         let snapshot = self
             .plan
             .spec()
@@ -173,9 +197,11 @@ impl PreparedLessonContext {
             .lesson_snapshot
             .as_ref()
             .ok_or_else(|| super::record::refusal("prepared lesson snapshot missing"))?;
-        let store_lock = self
-            .store
-            .lock_store(true, std::time::Duration::from_millis(snapshot.limits.elapsed_ms))?;
+        let store_lock = self.store.lock_store_for_lesson(
+            true,
+            std::time::Duration::from_millis(snapshot.limits.elapsed_ms),
+            "lesson.handoff-lock",
+        )?;
         self.store
             .validate_prepared_lesson_locked(&self.plan, &self.binding, actual_model, now)?;
         Ok(LessonHandoffGuard {
@@ -205,12 +231,14 @@ impl LessonHandoffGuard<'_> {
     /// durable handoff write. Publication cannot change the active target in
     /// the shared-store to actual-skill acquisition interval unnoticed.
     pub(in crate::skills::lifecycle) fn recheck_target_locked(&self, now: DateTime<Utc>) -> Result<(), LifecycleError> {
-        self.prepared.store.validate_prepared_lesson_locked(
-            &self.prepared.plan,
-            &self.prepared.binding,
-            &self.prepared.plan.spec().pins.model,
-            now,
-        )
+        self.prepared.with_lesson_clock(|| {
+            self.prepared.store.validate_prepared_lesson_locked(
+                &self.prepared.plan,
+                &self.prepared.binding,
+                &self.prepared.plan.spec().pins.model,
+                now,
+            )
+        })
     }
 }
 
@@ -225,7 +253,11 @@ impl SkillLifecycleStore {
         let Some(snapshot) = &plan.spec().pins.lesson_snapshot else {
             return Ok(None);
         };
-        let _owner = self.lock_store(true, std::time::Duration::from_millis(snapshot.limits.elapsed_ms))?;
+        let _owner = self.lock_store_for_lesson(
+            true,
+            std::time::Duration::from_millis(snapshot.limits.elapsed_ms),
+            "lesson.prepare-lock",
+        )?;
         self.validate_prepared_lesson_locked(plan, &binding, &plan.spec().pins.model, now)?;
         if snapshot.entries.is_empty() {
             return Ok(None);
@@ -244,6 +276,8 @@ impl SkillLifecycleStore {
             ));
         }
         let prepared = PreparedLessonContext {
+            #[cfg(test)]
+            clock: crate::causal_tree::logical_clock::capture(),
             store: Arc::clone(self),
             skill_id: plan.spec().pins.skill_id.clone(),
             binding,

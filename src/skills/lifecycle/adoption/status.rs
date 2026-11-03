@@ -29,7 +29,11 @@ impl SkillLifecycleStore {
         {
             return Err(refusal("study lesson snapshot owner or source bounds differ"));
         }
-        let _store = self.lock_store(true, Duration::from_millis(snapshot.limits.elapsed_ms))?;
+        let _store = self.lock_store_for_lesson(
+            true,
+            Duration::from_millis(snapshot.limits.elapsed_ms),
+            "lesson.provenance-lock",
+        )?;
         let mut roots: std::collections::BTreeSet<_> = snapshot.exclusions.iter().cloned().collect();
         let mut experiments = std::collections::BTreeSet::new();
         for entry in &snapshot.entries {
