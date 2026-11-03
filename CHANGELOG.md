@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[router.automix]` is ignored with one warning at load; remove this section
   from operator configuration. Turns return the serving model's reply without
   a premium continuation. Authenticated historical v1 replies remain readable.
+- SkillForge (unused auto-integration pipeline); skill discovery moved to skills::discovery.
+  Failed integrations already cleaned staging; successful integrations had no rollback.
 
 ### Fixed
 
@@ -38,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Console third-party skill installs require explicit confirmation and publish
+  quarantined, inactive skills for owner review before activation.
+
 - Redact credentials inside nested diagnostic pairs and error context chains,
   including URL userinfo and credential query values in plain-text secret
   scans. Apply shared redaction before error chains reach diagnostic logs,
@@ -47,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after `token`, even when it is not a credential.
 
 ### Changed
+
+- **BREAKING (gateway API):** skill discovery returns 400 `unsupported_source`,
+  429 `rate_limited`, and 502 `upstream_error` for invalid sources or upstream
+  failures instead of 200 with empty or partial results. `POST /api/skills/install`
+  installs disabled and returns `skill.enabled`.
 
 - **Known behaviour:** with the default builtin decision plane, named-tool chat
   turns, heavy-task delegation to `sessions_spawn`, discovered tools, and skill

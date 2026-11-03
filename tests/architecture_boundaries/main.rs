@@ -22,6 +22,7 @@ mod loop_requests;
 mod memory;
 mod process;
 mod providers;
+mod removed_modules;
 mod scanner_meta;
 mod scanner_probes;
 mod strip_tests;

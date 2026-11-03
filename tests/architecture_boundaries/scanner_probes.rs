@@ -91,6 +91,30 @@ pub(super) const TEST_INCLUSIVE_TREE_SCANNERS: &[(&str, &str)] = &[
         "removed evolution files and memory trash calls are forbidden in test code as well as production",
     ),
     (
+        "removed_modules_directory_and_exports_are_absent",
+        "Removal applies to production, tests and documentation alike; no test stripping is intended.",
+    ),
+    (
+        "removed_modules_text_references_are_allowlisted",
+        "Removal applies to production, tests and documentation alike; no test stripping is intended.",
+    ),
+    (
+        "removed_modules_security_document_has_no_reference",
+        "Removal applies to production, tests and documentation alike; no test stripping is intended.",
+    ),
+    (
+        "removed_modules_labeler_has_no_reference",
+        "Removal applies to production, tests and documentation alike; no test stripping is intended.",
+    ),
+    (
+        "removed_modules_pull_request_template_has_no_reference",
+        "Removal applies to production, tests and documentation alike; no test stripping is intended.",
+    ),
+    (
+        "removed_modules_changelog_records_removal",
+        "Removal applies to production, tests and documentation alike; no test stripping is intended.",
+    ),
+    (
         "runtime_and_message_events_preserve_typed_config_generation_columns",
         "it requires column names to be present in the whole PostgreSQL adapter directory, tests included; it prohibits nothing, so there is no violation to plant",
     ),
