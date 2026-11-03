@@ -260,6 +260,15 @@ fn retention_capture(f: &Fixture, task: &str, run: Option<&str>) -> Result<Strin
 
 #[tokio::test]
 async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and_retirement() -> Result<()> {
+    Box::pin(adoption_clock_contract(false)).await
+}
+
+#[tokio::test]
+async fn stage_and_preparation_expire_before_dispatch_on_the_unchanged_logical_lookup_budget() -> Result<()> {
+    Box::pin(adoption_clock_contract(true)).await
+}
+
+async fn adoption_clock_contract(probe_expiry: bool) -> Result<()> {
     crate::runtime::turn_decision::with_scored_publication("skill", async {
     let mut f = fixture();
     let server = Server::start(false).await?;
@@ -267,7 +276,7 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
     // plan, the spawned stage pin check, prune, and lesson preparation.
     // Production still measures wall time when no clock is installed.
     let clock = crate::causal_tree::logical_clock::ManualClock::new();
-    let result = crate::causal_tree::logical_clock::scope(clock, async {
+    let result = crate::causal_tree::logical_clock::scope(Arc::clone(&clock), async {
         let mut config = config(&f, &server);
         let price=config.cost.prices.get_mut(&format!("{}/experiment-loopback",config.default_provider.as_deref().unwrap()))
             .context("fixture model pricing missing")?;
@@ -420,6 +429,9 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         );
         let next_suite = fresh_suite(&f);
         let q = query(&f, &config, &journal, &next_suite)?;
+        for site in ["lesson.lookup-lock", "lesson.handoff-lock", "lesson.prepare-lock", "lesson.provenance-lock", "lesson.pins-lock"] {
+            clock.arm_site(site, Duration::from_millis(550), Duration::ZERO);
+        }
         let snapshot = f.store.query_adopted_lessons(&q)?;
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.entries[0].reference, reference);
@@ -507,9 +519,37 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         server.bodies.lock().clear();
         next.admit_experiment(next_plan.spec.clone(), &config)?;
         let cancel = CancellationToken::new();
+        if probe_expiry {
+        let before_stage_expiry = server.count.load(Ordering::SeqCst);
+        clock.arm_site("experiment.stage-lookup", Duration::ZERO, Duration::from_millis(501));
+        let expiry_cancel = CancellationToken::new();
+        let expired = CleanupScope::new(None, expiry_cancel.clone())?
+            .run(next.run_instruction_plan(&config, &next_plan, &expiry_cancel)).await;
+        let expired = match expired {
+            Err(error) => error,
+            Ok(_) => panic!("test: spawned stage must refuse after unchanged logical lookup budget"),
+        };
+        assert!(format!("{expired:#}").contains("lesson lookup deadline exhausted; no partial snapshot is usable"));
+        assert_eq!(server.count.load(Ordering::SeqCst), before_stage_expiry, "test: expired stage cannot dispatch");
+        assert_eq!(clock.site_hits("experiment.stage-lookup"), 1);
+        }
+        clock.arm_site("experiment.stage-lookup", Duration::from_millis(550), Duration::ZERO);
+        clock.arm_site("experiment.preparation-lookup", Duration::from_millis(550), Duration::ZERO);
+        clock.arm_site("lesson.pins-lock", Duration::from_millis(550), Duration::ZERO);
+        clock.arm_site("lesson.prepare-lock", Duration::from_millis(550), Duration::ZERO);
         let completed = CleanupScope::new(None, cancel.clone())?
             .run(next.run_instruction_plan(&config, &next_plan, &cancel))
-            .await?;
+            .await.with_context(|| format!(
+                "test: stage lookup hook hits={} clock={}; blocking preparation lookup hook hits={} clock={}",
+                clock.site_hits("experiment.stage-lookup"), clock.site_on_clock("experiment.stage-lookup"),
+                clock.site_hits("experiment.preparation-lookup"), clock.site_on_clock("experiment.preparation-lookup"),
+            ))?;
+        assert!(clock.site_hits("experiment.stage-lookup") > 0, "test: forced stall reached the spawned stage lookup");
+        assert!(clock.site_on_clock("experiment.stage-lookup"), "test: spawned stage lookup uses the admitted clock");
+        assert!(clock.site_hits("experiment.preparation-lookup") > 0, "test: forced stall reached blocking preparation in the real instruction plan");
+        assert!(clock.site_on_clock("experiment.preparation-lookup"), "test: blocking preparation lookup uses the admitted clock");
+        assert!(clock.site_hits("lesson.pins-lock") > 0, "test: spawned stage re-entered the logical clock at pin verification");
+        assert!(clock.site_hits("lesson.prepare-lock") > 0, "test: blocking preparation re-entered the logical clock");
         assert!(next.experiment_qualified(&completed)?);
         let bodies = server.bodies.lock().clone();
         let mut editors = 0;
@@ -698,7 +738,8 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
         );
         f.pin = f.store.pin_active(&f.pin.skill_id)?.unwrap();
         let owner_service = auto_service(&f, &third, &config)?;
-        owned_attempts_then_retire(&f, &server, &config, &next, &owner_service, owned_draft, &second).await?;
+        owned_attempts_then_retire(&f, &server, &config, &next, &owner_service,
+            OwnedAttempt { draft: owned_draft, probe_expiry }, &second).await?;
         origin.set_adoption_status(&reference, true, false)?;
         let sends = server.count.load(Ordering::SeqCst);
         assert_eq!(
@@ -715,6 +756,10 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
             "false cannot revive a retired origin"
         );
         assert_eq!(server.count.load(Ordering::SeqCst), sends);
+        for site in ["lesson.lookup-lock", "lesson.handoff-lock", "lesson.prepare-lock", "lesson.provenance-lock", "lesson.pins-lock"] {
+            assert!(clock.site_hits(site) > 0, "test: real lesson path must consume its named clock hook at {site}");
+            assert!(clock.site_on_clock(site), "test: real lesson lock uses the admitted clock at {site}");
+        }
         Ok(())
     })
     .await;
@@ -724,15 +769,24 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
     }).await
 }
 
+struct OwnedAttempt {
+    draft: InstructionCycleDraft,
+    probe_expiry: bool,
+}
+
 async fn owned_attempts_then_retire(
     f: &Fixture,
     server: &Server,
     config: &Config,
     origin: &Arc<SkillsLifecycleService>,
     target: &Arc<SkillsLifecycleService>,
-    mut draft: InstructionCycleDraft,
+    attempt: OwnedAttempt,
     reference: &LessonRef,
 ) -> Result<()> {
+    let OwnedAttempt {
+        mut draft,
+        probe_expiry,
+    } = attempt;
     draft.id = ExperimentId::parse("prepared-owned-attempts")?;
     // This is a fresh experiment after a second publication, not a replay of
     // either Committed origin. The prior pattern only covers the old baseline.
@@ -812,8 +866,23 @@ async fn owned_attempts_then_retire(
     )?;
     let scope = runtime.scope_id();
     cleanup.run(runtime.scope(async {
+            let clock = crate::causal_tree::logical_clock::capture().expect("test: owned editor retains its decision clock");
+            if probe_expiry {
+            let before_expiry = server.count.load(Ordering::SeqCst);
+            clock.arm_site("experiment.preparation-lookup", Duration::ZERO, Duration::from_millis(501));
+            let expired = match target.prepare_lesson_context(&frozen,"general",&plan.operations["general"],&user).await {
+                Err(error) => error,
+                Ok(_) => panic!("test: preparation must refuse after unchanged logical lookup budget"),
+            };
+            assert!(format!("{expired:#}").contains("lesson lookup deadline exhausted; no partial snapshot is usable"));
+            assert_eq!(server.count.load(Ordering::SeqCst), before_expiry, "test: expired context cannot send");
+            assert_eq!(clock.site_hits("experiment.preparation-lookup"), 1);
+            }
+            clock.arm_site("experiment.preparation-lookup", Duration::from_millis(550), Duration::ZERO);
             let prepared=target.prepare_lesson_context(&frozen,"general",&plan.operations["general"],&user)
                 .await?.context("genuine factory returned no context")?;
+            assert!(clock.site_hits("experiment.preparation-lookup") > 0, "test: forced stall reached blocking preparation");
+            assert!(clock.site_on_clock("experiment.preparation-lookup"), "test: owned preparation uses the admitted clock");
             assert_eq!(prepared.block(),block);assert_eq!(prepared.refs(),std::slice::from_ref(reference));
             assert_eq!(prepared.expected_user_slot_bytes(),u64::try_from(user.len())?);
             // A fresh worker captures no decision clock, as in production.
@@ -847,12 +916,15 @@ async fn owned_attempts_then_retire(
             for _ in 0..2 {
                 let tally=Arc::new(TallyCounters::default());
                 let reply=crate::runtime::lesson_delivery::scope(prepared.clone(),model.complete(
-                    "You revise one instruction skill. H2 role: general.",&user,tally.clone())).await?;
+                    "You revise one instruction skill. H2 role: general.",&user,tally.clone())).await
+                    .with_context(|| format!("test: handoff lookup hook hits={} clock={}",
+                        clock.site_hits("experiment.handoff-lookup"), clock.site_on_clock("experiment.handoff-lookup")))?;
                 assert_eq!((tally.snapshot().physical_requests,tally.snapshot().settled_requests),(1,1));
                 assert_eq!((reply.usage.physical_requests,reply.usage.settled_requests),(1,1));
             }
             assert_eq!(server.count.load(Ordering::SeqCst),before+2);
             assert!(clock.site_hits("experiment.handoff-lookup") > 0, "test: forced stall reached blocking handoff");
+            assert!(clock.site_on_clock("experiment.handoff-lookup"), "test: physical handoff validation uses the admitted clock");
             let delivered=delivery_records(f)?.into_iter().filter(|record|record["payload"]["experiment"]["experiment_sha256"]==frozen.digest()).collect::<Vec<_>>();assert_eq!(delivered.len(),2);
             assert_ne!(delivered[0]["payload"]["attempt_id"],delivered[1]["payload"]["attempt_id"]);
             assert_ne!(delivered[0]["payload"]["body_binding_sha256"],delivered[1]["payload"]["body_binding_sha256"]);

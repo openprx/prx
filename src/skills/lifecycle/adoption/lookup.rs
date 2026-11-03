@@ -6,6 +6,8 @@ use crate::skills::lifecycle::{LifecycleError, OwnerScope, RevisionId, SkillId, 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
+#[cfg(test)]
+pub(crate) mod worker_clock;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +70,8 @@ impl LookupBudget {
         })
     }
     pub fn check(&mut self) -> Result<(), LifecycleError> {
+        #[cfg(test)]
+        worker_clock::apply();
         // A test may sleep here on the wall. The measurement below still uses
         // the logical clock, so the sleep does not spend `elapsed_ms` while a
         // clock is installed. Production never arms the stall.

@@ -310,6 +310,8 @@ impl SkillsLifecycleService {
         // so the lesson pin check would otherwise spend wall time.
         #[cfg(test)]
         let inherited_clock = crate::causal_tree::logical_clock::capture();
+        #[cfg(test)]
+        let hook_clock = inherited_clock.clone();
         let worker = async move {
             let run = async move {
                 let outcome = crate::runtime::h2_entry::retain_run_continuation(
@@ -324,6 +326,9 @@ impl SkillsLifecycleService {
                 );
                 outcome
             };
+            #[cfg(test)]
+            let run =
+                crate::skills::lifecycle::adoption::worker_clock::scope(hook_clock, "experiment.stage-lookup", run);
             #[cfg(test)]
             if let Some(clock) = inherited_clock {
                 return crate::causal_tree::logical_clock::scope(clock, run).await;
