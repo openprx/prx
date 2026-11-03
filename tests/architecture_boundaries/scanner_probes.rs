@@ -79,6 +79,14 @@ use std::fs;
 /// production from tests through a marker-aware helper.
 pub(super) const TEST_INCLUSIVE_TREE_SCANNERS: &[(&str, &str)] = &[
     (
+        "removed_reply_feature_has_only_explicit_compatibility_references",
+        "feature retirement covers test code and fixtures too; its planted executable-reference regression verifies rejection",
+    ),
+    (
+        "removal_docs_contract_and_mutations",
+        "the Markdown contract reads README and CHANGELOG in full; negative controls restore feature claims and remove the operator breaking note",
+    ),
+    (
         "runtime_and_message_events_preserve_typed_config_generation_columns",
         "it requires column names to be present in the whole PostgreSQL adapter directory, tests included; it prohibits nothing, so there is no violation to plant",
     ),
