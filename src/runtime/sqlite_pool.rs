@@ -575,12 +575,29 @@ impl SqliteConnectionPool {
     /// Acquire the writer within a caller-owned deadline. Ordinary writers
     /// retain the unbounded `write` contract.
     pub fn write_until(&self, deadline: Instant) -> anyhow::Result<SqliteWriteGuard<'_>> {
-        anyhow::ensure!(Instant::now() < deadline, "SQLite writer deadline elapsed");
+        anyhow::ensure!(
+            crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
+            "SQLite writer deadline elapsed"
+        );
         let started = Instant::now();
         let guard = if let Some(guard) = self.writer.try_lock() {
             guard
         } else {
             self.metrics.write_waiters.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            let guard = if crate::causal_tree::logical_clock::is_logical_deadline(deadline) {
+                loop {
+                    if crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline {
+                        break None;
+                    }
+                    if let Some(guard) = self.writer.try_lock_for(std::time::Duration::from_millis(5)) {
+                        break Some(guard);
+                    }
+                }
+            } else {
+                self.writer.try_lock_until(deadline)
+            };
+            #[cfg(not(test))]
             let guard = self.writer.try_lock_until(deadline);
             self.metrics.write_waiters.fetch_sub(1, Ordering::Relaxed);
             self.metrics
@@ -589,7 +606,10 @@ impl SqliteConnectionPool {
             PoolMetrics::add_wait(&self.metrics.write_wait_nanos, started.elapsed());
             guard.ok_or_else(|| anyhow::anyhow!("SQLite writer deadline elapsed"))?
         };
-        anyhow::ensure!(Instant::now() < deadline, "SQLite writer deadline elapsed");
+        anyhow::ensure!(
+            crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
+            "SQLite writer deadline elapsed"
+        );
         self.metrics.write_acquisitions.fetch_add(1, Ordering::Relaxed);
         Ok(SqliteWriteGuard { pool: self, guard })
     }

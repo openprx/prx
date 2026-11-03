@@ -25,7 +25,7 @@ fn wait_for_lock(_attempt: i32) -> bool {
         std::thread::sleep(left.min(Duration::from_millis(5)));
         IO_DEADLINE
             .with(Cell::get)
-            .is_some_and(|deadline| Instant::now() < deadline)
+            .is_some_and(|deadline| crate::causal_tree::logical_clock::deadline_now(deadline) < deadline)
     })
 }
 
@@ -41,7 +41,10 @@ impl<'a> ConnectionDeadline<'a> {
         let previous = IO_DEADLINE.with(|cell| cell.replace(Some(deadline)));
         let guard = Self { connection, previous };
         connection.busy_handler(Some(wait_for_lock))?;
-        connection.progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
+        connection.progress_handler(
+            1_000,
+            Some(move || crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline),
+        )?;
         Ok(guard)
     }
 }

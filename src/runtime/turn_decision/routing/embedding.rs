@@ -98,7 +98,7 @@ pub(super) async fn embed_selected(
     cancellation: &CancellationToken,
 ) -> anyhow::Result<Vec<f32>> {
     ensure!(
-        !cancellation.is_cancelled() && Instant::now() < deadline,
+        !cancellation.is_cancelled() && crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
         "Router embedding cancelled or expired"
     );
     let targets = configured
@@ -130,7 +130,7 @@ pub(super) async fn embed_selected(
         "Router embedding shape differs"
     );
     ensure!(
-        !cancellation.is_cancelled() && Instant::now() < deadline,
+        !cancellation.is_cancelled() && crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
         "Router embedding cancelled or expired"
     );
     Ok(vector)

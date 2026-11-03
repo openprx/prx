@@ -64,7 +64,7 @@ impl RouterHistory {
     }
 
     pub(crate) fn query_deadline(&self, turn_deadline: std::time::Instant) -> Result<std::time::Instant> {
-        let local = std::time::Instant::now()
+        let local = crate::causal_tree::logical_clock::now()
             .checked_add(self.query_timeout)
             .ok_or_else(|| anyhow::anyhow!("Router history deadline overflow"))?;
         Ok(local.min(turn_deadline))
@@ -120,7 +120,7 @@ impl RouterHistory {
             "invalid Router query embedding"
         );
         anyhow::ensure!(
-            !cancellation.is_cancelled() && std::time::Instant::now() < deadline,
+            !cancellation.is_cancelled() && crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
             "Router history ranking cancelled or expired"
         );
         if read.rows.len() < self.knn_min_records {
@@ -134,7 +134,7 @@ impl RouterHistory {
                 tokio::task::yield_now().await;
             }
             anyhow::ensure!(
-                !cancellation.is_cancelled() && std::time::Instant::now() < deadline,
+                !cancellation.is_cancelled() && crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
                 "Router history ranking cancelled or expired"
             );
             if !row.success {
@@ -161,7 +161,7 @@ impl RouterHistory {
             }
         }
         anyhow::ensure!(
-            !cancellation.is_cancelled() && std::time::Instant::now() < deadline,
+            !cancellation.is_cancelled() && crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
             "Router history ranking cancelled or expired"
         );
         Ok(scores)

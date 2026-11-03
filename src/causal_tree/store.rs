@@ -2965,7 +2965,7 @@ thread_local! {
 
 fn recovery_time_left(deadline: Instant) -> Result<std::time::Duration, StoreError> {
     deadline
-        .checked_duration_since(Instant::now())
+        .checked_duration_since(crate::causal_tree::logical_clock::deadline_now(deadline))
         .filter(|left| !left.is_zero())
         .ok_or(StoreError::RecoveryDeadline)
 }
@@ -2975,7 +2975,7 @@ fn recovery_busy(_attempt: i32) -> bool {
     if let Some(deadline) = deadline {
         if let Ok(left) = recovery_time_left(deadline) {
             std::thread::sleep(left.min(std::time::Duration::from_millis(5)));
-            return Instant::now() < deadline;
+            return crate::causal_tree::logical_clock::deadline_now(deadline) < deadline;
         }
     }
     false
@@ -2991,7 +2991,10 @@ impl<'a> RecoveryReadBudget<'a> {
         let previous = RECOVERY_READ_DEADLINE.with(|cell| cell.replace(Some(deadline)));
         let guard = Self { connection, previous };
         connection.busy_handler(Some(recovery_busy))?;
-        connection.progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
+        connection.progress_handler(
+            1_000,
+            Some(move || crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline),
+        )?;
         Ok(guard)
     }
 }

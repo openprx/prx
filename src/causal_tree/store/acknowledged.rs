@@ -12,6 +12,8 @@ use tokio::sync::oneshot;
 
 #[cfg(any(feature = "llm-router", test))]
 pub(super) struct VerifiedDecision {
+    #[cfg(test)]
+    clock: Option<Arc<crate::causal_tree::logical_clock::ManualClock>>,
     record: DecisionRecord,
     scope: DecisionScope,
     deadline: Instant,
@@ -38,6 +40,8 @@ impl DecisionStoreWriter {
         record.lineage.workspace_id = Arc::clone(&self.workspace_id);
         let (done, finished) = oneshot::channel();
         let command = WriterMessage::VerifiedDecision(Box::new(VerifiedDecision {
+            #[cfg(test)]
+            clock: crate::causal_tree::logical_clock::capture(),
             record,
             scope,
             deadline,
@@ -53,7 +57,7 @@ impl DecisionStoreWriter {
             }
             return Err(StoreError::RecoveryUnavailable);
         }
-        let row = tokio::time::timeout_at(deadline.into(), finished)
+        let row = crate::causal_tree::logical_clock::timeout_at_std(deadline, finished)
             .await
             .map_err(|_| StoreError::RecoveryDeadline)?
             .map_err(|_| StoreError::RecoveryUnavailable)??;
@@ -65,6 +69,19 @@ impl DecisionStoreWriter {
 #[cfg(any(feature = "llm-router", test))]
 impl VerifiedDecision {
     pub(super) fn finish(self, thread: &mut WriterThread) {
+        #[cfg(test)]
+        let mut self_owned = self;
+        #[cfg(test)]
+        if let Some(clock) = self_owned.clock.take() {
+            return crate::causal_tree::logical_clock::sync_scope(clock, || self_owned.finish_owned(thread));
+        }
+        #[cfg(test)]
+        self_owned.finish_owned(thread);
+        #[cfg(not(test))]
+        self.finish_owned(thread);
+    }
+
+    fn finish_owned(self, thread: &mut WriterThread) {
         // This keeps the existing transaction, conflict handling, event and
         // retention path. No acknowledgement is based on the supplied record.
         thread.write_decisions(std::slice::from_ref(&self.record));

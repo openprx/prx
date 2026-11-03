@@ -136,7 +136,7 @@ impl RouterHistoryReadEvidence {
     pub(super) fn validate(&self, deadline: Instant) -> Result<()> {
         self.domain.validate()?;
         ensure!(
-            deadline <= self.deadline && Instant::now() < deadline,
+            deadline <= self.deadline && crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
             "Router history read exceeds its selected deadline"
         );
         ensure!(

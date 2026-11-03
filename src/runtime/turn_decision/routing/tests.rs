@@ -68,12 +68,16 @@ struct Fixture {
     observed: Arc<ObservedSqlite>,
     calls: Arc<AtomicUsize>,
     workspace: tempfile::TempDir,
+    clock: Arc<crate::causal_tree::logical_clock::ManualClock>,
 }
 impl Fixture {
     // Construct the boxed production future in a synchronous frame that returns
     // before polling it, so debug temporaries do not inflate the caller's poll.
     fn turn(&mut self) -> std::pin::Pin<Box<impl std::future::Future<Output = anyhow::Result<String>> + '_>> {
-        Box::pin(self.agent.turn(INPUT))
+        Box::pin(crate::causal_tree::logical_clock::scope(
+            Arc::clone(&self.clock),
+            self.agent.turn(INPUT),
+        ))
     }
 
     async fn new() -> Self {
@@ -163,6 +167,7 @@ impl Fixture {
             observed,
             calls,
             workspace,
+            clock: crate::causal_tree::logical_clock::ManualClock::new(),
         }
     }
 
@@ -688,4 +693,110 @@ async fn r3_textless_router_with_zero_hops_returns_a_typed_close() {
         0,
         "typed Router close cannot call the serving model"
     );
+}
+
+#[tokio::test]
+async fn router_record_wall_stall_preserves_the_unchanged_read_deadline() {
+    let mut fixture = Fixture::new().await;
+    let clock = Arc::clone(&fixture.clock);
+    clock.arm_site(
+        "router.record-owner",
+        std::time::Duration::from_millis(150),
+        std::time::Duration::ZERO,
+    );
+    fixture.seed().await;
+    assert_eq!(clock.site_hits("router.record-owner"), 1);
+    assert!(
+        clock.site_on_clock("router.record-owner"),
+        "test: recording runs on the admitted clock"
+    );
+}
+
+#[tokio::test]
+async fn router_read_wall_stall_reaches_the_intended_backend_refusal() {
+    let mut fixture = Fixture::new().await;
+    fixture.seed().await;
+    let clock = Arc::clone(&fixture.clock);
+    clock.arm_site(
+        "router.read-owner",
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
+    clock.arm_site(
+        "router.sqlite-read",
+        std::time::Duration::from_millis(150),
+        std::time::Duration::ZERO,
+    );
+    let mut vector = vec![0_u8; 384 * 4];
+    vector.get_mut(..4).unwrap().copy_from_slice(&f32::NAN.to_le_bytes());
+    fixture
+        .database()
+        .execute("UPDATE router_history_v1 SET embedding=?1", [vector])
+        .unwrap();
+    fixture.assert_read_closed("Router history vector is non-finite").await;
+    for site in ["router.read-owner", "router.sqlite-read"] {
+        assert_eq!(
+            clock.site_hits(site),
+            1,
+            "test: actual read consumed its hook at {site}"
+        );
+        assert!(
+            clock.site_on_clock(site),
+            "test: actual worker reads the admitted clock at {site}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn router_read_logical_expiry_returns_no_rows_and_sends_no_provider_request() {
+    let mut fixture = Fixture::new().await;
+    fixture.seed().await;
+    let clock = Arc::clone(&fixture.clock);
+    clock.arm_site(
+        "router.sqlite-read",
+        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(101),
+    );
+    fixture.assert_read_closed("Router history deadline expired").await;
+    assert_eq!(clock.site_hits("router.sqlite-read"), 1);
+    assert!(clock.site_on_clock("router.sqlite-read"));
+}
+
+#[tokio::test]
+async fn router_record_logical_expiry_never_dispatches_or_returns_a_usable_read() {
+    let mut fixture = Fixture::new().await;
+    let clock = Arc::clone(&fixture.clock);
+    clock.arm_site(
+        "router.record-owner",
+        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(101),
+    );
+    let result = fixture.turn().await;
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        0,
+        "test: expired recording cannot send"
+    );
+    {
+        let observed = fixture.observed.observations.lock();
+        assert_eq!(
+            (observed.read_calls, observed.commit_calls),
+            (0, 0),
+            "test: expired recording cannot admit a read or train"
+        );
+    }
+    if let Ok(reply) = result {
+        assert_ne!(reply, "The expression adds two integers.");
+        let receipt = fixture.latest_router_receipt();
+        assert_eq!(receipt.get("readmission_succeeded"), Some(&Value::Bool(false)));
+        assert_eq!(receipt.get("failure_stage").and_then(Value::as_str), Some("record"));
+    } else {
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("cleanup") || error.contains("expired"),
+            "test: closed result retains its recording failure: {error}"
+        );
+    }
+    assert_eq!(clock.site_hits("router.record-owner"), 1);
+    assert!(clock.site_on_clock("router.record-owner"));
 }
