@@ -294,7 +294,7 @@ impl TurnIds {
         self.0
             .lock()
             .seen
-            .retain(|key, _| !conversation.is_none_or(|conv| key.conversation == conv));
+            .retain(|key, _| conversation.is_some_and(|conv| key.conversation != conv));
     }
 
     pub(super) fn release_message(&self, conversation: &str, message: &str) {
