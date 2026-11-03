@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Committed v1 fixture captured before removal; only isolated read-side state.
 use super::*;
 use crate::memory::SqliteMemory;
