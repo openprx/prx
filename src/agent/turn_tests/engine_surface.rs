@@ -1146,13 +1146,14 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
                             tokio::pin!(admitting);
                             // Safety net only: a paused Tokio timer must fail clearly,
                             // rather than keeping the readiness driver runnable forever.
-                            let mut polls_left = 10_000_000_u32;
+                            let hang_guard = std::time::Instant::now() + Duration::from_secs(60);
                             loop {
                                 if let std::task::Poll::Ready(admitted) = futures::poll!(&mut admitting) {
                                     break admitted;
                                 }
-                                polls_left = polls_left.checked_sub(1).expect(
-                                    "mechanics admission exceeded 10000000 polls; it may be waiting on a paused Tokio timer",
+                                assert!(
+                                    std::time::Instant::now() < hang_guard,
+                                    "mechanics admission exceeded its 60 s wall hang guard; it may be waiting on a paused Tokio timer"
                                 );
                                 tokio::task::yield_now().await;
                             }
@@ -1329,13 +1330,14 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
                             tokio::pin!(admitting);
                             // Safety net only: a paused Tokio timer must fail clearly,
                             // rather than keeping the readiness driver runnable forever.
-                            let mut polls_left = 10_000_000_u32;
+                            let hang_guard = std::time::Instant::now() + Duration::from_secs(60);
                             loop {
                                 if let std::task::Poll::Ready(admitted) = futures::poll!(&mut admitting) {
                                     break admitted;
                                 }
-                                polls_left = polls_left.checked_sub(1).expect(
-                                    "mechanics admission exceeded 10000000 polls; it may be waiting on a paused Tokio timer",
+                                assert!(
+                                    std::time::Instant::now() < hang_guard,
+                                    "mechanics admission exceeded its 60 s wall hang guard; it may be waiting on a paused Tokio timer"
                                 );
                                 tokio::task::yield_now().await;
                             }
