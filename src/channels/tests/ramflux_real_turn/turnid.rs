@@ -455,7 +455,7 @@ async fn turnid_queue_interrupt_and_displacement_release() {
     host.send(&message(151, "conv-1", "queued", "queue-host")).await;
     assert_eq!(recv_id(&mut host, 151, true).await["result"]["ok"], true);
     assert!(channel.turnid_live("conv-1", "queue-host").is_none());
-    host.send(&json!({"jsonrpc":"2.0","id":152,"method":"turn.cancel","params":{"conversation_id":"conv-1","turn_id":"queue-host"}})).await;
+    host.send(&json!({"jsonrpc":"2.0","id":152,"method":"turn.cancel","params":{"reason":"host request","conversation_id":"conv-1","turn_id":"queue-host"}})).await;
     assert_eq!(recv_id(&mut host, 152, true).await["result"]["ok"], false);
     release.send(true).unwrap();
     finish(&mut host, "run-host").await;
@@ -525,7 +525,7 @@ async fn turnid_cancel_current_unknown_and_queued() {
         (162, internal.as_str(), false),
         (163, "cancel-host", true),
     ] {
-        host.send(&json!({"jsonrpc":"2.0","id":id,"method":"turn.cancel","params":{"conversation_id":"conv-1","turn_id":turn}})).await;
+        host.send(&json!({"jsonrpc":"2.0","id":id,"method":"turn.cancel","params":{"reason":"host request","conversation_id":"conv-1","turn_id":turn}})).await;
         assert_eq!(recv_id(&mut host, id, true).await["result"]["ok"], expected);
     }
     // recv_id can have consumed the terminal frame while awaiting cancel ACK.
@@ -634,7 +634,7 @@ async fn turnid_unacked_replay_blocks_reuse_and_delayed_cancel_targets_successor
     assert_eq!(replay["params"]["turn_id"], "replayed-host");
     ack(&mut host, &replay).await;
     // This response is ordered after the ACK on the reader.
-    host.send(&json!({"jsonrpc":"2.0","id":182,"method":"turn.cancel","params":{"conversation_id":"conv-1","turn_id":"replayed-host"}})).await;
+    host.send(&json!({"jsonrpc":"2.0","id":182,"method":"turn.cancel","params":{"reason":"host request","conversation_id":"conv-1","turn_id":"replayed-host"}})).await;
     assert_eq!(recv_id(&mut host, 182, true).await["result"]["ok"], false);
     let paused = channel.turnid_pause_forward();
     host.send(&message(183, "conv-1", "successor", "replayed-host")).await;
@@ -651,7 +651,7 @@ async fn turnid_unacked_replay_blocks_reuse_and_delayed_cancel_targets_successor
             break;
         }
     }
-    host.send(&json!({"jsonrpc":"2.0","id":184,"method":"turn.cancel","params":{"conversation_id":"conv-1","turn_id":"replayed-host"}})).await;
+    host.send(&json!({"jsonrpc":"2.0","id":184,"method":"turn.cancel","params":{"reason":"host request","conversation_id":"conv-1","turn_id":"replayed-host"}})).await;
     assert_eq!(recv_id(&mut host, 184, true).await["result"]["ok"], true);
     channel.shutdown();
 }

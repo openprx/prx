@@ -262,7 +262,7 @@ pub(super) fn prepare_reserved_message(
     let _admission_guard = inner.admission.lock();
     ensure_running(inner)?;
     let message: InboundMessageParams = parse(params)?;
-    if reserved.is_none()
+    let duplicate = reserved.is_none()
         && inner
             .rpc
             .turn_ids
@@ -271,10 +271,7 @@ pub(super) fn prepare_reserved_message(
                 &message.message_id,
                 message.turn_id.as_deref(),
             )
-            .map_err(InboundError::TurnId)?
-    {
-        return Ok(Some(super::turn_queue::Admission::Queued));
-    }
+            .map_err(InboundError::TurnId)?;
     super::turn_ids::TurnIds::validate(message.turn_id.as_deref()).map_err(InboundError::TurnId)?;
     tracing::debug!(
         conversation_id = %message.conversation_id,
@@ -306,6 +303,11 @@ pub(super) fn prepare_reserved_message(
         }
         // The indexed inbound event is the durable content copy. Queued input
         // remains in the identity-owned queue until that transaction commits.
+    }
+    // The durable erase fence owns deleted-message replay responses, even
+    // when this process still remembers the original admission.
+    if duplicate {
+        return Ok(Some(super::turn_queue::Admission::Queued));
     }
     inner
         .conversations
