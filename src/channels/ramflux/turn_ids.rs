@@ -24,7 +24,7 @@ struct State {
 #[derive(Default)]
 pub(super) struct TurnIds(Mutex<State>);
 
-/// The queue or forwarding future owns this until claim_slot transfers to the
+/// The queue or forwarding future owns this until `try_claim_slot` transfers to the
 /// turn guard. The map holds only a Weak reference, never a pre-bind owner.
 pub(crate) struct Reservation {
     ids: Arc<TurnIds>,
