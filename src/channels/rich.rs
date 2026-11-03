@@ -441,7 +441,7 @@ pub trait RichChannel: Channel {
     fn claim_slot(&self, _conversation_id: &str, _message_id: &str, _turn_id: &str) {}
 
     /// Acquire a slot unless its pre-bind owner was revoked or dropped.
-    /// Existing implementers retain their claim_slot hook and behavior.
+    /// Existing implementers retain their [`Self::claim_slot`] hook and behavior.
     fn try_claim_slot(&self, conversation_id: &str, message_id: &str, turn_id: &str) -> bool {
         self.claim_slot(conversation_id, message_id, turn_id);
         true
