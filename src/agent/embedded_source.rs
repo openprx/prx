@@ -23,11 +23,6 @@ pub(crate) struct SelectedEmbeddedModel {
 
 impl SelectedEmbeddedModel {
     #[cfg(feature = "llm-router")]
-    pub(crate) fn provider(&self) -> Arc<dyn crate::providers::Provider> {
-        Arc::clone(&self.provider)
-    }
-
-    #[cfg(feature = "llm-router")]
     pub(crate) const fn choice(&self) -> &super::entry::AgentModelChoice {
         &self.choice
     }
