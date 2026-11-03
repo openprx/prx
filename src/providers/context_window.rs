@@ -758,7 +758,7 @@ reserved_output_tokens = 8000"#,
 context_window = 16384"#,
         );
         crate::config::model_settings::validate_changes(None, &config).unwrap();
-        assert!(crate::config::model_settings::warnings(&config).unwrap().is_empty());
+        assert_eq!(crate::config::model_settings::warnings(&config).unwrap(), Vec::<String>::new());
         let result = settings_resolution(&config, "ollama", "my-local-model:latest");
         assert_eq!(result.config.max_context_tokens, 16_384);
         assert_eq!(result.max_context_source, ContextWindowSource::ModelSettings);
@@ -790,10 +790,10 @@ context_window = 300000"#,
     }
 
     #[derive(Clone)]
-    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    struct Capture(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
     impl std::io::Write for Capture {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
+            self.0.lock().extend_from_slice(bytes);
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -815,7 +815,7 @@ context_window = 300000"#,
             emit_legacy_router_window_warning(config, &once);
             emit_legacy_router_window_warning(config, &once);
         });
-        let bytes = captured.0.lock().unwrap().clone();
+        let bytes = captured.0.lock().clone();
         String::from_utf8(bytes).unwrap()
     }
 
