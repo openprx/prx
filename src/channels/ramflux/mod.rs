@@ -18,10 +18,15 @@ mod rpc;
 mod socket;
 mod storage;
 mod surface_schema;
+pub(crate) mod turn_ids;
 mod turn_queue;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod turnid_test_support;
+#[cfg(test)]
+pub(crate) use turnid_test_support::turnid_code_fixture;
 
 use super::rich::{RichChannel, RichInbound, RichReply, TextReply, TurnError, TurnState, TurnStatus};
 use super::traits::{Channel, SendMessage};
@@ -70,6 +75,36 @@ struct TurnMessage {
     source: String,
 }
 
+// A forwarding future owns the pre-bind slot. Binding removes slot_messages;
+// aborted/dropped forwarding releases only a still-unclaimed slot.
+struct ForwardSlot {
+    inner: Arc<Inner>,
+    conversation: String,
+    message: String,
+    armed: bool,
+    reservation: Option<Arc<turn_ids::Reservation>>,
+}
+impl ForwardSlot {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for ForwardSlot {
+    fn drop(&mut self) {
+        let released = {
+            let _admission = self.inner.admission.lock();
+            self.armed
+                && self.reservation.as_ref().is_none_or(|owner| owner.may_release_slot())
+                && self.inner.claim_slot_message(&self.conversation, &self.message)
+        };
+        // Pumping can spawn another owned future. Its immediate destruction
+        // during runtime shutdown must not re-enter the admission mutex.
+        if released {
+            self.inner.pump_next(&self.conversation, &self.message);
+        }
+    }
+}
+
 pub(crate) struct TrackedMessage {
     pub conversation_id: String,
     pub objects: Vec<String>,
@@ -77,6 +112,7 @@ pub(crate) struct TrackedMessage {
 }
 
 pub(crate) struct Inner {
+    self_weak: std::sync::Weak<Inner>,
     config: RamfluxConfig,
     admission: Mutex<()>,
     revocations: AtomicU64,
@@ -120,6 +156,12 @@ pub(crate) struct Inner {
     queue: turn_queue::TurnQueue,
     workspace: PathBuf,
     persona: Mutex<Option<accounts::Persona>>,
+    #[cfg(test)]
+    forward_pause: Mutex<Option<(tokio::sync::oneshot::Sender<()>, Arc<tokio::sync::Barrier>)>>,
+    #[cfg(test)]
+    forward_abort: Mutex<Option<tokio::task::AbortHandle>>,
+    #[cfg(test)]
+    forward_release: Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 impl Inner {
@@ -160,8 +202,30 @@ impl Inner {
             tx.send(event)
                 .await
                 .map_err(|_| inbound::InboundError::Failed("rich listener closed".to_string()))?;
+        } else {
+            return Err(inbound::InboundError::Failed("rich listener unavailable".to_owned()));
         }
         Ok(())
+    }
+
+    fn emit_message(
+        self: &Arc<Self>,
+        message: super::rich::RichMessage,
+    ) -> impl std::future::Future<Output = Result<(), inbound::InboundError>> + Send + 'static {
+        // Construct ownership before returning the future, including for a
+        // future that is dropped without ever being polled.
+        let mut guard = ForwardSlot {
+            inner: Arc::clone(self),
+            conversation: message.conversation_id.clone(),
+            message: message.message_id.clone(),
+            armed: true,
+            reservation: message.reservation.clone(),
+        };
+        async move {
+            guard.inner.emit_inbound(RichInbound::Message(message)).await?;
+            guard.disarm();
+            Ok(())
+        }
     }
 
     fn track_message(&self, message_id: &str, tracked: TrackedMessage) {
@@ -190,6 +254,7 @@ impl Inner {
     }
 
     fn bind_turn(&self, conversation_id: &str, turn_id: &str, token: CancellationToken) {
+        self.rpc.turn_ids.bind_direct(conversation_id, turn_id);
         let mut turns = self.turns.lock();
         let slots = turns.entry(conversation_id.to_string()).or_default();
         if let Some(existing) = slots.iter_mut().find(|slot| slot.turn_id == turn_id) {
@@ -204,6 +269,7 @@ impl Inner {
     }
 
     fn unbind_turn(&self, conversation_id: &str, turn_id: &str) {
+        self.rpc.turn_ids.unbind(turn_id);
         let mut turns = self.turns.lock();
         if let Some(slots) = turns.get_mut(conversation_id) {
             slots.retain(|slot| slot.turn_id != turn_id);
@@ -232,6 +298,7 @@ impl Inner {
     fn cancel_conversation(&self, conversation_id: &str) {
         self.cancel_tokens(conversation_id);
         self.queue.drain(conversation_id);
+        self.rpc.turn_ids.release_unbound(Some(conversation_id));
         self.slot_messages
             .lock()
             .retain(|key| key.conversation != conversation_id);
@@ -255,11 +322,11 @@ impl Inner {
             return;
         };
         self.note_slot_message(&next.conversation_id, &next.message_id);
-        let tx = self.inbound_tx.lock().clone();
-        if let Some(tx) = tx {
+        if let Some(inner) = self.self_weak.upgrade() {
+            let emitting = inner.emit_message(next);
             tokio::spawn(async move {
-                if tx.send(RichInbound::Message(next)).await.is_err() {
-                    tracing::debug!("ramflux queued message was not delivered");
+                if let Err(error) = emitting.await {
+                    tracing::debug!(%error, "ramflux queued message was not delivered");
                 }
             });
         }
@@ -285,11 +352,11 @@ impl Inner {
             }
             ready
         };
-        let tx = self.inbound_tx.lock().clone();
-        if let Some(tx) = tx {
+        if let Some(inner) = self.self_weak.upgrade() {
+            let emitting: Vec<_> = ready.into_iter().map(|next| inner.emit_message(next)).collect();
             tokio::spawn(async move {
-                for next in ready {
-                    if tx.send(RichInbound::Message(next)).await.is_err() {
+                for emitting in emitting {
+                    if emitting.await.is_err() {
                         break;
                     }
                 }
@@ -308,6 +375,7 @@ impl Inner {
         );
         for key in &family {
             self.queue.remove_queued(conversation_id, &key.message);
+            self.rpc.turn_ids.release_message(conversation_id, &key.message);
         }
         let run_ids: Vec<String> = self
             .slot_turns
@@ -351,6 +419,7 @@ impl Inner {
             slot.token.cancel();
         }
         self.queue.drain_all();
+        self.rpc.turn_ids.release_unbound(None);
         self.slot_messages.lock().clear();
     }
 
@@ -376,6 +445,7 @@ impl Inner {
         self.hello_done.store(false, Ordering::Release);
         self.auth.clear_hello();
         self.queue.drain_all();
+        self.rpc.turn_ids.release_unbound(None);
         self.slot_messages.lock().clear();
     }
 
@@ -598,7 +668,8 @@ impl RamfluxChannel {
         let max_in_flight = usize::from(config.max_in_flight_per_conversation.max(1));
         let queue = turn_queue::TurnQueue::new(config.on_new_message, max_in_flight);
         Ok(Self {
-            inner: Arc::new(Inner {
+            inner: Arc::new_cyclic(|self_weak| Inner {
+                self_weak: self_weak.clone(),
                 config,
                 admission: Mutex::new(()),
                 revocations: AtomicU64::new(0),
@@ -642,6 +713,12 @@ impl RamfluxChannel {
                 queue,
                 workspace: workspace_dir.to_path_buf(),
                 persona: Mutex::new(None),
+                #[cfg(test)]
+                forward_pause: Mutex::new(None),
+                #[cfg(test)]
+                forward_abort: Mutex::new(None),
+                #[cfg(test)]
+                forward_release: Mutex::new(None),
             }),
         })
     }
@@ -703,8 +780,16 @@ impl RamfluxChannel {
         *self.inner.expected_peer.lock() = uid;
     }
 
-    pub(crate) fn claim_admitted(&self, conversation_id: &str, message_id: &str, turn_id: &str) {
+    pub(crate) fn claim_admitted(&self, conversation_id: &str, message_id: &str, turn_id: &str) -> bool {
+        let _admission = self.inner.admission.lock();
+        if !self.inner.queue.owns(conversation_id, message_id) {
+            return false;
+        }
         if self.inner.claim_slot_message(conversation_id, message_id) {
+            if !self.inner.rpc.turn_ids.bind(conversation_id, message_id, turn_id) {
+                self.inner.pump_next(conversation_id, message_id);
+                return false;
+            }
             self.inner.note_slot_turn(conversation_id, message_id, turn_id);
             if let Some(tracked) = self
                 .inner
@@ -714,7 +799,9 @@ impl RamfluxChannel {
             {
                 self.inner.approvals.bind_sender(turn_id, tracked.sender.clone());
             }
+            return true;
         }
+        false
     }
 
     #[must_use]
@@ -822,15 +909,20 @@ impl Channel for RamfluxChannel {
     async fn listen(&self, tx: mpsc::Sender<crate::channels::traits::ChannelMessage>) -> anyhow::Result<()> {
         let (rich_tx, mut rich_rx) = mpsc::channel(64);
         let forward = async {
-            while let Some(event) = rich_rx.recv().await {
-                let message = match event {
+            let mut forwarding = tokio::task::JoinSet::new();
+            loop {
+                let event = tokio::select! {
+                    () = self.inner.shutdown.cancelled() => break,
+                    event = rich_rx.recv() => match event { Some(event) => event, None => break },
+                };
+                let (message, reservation) = match event {
                     RichInbound::Message(message) => {
                         self.stash_attachments(
                             &message.conversation_id,
                             &message.message_id,
                             message.attachments.clone(),
                         );
-                        message.to_channel_message()
+                        (message.to_channel_message(), message.reservation.clone())
                     }
                     RichInbound::SurfaceAction(action) => {
                         let chat = self.inner.conversations.lock().get(&action.conversation_id).cloned();
@@ -841,7 +933,7 @@ impl Channel for RamfluxChannel {
                         // Surface values are user input, never approval authority.
                         // Only the dedicated host decision can resolve a waiter.
                         let content = serde_json::json!({"event":"surface_action", "message_id":action.message_id, "surface_id":action.surface_id, "action_id":action.action_id, "values":action.values}).to_string();
-                        let derived_id = format!("{}:{}:{}", action.message_id, action.action_id, uuid::Uuid::new_v4());
+                        let derived_id = action.derived_message_id;
                         self.inner.derived_messages.lock().insert(
                             MessageKey::new(&action.conversation_id, &derived_id),
                             action.message_id.clone(),
@@ -854,7 +946,8 @@ impl Channel for RamfluxChannel {
                         // Deliver an admitted action at this position in the
                         // input stream. This loop must never send to rich_tx,
                         // whose only consumer is this same loop.
-                        let admitted = match inbound::prepare_message(&self.inner, &params) {
+                        let admitted = match inbound::prepare_reserved_message(&self.inner, &params, action.reservation)
+                        {
                             Ok(Some(turn_queue::Admission::Interrupt(message))) => {
                                 self.inner.cancel_tokens(&message.conversation_id);
                                 message
@@ -870,7 +963,7 @@ impl Channel for RamfluxChannel {
                                 continue;
                             }
                         };
-                        admitted.to_channel_message()
+                        (admitted.to_channel_message(), admitted.reservation.clone())
                     }
                     RichInbound::TaskEvent(event) => {
                         self.inner.project_task_event(&event).await;
@@ -878,14 +971,56 @@ impl Channel for RamfluxChannel {
                     }
                     RichInbound::Control(_) | RichInbound::MessageDeleted(_) => continue,
                 };
-                if tx.send(message).await.is_err() {
-                    break;
+                let inner = Arc::clone(&self.inner);
+                let sender = tx.clone();
+                #[cfg(test)]
+                let pause = inner.forward_pause.lock().take();
+                let (delivered_tx, delivered_rx) = tokio::sync::oneshot::channel();
+                let slot = ForwardSlot {
+                    inner,
+                    conversation: message.reply_target.clone(),
+                    message: message.id.clone(),
+                    armed: true,
+                    reservation: reservation.clone(),
+                };
+                let handle = forwarding.spawn(async move {
+                    let _slot = slot;
+                    #[cfg(test)]
+                    if let Some((entered, barrier)) = pause {
+                        let _ = entered.send(());
+                        barrier.wait().await;
+                    }
+                    let delivered = sender.send(message).await.is_ok();
+                    let _ = delivered_tx.send(delivered);
+                    if delivered {
+                        if let Some(reservation) = reservation {
+                            reservation.transferred.cancelled().await;
+                        }
+                    }
+                });
+                #[cfg(test)]
+                {
+                    *self.inner.forward_abort.lock() = Some(handle);
                 }
+                #[cfg(not(test))]
+                drop(handle);
+                // Keep the original bounded send backpressure. The task only
+                // outlives this handoff while a dispatcher is about to bind it.
+                let delivered = tokio::select! {
+                    () = self.inner.shutdown.cancelled() => break,
+                    delivered = delivered_rx => delivered,
+                };
+                if matches!(delivered, Ok(false)) {
+                    anyhow::bail!("channel dispatcher closed");
+                }
+                while forwarding.try_join_next().is_some() {}
             }
             Ok(())
         };
         let listen = self.listen_rich(rich_tx);
-        tokio::try_join!(listen, forward)?;
+        let outcome = tokio::try_join!(listen, forward);
+        self.inner.cancel_all();
+        outcome?;
         Ok(())
     }
 
@@ -1090,6 +1225,10 @@ impl RichChannel for RamfluxChannel {
 
     fn claim_slot(&self, conversation_id: &str, message_id: &str, turn_id: &str) {
         self.claim_admitted(conversation_id, message_id, turn_id);
+    }
+
+    fn try_claim_slot(&self, conversation_id: &str, message_id: &str, turn_id: &str) -> bool {
+        self.claim_admitted(conversation_id, message_id, turn_id)
     }
 
     fn record_erasure(&self, conversation_id: &str, message_id: &str, memory_key: &str, history_key: &str) {

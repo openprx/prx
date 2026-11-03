@@ -154,6 +154,7 @@ pub struct TurnStatus {
 /// Inbound user message mapped onto the existing channel pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RichMessage {
+    pub(crate) reservation: Option<Arc<super::ramflux::turn_ids::Reservation>>,
     pub conversation_id: String,
     pub message_id: String,
     pub sender: Sender,
@@ -197,6 +198,8 @@ impl RichMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceActionInbound {
+    pub(crate) derived_message_id: String,
+    pub(crate) reservation: Option<Arc<super::ramflux::turn_ids::Reservation>>,
     pub conversation_id: String,
     pub sender: Sender,
     pub surface_id: String,
@@ -436,6 +439,13 @@ pub trait RichChannel: Channel {
 
     /// Mark that this turn owns the queue slot admitted for `message_id`.
     fn claim_slot(&self, _conversation_id: &str, _message_id: &str, _turn_id: &str) {}
+
+    /// Acquire a slot unless its pre-bind owner was revoked or dropped.
+    /// Existing implementers retain their claim_slot hook and behavior.
+    fn try_claim_slot(&self, conversation_id: &str, message_id: &str, turn_id: &str) -> bool {
+        self.claim_slot(conversation_id, message_id, turn_id);
+        true
+    }
 
     /// Project the final answer as one markdown surface. Invalid surfaces are skipped.
     async fn project_final_surface(&self, _conversation_id: &str, _turn_id: &str, _text: &str) -> anyhow::Result<()> {

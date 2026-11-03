@@ -31,6 +31,24 @@ pub struct TurnQueue {
 }
 
 impl TurnQueue {
+    pub(super) fn pending_messages(&self, conversation_id: &str) -> HashSet<String> {
+        let state = self.state.lock();
+        state
+            .running
+            .get(conversation_id)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .chain(
+                state
+                    .queued
+                    .get(conversation_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|message| message.message_id.clone()),
+            )
+            .collect()
+    }
     #[must_use]
     pub fn new(policy: RamfluxOnNewMessage, max_in_flight: usize) -> Self {
         Self {
