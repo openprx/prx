@@ -404,7 +404,7 @@ async fn on_surface(inner: &Inner, params: &Value) -> Result<Value, InboundError
     let reservation = {
         let _admission = inner.admission.lock();
         ensure_running(inner)?;
-        inner
+        let reservation = inner
             .rpc
             .turn_ids
             .reserve(
@@ -413,7 +413,14 @@ async fn on_surface(inner: &Inner, params: &Value) -> Result<Value, InboundError
                 action.turn_id.as_deref(),
                 |run| inner.rpc.has_pending(run),
             )
-            .map_err(InboundError::TurnId)?
+            .map_err(InboundError::TurnId)?;
+        // Deletion must find a reserved action even while the listener is
+        // blocked before it can derive or admit that action's message.
+        inner.derived_messages.lock().insert(
+            super::MessageKey::new(&action.conversation_id, &derived_message_id),
+            action.message_id.clone(),
+        );
+        reservation
     };
     inner
         .emit_inbound(RichInbound::SurfaceAction(SurfaceActionInbound {

@@ -934,10 +934,6 @@ impl Channel for RamfluxChannel {
                         // Only the dedicated host decision can resolve a waiter.
                         let content = serde_json::json!({"event":"surface_action", "message_id":action.message_id, "surface_id":action.surface_id, "action_id":action.action_id, "values":action.values}).to_string();
                         let derived_id = action.derived_message_id;
-                        self.inner.derived_messages.lock().insert(
-                            MessageKey::new(&action.conversation_id, &derived_id),
-                            action.message_id.clone(),
-                        );
                         let params = serde_json::json!({
                             "conversation_id":action.conversation_id,
                             "message_id":derived_id,
@@ -974,7 +970,10 @@ impl Channel for RamfluxChannel {
                 let inner = Arc::clone(&self.inner);
                 let sender = tx.clone();
                 #[cfg(test)]
-                let pause = inner.forward_pause.lock().take();
+                let (entered, pause) = match inner.forward_pause.lock().take() {
+                    Some((entered, pause)) => (Some(entered), Some(pause)),
+                    None => (None, None),
+                };
                 let (delivered_tx, delivered_rx) = tokio::sync::oneshot::channel();
                 let slot = ForwardSlot {
                     inner,
@@ -986,8 +985,7 @@ impl Channel for RamfluxChannel {
                 let handle = forwarding.spawn(async move {
                     let _slot = slot;
                     #[cfg(test)]
-                    if let Some((entered, barrier)) = pause {
-                        let _ = entered.send(());
+                    if let Some(barrier) = pause {
                         barrier.wait().await;
                     }
                     let delivered = sender.send(message).await.is_ok();
@@ -1001,6 +999,9 @@ impl Channel for RamfluxChannel {
                 #[cfg(test)]
                 {
                     *self.inner.forward_abort.lock() = Some(handle);
+                    if let Some(entered) = entered {
+                        let _ = entered.send(());
+                    }
                 }
                 #[cfg(not(test))]
                 drop(handle);
