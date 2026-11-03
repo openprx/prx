@@ -52,7 +52,11 @@ pub(super) async fn perform(inner: &Inner, job: &EraseJob) -> Result<(), String>
         let origin = ErasureOrigin::new(&job.account, &job.conversation, message_id);
         let begin = origin.clone();
         storage(backend.clone(), move |store| store.begin_delete(&begin)).await?;
-        inner.cancel_message(&job.conversation, message_id);
+        let released = {
+            let _admission = inner.admission.lock();
+            inner.cancel_message(&job.conversation, message_id)
+        };
+        inner.pump_cancelled(released);
         fence_runs(inner, backend.clone(), origin.clone()).await?;
         inner.wait_message(&job.conversation, message_id).await;
         fence_runs(inner, backend.clone(), origin.clone()).await?;

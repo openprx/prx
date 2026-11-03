@@ -4,21 +4,32 @@ use super::MessageKey;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
+
+use super::rpc::{DEDUPE_LIMIT, DEDUPE_TTL};
 use tokio_util::sync::CancellationToken;
 
 struct Entry {
     generation: u64,
     host: Option<String>,
+    supplied_host: bool,
     internal: Option<String>,
     live: bool,
+    // Queue ownership must outlive the bounded message replay cache.
+    admitted: bool,
     owner: Weak<Reservation>,
+}
+
+struct Seen {
+    host: Option<String>,
+    at: Instant,
 }
 
 #[derive(Default)]
 struct State {
     generation: u64,
     entries: HashMap<MessageKey, Entry>,
-    seen: HashMap<MessageKey, Option<String>>,
+    seen: HashMap<MessageKey, Seen>,
 }
 
 #[derive(Default)]
@@ -86,7 +97,8 @@ impl TurnIds {
 
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
-        self.0.lock().entries.is_empty()
+        let state = self.0.lock();
+        state.entries.is_empty() && state.seen.is_empty()
     }
     pub(super) fn validate(host: Option<&str>) -> Result<(), String> {
         if let Some(host) = host
@@ -99,11 +111,28 @@ impl TurnIds {
         Ok(())
     }
 
-    pub(super) fn check_message(&self, conversation: &str, message: &str, host: Option<&str>) -> Result<bool, String> {
+    pub(super) fn check_message(
+        &self,
+        conversation: &str,
+        message: &str,
+        host: Option<&str>,
+        has_pending: impl Fn(&str) -> bool,
+    ) -> Result<bool, String> {
         Self::validate(host)?;
-        let state = self.0.lock();
+        let mut state = self.0.lock();
+        Self::prune_seen(&mut state, Instant::now());
+        state
+            .entries
+            .retain(|_, entry| entry.live || entry.internal.as_deref().is_some_and(&has_pending));
+        let key = MessageKey::new(conversation, message);
+        if let Some(entry) = state.entries.get(&key) {
+            if entry.host.as_deref().filter(|_| entry.supplied_host) != host {
+                return Err("message_id replay has a different turn_id".to_owned());
+            }
+            return Ok(true);
+        }
         if let Some(previous) = state.seen.get(&MessageKey::new(conversation, message)) {
-            if previous.as_deref() != host {
+            if previous.host.as_deref() != host {
                 return Err("message_id replay has a different turn_id".to_owned());
             }
             return Ok(state.entries.contains_key(&MessageKey::new(conversation, message)));
@@ -146,19 +175,49 @@ impl TurnIds {
             Entry {
                 generation,
                 host: host.map(str::to_owned),
+                supplied_host: host.is_some(),
                 internal: None,
                 live: true,
+                admitted: false,
                 owner: Arc::downgrade(&owner),
             },
         );
         Ok(owner)
     }
 
+    fn prune_seen(state: &mut State, now: Instant) {
+        state.seen.retain(|_, seen| now.duration_since(seen.at) < DEDUPE_TTL);
+    }
+
     pub(super) fn remember(&self, conversation: &str, message: &str, host: Option<&str>) {
-        self.0
-            .lock()
-            .seen
-            .insert(MessageKey::new(conversation, message), host.map(str::to_owned));
+        self.remember_at(conversation, message, host, Instant::now());
+    }
+
+    fn remember_at(&self, conversation: &str, message: &str, host: Option<&str>, now: Instant) {
+        let mut state = self.0.lock();
+        Self::prune_seen(&mut state, now);
+        let key = MessageKey::new(conversation, message);
+        if let Some(entry) = state.entries.get_mut(&key) {
+            entry.admitted = true;
+        }
+        state.seen.insert(
+            key,
+            Seen {
+                host: host.map(str::to_owned),
+                at: now,
+            },
+        );
+        while state.seen.len() > DEDUPE_LIMIT {
+            // Stable tie breaking also makes same-clock admissions deterministic.
+            let oldest = state
+                .seen
+                .iter()
+                .min_by_key(|(key, seen)| (seen.at, &key.conversation, &key.message))
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                state.seen.remove(&oldest);
+            }
+        }
     }
 
     pub(super) fn bind(&self, conversation: &str, message: &str, internal: &str) -> bool {
@@ -212,8 +271,10 @@ impl TurnIds {
             Entry {
                 generation,
                 host: Some(internal.to_owned()),
+                supplied_host: false,
                 internal: Some(internal.to_owned()),
                 live: true,
+                admitted: false,
                 owner: Weak::new(),
             },
         );
@@ -230,6 +291,10 @@ impl TurnIds {
 
     pub(super) fn release_unbound(&self, conversation: Option<&str>) {
         self.release_matching(|key, _| conversation.is_none_or(|conv| key.conversation == conv));
+        self.0
+            .lock()
+            .seen
+            .retain(|key, _| !conversation.is_none_or(|conv| key.conversation == conv));
     }
 
     pub(super) fn release_message(&self, conversation: &str, message: &str) {
@@ -237,16 +302,17 @@ impl TurnIds {
     }
 
     pub(super) fn release_displaced(&self, conversation: &str, pending: &std::collections::HashSet<String>) {
-        self.release_matching(|key, seen| key.conversation == conversation && seen && !pending.contains(&key.message));
+        self.release_matching(|key, admitted| {
+            key.conversation == conversation && admitted && !pending.contains(&key.message)
+        });
     }
 
     fn release_matching(&self, matches: impl Fn(&MessageKey, bool) -> bool) {
         let owners = {
             let mut state = self.0.lock();
             let mut owners = Vec::new();
-            let State { entries, seen, .. } = &mut *state;
-            entries.retain(|key, entry| {
-                let remove = entry.internal.is_none() && matches(key, seen.contains_key(key));
+            state.entries.retain(|key, entry| {
+                let remove = entry.internal.is_none() && matches(key, entry.admitted);
                 if remove && let Some(owner) = entry.owner.upgrade() {
                     owners.push(owner);
                 }
@@ -294,5 +360,88 @@ impl TurnIds {
             params["surface_id"] = format!("final-{host}").into();
         }
         params["turn_id"] = host.into();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seen_cache_stays_bounded_and_evicts_deterministically() {
+        let ids = TurnIds::default();
+        let now = Instant::now();
+        for n in 0..DEDUPE_LIMIT * 3 {
+            ids.remember_at("conv", &format!("message-{n:04}"), Some("host"), now);
+            assert!(ids.0.lock().seen.len() <= DEDUPE_LIMIT);
+        }
+        let state = ids.0.lock();
+        assert_eq!(state.seen.len(), DEDUPE_LIMIT);
+        assert!(!state.seen.contains_key(&MessageKey::new("conv", "message-0000")));
+        assert!(state.seen.contains_key(&MessageKey::new(
+            "conv",
+            &format!("message-{:04}", DEDUPE_LIMIT * 3 - 1)
+        )));
+    }
+
+    #[test]
+    fn seen_cache_expires_on_remember_and_check_and_clears_on_revocation() {
+        let ids = TurnIds::default();
+        let old = Instant::now() - DEDUPE_TTL;
+        ids.remember_at("expired", "input", Some("old"), old);
+        assert_eq!(ids.check_message("expired", "input", Some("new"), |_| false), Ok(false));
+        assert!(ids.is_empty());
+        ids.remember_at("expired", "input", None, old);
+        ids.remember("conv", "input", Some("host"));
+        assert_eq!(ids.0.lock().seen.len(), 1);
+        assert!(!ids.is_empty(), "volatile emptiness must include seen");
+        ids.remember("other", "input", None);
+        ids.release_unbound(Some("conv"));
+        assert_eq!(ids.0.lock().seen.len(), 1);
+        assert!(ids.0.lock().seen.contains_key(&MessageKey::new("other", "input")));
+        ids.release_unbound(None);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn seen_eviction_keeps_displacement_ownership() -> Result<(), String> {
+        let ids = Arc::new(TurnIds::default());
+        let owner = ids.reserve("conv", "queued", Some("host"), |_| false)?;
+        ids.remember("conv", "queued", Some("host"));
+        for n in 0..DEDUPE_LIMIT {
+            ids.remember("other", &format!("input-{n}"), None);
+        }
+        assert!(!ids.0.lock().seen.contains_key(&MessageKey::new("conv", "queued")));
+        ids.release_displaced("conv", &Default::default());
+        assert!(!ids.has_host("conv", "host"));
+        assert!(owner.transferred.is_cancelled());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod live_replay_tests {
+    use super::*;
+
+    #[test]
+    fn seen_eviction_preserves_live_and_unacknowledged_message_identity() -> Result<(), String> {
+        for host in [Some("host"), None] {
+            let ids = Arc::new(TurnIds::default());
+            let owner = ids.reserve("conv", "live", host, |_| false)?;
+            ids.remember("conv", "live", host);
+            assert!(ids.bind("conv", "live", "internal"));
+            for n in 0..DEDUPE_LIMIT {
+                ids.remember("other", &format!("input-{n}"), None);
+            }
+            assert!(!ids.0.lock().seen.contains_key(&MessageKey::new("conv", "live")));
+            assert_eq!(ids.check_message("conv", "live", host, |_| false), Ok(true));
+            assert!(ids.check_message("conv", "live", Some("changed"), |_| false).is_err());
+            ids.unbind("internal");
+            assert_eq!(ids.check_message("conv", "live", host, |_| true), Ok(true));
+            assert!(ids.check_message("conv", "live", Some("changed"), |_| true).is_err());
+            assert_eq!(ids.check_message("conv", "live", Some("changed"), |_| false), Ok(false));
+            drop(owner);
+        }
+        Ok(())
     }
 }

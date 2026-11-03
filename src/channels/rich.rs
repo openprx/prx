@@ -437,6 +437,9 @@ pub trait RichChannel: Channel {
         true
     }
 
+    /// Release pre-bind ownership when the dispatcher refuses a message.
+    fn reject_slot(&self, _conversation_id: &str, _message_id: &str) {}
+
     /// Mark that this turn owns the queue slot admitted for `message_id`.
     fn claim_slot(&self, _conversation_id: &str, _message_id: &str, _turn_id: &str) {}
 

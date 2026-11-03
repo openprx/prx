@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
-const DEDUPE_LIMIT: usize = 256;
+pub(super) const DEDUPE_LIMIT: usize = 256;
 const REPLAY_LIMIT: usize = 128;
-const DEDUPE_TTL: Duration = Duration::from_secs(600);
+pub(super) const DEDUPE_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RpcFailure {

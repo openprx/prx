@@ -793,3 +793,25 @@ async fn turnid_restart_keeps_legacy_durable_records_and_clears_volatile_state()
     assert!(rows.iter().any(|r| r.content == "legacy durable input"));
     restarted.shutdown();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turnid_dispatcher_refusal_releases_host_and_forwarding_task() {
+    let (_dir, channel, memory, mut host, provider) = identity_boot().await;
+    let entered = channel.turnid_pause_forward();
+    host.send(&message(220, "conv-1", "refused", "refused-host")).await;
+    assert_eq!(recv_id(&mut host, 220, true).await["result"]["ok"], true);
+    entered.await.unwrap();
+    // Fail the backend lookup only after admission, before dispatcher acceptance.
+    let backend = memory.erasure_store().unwrap();
+    channel.turnid_detach_store();
+    channel.turnid_resume_forward();
+    channel.turnid_wait_forward_finished().await;
+    channel.turnid_wait_unreserved("conv-1", "refused-host").await;
+    channel.turnid_wait_slot_released("conv-1", "refused").await;
+    assert!(provider.runs.lock().is_empty());
+    channel.turnid_attach_store(backend);
+    host.send(&message(221, "conv-1", "accepted", "refused-host")).await;
+    finish(&mut host, "refused-host").await;
+    assert_eq!(provider.runs.lock().len(), 1);
+    channel.shutdown();
+}

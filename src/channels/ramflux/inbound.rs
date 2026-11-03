@@ -108,6 +108,7 @@ pub async fn on_frame(inner: &std::sync::Arc<Inner>, bytes: &[u8]) -> Result<(),
                                 &message.conversation_id,
                                 &message.message_id,
                                 message.turn_id.as_deref(),
+                                |run| inner.rpc.has_pending(run),
                             )
                             .map(|_| ())
                             .map_err(InboundError::TurnId)
@@ -270,6 +271,7 @@ pub(super) fn prepare_reserved_message(
                 &message.conversation_id,
                 &message.message_id,
                 message.turn_id.as_deref(),
+                |run| inner.rpc.has_pending(run),
             )
             .map_err(InboundError::TurnId)?;
     super::turn_ids::TurnIds::validate(message.turn_id.as_deref()).map_err(InboundError::TurnId)?;
@@ -564,7 +566,7 @@ fn schedule_delete(
         tokio::sync::mpsc::error::TrySendError::Closed(_) => InboundError::Failed("eraser is not running".to_owned()),
     })?;
     let account = inner.account_id.lock().clone().unwrap_or_default();
-    {
+    let released = {
         let _admission = inner.admission.lock();
         inner.deleting.lock().insert((
             account.clone(),
@@ -574,8 +576,9 @@ fn schedule_delete(
         inner
             .queue
             .suspend_delete(&deleted.conversation_id, &deleted.message_id);
-        inner.cancel_message(&deleted.conversation_id, &deleted.message_id);
-    }
+        inner.cancel_message(&deleted.conversation_id, &deleted.message_id)
+    };
+    inner.pump_cancelled(released);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let job = super::eraser::EraseJob {
         account,
