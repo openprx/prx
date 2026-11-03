@@ -436,7 +436,6 @@ fn an_awaited_terminal_returns_when_its_worker_never_starts() {
             !settle.is_finished(),
             "the awaited call must still be waiting while its worker is queued"
         );
-        let wall = std::time::Instant::now();
         let bound = crate::skills::lifecycle::receipts::TERMINAL_BUDGET
             + crate::skills::lifecycle::receipts::TERMINAL_START_GRACE;
         // The wheel stores the sleep at the next millisecond, and the driver
@@ -462,10 +461,13 @@ fn an_awaited_terminal_returns_when_its_worker_never_starts() {
                 );
             }
         }
-        let elapsed = wall.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "the awaited miss follows the paused clock, not a wall wait ({elapsed:?})"
+            !occupier.is_finished(),
+            "the blocking pool must still be occupied at settle return"
+        );
+        assert!(
+            crate::skills::lifecycle::receipts::before_start_hold_is_armed(tmp.path()),
+            "settle must return before the before-start hold is released"
         );
         let experience = store
             .read_experience(&ids.run)
@@ -504,7 +506,10 @@ fn an_awaited_terminal_returns_when_its_worker_never_starts() {
                 () = &mut cap => panic!("test: the released worker did not finish the join"),
             }
         }
-        occupier.await.expect("test: pool occupier");
+        tokio::time::timeout(std::time::Duration::from_secs(60), occupier)
+            .await
+            .expect("test: released pool occupier exceeded its 60 s hang guard")
+            .expect("test: pool occupier");
         release_task_pins(&ids.scope(), &ids.run);
     });
 }
