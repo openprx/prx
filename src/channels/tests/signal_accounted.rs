@@ -367,6 +367,29 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
                 .expect("actual input receipt");
             assert_decision_path(workspace.path(), &input_event.event_id, priced);
         }
+        let auxiliary: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "provider.auxiliary.settled")
+            .collect();
+        assert_eq!(
+            auxiliary.len(),
+            usize::from(priced && vision_supported && !text_only),
+            "every admitted Signal vision call must retain its durable receipt"
+        );
+        if let Some(receipt) = auxiliary.first() {
+            let payload: Value = serde_json::from_str(
+                receipt.raw_payload_json.as_deref().expect("vision receipt payload"),
+            )
+            .expect("vision receipt JSON");
+            assert_eq!(payload.get("purpose").and_then(Value::as_str), Some("signal_vision"));
+            let input_event = events
+                .iter()
+                .find(|event| event.role == "user" && event.content == input)
+                .expect("actual input receipt");
+            assert!(receipt.run_id.is_some(), "vision receipt must bind its admitted turn");
+            assert_eq!(receipt.run_id, input_event.run_id);
+            assert_eq!(receipt.owner_id, input_event.owner_id);
+        }
         assert_eq!(
             events
                 .iter()
