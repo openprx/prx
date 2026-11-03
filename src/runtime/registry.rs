@@ -1139,6 +1139,9 @@ pub const fn long_task_warn_threshold(configured: Option<u64>) -> Option<Duratio
     }
 }
 
+#[cfg(test)]
+static WARNING_TICK: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+
 /// Emit a `warn!` for every work item that has been running longer than
 /// `threshold`, and report how many were warned about.
 ///
@@ -1151,6 +1154,8 @@ pub const fn long_task_warn_threshold(configured: Option<u64>) -> Option<Duratio
 /// explicit, separately named mechanism — turning this warning into a timeout is
 /// the specific regression this comment exists to prevent.
 pub fn warn_long_running(threshold: Duration) -> usize {
+    #[cfg(test)]
+    let _tick = WARNING_TICK.lock();
     let mut warned: usize = 0;
     for slot in REGISTRY.slots() {
         let elapsed = slot.started.elapsed();
@@ -2050,12 +2055,33 @@ mod tests {
 
     #[tokio::test]
     async fn long_task_warning_only_warns_and_never_terminates() {
-        let mut child = spawn_registered("sleep", &["300.33"]);
-        let row = find_by_name("sleep 300.33").expect("test: child must be registered");
-        let pid = row.pid.expect("test: pid");
+        let (mut child, row, pid, warned, logs) = {
+            // Registration and the observed sweep belong to one tick. Another
+            // test or background sweeper cannot consume this entry's warning.
+            let _tick = WARNING_TICK.lock();
+            let child = spawn_registered("sleep", &["300.33"]);
+            let row = find_by_name("sleep 300.33").expect("test: child must be registered");
+            let pid = row.pid.expect("test: pid");
+            let (blocked, blocked_rx) = std::sync::mpsc::channel();
+            let competitor = std::thread::spawn(move || {
+                blocked.send(WARNING_TICK.try_lock().is_none()).unwrap();
+            });
+            assert!(
+                blocked_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("test: competing warning tick exceeded hang guard"),
+                "test: competing tick must not consume this warning"
+            );
+            competitor.join().unwrap();
+            let (warned, logs) = capturing_logs(|| warn_long_running(Duration::ZERO));
+            (child, row, pid, warned, logs)
+        };
 
         // A zero threshold makes every live item immediately overdue.
-        let (warned, logs) = capturing_logs(|| warn_long_running(Duration::from_secs(0)));
+        assert!(
+            logs.contains("sleep 300.33"),
+            "test: warning must describe this child: {logs}"
+        );
         assert!(warned > 0, "test: at least this child should have been warned about");
         assert!(
             logs.contains("has been running for a long time"),
