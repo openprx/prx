@@ -84,7 +84,7 @@ impl AgentCaseExecutor {
         let stage = crate::runtime::experiment_stage::current();
         // The real agent starts on a fresh task poll stack. Its large CLI
         // admission state must not extend the evaluator/service poll stack.
-        tokio::spawn(async move {
+        let worker = async move {
             let outcome = crate::runtime::experiment_stage::retain(
                 stage,
                 owner.scope(Box::pin(async move {
@@ -94,9 +94,12 @@ impl AgentCaseExecutor {
             .await;
             ticket.finish(outcome.is_ok());
             outcome
-        })
-        .await
-        .map_err(|error| EvaluationError::Executor(format!("owned case worker failed: {error}")))?
+        };
+        #[cfg(test)]
+        let worker = crate::runtime::turn_decision::with_inherited_scored_prediction(worker);
+        tokio::spawn(worker)
+            .await
+            .map_err(|error| EvaluationError::Executor(format!("owned case worker failed: {error}")))?
     }
 }
 

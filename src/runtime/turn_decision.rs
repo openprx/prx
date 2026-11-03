@@ -7,7 +7,9 @@
 #[cfg(test)]
 mod ordinary_child_fixture;
 #[cfg(test)]
-pub(crate) use ordinary_child_fixture::{with_scored_action, with_scored_prediction};
+pub(crate) use ordinary_child_fixture::{
+    with_inherited_scored_prediction, with_scored_action, with_scored_prediction, with_scored_publication,
+};
 
 #[cfg(test)]
 use crate::causal_tree::state::ConstraintCode;

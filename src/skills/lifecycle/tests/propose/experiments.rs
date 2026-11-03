@@ -504,89 +504,92 @@ async fn experiment_production_builder_runs_one_proposal_and_refuses_replay() ->
 
 #[tokio::test]
 async fn experiment_solver_and_independent_verifier_use_the_same_admitted_plan() -> Result<()> {
-    let f = fixture();
-    let pattern = usable_pattern(&f);
-    let server = Server::start(false).await?;
-    let result = async {
-        let config = config(&f, &server);
-        let suite = suite(&f);
-        let service = service(&f, &suite);
-        let (plan, inputs) = plan(&f, &service, &config, vec![pattern.pattern_id])?;
-        for stage in ["proposal", "evaluation", "verify"] {
-            let journal = run_stage(&service, &config, &plan, stage, &inputs[stage])
-                .await
-                .with_context(|| format!("stage {stage}"))?;
-            if stage == "verify" {
-                if !service.experiment_qualified(&journal)? {
-                    let evaluations: Vec<_> = f
-                        .store
-                        .list_evaluation_ids()?
-                        .iter()
-                        .map(|id| {
-                            let verified = f.store.verify_evaluation(id, None).unwrap();
-                            json!({"receipt":verified.receipt,"cases":verified.cases,"summary":verified.summary})
-                        })
-                        .collect();
-                    let path = format!("/tmp/prx-m1-solver-failure-{}.json", uuid::Uuid::new_v4());
-                    std::fs::write(
-                        &path,
-                        serde_json::to_vec_pretty(
-                            &json!({"evaluations":evaluations,"requests":*server.bodies.lock()}),
-                        )?,
-                    )?;
-                    anyhow::bail!(
-                        "independent verification did not qualify; evidence retained at {path}; state={:?}",
-                        journal.state
-                    );
-                }
-            }
-        }
-        let journal = service.inspect_experiment(&plan.spec().id, plan.digest())?;
-        assert!(journal.state.committed(&plan)?.within(plan.spec().resources));
-        // Completed receipts cannot be transplanted into another experiment
-        // or another frozen stage input, even with the same candidate.
-        for change_input in [false, true] {
-            let mut transplanted = journal.clone();
-            let mut spec = transplanted.plan.spec().clone();
-            if change_input {
-                spec.stages[1].input_sha256 = "f".repeat(64);
-            } else {
-                spec.id = ExperimentId::parse("another-experiment")?;
-            }
-            transplanted.plan = spec.freeze()?;
-            assert!(!service.experiment_qualified(&transplanted)?);
-        }
-        let mut wrong_reference = journal;
-        for entry in &mut wrong_reference.entries {
-            if let ExperimentEvent::Settled { stage, reference, .. } = &mut entry.event {
+    crate::runtime::turn_decision::with_scored_publication("skill", async {
+        let f = fixture();
+        let pattern = usable_pattern(&f);
+        let server = Server::start(false).await?;
+        let result = async {
+            let config = config(&f, &server);
+            let suite = suite(&f);
+            let service = service(&f, &suite);
+            let (plan, inputs) = plan(&f, &service, &config, vec![pattern.pattern_id])?;
+            for stage in ["proposal", "evaluation", "verify"] {
+                let journal = run_stage(&service, &config, &plan, stage, &inputs[stage])
+                    .await
+                    .with_context(|| format!("stage {stage}"))?;
                 if stage == "verify" {
-                    *reference = Some("not-an-evaluation".into());
+                    if !service.experiment_qualified(&journal)? {
+                        let evaluations: Vec<_> = f
+                            .store
+                            .list_evaluation_ids()?
+                            .iter()
+                            .map(|id| {
+                                let verified = f.store.verify_evaluation(id, None).unwrap();
+                                json!({"receipt":verified.receipt,"cases":verified.cases,"summary":verified.summary})
+                            })
+                            .collect();
+                        let path = format!("/tmp/prx-m1-solver-failure-{}.json", uuid::Uuid::new_v4());
+                        std::fs::write(
+                            &path,
+                            serde_json::to_vec_pretty(
+                                &json!({"evaluations":evaluations,"requests":*server.bodies.lock()}),
+                            )?,
+                        )?;
+                        anyhow::bail!(
+                            "independent verification did not qualify; evidence retained at {path}; state={:?}",
+                            journal.state
+                        );
+                    }
                 }
             }
+            let journal = service.inspect_experiment(&plan.spec().id, plan.digest())?;
+            assert!(journal.state.committed(&plan)?.within(plan.spec().resources));
+            // Completed receipts cannot be transplanted into another experiment
+            // or another frozen stage input, even with the same candidate.
+            for change_input in [false, true] {
+                let mut transplanted = journal.clone();
+                let mut spec = transplanted.plan.spec().clone();
+                if change_input {
+                    spec.stages[1].input_sha256 = "f".repeat(64);
+                } else {
+                    spec.id = ExperimentId::parse("another-experiment")?;
+                }
+                transplanted.plan = spec.freeze()?;
+                assert!(!service.experiment_qualified(&transplanted)?);
+            }
+            let mut wrong_reference = journal;
+            for entry in &mut wrong_reference.entries {
+                if let ExperimentEvent::Settled { stage, reference, .. } = &mut entry.event {
+                    if stage == "verify" {
+                        *reference = Some("not-an-evaluation".into());
+                    }
+                }
+            }
+            assert!(!service.experiment_qualified(&wrong_reference)?);
+            assert_eq!(
+                server.count.load(Ordering::SeqCst),
+                13,
+                "one proposer and twelve baseline/candidate physical calls"
+            );
+            assert_eq!(
+                f.store.active_binding(&f.pin.skill_id)?.unwrap().generation,
+                f.pin.generation,
+                "Shadow must not publish"
+            );
+            assert!(
+                f.tmp
+                    .path()
+                    .read_dir()?
+                    .filter_map(std::result::Result::ok)
+                    .all(|entry| !entry.file_name().to_string_lossy().starts_with("prx-experiment-eval-"))
+            );
+            Ok(())
         }
-        assert!(!service.experiment_qualified(&wrong_reference)?);
-        assert_eq!(
-            server.count.load(Ordering::SeqCst),
-            13,
-            "one proposer and twelve baseline/candidate physical calls"
-        );
-        assert_eq!(
-            f.store.active_binding(&f.pin.skill_id)?.unwrap().generation,
-            f.pin.generation,
-            "Shadow must not publish"
-        );
-        assert!(
-            f.tmp
-                .path()
-                .read_dir()?
-                .filter_map(std::result::Result::ok)
-                .all(|entry| !entry.file_name().to_string_lossy().starts_with("prx-experiment-eval-"))
-        );
-        Ok(())
-    }
-    .await;
-    server.finish().await?;
-    result
+        .await;
+        server.finish().await?;
+        result
+    })
+    .await
 }
 
 #[tokio::test]
@@ -619,72 +622,75 @@ async fn experiment_durable_cancel_reaches_active_provider_and_recovery_never_re
 
 #[tokio::test]
 async fn experiment_native_write_edit_read_requires_independently_correct_artifacts() -> Result<()> {
-    for wrong in [false, true] {
-        let f = fixture();
-        let pattern = usable_pattern(&f);
-        let server = Server::start_mode(false, Some(wrong)).await?;
-        let mut result: Result<()> = async {
-            let config = config(&f, &server);
-            let suite = suite_mode(&f, true);
-            let service = service(&f, &suite);
-            let (plan, inputs) = plan(&f, &service, &config, vec![pattern.pattern_id])?;
-            for stage in ["proposal", "evaluation", "verify"] {
-                run_stage(&service, &config, &plan, stage, &inputs[stage])
-                    .await
-                    .with_context(|| format!("artifact stage {stage}, wrong={wrong}"))?;
+    crate::runtime::turn_decision::with_scored_publication("skill", async {
+        for wrong in [false, true] {
+            let f = fixture();
+            let pattern = usable_pattern(&f);
+            let server = Server::start_mode(false, Some(wrong)).await?;
+            let mut result: Result<()> = async {
+                let config = config(&f, &server);
+                let suite = suite_mode(&f, true);
+                let service = service(&f, &suite);
+                let (plan, inputs) = plan(&f, &service, &config, vec![pattern.pattern_id])?;
+                for stage in ["proposal", "evaluation", "verify"] {
+                    run_stage(&service, &config, &plan, stage, &inputs[stage])
+                        .await
+                        .with_context(|| format!("artifact stage {stage}, wrong={wrong}"))?;
+                }
+                let journal = service.inspect_experiment(&plan.spec().id, plan.digest())?;
+                anyhow::ensure!(
+                    service.experiment_qualified(&journal)? != wrong,
+                    "completed model output must not override the independent artifact verdict; wrong={wrong}"
+                );
+                let calls = server.count.load(Ordering::SeqCst);
+                assert!(
+                    (31..=49).contains(&calls),
+                    "six paired native trials plus admitted progressive discovery: {calls}"
+                );
+                assert_eq!(journal.state.committed(&plan)?.calls, u64::try_from(calls)?);
+                assert_eq!(
+                    f.store.active_binding(&f.pin.skill_id)?.unwrap().generation,
+                    f.pin.generation
+                );
+                for id in f.store.list_evaluation_ids()? {
+                    let verified = f.store.verify_evaluation(&id, None)?;
+                    assert_eq!(verified.outcome.is_pass(), !wrong);
+                }
+                assert!(
+                    f.tmp
+                        .path()
+                        .read_dir()?
+                        .filter_map(std::result::Result::ok)
+                        .all(|entry| !entry.file_name().to_string_lossy().starts_with("prx-experiment-eval-"))
+                );
+                Ok(())
             }
-            let journal = service.inspect_experiment(&plan.spec().id, plan.digest())?;
-            anyhow::ensure!(
-                service.experiment_qualified(&journal)? != wrong,
-                "completed model output must not override the independent artifact verdict; wrong={wrong}"
-            );
-            let calls = server.count.load(Ordering::SeqCst);
-            assert!(
-                (31..=49).contains(&calls),
-                "six paired native trials plus admitted progressive discovery: {calls}"
-            );
-            assert_eq!(journal.state.committed(&plan)?.calls, u64::try_from(calls)?);
-            assert_eq!(
-                f.store.active_binding(&f.pin.skill_id)?.unwrap().generation,
-                f.pin.generation
-            );
-            for id in f.store.list_evaluation_ids()? {
-                let verified = f.store.verify_evaluation(&id, None)?;
-                assert_eq!(verified.outcome.is_pass(), !wrong);
+            .await;
+            if let Err(error) = &result {
+                let evaluations: Vec<_> = f
+                    .store
+                    .list_evaluation_ids()?
+                    .iter()
+                    .map(|id| match f.store.verify_evaluation(id, None) {
+                        Ok(value) => json!({"receipt":value.receipt,"cases":value.cases,"summary":value.summary}),
+                        Err(error) => json!({"error":error.to_string()}),
+                    })
+                    .collect();
+                let path = format!("/tmp/prx-m1-artifact-failure-{}.json", uuid::Uuid::new_v4());
+                std::fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(
+                        &json!({"error":error.to_string(),"requests":*server.bodies.lock(),"evaluations":evaluations}),
+                    )?,
+                )?;
+                result = result.map_err(|error| error.context(format!("artifact failure evidence: {path}")));
             }
-            assert!(
-                f.tmp
-                    .path()
-                    .read_dir()?
-                    .filter_map(std::result::Result::ok)
-                    .all(|entry| !entry.file_name().to_string_lossy().starts_with("prx-experiment-eval-"))
-            );
-            Ok(())
+            server.finish().await?;
+            result?;
         }
-        .await;
-        if let Err(error) = &result {
-            let evaluations: Vec<_> = f
-                .store
-                .list_evaluation_ids()?
-                .iter()
-                .map(|id| match f.store.verify_evaluation(id, None) {
-                    Ok(value) => json!({"receipt":value.receipt,"cases":value.cases,"summary":value.summary}),
-                    Err(error) => json!({"error":error.to_string()}),
-                })
-                .collect();
-            let path = format!("/tmp/prx-m1-artifact-failure-{}.json", uuid::Uuid::new_v4());
-            std::fs::write(
-                &path,
-                serde_json::to_vec_pretty(
-                    &json!({"error":error.to_string(),"requests":*server.bodies.lock(),"evaluations":evaluations}),
-                )?,
-            )?;
-            result = result.map_err(|error| error.context(format!("artifact failure evidence: {path}")));
-        }
-        server.finish().await?;
-        result?;
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 #[tokio::test]

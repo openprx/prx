@@ -149,12 +149,19 @@ impl TurnDecisionContext {
 
 // Positive mechanics fixtures need an actually above-bar prediction. This
 // opt-in never changes the production builtin, policy or admitted references.
+#[derive(Clone, Copy)]
+enum ScoredPrediction {
+    BuiltinChoice,
+    Action(&'static str, &'static str),
+    Publication(&'static str),
+}
+
 tokio::task_local! {
-    static SCORED_PREDICTION: Option<(&'static str, &'static str)>;
+    static SCORED_PREDICTION: ScoredPrediction;
 }
 
 pub(crate) fn with_scored_prediction<F: std::future::Future>(work: F) -> impl std::future::Future<Output = F::Output> {
-    SCORED_PREDICTION.scope(None, Box::pin(work))
+    SCORED_PREDICTION.scope(ScoredPrediction::BuiltinChoice, Box::pin(work))
 }
 
 pub(crate) fn with_scored_action<F: std::future::Future>(
@@ -162,7 +169,29 @@ pub(crate) fn with_scored_action<F: std::future::Future>(
     family: &'static str,
     work: F,
 ) -> impl std::future::Future<Output = F::Output> {
-    SCORED_PREDICTION.scope(Some((action, family)), Box::pin(work))
+    SCORED_PREDICTION.scope(ScoredPrediction::Action(action, family), Box::pin(work))
+}
+
+pub(crate) fn with_scored_publication<F: std::future::Future>(
+    family: &'static str,
+    work: F,
+) -> impl std::future::Future<Output = F::Output> {
+    SCORED_PREDICTION.scope(ScoredPrediction::Publication(family), Box::pin(work))
+}
+
+// Capture before spawning, then scope only the explicitly controlled child.
+// An unscoped caller keeps its original factory and builtin predictions.
+pub(crate) fn with_inherited_scored_prediction<F: std::future::Future>(
+    work: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let inherited = SCORED_PREDICTION.try_with(|choice| *choice).ok();
+    async move {
+        if let Some(choice) = inherited {
+            SCORED_PREDICTION.scope(choice, Box::pin(work)).await
+        } else {
+            work.await
+        }
+    }
 }
 
 pub(super) fn wrap_factory(
@@ -173,7 +202,10 @@ pub(super) fn wrap_factory(
     let Ok(choice) = SCORED_PREDICTION.try_with(|choice| *choice) else {
         return original;
     };
-    let (action, family) = choice.unwrap_or(("answer", "none"));
+    let (action, family) = match choice {
+        ScoredPrediction::Action(action, family) => (action, family),
+        _ => ("answer", "none"),
+    };
     DecisionBackendFactory::from_slots(
         vec![Box::new(OrdinaryFixtureBackend {
             identity: BackendIdentity {
@@ -184,8 +216,11 @@ pub(super) fn wrap_factory(
             key: Arc::clone(&key),
             action,
             family,
-            follow_builtin: choice.is_none(),
-            publication_family: None,
+            follow_builtin: matches!(choice, ScoredPrediction::BuiltinChoice),
+            publication_family: match choice {
+                ScoredPrediction::Publication(family) => Some(family),
+                _ => None,
+            },
         })],
         key,
         OutboundSecrets::default(),

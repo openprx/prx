@@ -310,7 +310,7 @@ impl SkillsLifecycleService {
         // so the lesson pin check would otherwise spend wall time.
         #[cfg(test)]
         let inherited_clock = crate::causal_tree::logical_clock::capture();
-        tokio::spawn(async move {
+        let worker = async move {
             let run = async move {
                 let outcome = crate::runtime::h2_entry::retain_run_continuation(
                     continuation,
@@ -329,9 +329,10 @@ impl SkillsLifecycleService {
                 return crate::causal_tree::logical_clock::scope(clock, run).await;
             }
             run.await
-        })
-        .await
-        .context("experiment stage worker failed")?
+        };
+        #[cfg(test)]
+        let worker = crate::runtime::turn_decision::with_inherited_scored_prediction(worker);
+        tokio::spawn(worker).await.context("experiment stage worker failed")?
     }
     async fn run_experiment_stage_owned(
         self: Arc<Self>,

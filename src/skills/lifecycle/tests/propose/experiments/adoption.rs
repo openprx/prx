@@ -260,6 +260,7 @@ fn retention_capture(f: &Fixture, task: &str, run: Option<&str>) -> Result<Strin
 
 #[tokio::test]
 async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and_retirement() -> Result<()> {
+    crate::runtime::turn_decision::with_scored_publication("skill", async {
     let mut f = fixture();
     let server = Server::start(false).await?;
     // One paused clock for every lookup in this body, including confirm,
@@ -709,6 +710,8 @@ async fn committed_origin_cost_query_and_real_editor_delivery_survive_replay_and
     .await;
     server.finish().await?;
     result
+
+    }).await
 }
 
 async fn owned_attempts_then_retire(

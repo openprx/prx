@@ -34,75 +34,78 @@ fn instruction_plan(
 
 #[tokio::test]
 async fn product_between_stages_is_incomplete_and_only_the_owned_run_can_confirm_root_drain() -> Result<()> {
-    let f = fixture();
-    let pattern = usable_pattern(&f);
-    let server = Server::start(false).await?;
-    let result = async {
-        let (cfg, service) = configured_service(&f, &server)?;
-        let (frozen, operations) = plan(&f, &service, &cfg, vec![pattern.pattern_id])?;
-        let plan = instruction_plan(&frozen, operations);
-        let handle = ExperimentProductHandle::of(&plan)?;
-        let initial = service.inspect_product(&handle, &cfg)?;
-        assert_eq!(initial.execution, ExperimentExecutionStatus::Planned);
-        assert_eq!(initial.cleanup, ExperimentCleanupStatus::NotStarted);
-        assert!(!initial.termination_confirmed);
-        let journal = run_stage(&service, &cfg, &frozen, "proposal", &plan.operations["proposal"]).await?;
-        assert!(
-            journal.state.stages["proposal"].successful(),
-            "real stage must settle and clean"
-        );
-        let partial = service.inspect_product(&handle, &cfg)?;
-        assert_eq!(partial.execution, ExperimentExecutionStatus::Incomplete);
-        assert!(
-            partial
-                .stages
-                .iter()
-                .any(|stage| stage.state == ExperimentStageStatus::Planned)
-        );
-        assert!(
-            partial
-                .stages
-                .iter()
-                .any(|stage| stage.state == ExperimentStageStatus::Settled && stage.cleanup_confirmed)
-        );
-        assert!(
-            !partial.termination_confirmed,
-            "settled stage plus future work does not prove root exit"
-        );
-        assert_eq!(partial.root_worker_drain, ExperimentRootDrainStatus::Unconfirmed);
-        let completed = service.run_product(&plan, &cfg, &CancellationToken::new()).await?;
-        assert_eq!(completed.execution, ExperimentExecutionStatus::Completed);
-        assert_eq!(completed.root_worker_drain, ExperimentRootDrainStatus::Confirmed);
-        assert!(
-            completed.termination_confirmed,
-            "original run must finish its actual cleanup drain"
-        );
-        let sends = server.count.load(Ordering::SeqCst);
-        let historical = service.inspect_product(&handle, &cfg)?;
-        assert_eq!(historical.execution, ExperimentExecutionStatus::Completed);
-        assert!(
-            !historical.termination_confirmed,
-            "read-only history cannot mint a current drain receipt"
-        );
-        assert_eq!(historical.root_worker_drain, ExperimentRootDrainStatus::Unconfirmed);
-        for _ in 0..2 {
-            let cancelled = service.cancel_product(&handle, &cfg)?;
-            assert_eq!(cancelled.journal_head_sha256, historical.journal_head_sha256);
+    crate::runtime::turn_decision::with_scored_publication("skill", async {
+        let f = fixture();
+        let pattern = usable_pattern(&f);
+        let server = Server::start(false).await?;
+        let result = async {
+            let (cfg, service) = configured_service(&f, &server)?;
+            let (frozen, operations) = plan(&f, &service, &cfg, vec![pattern.pattern_id])?;
+            let plan = instruction_plan(&frozen, operations);
+            let handle = ExperimentProductHandle::of(&plan)?;
+            let initial = service.inspect_product(&handle, &cfg)?;
+            assert_eq!(initial.execution, ExperimentExecutionStatus::Planned);
+            assert_eq!(initial.cleanup, ExperimentCleanupStatus::NotStarted);
+            assert!(!initial.termination_confirmed);
+            let journal = run_stage(&service, &cfg, &frozen, "proposal", &plan.operations["proposal"]).await?;
             assert!(
-                !cancelled.cancel_requested,
-                "terminal cancellation is an idempotent history read"
+                journal.state.stages["proposal"].successful(),
+                "real stage must settle and clean"
             );
+            let partial = service.inspect_product(&handle, &cfg)?;
+            assert_eq!(partial.execution, ExperimentExecutionStatus::Incomplete);
+            assert!(
+                partial
+                    .stages
+                    .iter()
+                    .any(|stage| stage.state == ExperimentStageStatus::Planned)
+            );
+            assert!(
+                partial
+                    .stages
+                    .iter()
+                    .any(|stage| stage.state == ExperimentStageStatus::Settled && stage.cleanup_confirmed)
+            );
+            assert!(
+                !partial.termination_confirmed,
+                "settled stage plus future work does not prove root exit"
+            );
+            assert_eq!(partial.root_worker_drain, ExperimentRootDrainStatus::Unconfirmed);
+            let completed = service.run_product(&plan, &cfg, &CancellationToken::new()).await?;
+            assert_eq!(completed.execution, ExperimentExecutionStatus::Completed);
+            assert_eq!(completed.root_worker_drain, ExperimentRootDrainStatus::Confirmed);
+            assert!(
+                completed.termination_confirmed,
+                "original run must finish its actual cleanup drain"
+            );
+            let sends = server.count.load(Ordering::SeqCst);
+            let historical = service.inspect_product(&handle, &cfg)?;
+            assert_eq!(historical.execution, ExperimentExecutionStatus::Completed);
+            assert!(
+                !historical.termination_confirmed,
+                "read-only history cannot mint a current drain receipt"
+            );
+            assert_eq!(historical.root_worker_drain, ExperimentRootDrainStatus::Unconfirmed);
+            for _ in 0..2 {
+                let cancelled = service.cancel_product(&handle, &cfg)?;
+                assert_eq!(cancelled.journal_head_sha256, historical.journal_head_sha256);
+                assert!(
+                    !cancelled.cancel_requested,
+                    "terminal cancellation is an idempotent history read"
+                );
+            }
+            assert_eq!(server.count.load(Ordering::SeqCst), sends);
+            assert_eq!(
+                f.store.active_binding(&f.pin.skill_id)?.context("baseline")?.generation,
+                f.pin.generation
+            );
+            Ok(())
         }
-        assert_eq!(server.count.load(Ordering::SeqCst), sends);
-        assert_eq!(
-            f.store.active_binding(&f.pin.skill_id)?.context("baseline")?.generation,
-            f.pin.generation
-        );
-        Ok(())
-    }
-    .await;
-    server.finish().await?;
-    result
+        .await;
+        server.finish().await?;
+        result
+    })
+    .await
 }
 
 #[tokio::test]
