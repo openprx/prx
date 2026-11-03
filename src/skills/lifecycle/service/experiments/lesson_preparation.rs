@@ -150,6 +150,8 @@ impl SkillsLifecycleService {
         // so the snapshot budget does not fall back to wall time.
         #[cfg(test)]
         let inherited_clock = crate::causal_tree::logical_clock::capture();
+        #[cfg(test)]
+        let hook_clock = inherited_clock.clone();
         crate::runtime::blocking::spawn_blocking(move || {
             let run = || -> Result<_> {
                 ensure!(!cancellation.is_cancelled(), "lesson preparation cancelled");
@@ -158,6 +160,14 @@ impl SkillsLifecycleService {
                 ensure!(!cancellation.is_cancelled(), "lesson preparation cancelled");
                 runtime.ensure_active()?;
                 Ok(prepared)
+            };
+            #[cfg(test)]
+            let run = || {
+                crate::skills::lifecycle::adoption::worker_clock::sync_scope(
+                    hook_clock,
+                    "experiment.preparation-lookup",
+                    run,
+                )
             };
             let result = {
                 #[cfg(test)]

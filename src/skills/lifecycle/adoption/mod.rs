@@ -23,4 +23,6 @@ pub(in crate::skills::lifecycle) use snapshot::format_lesson_block;
 #[cfg(test)]
 pub(crate) use lookup::arm_lookup_wall_stall;
 #[cfg(test)]
+pub(crate) use lookup::worker_clock;
+#[cfg(test)]
 pub(crate) use profile::LessonFixtureProfileGuard;
