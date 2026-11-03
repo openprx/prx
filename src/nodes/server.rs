@@ -1477,6 +1477,10 @@ fn read_meminfo_value(key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    mod process_group;
+    #[cfg(unix)]
+    use process_group::descendant_alive;
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -1630,6 +1634,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancel_kills_descendant_process_group() {
+        const COMMAND_TIMEOUT: Duration = Duration::from_secs(3600);
         // Whole-test safety net only: PID publication and OS reaping decide readiness.
         tokio::time::timeout(Duration::from_secs(60), async {
             let temp = TempDir::new().unwrap();
@@ -1648,7 +1653,7 @@ mod tests {
                     &command,
                     Some(state_for_task.sandbox_root.path.clone()),
                     None,
-                    Duration::from_secs(30),
+                    COMMAND_TIMEOUT,
                     "process-tree",
                     cancellation_for_task,
                 )
@@ -1674,13 +1679,17 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             };
 
+            assert!(
+                descendant_alive(descendant_pid),
+                "test: descendant must be alive before cancellation"
+            );
             cancellation.cancel();
             let result = task.await.unwrap();
 
-            assert!(result.cancelled);
+            assert!(result.cancelled && !result.timed_out);
             // execute_shell_command awaited the leader's terminate_and_reap. Init
             // owns descendant reaping, so observe /proc without a second phase budget.
-            while Path::new("/proc").join(descendant_pid.to_string()).exists() {
+            while descendant_alive(descendant_pid) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
