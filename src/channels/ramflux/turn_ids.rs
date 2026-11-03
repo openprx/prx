@@ -385,9 +385,11 @@ mod tests {
     }
 
     #[test]
-    fn seen_cache_expires_on_remember_and_check_and_clears_on_revocation() {
+    fn seen_cache_expires_on_remember_and_check_and_clears_on_revocation() -> Result<(), &'static str> {
         let ids = TurnIds::default();
-        let old = Instant::now() - DEDUPE_TTL;
+        let old = Instant::now()
+            .checked_sub(DEDUPE_TTL)
+            .ok_or("test clock cannot represent the expiry fixture")?;
         ids.remember_at("expired", "input", Some("old"), old);
         assert_eq!(ids.check_message("expired", "input", Some("new"), |_| false), Ok(false));
         assert!(ids.is_empty());
@@ -401,6 +403,7 @@ mod tests {
         assert!(ids.0.lock().seen.contains_key(&MessageKey::new("other", "input")));
         ids.release_unbound(None);
         assert!(ids.is_empty());
+        Ok(())
     }
 
     #[test]
