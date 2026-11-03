@@ -85,7 +85,7 @@ struct ForwardSlot {
     reservation: Option<Arc<turn_ids::Reservation>>,
 }
 impl ForwardSlot {
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -112,7 +112,7 @@ pub(crate) struct TrackedMessage {
 }
 
 pub(crate) struct Inner {
-    self_weak: std::sync::Weak<Inner>,
+    self_weak: std::sync::Weak<Self>,
     config: RamfluxConfig,
     admission: Mutex<()>,
     revocations: AtomicU64,
@@ -970,7 +970,7 @@ impl Channel for RamfluxChannel {
                 let inner = Arc::clone(&self.inner);
                 let sender = tx.clone();
                 #[cfg(test)]
-                let (entered, pause) = match inner.forward_pause.lock().take() {
+                let (entered, pause) = match { inner.forward_pause.lock().take() } {
                     Some((entered, pause)) => (Some(entered), Some(pause)),
                     None => (None, None),
                 };
