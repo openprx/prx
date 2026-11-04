@@ -42,10 +42,12 @@ pub(crate) struct PendingRecord {
     pub(crate) expires_at: DateTime<Utc>,
 }
 
+/// A complete authenticated persisted review, still not execution authority.
+/// Final claim and current-call validation remain mandatory.
 pub(crate) struct VerifiedDecisionApproval {
-    pub(crate) pending: VerifiedPendingDecisionApproval,
-    pub(crate) local_owner: Option<Box<crate::runtime::h2_entry::LocalOwnerReviewStamp>>,
-    pub(crate) grants: Vec<ApprovalGrantV2>,
+    pub(in crate::security::approval_ledger) pending: VerifiedPendingDecisionApproval,
+    pub(in crate::security::approval_ledger) local_owner: Option<Box<crate::runtime::h2_entry::LocalOwnerReviewStamp>>,
+    pub(in crate::security::approval_ledger) grants: Vec<ApprovalGrantV2>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,9 +57,35 @@ pub(crate) struct SignedPending {
     pub(crate) mac: [u8; 32],
 }
 
+/// Constructed only after MAC, durable source, decision and current policy
+/// validation. It is metadata for human review, never execution authority.
 pub(crate) struct VerifiedPendingDecisionApproval {
-    pub(crate) record: PendingRecord,
-    pub(crate) source: MessageEvent,
+    pub(in crate::security::approval_ledger) record: PendingRecord,
+    pub(in crate::security::approval_ledger) source: MessageEvent,
+}
+
+impl VerifiedPendingDecisionApproval {
+    pub(crate) const fn record(&self) -> &PendingRecord {
+        &self.record
+    }
+
+    pub(crate) const fn source(&self) -> &MessageEvent {
+        &self.source
+    }
+}
+
+impl VerifiedDecisionApproval {
+    pub(crate) const fn pending(&self) -> &VerifiedPendingDecisionApproval {
+        &self.pending
+    }
+
+    pub(crate) fn grants(&self) -> &[ApprovalGrantV2] {
+        &self.grants
+    }
+
+    pub(crate) fn local_owner(&self) -> Option<&crate::runtime::h2_entry::LocalOwnerReviewStamp> {
+        self.local_owner.as_deref()
+    }
 }
 
 #[derive(Serialize)]

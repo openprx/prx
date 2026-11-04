@@ -37,7 +37,9 @@ impl TurnDecisionService {
         &self,
         pending: &VerifiedPendingDecisionApproval,
     ) -> anyhow::Result<()> {
-        if pending.source.source != crate::memory::MessageEventSource::Console || pending.record.sealed_call.is_none() {
+        if pending.source().source != crate::memory::MessageEventSource::Console
+            || pending.record().sealed_call.is_none()
+        {
             return Ok(());
         }
         let call = self.open_pending_call(pending)?;
@@ -50,12 +52,12 @@ impl TurnDecisionService {
             .and_then(serde_json::Value::as_str)
             .context("pending Console file path missing")?;
         let filesystem = self
-            .pending_console_filesystem(&pending.source)
+            .pending_console_filesystem(pending.source())
             .await?
             .context("pending Console filesystem unavailable")?;
         let (operation, risk) = self.scoped_file_operation(Some(&filesystem), &call.name, path).await?;
         anyhow::ensure!(
-            pending.record.op_ids.as_slice() == [operation] && pending.record.approval_risk()? == risk,
+            pending.record().op_ids.as_slice() == [operation] && pending.record().approval_risk()? == risk,
             "pending Console file namespace or operation changed"
         );
         Ok(())
@@ -482,7 +484,7 @@ impl TurnDecisionService {
                 .load_pending_decision_approval(owner, &scope.session_key, context.decision_id())
                 .await?;
             anyhow::ensure!(
-                &previous.record.binding == call.binding(),
+                &previous.record().binding == call.binding(),
                 "decision already awaits a different call"
             );
             return Ok(());
@@ -576,8 +578,8 @@ impl TurnDecisionService {
         let approval = self
             .load_reviewed_decision_approval(owner, session, decision_id)
             .await?;
-        let record = &approval.pending.record;
-        let source = &approval.pending.source;
+        let record = approval.pending().record();
+        let source = approval.pending().source();
 
         let entry = self
             .catalog
@@ -611,7 +613,7 @@ impl TurnDecisionService {
         crate::tools::execution::enforce_command_contract(&mut command.arguments, &descriptor, dialect)
             .map_err(anyhow::Error::msg)?;
         if record.sealed_call.is_some() {
-            let stored = self.open_pending_call(&approval.pending)?;
+            let stored = self.open_pending_call(approval.pending())?;
             anyhow::ensure!(
                 stored.name == command.name && stored.arguments == command.arguments,
                 "resume differs from the persisted original call"
@@ -692,7 +694,7 @@ impl TurnDecisionService {
         self.check_live_parity()?;
         let now = Utc::now();
         anyhow::ensure!(
-            record.expires_at > now && approval.grants.iter().all(|grant| grant.is_time_valid(now)),
+            record.expires_at > now && approval.grants().iter().all(|grant| grant.is_time_valid(now)),
             "resume approval expired during preparation"
         );
         // The request supplies only the effect, never retry/ledger identity.
@@ -811,7 +813,7 @@ impl crate::tools::capability::execution_binding::DecisionResumeAdapter for Exec
                 && selected.specs.first().is_some_and(|spec| spec.name == command.name),
             "resume call was not selected"
         );
-        let [grant] = resume.prepared.approval.grants.as_slice() else {
+        let [grant] = resume.prepared.approval.grants() else {
             anyhow::bail!("resume requires one exact grant");
         };
         // This wrapper is only injection metadata. The downstream verifier
@@ -923,15 +925,15 @@ impl TurnDecisionService {
             .prepare_decision_resume(
                 proof.owner_id(),
                 proof.session_key(),
-                DecisionId::parse(&resume.prepared.approval.pending.record.binding.decision_id)?,
+                DecisionId::parse(&resume.prepared.approval.pending().record().binding.decision_id)?,
                 command.clone(),
             )
             .await?;
         anyhow::ensure!(
             prepared.command == *command
-                && prepared.approval.grants == resume.prepared.approval.grants
-                && serde_json::to_value(&prepared.approval.pending.record)?
-                    == serde_json::to_value(&resume.prepared.approval.pending.record)?,
+                && prepared.approval.grants() == resume.prepared.approval.grants()
+                && serde_json::to_value(prepared.approval.pending().record())?
+                    == serde_json::to_value(resume.prepared.approval.pending().record())?,
             "resume approval changed after admission"
         );
         // Admission was authenticated earlier, but do not rely on an in-memory
@@ -951,11 +953,11 @@ impl TurnDecisionService {
             .validate_durable_chain()
             .await?;
         ensure_active()?;
-        let pending = &prepared.approval.pending;
-        let [grant] = prepared.approval.grants.as_slice() else {
+        let pending = prepared.approval.pending();
+        let [grant] = prepared.approval.grants() else {
             anyhow::bail!("resume dispatch requires one exact grant");
         };
-        let [operation] = pending.record.op_ids.as_slice() else {
+        let [operation] = pending.record().op_ids.as_slice() else {
             anyhow::bail!("resume dispatch requires one exact operation");
         };
         let execution = super::approval::ResumeClaimScope {
@@ -964,18 +966,18 @@ impl TurnDecisionService {
             run_id: proof.run_id().to_owned(),
         };
         anyhow::ensure!(
-            execution.decision_id != pending.record.binding.decision_id,
+            execution.decision_id != pending.record().binding.decision_id,
             "resume must consume under a fresh decision"
         );
         let receipt = self
             .claim_decision_grant(
-                scope_from_source(&pending.source),
+                scope_from_source(pending.source()),
                 grant,
                 &super::approval::DecisionGrantScope {
-                    subject: &pending.record.subject,
-                    binding: &pending.record.binding,
+                    subject: &pending.record().subject,
+                    binding: &pending.record().binding,
                     op_id: operation,
-                    risk: pending.record.approval_risk()?,
+                    risk: pending.record().approval_risk()?,
                 },
                 WitnessKeyring::global()?,
                 execution.clone(),
@@ -1026,14 +1028,14 @@ impl TurnDecisionService {
         let prepared = self
             .prepare_decision_resume(proof.owner_id(), proof.session_key(), decision_id, command)
             .await?;
-        let original = &prepared.approval.pending;
+        let original = prepared.approval.pending();
         let source_id = proof.source_event_id().context("resume source missing")?;
         anyhow::ensure!(
-            source_id != original.record.source_event_id
-                && proof.run_id() != original.record.run_id
-                && proof.workspace_id() == original.record.subject.workspace_id
-                && original.source.channel.as_deref() == Some(proof.policy_channel())
-                && original.source.sender.as_deref() == Some(proof.policy_sender()),
+            source_id != original.record().source_event_id
+                && proof.run_id() != original.record().run_id
+                && proof.workspace_id() == original.record().subject.workspace_id
+                && original.source().channel.as_deref() == Some(proof.policy_channel())
+                && original.source().sender.as_deref() == Some(proof.policy_sender()),
             "resume requires a fresh request from the original actor scope"
         );
         let source = self
@@ -1056,7 +1058,7 @@ impl TurnDecisionService {
             "resume input differs from admitted source"
         );
         let record = ResumeIntent {
-            binding: original.record.binding.clone(),
+            binding: original.record().binding.clone(),
             source_event_id: source.event_id.clone(),
             source_mac: self.state_key.hmac(
                 KeyDomain::ApprovalState,
@@ -1066,7 +1068,7 @@ impl TurnDecisionService {
             policy_version: self.policy_version.to_string(),
             reviewed_grants_mac: self.state_key.hmac(
                 KeyDomain::ApprovalState,
-                &[b"resume-grants", &serde_json::to_vec(&prepared.approval.grants)?],
+                &[b"resume-grants", &serde_json::to_vec(prepared.approval.grants())?],
             ),
         };
         let signed = SignedResumeIntent {
@@ -1110,7 +1112,8 @@ impl TurnDecisionService {
         self.check_live_parity()?;
         let now = Utc::now();
         anyhow::ensure!(
-            original.record.expires_at > now && prepared.approval.grants.iter().all(|grant| grant.is_time_valid(now)),
+            original.record().expires_at > now
+                && prepared.approval.grants().iter().all(|grant| grant.is_time_valid(now)),
             "resume approval expired during admission"
         );
         Ok(AdmittedDecisionResume {
@@ -1135,7 +1138,7 @@ pub(super) struct ResumeGateEvidence {
 
 impl AdmittedDecisionResume {
     pub(super) fn original_run(&self) -> &str {
-        &self.prepared.approval.pending.record.run_id
+        &self.prepared.approval.pending().record().run_id
     }
 
     pub(super) fn claimed_event(&self) -> Option<&MessageEvent> {
@@ -1151,8 +1154,8 @@ impl AdmittedDecisionResume {
             &self.prepared.command,
             self.prepared
                 .approval
-                .pending
-                .record
+                .pending()
+                .record()
                 .schema_dialect
                 .context("resume dialect missing")?,
         ))
@@ -1165,7 +1168,7 @@ impl AdmittedDecisionResume {
     ) -> anyhow::Result<ResumeGateEvidence> {
         use crate::causal_tree::branch::{CandidateId, CapabilityRef, CausalActionKind, Ns8};
         use std::collections::{BTreeMap, BTreeSet};
-        let pending = &self.prepared.approval.pending.record;
+        let pending = self.prepared.approval.pending().record();
         anyhow::ensure!(
             self.source.event_id == proof.source_event_id().context("resume source missing")?
                 && self.source.run_id.as_deref() == Some(proof.run_id())
@@ -1196,10 +1199,10 @@ impl AdmittedDecisionResume {
         );
         let keyring = WitnessKeyring::global()?;
         anyhow::ensure!(
-            self.prepared.approval.grants.len() == pending.op_ids.len() && !pending.op_ids.is_empty(),
+            self.prepared.approval.grants().len() == pending.op_ids.len() && !pending.op_ids.is_empty(),
             "resume gate grants incomplete"
         );
-        for (grant, op) in self.prepared.approval.grants.iter().zip(&pending.op_ids) {
+        for (grant, op) in self.prepared.approval.grants().iter().zip(&pending.op_ids) {
             grant.verify_for_decision(
                 keyring,
                 &pending.subject,
@@ -1216,7 +1219,7 @@ impl AdmittedDecisionResume {
             generation: entry.generation,
         };
         Ok(ResumeGateEvidence {
-            original_request: Arc::from(self.prepared.approval.pending.source.content.as_str()),
+            original_request: Arc::from(self.prepared.approval.pending().source().content.as_str()),
             candidate_reference: reference.clone(),
             calls: BTreeMap::from([
                 (CandidateId::new(CausalActionKind::UseTool, entry.family, None), digest),
@@ -1233,7 +1236,7 @@ impl AdmittedDecisionResume {
             grants: self
                 .prepared
                 .approval
-                .grants
+                .grants()
                 .iter()
                 .map(|grant| Arc::from(grant.grant_id.as_str()))
                 .collect(),

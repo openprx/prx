@@ -18,7 +18,7 @@ impl TurnDecisionService {
         let pending = self
             .load_pending_decision_approval(authority.principal(), session, decision_id)
             .await?;
-        let record = &pending.record;
+        let record = pending.record();
         let original = record
             .h2_origin
             .as_ref()
@@ -71,9 +71,9 @@ impl TurnDecisionService {
         approved: bool,
         stamp: Option<&LocalOwnerReviewStamp>,
     ) -> anyhow::Result<()> {
-        let Some(_) = pending.record.sealed_call else {
+        let Some(_) = pending.record().sealed_call else {
             anyhow::ensure!(
-                !approved || pending.record.h2_origin.is_none(),
+                !approved || pending.record().h2_origin.is_none(),
                 "controlled approval requires the original authenticated sealed call"
             );
             return Ok(());
@@ -89,41 +89,41 @@ impl TurnDecisionService {
         };
         let action = EntryAction::parse(action)?;
         let source = pending
-            .record
+            .record()
             .h2_origin
             .as_ref()
             .context("experiment pending call lacks original controlled input")?;
         anyhow::ensure!(
-            source.actor == pending.record.subject.owner_id
-                && source.workspace == pending.record.subject.workspace_id
-                && source.session == pending.record.subject.session_key.as_deref().unwrap_or_default()
-                && source.run == pending.record.run_id
-                && source.event == pending.record.source_event_id,
+            source.actor == pending.record().subject.owner_id
+                && source.workspace == pending.record().subject.workspace_id
+                && source.session == pending.record().subject.session_key.as_deref().unwrap_or_default()
+                && source.run == pending.record().run_id
+                && source.event == pending.record().source_event_id,
             "controlled pending source differs from its authenticated decision"
         );
         if approved && source.kind == "gateway" && action.requires_local_review() {
             let stamp = stamp.context("original local lifecycle owner must review this exact call")?;
             let pending_mac = self.state_key.hmac(
                 KeyDomain::ApprovalState,
-                &[b"pending", &serde_json::to_vec(&pending.record)?],
+                &[b"pending", &serde_json::to_vec(pending.record())?],
             );
             stamp.verify_pending(
                 pending_mac,
                 source,
-                &pending.record.binding.decision_id,
-                pending.record.binding.call_digest,
+                &pending.record().binding.decision_id,
+                pending.record().binding.call_digest,
             )?;
         }
         if let Some(stamp) = stamp {
             let pending_mac = self.state_key.hmac(
                 KeyDomain::ApprovalState,
-                &[b"pending", &serde_json::to_vec(&pending.record)?],
+                &[b"pending", &serde_json::to_vec(pending.record())?],
             );
             stamp.verify_pending(
                 pending_mac,
                 source,
-                &pending.record.binding.decision_id,
-                pending.record.binding.call_digest,
+                &pending.record().binding.decision_id,
+                pending.record().binding.call_digest,
             )?;
         }
         Ok(())
@@ -146,8 +146,8 @@ impl TurnDecisionService {
             return Ok(None);
         }
         let original = approval
-            .pending
-            .record
+            .pending()
+            .record()
             .h2_origin
             .as_ref()
             .context("original pending input was not controlled")?;
@@ -172,8 +172,8 @@ impl TurnDecisionService {
             current.boot == original.boot,
             "old-boot pending execution requires a fresh exact current request"
         );
-        match &approval.local_owner {
-            Some(stamp) => Ok(Some(LocalOwnerReview::from_signed(origin, stamp.as_ref().clone())?)),
+        match approval.local_owner() {
+            Some(stamp) => Ok(Some(LocalOwnerReview::from_signed(origin, stamp.clone())?)),
             None => {
                 anyhow::ensure!(
                     current.boot == original.boot,

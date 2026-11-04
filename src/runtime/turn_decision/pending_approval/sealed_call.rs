@@ -72,7 +72,7 @@ impl TurnDecisionService {
         pending: &VerifiedPendingDecisionApproval,
     ) -> anyhow::Result<crate::tools::ToolExecutionCommand> {
         use crate::tools::capability::execution_binding::{CallDigestSource, decision_call_digest};
-        let record = &pending.record;
+        let record = pending.record();
         let sealed = record
             .sealed_call
             .as_ref()
@@ -112,7 +112,7 @@ impl TurnDecisionService {
             fingerprint: entry.fingerprint,
             generation: entry.generation,
         };
-        let source = &pending.source;
+        let source = pending.source();
         let digest = decision_call_digest(
             &record.binding.decision_id,
             &capability,
