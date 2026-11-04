@@ -76,17 +76,26 @@ fi
 export CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
 
-# The physical path: sandbox rules match resolved paths (/var is a symlink
-# on macOS).
-guard_home="$(cd "$(mktemp -d)" && pwd -P)"
-profile="$guard_home.sb"
-build_profile="$guard_home.build.sb"
-linux_inner="$guard_home.net.sh"
-canary_profile="$guard_home.canary.sb"
-denials_log="$guard_home.denials.log"
+# Resolve before deleting anything: an override may only select disposable
+# space inside RUNNER_TEMP or the workspace, never the persistent real HOME.
+# The default is RUNNER_TEMP/home; reset stale state from interrupted jobs.
+guard_home="$(python3 "$(dirname "${BASH_SOURCE[0]}")/guard_home_path.py")"
+rm -rf -- "$guard_home"
+mkdir -p "$guard_home"
+profile="$guard_home/guard.sb"
+build_profile="$guard_home/build.sb"
+linux_inner="$guard_home/net.sh"
+canary_profile="$guard_home/canary.sb"
+denials_log="$guard_home/denials.log"
 log_pid=""
-# Every file of the run is "$guard_home" or "$guard_home.<name>".
-trap 'if [ -n "$log_pid" ]; then kill "$log_pid" 2>/dev/null; fi; rm -rf "$guard_home" "$guard_home".*' EXIT
+# Every guard-generated file is below guard_home; no sibling glob deletion.
+trap 'if [ -n "$log_pid" ]; then kill "$log_pid" 2>/dev/null; fi; rm -rf -- "$guard_home"' EXIT
+mkdir -p "$guard_home/tmp"
+export TMPDIR="$guard_home/tmp"
+export XDG_CONFIG_HOME="$guard_home/.config"
+export XDG_CACHE_HOME="$guard_home/.cache"
+export XDG_DATA_HOME="$guard_home/.local/share"
+export XDG_STATE_HOME="$guard_home/.local/state"
 # TEST-NET-1 (RFC 5737): never routed on the internet, so even a canary
 # the guard failed to stop goes nowhere.
 canary_address="192.0.2.1"
@@ -303,17 +312,17 @@ Darwin)
             echo "test_home_guard: canary: the sandbox's report of a denied connection did not arrive in the log; a denial by a child process could not be seen, so the tests do not run." >&2
             exit 2
         fi
-        run_marker="$guard_home.run-start"
+        run_marker="$guard_home/run-start"
         touch "$run_marker"
         run_start="$(date +%Y-%m-%d-%H%M%S)"
-        run_tree="$guard_home.run-tree"
+        run_tree="$guard_home/run-tree"
         # Every test binary cargo starts goes through this runner, which
         # records its pid and execs the binary (same pid): a crash report of
         # a test binary, or of its child, then names a pid of this run even
         # when the binary lived too briefly for the tree tracker to see it.
         host_triple="$(rustc -vV | sed -n 's/^host: //p')"
         runner_var="CARGO_TARGET_$(printf '%s' "$host_triple" | tr '[:lower:]-' '[:upper:]_')_RUNNER"
-        runner_script="$guard_home.runner.sh"
+        runner_script="$guard_home/runner.sh"
         printf '#!/bin/sh\necho "$$" >>"$PRX_GUARD_RUN_PIDS"\nexec ${PRX_GUARD_INNER_RUNNER:-} "$@"\n' >"$runner_script"
         chmod +x "$runner_script"
         echo "test_home_guard: phase=test started $(date -u +%Y-%m-%dT%H:%M:%SZ)"

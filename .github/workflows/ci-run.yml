@@ -5,6 +5,13 @@ on:
         branches: [main]
     pull_request:
         branches: [main]
+    workflow_dispatch:
+        inputs:
+            runner:
+                description: Heavy job runner (repo variable PRX_CI_RUNNER=github overrides qa)
+                type: choice
+                options: [qa, github]
+                default: qa
 
 concurrency:
     group: ci-${{ github.event.pull_request.number || github.sha }}
@@ -49,6 +56,8 @@ jobs:
         name: Detect Change Scope
         runs-on: ubuntu-latest
         outputs:
+            heavy_runner: ${{ steps.runner.outputs.heavy_runner }}
+            heavy_timeout: ${{ steps.runner.outputs.heavy_timeout }}
             docs_only: ${{ steps.scope.outputs.docs_only }}
             docs_changed: ${{ steps.scope.outputs.docs_changed }}
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
@@ -59,6 +68,20 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
+
+            # Forks always use GitHub-hosted runners. The variable or manual
+            # dispatch input can also bypass QA when the persistent host is offline.
+            - name: Select heavy job runner
+              id: runner
+              env:
+                  HEAVY_RUNNER: ${{ (vars.PRX_CI_RUNNER == 'github' || inputs.runner == 'github') && '"ubuntu-latest"' || (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","linux","x64","qa-16c"]' || '"ubuntu-latest"' }}
+              run: |
+                  echo "heavy_runner=$HEAVY_RUNNER" >> "$GITHUB_OUTPUT"
+                  if [ "$HEAVY_RUNNER" = '"ubuntu-latest"' ]; then
+                      echo "heavy_timeout=45" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "heavy_timeout=15" >> "$GITHUB_OUTPUT"
+                  fi
 
             - name: Detect docs-only changes
               id: scope
@@ -72,9 +95,18 @@ jobs:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: ubuntu-latest
-        timeout-minutes: 15
+        runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
+        timeout-minutes: ${{ fromJSON(needs.changes.outputs.heavy_timeout) }}
+        env:
+            CARGO_BUILD_JOBS: "4"
+            CARGO_INCREMENTAL: "0"
         steps:
+            - name: Configure runner paths
+              env:
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/opt/ops/prx-runner/target/{0}', runner.name) }}
+              run: |
+                  echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+                  echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
@@ -82,7 +114,8 @@ jobs:
               with:
                   toolchain: 1.99.0
                   components: rustfmt, clippy
-            - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+            - if: needs.changes.outputs.heavy_timeout == '45'
+              uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
                   key: clippy-default
             - name: Format check
@@ -95,14 +128,26 @@ jobs:
               run: cargo install cargo-machete --locked
             - name: Run unused dependency gate
               run: cargo machete
+            - name: Clean guard home
+              if: always()
+              run: rm -rf -- "${RUNNER_TEMP:?}/home"
 
     lint-all-features:
         name: Lint Gate (Clippy, all features)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: ubuntu-latest
-        timeout-minutes: 45
+        runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
+        timeout-minutes: ${{ fromJSON(needs.changes.outputs.heavy_timeout) }}
+        env:
+            CARGO_BUILD_JOBS: "4"
+            CARGO_INCREMENTAL: "0"
         steps:
+            - name: Configure runner paths
+              env:
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/opt/ops/prx-runner/target/{0}', runner.name) }}
+              run: |
+                  echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+                  echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
@@ -110,7 +155,8 @@ jobs:
               with:
                   toolchain: 1.99.0
                   components: clippy
-            - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+            - if: needs.changes.outputs.heavy_timeout == '45'
+              uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
                   key: clippy-all-features
                   cache-on-failure: true
@@ -119,14 +165,26 @@ jobs:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
                   CLIPPY_CARGO_ARGS: --all-features
               run: ./scripts/ci/rust_strict_delta_gate.sh
+            - name: Clean guard home
+              if: always()
+              run: rm -rf -- "${RUNNER_TEMP:?}/home"
 
     architecture:
         name: Architecture Boundaries
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: ubuntu-latest
-        timeout-minutes: 15
+        runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
+        timeout-minutes: ${{ fromJSON(needs.changes.outputs.heavy_timeout) }}
+        env:
+            CARGO_BUILD_JOBS: "4"
+            CARGO_INCREMENTAL: "0"
         steps:
+            - name: Configure runner paths
+              env:
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/opt/ops/prx-runner/target/{0}', runner.name) }}
+              run: |
+                  echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+                  echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
@@ -155,6 +213,10 @@ jobs:
                   path: executed.txt
                   retention-days: 1
 
+            - name: Clean guard home
+              if: always()
+              run: rm -rf -- "${RUNNER_TEMP:?}/home"
+
     # The crate is one huge package: its 10k-test lib test binary is a single
     # rustc that, built next to the other test binaries on a 16 GiB runner, got
     # the job killed (SIGTERM, no message). Two archives are built in parallel
@@ -165,8 +227,9 @@ jobs:
         name: Test Build (${{ matrix.name }})
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: ubuntu-latest
-        timeout-minutes: 45
+        runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
+        # One-release QA cold-build exception: 20 minutes (hosted fallback: 45).
+        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 20 }}
         strategy:
             fail-fast: false
             matrix:
@@ -176,16 +239,24 @@ jobs:
                     - name: rest
                       targets: --bins --tests
         env:
+            CARGO_BUILD_JOBS: "4"
             CARGO_INCREMENTAL: "0"
             CARGO_PROFILE_TEST_DEBUG: "0"
             CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
             CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
         steps:
+            - name: Configure runner paths
+              env:
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/opt/ops/prx-runner/target/{0}', runner.name) }}
+              run: |
+                  echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+                  echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.99.0
-            - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+            - if: needs.changes.outputs.heavy_timeout == '45'
+              uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
                   shared-key: test-archive-${{ matrix.name }}
                   cache-on-failure: true
@@ -216,23 +287,35 @@ jobs:
                       sharded.txt
                       architecture.txt
                   retention-days: 1
+            - name: Clean guard home
+              if: always()
+              run: rm -rf -- "${RUNNER_TEMP:?}/home"
 
     test-shard:
         name: Test Shard ${{ matrix.name }}
-        needs: [test-build]
-        runs-on: ubuntu-latest
-        timeout-minutes: 45
+        needs: [changes, test-build]
+        runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
+        timeout-minutes: ${{ fromJSON(needs.changes.outputs.heavy_timeout) }}
         strategy:
             fail-fast: false
             matrix:
                 include:
-                    - { name: lib-1, archive: lib, part: "1/5" }
-                    - { name: lib-2, archive: lib, part: "2/5" }
-                    - { name: lib-3, archive: lib, part: "3/5" }
-                    - { name: lib-4, archive: lib, part: "4/5" }
-                    - { name: lib-5, archive: lib, part: "5/5" }
-                    - { name: rest, archive: rest, part: "1/1" }
+                    - { name: lib-1, archive: lib, part: "1/3" }
+                    - { name: lib-2, archive: lib, part: "2/3" }
+                    - { name: lib-3, archive: lib, part: "3/3" }
+                    - { name: rest-1, archive: rest, part: "1/3" }
+                    - { name: rest-2, archive: rest, part: "2/3" }
+                    - { name: rest-3, archive: rest, part: "3/3" }
+        env:
+            CARGO_BUILD_JOBS: "4"
+            CARGO_INCREMENTAL: "0"
         steps:
+            - name: Configure runner paths
+              env:
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/opt/ops/prx-runner/target/{0}', runner.name) }}
+              run: |
+                  echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+                  echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
@@ -268,6 +351,9 @@ jobs:
                   name: executed-${{ matrix.name }}
                   path: executed.txt
                   retention-days: 1
+            - name: Clean guard home
+              if: always()
+              run: rm -rf -- "${RUNNER_TEMP:?}/home"
 
     test:
         name: Test
@@ -308,21 +394,29 @@ jobs:
         name: Mutants (advisory, in diff)
         needs: [changes]
         if: github.event_name == 'pull_request' && needs.changes.outputs.rust_changed == 'true'
-        runs-on: ubuntu-latest
-        timeout-minutes: 12
+        runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
+        timeout-minutes: ${{ fromJSON(needs.changes.outputs.heavy_timeout) }}
         # Advisory for the reviewer: never part of the required gate.
         continue-on-error: true
         env:
+            CARGO_BUILD_JOBS: "4"
             CARGO_INCREMENTAL: "0"
             CARGO_PROFILE_TEST_DEBUG: "0"
         steps:
+            - name: Configure runner paths
+              env:
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/opt/ops/prx-runner/target/{0}', runner.name) }}
+              run: |
+                  echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+                  echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
                   fetch-depth: 0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.99.0
-            - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+            - if: needs.changes.outputs.heavy_timeout == '45'
+              uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
                   key: mutants
             - name: Install cargo-mutants
@@ -335,6 +429,9 @@ jobs:
                   if [ ! -s pr.diff ]; then echo "no Rust source in the diff"; exit 0; fi
                   timeout 540 cargo mutants --in-diff pr.diff --baseline skip --test-tool nextest --jobs 2 --timeout 90 -- --lib --locked || echo "mutants exit $? (advisory)"
                   cat mutants.out/missed.txt 2>/dev/null || true
+            - name: Clean guard home
+              if: always()
+              run: rm -rf -- "${RUNNER_TEMP:?}/home"
 
     build:
         name: Build (Smoke)
@@ -356,19 +453,32 @@ jobs:
         name: Benchmarks (type-check)
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: ubuntu-latest
-        timeout-minutes: 15
+        runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
+        timeout-minutes: ${{ fromJSON(needs.changes.outputs.heavy_timeout) }}
 
+        env:
+            CARGO_BUILD_JOBS: "4"
+            CARGO_INCREMENTAL: "0"
         steps:
+            - name: Configure runner paths
+              env:
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/opt/ops/prx-runner/target/{0}', runner.name) }}
+              run: |
+                  echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
+                  echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.99.0
-            - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+            - if: needs.changes.outputs.heavy_timeout == '45'
+              uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
                   key: bench-check
             - name: Type-check criterion benchmarks
               run: cargo check --locked --profile ci --bench router_decision --bench prompt_render --bench tool_dispatch
+            - name: Clean guard home
+              if: always()
+              run: rm -rf -- "${RUNNER_TEMP:?}/home"
 
     windows-check:
         name: Windows Check
