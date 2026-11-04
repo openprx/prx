@@ -23,18 +23,28 @@ impl<'a> ContextWindowSources<'a> {
 }
 
 /// Internal lookup key; render it only through the provider-text redactor.
-pub fn model_settings_window_key(catalog: &CatalogView, provider: &str, model: &str) -> String {
+pub fn model_settings_window_key(
+    catalog: &CatalogView,
+    settings: &BTreeMap<String, ModelSettings>,
+    provider: &str,
+    model: &str,
+) -> String {
     let identity = crate::providers::ProviderId::of(provider);
-    if let Ok(release) = catalog.release_catalog()
-        && let Some(row) = release.model(&identity, model)
-    {
-        return row.id.clone();
-    }
-    format!(
+    let exact = format!(
         "{}/{}",
         identity.catalog_name().unwrap_or_else(|| provider.trim()),
         model
-    )
+    );
+    if settings.contains_key(&exact) {
+        return exact;
+    }
+    if let Ok(release) = catalog.release_catalog()
+        && let Some(row) = release.model(&identity, model)
+        && settings.contains_key(&row.id)
+    {
+        return row.id.clone();
+    }
+    exact
 }
 
 /// Migration guidance without changing legacy metadata or printing credentials.
@@ -42,6 +52,8 @@ pub fn legacy_router_window_warning(config: &Config) -> Option<String> {
     if config.router.models.is_empty() {
         return None;
     }
+    // Config loading has no pinned generation catalog. Migration suggestions
+    // use the release catalog and an empty map to preserve the selected spelling.
     let catalog = CatalogView::release_only();
     let rows = config
         .router
@@ -49,7 +61,12 @@ pub fn legacy_router_window_warning(config: &Config) -> Option<String> {
         .iter()
         .map(|row| {
             let label = redact_provider_text(&format!("{}/{}", row.provider, row.model_id));
-            let key = redact_provider_text(&model_settings_window_key(&catalog, &row.provider, &row.model_id));
+            let key = redact_provider_text(&model_settings_window_key(
+                &catalog,
+                &BTreeMap::new(),
+                &row.provider,
+                &row.model_id,
+            ));
             format!("{label} -> [model_settings.\"{key}\"]")
         })
         .collect::<Vec<_>>()
@@ -147,7 +164,7 @@ pub fn resolve_effective_compaction_config_with_catalog(
         );
     }
 
-    let key = model_settings_window_key(catalog, &selected_provider, &selected_model);
+    let key = model_settings_window_key(catalog, sources.model_settings, &selected_provider, &selected_model);
     if let Some(settings) = sources.model_settings.get(&key)
         && let Some(window) = settings.context_window
     {
@@ -867,6 +884,7 @@ context_window = 300000"#,
                 let label = redact_provider_text(&format!("{}/{}", row.provider, row.model_id));
                 let key = redact_provider_text(&model_settings_window_key(
                     &CatalogView::release_only(),
+                    &BTreeMap::new(),
                     &row.provider,
                     &row.model_id,
                 ));
@@ -898,5 +916,26 @@ context_window = 300000"#,
             assert!(!shown.contains(secret), "{shown}");
             assert!(shown.contains("[redacted]"), "{shown}");
         }
+    }
+    #[test]
+    fn openrouter_alias_resolves_through_row_id() {
+        let catalog = CatalogView::release_only();
+        let row_id = catalog
+            .release_catalog()
+            .unwrap()
+            .model(
+                &crate::providers::ProviderId::of("openrouter"),
+                "moonshotai/kimi-k2.5:free",
+            )
+            .unwrap()
+            .id
+            .clone();
+        let config = settings_config(&format!("[model_settings.\"{row_id}\"]\ncontext_window = 32768"));
+        let result = settings_resolution(&config, "openrouter", "moonshotai/kimi-k2.5:free");
+        assert_eq!(
+            result.config.max_context_tokens, 32_768,
+            "canonical row-ID variant window"
+        );
+        assert_eq!(result.max_context_source, ContextWindowSource::ModelSettings);
     }
 }

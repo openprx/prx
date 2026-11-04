@@ -240,6 +240,15 @@ impl OllamaProvider {
                     .rsplit_once('/')
                     .and_then(|(_, bare_model)| self.model_num_ctx.get(bare_model).copied())
             })
+            .or_else(|| {
+                let bare_model = model.rsplit_once('/').map_or(model, |(_, bare)| bare);
+                // Preserve exact-only behavior for models absent from the catalog.
+                let release = super::catalog::ReleaseCatalog::embedded_ref().ok()?;
+                release.model(&super::ProviderId::of("ollama"), bare_model)?;
+                bare_model
+                    .split_once(':')
+                    .and_then(|(untagged, _)| self.model_num_ctx.get(untagged).copied())
+            })
             .unwrap_or(DEFAULT_NUM_CTX);
         let resolved = requested.min(MAX_NUM_CTX);
         tracing::debug!(
@@ -1327,6 +1336,14 @@ mod tests {
 
         assert_eq!(request_num_ctx(&provider, "llama3"), 32_768);
         assert_eq!(request_num_ctx(&provider, "ollama/llama3"), 32_768);
+    }
+
+    #[test]
+    fn request_num_ctx_keeps_non_catalog_tags_exact() {
+        let provider =
+            OllamaProvider::new_with_runtime_options(None, None, None, None, vec![("prx_local".to_string(), 32768)]);
+        assert_eq!(request_num_ctx(&provider, "prx_local"), 32768);
+        assert_eq!(request_num_ctx(&provider, "prx_local:latest"), 8192);
     }
 
     #[test]

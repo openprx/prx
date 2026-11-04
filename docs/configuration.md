@@ -3110,10 +3110,10 @@ for examples, precedence, session-only chat choices and rollback.
 Model entries also accept positive integer `context_window` and
 `reserved_output_tokens` keys. The reserve requires a window in the same entry
 and must be smaller. These keys are TOML-only and are refused under
-`[[model_routes]]`. Use the catalog row ID when the selected provider/model has
-one; otherwise use `<canonical provider>/<model>` (or the trimmed provider
-string when there is no catalog identity). For a local model absent from the
-catalog:
+`[[model_routes]]`. Lookup first tries `<canonical provider>/<selected model>`
+(or the trimmed provider string when there is no catalog identity), then the
+catalog row ID. Exact tagged keys take precedence over a shared row-ID window.
+For a local model absent from the catalog:
 
 ```toml
 [model_settings."ollama/my-local-model:latest"]

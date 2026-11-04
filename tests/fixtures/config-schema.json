@@ -3742,7 +3742,7 @@
             "null"
           ],
           "format": "uint64",
-          "minimum": 0
+          "minimum": 1
         },
         "credential_ref": {
           "description": "A credential reference (`cred-<name>`, `prx providers credential\nset`) issued for this route's provider, used instead of an inline\n`api_key`. The reference is resolved from the encrypted auth-profile\nstore only when its owner is this provider; setting both is refused.",
@@ -3776,7 +3776,7 @@
             "null"
           ],
           "format": "uint64",
-          "minimum": 0
+          "minimum": 1
         }
       },
       "additionalProperties": true,
@@ -3797,7 +3797,7 @@
             "null"
           ],
           "format": "uint64",
-          "minimum": 0
+          "minimum": 1
         },
         "level": {
           "type": [
@@ -3812,7 +3812,7 @@
             "null"
           ],
           "format": "uint64",
-          "minimum": 0
+          "minimum": 1
         }
       },
       "additionalProperties": true

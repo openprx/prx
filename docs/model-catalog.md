@@ -290,9 +290,16 @@ level = "low"
 ```
 
 Window keys accept positive integers only. `reserved_output_tokens` requires a
-`context_window` in the same entry and must be smaller. For catalog models, use
-the catalog row ID. Otherwise use `<canonical provider>/<model>`, or the trimmed
-provider string when it has no catalog identity. Window-only entries need no
+`context_window` in the same entry and must be smaller. Window lookup first
+tries `<canonical provider>/<selected model>` (or the trimmed provider string
+when it has no catalog identity), then the catalog row ID. Exact keys such as
+`ollama/llama3.2:latest` and `ollama/llama3.2:70b` can have different windows.
+Ollama runtime-option keys and migration warning suggestions use the release
+catalog because those configuration paths have no pinned generation catalog;
+the compaction resolver uses its generation catalog. Prefer exact keys to keep
+these paths independent of catalog reloads. Migration warnings suggest the exact
+selected spelling, and Ollama also accepts an untagged row-ID window for tagged
+requests. Window-only entries need no
 catalog row; levels and parameter overrides keep strict catalog validation.
 Window keys are TOML settings and are refused under `[[model_routes]]`.
 

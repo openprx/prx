@@ -15,9 +15,11 @@ pub struct ModelSettings {
     pub level: Option<String>,
     /// Context window in tokens for this model; only honoured under `[model_settings]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub context_window: Option<u64>,
     /// Reserved output tokens for this model; only honoured under `[model_settings]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub reserved_output_tokens: Option<u64>,
     #[serde(flatten)]
     pub overrides: BTreeMap<String, Value>,

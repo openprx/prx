@@ -296,6 +296,9 @@ pub(crate) fn accepts_tool_dialect_declarations(name: &str) -> bool {
 }
 
 pub(super) fn ollama_model_num_ctx(config: &crate::config::Config) -> Vec<(String, usize)> {
+    // Runtime options are built before a generation catalog is available at
+    // many call sites. Key canonicalization here uses the release catalog;
+    // exact keys do not depend on catalog reloads (see docs/model-catalog.md).
     let catalog = super::catalog::CatalogView::release_only();
     let mut windows = std::collections::BTreeMap::new();
     for (key, settings) in &config.model_settings {
@@ -303,7 +306,8 @@ pub(super) fn ollama_model_num_ctx(config: &crate::config::Config) -> Vec<(Strin
             continue;
         };
         if super::ProviderId::of(provider).catalog_name() == Some("ollama")
-            && super::context_window::model_settings_window_key(&catalog, provider, model) == *key
+            && super::context_window::model_settings_window_key(&catalog, &config.model_settings, provider, model)
+                == *key
             && let Some(window) = settings.context_window
         {
             windows.insert(model.to_owned(), usize::try_from(window).unwrap_or(usize::MAX));
@@ -315,7 +319,19 @@ pub(super) fn ollama_model_num_ctx(config: &crate::config::Config) -> Vec<(Strin
             && model.max_context > 0
             && model.max_context < ROUTER_DEFAULT_MAX_CONTEXT_SENTINEL
     }) {
-        windows.entry(model.model_id.clone()).or_insert(model.max_context);
+        let key = super::context_window::model_settings_window_key(
+            &catalog,
+            &config.model_settings,
+            &model.provider,
+            &model.model_id,
+        );
+        let window = config
+            .model_settings
+            .get(&key)
+            .and_then(|settings| settings.context_window)
+            .map(|window| usize::try_from(window).unwrap_or(usize::MAX))
+            .unwrap_or(model.max_context);
+        windows.entry(model.model_id.clone()).or_insert(window);
     }
     windows.into_iter().collect()
 }
@@ -353,5 +369,151 @@ max_context = 8192
         assert!(windows.contains(&("my-local-model:latest".into(), 32_768)));
         assert!(windows.contains(&("prx_router_only".into(), 8_192)));
         assert!(!windows.iter().any(|(model, _)| model == "prx_default_window"));
+    }
+    async fn factory_request_num_ctx(config: &crate::config::Config, model: &str) -> usize {
+        use axum::{Json, Router, routing::post};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let app = Router::new().route(
+            "/api/chat",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let sender = sender.clone();
+                async move {
+                    sender.send(request).await.unwrap();
+                    Json(serde_json::json!({"message": {"role": "assistant", "content": "ok"}, "done": true}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let options = provider_runtime_options_from_config(config);
+        let provider = super::super::create_provider_with_url_and_options(
+            "ollama",
+            None.into(),
+            Some(&format!("http://{address}")),
+            &options,
+        )
+        .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.chat_with_system(None, "hello", model, 0.0),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        response.unwrap().unwrap();
+        let request = receiver.recv().await.unwrap();
+        usize::try_from(
+            request
+                .pointer("/options/num_ctx")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn window(config: &crate::config::Config, model: &str) -> usize {
+        super::super::context_window::resolve_effective_compaction_config(
+            &config.agent.compaction,
+            "ollama",
+            model,
+            super::super::context_window::ContextWindowSources::from_config(config),
+            &[],
+        )
+        .config
+        .max_context_tokens
+    }
+
+    #[tokio::test]
+    async fn tagged_exact_key_window_matches_num_ctx() {
+        let config = toml::from_str(
+            r#"[model_settings."ollama/llama3.2:latest"]
+context_window = 32768
+[model_settings."ollama/llama3.2"]
+context_window = 16384"#,
+        )
+        .unwrap();
+        assert_eq!(window(&config, "llama3.2:latest"), 32_768, "exact-key window");
+        assert_eq!(
+            window(&config, "llama3.2:latest"),
+            factory_request_num_ctx(&config, "llama3.2:latest").await,
+            "exact-key factory num_ctx agrees with resolver"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_id_key_window_matches_num_ctx_for_tagged_model() {
+        let mut config: crate::config::Config = toml::from_str(
+            r#"[model_settings."ollama/llama3.2"]
+context_window = 32768"#,
+        )
+        .unwrap();
+        assert_eq!(window(&config, "llama3.2:latest"), 32_768, "row-ID window");
+        assert_eq!(
+            window(&config, "llama3.2:latest"),
+            factory_request_num_ctx(&config, "llama3.2:latest").await,
+            "row-ID factory num_ctx agrees with resolver"
+        );
+        config.router.models.push(
+            toml::from_str(
+                r#"provider = "ollama"
+model_id = "llama3.2:latest"
+max_context = 16384"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            window(&config, "llama3.2:latest"),
+            factory_request_num_ctx(&config, "llama3.2:latest").await,
+            "row-ID settings still beat a tagged legacy router window"
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_suggestion_for_tagged_row_resolves_to_same_window() {
+        let legacy: crate::config::Config = toml::from_str(
+            r#"[[router.models]]
+provider = "ollama"
+model_id = "llama3.2:latest"
+max_context = 32768"#,
+        )
+        .unwrap();
+        let warning = super::super::context_window::legacy_router_window_warning(&legacy).unwrap();
+        let suggested = warning
+            .split(" -> [model_settings.\"")
+            .nth(1)
+            .unwrap()
+            .split("\"]")
+            .next()
+            .unwrap();
+        assert_eq!(suggested, "ollama/llama3.2:latest");
+        let migrated = toml::from_str(&format!("[model_settings.\"{suggested}\"]\ncontext_window = 32768")).unwrap();
+        assert_eq!(window(&migrated, "llama3.2:latest"), window(&legacy, "llama3.2:latest"));
+        assert_eq!(
+            window(&migrated, "llama3.2:latest"),
+            factory_request_num_ctx(&migrated, "llama3.2:latest").await,
+            "suggested exact key preserves the legacy factory num_ctx"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_tags_with_exact_keys_get_distinct_windows() {
+        let config = toml::from_str(
+            r#"[model_settings."ollama/llama3.2:latest"]
+context_window = 32768
+[model_settings."ollama/llama3.2:70b"]
+context_window = 49152
+[model_settings."ollama/llama3.2"]
+context_window = 16384"#,
+        )
+        .unwrap();
+        for (model, expected) in [("llama3.2:latest", 32768), ("llama3.2:70b", 49152), ("llama3.2", 16384)] {
+            assert_eq!(window(&config, model), expected, "exact selected tag precedes row ID");
+            assert_eq!(
+                factory_request_num_ctx(&config, model).await,
+                expected,
+                "factory preserves each selected tag"
+            );
+        }
     }
 }
