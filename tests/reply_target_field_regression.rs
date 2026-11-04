@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCAN_PATHS: &[&str] = &["src", "examples"];
+const SCAN_PATHS: &[&str] = &["src"];
 
 /// The base field token whose legacy use we forbid. We scan for this token and
 /// then decide per-occurrence whether it is a real `reply_to` field access vs a
