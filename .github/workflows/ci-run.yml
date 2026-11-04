@@ -302,7 +302,8 @@ jobs:
             - name: Run doc-tests (guard home, loopback-only network)
               if: matrix.name == 'rest'
               run: python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh --locked --all-features --doc
-            - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+            - if: needs.changes.outputs.heavy_timeout == '45'
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
               with:
                   name: prx-tests-${{ matrix.name }}
                   path: prx-tests-${{ matrix.name }}.tar.zst
@@ -328,24 +329,30 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - { name: lib-1, archive: lib, part: "1/3" }
-                    - { name: lib-2, archive: lib, part: "2/3" }
-                    - { name: lib-3, archive: lib, part: "3/3" }
-                    - { name: rest-1, archive: rest, part: "1/3" }
-                    - { name: rest-2, archive: rest, part: "2/3" }
-                    - { name: rest-3, archive: rest, part: "3/3" }
+                    - { name: lib-1, archive: lib, targets: --lib, part: "1/3" }
+                    - { name: lib-2, archive: lib, targets: --lib, part: "2/3" }
+                    - { name: lib-3, archive: lib, targets: --lib, part: "3/3" }
+                    - { name: rest-1, archive: rest, targets: --bins --tests, part: "1/3" }
+                    - { name: rest-2, archive: rest, targets: --bins --tests, part: "2/3" }
+                    - { name: rest-3, archive: rest, targets: --bins --tests, part: "3/3" }
         env:
             CARGO_BUILD_JOBS: "4"
             CARGO_INCREMENTAL: "0"
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/test-shards-{0}', matrix.archive) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
                   echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
                   if [ "$TARGET_DIR" != "$GITHUB_WORKSPACE/target" ]; then
+                      # Match Test Build profiles for the QA shard-local compilation.
+                      {
+                          echo "CARGO_PROFILE_TEST_DEBUG=0"
+                          echo "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true"
+                          echo "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true"
+                      } >> "$GITHUB_ENV"
                       mkdir -p /srv/ci-runner/cache/cargo/bin
                       echo "CARGO_HOME=/srv/ci-runner/cache/cargo" >> "$GITHUB_ENV"
                       echo "/srv/ci-runner/cache/cargo/bin" >> "$GITHUB_PATH"
@@ -356,10 +363,12 @@ jobs:
                   toolchain: 1.99.0
             - name: Install cargo-nextest
               run: command -v cargo-nextest >/dev/null || curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
-            - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+            - if: needs.changes.outputs.heavy_timeout == '45'
+              uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
               with:
                   name: prx-tests-${{ matrix.archive }}
             - name: Run shard ${{ matrix.part }} of ${{ matrix.archive }} (guard home, loopback-only network, 60 s per test)
+              if: needs.changes.outputs.heavy_timeout == '45'
               env:
                   PRX_GUARD_SUBCOMMAND: nextest
               run: |
@@ -369,12 +378,36 @@ jobs:
                       --profile ci --no-fail-fast \
                       -E 'not (binary(architecture_boundaries) and not test(/^retired_feature::/))' \
                       --partition hash:${{ matrix.part }} 2>&1 | tee shard.log
+            - name: Run shard ${{ matrix.part }} of ${{ matrix.archive }} on QA (guard home, loopback-only network, 60 s per test)
+              if: needs.changes.outputs.heavy_timeout != '45'
+              env:
+                  PRX_GUARD_SUBCOMMAND: nextest
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh \
+                      --locked --all-features ${{ matrix.targets }} \
+                      --profile ci --no-fail-fast \
+                      -E 'not (binary(architecture_boundaries) and not test(/^retired_feature::/))' \
+                      --partition count:${{ matrix.part }} 2>&1 | tee shard.log
             - name: Executed count must equal the shard's share of `nextest list`
+              if: needs.changes.outputs.heavy_timeout == '45'
               run: |
                   set -euo pipefail
                   executed="$(sed 's/\x1b\[[0-9;]*m//g' shard.log | sed -nE 's/.*Summary.* ([0-9]+) tests? run.*/\1/p' | tail -1)"
                   cargo nextest list --archive-file prx-tests-${{ matrix.archive }}.tar.zst --workspace-remap "$GITHUB_WORKSPACE" \
                       -E 'not (binary(architecture_boundaries) and not test(/^retired_feature::/))' --partition hash:${{ matrix.part }} \
+                      --message-format json > shard-list.json
+                  expected="$(python3 scripts/ci/nextest_test_count.py shard-list.json | sed -n 's/^sharded=//p')"
+                  echo "shard ${{ matrix.name }} (${{ matrix.part }}): executed=$executed listed=$expected"
+                  [ "$executed" = "$expected" ]
+                  echo "$executed" > executed.txt
+            - name: Executed count must equal the QA shard's share of `nextest list`
+              if: needs.changes.outputs.heavy_timeout != '45'
+              run: |
+                  set -euo pipefail
+                  executed="$(sed 's/\x1b\[[0-9;]*m//g' shard.log | sed -nE 's/.*Summary.* ([0-9]+) tests? run.*/\1/p' | tail -1)"
+                  cargo nextest list --locked --all-features ${{ matrix.targets }} \
+                      -E 'not (binary(architecture_boundaries) and not test(/^retired_feature::/))' --partition count:${{ matrix.part }} \
                       --message-format json > shard-list.json
                   expected="$(python3 scripts/ci/nextest_test_count.py shard-list.json | sed -n 's/^sharded=//p')"
                   echo "shard ${{ matrix.name }} (${{ matrix.part }}): executed=$executed listed=$expected"
