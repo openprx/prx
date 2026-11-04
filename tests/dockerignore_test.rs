@@ -14,7 +14,6 @@ const MUST_EXCLUDE: &[&str] = &[
     ".githooks",
     "target",
     "docs",
-    "examples",
     "tests",
     "*.md",
     "*.png",

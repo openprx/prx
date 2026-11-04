@@ -79,6 +79,9 @@ while IFS= read -r file; do
     || [[ "$file" == "Cargo.toml" ]] \
     || [[ "$file" == "Cargo.lock" ]] \
     || [[ "$file" == "deny.toml" ]] \
+    || [[ "$file" == ".dockerignore" ]] \
+    || [[ "$file" == "build.rs" ]] \
+    || [[ "$file" == benches/* ]] \
     || [[ "$file" == ".github/workflows/ci-run.yml" ]] \
     || [[ "$file" == scripts/ci/* ]]; then
     rust_changed=true
