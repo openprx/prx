@@ -1274,7 +1274,6 @@ non-streaming transport. The error names the tool and how to republish or exclud
 it through `[tool_tiering]`. An upstream OpenRouter root-schema rejection also carries a
 fixed remediation hint after the sanitized error preview.
 
-
 ## Prompt-cache metrics
 
 Successful provider round-trips in the main tool loop record raw prompt,
