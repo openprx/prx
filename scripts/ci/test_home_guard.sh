@@ -52,7 +52,8 @@
 #
 # PRX_GUARD_SUBCOMMAND=nextest runs `cargo nextest run [args...]` instead of
 # `cargo test` (CI shards run a prebuilt `--archive-file`), under exactly the
-# same guard. There is no build phase then: the archive was built, with the
+# same guard. PRX_GUARD_SUBCOMMAND=exec runs the given command itself (a
+# prebuilt test binary) under the guard. There is no build phase then: the archive was built, with the
 # network available, by the job that created it.
 
 set -euo pipefail
@@ -61,11 +62,17 @@ real_home="${HOME:?HOME must be set}"
 case "${PRX_GUARD_SUBCOMMAND:-test}" in
 test) test_cmd=(test); build_first=1 ;;
 nextest) test_cmd=(nextest run); build_first=0 ;;
+exec) test_cmd=(); build_first=0 ;;
 *)
     echo "test_home_guard: unknown PRX_GUARD_SUBCOMMAND '$PRX_GUARD_SUBCOMMAND'" >&2
     exit 2
     ;;
 esac
+if [ "${#test_cmd[@]}" -gt 0 ]; then
+    test_program=("$(command -v cargo)" "${test_cmd[@]}")
+else
+    test_program=()
+fi
 export CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
 
@@ -312,7 +319,7 @@ Darwin)
         echo "test_home_guard: phase=test started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         HOME="$guard_home" CARGO_NET_OFFLINE=true PRX_GUARD_RUN_PIDS="$run_tree" \
             PRX_GUARD_INNER_RUNNER="${!runner_var:-}" env "$runner_var=$runner_script" \
-            sandbox-exec -f "$profile" cargo "${test_cmd[@]}" "$@" &
+            sandbox-exec -f "$profile" ${test_program[@]+"${test_program[@]}"} "$@" &
         run_pid=$!
         track_tree "$run_pid" "$run_tree" &
         tracker_pid=$!
@@ -403,7 +410,7 @@ Linux)
         # read it without broadening its permissions.
         : >"$attempts_file"
         echo "test_home_guard: phase=test started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        "${runner[@]}" "${guard_env[@]}" "${namespace[@]}" bash "$linux_inner" "$(command -v cargo)" "${test_cmd[@]}" "$@" ||
+        "${runner[@]}" "${guard_env[@]}" "${namespace[@]}" bash "$linux_inner" ${test_program[@]+"${test_program[@]}"} "$@" ||
             status=$?
         echo "test_home_guard: phase=test finished exit=$status $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         if [ ! -s "$attempts_file" ]; then

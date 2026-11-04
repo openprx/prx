@@ -33,4 +33,9 @@ mod tool_tables;
 mod tool_tests;
 
 mod removed_evolution_layers;
+
+// Needs the crate itself, so the standalone optimized build of this suite
+// (scripts/ci/build_architecture_boundaries.sh, `--cfg arch_standalone`)
+// leaves it to the regular test archive.
+#[cfg(not(arch_standalone))]
 mod retired_feature;

@@ -2,8 +2,11 @@
 """Count the tests in `cargo nextest list --message-format json` output.
 
 Prints `total=` (tests a default run executes: matched and not ignored),
-`architecture=` (those in the architecture_boundaries binary, which has its
-own CI job) and `sharded=` (total minus architecture, what the shards run).
+`architecture=` (those in the architecture_boundaries binary except the
+`retired_feature::` module, which needs the crate and runs in a shard; the
+rest run in the architecture job from a standalone optimized binary,
+scripts/ci/build_architecture_boundaries.sh) and `sharded=` (total minus
+architecture, what the shards run).
 """
 import json
 import sys
@@ -23,7 +26,13 @@ def count(path):
         )
         total += runnable
         if suite.get("binary-name") == ARCHITECTURE_BINARY:
-            architecture += runnable
+            architecture += sum(
+                1
+                for name, case in suite["testcases"].items()
+                if not case["ignored"]
+                and case["filter-match"]["status"] == "matches"
+                and not name.startswith("retired_feature::")
+            )
     return total, architecture, total - architecture
 
 
