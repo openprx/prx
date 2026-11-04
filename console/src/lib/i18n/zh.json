@@ -379,7 +379,6 @@
     "licensed": "有许可证",
     "unlicensed": "无许可证",
     "readOnlyState": "启用状态当前为只读展示。",
-    "installSuccess": "Skill 安装成功",
     "installFailed": "Skill 安装失败",
     "uninstallSuccess": "Skill 已卸载",
     "uninstallFailed": "Skill 卸载失败",

@@ -1799,7 +1799,35 @@ mod tests {
             &crate::config::BrowserConfig::default(),
             &crate::config::HttpRequestConfig::default(),
         );
-        for enabled in [false, true, false] {
+        for refresh_catalog in [false, true] {
+            if refresh_catalog {
+                crate::skills::invalidate_skill_catalog(temp.path());
+            }
+            assert!(
+                !crate::skills::load_skills_with_config(temp.path(), &config)
+                    .iter()
+                    .any(|skill| skill.name == "quarantine"),
+                "published inactive skill must be absent from the catalog"
+            );
+            let schema = tool.parameters_schema();
+            assert!(
+                !schema["properties"]["skill"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("quarantine")),
+                "published inactive skill must be absent from the schema"
+            );
+            assert!(
+                !tool.specs().iter().any(|spec| spec.name == "skill__quarantine__run"),
+                "published inactive skill must not expose an alias"
+            );
+            let error = tool
+                .execute(json!({"skill":"quarantine","tool":"run"}))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Unknown or disabled skill"));
+        }
+        for enabled in [true, false] {
             crate::skills::set_installed_skill_enabled(temp.path(), "quarantine", enabled).unwrap();
             crate::skills::invalidate_skill_catalog(temp.path());
             assert_eq!(

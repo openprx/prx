@@ -379,7 +379,6 @@
     "licensed": "Лицензировано",
     "unlicensed": "Без лицензии",
     "readOnlyState": "Состояние включения доступно только для чтения.",
-    "installSuccess": "Навык успешно установлен",
     "installFailed": "Не удалось установить навык",
     "uninstallSuccess": "Навык удален",
     "uninstallFailed": "Не удалось удалить навык",

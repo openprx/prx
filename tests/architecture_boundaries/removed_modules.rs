@@ -4,12 +4,12 @@ use std::path::Path;
 fn needle() -> String {
     ["skill", "forge"].concat()
 }
-fn collect(dir: &Path, paths: &mut Vec<std::path::PathBuf>) {
+fn collect_files(dir: &Path, paths: &mut Vec<std::path::PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
         if entry.file_type().unwrap().is_dir() {
-            collect(&path, paths);
+            collect_files(&path, paths);
         } else if entry.file_type().unwrap().is_file() {
             paths.push(path);
         }
@@ -39,7 +39,7 @@ fn removed_modules_text_references_are_allowlisted() {
     let name = needle();
     let mut files = Vec::new();
     for directory in ["src", "tests", "docs", ".github", "console/src"] {
-        collect(&root.join(directory), &mut files);
+        collect_files(&root.join(directory), &mut files);
     }
     files.extend(["README.md", "Cargo.toml", "CHANGELOG.md"].map(|path| root.join(path)));
     let mut discovery_lines = Vec::new();

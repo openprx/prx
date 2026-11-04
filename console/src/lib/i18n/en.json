@@ -379,7 +379,6 @@
     "licensed": "Licensed",
     "unlicensed": "No license",
     "readOnlyState": "Enable state is read-only.",
-    "installSuccess": "Skill installed successfully",
     "installFailed": "Failed to install skill",
     "uninstallSuccess": "Skill uninstalled",
     "uninstallFailed": "Failed to uninstall skill",

@@ -27,15 +27,8 @@ async fn stub(responses: Vec<(u16, Vec<(&'static str, &'static str)>, String)>) 
             let recorded = recorded.clone();
             let responses = responses.clone();
             async move {
-                recorded
-                    .lock()
-                    .unwrap()
-                    .push((request.uri().to_string(), request.headers().clone()));
-                let (status, headers, body) = responses
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .expect("unexpected upstream request");
+                recorded.lock().push((request.uri().to_string(), request.headers().clone()));
+                let (status, headers, body) = responses.lock().pop_front().expect("unexpected upstream request");
                 let mut response = (StatusCode::from_u16(status).unwrap(), body).into_response();
                 for (name, value) in headers {
                     response.headers_mut().insert(name, value.parse().unwrap());
@@ -302,6 +295,7 @@ async fn r7_valid_empty_and_skipped_items_remain_successful() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn r8e_gateway_install_inventory_and_toggle_use_disabled_state() {
     let temp = tempfile::tempdir().unwrap();
