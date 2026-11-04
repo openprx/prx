@@ -2058,7 +2058,7 @@ mod tests {
         let (mut child, row, pid, warned, logs) = {
             // Registration and the observed sweep belong to one tick. Another
             // test or background sweeper cannot consume this entry's warning.
-            let _tick = WARNING_TICK.lock();
+            let tick = WARNING_TICK.lock();
             let child = spawn_registered("sleep", &["300.33"]);
             let row = find_by_name("sleep 300.33").expect("test: child must be registered");
             let pid = row.pid.expect("test: pid");
@@ -2073,7 +2073,7 @@ mod tests {
                 "test: competing warning sweep must block until the observed tick is released"
             );
             let (warned, logs) = capturing_logs(|| warn_long_running(Duration::ZERO));
-            drop(_tick);
+            drop(tick);
             competitor.join().unwrap();
             (child, row, pid, warned, logs)
         };
