@@ -110,11 +110,19 @@ async fn r1b_default_queries_deduplicate_keep_first_in_order() {
     let (status, body) = request(&stub.base, "").await;
     assert_eq!(status, StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let names: Vec<_> = body["results"]
+    let names: Vec<_> = body
+        .get("results")
+        .expect("discovery response must include results")
         .as_array()
-        .unwrap()
+        .expect("discovery results must be an array")
         .iter()
-        .map(|v| v["name"].as_str().unwrap())
+        .map(|value| {
+            value
+                .get("name")
+                .expect("discovery result must include a name")
+                .as_str()
+                .expect("discovery result name must be a string")
+        })
         .collect();
     assert_eq!(names, ["first", "shared", "last"]);
     let paths: Vec<_> = stub.requests.lock().iter().map(|v| v.0.clone()).collect();
@@ -327,5 +335,8 @@ async fn r8e_gateway_install_inventory_and_toggle_use_disabled_state() {
             .any(|skill| skill.name == "quarantine" && !skill.enabled)
     );
     let Json(toggled) = toggle_skill(State(state), Path("quarantine".into())).await.unwrap();
-    assert_eq!(toggled["enabled"], true);
+    assert_eq!(
+        toggled.get("enabled").expect("toggle response must include enabled"),
+        &serde_json::json!(true)
+    );
 }

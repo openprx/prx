@@ -1811,9 +1811,15 @@ mod tests {
             );
             let schema = tool.parameters_schema();
             assert!(
-                !schema["properties"]["skill"]["enum"]
+                !schema
+                    .get("properties")
+                    .expect("skill execution schema must include properties")
+                    .get("skill")
+                    .expect("skill execution schema must include the skill property")
+                    .get("enum")
+                    .expect("skill property must include enum values")
                     .as_array()
-                    .unwrap()
+                    .expect("skill enum values must be an array")
                     .contains(&json!("quarantine")),
                 "published inactive skill must be absent from the schema"
             );
@@ -1839,9 +1845,15 @@ mod tests {
             );
             let schema = tool.parameters_schema();
             assert_eq!(
-                schema["properties"]["skill"]["enum"]
+                schema
+                    .get("properties")
+                    .expect("skill execution schema must include properties")
+                    .get("skill")
+                    .expect("skill execution schema must include the skill property")
+                    .get("enum")
+                    .expect("skill property must include enum values")
                     .as_array()
-                    .unwrap()
+                    .expect("skill enum values must be an array")
                     .contains(&json!("quarantine")),
                 enabled,
                 "schema exposure must follow disabled marker"
