@@ -35,8 +35,8 @@
 #   - Linux: the tests run in a new network namespace, as the invoking user:
 #     through `sudo unshare --net` then `setpriv` back to the user when sudo
 #     is available (preferred; `modprobe dummy` is tried first), else an
-#     unprivileged user namespace whose tests run in a nested user namespace
-#     mapped back to the invoking uid and gid (util-linux 2.38 or later).
+#     unprivileged user + network namespace mapped to the invoking uid/gid.
+#     Setup retains capabilities; tests drop inheritable and ambient caps.
 #     Its routes are loopback and a dummy interface. A packet routed off loopback goes to the dummy
 #     interface, which drops it and counts it; any count fails the run. The
 #     resolver must be on loopback (systemd-resolved's 127.0.0.53), or a
@@ -200,13 +200,16 @@ write_profile() {
     done
 }
 
-# Run inside the Linux test namespace, as its root: bring loopback up, route
+# Run inside the Linux test namespace with setup capabilities: bring loopback up, route
 # everything else to a counting dummy interface, prove the count works, run
 # the tests (as the invoking user when started through sudo) and record how
 # many packets tried to leave.
 cat >"$linux_inner" <<'INNER'
 set -euo pipefail
-ip link set lo up
+if ! ip link set lo up; then
+    echo "test_home_guard: cannot bring up private loopback; tests will not run on the host network" >&2
+    exit 2
+fi
 ip link add prx-guard0 type dummy
 # Avoid kernel-generated link-local DAD/router solicitations being counted as
 # test traffic; the explicit IPv6 source below already uses nodad.
@@ -240,14 +243,34 @@ status=0
 # The tests never run as root, not even namespace root: its capabilities
 # would let them write files the invoking user cannot.
 ids="${PRX_GUARD_RUN_AS#*:}"
-case "${PRX_GUARD_RUN_AS%%:*}" in
-setpriv) setpriv --reuid="${ids%%:*}" --regid="${ids##*:}" --init-groups -- "$@" || status=$? ;;
-userns) unshare --user --map-user="${ids%%:*}" --map-group="${ids##*:}" -- "$@" || status=$? ;;
-*)
-    echo "test_home_guard: unknown PRX_GUARD_RUN_AS '$PRX_GUARD_RUN_AS'" >&2
-    exit 2
-    ;;
-esac
+run_as_user() {
+    case "${PRX_GUARD_RUN_AS%%:*}" in
+    setpriv) setpriv --reuid="${ids%%:*}" --regid="${ids##*:}" --init-groups -- "$@" ;;
+    userns) setpriv --inh-caps=-all --ambient-caps=-all -- "$@" ;;
+    *)
+        echo "test_home_guard: unknown PRX_GUARD_RUN_AS '$PRX_GUARD_RUN_AS'" >&2
+        exit 2
+        ;;
+    esac
+}
+# Prove fixture traffic works after dropping capabilities, before starting tests.
+run_as_user python3 - <<'PROBE'
+import socket
+
+with socket.socket() as listener, socket.socket() as client:
+    listener.settimeout(5)
+    client.settimeout(5)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    client.connect(listener.getsockname())
+    with listener.accept()[0] as peer:
+        peer.settimeout(5)
+        peer.sendall(b"PROBE-LOOPBACK-OK\n")
+        if client.makefile("rb").readline() != b"PROBE-LOOPBACK-OK\n":
+            raise SystemExit("test_home_guard: private loopback probe failed")
+print("PROBE-LOOPBACK-OK")
+PROBE
+run_as_user "$@" || status=$?
 echo "$(($(sent) - baseline))" >"$PRX_GUARD_ATTEMPTS_FILE"
 exit "$status"
 INNER
@@ -400,12 +423,13 @@ Linux)
             runner=(sudo -n -E env)
             namespace=(unshare --net --)
             run_as="setpriv:$(id -u):$(id -g)"
-        elif unshare --user --map-root-user --net true 2>/dev/null && unshare --help 2>&1 | grep -q -- '--map-user'; then
+        elif unshare --help 2>&1 | grep -q -- '--keep-caps' &&
+            unshare --user --map-user="$(id -u)" --map-group="$(id -g)" --net --keep-caps -- true 2>/dev/null; then
             runner=(env)
-            namespace=(unshare --user --map-root-user --net --)
+            namespace=(unshare --user --map-user="$(id -u)" --map-group="$(id -g)" --net --keep-caps --)
             run_as="userns:$(id -u):$(id -g)"
         else
-            echo "test_home_guard: cannot create a network namespace for the tests as the invoking user (no sudo, and no unprivileged user namespaces with 'unshare --map-user'); the network cannot be denied, so the tests do not run." >&2
+            echo "test_home_guard: cannot create a network namespace for the tests as the invoking user (no sudo, and no unprivileged user + network namespaces with 'unshare --map-user --keep-caps'); the network cannot be denied, so the tests do not run." >&2
             exit 2
         fi
         # Passed explicitly: sudo's policy may reset HOME and the rest even
