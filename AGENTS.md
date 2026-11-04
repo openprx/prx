@@ -212,9 +212,9 @@ All contributors (human or agent) must follow the same collaboration flow:
 
 - Create and work from a non-`main` branch.
 - Commit changes to that branch with clear, scoped commit messages.
-- Open a PR to `main`; do not push directly to `main`.
-- Wait for required checks and review outcomes before merging.
-- Merge via PR controls (squash/rebase/merge as repository policy allows).
+- Push the branch and open a (draft) PR so CI runs; review runs in parallel with CI.
+- When CI is green and the review approves: rebase locally onto the live `origin/main`. If there is no conflict, push `main` directly. If there is a conflict, rebase the branch and repeat.
+- Budget: 30–50 minutes per round from start to a pushed `main`. There is no merge queue and no post-submit stage.
 - Branch deletion after merge is optional; long-lived branches are allowed when intentionally maintained.
 
 ### 6.2 Worktree Workflow (Required for Multi-Track Agent Work)
@@ -296,13 +296,16 @@ Use these rules to keep the trait/factory architecture stable under growth.
 
 ## 8) Validation Matrix
 
-Default local checks for code changes:
+Default local checks for code changes (a scoped inner loop; PR CI is the full gate):
 
 ```bash
-cargo fmt --all -- --check
+cargo fmt --all
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test --lib <module::path>                 # named tests + the touched module only
+cargo test --test architecture_boundaries
 ```
+
+Do not run the full suite, mutation batches or stress loops locally.
 
 Preferred local pre-PR validation path (recommended, not required):
 
