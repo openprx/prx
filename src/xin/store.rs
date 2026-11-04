@@ -4178,8 +4178,9 @@ mod tests {
         let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
         let step = list_steps(&config, &goal.id).unwrap().remove(0);
 
-        // Claim with a short lease, then renew to keep it alive.
-        assert!(claim_step(&config, &step.id, "prx:1:aaaa", 1).unwrap());
+        // Claim with a lease long enough that a loaded CI runner cannot let it
+        // expire before the next statement, then renew to keep it alive.
+        assert!(claim_step(&config, &step.id, "prx:1:aaaa", 60).unwrap());
         assert!(mark_step_running(&config, &step.id, "prx:1:aaaa").unwrap());
         assert!(renew_step_lease(&config, &step.id, "prx:1:aaaa", 3600).unwrap());
 
