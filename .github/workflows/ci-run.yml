@@ -323,7 +323,7 @@ jobs:
         name: Test Shard ${{ matrix.name }}
         needs: [changes, test-build]
         runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
-        timeout-minutes: ${{ fromJSON(needs.changes.outputs.heavy_timeout) }}
+        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 25 }}
         strategy:
             fail-fast: false
             matrix:
@@ -486,6 +486,8 @@ jobs:
               with:
                   toolchain: 1.99.0
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+            - name: Disk space before smoke build
+              run: df -h / /tmp
             - name: Build binary (smoke check)
               run: cargo build --locked --verbose
 
