@@ -555,10 +555,11 @@ async fn adoption_clock_contract(probe_expiry: bool) -> Result<()> {
             eprintln!("R2 qualification diagnostic: state_qualified={} state={:?} plan={} entries={}",
                 completed.state.qualified(&completed.plan), completed.state,
                 serde_json::to_string(completed.plan.spec())?, serde_json::to_string(&completed.entries)?);
+            eprintln!("R2 development probes={:?}", next.experiment_development_probes(&completed));
             for entry in &completed.entries {
                 if let ExperimentEvent::Settled { stage, reference: Some(reference), evidence_sha256, .. } = &entry.event {
                     match f.store.verify_evaluation(reference, Some(evidence_sha256)) {
-                        Ok(verified) => eprintln!("R2 stage={stage} evaluation={:?} outcome={:?}", verified.receipt, verified.outcome),
+                        Ok(verified) => eprintln!("R2 stage={stage} verified={verified:?}"),
                         Err(error) => eprintln!("R2 stage={stage} evaluation_error={error:#}"),
                     }
                 }
