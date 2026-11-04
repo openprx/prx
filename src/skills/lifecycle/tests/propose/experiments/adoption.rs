@@ -550,7 +550,21 @@ async fn adoption_clock_contract(probe_expiry: bool) -> Result<()> {
         assert!(clock.site_on_clock("experiment.preparation-lookup"), "test: blocking preparation lookup uses the admitted clock");
         assert!(clock.site_hits("lesson.pins-lock") > 0, "test: spawned stage re-entered the logical clock at pin verification");
         assert!(clock.site_hits("lesson.prepare-lock") > 0, "test: blocking preparation re-entered the logical clock");
-        assert!(next.experiment_qualified(&completed)?);
+        let qualified = next.experiment_qualified(&completed)?;
+        if !qualified {
+            eprintln!("R2 qualification diagnostic: state_qualified={} state={:?} plan={} entries={}",
+                completed.state.qualified(&completed.plan), completed.state,
+                serde_json::to_string(completed.plan.spec())?, serde_json::to_string(&completed.entries)?);
+            for entry in &completed.entries {
+                if let ExperimentEvent::Settled { stage, reference: Some(reference), evidence_sha256, .. } = &entry.event {
+                    match f.store.verify_evaluation(reference, Some(evidence_sha256)) {
+                        Ok(verified) => eprintln!("R2 stage={stage} evaluation={:?} outcome={:?}", verified.receipt, verified.outcome),
+                        Err(error) => eprintln!("R2 stage={stage} evaluation_error={error:#}"),
+                    }
+                }
+            }
+        }
+        assert!(qualified, "test: completed instruction plan must qualify; see R2 qualification diagnostic");
         let bodies = server.bodies.lock().clone();
         let mut editors = 0;
         for body in &bodies {

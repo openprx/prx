@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
 #![cfg(test)]
 
 //! Contention diagnostics for existing five-second boundaries; no timer changes.
