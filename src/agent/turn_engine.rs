@@ -285,6 +285,7 @@ async fn run_turn_unguarded(
         runtime_adapter,
         memory: memory_runtime,
     } = services;
+    let cache_series = super::prompt_cache_metrics::Series::for_turn(scope_ctx, &memory_runtime);
     let TurnDelivery {
         cancellation: cancellation_token,
         on_delta,
@@ -1267,6 +1268,14 @@ async fn run_turn_unguarded(
         }
         let chat_processed = match chat_result {
             Ok(trace) => {
+                super::prompt_cache_metrics::record_round_trip(super::prompt_cache_metrics::RoundTrip {
+                    series: cache_series,
+                    provider: &trace.final_provider,
+                    model: &trace.final_model,
+                    system_prompt_sha256: system_prompt_sha256.as_deref(),
+                    tools_sha256: &tool_snapshot.sha256,
+                    usage: &trace.tokens_used,
+                });
                 // FIX #2: a turn recovered via fallback when its trace recorded
                 // more than one attempt (each failed attempt before the terminal
                 // success adds an entry) OR when the serving provider/model

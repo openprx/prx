@@ -242,3 +242,25 @@ test('decision plane shows a loading state before status arrives', async () => {
   expect(await screen.findByText('Loading...')).toBeInTheDocument();
   expect(screen.getByText(/CLI evaluate stays on the command line/)).toBeInTheDocument();
 });
+
+
+test('overview sums prompt cache reported requests and prefix continuations', async () => {
+  api.getStatus.mockResolvedValue({ prompt_cache: [
+    { requests_total: 4, cache_reported_total: 3, cache_hit_requests_total: 2, series_continuations_total: 3, system_prefix_changed_total: 1, tools_prefix_changed_total: 1 },
+    { requests_total: 3, cache_reported_total: 2, cache_hit_requests_total: 1, series_continuations_total: 1, system_prefix_changed_total: 0, tools_prefix_changed_total: 1 }
+  ] });
+  render(OverviewPage);
+  expect(await screen.findByText('hits 3/5 · system prefix changes 1/4 · tools 2/4')).toBeInTheDocument();
+});
+
+test('overview keeps prefix facts when cache usage is not reported', async () => {
+  api.getStatus.mockResolvedValue({ prompt_cache: [
+    { requests_total: 7, cache_reported_total: 0, series_continuations_total: 4, system_prefix_changed_total: 1, tools_prefix_changed_total: 2 }
+  ] });
+  const view = render(OverviewPage);
+  expect(await screen.findByText('Not reported · system prefix changes 1/4 · tools 2/4')).toBeInTheDocument();
+  view.unmount();
+  api.getStatus.mockResolvedValue({});
+  render(OverviewPage);
+  expect(await screen.findByText('Not reported')).toBeInTheDocument();
+});

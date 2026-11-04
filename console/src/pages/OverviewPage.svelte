@@ -57,6 +57,21 @@
     return names.length > 0 ? names.join(', ') : t('operations.overview.none');
   }
 
+  function promptCacheSummary(rows) {
+    const totals = (Array.isArray(rows) ? rows : []).reduce((sum, row) => ({
+      hits: sum.hits + (row.cache_hit_requests_total ?? 0),
+      reported: sum.reported + (row.cache_reported_total ?? 0),
+      cont: sum.cont + (row.series_continuations_total ?? 0),
+      sys: sum.sys + (row.system_prefix_changed_total ?? 0),
+      tools: sum.tools + (row.tools_prefix_changed_total ?? 0)
+    }), { hits: 0, reported: 0, cont: 0, sys: 0, tools: 0 });
+    if (totals.reported > 0) return t('operations.overview.promptCacheSummary', totals);
+    const unreported = t('operations.overview.promptCacheNotReported');
+    return totals.cont > 0
+      ? `${unreported} · ${t('operations.overview.promptCachePrefixes', totals)}`
+      : unreported;
+  }
+
   async function loadStatus() {
     try {
       const response = await api.getStatus();
@@ -122,6 +137,10 @@
             <dd class="mt-1 text-sm text-gray-900 dark:text-gray-100">{fact.value}</dd>
           </div>
         {/each}
+        <div>
+          <dt class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">{t('operations.overview.promptCache')}</dt>
+          <dd class="mt-1 text-sm text-gray-900 dark:text-gray-100">{promptCacheSummary(status?.prompt_cache)}</dd>
+        </div>
         <div>
           <dt class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">{t('operations.overview.participants')}</dt>
           <dd class="mt-1 text-sm text-gray-900 dark:text-gray-100">{namedList(status?.config_generation_participants)}</dd>

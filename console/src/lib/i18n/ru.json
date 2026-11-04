@@ -1047,6 +1047,10 @@
     },
     "overview": {
       "health": "Конфигурация и состояние провайдеров",
+      "promptCache": "Кэш промпта",
+      "promptCacheSummary": "попадания {hits}/{reported} · изменения системного префикса {sys}/{cont} · инструменты {tools}/{cont}",
+      "promptCacheNotReported": "Не сообщается",
+      "promptCachePrefixes": "изменения системного префикса {sys}/{cont} · инструменты {tools}/{cont}",
       "participants": "Участники перезагрузки",
       "unavailableProviders": "Недоступные провайдеры",
       "none": "Нет"

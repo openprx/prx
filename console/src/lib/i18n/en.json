@@ -1047,6 +1047,10 @@
     },
     "overview": {
       "health": "Config and provider health",
+      "promptCache": "Prompt cache",
+      "promptCacheSummary": "hits {hits}/{reported} · system prefix changes {sys}/{cont} · tools {tools}/{cont}",
+      "promptCacheNotReported": "Not reported",
+      "promptCachePrefixes": "system prefix changes {sys}/{cont} · tools {tools}/{cont}",
       "participants": "Reload participants",
       "unavailableProviders": "Unavailable providers",
       "none": "None"

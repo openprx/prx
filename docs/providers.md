@@ -1273,3 +1273,34 @@ alternative that cannot be lowered losslessly fails locally before streaming or
 non-streaming transport. The error names the tool and how to republish or exclude
 it through `[tool_tiering]`. An upstream OpenRouter root-schema rejection also carries a
 fixed remediation hint after the sanitized error preview.
+
+
+## Prompt-cache metrics
+
+Successful provider round-trips in the main tool loop record raw prompt,
+cache-read and cache-creation token sums, reported/hit request counts, and
+system/tools prefix change counts per serving provider/model. Failed calls and
+auxiliary calls (SignalVision, smart-group classification, compaction summaries,
+decision-plane requests and approval-argument collection) are excluded. This
+observation does not change prompts, routing or billing.
+
+Anthropic, OpenRouter and OpenAI-compatible endpoints can report cache usage.
+Native OpenAI, Gemini and Ollama do not currently report it through this metric.
+A hit means a reported cache-read count greater than zero. Missing cache counts
+are not treated as misses. Prompt-token semantics differ between providers, so
+raw token sums are not combined into a cross-provider token ratio.
+
+Prefix comparisons follow a hashed conversation identity: channel, chat and
+session for scoped turns, otherwise the observational event channel/session.
+Without either identity, comparisons cover only the current tool loop and
+increment `series_unkeyed_total`. The first observation starts a series;
+subsequent observations count continuations and system/tools hash changes.
+The oldest inserted series is evicted at 4096 entries. At most 256 named
+provider/model rows are retained; additional pairs accumulate in `other`.
+
+Read the process-local counters in `daemon_state.json` under `prompt_cache`,
+`prx doctor`, or Console Overview. They reset on process restart. Doctor reports
+baseline facts as OK items without hit-rate warnings. Enable per-round debug
+events with `RUST_LOG=openprx::prompt_cache=debug`; events contain redacted
+provider/model labels, hashes and usage counts, without prompts, schemas or
+conversation identifiers.

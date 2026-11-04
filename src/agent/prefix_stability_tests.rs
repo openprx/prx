@@ -583,3 +583,344 @@ fn q115_boxed_fixture_work<'a, F: std::future::Future + 'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + 'a>> {
     Box::pin(work)
 }
+
+struct CacheMetricsProvider {
+    name: String,
+    calls: AtomicUsize,
+    tool_round: bool,
+    fail: bool,
+    streaming: bool,
+}
+
+impl CacheMetricsProvider {
+    fn new(name: &str, tool_round: bool, streaming: bool, fail: bool) -> Self {
+        Self {
+            name: format!("custom:http://127.0.0.1:1/{name}"),
+            calls: AtomicUsize::new(0),
+            tool_round,
+            streaming,
+            fail,
+        }
+    }
+    fn response(&self) -> anyhow::Result<ChatResponse> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        anyhow::ensure!(!self.fail, "cache fixture provider failed");
+        let tool = self.tool_round && call == 0;
+        Ok(ChatResponse {
+            text: (!tool).then(|| "Cache fixture answer.".into()),
+            tool_calls: if tool {
+                vec![crate::providers::ToolCall {
+                    id: "cache-fixture-call".into(),
+                    name: "fixture_shell".into(),
+                    arguments: "{}".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+            reasoning_content: None,
+        })
+    }
+    fn usage() -> crate::llm::route_decision::TokenUsage {
+        crate::llm::route_decision::TokenUsage::reported_with_cache(
+            Some(1000),
+            Some(10),
+            Some(1010),
+            Some(0),
+            Some(800),
+        )
+    }
+}
+
+#[async_trait]
+impl Provider for CacheMetricsProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+
+    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+        anyhow::bail!("cache fixture requires the main chat path")
+    }
+    async fn chat_traced(
+        &self,
+        _: ChatRequest<'_>,
+        model: &str,
+        _: f64,
+    ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+        assert!(!self.streaming, "streaming fixture must reach the stream path");
+        Ok(crate::providers::traits::ChatTrace {
+            response: self.response()?,
+            attempts: Vec::new(),
+            final_provider: self.name.clone(),
+            final_model: model.into(),
+            served_member: None,
+            tokens_used: Self::usage(),
+        })
+    }
+    fn supports_streaming(&self) -> bool {
+        self.streaming
+    }
+    fn stream_chat_with_history(
+        &self,
+        _: &[ChatMessage],
+        _: &str,
+        _: f64,
+        _: crate::providers::traits::StreamOptions,
+    ) -> futures_util::stream::BoxStream<
+        'static,
+        crate::providers::traits::StreamResult<crate::providers::traits::StreamChunk>,
+    > {
+        use crate::providers::traits::{StreamChunk, ToolCallChunk};
+        assert!(self.streaming);
+        let response = self.response().expect("successful streaming fixture");
+        let mut chunks = vec![Ok(StreamChunk::usage(Self::usage()))];
+        if let Some(text) = response.text {
+            chunks.push(Ok(StreamChunk::delta(text)));
+        }
+        if !response.tool_calls.is_empty() {
+            chunks.push(Ok(StreamChunk::tool_call_chunk(
+                response
+                    .tool_calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call)| ToolCallChunk::new(call.id, call.name, call.arguments, index))
+                    .collect(),
+            )));
+        }
+        chunks.push(Ok(StreamChunk::final_chunk()));
+        Box::pin(futures_util::stream::iter(chunks))
+    }
+}
+
+async fn cache_metrics_turn(
+    workspace: &std::path::Path,
+    provider: &CacheMetricsProvider,
+    scope: Option<&crate::agent::turn_contracts::ScopeContext<'_>>,
+    memory: ToolLoopMemory,
+) -> anyhow::Result<()> {
+    let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(FixtureTool {
+        name: "fixture_shell",
+        tier: ToolTier::Core,
+        categories: &[],
+    })]);
+    let mut config = fixture_config(workspace);
+    // Admission validates the endpoint and price even for a scripted provider.
+    config.cost.prices.insert(
+        format!("{}/{MODEL}", provider.name),
+        crate::config::schema::ModelPricing {
+            input: 0.0,
+            output: 0.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
+    );
+    let memory_backend: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace).unwrap());
+    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_model(
+        config.clone(),
+        "cache fixture request",
+        Arc::clone(&tools),
+        memory_backend,
+        (&provider.name, MODEL),
+    )
+    .await;
+    let mut adapter = admission.adapter();
+    adapter.stream_provider = provider.streaming;
+    let system = build_runtime_system_prompt(&config, MODEL, &[], true);
+    let mut history = vec![ChatMessage::system(system), ChatMessage::user("cache fixture request")];
+    let hooks = crate::hooks::HookManager::new(workspace.to_path_buf());
+    let result = run_turn(
+        &mut history,
+        crate::agent::turn_request::TurnRequest {
+            channel_name: "terminal",
+            scope,
+            mode: ChatMode::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &config.multimodal,
+            schedule: crate::agent::turn_request::TurnSchedule {
+                read_only_tool_concurrency_window: 2,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: None,
+            decision: admission.decision(),
+        },
+        crate::agent::turn_request::TurnServices {
+            provider,
+            provider_name: &provider.name,
+            model: MODEL,
+            temperature: 0.0,
+            tools_registry: tools,
+            observer: &crate::observability::NoopObserver,
+            hooks: &hooks,
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(adapter),
+            memory,
+        },
+        crate::agent::turn_request::TurnDelivery {
+            cancellation: None,
+            on_delta: None,
+            on_tool_call: None,
+        },
+    )
+    .await;
+    result.map(|_| ())
+}
+
+fn cache_row(provider: &CacheMetricsProvider) -> crate::agent::prompt_cache_metrics::PromptCacheStats {
+    crate::agent::prompt_cache_metrics::snapshot()
+        .get(&format!("{}/{MODEL}", provider.name))
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn cache_metrics_two_rounds(streaming: bool) {
+    let workspace = tempfile::tempdir().unwrap();
+    let provider = CacheMetricsProvider::new(
+        if streaming {
+            "cache-streaming-fixture"
+        } else {
+            "cache-buffered-fixture"
+        },
+        true,
+        streaming,
+        false,
+    );
+    cache_metrics_turn(workspace.path(), &provider, None, ToolLoopMemory::none())
+        .await
+        .unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    let row = cache_row(&provider);
+    assert_eq!(row.requests_total, 2);
+    assert_eq!(row.cache_reported_total, 2);
+    assert_eq!(row.cache_hit_requests_total, 2);
+    assert_eq!(row.cache_read_tokens_total, 1600);
+    assert_eq!(
+        (
+            row.series_first_total,
+            row.series_continuations_total,
+            row.series_unkeyed_total
+        ),
+        (1, 1, 2)
+    );
+}
+
+#[tokio::test]
+async fn prompt_cache_records_two_buffered_tool_loop_rounds() {
+    q115_boxed_fixture_work(cache_metrics_two_rounds(false)).await;
+}
+
+#[tokio::test]
+async fn prompt_cache_records_two_streaming_tool_loop_rounds() {
+    q115_boxed_fixture_work(cache_metrics_two_rounds(true)).await;
+}
+
+#[tokio::test]
+async fn prompt_cache_does_not_record_failed_round_trip() {
+    q115_boxed_fixture_work(async {
+        let workspace = tempfile::tempdir().unwrap();
+        let provider = CacheMetricsProvider::new("cache-failed-fixture", false, false, true);
+        assert!(
+            cache_metrics_turn(workspace.path(), &provider, None, ToolLoopMemory::none())
+                .await
+                .is_err()
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache_row(&provider).requests_total, 0);
+    })
+    .await;
+}
+
+async fn cache_metrics_identity_series(scoped: bool, event_keyed: bool) {
+    use crate::agent::turn_contracts::ScopeContext;
+    let workspace = tempfile::tempdir().unwrap();
+    let provider = CacheMetricsProvider::new(
+        if scoped {
+            "cache-scoped-fixture"
+        } else if event_keyed {
+            "cache-event-fixture"
+        } else {
+            "cache-unkeyed-fixture"
+        },
+        false,
+        false,
+        false,
+    );
+    let config = fixture_config(workspace.path());
+    let policy = crate::security::SecurityPolicy::from_config(&config.autonomy, workspace.path());
+    let scope = ScopeContext {
+        policy: &policy,
+        sender: "prx_user",
+        channel: "terminal",
+        chat_type: "private",
+        chat_id: "cache-series",
+        session_key: Some("cache-series"),
+        owner_id: None,
+        owner_isolated: false,
+        topic_id: None,
+        task_id: None,
+        source_message_event_id: None,
+        config_generation_id: None,
+        config_source_revision: None,
+    };
+    std::fs::write(workspace.path().join("IDENTITY.md"), "PRX fixture identity one").unwrap();
+    for turn in 0..3 {
+        if turn == 2 {
+            std::fs::write(workspace.path().join("IDENTITY.md"), "PRX fixture identity two").unwrap();
+        }
+        let mut event = crate::memory::MessageEventScope::new("chat", crate::memory::MemoryVisibility::Workspace)
+            .with_channel("terminal");
+        if event_keyed {
+            event = event.with_session_key("cache-event-session");
+        }
+        cache_metrics_turn(
+            workspace.path(),
+            &provider,
+            scoped.then_some(&scope),
+            ToolLoopMemory::none().with_request_event_scope(event),
+        )
+        .await
+        .unwrap();
+        let row = cache_row(&provider);
+        assert_eq!(row.requests_total, turn + 1);
+        assert_eq!(
+            row.system_prefix_changed_total,
+            u64::from(turn == 2 && (scoped || event_keyed))
+        );
+    }
+    let row = cache_row(&provider);
+    assert_eq!(row.tools_prefix_changed_total, 0);
+    if scoped || event_keyed {
+        assert_eq!(
+            (
+                row.series_first_total,
+                row.series_continuations_total,
+                row.series_unkeyed_total
+            ),
+            (1, 2, 0)
+        );
+    } else {
+        assert_eq!(
+            (
+                row.series_first_total,
+                row.series_continuations_total,
+                row.series_unkeyed_total
+            ),
+            (3, 0, 3)
+        );
+    }
+}
+
+#[tokio::test]
+async fn prompt_cache_scoped_turns_compare_identity_prefix_changes() {
+    q115_boxed_fixture_work(cache_metrics_identity_series(true, false)).await;
+}
+
+#[tokio::test]
+async fn prompt_cache_cli_event_scope_compares_identity_prefix_changes() {
+    q115_boxed_fixture_work(cache_metrics_identity_series(false, true)).await;
+    q115_boxed_fixture_work(cache_metrics_identity_series(false, false)).await;
+}

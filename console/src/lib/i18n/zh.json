@@ -1047,6 +1047,10 @@
     },
     "overview": {
       "health": "配置与提供商健康",
+      "promptCache": "提示缓存",
+      "promptCacheSummary": "命中 {hits}/{reported} · 系统前缀变更 {sys}/{cont} · 工具 {tools}/{cont}",
+      "promptCacheNotReported": "未报告",
+      "promptCachePrefixes": "系统前缀变更 {sys}/{cont} · 工具 {tools}/{cont}",
       "participants": "重载参与者",
       "unavailableProviders": "不可用的提供商",
       "none": "无"

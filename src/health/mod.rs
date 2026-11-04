@@ -437,6 +437,12 @@ pub fn snapshot_json() -> serde_json::Value {
     ) {
         object.insert("rate_limits".to_string(), rate_limits);
     }
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "prompt_cache".into(),
+            serde_json::json!(crate::agent::prompt_cache_metrics::snapshot()),
+        );
+    }
     value
 }
 
@@ -777,4 +783,22 @@ mod tests {
             "{public_error}"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn prompt_cache_snapshot_contains_recorded_row() {
+    use crate::agent::prompt_cache_metrics::{RoundTrip, Series, record_round_trip};
+    record_round_trip(RoundTrip {
+        series: Series::for_turn(None, &crate::agent::turn_request::ToolLoopMemory::none()),
+        provider: "health-cache-fixture",
+        model: "model",
+        system_prompt_sha256: None,
+        tools_sha256: "tools",
+        usage: &crate::llm::route_decision::TokenUsage::default(),
+    });
+    assert_eq!(
+        snapshot_json().pointer("/prompt_cache/health-cache-fixture~1model/requests_total"),
+        Some(&serde_json::json!(1))
+    );
 }

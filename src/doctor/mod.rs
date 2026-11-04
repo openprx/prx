@@ -1,5 +1,6 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod prompt_cache;
 use crate::config::Config;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -187,6 +188,7 @@ pub fn diagnose(config: &Config) -> DoctorReport {
     check_unowned_shell_jobs(config, &mut items);
     check_unfinished_config_changes(config, &mut items);
     check_daemon_state(config, &mut items);
+    prompt_cache::check_prompt_cache(config, &mut items);
     check_daemon_process_path(config, &mut items);
     check_environment(&mut items);
 
@@ -544,6 +546,7 @@ pub async fn diagnose_runtime(config: &Config) -> DoctorReport {
     check_deployed_binary(&mut items);
     check_runtime_config(config, &mut items);
     check_daemon_state(config, &mut items);
+    prompt_cache::check_prompt_cache(config, &mut items);
     check_daemon_process_path(config, &mut items);
     check_gateway_runtime(config, &mut items);
     check_channel_runtime(config, &mut items);

@@ -1047,6 +1047,10 @@
     },
     "overview": {
       "health": "კონფიგურაციისა და პროვაიდერის სიჯანსაღე",
+      "promptCache": "პრომპტის ქეში",
+      "promptCacheSummary": "დამთხვევები {hits}/{reported} · სისტემის პრეფიქსის ცვლილებები {sys}/{cont} · ხელსაწყოები {tools}/{cont}",
+      "promptCacheNotReported": "არ არის მოწოდებული",
+      "promptCachePrefixes": "სისტემის პრეფიქსის ცვლილებები {sys}/{cont} · ხელსაწყოები {tools}/{cont}",
       "participants": "გადატვირთვის მონაწილეები",
       "unavailableProviders": "მიუწვდომელი პროვაიდერები",
       "none": "არ არის"
