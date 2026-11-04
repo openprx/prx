@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
 #![cfg(test)]
 
 //! Independent, task-scoped regression hooks survive a missing clock re-entry.

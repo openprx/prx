@@ -2062,18 +2062,19 @@ mod tests {
             let child = spawn_registered("sleep", &["300.33"]);
             let row = find_by_name("sleep 300.33").expect("test: child must be registered");
             let pid = row.pid.expect("test: pid");
-            let (blocked, blocked_rx) = std::sync::mpsc::channel();
+            let (returned, returned_rx) = std::sync::mpsc::channel();
             let competitor = std::thread::spawn(move || {
-                blocked.send(WARNING_TICK.try_lock().is_none()).unwrap();
+                warn_long_running(Duration::ZERO);
+                returned.send(()).unwrap();
             });
-            assert!(
-                blocked_rx
-                    .recv_timeout(Duration::from_secs(60))
-                    .expect("test: competing warning tick exceeded hang guard"),
-                "test: competing tick must not consume this warning"
+            assert_eq!(
+                returned_rx.recv_timeout(Duration::from_millis(200)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                "test: competing warning sweep must block until the observed tick is released"
             );
-            competitor.join().unwrap();
             let (warned, logs) = capturing_logs(|| warn_long_running(Duration::ZERO));
+            drop(_tick);
+            competitor.join().unwrap();
             (child, row, pid, warned, logs)
         };
 

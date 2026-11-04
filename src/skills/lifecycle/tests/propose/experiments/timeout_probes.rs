@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
 #![cfg(test)]
 
 //! Candidate timeout diagnostics do not identify a historical failure without its error detail.

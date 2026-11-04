@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
 #![cfg(test)]
 
 //! Logical command expiry and bounded cleanup of its blocking observers.
