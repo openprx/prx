@@ -49,10 +49,23 @@
 #
 # CI runs the test suite through this script (.github/workflows/ci-run.yml).
 # Usage: scripts/ci/test_home_guard.sh [cargo test args...]
+#
+# PRX_GUARD_SUBCOMMAND=nextest runs `cargo nextest run [args...]` instead of
+# `cargo test` (CI shards run a prebuilt `--archive-file`), under exactly the
+# same guard. There is no build phase then: the archive was built, with the
+# network available, by the job that created it.
 
 set -euo pipefail
 
 real_home="${HOME:?HOME must be set}"
+case "${PRX_GUARD_SUBCOMMAND:-test}" in
+test) test_cmd=(test); build_first=1 ;;
+nextest) test_cmd=(nextest run); build_first=0 ;;
+*)
+    echo "test_home_guard: unknown PRX_GUARD_SUBCOMMAND '$PRX_GUARD_SUBCOMMAND'" >&2
+    exit 2
+    ;;
+esac
 export CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
 
@@ -255,7 +268,9 @@ Darwin)
     write_profile 1 "$guard_token-canary" >"$canary_profile"
     write_profile 1 "$guard_token-run" >"$profile"
     echo "test_home_guard: phase=build started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    HOME="$guard_home" sandbox-exec -f "$build_profile" cargo test --no-run "$@" || status=$?
+    if [ "$build_first" = 1 ]; then
+        HOME="$guard_home" sandbox-exec -f "$build_profile" cargo test --no-run "$@" || status=$?
+    fi
     echo "test_home_guard: phase=build finished exit=$status $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if [ "$status" -eq 0 ]; then
         # The kernel reports every denial with the rule's message: this run's
@@ -297,7 +312,7 @@ Darwin)
         echo "test_home_guard: phase=test started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         HOME="$guard_home" CARGO_NET_OFFLINE=true PRX_GUARD_RUN_PIDS="$run_tree" \
             PRX_GUARD_INNER_RUNNER="${!runner_var:-}" env "$runner_var=$runner_script" \
-            sandbox-exec -f "$profile" cargo test "$@" &
+            sandbox-exec -f "$profile" cargo "${test_cmd[@]}" "$@" &
         run_pid=$!
         track_tree "$run_pid" "$run_tree" &
         tracker_pid=$!
@@ -350,7 +365,9 @@ Darwin)
     ;;
 Linux)
     echo "test_home_guard: phase=build started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    HOME="$guard_home" cargo test --no-run "$@" || status=$?
+    if [ "$build_first" = 1 ]; then
+        HOME="$guard_home" cargo test --no-run "$@" || status=$?
+    fi
     echo "test_home_guard: phase=build finished exit=$status $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if [ "$status" -eq 0 ]; then
         if sudo -n true 2>/dev/null && sudo -n unshare --net true 2>/dev/null; then
@@ -386,7 +403,7 @@ Linux)
         # read it without broadening its permissions.
         : >"$attempts_file"
         echo "test_home_guard: phase=test started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        "${runner[@]}" "${guard_env[@]}" "${namespace[@]}" bash "$linux_inner" "$(command -v cargo)" test "$@" ||
+        "${runner[@]}" "${guard_env[@]}" "${namespace[@]}" bash "$linux_inner" "$(command -v cargo)" "${test_cmd[@]}" "$@" ||
             status=$?
         echo "test_home_guard: phase=test finished exit=$status $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         if [ ! -s "$attempts_file" ]; then

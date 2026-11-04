@@ -43,6 +43,7 @@ class ChangeScopeTests(unittest.TestCase):
             ("scripts/ci/test_home_guard.sh", "false"),
             ("scripts/ci/observe_test_gate.py", "false"),
             ("scripts/ci/detect_change_scope.sh", "false"),
+            (".config/nextest.toml", "false"),
         ):
             with self.subTest(path=path):
                 lines = self.classify(path)

@@ -1,0 +1,12 @@
+# FASTCI-02: every test must finish well inside a minute. A test that runs
+# longer is reported SLOW after 60 s and killed after one more period.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 1 }
+fail-fast = false
+status-level = "slow"
+final-status-level = "slow"
+
+[profile.ci]
+slow-timeout = { period = "60s", terminate-after = 1 }
+fail-fast = false
+failure-output = "immediate-final"

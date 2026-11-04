@@ -83,6 +83,7 @@ while IFS= read -r file; do
     || [[ "$file" == "build.rs" ]] \
     || [[ "$file" == benches/* ]] \
     || [[ "$file" == ".github/workflows/ci-run.yml" ]] \
+    || [[ "$file" == .config/* ]] \
     || [[ "$file" == scripts/ci/* ]]; then
     rust_changed=true
   fi

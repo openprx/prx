@@ -73,7 +73,7 @@ jobs:
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-latest
-        timeout-minutes: 25
+        timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
@@ -83,9 +83,11 @@ jobs:
                   toolchain: 1.99.0
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-            - name: Run rust quality gate
-              run: ./scripts/ci/rust_quality_gate.sh
-            - name: Run strict lint delta gate
+              with:
+                  key: clippy-default
+            - name: Format check
+              run: cargo fmt --all -- --check
+            - name: Clippy, default features (correctness lints deny everywhere, all other lints deny on changed lines)
               env:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
               run: ./scripts/ci/rust_strict_delta_gate.sh
@@ -94,17 +96,36 @@ jobs:
             - name: Run unused dependency gate
               run: cargo machete
 
-    test:
-        name: Test
-        needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
+    lint-all-features:
+        name: Lint Gate (Clippy, all features)
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-latest
-        # A cold serial build takes about 29 minutes before the guarded tests.
-        timeout-minutes: 90
-        # Full-debug test compilation exhausted 16 GiB RAM and 3 GiB swap
-        # before tests started. Reduce build memory, not test coverage.
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.99.0
+                  components: clippy
+            - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+              with:
+                  key: clippy-all-features
+            - name: Clippy, all features
+              env:
+                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+                  CLIPPY_CARGO_ARGS: --all-features
+              run: ./scripts/ci/rust_strict_delta_gate.sh
+
+    architecture:
+        name: Architecture Boundaries
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
         env:
-            CARGO_BUILD_JOBS: "1"
             CARGO_INCREMENTAL: "0"
             CARGO_PROFILE_TEST_DEBUG: "0"
             CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
@@ -116,9 +137,160 @@ jobs:
                   toolchain: 1.99.0
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
-                  key: serial-tests-no-debuginfo
-            - name: Run tests (HOME is a guard home, the network is denied except loopback; no test may touch ~/.openprx, a credential store or another host)
-              run: python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh --locked --all-features
+                  key: test-archive
+                  save-if: false
+            - name: Install cargo-nextest
+              run: curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
+            - name: Build the architecture_boundaries binary only
+              run: cargo nextest archive --locked --all-features --test architecture_boundaries --archive-file arch.tar.zst
+            - name: Run architecture_boundaries (guard home, loopback-only network, 60 s per test)
+              env:
+                  PRX_GUARD_SUBCOMMAND: nextest
+              run: python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh --archive-file arch.tar.zst --workspace-remap "$GITHUB_WORKSPACE" --profile ci --no-fail-fast
+
+    test-build:
+        name: Test Build (archive)
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        outputs:
+            sharded: ${{ steps.list.outputs.sharded }}
+        # Test binaries are built once, here, and every shard runs a slice of
+        # the archive. Debuginfo stays off (full-debug test linking exhausted
+        # 16 GiB before); dependencies are optimized by [profile.dev.package."*"].
+        env:
+            CARGO_INCREMENTAL: "0"
+            CARGO_PROFILE_TEST_DEBUG: "0"
+            CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
+            CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.99.0
+            - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+              with:
+                  key: test-archive
+            - name: Install cargo-nextest
+              run: curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
+            - name: Build the test archive
+              run: cargo nextest archive --locked --all-features --archive-file prx-tests.tar.zst
+            - name: List every test (the sharded runs must add up to this)
+              id: list
+              run: |
+                  set -euo pipefail
+                  cargo nextest list --locked --all-features --archive-file prx-tests.tar.zst --workspace-remap "$GITHUB_WORKSPACE" --message-format json > list.json
+                  python3 scripts/ci/nextest_test_count.py list.json | tee count.txt
+                  echo "sharded=$(sed -n 's/^sharded=//p' count.txt)" >> "$GITHUB_OUTPUT"
+            - name: Run doc-tests (guard home, loopback-only network)
+              run: python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh --locked --all-features --doc
+            - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: prx-tests
+                  path: prx-tests.tar.zst
+                  retention-days: 1
+                  compression-level: 0
+
+    test-shard:
+        name: Test Shard ${{ matrix.shard }}/6
+        needs: [test-build]
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        strategy:
+            fail-fast: false
+            matrix:
+                shard: [1, 2, 3, 4, 5, 6]
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.99.0
+            - name: Install cargo-nextest
+              run: curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
+            - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+              with:
+                  name: prx-tests
+            - name: Run shard ${{ matrix.shard }}/6 (guard home, loopback-only network, 60 s per test)
+              env:
+                  PRX_GUARD_SUBCOMMAND: nextest
+              run: |
+                  set -euo pipefail
+                  python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh \
+                      --archive-file prx-tests.tar.zst --workspace-remap "$GITHUB_WORKSPACE" \
+                      --profile ci --no-fail-fast \
+                      -E 'not binary(architecture_boundaries)' \
+                      --partition hash:${{ matrix.shard }}/6 2>&1 | tee shard.log
+            - name: Executed count must equal the shard's share of `nextest list`
+              run: |
+                  set -euo pipefail
+                  executed="$(sed 's/\x1b\[[0-9;]*m//g' shard.log | sed -nE 's/.*Summary.* ([0-9]+) tests? run.*/\1/p' | tail -1)"
+                  cargo nextest list --archive-file prx-tests.tar.zst --workspace-remap "$GITHUB_WORKSPACE" \
+                      -E 'not binary(architecture_boundaries)' --partition hash:${{ matrix.shard }}/6 \
+                      --message-format json > shard-list.json
+                  expected="$(python3 scripts/ci/nextest_test_count.py shard-list.json | sed -n 's/^sharded=//p')"
+                  echo "shard ${{ matrix.shard }}/6: executed=$executed listed=$expected"
+                  [ "$executed" = "$expected" ]
+                  echo "$executed" > executed.txt
+            - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: executed-${{ matrix.shard }}
+                  path: executed.txt
+                  retention-days: 1
+
+    test:
+        name: Test
+        needs: [changes, test-build, test-shard, architecture]
+        if: always() && needs.changes.outputs.rust_changed == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - name: Every job must have passed
+              run: |
+                  echo "build=${{ needs.test-build.result }} shards=${{ needs.test-shard.result }} architecture=${{ needs.architecture.result }}"
+                  [ "${{ needs.test-build.result }}" = success ] && [ "${{ needs.test-shard.result }}" = success ] && [ "${{ needs.architecture.result }}" = success ]
+            - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+              with:
+                  pattern: executed-*
+                  merge-multiple: false
+                  path: executed
+            - name: The shards together ran exactly what nextest lists
+              run: |
+                  total="$(cat executed/*/executed.txt | paste -sd+ - | bc)"
+                  echo "shards executed=$total, nextest list (minus architecture_boundaries)=${{ needs.test-build.outputs.sharded }}"
+                  [ "$total" = "${{ needs.test-build.outputs.sharded }}" ]
+
+    mutants:
+        name: Mutants (advisory, in diff)
+        needs: [changes]
+        if: github.event_name == 'pull_request' && needs.changes.outputs.rust_changed == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 12
+        # Advisory for the reviewer: never part of the required gate.
+        continue-on-error: true
+        env:
+            CARGO_INCREMENTAL: "0"
+            CARGO_PROFILE_TEST_DEBUG: "0"
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  fetch-depth: 0
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.99.0
+            - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+              with:
+                  key: mutants
+            - name: Install cargo-mutants
+              run: cargo install cargo-mutants --locked
+            - name: Mutate the diff, 10 minute box
+              env:
+                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
+              run: |
+                  git diff "$BASE_SHA" HEAD -- 'src/**/*.rs' 'src/*.rs' > pr.diff
+                  if [ ! -s pr.diff ]; then echo "no Rust source in the diff"; exit 0; fi
+                  timeout 540 cargo mutants --in-diff pr.diff --baseline skip --test-tool nextest --jobs 2 --timeout 90 -- --lib --locked || echo "mutants exit $? (advisory)"
+                  cat mutants.out/missed.txt 2>/dev/null || true
 
     build:
         name: Build (Smoke)
@@ -135,6 +307,22 @@ jobs:
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
             - name: Build binary (smoke check)
               run: cargo build --locked --verbose
+
+    bench-check:
+        name: Benchmarks (type-check)
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.99.0
+            - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+              with:
+                  key: bench-check
             - name: Type-check criterion benchmarks
               run: cargo check --locked --profile ci --bench router_decision --bench prompt_render --bench tool_dispatch
 
@@ -234,7 +422,7 @@ jobs:
     lint-feedback:
         name: Lint Feedback
         if: github.event_name == 'pull_request'
-        needs: [changes, lint, docs-quality]
+        needs: [changes, lint, lint-all-features, docs-quality]
         runs-on: ubuntu-latest
         permissions:
             contents: read
@@ -250,7 +438,7 @@ jobs:
                   RUST_CHANGED: ${{ needs.changes.outputs.rust_changed }}
                   DOCS_CHANGED: ${{ needs.changes.outputs.docs_changed }}
                   LINT_RESULT: ${{ needs.lint.result }}
-                  LINT_DELTA_RESULT: ${{ needs.lint.result }}
+                  LINT_DELTA_RESULT: ${{ needs.lint-all-features.result }}
                   DOCS_RESULT: ${{ needs.docs-quality.result }}
               with:
                   script: |
@@ -280,7 +468,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [contracts, windows-installer, changes, lint, test, build, windows-check, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval]
+        needs: [contracts, windows-installer, changes, lint, lint-all-features, test, build, bench-check, windows-check, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval]
         runs-on: ubuntu-latest
         steps:
             - name: Enforce required status
@@ -330,7 +518,7 @@ jobs:
                   fi
 
                   lint_result="${{ needs.lint.result }}"
-                  lint_strict_delta_result="${{ needs.lint.result }}"
+                  lint_strict_delta_result="${{ needs.lint-all-features.result }}"
                   test_result="${{ needs.test.result }}"
                   build_result="${{ needs.build.result }}"
                   windows_check_result="${{ needs.windows-check.result }}"
@@ -349,7 +537,7 @@ jobs:
                   fi
 
                   if [ "$event_name" = "pull_request" ]; then
-                    if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ] || [ "$windows_check_result" != "success" ]; then
+                    if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ] || [ "${{ needs.bench-check.result }}" != "success" ] || [ "$windows_check_result" != "success" ]; then
                       echo "Required PR CI jobs did not pass."
                       exit 1
                     fi
@@ -357,7 +545,7 @@ jobs:
                     exit 0
                   fi
 
-                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ] || [ "$windows_check_result" != "success" ]; then
+                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ] || [ "${{ needs.bench-check.result }}" != "success" ] || [ "$windows_check_result" != "success" ]; then
                     echo "Required push CI jobs did not pass."
                     exit 1
                   fi
