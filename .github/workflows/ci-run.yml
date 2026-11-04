@@ -259,7 +259,7 @@ jobs:
                     - name: lib
                       targets: --lib
                     - name: rest
-                      targets: --bins --tests
+                      targets: "--bins --test '*'"
         env:
             CARGO_BUILD_JOBS: "4"
             CARGO_INCREMENTAL: "0"
@@ -332,9 +332,9 @@ jobs:
                     - { name: lib-1, archive: lib, targets: --lib, part: "1/3" }
                     - { name: lib-2, archive: lib, targets: --lib, part: "2/3" }
                     - { name: lib-3, archive: lib, targets: --lib, part: "3/3" }
-                    - { name: rest-1, archive: rest, targets: --bins --tests, part: "1/3" }
-                    - { name: rest-2, archive: rest, targets: --bins --tests, part: "2/3" }
-                    - { name: rest-3, archive: rest, targets: --bins --tests, part: "3/3" }
+                    - { name: rest-1, archive: rest, targets: "--bins --test '*'", part: "1/3" }
+                    - { name: rest-2, archive: rest, targets: "--bins --test '*'", part: "2/3" }
+                    - { name: rest-3, archive: rest, targets: "--bins --test '*'", part: "3/3" }
         env:
             CARGO_BUILD_JOBS: "4"
             CARGO_INCREMENTAL: "0"
