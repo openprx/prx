@@ -7,13 +7,7 @@ use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct EncryptedCall {
-    version: u8,
-    nonce: [u8; 12],
-    ciphertext: String,
-}
+use crate::security::approval_ledger::pending::EncryptedCall;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

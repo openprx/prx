@@ -8,6 +8,7 @@
 //!
 //! An [`AuditLogger`] records security-relevant events for forensic review.
 
+pub(crate) mod approval_ledger;
 pub(crate) mod approval_operation;
 pub mod audit;
 pub(crate) mod decision_approval;

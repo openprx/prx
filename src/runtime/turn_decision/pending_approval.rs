@@ -10,34 +10,17 @@ use crate::causal_tree::store::DecisionScope;
 use crate::decision::KeyDomain;
 use crate::memory::{MemoryFabric, MessageEvent, MessageEventScope};
 use crate::runtime::turn_source::TurnSourceProof;
+use crate::security::approval_ledger::keys::{ApprovalAuthority, DecisionAuthority};
+pub(crate) use crate::security::approval_ledger::pending::{
+    DecisionApprovalReceipt, DecisionApprovalView, DecisionRevocationReceipt, PendingApprovalPage,
+    VerifiedPendingDecisionApproval,
+};
+use crate::security::approval_ledger::pending::{PendingRecord, VerifiedDecisionApproval, scope_from_source};
+use crate::security::approval_ledger::{ApprovalLedger, ApprovalRuntime, GrantScope};
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PendingRecord {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    h2_origin: Option<Box<crate::runtime::h2_entry::EntryOriginRecord>>,
-    subject: Subject,
-    binding: DecisionApprovalBinding,
-    source_event_id: String,
-    source_mac: [u8; 32],
-    run_id: String,
-    decision_digests: Vec<(String, String)>,
-    policy_version: String,
-    capabilities: Vec<(String, [u8; 32], [u8; 32])>,
-    op_ids: Vec<String>,
-    effect: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    risk: Option<RiskLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    schema_dialect: Option<crate::tools::schema::ToolSchemaDialect>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    sealed_call: Option<sealed_call::EncryptedCall>,
-    expires_at: DateTime<Utc>,
-}
 
 /// A durable pending or declined collection result. Only writer/readback can construct it.
 pub(super) struct CollectedApprovalResult {
@@ -47,115 +30,6 @@ impl CollectedApprovalResult {
     pub(super) const fn event(&self) -> &MessageEvent {
         &self.event
     }
-}
-
-impl PendingRecord {
-    fn approval_risk(&self) -> anyhow::Result<RiskLevel> {
-        Ok(self.risk.unwrap_or(match self.effect.as_str() {
-            "read_only" => RiskLevel::Low,
-            "local_write" => RiskLevel::Medium,
-            "process_exec" | "external_send" | "credential_or_config" | "destructive" => RiskLevel::High,
-            _ => anyhow::bail!("pending approval effect is unknown"),
-        }))
-    }
-}
-
-/// A complete authenticated persisted review, still not execution authority.
-/// Final claim and current-call validation remain mandatory.
-pub(super) struct VerifiedDecisionApproval {
-    pending: VerifiedPendingDecisionApproval,
-    local_owner: Option<Box<crate::runtime::h2_entry::LocalOwnerReviewStamp>>,
-    grants: Vec<ApprovalGrantV2>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SignedPending {
-    record: PendingRecord,
-    mac: [u8; 32],
-}
-
-/// Constructed only after MAC, durable source, decision and current policy
-/// validation. It is metadata for human review, never execution authority.
-pub(crate) struct VerifiedPendingDecisionApproval {
-    record: PendingRecord,
-    source: MessageEvent,
-}
-
-#[cfg(test)]
-impl VerifiedPendingDecisionApproval {
-    /// The exact operations the pending call asks the owner to approve.
-    pub(crate) fn op_ids(&self) -> &[String] {
-        &self.record.op_ids
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewRecord {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    local_owner: Option<Box<crate::runtime::h2_entry::LocalOwnerReviewStamp>>,
-    pending_mac: [u8; 32],
-    approved: bool,
-    grants: Vec<ApprovalGrantV2>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SignedReview {
-    record: ReviewRecord,
-    mac: [u8; 32],
-}
-
-/// Deliberately excludes signed grants, source text, and private scope fields.
-#[derive(Serialize)]
-pub(crate) struct DecisionApprovalReceipt {
-    decision_id: String,
-    approved: bool,
-    grant_count: usize,
-    expires_at: DateTime<Utc>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct DecisionRevocationReceipt {
-    decision_id: String,
-    revoked_grants: usize,
-}
-
-enum ApprovalRead {
-    ForExecution,
-    ForRevocation,
-}
-
-/// Owner-authorized review projection. It contains neither reusable grants
-/// nor raw operation strings (which can themselves contain command secrets).
-#[derive(Serialize)]
-pub(crate) struct DecisionApprovalView {
-    decision_id: String,
-    tool: Option<String>,
-    arguments: Option<serde_json::Value>,
-    arguments_redacted: bool,
-    original_call_available: bool,
-    effect: String,
-    call_digest: String,
-    pending_expires_at: DateTime<Utc>,
-    single_use: bool,
-}
-
-pub(crate) struct PendingApprovalListItem {
-    pub(crate) session_id: String,
-    pub(crate) view: DecisionApprovalView,
-}
-
-pub(crate) struct PendingApprovalPage {
-    pub(crate) items: Vec<PendingApprovalListItem>,
-    pub(crate) next_cursor: Option<i64>,
-}
-
-fn pending_decision_id(idempotency_key: Option<&str>) -> Option<DecisionId> {
-    let key = idempotency_key?;
-    let rest = key.strip_prefix("decision-approval:")?.strip_suffix(":pending")?;
-    DecisionId::parse(rest).ok()
 }
 
 impl TurnDecisionService {
@@ -193,41 +67,9 @@ impl TurnDecisionService {
         session: &str,
         decision_id: DecisionId,
     ) -> anyhow::Result<DecisionApprovalView> {
-        let pending = self.load_pending_decision_approval(owner, session, decision_id).await?;
-        self.inspect_verified_pending(&pending).await
-    }
-
-    async fn inspect_verified_pending(
-        &self,
-        pending: &VerifiedPendingDecisionApproval,
-    ) -> anyhow::Result<DecisionApprovalView> {
-        self.verify_pending_console_file_operation(pending).await?;
-        let call = pending
-            .record
-            .sealed_call
-            .as_ref()
-            .map(|_| self.open_pending_call(pending))
-            .transpose()?;
-        let arguments = call
-            .as_ref()
-            .map(|call| crate::security::redaction::redact_json_structure(&call.arguments))
-            .transpose()?;
-        let arguments_redacted = call
-            .as_ref()
-            .is_some_and(|call| arguments.as_ref() != Some(&call.arguments));
-        self.check_live_parity()?;
-        anyhow::ensure!(Utc::now() < pending.record.expires_at, "pending approval expired");
-        Ok(DecisionApprovalView {
-            decision_id: pending.record.binding.decision_id.clone(),
-            tool: call.as_ref().map(|call| call.name.clone()),
-            arguments,
-            arguments_redacted,
-            original_call_available: call.is_some(),
-            effect: pending.record.effect.clone(),
-            call_digest: hex::encode(pending.record.binding.call_digest),
-            pending_expires_at: pending.record.expires_at,
-            single_use: true,
-        })
+        self.approval_ledger()
+            .inspect_pending_decision_approval(owner, session, decision_id)
+            .await
     }
 
     /// Pending approvals for one owner, from the same ledger `inspect` reads.
@@ -243,162 +85,9 @@ impl TurnDecisionService {
         after_id: i64,
         limit: usize,
     ) -> anyhow::Result<PendingApprovalPage> {
-        const MAX_SCAN: usize = 256;
-        anyhow::ensure!(
-            self.recordable && self.durable_key && self.generation.effective.causal_tree.enabled,
-            "pending approval requires enabled durable service"
-        );
-        anyhow::ensure!(
-            !owner.is_empty() && after_id >= 0 && (1..=100).contains(&limit),
-            "invalid approval inbox page"
-        );
-        let workspace = self.generation.effective.workspace_dir.to_string_lossy();
-        anyhow::ensure!(!workspace.is_empty(), "approval inbox workspace missing");
-        let mut cursor = after_id;
-        let mut scanned = 0usize;
-        let mut items = Vec::new();
-        let mut exhausted = false;
-        while items.len() < limit && scanned < MAX_SCAN {
-            let batch_limit = (limit - items.len()).clamp(1, 100);
-            let batch = self
-                .memory
-                .list_owned_message_events_by_type(&workspace, owner, "approval.decision.pending", cursor, batch_limit)
-                .await?;
-            if batch.is_empty() {
-                exhausted = true;
-                break;
-            }
-            let batch_len = batch.len();
-            let mut examined_batch = true;
-            for event in batch {
-                scanned = scanned.saturating_add(1);
-                cursor = event.id;
-                if let Some(item) = self.inbox_item_for_event(owner, &workspace, &event).await? {
-                    items.push(item);
-                }
-                if items.len() == limit || scanned >= MAX_SCAN {
-                    examined_batch = false;
-                    break;
-                }
-            }
-            if examined_batch && batch_len < batch_limit {
-                exhausted = true;
-                break;
-            }
-            if !examined_batch || items.len() == limit || scanned >= MAX_SCAN {
-                break;
-            }
-        }
-        let next_cursor = if exhausted { None } else { Some(cursor) };
-        Ok(PendingApprovalPage { items, next_cursor })
-    }
-
-    async fn inbox_item_for_event(
-        &self,
-        owner: &str,
-        workspace: &str,
-        event: &MessageEvent,
-    ) -> anyhow::Result<Option<PendingApprovalListItem>> {
-        if event.owner_id.as_deref() != Some(owner) || event.workspace_id != workspace {
-            return Ok(None);
-        }
-        let Some(session_id) = event.session_key.clone().filter(|session| !session.is_empty()) else {
-            return Ok(None);
-        };
-        let Some(decision_id) = pending_decision_id(event.idempotency_key.as_deref()) else {
-            return Ok(None);
-        };
-        let pending = match self
-            .load_pending_decision_approval(owner, &session_id, decision_id)
+        self.approval_ledger()
+            .list_pending_decision_approvals(owner, after_id, limit)
             .await
-        {
-            Ok(pending) => pending,
-            Err(error) => {
-                tracing::debug!(%error, "pending approval omitted from inbox");
-                return Ok(None);
-            }
-        };
-        if self.pending_review_denies(&pending).await? || self.pending_operations_resolved(&pending).await? {
-            return Ok(None);
-        }
-        match self.inspect_verified_pending(&pending).await {
-            Ok(view) => Ok(Some(PendingApprovalListItem { session_id, view })),
-            Err(error) => {
-                tracing::debug!(%error, "pending approval omitted from inbox");
-                Ok(None)
-            }
-        }
-    }
-
-    /// A denial writes `decision-approval:{id}:review` with `approved: false`
-    /// and no resolution rows. Only an authenticated denial closes the item.
-    /// A missing, mismatched, or unauthenticated review leaves it listed.
-    async fn pending_review_denies(&self, pending: &VerifiedPendingDecisionApproval) -> anyhow::Result<bool> {
-        let record = &pending.record;
-        let review_key = format!("decision-approval:{}:review", record.binding.decision_id);
-        let Some(event) = self
-            .memory
-            .find_message_event_by_idempotency_key(&record.subject.workspace_id, &review_key)
-            .await?
-        else {
-            return Ok(false);
-        };
-        let session = record.subject.session_key.as_deref().unwrap_or("");
-        let lineage_matches = event.id > 0
-            && event.workspace_id == record.subject.workspace_id
-            && event.owner_id.as_deref() == Some(record.subject.owner_id.as_str())
-            && event.session_key.as_deref() == Some(session)
-            && event.run_id == pending.source.run_id
-            && event.causation_event_id.as_deref() == Some(record.source_event_id.as_str())
-            && event.idempotency_key.as_deref() == Some(review_key.as_str())
-            && event.event_type == "approval.decision.reviewed";
-        if !lineage_matches {
-            tracing::debug!("pending review lineage did not match; inbox keeps the item");
-            return Ok(false);
-        }
-        let Some(payload) = event.raw_payload_json.as_deref() else {
-            tracing::debug!("pending review payload missing; inbox keeps the item");
-            return Ok(false);
-        };
-        let review: SignedReview = match serde_json::from_str(payload) {
-            Ok(review) => review,
-            Err(error) => {
-                tracing::debug!(%error, "pending review payload is not a signed review");
-                return Ok(false);
-            }
-        };
-        let pending_mac = self
-            .state_key
-            .hmac(KeyDomain::ApprovalState, &[b"pending", &serde_json::to_vec(record)?]);
-        let authentic = self.state_key.verify_hmac(
-            KeyDomain::ApprovalState,
-            &[b"review", &serde_json::to_vec(&review.record)?],
-            &review.mac,
-        ) && review.record.pending_mac == pending_mac;
-        if !authentic {
-            tracing::debug!("pending review mac did not authenticate; inbox keeps the item");
-            return Ok(false);
-        }
-        Ok(!review.record.approved)
-    }
-
-    async fn pending_operations_resolved(&self, pending: &VerifiedPendingDecisionApproval) -> anyhow::Result<bool> {
-        if pending.record.op_ids.is_empty() {
-            return Ok(false);
-        }
-        let workspace = pending.record.subject.workspace_id.as_str();
-        for op_id in &pending.record.op_ids {
-            let key = super::approval::decision_resolution_key(&pending.record.binding, op_id);
-            if self
-                .memory
-                .find_message_event_by_idempotency_key(workspace, &key)
-                .await?
-                .is_none()
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     pub(super) async fn record_pending_decision_approval(
@@ -577,45 +266,9 @@ impl TurnDecisionService {
         record: PendingRecord,
         source: &MessageEvent,
     ) -> anyhow::Result<MessageEvent> {
-        let record_owner = record.subject.owner_id.clone();
-        let record_decision = record.binding.decision_id.clone();
-        let signed = SignedPending {
-            mac: self
-                .state_key
-                .hmac(KeyDomain::ApprovalState, &[b"pending", &serde_json::to_vec(&record)?]),
-            record,
-        };
-        let expected = serde_json::to_value(&signed)?;
-        let fabric = MemoryFabric::new(self.memory.clone(), &source.workspace_id);
-        let event = fabric
-            .record_runtime_event_idempotent(
-                scope_from_source(source),
-                "approval.decision.pending",
-                "decision awaiting human approval",
-                Some(serde_json::to_string(&signed)?),
-                format!("decision-approval:{}:pending", record_decision),
-            )
-            .await?;
-        let durable = self
-            .memory
-            .find_owned_message_event(&source.workspace_id, &record_owner, &event.event_id)
-            .await?
-            .context("pending approval receipt is not durable")?;
-        anyhow::ensure!(
-            durable.id > 0
-                && durable.event_type == "approval.decision.pending"
-                && durable.session_key == source.session_key
-                && durable.run_id == source.run_id
-                && serde_json::to_value(&event)? == serde_json::to_value(&durable)?
-                && serde_json::from_str::<serde_json::Value>(
-                    durable
-                        .raw_payload_json
-                        .as_deref()
-                        .context("pending approval payload missing")?
-                )? == expected,
-            "pending approval receipt conflicts with issued scope"
-        );
-        Ok(durable)
+        self.approval_ledger()
+            .persist_pending_record_receipt(record, source)
+            .await
     }
 
     /// Only the authenticated owner can resolve this pending record. Review is
@@ -628,7 +281,8 @@ impl TurnDecisionService {
         decision_id: DecisionId,
         approved: bool,
     ) -> anyhow::Result<DecisionApprovalReceipt> {
-        self.review_pending_with_local(owner, session, decision_id, approved, None)
+        self.approval_ledger()
+            .review_pending_decision_approval(owner, session, decision_id, approved)
             .await
     }
     async fn review_pending_with_local(
@@ -639,144 +293,9 @@ impl TurnDecisionService {
         approved: bool,
         local_owner: Option<crate::runtime::h2_entry::LocalOwnerReviewStamp>,
     ) -> anyhow::Result<DecisionApprovalReceipt> {
-        let pending = self.load_pending_decision_approval(owner, session, decision_id).await?;
-        if approved {
-            self.verify_pending_console_file_operation(&pending).await?;
-        }
-        let record = &pending.record;
-        self.verify_h2_review_requirement(&pending, approved, local_owner.as_ref())?;
-        let risk = record.approval_risk()?;
-        let keyring = WitnessKeyring::global()?;
-        let pending_mac = self
-            .state_key
-            .hmac(KeyDomain::ApprovalState, &[b"pending", &serde_json::to_vec(record)?]);
-        let mut grants = Vec::new();
-        if approved {
-            for op_id in &record.op_ids {
-                grants.push(ApprovalGrantV2::issue_decision_one_shot(
-                    keyring,
-                    record.subject.clone(),
-                    op_id,
-                    risk,
-                    record.binding.clone(),
-                    record.expires_at,
-                )?);
-            }
-        }
-        let review = ReviewRecord {
-            local_owner: local_owner.map(Box::new),
-            pending_mac,
-            approved,
-            grants,
-        };
-        let proposed = SignedReview {
-            mac: self
-                .state_key
-                .hmac(KeyDomain::ApprovalState, &[b"review", &serde_json::to_vec(&review)?]),
-            record: review,
-        };
-        let key = format!("decision-approval:{decision_id}:review");
-        let scope = scope_from_source(&pending.source);
-        let fabric = MemoryFabric::new(self.memory.clone(), record.subject.workspace_id.clone());
-        let event = fabric
-            .record_runtime_event_idempotent(
-                scope.clone(),
-                "approval.decision.reviewed",
-                "human decision approval review recorded",
-                Some(serde_json::to_string(&proposed)?),
-                &key,
-            )
-            .await?;
-        let durable = self
-            .memory
-            .find_owned_message_event(&record.subject.workspace_id, owner, &event.event_id)
-            .await?
-            .context("decision review receipt is not durable")?;
-        anyhow::ensure!(
-            durable.id > 0
-                && durable.idempotency_key.as_deref() == Some(key.as_str())
-                && durable.event_type == "approval.decision.reviewed"
-                && durable.owner_id.as_deref() == Some(owner)
-                && durable.session_key.as_deref() == Some(session)
-                && durable.run_id == pending.source.run_id
-                && durable.causation_event_id.as_deref() == Some(record.source_event_id.as_str())
-                && serde_json::to_value(&event)? == serde_json::to_value(&durable)?,
-            "decision review receipt differs from pending source"
-        );
-        let stored: SignedReview = serde_json::from_str(
-            durable
-                .raw_payload_json
-                .as_deref()
-                .context("decision review payload missing")?,
-        )?;
-        anyhow::ensure!(
-            self.state_key.verify_hmac(
-                KeyDomain::ApprovalState,
-                &[b"review", &serde_json::to_vec(&stored.record)?],
-                &stored.mac
-            ) && stored.record.pending_mac == pending_mac,
-            "decision review does not authenticate this pending scope"
-        );
-        anyhow::ensure!(
-            stored.record.approved == approved && stored.record.local_owner == proposed.record.local_owner,
-            "pending decision already has a different review"
-        );
-        anyhow::ensure!(
-            stored.record.grants.len() == if approved { record.op_ids.len() } else { 0 },
-            "decision review grant set is incomplete"
-        );
-        for (grant, op_id) in stored.record.grants.iter().zip(&record.op_ids) {
-            anyhow::ensure!(
-                grant.expires_at <= record.expires_at,
-                "decision grant outlives pending approval"
-            );
-            let expected = super::approval::DecisionGrantScope {
-                subject: &record.subject,
-                binding: &record.binding,
-                op_id,
-                risk,
-            };
-            self.store_decision_grant(scope.clone(), grant, &expected, keyring)
-                .await?;
-        }
-        self.check_live_parity()?;
-        // The batch is usable only while every operation grant remains valid.
-        // Pending metadata can outlive the shorter signed grant lifetime.
-        let expires_at = stored
-            .record
-            .grants
-            .iter()
-            .map(|grant| grant.expires_at)
-            .min()
-            .unwrap_or(record.expires_at)
-            .min(record.expires_at);
-        anyhow::ensure!(expires_at > Utc::now(), "decision approval expired during review");
-        if approved {
-            // Read through the same complete-batch verifier used by resume
-            // preparation. An issued subset can never produce a ready receipt.
-            let verified = self
-                .load_reviewed_decision_approval(owner, session, decision_id)
-                .await?;
-            anyhow::ensure!(
-                verified.grants.len() == stored.record.grants.len()
-                    && verified.pending.record.binding == record.binding,
-                "decision approval batch changed during review"
-            );
-        }
-        if !approved {
-            self.recursive_allowances.retire_pending(
-                &record.subject.workspace_id,
-                &record.subject.owner_id,
-                record.subject.session_key.as_deref().unwrap_or_default(),
-                &record.run_id,
-            );
-        }
-        Ok(DecisionApprovalReceipt {
-            decision_id: record.binding.decision_id.clone(),
-            approved,
-            grant_count: stored.record.grants.len(),
-            expires_at,
-        })
+        self.approval_ledger()
+            .review_pending_with_local(owner, session, decision_id, approved, local_owner)
+            .await
     }
 
     /// Read-only preparation: authenticate original pending provenance, the
@@ -788,7 +307,8 @@ impl TurnDecisionService {
         session: &str,
         decision_id: DecisionId,
     ) -> anyhow::Result<VerifiedDecisionApproval> {
-        self.read_reviewed_decision_approval(owner, session, decision_id, ApprovalRead::ForExecution)
+        self.approval_ledger()
+            .load_reviewed_decision_approval(owner, session, decision_id)
             .await
     }
 
@@ -801,9 +321,9 @@ impl TurnDecisionService {
         session: &str,
         decision_id: DecisionId,
     ) -> anyhow::Result<()> {
-        self.load_reviewed_decision_approval(owner, session, decision_id)
+        self.approval_ledger()
+            .validate_pending_decision_resume(owner, session, decision_id)
             .await
-            .map(|_| ())
     }
 
     /// Revocation reads authenticated metadata even when a resolution already
@@ -815,141 +335,9 @@ impl TurnDecisionService {
         session: &str,
         decision_id: DecisionId,
     ) -> anyhow::Result<DecisionRevocationReceipt> {
-        let approval = self
-            .read_reviewed_decision_approval(owner, session, decision_id, ApprovalRead::ForRevocation)
-            .await?;
-        let record = &approval.pending.record;
-        let scope = scope_from_source(&approval.pending.source);
-        let keyring = WitnessKeyring::global()?;
-        for (grant, operation) in approval.grants.iter().zip(&record.op_ids) {
-            self.revoke_decision_grant(
-                scope.clone(),
-                grant,
-                &super::approval::DecisionGrantScope {
-                    subject: &record.subject,
-                    binding: &record.binding,
-                    op_id: operation,
-                    risk: record.approval_risk()?,
-                },
-                keyring,
-            )
-            .await?;
-        }
-        self.recursive_allowances.retire_pending(
-            &record.subject.workspace_id,
-            &record.subject.owner_id,
-            record.subject.session_key.as_deref().unwrap_or_default(),
-            &record.run_id,
-        );
-        Ok(DecisionRevocationReceipt {
-            decision_id: decision_id.to_string(),
-            revoked_grants: approval.grants.len(),
-        })
-    }
-
-    async fn read_reviewed_decision_approval(
-        &self,
-        owner: &str,
-        session: &str,
-        decision_id: DecisionId,
-        purpose: ApprovalRead,
-    ) -> anyhow::Result<VerifiedDecisionApproval> {
-        let pending = self.load_pending_decision_approval(owner, session, decision_id).await?;
-        let record = &pending.record;
-        let risk = record.approval_risk()?;
-        let keyring = WitnessKeyring::global()?;
-        let review_key = format!("decision-approval:{decision_id}:review");
-        let review_event = self
-            .memory
-            .find_message_event_by_idempotency_key(&record.subject.workspace_id, &review_key)
-            .await?
-            .context("decision review missing")?;
-        let verify_lineage = |event: &MessageEvent, key: &str, kind: &str| -> anyhow::Result<()> {
-            anyhow::ensure!(
-                event.id > 0
-                    && event.workspace_id == record.subject.workspace_id
-                    && event.owner_id.as_deref() == Some(owner)
-                    && event.session_key.as_deref() == Some(session)
-                    && event.run_id == pending.source.run_id
-                    && event.source == pending.source.source
-                    && event.channel == pending.source.channel
-                    && event.sender == pending.source.sender
-                    && event.config_generation_id == pending.source.config_generation_id
-                    && event.config_source_revision == pending.source.config_source_revision
-                    && event.causation_event_id.as_deref() == Some(record.source_event_id.as_str())
-                    && event.idempotency_key.as_deref() == Some(key)
-                    && event.event_type == kind,
-                "decision review grant lineage changed"
-            );
-            Ok(())
-        };
-        verify_lineage(&review_event, &review_key, "approval.decision.reviewed")?;
-        let review: SignedReview = serde_json::from_str(
-            review_event
-                .raw_payload_json
-                .as_deref()
-                .context("decision review payload missing")?,
-        )?;
-        let pending_mac = self
-            .state_key
-            .hmac(KeyDomain::ApprovalState, &[b"pending", &serde_json::to_vec(record)?]);
-        anyhow::ensure!(
-            self.state_key.verify_hmac(
-                KeyDomain::ApprovalState,
-                &[b"review", &serde_json::to_vec(&review.record)?],
-                &review.mac
-            ) && review.record.pending_mac == pending_mac
-                && review.record.approved
-                && !record.op_ids.is_empty()
-                && review.record.grants.len() == record.op_ids.len(),
-            "decision review is denied, incomplete or unauthenticated"
-        );
-        for (grant, op_id) in review.record.grants.iter().zip(&record.op_ids) {
-            grant.verify_for_decision(keyring, &record.subject, &record.binding, op_id, risk, Utc::now())?;
-            anyhow::ensure!(
-                grant.expires_at <= record.expires_at,
-                "decision grant outlives pending scope"
-            );
-            let issued_key = format!("decision-approval:{}:issued", grant.grant_id);
-            let issued = self
-                .memory
-                .find_message_event_by_idempotency_key(&record.subject.workspace_id, &issued_key)
-                .await?
-                .context("decision review grant was not issued")?;
-            verify_lineage(&issued, &issued_key, "approval.decision.issued")?;
-            let stored: ApprovalGrantV2 = serde_json::from_str(
-                issued
-                    .raw_payload_json
-                    .as_deref()
-                    .context("issued approval payload missing")?,
-            )?;
-            anyhow::ensure!(stored == *grant, "issued approval differs from reviewed batch");
-            // Any existing resolution closes this operation, including a
-            // malformed/conflicting row. Absence is only a preflight fact;
-            // final dispatch must still win the atomic resolution write.
-            let resolution_key = super::approval::decision_resolution_key(&record.binding, op_id);
-            if matches!(purpose, ApprovalRead::ForExecution) {
-                anyhow::ensure!(
-                    self.memory
-                        .find_message_event_by_idempotency_key(&record.subject.workspace_id, &resolution_key,)
-                        .await?
-                        .is_none(),
-                    "decision approval is already resolved"
-                );
-            }
-        }
-        self.verify_h2_review_requirement(&pending, true, review.record.local_owner.as_deref())?;
-        self.check_live_parity()?;
-        let now = Utc::now();
-        anyhow::ensure!(
-            record.expires_at > now && review.record.grants.iter().all(|grant| grant.is_time_valid(now)),
-            "decision approval expired during preparation"
-        );
-        Ok(VerifiedDecisionApproval {
-            pending,
-            grants: review.record.grants,
-            local_owner: review.record.local_owner,
-        })
+        self.approval_ledger()
+            .revoke_pending_decision_approval(owner, session, decision_id)
+            .await
     }
 
     pub(crate) async fn load_pending_decision_approval(
@@ -958,118 +346,10 @@ impl TurnDecisionService {
         session: &str,
         decision_id: DecisionId,
     ) -> anyhow::Result<VerifiedPendingDecisionApproval> {
-        anyhow::ensure!(
-            self.recordable && self.durable_key && self.generation.effective.causal_tree.enabled,
-            "pending approval requires enabled durable service"
-        );
-        let workspace = self.generation.effective.workspace_dir.to_string_lossy();
-        let key = format!("decision-approval:{decision_id}:pending");
-        let event = self
-            .memory
-            .find_message_event_by_idempotency_key(&workspace, &key)
-            .await?
-            .context("pending decision approval not found")?;
-        anyhow::ensure!(
-            event.id > 0
-                && event.workspace_id == workspace
-                && event.owner_id.as_deref() == Some(owner)
-                && event.session_key.as_deref() == Some(session)
-                && event.idempotency_key.as_deref() == Some(key.as_str())
-                && event.event_type == "approval.decision.pending",
-            "pending decision approval belongs to another scope"
-        );
-        let signed: SignedPending = serde_json::from_str(
-            event
-                .raw_payload_json
-                .as_deref()
-                .context("pending approval payload missing")?,
-        )?;
-        anyhow::ensure!(
-            self.state_key.verify_hmac(
-                KeyDomain::ApprovalState,
-                &[b"pending", &serde_json::to_vec(&signed.record)?],
-                &signed.mac
-            ),
-            "pending approval authentication failed"
-        );
-        let record = signed.record;
-        anyhow::ensure!(
-            record.subject.owner_id == owner
-                && record.subject.workspace_id == workspace
-                && record.subject.session_key.as_deref() == Some(session)
-                && record.binding.decision_id == decision_id.to_string()
-                && record.binding.catalog_generation == self.catalog.generation().0
-                && record.policy_version == self.policy_version.as_ref()
-                && record.expires_at > Utc::now(),
-            "pending approval is stale or out of scope"
-        );
-        anyhow::ensure!(
-            event.run_id.as_deref() == Some(record.run_id.as_str())
-                && event.causation_event_id.as_deref() == Some(record.source_event_id.as_str()),
-            "pending approval marker lineage changed"
-        );
-        let source = self
-            .memory
-            .find_owned_message_event(&workspace, owner, &record.source_event_id)
-            .await?
-            .context("pending approval original input missing")?;
-        anyhow::ensure!(
-            self.state_key.verify_hmac(
-                KeyDomain::ApprovalState,
-                &[b"source", &serde_json::to_vec(&source)?],
-                &record.source_mac
-            ),
-            "pending approval original input changed"
-        );
-        let store_workspace = self.store.workspace_id().context("approval decision store missing")?;
-        anyhow::ensure!(
-            record.decision_digests.last().map(|hop| hop.0.as_str()) == Some(record.binding.decision_id.as_str()),
-            "pending approval final hop changed"
-        );
-        let decision_scope = DecisionScope::Owner {
-            workspace_id: store_workspace,
-            owner_id: Arc::from(owner),
-        };
-        let mut prior = None;
-        for (id, digest) in &record.decision_digests {
-            let id = DecisionId::parse(id)?;
-            let row = self
-                .store
-                .reader()
-                .replay_record(&decision_scope, &id)?
-                .context("pending approval decision missing")?;
-            anyhow::ensure!(
-                row.digest == *digest
-                    && row.decision.prior_decision_id == prior
-                    && row.decision.session_key.as_deref() == Some(session)
-                    && row.decision.run_id.as_deref() == Some(record.run_id.as_str()),
-                "pending approval recorded chain changed"
-            );
-            prior = Some(id);
-        }
-        self.check_live_parity()?;
-        Ok(VerifiedPendingDecisionApproval { record, source })
+        self.approval_ledger()
+            .load_pending_decision_approval(owner, session, decision_id)
+            .await
     }
-}
-
-fn scope_from_source(source: &MessageEvent) -> MessageEventScope {
-    let mut scope = MessageEventScope::new(source.source.clone(), source.visibility.clone());
-    scope.owner_id = source.owner_id.clone();
-    scope.channel = source.channel.clone();
-    scope.session_key = source.session_key.clone();
-    scope.run_id = source.run_id.clone();
-    scope.parent_session_key = source.parent_session_key.clone();
-    scope.parent_run_id = source.parent_run_id.clone();
-    scope.agent_id = source.agent_id.clone();
-    scope.persona_id = source.persona_id.clone();
-    scope.sender = source.sender.clone();
-    scope.recipient = source.recipient.clone();
-    scope.causation_event_id = Some(source.event_id.clone());
-    scope.config_generation_id = source.config_generation_id;
-    scope.config_source_revision = source.config_source_revision.clone();
-    scope.attempt_id = source.attempt_id.clone();
-    scope.lease_epoch = source.lease_epoch;
-    scope
 }
 
 /// The execution adapter owns only a reference to the issued turn. It cannot
@@ -1795,7 +1075,7 @@ impl TurnDecisionService {
                 .hmac(KeyDomain::ApprovalState, &[b"resume", &serde_json::to_vec(&record)?]),
             record,
         };
-        let key = format!("decision-approval:{decision_id}:resume:{source_id}");
+        let key = DecisionAuthority(decision_id).resume_key(source_id);
         let expected = serde_json::to_value(&signed)?;
         let receipt = MemoryFabric::new(self.memory.clone(), proof.workspace_id())
             .record_runtime_event_idempotent(
@@ -1959,5 +1239,98 @@ impl AdmittedDecisionResume {
                 .collect(),
             causation: Arc::from(self.receipt.event_id.as_str()),
         })
+    }
+}
+
+impl TurnDecisionService {
+    fn approval_ledger(&self) -> ApprovalLedger<'_> {
+        ApprovalLedger {
+            memory: &self.memory,
+            state_key: &self.state_key,
+            store: &self.store,
+            workspace: self.generation.effective.workspace_dir.to_string_lossy().into_owned(),
+            catalog_generation: self.catalog.generation().0,
+            policy_version: &self.policy_version,
+            enabled: self.recordable && self.durable_key && self.generation.effective.causal_tree.enabled,
+            port: self,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApprovalRuntime for TurnDecisionService {
+    fn check_live_parity(&self) -> anyhow::Result<()> {
+        Ok(Self::check_live_parity(self)?)
+    }
+    async fn verify_pending_console_file_operation(
+        &self,
+        pending: &VerifiedPendingDecisionApproval,
+    ) -> anyhow::Result<()> {
+        Self::verify_pending_console_file_operation(self, pending).await
+    }
+    fn open_pending_call(
+        &self,
+        pending: &VerifiedPendingDecisionApproval,
+    ) -> anyhow::Result<crate::tools::ToolExecutionCommand> {
+        Self::open_pending_call(self, pending)
+    }
+    fn verify_h2_review_requirement(
+        &self,
+        pending: &VerifiedPendingDecisionApproval,
+        approved: bool,
+        stamp: Option<&crate::runtime::h2_entry::LocalOwnerReviewStamp>,
+    ) -> anyhow::Result<()> {
+        Self::verify_h2_review_requirement(self, pending, approved, stamp)
+    }
+    async fn store_decision_grant(
+        &self,
+        scope: MessageEventScope,
+        grant: &crate::acl::approval_grant::ApprovalGrantV2,
+        expected: &GrantScope<'_>,
+        keyring: &crate::acl::approval_grant::WitnessKeyring,
+    ) -> anyhow::Result<()> {
+        Self::store_decision_grant(
+            self,
+            scope,
+            grant,
+            &super::approval::DecisionGrantScope {
+                subject: expected.subject,
+                binding: expected.binding,
+                op_id: expected.op_id,
+                risk: expected.risk,
+            },
+            keyring,
+        )
+        .await
+    }
+    async fn revoke_decision_grant(
+        &self,
+        scope: MessageEventScope,
+        grant: &crate::acl::approval_grant::ApprovalGrantV2,
+        expected: &GrantScope<'_>,
+        keyring: &crate::acl::approval_grant::WitnessKeyring,
+    ) -> anyhow::Result<()> {
+        Self::revoke_decision_grant(
+            self,
+            scope,
+            grant,
+            &super::approval::DecisionGrantScope {
+                subject: expected.subject,
+                binding: expected.binding,
+                op_id: expected.op_id,
+                risk: expected.risk,
+            },
+            keyring,
+        )
+        .await
+        .map(|_| ())
+    }
+    fn retire_pending(&self, record: &PendingRecord) {
+        self.recursive_allowances.retire_pending(
+            &record.subject.workspace_id,
+            &record.subject.owner_id,
+            record.subject.session_key.as_deref().unwrap_or_default(),
+            &record.run_id,
+        );
     }
 }
