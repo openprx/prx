@@ -224,7 +224,7 @@ pub(super) async fn run_sub_agent_process(
     }
 
     #[cfg(not(test))]
-    let executable = std::env::current_exe()?;
+    let executable = std::env::current_exe().context("resolve the current executable for the session worker child")?;
     #[cfg(test)]
     let executable = if let Some(artifact) = test_worker_executable {
         artifact.verify()?;
@@ -298,7 +298,13 @@ pub(super) async fn run_sub_agent_process(
         control.claim()?;
         control.check_serialized_precondition(&payload)?;
     }
-    let mut child = command.spawn()?;
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "spawn session worker child `{}` (cwd {})",
+            command.as_std().get_program().to_string_lossy(),
+            std::env::current_dir().map_or_else(|_| "<unavailable>".to_owned(), |dir| dir.display().to_string())
+        )
+    })?;
     #[cfg(unix)]
     prepared_manifest.mark_spawned();
     #[cfg(test)]

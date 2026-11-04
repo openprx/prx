@@ -38,7 +38,7 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     "src/tools/sessions_spawn/tests/owned_child.rs::owner_keeps_child_after_requester_timeout_until_reap::let child = command.spawn().unwrap();",
     "src/tools/sessions_spawn/tests/owned_child.rs::owner_mediated_process_kill_reaps_leader_and_terminates_group::let child = command.spawn().expect(\"test child should spawn\");",
     "src/tools/sessions_spawn/tests/owned_child.rs::process_mode_waits_for_natural_completion_without_a_deadline::let mut child = command.spawn().unwrap();",
-    "src/tools/sessions_spawn/process_mode.rs::run_sub_agent_process::let mut child = command.spawn()?;",
+    "src/tools/sessions_spawn/process_mode.rs::run_sub_agent_process::let mut child = command.spawn().with_context(|| {",
     // Test-only: the steer wire is only proved by a real pipe to a real child,
     // so these two stand in for a session-worker (one echoes stdin, one never
     // reads it) rather than mocking the very pipe under test.
