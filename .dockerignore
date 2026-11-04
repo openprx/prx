@@ -8,7 +8,6 @@ target
 
 # Documentation and examples (not needed for runtime)
 docs
-examples
 tests
 
 # Markdown files (README, CHANGELOG, etc.)
