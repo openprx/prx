@@ -138,7 +138,7 @@ jobs:
                   toolchain: 1.99.0
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
-                  shared-key: test-archive
+                  shared-key: test-archive-rest
                   cache-on-failure: true
             # One libtest process on purpose: the scanners memoize file text
             # process-wide, so one process per test (nextest) is twice as slow.
@@ -151,21 +151,27 @@ jobs:
                       exit 1
                   fi
 
+    # The crate is one huge package: its 10k-test lib test binary is a single
+    # rustc that, built next to the other test binaries on a 16 GiB runner, got
+    # the job killed (SIGTERM, no message). Two archives are built in parallel
+    # instead: `lib` (the lib test binary) and `rest` (bins, integration tests,
+    # doc-tests). Debuginfo stays off; dependencies are optimized by
+    # [profile.dev.package."*"].
     test-build:
-        name: Test Build (archive)
+        name: Test Build (${{ matrix.name }})
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 45
-        outputs:
-            sharded: ${{ steps.list.outputs.sharded }}
-        # Test binaries are built once, here, and every shard runs a slice of
-        # the archive. Debuginfo stays off (full-debug test linking exhausted
-        # 16 GiB before); dependencies are optimized by [profile.dev.package."*"].
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - name: lib
+                      targets: --lib
+                    - name: rest
+                      targets: --bins --tests
         env:
-            # The run before this was killed (SIGTERM, no message) while linking
-            # many test binaries at full parallelism: bound the build.
-            CARGO_BUILD_JOBS: "2"
             CARGO_INCREMENTAL: "0"
             CARGO_PROFILE_TEST_DEBUG: "0"
             CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
@@ -177,37 +183,48 @@ jobs:
                   toolchain: 1.99.0
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
-                  shared-key: test-archive
+                  shared-key: test-archive-${{ matrix.name }}
                   cache-on-failure: true
             - name: Install cargo-nextest
               run: curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
             - name: Build the test archive
-              run: cargo nextest archive --locked --all-features --archive-file prx-tests.tar.zst
+              run: cargo nextest archive --locked --all-features ${{ matrix.targets }} --archive-file prx-tests-${{ matrix.name }}.tar.zst
             - name: List every test (the sharded runs must add up to this)
-              id: list
               run: |
                   set -euo pipefail
-                  cargo nextest list --locked --all-features --archive-file prx-tests.tar.zst --workspace-remap "$GITHUB_WORKSPACE" --message-format json > list.json
+                  cargo nextest list --locked --all-features --archive-file prx-tests-${{ matrix.name }}.tar.zst --workspace-remap "$GITHUB_WORKSPACE" --message-format json > list.json
                   python3 scripts/ci/nextest_test_count.py list.json | tee count.txt
-                  echo "sharded=$(sed -n 's/^sharded=//p' count.txt)" >> "$GITHUB_OUTPUT"
+                  sed -n 's/^sharded=//p' count.txt > sharded.txt
             - name: Run doc-tests (guard home, loopback-only network)
+              if: matrix.name == 'rest'
               run: python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh --locked --all-features --doc
             - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
               with:
-                  name: prx-tests
-                  path: prx-tests.tar.zst
+                  name: prx-tests-${{ matrix.name }}
+                  path: prx-tests-${{ matrix.name }}.tar.zst
                   retention-days: 1
                   compression-level: 0
+            - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: sharded-${{ matrix.name }}
+                  path: sharded.txt
+                  retention-days: 1
 
     test-shard:
-        name: Test Shard ${{ matrix.shard }}/6
+        name: Test Shard ${{ matrix.name }}
         needs: [test-build]
         runs-on: ubuntu-latest
-        timeout-minutes: 15
+        timeout-minutes: 45
         strategy:
             fail-fast: false
             matrix:
-                shard: [1, 2, 3, 4, 5, 6]
+                include:
+                    - { name: lib-1, archive: lib, part: "1/5" }
+                    - { name: lib-2, archive: lib, part: "2/5" }
+                    - { name: lib-3, archive: lib, part: "3/5" }
+                    - { name: lib-4, archive: lib, part: "4/5" }
+                    - { name: lib-5, archive: lib, part: "5/5" }
+                    - { name: rest, archive: rest, part: "1/1" }
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -217,31 +234,31 @@ jobs:
               run: curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
             - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
               with:
-                  name: prx-tests
-            - name: Run shard ${{ matrix.shard }}/6 (guard home, loopback-only network, 60 s per test)
+                  name: prx-tests-${{ matrix.archive }}
+            - name: Run shard ${{ matrix.part }} of ${{ matrix.archive }} (guard home, loopback-only network, 60 s per test)
               env:
                   PRX_GUARD_SUBCOMMAND: nextest
               run: |
                   set -euo pipefail
                   python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh \
-                      --archive-file prx-tests.tar.zst --workspace-remap "$GITHUB_WORKSPACE" \
+                      --archive-file prx-tests-${{ matrix.archive }}.tar.zst --workspace-remap "$GITHUB_WORKSPACE" \
                       --profile ci --no-fail-fast \
                       -E 'not binary(architecture_boundaries)' \
-                      --partition hash:${{ matrix.shard }}/6 2>&1 | tee shard.log
+                      --partition hash:${{ matrix.part }} 2>&1 | tee shard.log
             - name: Executed count must equal the shard's share of `nextest list`
               run: |
                   set -euo pipefail
                   executed="$(sed 's/\x1b\[[0-9;]*m//g' shard.log | sed -nE 's/.*Summary.* ([0-9]+) tests? run.*/\1/p' | tail -1)"
-                  cargo nextest list --archive-file prx-tests.tar.zst --workspace-remap "$GITHUB_WORKSPACE" \
-                      -E 'not binary(architecture_boundaries)' --partition hash:${{ matrix.shard }}/6 \
+                  cargo nextest list --archive-file prx-tests-${{ matrix.archive }}.tar.zst --workspace-remap "$GITHUB_WORKSPACE" \
+                      -E 'not binary(architecture_boundaries)' --partition hash:${{ matrix.part }} \
                       --message-format json > shard-list.json
                   expected="$(python3 scripts/ci/nextest_test_count.py shard-list.json | sed -n 's/^sharded=//p')"
-                  echo "shard ${{ matrix.shard }}/6: executed=$executed listed=$expected"
+                  echo "shard ${{ matrix.name }} (${{ matrix.part }}): executed=$executed listed=$expected"
                   [ "$executed" = "$expected" ]
                   echo "$executed" > executed.txt
             - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
               with:
-                  name: executed-${{ matrix.shard }}
+                  name: executed-${{ matrix.name }}
                   path: executed.txt
                   retention-days: 1
 
@@ -259,13 +276,17 @@ jobs:
             - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
               with:
                   pattern: executed-*
-                  merge-multiple: false
                   path: executed
+            - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+              with:
+                  pattern: sharded-*
+                  path: sharded
             - name: The shards together ran exactly what nextest lists
               run: |
-                  total="$(cat executed/*/executed.txt | paste -sd+ - | bc)"
-                  echo "shards executed=$total, nextest list (minus architecture_boundaries)=${{ needs.test-build.outputs.sharded }}"
-                  [ "$total" = "${{ needs.test-build.outputs.sharded }}" ]
+                  executed="$(cat executed/*/executed.txt | paste -sd+ - | bc)"
+                  listed="$(cat sharded/*/sharded.txt | paste -sd+ - | bc)"
+                  echo "shards executed=$executed, nextest list (minus architecture_boundaries)=$listed"
+                  [ "$executed" = "$listed" ]
 
     mutants:
         name: Mutants (advisory, in diff)
