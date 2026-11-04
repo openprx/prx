@@ -1053,6 +1053,9 @@
       "promptCachePrefixes": "system prefix changes {sys}/{cont} · tools {tools}/{cont}",
       "participants": "Reload participants",
       "unavailableProviders": "Unavailable providers",
+      "providerCircuits": "Provider circuits",
+      "circuitOpen": "open",
+      "circuitHalfOpen": "half-open",
       "none": "None"
     },
     "decision": {

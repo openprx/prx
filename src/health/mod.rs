@@ -443,8 +443,17 @@ pub fn snapshot_json() -> serde_json::Value {
             serde_json::json!(crate::agent::prompt_cache_metrics::snapshot()),
         );
     }
+    if let (Some(object), Ok(circuits)) = (
+        value.as_object_mut(),
+        serde_json::to_value(crate::providers::circuit_breaker::snapshot()),
+    ) {
+        object.insert("provider_circuits".to_string(), circuits);
+    }
     value
 }
+
+#[cfg(test)]
+mod provider_circuits;
 
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]

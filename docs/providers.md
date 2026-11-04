@@ -1061,6 +1061,52 @@ explicit signal from the upstream.
   `runtime` only. The block is attached by `health::snapshot_json()`, which no
   gateway route calls: the daemon's state writer is what puts it on disk.
 
+## Provider circuit breaker
+
+Factory-built provider chains share a process-local circuit breaker. Five
+consecutive failed attempts open a provider's circuit for 30 seconds. With the
+default two retries, two consecutive failing requests can open it. While open,
+all requests skip that provider, including its other models and rotated API
+keys. If every candidate is open, the request fails immediately with circuit
+reasons, without sending another attempt or sleeping for backoff.
+
+| Attempt outcome | Circuit effect |
+| --- | --- |
+| 5xx (including 503), 408, timeout, transport failure, transient body-read failure | Count a failure |
+| Success, 4xx/authentication error, context overflow, 429 (including billing/quota and Retry-After responses) | Reset consecutive failures; close a probe |
+| Local accounting/tool-schema refusal, deterministic streaming content-filter or tool-index stop | Leave endpoint health unchanged |
+| Error after streamed content starts | Leave the circuit unchanged; surface the error without fallback |
+
+When the open window expires, the circuit becomes half-open and admits one
+probe. Success or another upstream response closes it and resets the window to
+30 seconds. A failed probe reopens it for twice the previous window, capped at
+300 seconds. Cancelling a probe releases its slot for the next request.
+Fallback admission and rate-limit cool-down still apply; circuit admission
+happens before waiting for a rate-limit gate and is revalidated before sending.
+
+Configure `[reliability.circuit_breaker]` with `enabled` (default `true`),
+`failure_threshold` (`5`), `open_secs` (`30`) and `max_open_secs` (`300`). Set
+`enabled = false` to restore the previous retry behavior. Threshold and initial
+window must be at least 1; the maximum window must be between `open_secs` and
+3600 seconds. Invalid keys are rejected when loading the configuration; fix
+the named key or delete the table to restore defaults.
+
+Overlapping configuration generations share their circuits. Rebuilt chains use
+new parameters; in-flight chains keep theirs. After the last chain releases an
+entry, up to 256 retired circuits retain open protection temporarily for reloads.
+Expired windows and the retirement cap can remove them; unleased closed entries
+with no outstanding attempt can be removed immediately. Retired members do not
+appear in the public snapshot.
+
+The registry is in memory. It resets on daemon restart and does not cross the
+process boundary of `mode = "process"` sub-agents, just like the rate-limit gate.
+
+Inspect `provider_circuits` in `daemon_state.json`, `prx doctor`, or Console
+Overview's **Provider circuits** field (`GET /api/status`). Public labels and
+transition logs redact URL credentials and query secrets; private member keys
+are never exposed. Labels that redact to the same value share one displayed
+row with summed counters and the worst state.
+
 ## OpenAI Codex notes
 
 - Malformed/unexpected response payloads fail fast with

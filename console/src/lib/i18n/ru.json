@@ -1053,6 +1053,9 @@
       "promptCachePrefixes": "изменения системного префикса {sys}/{cont} · инструменты {tools}/{cont}",
       "participants": "Участники перезагрузки",
       "unavailableProviders": "Недоступные провайдеры",
+      "providerCircuits": "Цепи провайдеров",
+      "circuitOpen": "открыта",
+      "circuitHalfOpen": "полуоткрыта",
       "none": "Нет"
     },
     "decision": {

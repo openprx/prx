@@ -1569,6 +1569,7 @@ fn resolved_provider_refuses_an_invalid_fallback() {
         acknowledge_single_provider_risk: false,
         api_keys: Vec::new(),
         model_fallbacks: std::collections::HashMap::new(),
+        circuit_breaker: Default::default(),
         channel_initial_backoff_secs: 2,
         channel_max_backoff_secs: 60,
         scheduler_poll_secs: 15,
@@ -1619,6 +1620,7 @@ fn summarize_provider_availability_marks_degraded_when_only_primary_has_credenti
         acknowledge_single_provider_risk: false,
         api_keys: Vec::new(),
         model_fallbacks: std::collections::HashMap::new(),
+        circuit_breaker: Default::default(),
         channel_initial_backoff_secs: 2,
         channel_max_backoff_secs: 60,
         scheduler_poll_secs: 15,
@@ -1684,6 +1686,7 @@ fn summarize_provider_availability_marks_openai_codex_available_with_auth_profil
             acknowledge_single_provider_risk: false,
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            circuit_breaker: Default::default(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -1722,6 +1725,7 @@ fn summarize_provider_availability_marks_openai_codex_unavailable_without_auth_p
             acknowledge_single_provider_risk: false,
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            circuit_breaker: Default::default(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -1897,6 +1901,7 @@ fn resilient_fallback_resolves_own_credential() {
         acknowledge_single_provider_risk: false,
         api_keys: Vec::new(),
         model_fallbacks: std::collections::HashMap::new(),
+        circuit_breaker: Default::default(),
         channel_initial_backoff_secs: 2,
         channel_max_backoff_secs: 60,
         scheduler_poll_secs: 15,
@@ -1921,6 +1926,7 @@ fn resilient_fallback_supports_custom_url() {
         acknowledge_single_provider_risk: false,
         api_keys: Vec::new(),
         model_fallbacks: std::collections::HashMap::new(),
+        circuit_breaker: Default::default(),
         channel_initial_backoff_secs: 2,
         channel_max_backoff_secs: 60,
         scheduler_poll_secs: 15,
@@ -1948,6 +1954,7 @@ fn resolved_provider_refuses_a_mixed_chain_with_an_invalid_member() {
         acknowledge_single_provider_risk: false,
         api_keys: Vec::new(),
         model_fallbacks: std::collections::HashMap::new(),
+        circuit_breaker: Default::default(),
         channel_initial_backoff_secs: 2,
         channel_max_backoff_secs: 60,
         scheduler_poll_secs: 15,
@@ -2277,6 +2284,7 @@ fn byo_reliability_without_fallbacks() -> crate::config::ReliabilityConfig {
         acknowledge_single_provider_risk: false,
         api_keys: Vec::new(),
         model_fallbacks: std::collections::HashMap::new(),
+        circuit_breaker: Default::default(),
         channel_initial_backoff_secs: 2,
         channel_max_backoff_secs: 60,
         scheduler_poll_secs: 15,
@@ -2925,4 +2933,61 @@ async fn keyed_byo_endpoint_still_presents_its_own_credential() {
         .expect("test: a keyed endpoint receives an authorization header");
     assert_eq!(authorization, format!("Bearer {BYO_SENTINEL_KEY}"));
     endpoint.shutdown();
+}
+
+async fn breaker_factory_probe(enabled: bool) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&requests);
+    let app = axum::Router::new().fallback(move || {
+        count.fetch_add(1, Ordering::SeqCst);
+        async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "upstream unavailable") }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let temp = TempDir::new().unwrap();
+    let mut reliability = byo_reliability_without_fallbacks();
+    reliability.circuit_breaker.enabled = enabled;
+    reliability.circuit_breaker.failure_threshold = 2;
+    let config = factory_config(
+        &format!("custom:http://{addr}/v1"),
+        BYO_BARE_MODEL,
+        None,
+        None,
+        reliability,
+    );
+    let provider = create_provider_from_test_config(&config, &byo_isolated_options(&temp)).unwrap();
+    for expected in 1..=2 {
+        assert!(
+            provider
+                .chat_with_system(None, "ping", BYO_BARE_MODEL, 0.0)
+                .await
+                .is_err()
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), expected);
+    }
+    let third = provider
+        .chat_with_system(None, "ping", BYO_BARE_MODEL, 0.0)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        if enabled { 2 } else { 3 },
+        "factory must honor breaker enabled"
+    );
+    assert_eq!(third.to_string().contains("circuit open"), enabled);
+    server.abort();
+}
+
+#[tokio::test]
+async fn r4b_factory_attaches_shared_breaker_to_real_transport() {
+    breaker_factory_probe(true).await;
+}
+#[tokio::test]
+async fn r4c_factory_disabled_breaker_keeps_sending() {
+    breaker_factory_probe(false).await;
 }

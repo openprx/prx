@@ -1,4 +1,5 @@
 use super::{AppState, configured_channel_names, resolve_memory_backend};
+use crate::security::redaction::redact_provider_text;
 use axum::{Json, extract::State};
 use serde::Serialize;
 
@@ -14,6 +15,7 @@ pub(super) struct StatusResponse {
     provider_degraded: bool,
     provider_available: Vec<String>,
     provider_unavailable: Vec<String>,
+    provider_circuits: Vec<ProviderCircuitStatus>,
     active_config_generation: u64,
     active_config_source_revision: String,
     desired_config_source_revision: String,
@@ -35,6 +37,15 @@ struct PromptCacheStatus {
     system_prefix_changed_total: u64,
     tools_prefix_changed_total: u64,
     series_unkeyed_total: u64,
+}
+
+#[derive(Serialize)]
+struct ProviderCircuitStatus {
+    provider: String,
+    state: &'static str,
+    consecutive_failures: u32,
+    opened_total: u64,
+    retry_in_ms: Option<u64>,
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
@@ -74,12 +85,12 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         channels: configured_channel_names(&config),
         gateway_port: state.gateway_port,
         provider_degraded: availability.degraded,
-        // Labels and reasons may quote a `custom:` URL carrying
-        // `user:password@`; this response leaves the host.
+        // Labels and reasons may quote a `custom:` URL carrying userinfo
+        // or query credentials; every field in this response leaves the host.
         provider_available: availability
             .available
             .iter()
-            .map(|name| crate::providers::redact_endpoint_userinfo(name).into_owned())
+            .map(|name| redact_provider_text(&crate::providers::redact_endpoint_userinfo(name)))
             .collect(),
         provider_unavailable: availability
             .unavailable
@@ -87,9 +98,19 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
             .map(|(name, reason)| {
                 format!(
                     "{}: {}",
-                    crate::providers::redact_endpoint_userinfo(&name),
-                    crate::providers::redact_endpoint_userinfo(&reason)
+                    redact_provider_text(&crate::providers::redact_endpoint_userinfo(&name)),
+                    redact_provider_text(&crate::providers::redact_endpoint_userinfo(&reason))
                 )
+            })
+            .collect(),
+        provider_circuits: crate::providers::circuit_breaker::snapshot()
+            .into_iter()
+            .map(|(provider, row)| ProviderCircuitStatus {
+                provider,
+                state: row.state,
+                consecutive_failures: row.consecutive_failures,
+                opened_total: row.opened_total,
+                retry_in_ms: row.retry_in_ms,
             })
             .collect(),
         active_config_generation: generation.id.0,
@@ -116,58 +137,4 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn get_status_exposes_redacted_prompt_cache_row() {
-        use crate::agent::prompt_cache_metrics::{RoundTrip, Series, record_round_trip};
-        let provider = [
-            "custom:https://user:",
-            "sk-live-",
-            "SECRET@example.test/v1?key=",
-            "QUERYSECRET",
-        ]
-        .concat();
-        record_round_trip(RoundTrip {
-            series: Series::for_turn(None, &crate::agent::turn_request::ToolLoopMemory::none()),
-            provider: &provider,
-            model: "status-cache-fixture",
-            system_prompt_sha256: None,
-            tools_sha256: "tools",
-            usage: &crate::llm::route_decision::TokenUsage::reported_with_cache(
-                Some(1000),
-                Some(10),
-                Some(1010),
-                Some(0),
-                Some(800),
-            ),
-        });
-        let workspace = tempfile::tempdir().unwrap();
-        let config = crate::config::Config {
-            workspace_dir: workspace.path().into(),
-            config_path: workspace.path().join("config.toml"),
-            ..crate::config::Config::default()
-        };
-        let state = super::super::test_support::app_state(config);
-        let body = serde_json::to_value(get_status(State(state)).await.0).unwrap();
-        let rows = body.get("prompt_cache").unwrap().as_array().unwrap();
-        let row = rows
-            .iter()
-            .find(|row| {
-                row.get("provider_model")
-                    .unwrap()
-                    .as_str()
-                    .unwrap()
-                    .ends_with("/status-cache-fixture")
-            })
-            .unwrap();
-        assert_eq!(row.get("requests_total"), Some(&serde_json::json!(1)));
-        assert_eq!(row.get("cache_reported_total"), Some(&serde_json::json!(1)));
-        assert_eq!(row.get("cache_hit_requests_total"), Some(&serde_json::json!(1)));
-        assert_eq!(row.get("cache_read_tokens_total"), Some(&serde_json::json!(800)));
-        let text = body.to_string();
-        for secret in [["sk-live-", "SECRET"].concat(), "QUERYSECRET".into(), "user:".into()] {
-            assert!(!text.contains(&secret), "credential leaked");
-        }
-    }
-}
+mod tests;

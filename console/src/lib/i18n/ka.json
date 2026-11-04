@@ -1053,6 +1053,9 @@
       "promptCachePrefixes": "სისტემის პრეფიქსის ცვლილებები {sys}/{cont} · ხელსაწყოები {tools}/{cont}",
       "participants": "გადატვირთვის მონაწილეები",
       "unavailableProviders": "მიუწვდომელი პროვაიდერები",
+      "providerCircuits": "პროვაიდერის წრედები",
+      "circuitOpen": "ღია",
+      "circuitHalfOpen": "ნახევრად ღია",
       "none": "არ არის"
     },
     "decision": {

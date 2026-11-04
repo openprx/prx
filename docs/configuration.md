@@ -643,6 +643,31 @@ claude-opus-4-6 = ["claude-sonnet-4-6"]
 fallback_providers = ["xai"]
 ```
 
+The provider circuit breaker is enabled by default. It counts consecutive
+transient endpoint failures across requests and models in this process:
+
+```toml
+[reliability.circuit_breaker]
+enabled = true
+failure_threshold = 5
+open_secs = 30
+max_open_secs = 300
+```
+
+`failure_threshold` and `open_secs` must be at least 1. `max_open_secs` must be
+at least `open_secs` and at most 3600. These checks apply even when disabled;
+invalid configurations name the key and are rejected. Fix the key or delete
+this table to restore defaults. Configurations without the table get these
+defaults. Set `enabled = false` to restore the previous retry behavior.
+
+A failed probe doubles the open window up to the maximum. An answered probe
+closes the circuit. Open candidates are skipped before rate-limit waits; when
+all candidates are open the request fails immediately. Rebuilt chains share
+entries that are still leased or retained for reloads, and use the new parameters;
+in-flight chains keep their parameters. State resets on daemon restart and is
+not shared with process-mode sub-agents. See [Provider circuit breaker](providers.md#provider-circuit-breaker)
+for retention limits, counted failure classes and status surfaces.
+
 When the `wasm-plugins` feature is enabled, an installed provider component can
 be selected with `default_provider = "wasm:<exported-name>"`. Likewise,
 `memory.backend = "wasm:<exported-name>"` selects an installed storage

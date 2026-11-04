@@ -72,6 +72,13 @@
       : unreported;
   }
 
+  function circuitList(rows) {
+    const active = Array.isArray(rows) ? rows.filter((row) => row.state !== 'closed') : [];
+    return active.length > 0
+      ? active.map((row) => `${row.provider} (${t(row.state === 'half_open' ? 'operations.overview.circuitHalfOpen' : 'operations.overview.circuitOpen')}, ${Math.ceil((row.retry_in_ms ?? 0) / 1000)}s)`).join(', ')
+      : t('operations.overview.none');
+  }
+
   async function loadStatus() {
     try {
       const response = await api.getStatus();
@@ -148,6 +155,10 @@
         <div>
           <dt class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">{t('operations.overview.unavailableProviders')}</dt>
           <dd class="mt-1 text-sm text-gray-900 dark:text-gray-100">{namedList(status?.provider_unavailable)}</dd>
+        </div>
+        <div>
+          <dt class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">{t('operations.overview.providerCircuits')}</dt>
+          <dd class="mt-1 text-sm text-gray-900 dark:text-gray-100">{circuitList(status?.provider_circuits)}</dd>
         </div>
       </dl>
     </div>

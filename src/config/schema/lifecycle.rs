@@ -868,6 +868,7 @@ impl Config {
 
         // Smart group-reply pre-gate numeric ranges.
         self.smart_group.validate()?;
+        self.reliability.circuit_breaker.validate()?;
 
         // wacli channel (webhook + CLI) settings.
         if let Some(wacli) = self.channels_config.wacli.as_ref() {

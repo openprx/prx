@@ -147,6 +147,12 @@ impl RateLimitGate {
         }
     }
 
+    /// Release the wall-clock deadline in paused-clock circuit integration tests.
+    #[cfg(test)]
+    pub(super) fn clear_for_circuit_test(&self, key: &str) {
+        self.deadlines.write().remove(key);
+    }
+
     /// Remaining cool-down for `provider`, or `None` when it is not throttled.
     #[must_use]
     pub fn cooldown_remaining(&self, provider: &str) -> Option<Duration> {

@@ -132,6 +132,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process). Use `[model_settings."<id>"]` with `context_window` and
   `reserved_output_tokens` instead. cl100k token counting no longer depends on
   the `llm-router` feature.
+- **BREAKING (operators)**: Providers that fail 5 consecutive attempts (5xx, timeouts, transport errors) are skipped for 30 s (doubling to 300 s); a request whose every candidate is open fails immediately instead of retrying. New `[reliability.circuit_breaker]` (`enabled`, `failure_threshold`, `open_secs`, `max_open_secs`); set `enabled = false` for the previous behaviour.
 
 ### Fixed
 

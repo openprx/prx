@@ -1053,6 +1053,9 @@
       "promptCachePrefixes": "系统前缀变更 {sys}/{cont} · 工具 {tools}/{cont}",
       "participants": "重载参与者",
       "unavailableProviders": "不可用的提供商",
+      "providerCircuits": "提供商熔断",
+      "circuitOpen": "打开",
+      "circuitHalfOpen": "半开",
       "none": "无"
     },
     "decision": {

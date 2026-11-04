@@ -20,6 +20,7 @@ pub mod anthropic;
 pub(crate) mod attempt_accounting;
 pub mod bedrock;
 pub mod catalog;
+pub mod circuit_breaker;
 pub mod compatible;
 pub mod connection_test;
 pub mod context_window;
@@ -1120,6 +1121,19 @@ fn create_resilient_provider_from_resolved(
         // cool-down, so one request's 429 defers the others already in flight.
         .with_rate_limit_gate(rate_limit::shared_gate())
         .with_fallback_admission(fallback_admission);
+
+    let reliable = if reliability.circuit_breaker.enabled {
+        reliable.with_circuit_breaker(
+            circuit_breaker::shared_registry(),
+            circuit_breaker::BreakerParams {
+                failure_threshold: reliability.circuit_breaker.failure_threshold,
+                open_for: std::time::Duration::from_secs(reliability.circuit_breaker.open_secs),
+                max_open_for: std::time::Duration::from_secs(reliability.circuit_breaker.max_open_secs),
+            },
+        )
+    } else {
+        reliable
+    };
 
     Ok(Box::new(reliable))
 }

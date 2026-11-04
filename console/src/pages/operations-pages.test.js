@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { beforeEach, expect, test, vi } from 'vitest';
 
 const { api, ApiError } = vi.hoisted(() => {
@@ -84,8 +84,21 @@ test('overview shows health values and unknown when a status field is absent', a
   expect(screen.getAllByText('Unknown').length).toBeGreaterThan(0);
   expect(screen.getByText('Required: channels')).toBeInTheDocument();
   expect(screen.getByText('Available')).toBeInTheDocument();
-  expect(screen.getByText('None')).toBeInTheDocument();
+  expect(within(screen.getByText('Reload participants').parentElement).getByText('None')).toBeInTheDocument();
+  expect(within(screen.getByText('Provider circuits').parentElement).getByText('None')).toBeInTheDocument();
   expect(screen.getByText('remote')).toBeInTheDocument();
+});
+
+test.each([
+  [[{ provider: 'remote', state: 'open', retry_in_ms: 12000 }], 'remote (open, 12s)'],
+  [[{ provider: 'remote', state: 'half_open', retry_in_ms: 0 }], 'remote (half-open, 0s)'],
+  [[{ provider: 'remote', state: 'closed' }], 'None'],
+  [undefined, 'None']
+])('overview provider circuits %j renders %s', async (provider_circuits, expected) => {
+  api.getStatus.mockResolvedValue({ channels: [], provider_circuits });
+  render(OverviewPage);
+  const label = await screen.findByText('Provider circuits');
+  expect(label.parentElement.querySelector('dd')).toHaveTextContent(expected);
 });
 
 test('schedules add a shell job and run now reloads runs once', async () => {

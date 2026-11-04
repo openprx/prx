@@ -9,6 +9,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod provider_circuits;
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
@@ -189,6 +190,7 @@ pub fn diagnose(config: &Config) -> DoctorReport {
     check_unfinished_config_changes(config, &mut items);
     check_daemon_state(config, &mut items);
     prompt_cache::check_prompt_cache(config, &mut items);
+    provider_circuits::check_provider_circuits(config, &mut items);
     check_daemon_process_path(config, &mut items);
     check_environment(&mut items);
 
@@ -547,6 +549,7 @@ pub async fn diagnose_runtime(config: &Config) -> DoctorReport {
     check_runtime_config(config, &mut items);
     check_daemon_state(config, &mut items);
     prompt_cache::check_prompt_cache(config, &mut items);
+    provider_circuits::check_provider_circuits(config, &mut items);
     check_daemon_process_path(config, &mut items);
     check_gateway_runtime(config, &mut items);
     check_channel_runtime(config, &mut items);

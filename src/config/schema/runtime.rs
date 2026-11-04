@@ -219,6 +219,9 @@ pub struct ReliabilityConfig {
     /// Example: `{ "claude-opus-4-20250514" = ["claude-sonnet-4-20250514", "gpt-4o"] }`
     #[serde(default)]
     pub model_fallbacks: std::collections::HashMap<String, Vec<String>>,
+    /// Per-provider consecutive failure protection.
+    #[serde(default)]
+    pub circuit_breaker: ReliabilityCircuitBreakerConfig,
     /// Initial backoff for channel/daemon restarts.
     #[serde(default = "default_channel_backoff_secs")]
     pub channel_initial_backoff_secs: u64,
@@ -268,11 +271,59 @@ impl Default for ReliabilityConfig {
             acknowledge_single_provider_risk: false,
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            circuit_breaker: ReliabilityCircuitBreakerConfig::default(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
         }
+    }
+}
+
+/// Process-local provider circuit policy (`[reliability.circuit_breaker]`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ReliabilityCircuitBreakerConfig {
+    /// Enable protection for factory-built provider chains.
+    pub enabled: bool,
+    /// Consecutive transient failures that open a circuit (at least 1).
+    pub failure_threshold: u32,
+    /// Initial open window in seconds (at least 1).
+    pub open_secs: u64,
+    /// Maximum doubled window, between open_secs and 3600 seconds.
+    pub max_open_secs: u64,
+}
+
+impl Default for ReliabilityCircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            failure_threshold: 5,
+            open_secs: 30,
+            max_open_secs: 300,
+        }
+    }
+}
+
+impl ReliabilityCircuitBreakerConfig {
+    /// Reject unsafe timings even when the breaker is disabled.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (key, valid, requirement) in [
+            ("failure_threshold", self.failure_threshold >= 1, "must be at least 1"),
+            ("open_secs", self.open_secs >= 1, "must be at least 1"),
+            (
+                "max_open_secs",
+                self.max_open_secs >= self.open_secs && self.max_open_secs <= 3600,
+                "must be at least open_secs and at most 3600",
+            ),
+        ] {
+            if !valid {
+                anyhow::bail!(
+                    "reliability.circuit_breaker.{key} {requirement}; fix the key or delete [reliability.circuit_breaker] to restore defaults"
+                );
+            }
+        }
+        Ok(())
     }
 }
 

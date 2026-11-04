@@ -1,4 +1,5 @@
 use super::Provider;
+use super::circuit_breaker::{self, AttemptPermit, BreakerOutcome, BreakerParams, ChainLease, CircuitBreakerRegistry};
 use super::rate_limit::{
     self, MAX_HONORED_RETRY_AFTER_MS, RateLimitGate, jitter_after_hint_ms, jitter_backoff_ms, retry_after_hint_ms,
 };
@@ -562,6 +563,8 @@ pub struct ReliableProvider {
     /// in-flight request to the same provider. Chains constructed directly get
     /// a private gate, keeping unit tests isolated from one another.
     rate_limit_gate: Arc<RateLimitGate>,
+    circuit_breaker: Option<(Arc<CircuitBreakerRegistry>, BreakerParams)>,
+    circuit_lease: Option<Arc<ChainLease>>,
 }
 
 impl ReliableProvider {
@@ -596,6 +599,8 @@ impl ReliableProvider {
             fallback_admission: None,
             unavailable_providers: Vec::new(),
             rate_limit_gate: Arc::new(RateLimitGate::new()),
+            circuit_breaker: None,
+            circuit_lease: None,
         }
     }
 
@@ -604,6 +609,27 @@ impl ReliableProvider {
     pub fn with_rate_limit_gate(mut self, gate: Arc<RateLimitGate>) -> Self {
         self.rate_limit_gate = gate;
         self
+    }
+
+    /// Attach process-local provider health protection and lease this chain's keys.
+    #[must_use]
+    pub fn with_circuit_breaker(mut self, registry: Arc<CircuitBreakerRegistry>, params: BreakerParams) -> Self {
+        self.circuit_lease = Some(Arc::new(
+            registry.register(
+                self.providers
+                    .iter()
+                    .map(|member| (Arc::clone(&member.key), Arc::clone(&member.name))),
+            ),
+        ));
+        self.circuit_breaker = Some((registry, params));
+        self
+    }
+
+    fn admit_circuit(&self, key: &Arc<str>) -> Result<Option<AttemptPermit>, u64> {
+        match &self.circuit_breaker {
+            Some((registry, params)) => registry.admit(key, *params),
+            None => Ok(None),
+        }
     }
 
     /// Set per-model fallback chains.
@@ -667,10 +693,20 @@ impl ReliableProvider {
     }
 
     fn all_failed_message(&self, failures: &[String], runtime_unavailable: &[(String, String)]) -> String {
+        // Redact labels before adding punctuation and diagnostic reasons: a
+        // credential-shaped query value followed by ':' can otherwise consume
+        // the reason as another credential pair in the assembled message.
+        let display = |text: &str| {
+            if self.circuit_breaker.is_some() {
+                crate::security::redaction::redact_provider_text(text)
+            } else {
+                text.to_owned()
+            }
+        };
         let available = self
             .providers
             .iter()
-            .map(|member| member.name.to_string())
+            .map(|member| display(&member.name))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -681,17 +717,22 @@ impl ReliableProvider {
         } else {
             unavailable
                 .into_iter()
-                .map(|(name, reason)| format!("{name}: {reason}"))
+                .map(|(name, reason)| format!("{}: {}", display(&name), display(&reason)))
                 .collect::<Vec<_>>()
                 .join("; ")
         };
 
-        format!(
+        let message = format!(
             "All providers/models failed. Available providers: [{}]. Unavailable providers: {}. Attempts:\n{}",
             available,
             unavailable_text,
             failures.join("\n")
-        )
+        );
+        if self.circuit_breaker.is_some() {
+            crate::security::redaction::redact_provider_text(&message)
+        } else {
+            message
+        }
     }
 
     /// Build the list of models to try: [original, fallback1, fallback2, ...]
@@ -1005,13 +1046,25 @@ impl Provider for ReliableProvider {
                 let mut rate_limited_seen = false;
 
                 for attempt in 0..=self.max_retries {
+                    let permit = match self.admit_circuit(member_key) {
+                        Ok(permit) => permit,
+                        Err(ms) => {
+                            runtime_unavailable.push((provider_name.to_string(), circuit_reason(ms)));
+                            break;
+                        }
+                    };
                     self.await_rate_limit_gate(provider_name, member_key, current_model)
                         .await;
+                    if permit.as_ref().is_some_and(|permit| !permit.revalidate()) {
+                        runtime_unavailable.push((provider_name.to_string(), circuit_reason(0)));
+                        break;
+                    }
                     match provider
                         .chat_with_system(system_prompt, message, current_model, temperature)
                         .await
                     {
                         Ok(resp) => {
+                            complete_circuit(permit, BreakerOutcome::Answered);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = %provider_name,
@@ -1027,6 +1080,7 @@ impl Provider for ReliableProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            complete_circuit(permit, buffered_breaker_outcome(&e));
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
@@ -1156,10 +1210,22 @@ impl Provider for ReliableProvider {
                 let mut rate_limited_seen = false;
 
                 for attempt in 0..=self.max_retries {
+                    let permit = match self.admit_circuit(member_key) {
+                        Ok(permit) => permit,
+                        Err(ms) => {
+                            runtime_unavailable.push((provider_name.to_string(), circuit_reason(ms)));
+                            break;
+                        }
+                    };
                     self.await_rate_limit_gate(provider_name, member_key, current_model)
                         .await;
+                    if permit.as_ref().is_some_and(|permit| !permit.revalidate()) {
+                        runtime_unavailable.push((provider_name.to_string(), circuit_reason(0)));
+                        break;
+                    }
                     match provider.chat_with_history(messages, current_model, temperature).await {
                         Ok(resp) => {
+                            complete_circuit(permit, BreakerOutcome::Answered);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = %provider_name,
@@ -1175,6 +1241,7 @@ impl Provider for ReliableProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            complete_circuit(permit, buffered_breaker_outcome(&e));
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
@@ -1328,11 +1395,23 @@ impl Provider for ReliableProvider {
 
                 for attempt in 0..=self.max_retries {
                     super::attempt_accounting::ensure_supported(provider.as_ref())?;
+                    let permit = match self.admit_circuit(member_key) {
+                        Ok(permit) => permit,
+                        Err(ms) => {
+                            runtime_unavailable.push((provider_name.to_string(), circuit_reason(ms)));
+                            break;
+                        }
+                    };
                     self.await_rate_limit_gate(provider_name, member_key, current_model)
                         .await;
+                    if permit.as_ref().is_some_and(|permit| !permit.revalidate()) {
+                        runtime_unavailable.push((provider_name.to_string(), circuit_reason(0)));
+                        break;
+                    }
                     let attempt_started_at = chrono::Utc::now();
                     match provider.chat_traced(request, current_model, temperature).await {
                         Ok(trace) => {
+                            complete_circuit(permit, BreakerOutcome::Answered);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = %provider_name,
@@ -1364,6 +1443,7 @@ impl Provider for ReliableProvider {
                             });
                         }
                         Err(e) => {
+                            complete_circuit(permit, buffered_breaker_outcome(&e));
                             if super::attempt_accounting::is_local_refusal(&e) {
                                 return Err(e);
                             }
@@ -1556,13 +1636,25 @@ impl Provider for ReliableProvider {
                 let mut rate_limited_seen = false;
 
                 for attempt in 0..=self.max_retries {
+                    let permit = match self.admit_circuit(member_key) {
+                        Ok(permit) => permit,
+                        Err(ms) => {
+                            runtime_unavailable.push((provider_name.to_string(), circuit_reason(ms)));
+                            break;
+                        }
+                    };
                     self.await_rate_limit_gate(provider_name, member_key, current_model)
                         .await;
+                    if permit.as_ref().is_some_and(|permit| !permit.revalidate()) {
+                        runtime_unavailable.push((provider_name.to_string(), circuit_reason(0)));
+                        break;
+                    }
                     match provider
                         .chat_with_tools(messages, tools, current_model, temperature)
                         .await
                     {
                         Ok(resp) => {
+                            complete_circuit(permit, BreakerOutcome::Answered);
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = %provider_name,
@@ -1578,6 +1670,7 @@ impl Provider for ReliableProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            complete_circuit(permit, buffered_breaker_outcome(&e));
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
@@ -1767,6 +1860,8 @@ impl ReliableProvider {
                     provider_name: Arc::clone(provider_name),
                     member_key: Arc::clone(member_key),
                     provider: Arc::clone(provider),
+                    circuit_breaker: self.circuit_breaker.clone(),
+                    _lease: self.circuit_lease.clone(),
                     model: current_model.to_string(),
                 });
             }
@@ -1775,8 +1870,27 @@ impl ReliableProvider {
     }
 }
 
+fn circuit_reason(ms: u64) -> String {
+    format!("circuit open; next probe in {}s", ms.div_ceil(1000))
+}
+
+fn complete_circuit(permit: Option<AttemptPermit>, outcome: BreakerOutcome) {
+    if let Some(permit) = permit {
+        permit.complete(outcome);
+    }
+}
+
+fn buffered_breaker_outcome(err: &anyhow::Error) -> BreakerOutcome {
+    circuit_breaker::classify(
+        is_tool_schema_refusal(err) || super::attempt_accounting::is_local_refusal(err),
+        is_rate_limited(err) || is_non_retryable_rate_limit(err) || is_non_retryable(err),
+    )
+}
+
 /// One candidate (provider, model) pair for a streaming request.
 struct StreamAttempt {
+    circuit_breaker: Option<(Arc<CircuitBreakerRegistry>, BreakerParams)>,
+    _lease: Option<Arc<ChainLease>>,
     provider_name: Arc<str>,
     /// Refusals and the rate-limit cool-down are keyed by this
     /// ([`member_key`]), never by the display name.
@@ -2073,6 +2187,7 @@ where
         let mut last_refusal: Option<super::traits::StreamError> = None;
         let mut attempt_seq = 0_u32;
         let mut refused = RefusedCandidates::default();
+        let mut circuit_refusals = Vec::new();
 
         for (index, attempt) in attempts.iter().enumerate() {
             if refused.contains(&attempt.member_key, &attempt.model) {
@@ -2092,6 +2207,20 @@ where
             let mut rate_limited_seen = false;
 
             'candidate: loop {
+                let mut permit = match &attempt.circuit_breaker {
+                    Some((registry, params)) => match registry.admit(&attempt.member_key, *params) {
+                        Ok(permit) => permit,
+                        Err(ms) => {
+                            circuit_refusals.push(format!(
+                                "{}: {}",
+                                crate::security::redaction::redact_provider_text(&attempt.provider_name),
+                                circuit_reason(ms)
+                            ));
+                            break 'candidate;
+                        }
+                    },
+                    None => None,
+                };
                 if let Some(deferred_ms) = gate.wait_until_clear(&attempt.member_key, &attempt.provider_name).await {
                     tracing::warn!(
                         provider = %attempt.provider_name,
@@ -2099,6 +2228,14 @@ where
                         deferred_ms,
                         "Deferred behind the shared provider rate-limit cool-down"
                     );
+                }
+                if permit.as_ref().is_some_and(|permit| !permit.revalidate()) {
+                    circuit_refusals.push(format!(
+                        "{}: {}",
+                        crate::security::redaction::redact_provider_text(&attempt.provider_name),
+                        circuit_reason(0)
+                    ));
+                    break 'candidate;
                 }
                 attempt_seq = attempt_seq.saturating_add(1);
                 let attempt_started_at = chrono::Utc::now();
@@ -2121,6 +2258,7 @@ where
                     };
                     match chunk {
                         Ok(mut content) => {
+                            complete_circuit(permit.take(), BreakerOutcome::Answered);
                             if !emitted_content && rate_limited_seen {
                                 rate_limit::record_recovered(&attempt.provider_name);
                             }
@@ -2177,6 +2315,13 @@ where
                             // it fails over to the next candidate, which lowers
                             // the schema in its own dialect (D-020 Q2, D-068 (3)).
                             let tool_schema_refusal = stream_error_is_tool_schema_refusal(&err);
+                            complete_circuit(
+                                permit.take(),
+                                circuit_breaker::classify(
+                                    skips_in_place_retry(&err),
+                                    tool_schema_refusal || class != StreamFailureClass::Retryable,
+                                ),
+                            );
                             if tool_schema_refusal {
                                 refused.insert(&attempt.member_key, &attempt.model);
                             }
@@ -2341,6 +2486,7 @@ where
                 // Empty, error-free stream: treat as a transient failure and try
                 // the next candidate (parity with non-streaming "exhausted, try
                 // next"). Break the per-candidate retry loop either way.
+                complete_circuit(permit.take(), BreakerOutcome::Failure);
                 let empty_attempt = ProviderAttempt {
                     seq: attempt_seq,
                     provider: attempt.provider_name.to_string(),
@@ -2361,6 +2507,15 @@ where
         // All candidates exhausted without content. Surface the last failure
         // that was not a refusal if there was one, else the last refusal,
         // otherwise a generic aggregate failure.
+        if !circuit_refusals.is_empty() {
+            let _ = tx
+                .send(Err(super::traits::StreamError::Provider(format!(
+                    "All streaming providers/models failed; {}",
+                    circuit_refusals.join("; ")
+                ))))
+                .await;
+            return;
+        }
         let final_err = last_error.or(last_refusal).unwrap_or_else(|| {
             super::traits::StreamError::Provider("All streaming providers/models failed".to_string())
         });

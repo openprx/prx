@@ -12,6 +12,7 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod circuit_breaker;
 mod retry_and_backoff;
 mod stream_release;
 mod stream_retry;

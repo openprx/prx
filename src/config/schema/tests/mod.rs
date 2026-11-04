@@ -189,4 +189,5 @@ mod persistence;
 mod proxy;
 mod security;
 
+mod circuit_breaker;
 mod retired_router;
