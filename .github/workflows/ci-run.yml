@@ -101,7 +101,7 @@ jobs:
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-latest
-        timeout-minutes: 15
+        timeout-minutes: 45
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
@@ -113,6 +113,7 @@ jobs:
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
                   key: clippy-all-features
+                  cache-on-failure: true
             - name: Clippy, all features
               env:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
@@ -124,7 +125,7 @@ jobs:
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-latest
-        timeout-minutes: 15
+        timeout-minutes: 45
         env:
             CARGO_INCREMENTAL: "0"
             CARGO_PROFILE_TEST_DEBUG: "0"
@@ -138,7 +139,7 @@ jobs:
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
                   key: test-archive
-                  save-if: false
+                  cache-on-failure: true
             - name: Install cargo-nextest
               run: curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
             - name: Build the architecture_boundaries binary only
@@ -153,7 +154,7 @@ jobs:
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-latest
-        timeout-minutes: 20
+        timeout-minutes: 45
         outputs:
             sharded: ${{ steps.list.outputs.sharded }}
         # Test binaries are built once, here, and every shard runs a slice of
