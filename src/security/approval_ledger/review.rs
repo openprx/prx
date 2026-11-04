@@ -204,8 +204,7 @@ impl ApprovalLedger<'_> {
                 op_id,
                 risk,
             };
-            self.port
-                .store_decision_grant(scope.clone(), grant, &expected, keyring)
+            self.store_decision_grant(scope.clone(), grant, &expected, keyring)
                 .await?;
         }
         self.port.check_live_parity()?;
@@ -277,19 +276,18 @@ impl ApprovalLedger<'_> {
         let scope = scope_from_source(&approval.pending.source);
         let keyring = WitnessKeyring::global()?;
         for (grant, operation) in approval.grants.iter().zip(&record.op_ids) {
-            self.port
-                .revoke_decision_grant(
-                    scope.clone(),
-                    grant,
-                    &GrantScope {
-                        subject: &record.subject,
-                        binding: &record.binding,
-                        op_id: operation,
-                        risk: record.approval_risk()?,
-                    },
-                    keyring,
-                )
-                .await?;
+            self.revoke_decision_grant(
+                scope.clone(),
+                grant,
+                &GrantScope {
+                    subject: &record.subject,
+                    binding: &record.binding,
+                    op_id: operation,
+                    risk: record.approval_risk()?,
+                },
+                keyring,
+            )
+            .await?;
         }
         self.port.retire_pending(record);
         Ok(DecisionRevocationReceipt {

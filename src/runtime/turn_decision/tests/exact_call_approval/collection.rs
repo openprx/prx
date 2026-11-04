@@ -72,6 +72,25 @@ async fn exact_file_collection_with_recursive_budget(
     approved: bool,
     recursive_budget: RecursiveBudgetCase,
 ) {
+    exact_file_collection_with_legacy_events(edit, approved, recursive_budget, false).await;
+}
+
+pub(crate) async fn historical_approval_events() {
+    Box::pin(exact_file_collection_with_legacy_events(
+        false,
+        true,
+        RecursiveBudgetCase::Disabled,
+        true,
+    ))
+    .await;
+}
+
+async fn exact_file_collection_with_legacy_events(
+    edit: bool,
+    approved: bool,
+    recursive_budget: RecursiveBudgetCase,
+    legacy_events: bool,
+) {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().unwrap();
     let tool_name = if edit { "file_edit" } else { "file_write" };
@@ -124,7 +143,8 @@ async fn exact_file_collection_with_recursive_budget(
         },
         calls: Arc::clone(&dispatches),
     })]);
-    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let sqlite = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let memory: Arc<dyn Memory> = sqlite.clone();
     let execution = Arc::new(
         ToolExecutionService::from_shared_boxed_registry(
             Arc::clone(&registry),
@@ -321,8 +341,13 @@ async fn exact_file_collection_with_recursive_budget(
             review.get("grant_count"),
             Some(&serde_json::json!(usize::from(approved)))
         );
+        if legacy_events {
+            install_legacy_approval_events(workspace.path(), &service, sqlite.as_ref(), owner, session, id).await;
+        }
         let resume_input = serde_json::json!({"decision_id":id.to_string()}).to_string();
         if !approved {
+            assert!(service.review_pending_decision_approval(owner, session, id, true).await.is_err(), "denial cannot be replaced by approval");
+            assert!(memory.list_owned_message_events_by_type(proof.workspace_id(), owner, "approval.decision.issued", 0, 100).await.unwrap().is_empty(), "denied review must issue no durable grants");
             let (denied_resume, _) = recorded_approval_source(
                 &generation,
                 Arc::clone(&memory),
@@ -956,4 +981,97 @@ async fn fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once() {
         std::panic::resume_unwind(panic);
     }
     assert!(confirmed, "approval fixture final writer cleanup must be confirmed");
+}
+
+/// Replay the captured pre-extraction wire layouts with this genuine recorded
+/// turn's authenticated identities, clock values, ciphertext and signatures.
+/// The original input, decision rows and review remain unchanged. The ordinary
+/// resume below must load these legacy pending/issued events and claim once.
+async fn install_legacy_approval_events(
+    workspace: &std::path::Path,
+    service: &TurnDecisionService,
+    memory: &crate::memory::SqliteMemory,
+    owner: &str,
+    session: &str,
+    id: DecisionId,
+) {
+    let workspace_id = workspace.to_string_lossy();
+    let pending_key = format!("decision-approval:{id}:pending");
+    let pending_event = memory
+        .find_message_event_by_idempotency_key(&workspace_id, &pending_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(pending_event.raw_payload_json.as_deref().unwrap()).unwrap();
+    let record = &payload["record"];
+    assert!(
+        record.get("h2_origin").is_none(),
+        "the genuine Chat fixture has no H2 origin"
+    );
+    for name in ["risk", "schema_dialect", "sealed_call"] {
+        assert!(!record[name].is_null());
+    }
+    let legacy_pending = format!(
+        r#"{{"record":{{"subject":{},"binding":{},"source_event_id":{},"source_mac":{},"run_id":{},"decision_digests":{},"policy_version":{},"capabilities":{},"op_ids":{},"effect":{},"risk":{},"schema_dialect":{},"sealed_call":{},"expires_at":{}}},"mac":{}}}"#,
+        record["subject"],
+        record["binding"],
+        record["source_event_id"],
+        record["source_mac"],
+        record["run_id"],
+        record["decision_digests"],
+        record["policy_version"],
+        record["capabilities"],
+        record["op_ids"],
+        record["effect"],
+        record["risk"],
+        record["schema_dialect"],
+        record["sealed_call"],
+        record["expires_at"],
+        payload["mac"],
+    );
+    let approval = service
+        .load_reviewed_decision_approval(owner, session, id)
+        .await
+        .unwrap();
+    assert_eq!(approval.grants().len(), 1);
+    memory
+        .replace_event_payload_for_test(&pending_event.event_id, &legacy_pending)
+        .unwrap();
+    for grant in approval.grants() {
+        let issued_key = format!("decision-approval:{}:issued", grant.grant_id);
+        let event = memory
+            .find_message_event_by_idempotency_key(&workspace_id, &issued_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let issued: serde_json::Value = serde_json::from_str(event.raw_payload_json.as_deref().unwrap()).unwrap();
+        let legacy_issued = format!(
+            r#"{{"grant_id":{},"version":{},"subject":{},"issuer":{},"capability":{},"resource_constraints":{},"issued_at":{},"not_before":{},"expires_at":{},"max_uses":{},"uses_consumed":{},"witness_signature":{},"related_task_id":{},"related_message_event_id":{},"revoked_at":{},"revocation_reason":{},"decision_binding":{}}}"#,
+            issued["grant_id"],
+            issued["version"],
+            issued["subject"],
+            issued["issuer"],
+            issued["capability"],
+            issued["resource_constraints"],
+            issued["issued_at"],
+            issued["not_before"],
+            issued["expires_at"],
+            issued["max_uses"],
+            issued["uses_consumed"],
+            issued["witness_signature"],
+            issued["related_task_id"],
+            issued["related_message_event_id"],
+            issued["revoked_at"],
+            issued["revocation_reason"],
+            issued["decision_binding"],
+        );
+        memory
+            .replace_event_payload_for_test(&event.event_id, &legacy_issued)
+            .unwrap();
+    }
+    let loaded = service
+        .load_reviewed_decision_approval(owner, session, id)
+        .await
+        .unwrap();
+    assert_eq!(loaded.grants(), approval.grants());
 }

@@ -46,3 +46,13 @@ fn pending_and_review_payloads_keep_pre_extraction_bytes() {
         assert_eq!(serde_json::to_string(&review).unwrap(), expected);
     }
 }
+
+#[tokio::test]
+async fn pre_extraction_pending_and_issued_events_are_resolved_by_the_ledger() {
+    Box::pin(crate::runtime::turn_decision::historical_approval_events()).await;
+}
+
+#[tokio::test]
+async fn review_denial_blocks_issue() {
+    Box::pin(crate::runtime::turn_decision::exact_file_collection_for_review(false)).await;
+}

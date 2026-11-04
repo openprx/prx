@@ -8,18 +8,17 @@ use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskL
 use crate::causal_tree::ids::DecisionId;
 use crate::causal_tree::store::DecisionScope;
 use crate::decision::KeyDomain;
-use crate::memory::{MemoryFabric, MessageEvent, MessageEventScope};
+use crate::memory::MessageEvent;
 use crate::runtime::turn_source::TurnSourceProof;
-use crate::security::approval_ledger::keys::{ApprovalAuthority, DecisionAuthority};
 pub(crate) use crate::security::approval_ledger::pending::{
     DecisionApprovalReceipt, DecisionApprovalView, DecisionRevocationReceipt, PendingApprovalPage,
     VerifiedPendingDecisionApproval,
 };
 use crate::security::approval_ledger::pending::{PendingRecord, VerifiedDecisionApproval, scope_from_source};
-use crate::security::approval_ledger::{ApprovalLedger, ApprovalRuntime, GrantScope};
+use crate::security::approval_ledger::{ApprovalLedger, ApprovalRuntime};
 use anyhow::Context;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 
 /// A durable pending or declined collection result. Only writer/readback can construct it.
@@ -407,19 +406,32 @@ impl crate::tools::capability::execution_binding::DecisionApprovalRecorder for E
         &self,
         call: &crate::tools::capability::execution_binding::VerifiedDecisionCall,
     ) -> anyhow::Result<()> {
+        let Some((record, source)) = self
+            .service
+            .prepare_pending_execution_call(&self.context, call, self.h2_origin.as_deref())
+            .await?
+        else {
+            return Ok(());
+        };
+        let expires_at = record.expires_at;
         self.service
-            .record_pending_execution_call(&self.context, call, self.h2_origin.as_deref())
-            .await
+            .approval_ledger()
+            .persist_pending_record_receipt(record, &source)
+            .await?;
+        if let Some(owner) = self.context.recursive_allowance.get() {
+            owner.retain_pending(expires_at);
+        }
+        Ok(())
     }
 }
 
 impl TurnDecisionService {
-    async fn record_pending_execution_call(
+    async fn prepare_pending_execution_call(
         &self,
         context: &Arc<TurnDecisionContext>,
         call: &crate::tools::capability::execution_binding::VerifiedDecisionCall,
         h2_origin: Option<&crate::runtime::h2_entry::VerifiedEntryOrigin>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<(PendingRecord, MessageEvent)>> {
         use std::sync::atomic::Ordering;
         let trusted = context.engine.state.trusted.parts();
         let scope = call.scope();
@@ -487,7 +499,7 @@ impl TurnDecisionService {
                 &previous.record().binding == call.binding(),
                 "decision already awaits a different call"
             );
-            return Ok(());
+            return Ok(None);
         }
         let decision_scope = DecisionScope::Owner {
             workspace_id: self.store.workspace_id().context("approval store missing")?,
@@ -549,12 +561,7 @@ impl TurnDecisionService {
             ),
         };
         record.sealed_call = Some(self.seal_pending_call(&record, call.command())?);
-        let expires_at = record.expires_at;
-        self.persist_pending_record(record, &source).await?;
-        if let Some(owner) = context.recursive_allowance.get() {
-            owner.retain_pending(expires_at);
-        }
-        Ok(())
+        Ok(Some((record, source)))
     }
 }
 
@@ -725,22 +732,6 @@ struct ExplicitDecisionResumeRequest {
     arguments: serde_json::Value,
 }
 
-#[derive(Serialize)]
-struct ResumeIntent {
-    binding: DecisionApprovalBinding,
-    source_event_id: String,
-    source_mac: [u8; 32],
-    run_id: String,
-    policy_version: String,
-    reviewed_grants_mac: [u8; 32],
-}
-
-#[derive(Serialize)]
-struct SignedResumeIntent {
-    record: ResumeIntent,
-    mac: [u8; 32],
-}
-
 /// Fresh admitted request plus the authenticated original call. No execution
 /// permission is exposed: re-decision and final durable claim still follow.
 pub(super) struct AdmittedDecisionResume {
@@ -831,10 +822,7 @@ impl crate::tools::capability::execution_binding::DecisionResumeAdapter for Exec
         execution_context: &crate::tools::ToolExecutionContext,
     ) -> anyhow::Result<Box<dyn crate::security::decision_approval::DecisionGrantAuthority>> {
         self.verify(command, execution_context)?;
-        let claimed = self
-            .service
-            .claim_decision_resume(&self.proof, &self.context, command)
-            .await?;
+        let claimed = self.claim_decision_resume(command).await?;
         Ok(Box::new(claimed))
     }
 }
@@ -889,17 +877,18 @@ impl crate::security::decision_approval::DecisionGrantAuthority for ClaimedDecis
     }
 }
 
-impl TurnDecisionService {
+impl ExecutionResumeAdapter {
     /// Final claim for the prepared call, never for model-generated replacement
     /// arguments. The caller must place this after admission/idempotency checks
     /// and immediately before the scoped backend dispatch. A later failure burns
     /// the grant; it does not restore approval for an uncertain execution.
-    pub(super) async fn claim_decision_resume(
-        self: &Arc<Self>,
-        proof: &dyn TurnSourceProof,
-        context: &Arc<TurnDecisionContext>,
+    async fn claim_decision_resume(
+        &self,
         command: &crate::tools::ToolExecutionCommand,
     ) -> anyhow::Result<ClaimedDecisionResume> {
+        let service = &self.service;
+        let proof: &dyn TurnSourceProof = &self.proof;
+        let context = &self.context;
         use std::sync::atomic::Ordering;
         let resume = context.resume.as_ref().context("resume admission missing")?;
         let ensure_active = || -> anyhow::Result<()> {
@@ -908,7 +897,7 @@ impl TurnDecisionService {
                     && context.execution_trace.get().is_some_and(|trace| !trace.is_sealed()),
                 "resume execution is closed"
             );
-            let selected = self.agent_execution_specs(proof, context)?;
+            let selected = service.agent_execution_specs(proof, context)?;
             anyhow::ensure!(
                 matches!(context.directive, TurnExecutionDirective::Execute { .. })
                     && selected.specs.len() == 1
@@ -921,7 +910,7 @@ impl TurnDecisionService {
         ensure_active()?;
         // Reload the original pending/review/issued records and resolve the
         // operation again. This also checks that no resolution already exists.
-        let prepared = self
+        let prepared = service
             .prepare_decision_resume(
                 proof.owner_id(),
                 proof.session_key(),
@@ -939,7 +928,7 @@ impl TurnDecisionService {
         // Admission was authenticated earlier, but do not rely on an in-memory
         // source or intent if its durable record is now missing or different.
         for expected in [&resume.source, &resume.receipt] {
-            let actual = self
+            let actual = service
                 .memory
                 .find_owned_message_event(proof.workspace_id(), proof.owner_id(), &expected.event_id)
                 .await?
@@ -949,7 +938,8 @@ impl TurnDecisionService {
                 "resume durable provenance changed"
             );
         }
-        self.settlement_ref(Arc::clone(context))?
+        service
+            .settlement_ref(Arc::clone(context))?
             .validate_durable_chain()
             .await?;
         ensure_active()?;
@@ -969,7 +959,8 @@ impl TurnDecisionService {
             execution.decision_id != pending.record().binding.decision_id,
             "resume must consume under a fresh decision"
         );
-        let receipt = self
+        let receipt = service
+            .approval_ledger()
             .claim_decision_grant(
                 scope_from_source(pending.source()),
                 grant,
@@ -995,7 +986,7 @@ impl TurnDecisionService {
             grant: grant.clone(),
             execution,
             operation: operation.clone(),
-            service: Arc::clone(self),
+            service: Arc::clone(service),
             context: Arc::clone(context),
         })
     }
@@ -1057,59 +1048,21 @@ impl TurnDecisionService {
                 && crate::runtime::turn_source::recorded_input_matches(proof.surface(), &source, proof.routing_input()),
             "resume input differs from admitted source"
         );
-        let record = ResumeIntent {
-            binding: original.record().binding.clone(),
-            source_event_id: source.event_id.clone(),
-            source_mac: self.state_key.hmac(
-                KeyDomain::ApprovalState,
-                &[b"resume-source", &serde_json::to_vec(&source)?],
-            ),
-            run_id: proof.run_id().to_owned(),
-            policy_version: self.policy_version.to_string(),
-            reviewed_grants_mac: self.state_key.hmac(
-                KeyDomain::ApprovalState,
-                &[b"resume-grants", &serde_json::to_vec(prepared.approval.grants())?],
-            ),
-        };
-        let signed = SignedResumeIntent {
-            mac: self
-                .state_key
-                .hmac(KeyDomain::ApprovalState, &[b"resume", &serde_json::to_vec(&record)?]),
-            record,
-        };
-        let key = DecisionAuthority(decision_id).resume_key(source_id);
-        let expected = serde_json::to_value(&signed)?;
-        let receipt = MemoryFabric::new(self.memory.clone(), proof.workspace_id())
-            .record_runtime_event_idempotent(
-                scope_from_source(&source),
-                "approval.decision.resume_requested",
-                "decision resume request admitted",
-                Some(serde_json::to_string(&signed)?),
-                &key,
+        let durable = self
+            .approval_ledger()
+            .record_decision_resume(
+                crate::security::approval_ledger::ResumeRequestScope {
+                    decision_id,
+                    workspace: proof.workspace_id(),
+                    owner: proof.owner_id(),
+                    source_id,
+                    run_id: proof.run_id(),
+                },
+                &source,
+                &original.record().binding,
+                prepared.approval.grants(),
             )
             .await?;
-        let durable = self
-            .memory
-            .find_owned_message_event(proof.workspace_id(), proof.owner_id(), &receipt.event_id)
-            .await?
-            .context("resume admission receipt is not durable")?;
-        anyhow::ensure!(
-            durable.id > 0
-                && durable.event_type == "approval.decision.resume_requested"
-                && durable.idempotency_key.as_deref() == Some(key.as_str())
-                && durable.session_key == source.session_key
-                && durable.run_id == source.run_id
-                && durable.causation_event_id.as_deref() == Some(source_id)
-                && serde_json::to_value(&durable)? == serde_json::to_value(&receipt)?
-                && serde_json::from_str::<serde_json::Value>(
-                    durable
-                        .raw_payload_json
-                        .as_deref()
-                        .context("resume receipt payload missing")?
-                )? == expected,
-            "resume admission receipt conflicts with source"
-        );
-        self.check_live_parity()?;
         let now = Utc::now();
         anyhow::ensure!(
             original.record().expires_at > now
@@ -1246,7 +1199,7 @@ impl AdmittedDecisionResume {
 }
 
 impl TurnDecisionService {
-    fn approval_ledger(&self) -> ApprovalLedger<'_> {
+    pub(super) fn approval_ledger(&self) -> ApprovalLedger<'_> {
         ApprovalLedger {
             memory: &self.memory,
             state_key: &self.state_key,
@@ -1285,49 +1238,7 @@ impl ApprovalRuntime for TurnDecisionService {
     ) -> anyhow::Result<()> {
         Self::verify_h2_review_requirement(self, pending, approved, stamp)
     }
-    async fn store_decision_grant(
-        &self,
-        scope: MessageEventScope,
-        grant: &crate::acl::approval_grant::ApprovalGrantV2,
-        expected: &GrantScope<'_>,
-        keyring: &crate::acl::approval_grant::WitnessKeyring,
-    ) -> anyhow::Result<()> {
-        Self::store_decision_grant(
-            self,
-            scope,
-            grant,
-            &super::approval::DecisionGrantScope {
-                subject: expected.subject,
-                binding: expected.binding,
-                op_id: expected.op_id,
-                risk: expected.risk,
-            },
-            keyring,
-        )
-        .await
-    }
-    async fn revoke_decision_grant(
-        &self,
-        scope: MessageEventScope,
-        grant: &crate::acl::approval_grant::ApprovalGrantV2,
-        expected: &GrantScope<'_>,
-        keyring: &crate::acl::approval_grant::WitnessKeyring,
-    ) -> anyhow::Result<()> {
-        Self::revoke_decision_grant(
-            self,
-            scope,
-            grant,
-            &super::approval::DecisionGrantScope {
-                subject: expected.subject,
-                binding: expected.binding,
-                op_id: expected.op_id,
-                risk: expected.risk,
-            },
-            keyring,
-        )
-        .await
-        .map(|_| ())
-    }
+
     fn retire_pending(&self, record: &PendingRecord) {
         self.recursive_allowances.retire_pending(
             &record.subject.workspace_id,

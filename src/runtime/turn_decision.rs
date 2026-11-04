@@ -3632,3 +3632,6 @@ fn selected_custom_memory_read_scope(
 
 #[cfg(test)]
 mod selected_custom_memory_scope_tests;
+
+#[cfg(test)]
+pub(crate) use tests::exact_call_approval::collection::{exact_file_collection_for_review, historical_approval_events};

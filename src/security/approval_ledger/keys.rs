@@ -29,3 +29,11 @@ impl ApprovalAuthority for DecisionAuthority {
         format!("decision-approval:{grant_id}:issued")
     }
 }
+
+pub(crate) fn decision_resolution_key(
+    binding: &crate::acl::approval_grant::DecisionApprovalBinding,
+    op_id: &str,
+) -> String {
+    let operation = hex::encode(Sha256::digest(op_id.as_bytes()));
+    format!("decision-approval:{}:{operation}:resolution", binding.decision_id)
+}

@@ -1,16 +1,20 @@
 //! Durable approval lifecycle over the existing MemoryFabric event ledger.
 //! Runtime admission checks remain in the adapter; persisted authentication,
 //! review arbitration and metadata reads belong here.
+mod grant;
 pub(crate) mod keys;
 pub(crate) mod pending;
+pub(crate) mod resolution;
+mod resume;
+pub(crate) use resume::ResumeRequestScope;
 mod review;
 #[cfg(test)]
 mod tests;
 
-use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject, WitnessKeyring};
+use crate::acl::approval_grant::{DecisionApprovalBinding, RiskLevel, Subject};
 use crate::causal_tree::store::CausalDecisionStore;
 use crate::decision::DecisionKey;
-use crate::memory::{Memory, MessageEventScope};
+use crate::memory::Memory;
 use pending::{PendingRecord, VerifiedPendingDecisionApproval};
 use std::sync::Arc;
 
@@ -21,7 +25,7 @@ pub(crate) struct GrantScope<'a> {
     pub(crate) risk: RiskLevel,
 }
 
-/// Runtime-only checks and grant writers retained until the second round.
+/// Runtime admission checks remain outside the durable storage lifecycle.
 #[async_trait::async_trait]
 pub(crate) trait ApprovalRuntime: Send + Sync {
     fn check_live_parity(&self) -> anyhow::Result<()>;
@@ -39,20 +43,7 @@ pub(crate) trait ApprovalRuntime: Send + Sync {
         approved: bool,
         stamp: Option<&crate::runtime::h2_entry::LocalOwnerReviewStamp>,
     ) -> anyhow::Result<()>;
-    async fn store_decision_grant(
-        &self,
-        scope: MessageEventScope,
-        grant: &ApprovalGrantV2,
-        expected: &GrantScope<'_>,
-        keyring: &WitnessKeyring,
-    ) -> anyhow::Result<()>;
-    async fn revoke_decision_grant(
-        &self,
-        scope: MessageEventScope,
-        grant: &ApprovalGrantV2,
-        expected: &GrantScope<'_>,
-        keyring: &WitnessKeyring,
-    ) -> anyhow::Result<()>;
+
     fn retire_pending(&self, record: &PendingRecord);
 }
 
