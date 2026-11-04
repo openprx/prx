@@ -60,7 +60,16 @@ set -euo pipefail
 
 real_home="${HOME:?HOME must be set}"
 case "${PRX_GUARD_SUBCOMMAND:-test}" in
-test) test_cmd=(test); build_first=1 ;;
+test)
+    test_cmd=(test); build_first=1
+    # Cargo rejects --doc with --no-run; compile and run under the test guard.
+    for arg in "$@"; do
+        if [ "$arg" = --doc ]; then
+            build_first=0
+            break
+        fi
+    done
+    ;;
 nextest) test_cmd=(nextest run); build_first=0 ;;
 exec) test_cmd=(); build_first=0 ;;
 *)

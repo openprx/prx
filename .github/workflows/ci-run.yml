@@ -98,14 +98,15 @@ jobs:
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
-        timeout-minutes: ${{ fromJSON(needs.changes.outputs.heavy_timeout) }}
+        # r5 QA cap: measure, then lower (hosted fallback unchanged).
+        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 25 }}
         env:
             CARGO_BUILD_JOBS: "4"
             CARGO_INCREMENTAL: "0"
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', runner.name) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
@@ -133,7 +134,7 @@ jobs:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
               run: ./scripts/ci/rust_strict_delta_gate.sh
             - name: Install cargo-machete
-              run: cargo install cargo-machete --locked
+              run: command -v cargo-machete >/dev/null || cargo install cargo-machete --locked
             - name: Run unused dependency gate
               run: cargo machete
             - name: Clean guard home
@@ -145,14 +146,15 @@ jobs:
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
-        timeout-minutes: ${{ fromJSON(needs.changes.outputs.heavy_timeout) }}
+        # r5 QA cap: measure, then lower (hosted fallback unchanged).
+        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 25 }}
         env:
             CARGO_BUILD_JOBS: "4"
             CARGO_INCREMENTAL: "0"
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', runner.name) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
@@ -195,7 +197,7 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', runner.name) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
@@ -248,8 +250,8 @@ jobs:
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
-        # One-release QA cold-build exception: 20 minutes (hosted fallback: 45).
-        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 20 }}
+        # r5 QA cap: measure, then lower (hosted fallback unchanged).
+        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 25 }}
         strategy:
             fail-fast: false
             matrix:
@@ -267,7 +269,7 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', runner.name) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}{1}', github.job, matrix.name && format('-{0}', matrix.name) || '') }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
@@ -287,7 +289,7 @@ jobs:
                   shared-key: test-archive-${{ matrix.name }}
                   cache-on-failure: true
             - name: Install cargo-nextest
-              run: curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
+              run: command -v cargo-nextest >/dev/null || curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
             - name: Build the test archive
               run: cargo nextest archive --locked --all-features ${{ matrix.targets }} --archive-file prx-tests-${{ matrix.name }}.tar.zst
             - name: List every test (the sharded runs must add up to this)
@@ -338,7 +340,7 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', runner.name) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
@@ -353,7 +355,7 @@ jobs:
               with:
                   toolchain: 1.99.0
             - name: Install cargo-nextest
-              run: curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
+              run: command -v cargo-nextest >/dev/null || curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
             - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
               with:
                   name: prx-tests-${{ matrix.archive }}
@@ -437,7 +439,7 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', runner.name) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
@@ -500,7 +502,7 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', runner.name) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
