@@ -522,6 +522,12 @@
         "api_keys": [],
         "channel_initial_backoff_secs": 2,
         "channel_max_backoff_secs": 60,
+        "circuit_breaker": {
+          "enabled": true,
+          "failure_threshold": 5,
+          "max_open_secs": 300,
+          "open_secs": 30
+        },
         "fallback_providers": [],
         "model_fallbacks": {},
         "provider_backoff_ms": 500,
@@ -4640,6 +4646,38 @@
         }
       }
     },
+    "ReliabilityCircuitBreakerConfig": {
+      "description": "Process-local provider circuit policy (`[reliability.circuit_breaker]`).",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Enable protection for factory-built provider chains.",
+          "type": "boolean",
+          "default": true
+        },
+        "failure_threshold": {
+          "description": "Consecutive transient failures that open a circuit (at least 1).",
+          "type": "integer",
+          "format": "uint32",
+          "default": 5,
+          "minimum": 0
+        },
+        "max_open_secs": {
+          "description": "Maximum doubled window, between open_secs and 3600 seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 300,
+          "minimum": 0
+        },
+        "open_secs": {
+          "description": "Initial open window in seconds (at least 1).",
+          "type": "integer",
+          "format": "uint64",
+          "default": 30,
+          "minimum": 0
+        }
+      }
+    },
     "ReliabilityConfig": {
       "description": "Reliability and supervision configuration (`[reliability]` section).\n\nControls provider retries, fallback chains, API key rotation, and channel restart backoff.",
       "type": "object",
@@ -4670,6 +4708,16 @@
           "format": "uint64",
           "default": 60,
           "minimum": 0
+        },
+        "circuit_breaker": {
+          "description": "Per-provider consecutive failure protection.",
+          "$ref": "#/$defs/ReliabilityCircuitBreakerConfig",
+          "default": {
+            "enabled": true,
+            "failure_threshold": 5,
+            "max_open_secs": 300,
+            "open_secs": 30
+          }
         },
         "fallback_providers": {
           "description": "Fallback provider chain (e.g. `[\"anthropic\", \"openai\"]`).",
