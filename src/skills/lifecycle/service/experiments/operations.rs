@@ -82,6 +82,13 @@ impl SkillsLifecycleService {
     }
     pub(crate) fn experiment_qualified(&self, journal: &ExperimentJournal) -> Result<bool> {
         if !journal.state.qualified(&journal.plan) {
+            #[cfg(test)]
+            eprintln!(
+                "R2 experiment_qualified false branch=state-qualified; state={:?}; committed={:?}; resources={:?}",
+                journal.state,
+                journal.state.committed(&journal.plan),
+                journal.plan.spec().resources
+            );
             return Ok(false);
         }
         let mut splits = std::collections::BTreeMap::new();
@@ -119,20 +126,37 @@ impl SkillsLifecycleService {
                 }
             }
             if !matched {
+                #[cfg(test)]
+                eprintln!(
+                    "R2 experiment_qualified false branch=unmatched-verifier stage={}; state={:?}",
+                    stage.id, journal.state
+                );
                 return Ok(false);
             }
         }
         let pins = &journal.plan.spec().pins;
         if !splits.contains_key(&pins.verification_split) {
+            #[cfg(test)]
+            eprintln!(
+                "R2 experiment_qualified false branch=missing-verification-split; splits={splits:?}; state={:?}",
+                journal.state
+            );
             return Ok(false);
         }
         if pins.holdout_split_digest.is_some() {
             let validation = splits.get(&EvalSplit::Validation).and_then(Option::as_ref);
             let holdout = splits.get(&EvalSplit::Holdout).and_then(Option::as_ref);
             if validation.is_none() || validation != holdout {
+                #[cfg(test)]
+                eprintln!(
+                    "R2 experiment_qualified false branch=holdout-binding; validation={validation:?}; holdout={holdout:?}; state={:?}",
+                    journal.state
+                );
                 return Ok(false);
             }
         }
+        #[cfg(test)]
+        eprintln!("R2 experiment_qualified true; state={:?}", journal.state);
         Ok(true)
     }
     pub(super) fn validate_stage_operation(
