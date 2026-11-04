@@ -125,31 +125,35 @@ jobs:
         needs: [changes]
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-latest
-        timeout-minutes: 45
-        env:
-            CARGO_INCREMENTAL: "0"
-            CARGO_PROFILE_TEST_DEBUG: "0"
-            CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
-            CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
+        timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.99.0
-            - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-              with:
-                  shared-key: test-archive-rest
-                  cache-on-failure: true
-            # One libtest process on purpose: the scanners memoize file text
-            # process-wide, so one process per test (nextest) is twice as slow.
+            # 252 source scanners that need no crate code: built on their own,
+            # optimized (4 s build, 26 s run; 10 minutes and over 60 s per probe
+            # when built unoptimized with the crate). `retired_feature` needs the
+            # crate and runs in a test shard.
+            - name: Build the architecture_boundaries binary
+              run: scripts/ci/build_architecture_boundaries.sh "$PWD/architecture-boundaries"
             - name: Run architecture_boundaries (guard home, loopback-only network, no test over 60 s)
+              env:
+                  PRX_GUARD_SUBCOMMAND: exec
               run: |
                   set -o pipefail
-                  python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh --locked --all-features --test architecture_boundaries 2>&1 | tee arch.log
+                  python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh "$PWD/architecture-boundaries" 2>&1 | tee arch.log
                   if grep -q 'has been running for over 60 seconds' arch.log; then
                       echo "a test exceeded the 60 s budget" >&2
                       exit 1
                   fi
+                  sed -nE 's/^test result: ok\. ([0-9]+) passed.*/\1/p' arch.log | tail -1 > executed.txt
+                  test -s executed.txt
+            - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: arch-executed
+                  path: executed.txt
+                  retention-days: 1
 
     # The crate is one huge package: its 10k-test lib test binary is a single
     # rustc that, built next to the other test binaries on a 16 GiB runner, got
@@ -192,9 +196,10 @@ jobs:
             - name: List every test (the sharded runs must add up to this)
               run: |
                   set -euo pipefail
-                  cargo nextest list --locked --all-features --archive-file prx-tests-${{ matrix.name }}.tar.zst --workspace-remap "$GITHUB_WORKSPACE" --message-format json > list.json
+                  cargo nextest list --archive-file prx-tests-${{ matrix.name }}.tar.zst --workspace-remap "$GITHUB_WORKSPACE" --message-format json > list.json
                   python3 scripts/ci/nextest_test_count.py list.json | tee count.txt
                   sed -n 's/^sharded=//p' count.txt > sharded.txt
+                  sed -n 's/^architecture=//p' count.txt > architecture.txt
             - name: Run doc-tests (guard home, loopback-only network)
               if: matrix.name == 'rest'
               run: python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh --locked --all-features --doc
@@ -207,7 +212,9 @@ jobs:
             - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
               with:
                   name: sharded-${{ matrix.name }}
-                  path: sharded.txt
+                  path: |
+                      sharded.txt
+                      architecture.txt
                   retention-days: 1
 
     test-shard:
@@ -243,14 +250,14 @@ jobs:
                   python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh \
                       --archive-file prx-tests-${{ matrix.archive }}.tar.zst --workspace-remap "$GITHUB_WORKSPACE" \
                       --profile ci --no-fail-fast \
-                      -E 'not binary(architecture_boundaries)' \
+                      -E 'not (binary(architecture_boundaries) and not test(/^retired_feature::/))' \
                       --partition hash:${{ matrix.part }} 2>&1 | tee shard.log
             - name: Executed count must equal the shard's share of `nextest list`
               run: |
                   set -euo pipefail
                   executed="$(sed 's/\x1b\[[0-9;]*m//g' shard.log | sed -nE 's/.*Summary.* ([0-9]+) tests? run.*/\1/p' | tail -1)"
                   cargo nextest list --archive-file prx-tests-${{ matrix.archive }}.tar.zst --workspace-remap "$GITHUB_WORKSPACE" \
-                      -E 'not binary(architecture_boundaries)' --partition hash:${{ matrix.part }} \
+                      -E 'not (binary(architecture_boundaries) and not test(/^retired_feature::/))' --partition hash:${{ matrix.part }} \
                       --message-format json > shard-list.json
                   expected="$(python3 scripts/ci/nextest_test_count.py shard-list.json | sed -n 's/^sharded=//p')"
                   echo "shard ${{ matrix.name }} (${{ matrix.part }}): executed=$executed listed=$expected"
@@ -281,6 +288,15 @@ jobs:
               with:
                   pattern: sharded-*
                   path: sharded
+            - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+              with:
+                  name: arch-executed
+                  path: arch
+            - name: The architecture job ran exactly the architecture tests nextest lists
+              run: |
+                  listed="$(cat sharded/*/architecture.txt | paste -sd+ - | bc)"
+                  echo "architecture executed=$(cat arch/executed.txt), listed=$listed"
+                  [ "$(cat arch/executed.txt)" = "$listed" ]
             - name: The shards together ran exactly what nextest lists
               run: |
                   executed="$(cat executed/*/executed.txt | paste -sd+ - | bc)"

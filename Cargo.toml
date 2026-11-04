@@ -307,6 +307,8 @@ tokio = { version = "1.53.3", features = ["test-util"] }
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "deny"
+# Set only by scripts/ci/build_architecture_boundaries.sh.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(arch_standalone)"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
