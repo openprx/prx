@@ -138,16 +138,18 @@ jobs:
                   toolchain: 1.99.0
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
-                  key: test-archive
+                  shared-key: test-archive
                   cache-on-failure: true
-            - name: Install cargo-nextest
-              run: curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
-            - name: Build the architecture_boundaries binary only
-              run: cargo nextest archive --locked --all-features --test architecture_boundaries --archive-file arch.tar.zst
-            - name: Run architecture_boundaries (guard home, loopback-only network, 60 s per test)
-              env:
-                  PRX_GUARD_SUBCOMMAND: nextest
-              run: python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh --archive-file arch.tar.zst --workspace-remap "$GITHUB_WORKSPACE" --profile ci --no-fail-fast
+            # One libtest process on purpose: the scanners memoize file text
+            # process-wide, so one process per test (nextest) is twice as slow.
+            - name: Run architecture_boundaries (guard home, loopback-only network, no test over 60 s)
+              run: |
+                  set -o pipefail
+                  python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh --locked --all-features --test architecture_boundaries 2>&1 | tee arch.log
+                  if grep -q 'has been running for over 60 seconds' arch.log; then
+                      echo "a test exceeded the 60 s budget" >&2
+                      exit 1
+                  fi
 
     test-build:
         name: Test Build (archive)
@@ -161,6 +163,9 @@ jobs:
         # the archive. Debuginfo stays off (full-debug test linking exhausted
         # 16 GiB before); dependencies are optimized by [profile.dev.package."*"].
         env:
+            # The run before this was killed (SIGTERM, no message) while linking
+            # many test binaries at full parallelism: bound the build.
+            CARGO_BUILD_JOBS: "2"
             CARGO_INCREMENTAL: "0"
             CARGO_PROFILE_TEST_DEBUG: "0"
             CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
@@ -172,7 +177,7 @@ jobs:
                   toolchain: 1.99.0
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
               with:
-                  key: test-archive
+                  shared-key: test-archive
                   cache-on-failure: true
             - name: Install cargo-nextest
               run: curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
