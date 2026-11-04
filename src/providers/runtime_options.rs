@@ -467,6 +467,20 @@ max_context = 16384"#,
             factory_request_num_ctx(&config, "llama3.2:latest").await,
             "row-ID settings still beat a tagged legacy router window"
         );
+        config.model_settings.insert(
+            "ollama/llama3.2:latest".into(),
+            crate::config::model_settings::ModelSettings::default(),
+        );
+        assert_eq!(
+            window(&config, "llama3.2:latest"),
+            32_768,
+            "an exact entry without a window does not hide the row-ID window"
+        );
+        assert_eq!(
+            window(&config, "llama3.2:latest"),
+            factory_request_num_ctx(&config, "llama3.2:latest").await,
+            "an empty exact entry preserves factory and resolver agreement"
+        );
     }
 
     #[tokio::test]

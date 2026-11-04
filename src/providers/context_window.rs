@@ -35,12 +35,14 @@ pub fn model_settings_window_key(
         identity.catalog_name().unwrap_or_else(|| provider.trim()),
         model
     );
-    if settings.contains_key(&exact) {
+    if settings.get(&exact).is_some_and(|entry| entry.context_window.is_some()) {
         return exact;
     }
     if let Ok(release) = catalog.release_catalog()
         && let Some(row) = release.model(&identity, model)
-        && settings.contains_key(&row.id)
+        && settings
+            .get(&row.id)
+            .is_some_and(|entry| entry.context_window.is_some())
     {
         return row.id.clone();
     }
