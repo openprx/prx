@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 
+# One clippy pass per feature set replaces the former two passes (correctness
+# gate, then strict delta gate): `-D clippy::correctness` makes correctness
+# lints and compile errors errors everywhere, and every other diagnostic stays a
+# warning that blocks only when it lands on a changed line. The result is the
+# union of both former gates. Extra cargo arguments (for example
+# `--all-features`) come from CLIPPY_CARGO_ARGS.
+
 set -euo pipefail
 
+CLIPPY_CARGO_ARGS="${CLIPPY_CARGO_ARGS:-}"
 BASE_SHA="${BASE_SHA:-}"
 RUST_FILES_RAW="${RUST_FILES:-}"
 
@@ -30,24 +38,15 @@ while IFS= read -r file; do
     fi
 done < <(printf '%s\n' "$RUST_FILES_RAW")
 
-if [ "${#ALL_FILES[@]}" -eq 0 ]; then
-    echo "No Rust source files changed; skipping strict delta gate."
-    exit 0
-fi
 
 EXISTING_FILES=()
-for file in "${ALL_FILES[@]}"; do
+for file in ${ALL_FILES[@]+"${ALL_FILES[@]}"}; do
     if [ -f "$file" ]; then
         EXISTING_FILES+=("$file")
     fi
 done
 
-if [ "${#EXISTING_FILES[@]}" -eq 0 ]; then
-    echo "No existing changed Rust files to lint; skipping strict delta gate."
-    exit 0
-fi
-
-echo "Strict delta linting changed Rust files: ${EXISTING_FILES[*]}"
+echo "Strict delta linting changed Rust files: ${EXISTING_FILES[*]:-none}"
 
 CHANGED_LINES_JSON_FILE="$(mktemp)"
 CLIPPY_JSON_FILE="$(mktemp)"
@@ -55,7 +54,7 @@ CLIPPY_STDERR_FILE="$(mktemp)"
 FILTERED_OUTPUT_FILE="$(mktemp)"
 trap 'rm -f "$CHANGED_LINES_JSON_FILE" "$CLIPPY_JSON_FILE" "$CLIPPY_STDERR_FILE" "$FILTERED_OUTPUT_FILE"' EXIT
 
-python3 - "$BASE_SHA" "${EXISTING_FILES[@]}" >"$CHANGED_LINES_JSON_FILE" <<'PY'
+python3 - "$BASE_SHA" ${EXISTING_FILES[@]+"${EXISTING_FILES[@]}"} >"$CHANGED_LINES_JSON_FILE" <<'PY'
 import json
 import re
 import subprocess
@@ -88,23 +87,20 @@ print(json.dumps(changed))
 PY
 
 set +e
-cargo clippy --quiet --locked --all-targets --message-format=json -- -D warnings >"$CLIPPY_JSON_FILE" 2>"$CLIPPY_STDERR_FILE"
+# shellcheck disable=SC2086
+cargo clippy --quiet --locked --all-targets $CLIPPY_CARGO_ARGS --message-format=json -- -D clippy::correctness >"$CLIPPY_JSON_FILE" 2>"$CLIPPY_STDERR_FILE"
 CLIPPY_EXIT=$?
 set -e
 
-if [ "$CLIPPY_EXIT" -eq 0 ]; then
-    echo "Strict delta gate passed: no strict warnings/errors." 
-    exit 0
-fi
-
 set +e
-python3 - "$CLIPPY_JSON_FILE" "$CHANGED_LINES_JSON_FILE" >"$FILTERED_OUTPUT_FILE" <<'PY'
+python3 - "$CLIPPY_JSON_FILE" "$CHANGED_LINES_JSON_FILE" "$CLIPPY_EXIT" >"$FILTERED_OUTPUT_FILE" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 messages_file = sys.argv[1]
 changed_file = sys.argv[2]
+clippy_exit = int(sys.argv[3])
 
 with open(changed_file, "r", encoding="utf-8") as f:
     changed = json.load(f)
@@ -186,7 +182,7 @@ with open(messages_file, "r", encoding="utf-8", errors="ignore") as f:
 
         entry = f"{best_path}:{best_line} {level.upper()} {code or '-'} {text}"
         classified_count += 1
-        if is_changed_line:
+        if is_changed_line or level == "error":
             blocking.append(entry)
         else:
             baseline.append(entry)
@@ -203,7 +199,7 @@ if blocking:
     print(f"Blocking strict lint issues: {len(blocking)}")
     sys.exit(1)
 
-if classified_count > 0:
+if classified_count > 0 or clippy_exit == 0:
     print("No blocking strict lint issues on changed Rust lines.")
     sys.exit(0)
 

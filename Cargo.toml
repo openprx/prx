@@ -259,6 +259,12 @@ terminal-tui = ["dep:ratatui", "dep:syntect", "dep:unicode-width", "dep:portable
 # Implementation: src/providers/router.rs + src/providers/mod.rs (factory match).
 test-mock = []
 
+# Dependencies only: crypto, SQLite, wasmtime and parser crates run orders of
+# magnitude faster when optimized, while workspace code keeps opt-level 0 for
+# fast incremental rebuilds (FASTCI-02).
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = "thin"         # Lower memory use during release builds
