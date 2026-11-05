@@ -1,9 +1,10 @@
 //! Workspace-scoped counters observe real access sites without cross-test races.
+use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, LazyLock, Mutex, Weak,
+        Arc, LazyLock, Weak,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -20,10 +21,7 @@ pub(crate) struct AccessSpy {
 impl AccessSpy {
     pub fn new(workspace: &Path) -> Self {
         let counts = Arc::new(AccessCounts::default());
-        SPIES
-            .lock()
-            .unwrap()
-            .insert(workspace.to_owned(), Arc::downgrade(&counts));
+        SPIES.lock().insert(workspace.to_owned(), Arc::downgrade(&counts));
         Self {
             workspace: workspace.to_owned(),
             counts,
@@ -32,11 +30,12 @@ impl AccessSpy {
 }
 impl Drop for AccessSpy {
     fn drop(&mut self) {
-        SPIES.lock().unwrap().remove(&self.workspace);
+        SPIES.lock().remove(&self.workspace);
     }
 }
 pub(crate) fn record(workspace: &Path, credential: bool) {
-    if let Some(counts) = SPIES.lock().unwrap().get(workspace).and_then(Weak::upgrade) {
+    let counts = SPIES.lock().get(workspace).and_then(Weak::upgrade);
+    if let Some(counts) = counts {
         let counter = if credential {
             &counts.credentials
         } else {

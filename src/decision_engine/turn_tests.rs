@@ -547,14 +547,22 @@ async fn pre_mode_brief_is_bounded_redacted_deterministic_and_traced() {
     let system_messages = messages
         .iter()
         .enumerate()
-        .filter(|(_, message)| message["role"] == "system")
+        .filter(|(_, message)| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
         .collect::<Vec<_>>();
     assert_eq!(system_messages.len(), 1);
-    assert_eq!(system_messages[0].0, 0);
-    let system = system_messages[0].1["content"].as_str().unwrap();
+    let (system_index, system_message) = system_messages
+        .get(0)
+        .expect("pre_mode_brief_is_bounded_redacted_deterministic_and_traced: leading system message missing");
+    assert_eq!(*system_index, 0);
+    let system = system_message
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .expect("pre_mode_brief_is_bounded_redacted_deterministic_and_traced: system content missing");
     let expected_brief = render::render_decision_brief(&long_analysis(), 50, enabled(DecisionMode::Pre).candidates);
     assert!(system.ends_with(&expected_brief));
-    let brief = &system[system.len() - expected_brief.len()..];
+    let brief = system
+        .get(system.len() - expected_brief.len()..)
+        .expect("pre_mode_brief_is_bounded_redacted_deterministic_and_traced: brief suffix missing");
     assert!(crate::agent::context_budget::count_tokens(brief) <= 50);
     assert!(!brief.contains("sk-test-private-credential-value"));
     assert_eq!(first.requests, second.requests);
@@ -714,11 +722,19 @@ fn render_top_k_uses_highest_expected_gain() {
 #[tokio::test]
 async fn pre_and_both_preserve_disabled_serving_tools_and_fingerprint() {
     let disabled = exercise(None, None).await;
-    let baseline = &disabled.requests[0]["tools"];
+    let baseline = disabled
+        .requests
+        .get(0)
+        .and_then(|request| request.get("tools"))
+        .expect("pre_and_both_preserve_disabled_serving_tools_and_fingerprint: disabled tools missing");
     assert!(baseline.is_array());
     for mode in [DecisionMode::Pre, DecisionMode::Both] {
         let enabled = exercise(Some(enabled(mode)), Some(long_analysis())).await;
-        let tools = &enabled.requests[0]["tools"];
+        let tools = enabled
+            .requests
+            .get(0)
+            .and_then(|request| request.get("tools"))
+            .expect("pre_and_both_preserve_disabled_serving_tools_and_fingerprint: enabled tools missing");
         assert_eq!(tools, baseline);
         assert_eq!(
             crate::agent::prompt::prompt_sha256(&tools.to_string()),
