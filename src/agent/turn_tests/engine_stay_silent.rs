@@ -24,6 +24,7 @@ async fn run_without_tools(
     let outcome = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "terminal",
             scope: None,
             mode: ChatMode::default(),
@@ -77,6 +78,7 @@ async fn run_without_tools_configured_answer(
     let outcome = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "terminal",
             scope: None,
             mode: ChatMode::default(),
@@ -231,6 +233,7 @@ async fn empty_response_retry_keeps_one_leading_system_message_unchanged() {
             let result = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "cli",
                     scope: None,
                     mode: ChatMode::default(),
@@ -406,6 +409,7 @@ async fn fabricated_tool_marker_without_tool_execution_retries_once() {
             let (outcome, _trace) = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "terminal",
                     scope: None,
                     mode: ChatMode::default(),
@@ -544,6 +548,7 @@ async fn marker_after_a_real_tool_batch_is_stripped_without_a_retry() {
                         let (outcome, _trace) = run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -682,6 +687,7 @@ async fn a_marker_written_beside_real_tool_calls_never_reaches_history() {
                         let (outcome, _trace) = run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -821,6 +827,7 @@ async fn a_batch_whose_calls_all_failed_still_buys_the_corrective_retry() {
                         let (outcome, _trace) = run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -906,6 +913,7 @@ async fn an_inline_fabricated_marker_without_tool_execution_retries_once_then_is
         let (outcome, _trace) = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "terminal",
                 scope: None,
                 mode: ChatMode::default(),
@@ -984,6 +992,7 @@ async fn an_inline_marker_is_stripped_before_it_can_be_streamed() {
             let (outcome, _trace) = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "terminal",
                     scope: None,
                     mode: ChatMode::default(),
@@ -1092,6 +1101,7 @@ async fn a_denied_only_batch_followed_by_an_inline_marker_still_retries() {
         let (outcome, _trace) = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -1206,6 +1216,7 @@ async fn an_inline_marker_beside_real_tool_calls_is_stripped_without_a_retry() {
                         let (outcome, _trace) = run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -1373,6 +1384,7 @@ async fn a_marker_after_a_mixed_fence_block_retries_once_then_is_stripped() {
             let (outcome, _trace) = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "terminal",
                     scope: None,
                     mode: ChatMode::default(),
@@ -1466,6 +1478,7 @@ async fn a_marker_inside_a_long_fence_block_is_neither_retried_nor_edited() {
             let (outcome, _trace) = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "terminal",
                     scope: None,
                     mode: ChatMode::default(),
@@ -1537,6 +1550,7 @@ async fn run_with_response(response: &str, expose: bool) -> (ToolLoopOutcome, Ve
     let (outcome, _trace) = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "telegram",
             scope: None,
             mode: ChatMode::default(),
@@ -1641,6 +1655,7 @@ async fn stay_silent_not_honored_when_not_exposed() {
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "telegram",
                 scope: None,
                 mode: ChatMode::default(),

@@ -133,6 +133,7 @@ pub(crate) async fn collect_approval_arguments(
         || response.final_model != request.model;
     let reported = response.tokens_used.is_reported() && response.tokens_used.has_any_tokens();
     let trace = ToolLoopTrace {
+        decision_brief_sha256: None,
         prepared_parameters: parameters.snapshot(),
         final_provider: Some(response.final_provider),
         final_model: Some(response.final_model),

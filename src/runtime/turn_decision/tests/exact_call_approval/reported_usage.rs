@@ -130,6 +130,7 @@ async fn exercise_owned(f: &Fixture<'_>) {
     let (outcome, trace) = Box::pin(crate::agent::turn_engine::run_turn(
         &mut history,
         TurnRequest {
+            advice: None,
             channel_name: f.proof.policy_channel(),
             scope: None,
             mode: ChatMode::Edit,

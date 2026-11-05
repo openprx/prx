@@ -480,6 +480,7 @@ async fn a_corrective_retry_round_does_not_move_the_system_prefix() {
             let (outcome, _trace) = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "terminal",
                     scope: None,
                     mode: ChatMode::default(),
@@ -733,6 +734,7 @@ async fn cache_metrics_turn(
     let result = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "terminal",
             scope,
             mode: ChatMode::default(),

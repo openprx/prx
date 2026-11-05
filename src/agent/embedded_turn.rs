@@ -513,6 +513,7 @@ async fn run_work(
         .run(crate::agent::turn_engine::run_turn(
             &mut history.wire,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "agent_api",
                 scope: None,
                 mode: crate::agent::turn_contracts::ChatMode::default(),

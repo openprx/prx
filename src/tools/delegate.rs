@@ -1533,6 +1533,7 @@ impl DelegateLoopResources {
             .run(crate::agent::turn_engine::run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "delegate",
                     scope: Some(&scope_ctx),
                     mode: crate::agent::turn_contracts::ChatMode::default(),
@@ -3205,6 +3206,7 @@ mod tests {
                         crate::agent::turn_engine::run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "agent",
                                 scope: None,
                                 mode: Default::default(),

@@ -2513,6 +2513,7 @@ async fn drive_start_turn_stream(
     let work = crate::agent::turn_engine::run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: binding.decision_advice(),
             channel_name: "terminal",
             scope: None,
             mode: chat_mode,

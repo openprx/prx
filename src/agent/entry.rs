@@ -2002,6 +2002,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -2496,6 +2497,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),

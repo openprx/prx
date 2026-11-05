@@ -1188,6 +1188,7 @@ pub(super) async fn run_channel_turn(
                             crate::agent::turn_engine::run_turn(
                                 &mut history,
                                 crate::agent::turn_request::TurnRequest {
+                                    advice: None,
                                     channel_name: msg.channel.as_str(),
                                     scope: Some(&scope_ctx),
                                     mode: crate::agent::turn_contracts::ChatMode::default(),

@@ -1423,6 +1423,7 @@ mod tests {
             let result = boxed_terminal_fixture_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "cli",
                     scope: None,
                     mode: Default::default(),

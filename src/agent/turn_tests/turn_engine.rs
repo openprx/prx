@@ -457,6 +457,7 @@ async fn a_corrective_aside_stays_attributable_when_the_model_echoes_it() {
                         let result = run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -761,6 +762,7 @@ async fn run_tool_call_loop_native_mode_persists_each_tool_output_once() {
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -1024,6 +1026,7 @@ async fn run_tool_call_loop_aggregates_intermediate_turn_fallback() {
         let (text, trace) = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -1131,6 +1134,7 @@ async fn a_loop_turn_records_its_provider_without_url_userinfo() {
     let result = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "terminal",
             scope: None,
             mode: ChatMode::default(),
@@ -1213,6 +1217,7 @@ async fn compiled_request_context_is_persisted_with_transcript_lineage_without_p
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -1319,6 +1324,7 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
             let result = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "cli",
                     scope: None,
                     mode: ChatMode::default(),
@@ -1549,6 +1555,7 @@ async fn compiled_request_event_breaks_the_tool_surface_down_by_root_and_adapter
                         let result = run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -1693,6 +1700,7 @@ async fn a_capability_search_hit_is_declared_on_the_next_request_and_not_the_cur
                         let result = run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -1896,6 +1904,7 @@ async fn compiled_tool_snapshot_is_rendered_once_per_turn_with_a_stable_system_p
                         let result = run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -2031,6 +2040,7 @@ async fn image_turn_is_gated_by_catalog_vision_input_before_provider_transport()
     let err = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "cli",
             scope: None,
             // no document ingest
@@ -2110,6 +2120,7 @@ async fn the_vision_refusal_names_the_provider_without_url_userinfo() {
     let err = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "cli",
             scope: None,
             mode: ChatMode::default(),
@@ -2181,6 +2192,7 @@ async fn run_tool_call_loop_rejects_oversized_image_payload() {
     let err = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "cli",
             scope: None,
             // no document ingest
@@ -2254,6 +2266,7 @@ async fn run_tool_call_loop_accepts_valid_multimodal_request_flow() {
             let result = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "cli",
                     scope: None,
                     // no document ingest
@@ -2335,6 +2348,7 @@ async fn quoted_image_marker_fossil_still_completes_the_turn() {
             let result = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "cli",
                     scope: None,
                     mode: ChatMode::default(),
@@ -2416,6 +2430,7 @@ async fn run_tool_call_loop_forwards_audio_transcript_with_image_payload() {
             let result = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "cli",
                     scope: None,
                     // no document ingest
@@ -2554,6 +2569,7 @@ async fn shared_tool_loop_applies_wasm_middleware_to_delivered_text_and_history(
             let (outcome, _) = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "whatsapp",
                     scope: None,
                     mode: ChatMode::default(),
@@ -2759,6 +2775,7 @@ mod outbound_middleware_lifecycle {
             let (outcome, _trace) = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "cli",
                     scope: None,
                     mode: ChatMode::default(),
@@ -2869,6 +2886,7 @@ mod outbound_middleware_lifecycle {
             let (outcome, _trace) = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "cli",
                     scope: None,
                     mode: ChatMode::default(),
@@ -2949,6 +2967,7 @@ mod outbound_middleware_lifecycle {
             let (outcome, _trace) = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "cli",
                     scope: None,
                     mode: ChatMode::default(),
@@ -3226,6 +3245,7 @@ async fn tool_arguments_are_validated_in_the_serving_models_dialect() {
         run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -3404,6 +3424,7 @@ async fn a_fallback_members_tool_call_is_validated_in_that_members_dialect() {
         let (_, trace) = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -3609,6 +3630,7 @@ async fn run_turn_refuses_unpriced_and_tool_less_fallbacks_after_primary_429() {
         let error = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),

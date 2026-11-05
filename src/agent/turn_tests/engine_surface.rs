@@ -110,6 +110,7 @@ async fn run_tool_call_loop_executes_read_only_tools_with_bounded_parallelism() 
                         let result = run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -255,6 +256,7 @@ async fn run_tool_call_loop_persists_large_tool_output_documents() {
                         let result = run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -401,6 +403,7 @@ async fn run_tool_call_loop_keeps_stateful_tools_strictly_serial() {
                         let result = run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -527,6 +530,7 @@ async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "wacli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -612,6 +616,7 @@ async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "gateway",
                 scope: None,
                 mode: ChatMode::default(),
@@ -704,6 +709,7 @@ async fn prompt_guided_provider_receives_only_the_compiled_turn_tool_snapshot() 
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "gateway",
                 scope: None,
                 mode: ChatMode::default(),
@@ -804,6 +810,7 @@ async fn tool_loop_rejects_a_registered_tool_not_exposed_for_the_turn() {
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "gateway",
                 scope: None,
                 mode: ChatMode::default(),
@@ -888,6 +895,7 @@ async fn turn_exposure_guard_preserves_unknown_tool_diagnostics() {
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "gateway",
                 scope: None,
                 mode: ChatMode::default(),
@@ -991,6 +999,7 @@ async fn production_turn_that_hangs_is_terminated_by_the_idle_detector() {
                 run_turn(
                     &mut history,
                     crate::agent::turn_request::TurnRequest {
+                        advice: None,
                         channel_name: "telegram",
                         scope: None,
                         // no document ingest
@@ -1177,6 +1186,7 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
                             run_turn(
                                 &mut history,
                                 crate::agent::turn_request::TurnRequest {
+                                    advice: None,
                                     channel_name: "cli",
                                     scope: None,
                                     mode: ChatMode::default(),
@@ -1358,6 +1368,7 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
                             run_turn(
                                 &mut history,
                                 crate::agent::turn_request::TurnRequest {
+                                    advice: None,
                                     channel_name: "cli",
                                     scope: None,
                                     mode: ChatMode::default(),
@@ -1565,6 +1576,7 @@ async fn an_interrupted_tool_batch_still_records_the_calls_that_ran() {
                             run_turn(
                                 &mut history,
                                 crate::agent::turn_request::TurnRequest {
+                                    advice: None,
                                     channel_name: "cli",
                                     scope: None,
                                     mode: ChatMode::default(),
@@ -1852,6 +1864,7 @@ impl Tool for ChildSurfaceProbe {
             let result = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "sessions_spawn",
                     scope: None,
                     mode: ChatMode::default(),
@@ -2029,6 +2042,7 @@ async fn published_child_tools(tiering: crate::config::ToolTieringConfig, input:
                         run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: None,
                                 channel_name: "wacli",
                                 scope: None,
                                 mode: ChatMode::default(),

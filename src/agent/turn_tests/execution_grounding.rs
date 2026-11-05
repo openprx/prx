@@ -157,6 +157,7 @@ async fn exercise_grounding_request(
                     let result = run_turn(
                         &mut history,
                         TurnRequest {
+                            advice: None,
                             channel_name: "cli",
                             scope: None,
                             mode: ChatMode::default(),
@@ -615,6 +616,7 @@ async fn proposed_real_writes_wait_for_one_source_intent_even_at_full_autonomy()
                         let result = run_turn(
                             &mut history,
                             TurnRequest {
+                                advice: None,
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),

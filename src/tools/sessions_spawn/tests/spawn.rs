@@ -89,6 +89,7 @@ async fn task_mode_no_tools_preserves_single_turn_trace_usage() {
         crate::agent::turn_engine::run_turn(
             &mut parent_history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "agent",
                 scope: None,
                 mode: Default::default(),

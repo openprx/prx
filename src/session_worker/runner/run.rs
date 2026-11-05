@@ -1184,6 +1184,7 @@ async fn run_owned_manifest(
                             run_turn(
                                 &mut segment_history,
                                 crate::agent::turn_request::TurnRequest {
+                                    advice: None,
                                     channel_name: "session-worker",
                                     scope: loop_scope,
                                     mode: crate::agent::turn_contracts::ChatMode::default(),

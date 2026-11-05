@@ -49,6 +49,7 @@ async fn admitted_turn_retains_the_actual_serialized_parameters() {
     let (reply, trace) = crate::agent::turn_engine::run_turn(
         &mut history,
         TurnRequest {
+            advice: None,
             channel_name: "cli",
             scope: None,
             mode: ChatMode::default(),

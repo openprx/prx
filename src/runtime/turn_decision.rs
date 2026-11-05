@@ -23,6 +23,7 @@ pub(crate) mod evidence_fixture;
 pub(crate) mod selected_loader_fixture;
 
 mod accounting;
+mod advisory;
 mod auxiliary;
 mod build_error;
 mod issued;
@@ -156,6 +157,7 @@ impl ChildExecutionPolicy {
 }
 
 pub(crate) struct TurnDecisionService {
+    advisory_engine: std::sync::OnceLock<Arc<crate::decision_engine::causal_adapter::CausalEngine>>,
     child_recovery: child_recovery::ChildRecoveryState,
     recursive_allowances: recursive_allowance::RunAllowances,
     memory_loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
@@ -3572,6 +3574,7 @@ pub(crate) async fn build_turn_decision_service(
     let factory = ordinary_child_fixture::wrap_factory(factory, Arc::clone(&state_key), Arc::clone(&events));
     let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
     Ok(Arc::new(TurnDecisionService {
+        advisory_engine: Default::default(),
         child_recovery: Default::default(),
         recursive_allowances: Default::default(),
         memory_loader: None,

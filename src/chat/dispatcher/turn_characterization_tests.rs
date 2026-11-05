@@ -767,6 +767,7 @@ async fn run_agent_fixture_with_history(
     let result = crate::agent::turn_engine::run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "cli",
             scope: None,
             mode: crate::agent::turn_contracts::ChatMode::Edit,

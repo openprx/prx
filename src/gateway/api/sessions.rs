@@ -467,6 +467,7 @@ async fn run_console_runtime_turn(
     let loop_result = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "console",
             scope: Some(&scope_ctx),
             mode: crate::agent::turn_contracts::ChatMode::default(),

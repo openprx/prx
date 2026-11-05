@@ -4355,6 +4355,7 @@ Retry with a compatible model: /provider {shown} <model>",
                         run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
+                                advice: admitted_binding.decision_advice(),
                                 channel_name: "terminal",
                                 scope: Some(&scope_ctx),
                                 mode: admitted_binding.admitted_model_mode()?,

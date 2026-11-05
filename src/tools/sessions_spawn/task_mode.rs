@@ -419,6 +419,7 @@ pub(super) async fn run_sub_agent_task(
                     .run(crate::agent::turn_engine::run_turn(
                         &mut task_history,
                         crate::agent::turn_request::TurnRequest {
+                            advice: None,
                             channel_name: "sessions_spawn",
                             // chat event bridge: incremental loop output (v1.1a)
                             scope: Some(&scope_ctx),

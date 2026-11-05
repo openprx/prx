@@ -130,6 +130,9 @@ pub(crate) async fn run_turn(
     services: TurnServices<'_>,
     delivery: TurnDelivery,
 ) -> Result<(ToolLoopOutcome, ToolLoopTrace)> {
+    let advisory_service = request.decision.service;
+    let advisory_context = request.decision.context;
+    let advisory_id = request.advice.as_ref().map(|analysis| analysis.decision_id.clone());
     let guard_token = delivery.cancellation.clone();
     let channel_name = request.channel_name;
     // Boxed at the boundary, not inside the guard. The loop future is one of the
@@ -138,13 +141,15 @@ pub(crate) async fn run_turn(
     // stack on the chat path. A pointer costs nothing here and keeps the guard's
     // own future tiny.
     let inner = Box::pin(run_turn_unguarded(history, request, services, delivery));
-    crate::agent::idle::run_guarded(
+    let result = crate::agent::idle::run_guarded(
         crate::agent::idle::configured(),
         channel_name,
         guard_token.as_ref(),
         inner,
     )
-    .await
+    .await;
+    advisory_service.observe_advisory(advisory_context, advisory_id, result.is_ok());
+    result
 }
 
 /// The history an inbound middleware plugin handed back, with every `user`
@@ -253,6 +258,7 @@ async fn run_turn_unguarded(
     delivery: TurnDelivery,
 ) -> Result<(ToolLoopOutcome, ToolLoopTrace)> {
     let TurnRequest {
+        advice,
         channel_name,
         scope: scope_ctx,
         mode: chat_mode,
@@ -285,6 +291,11 @@ async fn run_turn_unguarded(
         runtime_adapter,
         memory: memory_runtime,
     } = services;
+    let decision_brief = advice.as_ref().map(|analysis| {
+        let config = service.advisory_config();
+        crate::decision_engine::render::render_decision_brief(analysis, config.prompt_budget_tokens, config.candidates)
+    });
+    let decision_brief_sha256 = decision_brief.as_deref().map(crate::agent::prompt::prompt_sha256);
     let cache_series = super::prompt_cache_metrics::Series::for_turn(scope_ctx, &memory_runtime);
     let TurnDelivery {
         cancellation: cancellation_token,
@@ -401,18 +412,22 @@ async fn run_turn_unguarded(
                 ),
             )
             .await?;
+        crate::decision_engine::turn::append_brief(&mut proposal_messages, decision_brief.as_deref());
         let system_prompt = proposal_messages.iter().find(|message| message.role == "system");
         let system_prompt_sha256 = system_prompt.map(|message| crate::agent::prompt::prompt_sha256(&message.content));
         hooks
             .emit(
                 HookEvent::LlmRequest,
-                serde_json::json!({
-                    "provider": provider_name, "model": model, "messages_count": proposal_messages.len(),
-                    "system_prompt_sha256": system_prompt_sha256,
-                    "system_prompt_chars": system_prompt.map_or(0, |message| message.content.chars().count()),
-                    "proposal_schema_sha256": hex::encode(proposal_schema.0),
-                    "tool_count": 1, "executable_capability_count": 0,
-                }),
+                crate::decision_engine::turn::request_trace(
+                    serde_json::json!({
+                        "provider": provider_name, "model": model, "messages_count": proposal_messages.len(),
+                        "system_prompt_sha256": system_prompt_sha256,
+                        "system_prompt_chars": system_prompt.map_or(0, |message| message.content.chars().count()),
+                        "proposal_schema_sha256": hex::encode(proposal_schema.0),
+                        "tool_count": 1, "executable_capability_count": 0,
+                    }),
+                    decision_brief_sha256.as_deref(),
+                ),
             )
             .await;
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -435,6 +450,7 @@ async fn run_turn_unguarded(
         .await?;
         let pending = outcome.pending?;
         let mut trace = outcome.trace;
+        trace.decision_brief_sha256 = decision_brief_sha256.clone();
         trace.execution_trace = Some(context.terminal_execution_trace());
         if !pending {
             return Ok((
@@ -475,7 +491,10 @@ async fn run_turn_unguarded(
     // FIX-P0-30/31: attribution of the final returning turn. Each provider call
     // overwrites this with that turn's real serving provider/model + attempts;
     // the value at the returning turn is handed back to the caller.
-    let mut last_turn_trace = ToolLoopTrace::default();
+    let mut last_turn_trace = ToolLoopTrace {
+        decision_brief_sha256: decision_brief_sha256.clone(),
+        ..Default::default()
+    };
     let mut usage_accumulator = ProviderUsageAccumulator::new();
     // FIX #2: sticky cross-turn fallback flag. `last_turn_trace` is overwritten
     // every turn, so a fallback on an intermediate (tool-call) turn would be lost
@@ -1007,6 +1026,7 @@ async fn run_turn_unguarded(
         // contribute request-local system context, so canonicalize only the
         // prepared request after every contributor has run.
         coalesce_system_messages_at_front(&mut prepared_messages.messages);
+        crate::decision_engine::turn::append_brief(&mut prepared_messages.messages, decision_brief.as_deref());
         let final_system_prompt = prepared_messages
             .messages
             .iter()
@@ -1014,6 +1034,13 @@ async fn run_turn_unguarded(
         let system_prompt_sha256 =
             final_system_prompt.map(|message| crate::agent::prompt::prompt_sha256(&message.content));
         let system_prompt_chars = final_system_prompt.map_or(0, |message| message.content.chars().count());
+        if let Some(brief_hash) = decision_brief_sha256.as_deref() {
+            tracing::debug!(
+                system_prompt_sha256 = system_prompt_sha256.as_deref(),
+                decision_brief_sha256 = brief_hash,
+                "advisory request prepared"
+            );
+        }
         let tool_snapshot = compiled_tool_context.fingerprint();
         // How much of this request is prompt and how much is native tool
         // schema. Sizes, counts and estimates only: this is emitted into a
@@ -1161,15 +1188,18 @@ async fn run_turn_unguarded(
         hooks
             .emit(
                 HookEvent::LlmRequest,
-                serde_json::json!({
-                    "provider": provider_name,
-                    "model": model,
-                    "messages_count": history.len(),
-                    "system_prompt_sha256": system_prompt_sha256.as_deref(),
-                    "system_prompt_chars": system_prompt_chars,
-                    "tool_snapshot_sha256": tool_snapshot.sha256,
-                    "tool_count": tool_snapshot.count,
-                }),
+                crate::decision_engine::turn::request_trace(
+                    serde_json::json!({
+                        "provider": provider_name,
+                        "model": model,
+                        "messages_count": history.len(),
+                        "system_prompt_sha256": system_prompt_sha256.as_deref(),
+                        "system_prompt_chars": system_prompt_chars,
+                        "tool_snapshot_sha256": tool_snapshot.sha256,
+                        "tool_count": tool_snapshot.count,
+                    }),
+                    decision_brief_sha256.as_deref(),
+                ),
             )
             .await;
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -1303,6 +1333,7 @@ async fn run_turn_unguarded(
                     )
                     .unwrap_or_else(|| provider.tool_schema_dialect_for(&trace.final_model));
                 last_turn_trace = ToolLoopTrace {
+                    decision_brief_sha256: decision_brief_sha256.clone(),
                     prepared_parameters: std::mem::take(&mut last_turn_trace.prepared_parameters),
                     final_provider: Some(trace.final_provider),
                     final_model: Some(trace.final_model),

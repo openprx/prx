@@ -152,6 +152,7 @@ async fn context_budget_counts_native_tool_schemas_before_provider_call() {
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -333,6 +334,7 @@ async fn small_native_schema_fixture(excluded: bool) {
             let result = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "terminal",
                     scope: None,
                     mode: ChatMode::default(),
@@ -576,6 +578,7 @@ async fn configured_small_native_schema_fixture() {
                 let result = run_turn(
                     &mut history,
                     crate::agent::turn_request::TurnRequest {
+                        advice: None,
                         channel_name: "terminal",
                         scope: None,
                         mode: ChatMode::default(),
@@ -720,6 +723,7 @@ async fn the_compiled_request_event_reports_the_budgeted_and_the_prepared_totals
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "terminal",
                 scope: None,
                 mode: ChatMode::default(),
@@ -873,6 +877,7 @@ async fn context_budget_counts_the_appended_prompt_sections_before_the_provider_
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -1011,6 +1016,7 @@ async fn the_mid_turn_trim_after_a_tool_round_aims_at_the_reserved_window() {
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -1118,6 +1124,7 @@ async fn an_oversized_tool_payload_never_trims_away_the_current_user_message() {
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -1246,6 +1253,7 @@ async fn the_inline_tool_result_budget_aims_at_the_reserved_window() {
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -1508,6 +1516,7 @@ async fn the_mid_turn_trim_keeps_a_prompt_guided_request_for_the_next_iteration(
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -1657,6 +1666,7 @@ async fn the_mid_turn_trim_keeps_a_native_request_and_its_tool_round_paired() {
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -1791,6 +1801,7 @@ async fn an_unsaturated_mid_turn_window_leaves_history_exactly_as_it_was() {
             let result = run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
+                    advice: None,
                     channel_name: "cli",
                     scope: None,
                     mode: ChatMode::default(),
@@ -1944,6 +1955,7 @@ async fn a_trim_only_preflight_opens_the_prompt_guided_second_request_on_the_que
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -2080,6 +2092,7 @@ async fn a_trim_only_preflight_opens_the_native_second_request_on_the_question()
         let result = run_turn(
             &mut history,
             crate::agent::turn_request::TurnRequest {
+                advice: None,
                 channel_name: "cli",
                 scope: None,
                 mode: ChatMode::default(),
@@ -2200,6 +2213,7 @@ async fn preflight_compacts_before_provider_call_when_over_hard_limit() {
     let result = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "cli",
             scope: None,
             mode: ChatMode::default(),
@@ -2306,6 +2320,7 @@ async fn legacy_preflight_provider_history_keeps_real_user_question_last_after_c
     let result = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "cli",
             scope: None,
             mode: ChatMode::default(),
@@ -2425,6 +2440,7 @@ async fn off_mode_preflight_trims_without_silent_summary() {
     let result = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "cli",
             scope: None,
             mode: ChatMode::default(),

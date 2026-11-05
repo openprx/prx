@@ -204,6 +204,7 @@ pub(crate) struct TurnSchedule {
 /// What one turn is asked to do: its channel and scope, mode, delivery
 /// flags, multimodal limits, scheduling, compaction and capability routing.
 pub(crate) struct TurnRequest<'a> {
+    pub(crate) advice: Option<crate::decision_engine::IntentAnalysis>,
     pub(crate) channel_name: &'a str,
     pub(crate) scope: Option<&'a ScopeContext<'a>>,
     pub(crate) mode: ChatMode,

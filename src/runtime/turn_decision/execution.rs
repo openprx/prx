@@ -278,6 +278,7 @@ impl OrdinaryChildPublication {
         )?
         .with_unproven_budget_gate();
         Ok(Arc::new(TurnDecisionService {
+            advisory_engine: Default::default(),
             child_recovery: Default::default(),
             recursive_allowances: Default::default(),
             memory_loader: None,

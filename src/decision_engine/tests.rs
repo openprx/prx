@@ -273,3 +273,5 @@ fn rendered_brief_is_bounded_redacted_deterministic() {
     assert!(brief.contains("question_"));
     assert_eq!(render::render_decision_brief(&analysis, 0, 0), "");
 }
+
+include!("turn_tests.rs");

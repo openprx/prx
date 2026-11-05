@@ -241,6 +241,7 @@ impl TurnDecisionService {
         .with_unproven_budget_gate();
         let store = CausalDecisionStore::open_unshared_read_only(&config.workspace_dir);
         let service = Arc::new(Self {
+            advisory_engine: Default::default(),
             child_recovery: Default::default(),
             recursive_allowances: Default::default(),
             memory_loader: None,

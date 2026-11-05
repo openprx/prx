@@ -557,6 +557,7 @@ struct CapturedChatTrace {
 }
 
 struct ChatDecision {
+    advice: Option<crate::decision_engine::IntentAnalysis>,
     resume: bool,
     service: Arc<crate::runtime::turn_decision::TurnDecisionService>,
     context: Arc<crate::runtime::turn_decision::TurnDecisionContext>,
@@ -881,7 +882,9 @@ impl ChatTurnBinding {
                 } else {
                     service.decide_agent_initial(self, kind, cancellation).await?
                 };
+                let advice = service.analyze_advisory(&context, cancellation).await;
                 Ok::<_, anyhow::Error>(ChatDecision {
+                    advice,
                     resume,
                     service: Arc::clone(service),
                     context,
@@ -1042,6 +1045,10 @@ impl ChatTurnBinding {
             .get()
             .context("chat skill view requires an admitted decision")?;
         decided.service.agent_prompt_skills(self, &decided.context)
+    }
+
+    pub(super) fn decision_advice(&self) -> Option<crate::decision_engine::IntentAnalysis> {
+        self.decision.get().and_then(|decided| decided.advice.clone())
     }
 
     pub(super) fn decision_routing(&self) -> Option<crate::agent::turn_request::TurnDecision<'_>> {

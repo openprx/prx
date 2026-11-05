@@ -2744,6 +2744,7 @@ async fn run_gateway_chat_with_multimodal(
                     run_turn(
                         &mut history,
                         crate::agent::turn_request::TurnRequest {
+                            advice: None,
                             // no approval manager
                             channel_name: "webhook",
                             // no streaming delta sender

@@ -94,6 +94,7 @@ impl TurnDecisionService {
         )?;
         let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
         let service = Arc::new(Self {
+            advisory_engine: Default::default(),
             child_recovery: Default::default(),
             recursive_allowances: Default::default(),
             memory_loader: None,

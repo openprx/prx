@@ -112,6 +112,7 @@ async fn cli_turn_capability_refreshes(raw_turn_text: &str) -> (usize, usize) {
     let result = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
+            advice: None,
             channel_name: "cli",
             scope: None,
             mode: ChatMode::default(),
