@@ -440,3 +440,320 @@ async fn wrong_owner_or_session_cannot_review_or_claim() {
         "rejected attempts must not consume the grant"
     );
 }
+
+use super::keys::RunCallAuthority;
+use super::run_call::{ApprovalLedgerPort, PendingCall};
+
+struct CallFixture {
+    memory: Arc<dyn Memory>,
+    key: Arc<DecisionKey>,
+    pending: PendingCall,
+}
+impl CallFixture {
+    async fn new(path: &std::path::Path) -> Self {
+        Self::in_workspace(path, "prx_workspace").await
+    }
+    async fn in_workspace(path: &std::path::Path, workspace: &str) -> Self {
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(path).unwrap());
+        let key = DecisionKey::load_or_create(path).unwrap();
+        let mut scope = MessageEventScope::new("cli", MemoryVisibility::Private);
+        scope.owner_id = Some("prx_owner".into());
+        scope.session_key = Some("prx_session".into());
+        scope.run_id = Some("prx_run".into());
+        let source = MemoryFabric::new(memory.clone(), workspace)
+            .record_inbound_user_message(scope, "project call", None, None)
+            .await
+            .unwrap();
+        let pending = PendingCall {
+            authority: call_authority(&source, &serde_json::json!({"path":"project_a"})),
+            subject: Subject {
+                agent_id: "prx_agent".into(),
+                principal_id: "prx_principal".into(),
+                owner_id: "prx_owner".into(),
+                workspace_id: workspace.into(),
+                session_key: Some("prx_session".into()),
+            },
+            source_event_id: source.event_id,
+            source_mac: [0; 32],
+            operation: "prx_operation".into(),
+            risk: RiskLevel::Medium,
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(4),
+        };
+        let fixture = Self { memory, key, pending };
+        assert_eq!(
+            fixture.port().record_pending(fixture.pending.clone()).await.unwrap(),
+            crate::tools::ToolExecutionStatus::AwaitingApproval
+        );
+        fixture
+    }
+    fn port(&self) -> ApprovalLedgerPort<'_> {
+        ApprovalLedgerPort {
+            memory: &self.memory,
+            state_key: &self.key,
+            workspace: &self.pending.subject.workspace_id,
+            keyring: WitnessKeyring::global_for_tests(),
+        }
+    }
+    async fn review(&self) {
+        self.port()
+            .review("prx_owner", "prx_session", &self.pending.authority, true)
+            .await
+            .unwrap();
+    }
+    async fn claim(&self) -> anyhow::Result<crate::memory::MessageEvent> {
+        self.port()
+            .claim("prx_owner", "prx_session", &self.pending.authority)
+            .await
+    }
+}
+fn call_authority(source: &crate::memory::MessageEvent, args: &serde_json::Value) -> RunCallAuthority {
+    use crate::causal_tree::branch::{
+        CapabilityId, CapabilityRef, CapabilityTarget, CatalogGeneration, SchemaFingerprint,
+    };
+    RunCallAuthority::for_call(
+        &CapabilityRef {
+            id: CapabilityId::new(CapabilityTarget::NativeTool, "prx", "file").unwrap(),
+            fingerprint: SchemaFingerprint([7; 32]),
+            generation: CatalogGeneration([8; 32]),
+        },
+        crate::tools::capability::execution_binding::CallDigestSource {
+            workspace: &source.workspace_id,
+            owner: source.owner_id.as_deref().unwrap(),
+            session: source.session_key.as_deref().unwrap(),
+            run: source.run_id.as_deref(),
+            event: Some(&source.event_id),
+            channel: source.channel.as_deref(),
+            sender: source.sender.as_deref(),
+            generation: source.config_generation_id,
+            revision: source.config_source_revision.as_deref(),
+        },
+        args,
+        "prx_operation",
+        RiskLevel::Medium,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn run_keyed_pending_survives_restart_and_claims_once() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = CallFixture::new(path.path()).await;
+    let pending = fixture.pending.clone();
+    drop(fixture);
+    let fixture = CallFixture {
+        memory: Arc::new(SqliteMemory::new(path.path()).unwrap()),
+        key: DecisionKey::load_or_create(path.path()).unwrap(),
+        pending,
+    };
+    assert_eq!(
+        fixture
+            .port()
+            .list_pending_calls("prx_owner", 0, 10)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    fixture.review().await;
+    drop(fixture);
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(path.path()).unwrap());
+    let key = DecisionKey::load_or_create(path.path()).unwrap();
+    let port = ApprovalLedgerPort {
+        memory: &memory,
+        state_key: &key,
+        workspace: "prx_workspace",
+        keyring: WitnessKeyring::global_for_tests(),
+    };
+    let page = port.list_pending_calls("prx_owner", 0, 10).await.unwrap();
+    let authority = &page.items.first().unwrap().authority;
+    port.claim("prx_owner", "prx_session", authority).await.unwrap();
+    assert_eq!(
+        port.claim("prx_owner", "prx_session", authority)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "call approval was already consumed or revoked"
+    );
+    assert!(
+        port.list_pending_calls("prx_owner", 0, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_keyed_claim_and_revoke_race_has_exactly_one_winner() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = CallFixture::new(path.path()).await;
+    fixture.review().await;
+    let other_memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(path.path()).unwrap());
+    let port = ApprovalLedgerPort {
+        memory: &other_memory,
+        state_key: &fixture.key,
+        workspace: "prx_workspace",
+        keyring: WitnessKeyring::global_for_tests(),
+    };
+    let (claim, revoke) = tokio::join!(
+        fixture.claim(),
+        port.revoke("prx_owner", "prx_session", &fixture.pending.authority)
+    );
+    assert_ne!(claim.is_ok(), revoke.is_ok());
+    let loser = if let Err(error) = claim {
+        error
+    } else {
+        revoke.unwrap_err()
+    };
+    assert_eq!(loser.to_string(), "call approval was already consumed or revoked");
+}
+
+#[tokio::test]
+async fn changed_arguments_do_not_match_the_pending_digest() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = CallFixture::new(path.path()).await;
+    fixture.review().await;
+    let source = fixture
+        .memory
+        .find_owned_message_event("prx_workspace", "prx_owner", &fixture.pending.source_event_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let changed = call_authority(&source, &serde_json::json!({"path":"project_b"}));
+    assert_ne!(changed, fixture.pending.authority);
+    assert_eq!(
+        fixture
+            .port()
+            .claim("prx_owner", "prx_session", &changed)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "pending call approval not found"
+    );
+    fixture.claim().await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_run_keyed_grant_cannot_be_claimed() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = CallFixture::new(path.path()).await;
+    fixture.review().await;
+    let authority = &fixture.pending.authority;
+    let event = fixture
+        .memory
+        .find_message_event_by_idempotency_key("prx_workspace", &authority.issued_key(""))
+        .await
+        .unwrap()
+        .unwrap();
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Review {
+        pending_mac: [u8; 32],
+        approved: bool,
+        grant: Option<ApprovalGrantV2>,
+    }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SignedReview {
+        record: Review,
+        mac: [u8; 32],
+    }
+    let mut payload: SignedReview = serde_json::from_str(event.raw_payload_json.as_deref().unwrap()).unwrap();
+    let grant = payload.record.grant.as_mut().unwrap();
+    grant.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    crate::acl::approval_grant::sign_grant(WitnessKeyring::global_for_tests(), grant).unwrap();
+    payload.mac = fixture.key.hmac(
+        KeyDomain::ApprovalState,
+        &[b"call.review", &serde_json::to_vec(&payload.record).unwrap()],
+    );
+    SqliteMemory::new(path.path())
+        .unwrap()
+        .replace_event_payload_for_test(&event.event_id, &serde_json::to_string(&payload).unwrap())
+        .unwrap();
+    assert_eq!(
+        fixture.claim().await.unwrap_err().to_string(),
+        "approval grant is outside its validity window"
+    );
+    assert!(
+        fixture
+            .memory
+            .find_message_event_by_idempotency_key("prx_workspace", &authority.resolution_key(""))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn run_keyed_and_decision_keyed_listings_do_not_mix() {
+    let path = tempfile::tempdir().unwrap();
+    let decision = LifecycleFixture::new(path.path()).await;
+    let fixture = CallFixture::in_workspace(path.path(), &decision.subject.workspace_id).await;
+    let page = fixture.port().list_pending_calls("prx_owner", 0, 1).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items.first().unwrap().authority, fixture.pending.authority);
+    assert!(page.next_cursor.is_some());
+    assert!(
+        fixture
+            .port()
+            .list_pending_calls("prx_other_owner", 0, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let decisions = decision
+        .ledger()
+        .list_pending_decision_approvals("prx_owner", 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(decisions.items.len(), 1);
+    assert_eq!(
+        decisions.items.first().unwrap().view.decision_id,
+        decision.binding.decision_id
+    );
+}
+
+#[tokio::test]
+async fn run_keyed_review_by_wrong_owner_is_refused() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = CallFixture::new(path.path()).await;
+    for (owner, session) in [("prx_other_owner", "prx_session"), ("prx_owner", "prx_other_session")] {
+        assert_eq!(
+            fixture
+                .port()
+                .review(owner, session, &fixture.pending.authority, true)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "pending call approval belongs to another scope"
+        );
+        assert_eq!(
+            fixture
+                .port()
+                .claim(owner, session, &fixture.pending.authority)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "pending call approval belongs to another scope"
+        );
+    }
+    fixture.review().await;
+    fixture.claim().await.unwrap();
+}
+
+#[tokio::test]
+async fn decision_claim_checks_stored_grant_owner() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = LifecycleFixture::new(path.path()).await;
+    let connection = rusqlite::Connection::open(path.path().join("memory/brain.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE message_events SET owner_id = 'prx_other_owner' WHERE idempotency_key = ?1",
+            [format!("decision-approval:{}:issued", fixture.grant.grant_id)],
+        )
+        .unwrap();
+    assert_eq!(
+        fixture.claim().await.unwrap_err().to_string(),
+        "stored approval belongs to another scope"
+    );
+}

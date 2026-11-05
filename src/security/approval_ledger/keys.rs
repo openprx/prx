@@ -38,3 +38,23 @@ pub(crate) fn decision_resolution_key(
     let operation = hex::encode(Sha256::digest(op_id.as_bytes()));
     format!("decision-approval:{}:{operation}:resolution", binding.decision_id)
 }
+
+/// Identity of one exact call, independent of any causal decision.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunCallAuthority {
+    pub(crate) run_id: String,
+    pub(crate) call_digest: [u8; 32],
+}
+
+impl ApprovalAuthority for RunCallAuthority {
+    fn namespace(&self) -> String {
+        format!("call-approval:{}:{}", self.run_id, hex::encode(self.call_digest))
+    }
+    fn issued_key(&self, _grant_id: &str) -> String {
+        format!("{}:issued", self.namespace())
+    }
+    fn resolution_key(&self, _op_id: &str) -> String {
+        format!("{}:resolution", self.namespace())
+    }
+}
