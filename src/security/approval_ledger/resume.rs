@@ -7,8 +7,8 @@ use crate::causal_tree::ids::DecisionId;
 use crate::decision::KeyDomain;
 use crate::memory::{MemoryFabric, MessageEvent};
 use anyhow::Context;
-use serde::Serialize;
-#[derive(Serialize)]
+use serde::{Deserialize, Serialize};
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct ResumeIntent {
     binding: DecisionApprovalBinding,
     source_event_id: String,
@@ -17,8 +17,8 @@ struct ResumeIntent {
     policy_version: String,
     reviewed_grants_mac: [u8; 32],
 }
-#[derive(Serialize)]
-struct SignedResumeIntent {
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct SignedResumeIntent {
     record: ResumeIntent,
     mac: [u8; 32],
 }

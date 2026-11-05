@@ -99,7 +99,7 @@ impl ApprovalLedger<'_> {
         let workspace = self.workspace.as_str();
         let durable = self
             .memory
-            .find_owned_message_event(&workspace, owner, &event.event_id)
+            .find_owned_message_event(workspace, owner, &event.event_id)
             .await?
             .context("decision approval receipt is not durable")?;
         anyhow::ensure!(

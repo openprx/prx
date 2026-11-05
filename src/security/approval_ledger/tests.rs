@@ -21,6 +21,15 @@ fn decision_keys_are_byte_identical_to_pre_extraction() {
         authority.resolution_key("fixture operation"),
         "decision-approval:00000000-0000-0000-0000-000000000001:ad3f377ae32bf3fca6b60175d758bb069396189058c30fbee26b15b9036e2f2a:resolution"
     );
+    let binding = crate::acl::approval_grant::DecisionApprovalBinding {
+        decision_id: "00000000-0000-0000-0000-000000000001".into(),
+        catalog_generation: [0; 32],
+        call_digest: [0; 32],
+    };
+    assert_eq!(
+        super::keys::decision_resolution_key(&binding, "fixture operation"),
+        "decision-approval:00000000-0000-0000-0000-000000000001:ad3f377ae32bf3fca6b60175d758bb069396189058c30fbee26b15b9036e2f2a:resolution"
+    );
     assert_eq!(
         authority.resume_key("source_fixture"),
         "decision-approval:00000000-0000-0000-0000-000000000001:resume:source_fixture"
@@ -55,4 +64,34 @@ async fn pre_extraction_pending_and_issued_events_are_resolved_by_the_ledger() {
 #[tokio::test]
 async fn review_denial_blocks_issue() {
     Box::pin(crate::runtime::turn_decision::exact_file_collection_for_review(false)).await;
+}
+
+// Field order and omission follow the writer on 663db817, approval.rs:20-44.
+#[test]
+fn consumed_grant_claim_keeps_pre_extraction_bytes() {
+    const EXPECTED: &str = r#"{"disposition":"consumed","grant_id":"prx_grant","signed_payload_sha256":"prx_signed_payload","binding":{"decision_id":"00000000-0000-0000-0000-000000000001","catalog_generation":[32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63],"call_digest":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]},"nonce":"prx_nonce","execution":{"decision_id":"prx_resume","source_event_id":"prx_source","run_id":"prx_run"}}"#;
+    let value: super::resolution::GrantClaim = serde_json::from_str(EXPECTED).unwrap();
+    assert_eq!(serde_json::to_string(&value).unwrap(), EXPECTED);
+    let restored: super::resolution::GrantClaim = serde_json::from_str(EXPECTED).unwrap();
+    assert!(value == restored);
+}
+
+// Field order and omission follow the writer on 663db817, approval.rs:20-44.
+#[test]
+fn revoked_grant_claim_keeps_pre_extraction_bytes() {
+    const EXPECTED: &str = r#"{"disposition":"revoked","grant_id":"prx_grant","signed_payload_sha256":"prx_signed_payload","binding":{"decision_id":"00000000-0000-0000-0000-000000000001","catalog_generation":[32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63],"call_digest":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]},"nonce":"prx_nonce"}"#;
+    let value: super::resolution::GrantClaim = serde_json::from_str(EXPECTED).unwrap();
+    assert_eq!(serde_json::to_string(&value).unwrap(), EXPECTED);
+    let restored: super::resolution::GrantClaim = serde_json::from_str(EXPECTED).unwrap();
+    assert!(value == restored);
+}
+
+// Field order follows the writer on 663db817, pending_approval.rs:728-742.
+#[test]
+fn signed_resume_intent_keeps_pre_extraction_bytes() {
+    const EXPECTED: &str = r#"{"record":{"binding":{"decision_id":"00000000-0000-0000-0000-000000000001","catalog_generation":[32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63],"call_digest":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]},"source_event_id":"prx_source","source_mac":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32],"run_id":"prx_run","policy_version":"prx_policy","reviewed_grants_mac":[32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63]},"mac":[32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1]}"#;
+    let value: super::resume::SignedResumeIntent = serde_json::from_str(EXPECTED).unwrap();
+    assert_eq!(serde_json::to_string(&value).unwrap(), EXPECTED);
+    let restored: super::resume::SignedResumeIntent = serde_json::from_str(EXPECTED).unwrap();
+    assert!(value == restored);
 }

@@ -15,7 +15,7 @@ enum ClaimDisposition {
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct GrantClaim {
+pub(super) struct GrantClaim {
     disposition: ClaimDisposition,
     grant_id: String,
     signed_payload_sha256: String,

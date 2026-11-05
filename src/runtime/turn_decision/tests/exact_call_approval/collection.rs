@@ -72,24 +72,33 @@ async fn exact_file_collection_with_recursive_budget(
     approved: bool,
     recursive_budget: RecursiveBudgetCase,
 ) {
-    exact_file_collection_with_legacy_events(edit, approved, recursive_budget, false).await;
+    exact_file_collection_with_legacy_events(edit, approved, recursive_budget, LegacyEvents::None).await;
 }
 
 pub(crate) async fn historical_approval_events() {
-    Box::pin(exact_file_collection_with_legacy_events(
-        false,
-        true,
-        RecursiveBudgetCase::Disabled,
-        true,
-    ))
-    .await;
+    for legacy in [LegacyEvents::Issued, LegacyEvents::Revoked] {
+        Box::pin(exact_file_collection_with_legacy_events(
+            false,
+            true,
+            RecursiveBudgetCase::Disabled,
+            legacy,
+        ))
+        .await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LegacyEvents {
+    None,
+    Issued,
+    Revoked,
 }
 
 async fn exact_file_collection_with_legacy_events(
     edit: bool,
     approved: bool,
     recursive_budget: RecursiveBudgetCase,
-    legacy_events: bool,
+    legacy_events: LegacyEvents,
 ) {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().unwrap();
@@ -341,12 +350,49 @@ async fn exact_file_collection_with_legacy_events(
             review.get("grant_count"),
             Some(&serde_json::json!(usize::from(approved)))
         );
-        if legacy_events {
+        if !matches!(legacy_events, LegacyEvents::None) {
             install_legacy_approval_events(workspace.path(), &service, sqlite.as_ref(), owner, session, id).await;
+        }
+        if matches!(legacy_events, LegacyEvents::Revoked) {
+            let approval = service.load_reviewed_decision_approval(owner, session, id).await.unwrap();
+            let grant = approval.grants().first().expect("legacy issued grant missing");
+            let binding = grant.decision_binding.as_ref().expect("legacy grant missing decision_binding");
+            let key = crate::security::approval_ledger::keys::decision_resolution_key(binding, &grant.capability.op_id);
+            // Materialize the literal revoked layout from 663db817 approval.rs:20-44
+            // with the genuine issued grant's authenticated per-run values.
+            let legacy_revoked = format!(
+                r#"{{"disposition":"revoked","grant_id":{},"signed_payload_sha256":{},"binding":{},"nonce":"prx_legacy_revoke"}}"#,
+                serde_json::to_string(&grant.grant_id).unwrap(),
+                serde_json::to_string(&grant.witness_signature.signed_payload_sha256).unwrap(),
+                serde_json::to_string(binding).unwrap(),
+            );
+            service.revoke_pending_decision_approval(owner, session, id).await.unwrap();
+            let event = memory.find_message_event_by_idempotency_key(proof.workspace_id(), &key)
+                .await.unwrap().expect("legacy resolution event missing");
+            sqlite.replace_event_payload_for_test(&event.event_id, &legacy_revoked).unwrap();
+            let expected = crate::security::approval_ledger::GrantScope {
+                subject: &grant.subject, binding, op_id: &grant.capability.op_id,
+                risk: grant.capability.risk_level,
+            };
+            let error = service.approval_ledger().claim_decision_grant(
+                crate::security::approval_ledger::pending::scope_from_source(approval.pending().source()),
+                grant, &expected, crate::acl::approval_grant::WitnessKeyring::global().unwrap(),
+                crate::security::approval_ledger::resolution::ResumeClaimScope {
+                    decision_id: "prx_resume".into(), source_event_id: "prx_source".into(), run_id: "prx_run".into(),
+                },
+            ).await.expect_err("legacy revocation must block the ordinary claim");
+            assert!(error.to_string().contains("decision approval was already consumed or revoked"), "{error:#}");
+            service.revoke_pending_decision_approval(owner, session, id).await
+                .expect("repeated legacy revoke must be accepted");
+            assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+            assert_unmodified();
+            return;
         }
         let resume_input = serde_json::json!({"decision_id":id.to_string()}).to_string();
         if !approved {
-            assert!(service.review_pending_decision_approval(owner, session, id, true).await.is_err(), "denial cannot be replaced by approval");
+            let error = service.review_pending_decision_approval(owner, session, id, true)
+                .await.err().expect("denial cannot be replaced by approval");
+            assert!(error.to_string().contains("pending decision already has a different review"), "{error:#}");
             assert!(memory.list_owned_message_events_by_type(proof.workspace_id(), owner, "approval.decision.issued", 0, 100).await.unwrap().is_empty(), "denied review must issue no durable grants");
             let (denied_resume, _) = recorded_approval_source(
                 &generation,
@@ -1003,31 +1049,44 @@ async fn install_legacy_approval_events(
         .unwrap()
         .unwrap();
     let payload: serde_json::Value = serde_json::from_str(pending_event.raw_payload_json.as_deref().unwrap()).unwrap();
-    let record = &payload["record"];
+    let record = payload.get("record").expect("legacy payload missing record");
     assert!(
         record.get("h2_origin").is_none(),
         "the genuine Chat fixture has no H2 origin"
     );
     for name in ["risk", "schema_dialect", "sealed_call"] {
-        assert!(!record[name].is_null());
+        assert!(
+            !record
+                .get(name)
+                .unwrap_or_else(|| panic!("legacy record missing {name}"))
+                .is_null()
+        );
     }
     let legacy_pending = format!(
         r#"{{"record":{{"subject":{},"binding":{},"source_event_id":{},"source_mac":{},"run_id":{},"decision_digests":{},"policy_version":{},"capabilities":{},"op_ids":{},"effect":{},"risk":{},"schema_dialect":{},"sealed_call":{},"expires_at":{}}},"mac":{}}}"#,
-        record["subject"],
-        record["binding"],
-        record["source_event_id"],
-        record["source_mac"],
-        record["run_id"],
-        record["decision_digests"],
-        record["policy_version"],
-        record["capabilities"],
-        record["op_ids"],
-        record["effect"],
-        record["risk"],
-        record["schema_dialect"],
-        record["sealed_call"],
-        record["expires_at"],
-        payload["mac"],
+        record.get("subject").expect("legacy record missing subject"),
+        record.get("binding").expect("legacy record missing binding"),
+        record
+            .get("source_event_id")
+            .expect("legacy record missing source_event_id"),
+        record.get("source_mac").expect("legacy record missing source_mac"),
+        record.get("run_id").expect("legacy record missing run_id"),
+        record
+            .get("decision_digests")
+            .expect("legacy record missing decision_digests"),
+        record
+            .get("policy_version")
+            .expect("legacy record missing policy_version"),
+        record.get("capabilities").expect("legacy record missing capabilities"),
+        record.get("op_ids").expect("legacy record missing op_ids"),
+        record.get("effect").expect("legacy record missing effect"),
+        record.get("risk").expect("legacy record missing risk"),
+        record
+            .get("schema_dialect")
+            .expect("legacy record missing schema_dialect"),
+        record.get("sealed_call").expect("legacy record missing sealed_call"),
+        record.get("expires_at").expect("legacy record missing expires_at"),
+        payload.get("mac").expect("legacy payload missing mac"),
     );
     let approval = service
         .load_reviewed_decision_approval(owner, session, id)
@@ -1047,23 +1106,37 @@ async fn install_legacy_approval_events(
         let issued: serde_json::Value = serde_json::from_str(event.raw_payload_json.as_deref().unwrap()).unwrap();
         let legacy_issued = format!(
             r#"{{"grant_id":{},"version":{},"subject":{},"issuer":{},"capability":{},"resource_constraints":{},"issued_at":{},"not_before":{},"expires_at":{},"max_uses":{},"uses_consumed":{},"witness_signature":{},"related_task_id":{},"related_message_event_id":{},"revoked_at":{},"revocation_reason":{},"decision_binding":{}}}"#,
-            issued["grant_id"],
-            issued["version"],
-            issued["subject"],
-            issued["issuer"],
-            issued["capability"],
-            issued["resource_constraints"],
-            issued["issued_at"],
-            issued["not_before"],
-            issued["expires_at"],
-            issued["max_uses"],
-            issued["uses_consumed"],
-            issued["witness_signature"],
-            issued["related_task_id"],
-            issued["related_message_event_id"],
-            issued["revoked_at"],
-            issued["revocation_reason"],
-            issued["decision_binding"],
+            issued.get("grant_id").expect("legacy issued missing grant_id"),
+            issued.get("version").expect("legacy issued missing version"),
+            issued.get("subject").expect("legacy issued missing subject"),
+            issued.get("issuer").expect("legacy issued missing issuer"),
+            issued.get("capability").expect("legacy issued missing capability"),
+            issued
+                .get("resource_constraints")
+                .expect("legacy issued missing resource_constraints"),
+            issued.get("issued_at").expect("legacy issued missing issued_at"),
+            issued.get("not_before").expect("legacy issued missing not_before"),
+            issued.get("expires_at").expect("legacy issued missing expires_at"),
+            issued.get("max_uses").expect("legacy issued missing max_uses"),
+            issued
+                .get("uses_consumed")
+                .expect("legacy issued missing uses_consumed"),
+            issued
+                .get("witness_signature")
+                .expect("legacy issued missing witness_signature"),
+            issued
+                .get("related_task_id")
+                .expect("legacy issued missing related_task_id"),
+            issued
+                .get("related_message_event_id")
+                .expect("legacy issued missing related_message_event_id"),
+            issued.get("revoked_at").expect("legacy issued missing revoked_at"),
+            issued
+                .get("revocation_reason")
+                .expect("legacy issued missing revocation_reason"),
+            issued
+                .get("decision_binding")
+                .expect("legacy issued missing decision_binding"),
         );
         memory
             .replace_event_payload_for_test(&event.event_id, &legacy_issued)

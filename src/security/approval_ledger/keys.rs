@@ -30,6 +30,7 @@ impl ApprovalAuthority for DecisionAuthority {
     }
 }
 
+/// This free function and `DecisionAuthority::resolution_key` must agree.
 pub(crate) fn decision_resolution_key(
     binding: &crate::acl::approval_grant::DecisionApprovalBinding,
     op_id: &str,
