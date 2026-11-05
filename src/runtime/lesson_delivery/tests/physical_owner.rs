@@ -250,6 +250,11 @@ async fn wrong_actual_owner_refuses_before_wire_with_real_spent_liability_and_ta
     assert_eq!(reply.usage.physical_requests, 1);
     assert_eq!(reply.usage.settled_requests, 1);
     assert_eq!(probe.requests().len(), 1);
+    // Reported usage returns before cleanup-owned persistence completes.
+    // Wait for the actual settlement job before reading its durable projection.
+    cleanup
+        .drain(tokio::time::Instant::now() + Duration::from_secs(30))
+        .await?;
     let settled = tracker.physical_scope_usage(&expected.scope_id())?;
     assert_eq!(settled.calls, 1);
     assert_eq!(settled.settled_calls, 1);
@@ -260,8 +265,5 @@ async fn wrong_actual_owner_refuses_before_wire_with_real_spent_liability_and_ta
     assert_eq!(still_held.micro_usd, held.micro_usd);
     assert!(still_held.unresolved && still_held.settled_calls == 0);
     assert!(std::fs::read(&ledger_path)?.starts_with(&refused_bytes));
-    cleanup
-        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
-        .await?;
     Ok(())
 }
