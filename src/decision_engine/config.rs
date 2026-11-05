@@ -52,8 +52,24 @@ fn serialize_backend<S: serde::Serializer>(
     }
     value.serialize(serializer)
 }
+#[derive(Debug, thiserror::Error)]
+pub enum DecisionEngineConfigError {
+    #[error("decision_engine.{key} must be between {min} and {max}")]
+    OutOfRange { key: &'static str, min: u32, max: u32 },
+    #[error("invalid decision_engine.backend: {0}")]
+    Backend(#[source] crate::causal_tree::config::CausalConfigError),
+}
+
+fn ensure_range(key: &'static str, value: u32, min: u32, max: u32) -> Result<(), DecisionEngineConfigError> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(DecisionEngineConfigError::OutOfRange { key, min, max })
+    }
+}
+
 impl DecisionEngineConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> Result<(), DecisionEngineConfigError> {
         for (key, value, min, max) in [
             ("prompt_budget_tokens", self.prompt_budget_tokens, 50, 2_000),
             ("candidates", self.candidates, 1, 20),
@@ -61,37 +77,39 @@ impl DecisionEngineConfig {
             ("telemetry_cap", self.telemetry_cap, 0, 100_000),
             ("observe_queue", self.observe_queue, 1, 1_024),
         ] {
-            anyhow::ensure!(
-                (min..=max).contains(&value),
-                "decision_engine.{key} must be between {min} and {max}"
-            );
+            ensure_range(key, value, min, max)?;
         }
         if let Some(backend) = &self.backend {
             for (key, value, min, max) in [
-                ("timeout_ms", backend.timeout_ms, 10, self.timeout_ms),
-                ("max_request_bytes", backend.max_request_bytes, 4_096, 1_048_576),
-                ("max_response_bytes", backend.max_response_bytes, 4_096, 1_048_576),
                 (
-                    "circuit_breaker.failure_threshold",
+                    "backend.timeout_ms",
+                    backend.timeout_ms,
+                    10,
+                    if self.enabled { self.timeout_ms } else { u32::MAX },
+                ),
+                ("backend.max_request_bytes", backend.max_request_bytes, 4_096, 1_048_576),
+                (
+                    "backend.max_response_bytes",
+                    backend.max_response_bytes,
+                    4_096,
+                    1_048_576,
+                ),
+                (
+                    "backend.circuit_breaker.failure_threshold",
                     backend.circuit_breaker.failure_threshold,
                     1,
                     100,
                 ),
                 (
-                    "circuit_breaker.cooldown_secs",
+                    "backend.circuit_breaker.cooldown_secs",
                     backend.circuit_breaker.cooldown_secs,
                     1,
                     3_600,
                 ),
             ] {
-                anyhow::ensure!(
-                    (min..=max).contains(&value),
-                    "decision_engine.backend.{key} must be between {min} and {max}"
-                );
+                ensure_range(key, value, min, max)?;
             }
-            backend.validate_shared().map_err(|e| {
-                anyhow::anyhow!(e.to_string().replace("causal_tree.backend", "decision_engine.backend"))
-            })?;
+            backend.validate_shared().map_err(DecisionEngineConfigError::Backend)?;
         }
         Ok(())
     }

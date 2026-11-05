@@ -142,3 +142,46 @@ async fn differing_legacy_and_new_tables_round_trip_through_save_reload() {
     .await;
     assert_ne!(c.decision_engine.backend.unwrap(), c.causal_tree.backend);
 }
+
+#[test]
+fn legacy_backend_above_engine_timeout_loads_only_while_disabled() {
+    let legacy = format!(
+        "[causal_tree.policy]\nextra_latency_budget_ms=3000\n[causal_tree.backend]\n{}",
+        REMOTE.replace("timeout_ms = 200\n", "timeout_ms = 2000\n")
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, &legacy).unwrap();
+    let config = Config::load_from_path(&path, dir.path().join("workspace")).unwrap();
+    assert!(!config.decision_engine.enabled);
+    assert_eq!(config.decision_engine.backend.as_ref().unwrap().timeout_ms, 2_000);
+    std::fs::write(
+        &path,
+        format!("{legacy}\n[decision_engine]\nenabled=true\ntimeout_ms=1500\n"),
+    )
+    .unwrap();
+    let error = Config::load_from_path(&path, dir.path().join("workspace")).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<DecisionEngineConfigError>(),
+        Some(DecisionEngineConfigError::OutOfRange {
+            key: "backend.timeout_ms",
+            min: 10,
+            max: 1_500
+        })
+    ));
+}
+
+#[test]
+fn shared_backend_validation_preserves_typed_source() {
+    use std::error::Error;
+    let config: DecisionEngineConfig =
+        toml::from_str("[backend]\nkind='compatible_http'\nendpoint='https://example.com/v1'").unwrap();
+    let error = config.validate().unwrap_err();
+    assert!(matches!(error, DecisionEngineConfigError::Backend(_)));
+    assert!(
+        error
+            .source()
+            .unwrap()
+            .is::<crate::causal_tree::config::CausalConfigError>()
+    );
+}

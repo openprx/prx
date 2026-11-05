@@ -105,16 +105,48 @@ fn outcome(id: &str) -> TurnOutcome {
 #[tokio::test]
 async fn observe_queue_full_drops_and_counts_without_blocking() {
     let cancel = CancellationToken::new();
+    struct GatedWriter {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        written: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl TelemetryWriter for GatedWriter {
+        fn append_fifo(&mut self, _: TurnOutcome, _: usize) -> anyhow::Result<()> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+                self.release.recv()?;
+            }
+            self.written.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (queue, worker) = ObserveQueue::start(1, 10, cancel.clone(), || {
-        Ok(Box::new(SqliteTelemetryWriter::open(std::path::Path::new(":memory:"))?))
+        Ok(Box::new(GatedWriter {
+            started: Some(started),
+            release: gate,
+            written: std::sync::Arc::clone(&written),
+        }))
     })
     .unwrap();
-    // No await: the single-thread worker cannot drain the queue yet.
     assert_eq!(queue.observe(outcome("a")), ObserveAdmission::Accepted);
-    assert_eq!(queue.observe(outcome("b")), ObserveAdmission::Dropped);
+    // A blocking writer must leave this single-thread async runtime responsive.
+    ready.await.unwrap();
+    assert_eq!(queue.observe(outcome("b")), ObserveAdmission::Accepted);
+    assert_eq!(queue.observe(outcome("c")), ObserveAdmission::Dropped);
     assert_eq!(queue.counters.dropped.load(Ordering::Relaxed), 1);
     cancel.cancel();
+    release.send(()).unwrap();
     worker.unwrap().await.unwrap();
+    assert_eq!(
+        written.load(Ordering::Relaxed),
+        2,
+        "cancellation must drain accepted outcomes"
+    );
+    assert_eq!(queue.observe(outcome("closed")), ObserveAdmission::Dropped);
+    assert_eq!(queue.counters.dropped.load(Ordering::Relaxed), 2);
     let (disabled, worker) = ObserveQueue::start(1, 0, CancellationToken::new(), || {
         panic!("zero cap must not open a store")
     })

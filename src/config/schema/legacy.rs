@@ -166,12 +166,13 @@ pub(super) fn migrate_legacy_config_keys(root: &mut toml::Value, config_path: Op
              its default. To keep the disable, write `schema_version = 2` alongside `enabled = false`"
         );
     }
+    // Copy the legacy backend before retired-key removal and empty-table pruning.
+    crate::decision_engine::config::migrate_backend(root)?;
     // Retired keys are dropped *here*, before the unknown-path check below, so
     // that a config written against an older prx keeps loading with a warning
     // instead of failing to start. Only the paths on the published list are
     // absorbed; every other unrecognised key still stops the load, because a
     // typo must not inherit the leniency built for deliberate removals.
-    crate::decision_engine::config::migrate_backend(root)?;
     crate::config::deprecations::strip_deprecated_keys(root, config_path);
     prune_empty_toml_tables(root);
     Ok(())

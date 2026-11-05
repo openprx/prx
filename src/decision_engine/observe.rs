@@ -48,18 +48,32 @@ impl ObserveQueue {
         let (sender, mut receiver) = mpsc::channel(queue);
         let counters = Arc::new(ObserveCounters::default());
         let worker_counters = Arc::clone(&counters);
-        let worker = tokio::spawn(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let worker = tokio::task::spawn_blocking(move || {
             loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => break,
-                    outcome = receiver.recv() => {
-                        let Some(outcome) = outcome else { break; };
-                        if writer.append_fifo(outcome, cap).is_err() {
-                            worker_counters.store_errors.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!("decision engine telemetry write failed");
+                let outcome = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            // Stop admission, then persist every accepted outcome.
+                            receiver.close();
+                            None
                         }
+                        outcome = receiver.recv() => outcome,
                     }
+                });
+                let Some(outcome) = outcome else {
+                    break;
+                };
+                if writer.append_fifo(outcome, cap).is_err() {
+                    worker_counters.store_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("decision engine telemetry write failed");
+                }
+            }
+            while let Some(outcome) = receiver.blocking_recv() {
+                if writer.append_fifo(outcome, cap).is_err() {
+                    worker_counters.store_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("decision engine telemetry write failed");
                 }
             }
         });
