@@ -1090,7 +1090,7 @@ impl SessionsSpawnTool {
                                     let (status, text) = if result.success {
                                         (SubAgentStatus::Completed(result.output.clone()), result.output)
                                     } else {
-                                        let error = result.error.unwrap_or_else(|| "worker failed".to_owned());
+                                        let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
                                         (
                                             SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
                                             format!("Sub-agent error: {error}"),
@@ -1104,7 +1104,7 @@ impl SessionsSpawnTool {
                                     let (status, text) = if result.success {
                                         (SubAgentStatus::Completed(result.output.clone()), result.output)
                                     } else {
-                                        let error = result.error.unwrap_or_else(|| "worker failed".to_owned());
+                                        let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
                                         (SubAgentStatus::Failed(sub_agent_reported_failure(&error)), format!("Sub-agent error: {error}"))
                                     };
                                     (status, text, completion.usage, ProcessFinalization::Natural)
@@ -1115,7 +1115,7 @@ impl SessionsSpawnTool {
                                     let (status, text) = if result.success {
                                         (SubAgentStatus::Completed(result.output.clone()), result.output)
                                     } else {
-                                        let error = result.error.unwrap_or_else(|| "worker failed".to_owned());
+                                        let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
                                         (SubAgentStatus::Failed(sub_agent_reported_failure(&error)), format!("Sub-agent error: {error}"))
                                     };
                                     (status, text, completion.usage, ProcessFinalization::Natural)
@@ -1223,9 +1223,10 @@ impl SessionsSpawnTool {
                                     )
                                 }
                                 Err(error) => {
-                                    let msg = format!("Sub-agent process error: {error:#}");
+                                    let detail = super::failure::llm_visible_error(&format!("{error:#}"));
+                                    let msg = format!("Sub-agent process error: {detail}");
                                     (
-                                        SubAgentStatus::Failed(format!("{error:#}")),
+                                        SubAgentStatus::Failed(detail),
                                         msg,
                                         Vec::new(),
                                         if is_ordinary_process || is_operator_process || current_spawn_execution_context().as_ref()
