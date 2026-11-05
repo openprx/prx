@@ -11,9 +11,9 @@ slow-timeout = { period = "60s", terminate-after = 1 }
 fail-fast = false
 failure-output = "immediate-final"
 
-# PRX-SLOW-01: make the adoption tests fit the standard 60-s budget.
+# PRX-SLOW-01: make the experiments tests fit the standard 60-s budget.
 [[profile.ci.overrides]]
-filter = 'test(/^skills::lifecycle::tests::propose::experiments::adoption::/)'
+filter = 'test(/^skills::lifecycle::tests::propose::experiments::/)'
 slow-timeout = { period = "60s", terminate-after = 4 }
 
 # PRX-SLOW-01: 1000 tool iterations exceed 60 s on the QA 4-CPU quota.

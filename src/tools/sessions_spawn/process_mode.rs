@@ -823,7 +823,14 @@ pub(super) async fn run_sub_agent_process(
     // The leader is confirmed reaped here, including decode/verification
     // failures. Unconfirmed cleanup branches above retain their workspace.
     cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
-    outcome
+    outcome.with_context(|| {
+        format!(
+            "collect worker result and completion journal for run {run_id} in {} (config {}, memory {})",
+            manifest.workspace_dir.display(),
+            manifest.config_dir.display(),
+            manifest.memory_db_path.display()
+        )
+    })
 }
 
 /// Turn "the worker process is gone, here is what it left on its pipes" into a

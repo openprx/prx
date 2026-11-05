@@ -149,7 +149,7 @@ pub async fn run_from_stdin(
                 operator_completion: None,
                 success: false,
                 output: String::new(),
-                error: Some(format!("Invalid worker manifest JSON: {error}")),
+                error: Some(format!("Invalid worker manifest JSON: {error:#}")),
                 tokens_used: None,
             };
             write_worker_result(&result)?;
@@ -176,7 +176,7 @@ pub async fn run_from_stdin(
             operator_completion: None,
             success: false,
             output: String::new(),
-            error: Some(error.to_string()),
+            error: Some(format!("{error:#}")),
             tokens_used: None,
         };
         write_worker_result(&result)?;
@@ -195,7 +195,7 @@ pub async fn run_from_stdin(
                 operator_completion: None,
                 success: false,
                 output: String::new(),
-                error: Some(error.to_string()),
+                error: Some(format!("{error:#}")),
                 tokens_used: None,
             }
         }

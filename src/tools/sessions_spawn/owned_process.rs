@@ -159,7 +159,7 @@ pub(super) async fn wait_for_owned_process(
         reason = process_control.termination_requested() => {
             match terminate_owned_child(child, process_group).await {
                 Ok(_) => Ok(OwnedChildExit::Terminated(reason)),
-                Err(error) => Ok(OwnedChildExit::TerminationFailed(error.to_string())),
+                Err(error) => Ok(OwnedChildExit::TerminationFailed(format!("{error:#}"))),
             }
         }
     }

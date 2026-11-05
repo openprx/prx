@@ -60,9 +60,20 @@ pub(super) async fn run_authenticated_manifest(
 ) -> Result<WorkerResult> {
     let parent = crate::runtime::turn_cleanup::current_tracker();
     let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(parent.as_ref(), CancellationToken::new())?;
+    let workspace = manifest.workspace_dir.clone();
+    let config_dir = manifest.config_dir.clone();
+    let memory_db = manifest.memory_db_path.clone();
     let prepared = cleanup
         .run(owned_worker_future(manifest, steer_rx, explicit_config_dir, transport))
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "run and clean up worker in {} (config {}, memory {})",
+                workspace.display(),
+                config_dir.display(),
+                memory_db.display()
+            )
+        })?;
     if let Some(completion) = prepared.completion {
         crate::session_worker::completion::persist(
             &completion.fabric,
@@ -70,13 +81,33 @@ pub(super) async fn run_authenticated_manifest(
             &completion.grant,
             &prepared.result,
         )
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "persist worker completion journal in {}",
+                completion.fabric.workspace_id()
+            )
+        })?;
     }
     if let Some(authority) = prepared.ordinary_completion {
-        crate::session_worker::completion::persist_ordinary(&authority, &prepared.result).await?;
+        crate::session_worker::completion::persist_ordinary(&authority, &prepared.result)
+            .await
+            .with_context(|| {
+                format!(
+                    "persist ordinary worker completion journal in {}",
+                    authority.source_fabric().workspace_id()
+                )
+            })?;
     }
     if let Some(authority) = prepared.operator_completion {
-        crate::session_worker::completion::persist_operator(&authority, &prepared.result).await?;
+        crate::session_worker::completion::persist_operator(&authority, &prepared.result)
+            .await
+            .with_context(|| {
+                format!(
+                    "persist operator worker completion journal in {}",
+                    authority.source_fabric().workspace_id()
+                )
+            })?;
     }
     Ok(prepared.result)
 }
@@ -346,7 +377,7 @@ async fn run_owned_manifest(
                 &authenticated.key,
                 authenticated.manifest_digest,
                 &manifest.run_id,
-                error.to_string(),
+                format!("{error:#}"),
             )?;
             return Err(failure.into());
         }
@@ -1299,7 +1330,11 @@ async fn run_owned_manifest(
                 operator_completion: None,
                 success: false,
                 output: String::new(),
-                error: Some(error.to_string()),
+                error: Some(format!(
+                    "worker execution in {} (memory {}): {error:#}",
+                    manifest.workspace_dir.display(),
+                    manifest.memory_db_path.display()
+                )),
                 tokens_used: None,
             },
             crate::agent::terminal::TurnTerminalStatus::Failed,
@@ -1353,7 +1388,12 @@ async fn run_owned_manifest(
             },
         )
         .await
-        .context("commit session-worker terminal before publishing result")?;
+        .with_context(|| {
+            format!(
+                "commit session-worker terminal before publishing result in {}",
+                terminal_fabric.workspace_id()
+            )
+        })?;
     if child_segments.is_some() {
         let event = &terminal_receipt.terminal_event;
         let expected_key = format!("turn:{}:final", manifest.run_id);

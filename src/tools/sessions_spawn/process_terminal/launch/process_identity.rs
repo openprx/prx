@@ -9,13 +9,18 @@ pub(in crate::tools::sessions_spawn::process_terminal) fn context_mac(
 
 #[cfg(target_os = "linux")]
 fn context() -> anyhow::Result<Option<Vec<u8>>> {
+    use anyhow::Context as _;
     use std::os::unix::fs::MetadataExt;
-    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let boot_path = std::path::Path::new("/proc/sys/kernel/random/boot_id");
+    let boot = std::fs::read_to_string(boot_path)
+        .with_context(|| format!("read worker recovery boot identity {}", boot_path.display()))?;
     let boot = uuid::Uuid::parse_str(boot.trim())?;
     anyhow::ensure!(!boot.is_nil(), "worker recovery boot identity is empty");
     // Follow the namespace link: its inode distinguishes containers sharing a
     // kernel boot. A process in another PID namespace is never probed as ours.
-    let namespace = std::fs::metadata("/proc/self/ns/pid")?;
+    let namespace_path = std::path::Path::new("/proc/self/ns/pid");
+    let namespace = std::fs::metadata(namespace_path)
+        .with_context(|| format!("inspect worker recovery PID namespace {}", namespace_path.display()))?;
     Ok(Some(serde_json::to_vec(&(
         "linux",
         boot.to_string(),

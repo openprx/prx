@@ -395,7 +395,7 @@ async fn worker_rejects_changed_config_generation_before_workspace_side_effects(
     .await
     .unwrap_err();
 
-    assert!(error.to_string().contains("generation mismatch"));
+    assert!(format!("{error:#}").contains("generation mismatch"));
     assert!(
         !workspace.exists(),
         "generation mismatch must fail before worker side effects"
