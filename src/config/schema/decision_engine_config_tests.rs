@@ -44,7 +44,16 @@ fn legacy_backend_copies_every_field_with_one_warn() {
     assert!(!logs.contains("W2:") && !logs.contains("W3:"));
     let c = load(&text);
     assert_eq!(c.decision_engine.backend.as_ref().unwrap(), &c.causal_tree.backend);
-    assert_eq!(root["decision_engine"]["backend"], root["causal_tree"]["backend"]);
+    assert_eq!(
+        root.get("decision_engine")
+            .expect("missing decision_engine table")
+            .get("backend")
+            .expect("missing decision_engine.backend key"),
+        root.get("causal_tree")
+            .expect("missing causal_tree table")
+            .get("backend")
+            .expect("missing causal_tree.backend key")
+    );
     let (_, logs) = migrated(&format!("[causal_tree.backend]\n{REMOTE}"));
     assert_eq!(logs.matches("W3:").count(), 1);
 }
@@ -77,11 +86,11 @@ fn hosted_backend_without_remote_enabled_excluded_not_rejected() {
 #[test]
 fn numeric_bounds_reject_min_minus_one_and_max_plus_one() {
     for (key, min, max) in [
-        ("prompt_budget_tokens", 50, 2000),
+        ("prompt_budget_tokens", 50, 2_000),
         ("candidates", 1, 20),
-        ("timeout_ms", 100, 30000),
-        ("telemetry_cap", 0, 100000),
-        ("observe_queue", 1, 1024),
+        ("timeout_ms", 100, 30_000),
+        ("telemetry_cap", 0, 100_000),
+        ("observe_queue", 1, 1_024),
     ] {
         for value in [min - 1, max + 1] {
             let parsed = toml::from_str::<DecisionEngineConfig>(&format!("{key}={value}"));

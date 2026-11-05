@@ -58,7 +58,7 @@ impl TurnOutcome {
     pub fn tools(&self) -> &[String] {
         &self.tools
     }
-    pub fn succeeded(&self) -> bool {
+    pub const fn succeeded(&self) -> bool {
         self.succeeded
     }
 }

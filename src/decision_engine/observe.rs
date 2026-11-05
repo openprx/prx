@@ -38,7 +38,7 @@ impl ObserveQueue {
         F: FnOnce() -> anyhow::Result<Box<dyn TelemetryWriter>>,
     {
         anyhow::ensure!(
-            queue > 0 && queue <= 1024 && cap <= 100000,
+            queue > 0 && queue <= 1_024 && cap <= 100_000,
             "invalid observation bounds"
         );
         if cap == 0 {

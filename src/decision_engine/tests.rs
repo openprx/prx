@@ -43,9 +43,16 @@ async fn causal_adapter_maps_all_ten_questions() {
         .unwrap();
     assert_eq!(analysis.decision_id, "decision_a");
     assert_eq!(analysis.global.len(), 6);
-    assert_eq!(analysis.candidates[key.as_str()].len(), 4);
+    let candidate_answers = analysis
+        .candidates
+        .get(key.as_str())
+        .unwrap_or_else(|| panic!("missing candidate key {}", key.as_str()));
+    assert_eq!(candidate_answers.len(), 4);
     for q in GlobalQuestion::ALL {
-        let value = &analysis.global[q.as_str()];
+        let value = analysis
+            .global
+            .get(q.as_str())
+            .unwrap_or_else(|| panic!("missing global question key {}", q.as_str()));
         match q {
             GlobalQuestion::NextAction | GlobalQuestion::CapabilityTarget => assert_eq!(
                 value,
@@ -60,8 +67,10 @@ async fn causal_adapter_maps_all_ten_questions() {
     }
     for q in CandidateQuestion::ALL {
         assert_eq!(
-            analysis.candidates[key.as_str()][q.as_str()],
-            match q {
+            candidate_answers
+                .get(q.as_str())
+                .unwrap_or_else(|| panic!("missing candidate question key {}", q.as_str())),
+            &match q {
                 CandidateQuestion::Risk | CandidateQuestion::Gain => expected_score(),
                 _ => IntentValue::Probability(0.7),
             }

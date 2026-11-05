@@ -32,8 +32,8 @@ impl Default for DecisionEngineConfig {
             mode: DecisionMode::Pre,
             prompt_budget_tokens: 300,
             candidates: 5,
-            timeout_ms: 1500,
-            telemetry_cap: 1000,
+            timeout_ms: 1_500,
+            telemetry_cap: 1_000,
             observe_queue: 64,
             backend: None,
         }
@@ -55,11 +55,11 @@ fn serialize_backend<S: serde::Serializer>(
 impl DecisionEngineConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         for (key, value, min, max) in [
-            ("prompt_budget_tokens", self.prompt_budget_tokens, 50, 2000),
+            ("prompt_budget_tokens", self.prompt_budget_tokens, 50, 2_000),
             ("candidates", self.candidates, 1, 20),
-            ("timeout_ms", self.timeout_ms, 100, 30000),
-            ("telemetry_cap", self.telemetry_cap, 0, 100000),
-            ("observe_queue", self.observe_queue, 1, 1024),
+            ("timeout_ms", self.timeout_ms, 100, 30_000),
+            ("telemetry_cap", self.telemetry_cap, 0, 100_000),
+            ("observe_queue", self.observe_queue, 1, 1_024),
         ] {
             anyhow::ensure!(
                 (min..=max).contains(&value),
@@ -69,8 +69,8 @@ impl DecisionEngineConfig {
         if let Some(backend) = &self.backend {
             for (key, value, min, max) in [
                 ("timeout_ms", backend.timeout_ms, 10, self.timeout_ms),
-                ("max_request_bytes", backend.max_request_bytes, 4096, 1048576),
-                ("max_response_bytes", backend.max_response_bytes, 4096, 1048576),
+                ("max_request_bytes", backend.max_request_bytes, 4_096, 1_048_576),
+                ("max_response_bytes", backend.max_response_bytes, 4_096, 1_048_576),
                 (
                     "circuit_breaker.failure_threshold",
                     backend.circuit_breaker.failure_threshold,
@@ -81,7 +81,7 @@ impl DecisionEngineConfig {
                     "circuit_breaker.cooldown_secs",
                     backend.circuit_breaker.cooldown_secs,
                     1,
-                    3600,
+                    3_600,
                 ),
             ] {
                 anyhow::ensure!(

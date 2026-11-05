@@ -1,5 +1,5 @@
 //! Zero-cost disabled engine.
-use super::contract::*;
+use super::contract::{DecisionEngine, EngineError, IntentAnalysis, IntentInput, ObserveAdmission, TurnOutcome};
 #[derive(Debug, Default)]
 pub struct NoopEngine;
 #[async_trait::async_trait]
