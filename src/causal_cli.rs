@@ -677,11 +677,16 @@ impl DecisionSetup {
             crate::config::manage::RiskReason::EndpointChanged { path } => {
                 loopback
                     && (path == "causal_tree.backend.endpoint"
+                        || path == "decision_engine.backend.endpoint"
                         || (path.starts_with("providers.models[") && path.ends_with("].provider")))
             }
             // The hosted flow stored this credential itself, one step before.
             crate::config::manage::RiskReason::CredentialChanged { path } => {
-                hosted && path == "causal_tree.backend.credential_ref"
+                hosted
+                    && matches!(
+                        path.as_str(),
+                        "causal_tree.backend.credential_ref" | "decision_engine.backend.credential_ref"
+                    )
             }
             _ => false,
         })

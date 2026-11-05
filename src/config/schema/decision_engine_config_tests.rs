@@ -185,3 +185,30 @@ fn shared_backend_validation_preserves_typed_source() {
             .is::<crate::causal_tree::config::CausalConfigError>()
     );
 }
+
+#[test]
+fn disabled_engine_legacy_migration_preserves_process_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        config_path: dir.path().join("config.toml"),
+        workspace_dir: dir.path().join("workspace"),
+        ..Config::default()
+    };
+    config.causal_tree.backend.timeout_ms = 200;
+    assert!(!config.decision_engine.enabled);
+    assert!(config.decision_engine.backend.is_none());
+    std::fs::write(&config.config_path, toml::to_string(&config).unwrap()).unwrap();
+    let generation = crate::config::new_shared(config.clone()).pin();
+    let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx-engine-binding-fixture");
+    let key = crate::decision::DecisionKey::from_worker_channel(&transport, "prx-workspace", "prx-run", "prx-config")
+        .unwrap();
+    let binding = generation.bind_process(&key).unwrap();
+    let mut loaded = Config::load_from_path(&config.config_path, config.workspace_dir.clone()).unwrap();
+    assert_eq!(
+        loaded.decision_engine.backend.as_ref(),
+        Some(&config.causal_tree.backend)
+    );
+    crate::config::ConfigGeneration::restore_process(loaded.clone(), &binding, &key).unwrap();
+    loaded.decision_engine.backend.as_mut().unwrap().timeout_ms += 1;
+    assert!(crate::config::ConfigGeneration::restore_process(loaded, &binding, &key).is_err());
+}

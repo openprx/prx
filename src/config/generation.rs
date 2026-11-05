@@ -138,6 +138,13 @@ impl ProcessGenerationBinding {
         // nested maps so process-specific HashMap iteration cannot change a tag.
         let workspace = process_path_identity(&config.workspace_dir)?;
         let config_path = process_path_identity(&config.config_path)?;
+        // Disk migration materializes an absent advisory backend from the
+        // legacy backend. Bind that same effective representation for in-memory
+        // parents, while preserving every explicit override in the seal.
+        let mut normalized = config.clone();
+        if normalized.decision_engine.backend.is_none() {
+            normalized.decision_engine.backend = Some(normalized.causal_tree.backend.clone());
+        }
         let mut value = serde_json::to_value((
             self.id,
             &self.source_revision,
@@ -146,7 +153,7 @@ impl ProcessGenerationBinding {
             &self.deferred_changes,
             workspace,
             config_path,
-            config,
+            &normalized,
         ))?;
         value.sort_all_objects();
         Ok(serde_json::to_vec(&value)?)

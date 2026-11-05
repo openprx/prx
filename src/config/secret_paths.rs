@@ -631,6 +631,10 @@ pub static ENDPOINT_PATHS: &[EndpointPath] = &[
         "causal_tree.backend.endpoint",
         &[Key("causal_tree"), Key("backend"), Key("endpoint")],
     ),
+    recipient_url(
+        "decision_engine.backend.endpoint",
+        &[Key("decision_engine"), Key("backend"), Key("endpoint")],
+    ),
     // The endpoint a calibration was applied to (D-094 C-7): its userinfo is
     // redacted like the backend's, and it receives nothing.
     userinfo(
@@ -1795,6 +1799,9 @@ ws_url = "ws://wa:userinfo-sentinel-whatsapp@127.0.0.1:26"
 
 [causal_tree.backend]
 endpoint = "https://decider:userinfo-sentinel-decision@127.0.0.1:27/v1"
+
+[decision_engine.backend]
+endpoint = "https://decider:userinfo-sentinel-engine@127.0.0.1:28/v1"
 "#;
 
     /// `toml` (a partial configuration) overlaid onto the default tree, as a
@@ -3755,6 +3762,7 @@ classifier_provider = "custom:http://grace:userinfo-sentinel-classifier@127.0.0.
             agents,
             media,
             causal_tree,
+            decision_engine,
             security,
             compliance,
             tool_tiering,
@@ -3868,6 +3876,7 @@ output = 1.0
             "tunnel.custom" => d(c.tunnel.custom.as_ref()?),
             "chat.daemon" => d(&c.chat.daemon),
             "causal_tree.backend" => d(&c.causal_tree.backend),
+            "decision_engine.backend" => d(c.decision_engine.backend.as_ref()?),
             "nodes.nodes[0]" => d(c.nodes.nodes.first()?),
             "nodes.server" => d(&c.nodes.server),
             "proxy" => d(&c.proxy),
