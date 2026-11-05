@@ -37,13 +37,40 @@ impl RunCallAuthority {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PendingCall {
-    pub(crate) authority: RunCallAuthority,
-    pub(crate) subject: Subject,
-    pub(crate) source_event_id: String,
-    pub(crate) source_mac: [u8; 32],
-    pub(crate) operation: String,
-    pub(crate) risk: RiskLevel,
-    pub(crate) expires_at: DateTime<Utc>,
+    authority: RunCallAuthority,
+    subject: Subject,
+    source_event_id: String,
+    source_mac: [u8; 32],
+    operation: String,
+    risk: RiskLevel,
+    expires_at: DateTime<Utc>,
+}
+
+impl PendingCall {
+    pub(crate) const fn authority(&self) -> &RunCallAuthority {
+        &self.authority
+    }
+    pub(crate) const fn subject(&self) -> &Subject {
+        &self.subject
+    }
+    #[cfg(test)]
+    pub(crate) fn source_event_id(&self) -> &str {
+        &self.source_event_id
+    }
+    pub(crate) fn view(&self) -> super::pending::DecisionApprovalView {
+        super::pending::DecisionApprovalView {
+            decision_id: String::new(),
+            call_id: Some(self.authority.call_id()),
+            tool: None,
+            arguments: None,
+            arguments_redacted: true,
+            original_call_available: false,
+            effect: "approval_required".into(),
+            call_digest: hex::encode(self.authority.call_digest),
+            pending_expires_at: self.expires_at,
+            single_use: true,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,27 +216,93 @@ impl ApprovalLedgerPort<'_> {
 
     pub(crate) async fn record_pending(
         &self,
-        mut pending: PendingCall,
-    ) -> anyhow::Result<crate::tools::ToolExecutionStatus> {
+        envelope: &crate::runtime::envelope::RuntimeEnvelope,
+        capability: &crate::causal_tree::branch::CapabilityRef,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> anyhow::Result<PendingCall> {
+        let owner = envelope
+            .owner_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .context("approval owner missing")?;
         anyhow::ensure!(
-            !pending.operation.is_empty()
-                && !pending.subject.agent_id.is_empty()
-                && !pending.subject.principal_id.is_empty()
-                && pending.expires_at > Utc::now()
-                && pending.expires_at <= Utc::now() + chrono::Duration::minutes(5),
-            "call approval scope is incomplete or expired"
+            envelope.workspace_id == self.workspace && !envelope.session_key.is_empty(),
+            "call approval scope is incomplete"
         );
         let source = self
-            .source(
-                &pending,
-                &pending.subject.owner_id,
-                pending.subject.session_key.as_deref().unwrap_or(""),
+            .memory
+            .find_owned_message_event(
+                self.workspace,
+                owner,
+                envelope
+                    .source_message_event_id
+                    .as_deref()
+                    .context("approval source missing")?,
             )
-            .await?;
-        pending.source_mac = self.state_key.hmac(
-            KeyDomain::ApprovalState,
-            &[b"call.source", &serde_json::to_vec(&source)?],
+            .await?
+            .context("approval source is not durable")?;
+        anyhow::ensure!(
+            source.id > 0
+                && source.role == "user"
+                && source.event_type == "message.created"
+                && source.workspace_id == self.workspace
+                && source.owner_id.as_deref() == Some(owner)
+                && source.session_key.as_deref() == Some(envelope.session_key.as_str())
+                && source.run_id == envelope.run_id,
+            "call approval source scope changed"
         );
+        let (operation, risk) = match crate::security::approval_operation::grant_op_for_call(tool, arguments) {
+            Some(crate::security::approval_operation::GrantOp::ResourceExact(op, risk)) => (op, risk),
+            _ => anyhow::bail!("call approval requires an exact resource operation"),
+        };
+        let authority = RunCallAuthority::for_call(
+            capability,
+            CallDigestSource {
+                workspace: &source.workspace_id,
+                owner,
+                session: &envelope.session_key,
+                run: source.run_id.as_deref(),
+                event: Some(&source.event_id),
+                channel: source.channel.as_deref(),
+                sender: source.sender.as_deref(),
+                generation: source.config_generation_id,
+                revision: source.config_source_revision.as_deref(),
+            },
+            arguments,
+            &operation,
+            risk,
+        )?;
+        if self
+            .memory
+            .find_message_event_by_idempotency_key(self.workspace, &authority.pending_key())
+            .await?
+            .is_some()
+        {
+            return self.inspect(owner, &envelope.session_key, &authority).await;
+        }
+        let pending = PendingCall {
+            authority,
+            subject: Subject {
+                workspace_id: self.workspace.into(),
+                owner_id: owner.into(),
+                session_key: source.session_key.clone(),
+                agent_id: source
+                    .agent_id
+                    .clone()
+                    .filter(|agent| !agent.is_empty())
+                    .unwrap_or_else(|| "prx_agent".into()),
+                principal_id: owner.into(),
+            },
+            source_event_id: source.event_id.clone(),
+            source_mac: self.state_key.hmac(
+                KeyDomain::ApprovalState,
+                &[b"call.source", &serde_json::to_vec(&source)?],
+            ),
+            operation,
+            risk,
+            expires_at: Utc::now() + chrono::Duration::minutes(4),
+        };
         let signed = self.sign(b"call.pending", pending)?;
         let event = self
             .write(
@@ -225,7 +318,7 @@ impl ApprovalLedgerPort<'_> {
             )? == serde_json::to_value(&signed)?,
             "pending call approval conflicts"
         );
-        Ok(crate::tools::ToolExecutionStatus::AwaitingApproval)
+        Ok(signed.record)
     }
 
     async fn load(
@@ -256,13 +349,22 @@ impl ApprovalLedgerPort<'_> {
         Ok((signed, source))
     }
 
+    pub(crate) async fn inspect(
+        &self,
+        owner: &str,
+        session: &str,
+        authority: &RunCallAuthority,
+    ) -> anyhow::Result<PendingCall> {
+        Ok(self.load(owner, session, authority).await?.0.record)
+    }
+
     pub(crate) async fn review(
         &self,
         owner: &str,
         session: &str,
         authority: &RunCallAuthority,
         approved: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<DateTime<Utc>> {
         let (pending, source) = self.load(owner, session, authority).await?;
         let grant = if approved {
             let mut grant = ApprovalGrantV2::issue_one_shot(
@@ -304,7 +406,11 @@ impl ApprovalLedgerPort<'_> {
                 "issued call approval changed"
             );
         }
-        Ok(())
+        Ok(stored
+            .record
+            .grant
+            .as_ref()
+            .map_or(pending.record.expires_at, |grant| grant.expires_at))
     }
 
     fn verify_grant(&self, pending: &PendingCall, grant: &ApprovalGrantV2) -> anyhow::Result<()> {
@@ -329,6 +435,24 @@ impl ApprovalLedgerPort<'_> {
         authority: &RunCallAuthority,
     ) -> anyhow::Result<MessageEvent> {
         self.resolve(owner, session, authority, false).await
+    }
+
+    pub(crate) async fn claim_if_approved(
+        &self,
+        owner: &str,
+        session: &str,
+        authority: &RunCallAuthority,
+    ) -> anyhow::Result<Option<ApprovalGrantV2>> {
+        let Some(issued) = self
+            .memory
+            .find_message_event_by_idempotency_key(self.workspace, &authority.issued_key(""))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let signed: Signed<CallReview> = self.decode(&issued, b"call.review")?;
+        self.claim(owner, session, authority).await?;
+        Ok(Some(signed.record.grant.context("call approval grant missing")?))
     }
 
     pub(crate) async fn revoke(

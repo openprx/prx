@@ -953,6 +953,9 @@ pub(super) async fn get_decision_approval(
     Path((session_id, decision_id)): Path<(String, String)>,
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
 ) -> Response {
+    if decision_id.starts_with("call.") {
+        return call_approval_action(state, session_id, decision_id, principal, None).await;
+    }
     let decision_id = match crate::causal_tree::ids::DecisionId::parse(&decision_id) {
         Ok(id) => id,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid decision id"),
@@ -1040,27 +1043,77 @@ pub(super) async fn get_session_approvals(
     let result = cleanup
         .run(Box::pin(async {
             let service = runtime.decision_slot.publish(&runtime, &state).await?;
-            service
+            let page = service
                 .list_pending_decision_approvals(&principal.owner_id, after_id, limit)
-                .await
+                .await?;
+            let mut envelope = RuntimeEnvelope::console(
+                runtime
+                    .config_generation
+                    .effective
+                    .workspace_dir
+                    .to_string_lossy()
+                    .as_ref(),
+                "approval-inbox",
+            );
+            envelope.owner_id = Some(principal.owner_id.clone());
+            let adapter = service.call_approval_strategy(envelope)?;
+            let calls = adapter
+                .port
+                .list_pending_calls(&principal.owner_id, after_id, limit)
+                .await?;
+            let mut rows = Vec::new();
+            use crate::security::approval_ledger::keys::{ApprovalAuthority, DecisionAuthority};
+            for item in page.items {
+                let key = DecisionAuthority(crate::causal_tree::ids::DecisionId::parse(&item.view.decision_id)?)
+                    .pending_key();
+                let event = service
+                    .memory()
+                    .find_message_event_by_idempotency_key(adapter.port.workspace, &key)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("pending approval disappeared"))?;
+                rows.push((
+                    event.id,
+                    ApprovalInboxItem {
+                        session_id: item.session_id,
+                        view: item.view,
+                    },
+                ));
+            }
+            for item in calls.items {
+                let event = service
+                    .memory()
+                    .find_message_event_by_idempotency_key(adapter.port.workspace, &item.authority().pending_key())
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("pending call disappeared"))?;
+                rows.push((
+                    event.id,
+                    ApprovalInboxItem {
+                        session_id: item.subject().session_key.clone().unwrap_or_default(),
+                        view: item.view(),
+                    },
+                ));
+            }
+            // Do not advance past either reader's bounded scan frontier.
+            let frontier = page.next_cursor.into_iter().chain(calls.next_cursor).min();
+            if let Some(frontier) = frontier {
+                rows.retain(|(id, _)| *id <= frontier);
+            }
+            rows.sort_by_key(|(id, _)| *id);
+            let more = rows.len() > limit;
+            rows.truncate(limit);
+            let next_cursor = if more {
+                rows.last().map(|(id, _)| id.to_string())
+            } else {
+                frontier.map(|id| id.to_string())
+            };
+            Ok::<_, anyhow::Error>(ApprovalInboxResponse {
+                approvals: rows.into_iter().map(|(_, item)| item).collect(),
+                next_cursor,
+            })
         }))
         .await;
     match result {
-        Ok(page) => {
-            let approvals = page
-                .items
-                .into_iter()
-                .map(|item| ApprovalInboxItem {
-                    session_id: item.session_id,
-                    view: item.view,
-                })
-                .collect();
-            Json(ApprovalInboxResponse {
-                approvals,
-                next_cursor: page.next_cursor.map(|id| id.to_string()),
-            })
-            .into_response()
-        }
+        Ok(page) => Json(page).into_response(),
         Err(error) => {
             tracing::warn!(error = %error, "approval inbox failed");
             json_error(StatusCode::SERVICE_UNAVAILABLE, "Approval inbox is unavailable")
@@ -1162,6 +1215,9 @@ async fn change_decision_approval(
     principal: super::ApiPrincipal,
     change: DecisionApprovalChange,
 ) -> Response {
+    if decision_id.starts_with("call.") {
+        return call_approval_action(state, session_id, decision_id, principal, Some(change)).await;
+    }
     let decision_id = match crate::causal_tree::ids::DecisionId::parse(&decision_id) {
         Ok(id) => id,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid decision id"),
@@ -3754,4 +3810,75 @@ mod tests {
         assert_ne!(error, "Decision approvals are disabled", "{body}");
         assert!(!error.to_ascii_lowercase().contains("disabled"), "{body}");
     }
+}
+
+async fn call_approval_action(
+    state: AppState,
+    session: String,
+    id: String,
+    principal: super::ApiPrincipal,
+    change: Option<DecisionApprovalChange>,
+) -> Response {
+    use crate::security::approval_ledger::keys::RunCallAuthority;
+    let authority = match RunCallAuthority::parse_call_id(&id) {
+        Ok(value) => value,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid call id"),
+    };
+    let runtime = state.pin_turn_runtime();
+    if !runtime.config_generation.effective.causal_tree.enabled {
+        return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
+    }
+    if change.is_some() {
+        if let Err(message) = console_decision_control_policy(&runtime.config_generation.effective) {
+            return json_error(StatusCode::FORBIDDEN, message);
+        }
+    }
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let cleanup =
+        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
+            Ok(value) => value,
+            Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining"),
+        };
+    let result = cleanup
+        .run(Box::pin(async {
+            let service = runtime.decision_slot.publish(&runtime, &state).await?;
+            let mut envelope = RuntimeEnvelope::console(
+                runtime
+                    .config_generation
+                    .effective
+                    .workspace_dir
+                    .to_string_lossy()
+                    .as_ref(),
+                &session,
+            );
+            envelope.owner_id = Some(principal.owner_id.clone());
+            let adapter = service.call_approval_strategy(envelope)?;
+            let pending = adapter.port.inspect(&principal.owner_id, &session, &authority).await?;
+            let receipt = match change {
+                None => serde_json::to_value(pending.view())?,
+                Some(DecisionApprovalChange::Review(approved)) => {
+                    let expires_at = adapter
+                        .port
+                        .review(&principal.owner_id, &session, &authority, approved)
+                        .await?;
+                    serde_json::json!({"decision_id":"", "call_id":id, "approved":approved,
+                        "grant_count":usize::from(approved), "expires_at":expires_at})
+                }
+                Some(DecisionApprovalChange::Revoke) => {
+                    adapter.port.revoke(&principal.owner_id, &session, &authority).await?;
+                    serde_json::json!({"decision_id":"", "call_id":id, "revoked_grants":1})
+                }
+            };
+            Ok::<_, anyhow::Error>(receipt)
+        }))
+        .await;
+    result.map_or_else(
+        |_| {
+            json_error(
+                StatusCode::CONFLICT,
+                "Call approval is unavailable, expired, or already resolved",
+            )
+        },
+        |view| Json(view).into_response(),
+    )
 }

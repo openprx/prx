@@ -33,6 +33,7 @@ mod store_preparation;
 pub(crate) use build_error::TurnServiceBuildError;
 
 mod approval;
+mod call_approval;
 mod child_recovery;
 mod delegation;
 mod discovery;

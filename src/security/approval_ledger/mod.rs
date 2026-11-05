@@ -6,9 +6,8 @@ pub(crate) mod keys;
 pub(crate) mod pending;
 pub(crate) mod resolution;
 mod resume;
-// Introduced in prerequisite R1; production consumer is wired in R2.
-#[allow(dead_code)]
 pub(crate) mod run_call;
+pub(crate) mod strategy;
 pub(crate) use resume::ResumeRequestScope;
 mod review;
 #[cfg(test)]

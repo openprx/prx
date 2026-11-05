@@ -149,6 +149,14 @@ legacy or malformed gate summaries remain unavailable.
 
 ### Decision approval and resume
 
+Run-keyed approvals use the same list, inspect, review and revoke routes. Their
+projection adds an optional `call_id`; pass that opaque ID in the existing
+`{decision_id}` path slot. Decision-keyed responses omit `call_id` and keep their
+existing fields. Call approvals require the authenticated owner and session,
+expire, and can be claimed only once. This ledger adapter is not installed in
+ordinary tool dispatch yet. Revert the run-keyed approval change to roll back;
+decision approval events and IDs remain independent.
+
 In a conversation, expand **Review a pending operation**, enter the decision
 identifier from the waiting reply, and load its details. Inspect the tool,
 effect and redacted arguments before approving. Approval, rejection,
