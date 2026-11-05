@@ -73,7 +73,7 @@ impl ConfigSourceRevision {
             });
         }
 
-        let encoded = serde_json::to_vec(config)?;
+        let encoded = serde_json::to_vec(&normalized_process_config(config)?)?;
         Ok(Self {
             fingerprint_sha256: format!("{:x}", Sha256::digest(encoded)),
             disk_generation: None,
@@ -132,25 +132,30 @@ pub struct ProcessGenerationBinding {
     pub seal: [u8; 32],
 }
 
+// Disk migration materializes the inherited backend. Fingerprints and seals
+// must bind the same representation while retaining explicit overrides.
+fn normalized_process_config(config: &Config) -> anyhow::Result<serde_json::Value> {
+    let mut normalized = serde_json::to_value(config)?;
+    let backend = crate::decision_engine::config::effective_backend(
+        config.decision_engine.backend.as_ref(),
+        &config.causal_tree.backend,
+    );
+    let mut engine = config.decision_engine.clone();
+    engine.backend = Some(backend.clone());
+    if let Some(root) = normalized.as_object_mut() {
+        root.insert("decision_engine".into(), serde_json::to_value(engine)?);
+    }
+    normalized.sort_all_objects();
+    Ok(normalized)
+}
+
 impl ProcessGenerationBinding {
     fn signing_payload(&self, config: &Config) -> anyhow::Result<Vec<u8>> {
         // Config excludes both paths from serde; bind them explicitly. Sort
         // nested maps so process-specific HashMap iteration cannot change a tag.
         let workspace = process_path_identity(&config.workspace_dir)?;
         let config_path = process_path_identity(&config.config_path)?;
-        // Disk migration materializes an absent advisory backend from the
-        // legacy backend. Bind that same effective representation for in-memory
-        // parents, while preserving every explicit override in the seal.
-        let mut normalized = serde_json::to_value(config)?;
-        let backend = crate::decision_engine::config::effective_backend(
-            config.decision_engine.backend.as_ref(),
-            &config.causal_tree.backend,
-        );
-        let mut engine = config.decision_engine.clone();
-        engine.backend = Some(backend.clone());
-        if let Some(root) = normalized.as_object_mut() {
-            root.insert("decision_engine".into(), serde_json::to_value(engine)?);
-        }
+        let normalized = normalized_process_config(config)?;
         let mut value = serde_json::to_value((
             self.id,
             &self.source_revision,

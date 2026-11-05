@@ -8,4 +8,5 @@ pub mod render;
 pub(crate) mod turn;
 pub use contract::*;
 #[cfg(test)]
+#[path = "turn_tests.rs"]
 mod tests;

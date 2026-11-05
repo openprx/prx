@@ -1,5 +1,6 @@
 //! Default-off advisory engine configuration and raw-key migration.
 pub use crate::causal_tree::config::DecisionBackendConfig;
+use crate::causal_tree::config::DecisionBackendConfig as BackendConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -131,7 +132,7 @@ impl DecisionEngineConfig {
 pub(crate) fn effective_backend<'a>(
     explicit: Option<&'a DecisionBackendConfig>,
     legacy: &'a DecisionBackendConfig,
-) -> &'a DecisionBackendConfig {
+) -> &'a BackendConfig {
     explicit.unwrap_or(legacy)
 }
 
@@ -157,17 +158,7 @@ pub(crate) fn migrate_backend(root: &mut toml::Value) -> anyhow::Result<()> {
     };
     // Materialize full defaults before empty-table pruning. An empty explicit
     // table is still an override, and must never inherit a legacy backend.
-    let inherited = if explicit.is_none() {
-        legacy
-            .as_ref()
-            .map(|raw| -> anyhow::Result<toml::Value> {
-                let parsed: DecisionBackendConfig = raw.clone().try_into()?;
-                Ok(toml::Value::try_from(effective_backend(None, &parsed))?)
-            })
-            .transpose()?
-    } else {
-        None
-    };
+    let inherited = if explicit.is_none() { legacy } else { None };
     if let Some(raw) = explicit.or(inherited) {
         let full = if empty_tables_only(&raw) {
             toml::Value::try_from(DecisionBackendConfig::default())?
