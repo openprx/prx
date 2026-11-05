@@ -367,6 +367,8 @@ jobs:
               uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
               with:
                   name: prx-tests-${{ matrix.archive }}
+            # Tests spawn the binary via env!("CARGO_BIN_EXE_prx"), a compile-time path under
+            # $GITHUB_WORKSPACE/target. Extract the archive there so that path exists in this job.
             - name: Run shard ${{ matrix.part }} of ${{ matrix.archive }} (guard home, loopback-only network, 60 s per test)
               if: needs.changes.outputs.heavy_timeout == '45'
               env:
@@ -375,6 +377,7 @@ jobs:
                   set -euo pipefail
                   python3 scripts/ci/observe_test_gate.py ./scripts/ci/test_home_guard.sh \
                       --archive-file prx-tests-${{ matrix.archive }}.tar.zst --workspace-remap "$GITHUB_WORKSPACE" \
+                      --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
                       --profile ci --no-fail-fast \
                       -E 'not (binary(architecture_boundaries) and not test(/^retired_feature::/))' \
                       --partition hash:${{ matrix.part }} 2>&1 | tee shard.log
