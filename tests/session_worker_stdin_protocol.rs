@@ -595,9 +595,12 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     let wrong_parent_result = assert_single_json_line(&wrong_parent_run.stdout);
     assert!(wrong_parent_run.status.success());
     assert!(!wrong_parent_result.success);
-    assert_eq!(
-        wrong_parent_result.error.as_deref(),
-        Some("session-worker parent decision differs from issued authority")
+    // The worker reports the full error chain (path context first); the
+    // refusal reason must stay the innermost cause.
+    let wrong_parent_result_error = wrong_parent_result.error.as_deref().unwrap_or_default();
+    assert!(
+        wrong_parent_result_error.ends_with("session-worker parent decision differs from issued authority"),
+        "unexpected refusal: {wrong_parent_result_error}"
     );
     assert_eq!(seen.lock().len(), requests_before_wrong_parent);
     // Finding94: retain every original phase above, then exercise a new real
