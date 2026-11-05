@@ -7,6 +7,9 @@ status-level = "slow"
 final-status-level = "slow"
 
 [profile.ci]
+# QA runners have a 4-CPU quota; run at most 4 tests at once so wall-clock
+# deadlines inside tests are not starved (QA runs 42018222917, 42055508885).
+test-threads = 4
 slow-timeout = { period = "60s", terminate-after = 1 }
 fail-fast = false
 failure-output = "immediate-final"
@@ -20,3 +23,9 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 [[profile.ci.overrides]]
 filter = 'test(=agent_allows_one_thousand_tool_iterations_to_finish)'
 slow-timeout = { period = "60s", terminate-after = 4 }
+
+# PTY and child-process end-to-end tests drive a real `prx` binary plus its
+# children; give each two of the four slots.
+[[profile.ci.overrides]]
+filter = 'binary(chat_pty_e2e) | binary(session_worker_stdin_protocol)'
+threads-required = 2
