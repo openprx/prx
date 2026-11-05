@@ -367,9 +367,12 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     let bad_run = finish(bad_child, None);
     let bad_result = assert_single_json_line(&bad_run.stdout);
     assert!(!bad_result.success, "wrong sealed key must be refused");
-    assert_eq!(
-        bad_result.error.as_deref(),
-        Some("worker provider or credential provenance differs from issued selection")
+    // The worker reports the full error chain (path context first); the
+    // refusal reason must stay the innermost cause.
+    let bad_result_error = bad_result.error.as_deref().unwrap_or_default();
+    assert!(
+        bad_result_error.ends_with("worker provider or credential provenance differs from issued selection"),
+        "unexpected refusal: {bad_result_error}"
     );
     assert_eq!(seen.lock().len(), served_requests);
 
@@ -718,9 +721,12 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         "refused missing-source worker exits cleanly"
     );
     assert!(!missing_source_result.success, "missing provenance must be refused");
-    assert_eq!(
-        missing_source_result.error.as_deref(),
-        Some("worker provider or credential provenance differs from issued selection")
+    // The worker reports the full error chain (path context first); the
+    // refusal reason must stay the innermost cause.
+    let missing_source_result_error = missing_source_result.error.as_deref().unwrap_or_default();
+    assert!(
+        missing_source_result_error.ends_with("worker provider or credential provenance differs from issued selection"),
+        "unexpected refusal: {missing_source_result_error}"
     );
     assert_eq!(
         requests.len(),
