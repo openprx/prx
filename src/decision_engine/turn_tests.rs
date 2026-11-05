@@ -1,8 +1,9 @@
 // Included in decision_engine::tests so card test names remain exact.
 use crate::decision_engine::config::{DecisionEngineConfig, DecisionMode};
 use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct RequestSpy {
@@ -24,7 +25,7 @@ impl Provider for RequestSpy {
         if let Some(store) = &self.store {
             assert!(!store.exists(), "observe must run after the final provider outcome");
         }
-        let mut requests = self.requests.lock().unwrap();
+        let mut requests = self.requests.lock();
         let first = requests.is_empty();
         requests.push(serde_json::json!({"messages": request.messages, "tools": request.tools}));
         Ok(ChatResponse {
@@ -135,7 +136,7 @@ async fn exercise(config: Option<DecisionEngineConfig>, advice: Option<IntentAna
     let store = directory.path().join("decision-engine.sqlite");
     drop(admission);
     TurnProbe {
-        requests: provider.requests.into_inner().unwrap(),
+        requests: provider.requests.into_inner(),
         trace,
         store,
         dispatches: calls.load(Ordering::SeqCst),
@@ -199,10 +200,20 @@ async fn disabled_engine_is_byte_identical_in_one_build() {
         serde_json::to_vec(&before.requests).unwrap(),
         serde_json::to_vec(&after.requests).unwrap()
     );
-    assert_eq!(before.requests[0]["tools"], after.requests[0]["tools"]);
+    let before_tools = before
+        .requests
+        .get(0)
+        .and_then(|request| request.get("tools"))
+        .expect("disabled_engine_is_byte_identical_in_one_build: baseline request tools missing");
+    let after_tools = after
+        .requests
+        .get(0)
+        .and_then(|request| request.get("tools"))
+        .expect("disabled_engine_is_byte_identical_in_one_build: disabled request tools missing");
+    assert_eq!(before_tools, after_tools);
     assert_eq!(
-        crate::agent::prompt::prompt_sha256(&before.requests[0]["tools"].to_string()),
-        crate::agent::prompt::prompt_sha256(&after.requests[0]["tools"].to_string())
+        crate::agent::prompt::prompt_sha256(&before_tools.to_string()),
+        crate::agent::prompt::prompt_sha256(&after_tools.to_string())
     );
     assert_eq!(before.dispatches, 1);
     assert_eq!(after.dispatches, 1);
@@ -214,10 +225,19 @@ async fn disabled_engine_is_byte_identical_in_one_build() {
 async fn pre_mode_brief_is_bounded_redacted_deterministic_and_traced() {
     let first = exercise(Some(enabled(DecisionMode::Pre)), Some(long_analysis())).await;
     let second = exercise(Some(enabled(DecisionMode::Pre)), Some(long_analysis())).await;
-    let messages = first.requests[0]["messages"].as_array().unwrap();
-    let brief = messages.iter().rev().find(|m| m["role"] == "system").unwrap()["content"]
-        .as_str()
-        .unwrap();
+    let messages = first
+        .requests
+        .get(0)
+        .and_then(|request| request.get("messages"))
+        .and_then(serde_json::Value::as_array)
+        .expect("pre_mode_brief_is_bounded_redacted_deterministic_and_traced: request messages missing");
+    let brief = messages
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .expect("pre_mode_brief_is_bounded_redacted_deterministic_and_traced: system brief missing");
     assert!(crate::agent::context_budget::count_tokens(brief) <= 50);
     assert!(!brief.contains("sk-test-private-credential-value"));
     assert_eq!(first.requests, second.requests);
@@ -238,15 +258,22 @@ async fn post_mode_records_outcome_without_brief() {
     );
     let records = recorded(&probe).await;
     assert_eq!(records.len(), 1);
-    assert!(records[0].succeeded());
-    assert!(records[0].decision_id().is_none());
+    let outcome = records
+        .get(0)
+        .expect("post_mode_records_outcome_without_brief: recorded outcome missing");
+    assert!(outcome.succeeded());
+    assert!(outcome.decision_id().is_none());
     assert_eq!(probe.dispatches, 1);
 }
 #[tokio::test]
 async fn both_mode_links_outcome_to_analysis_decision_id() {
     let probe = exercise(Some(enabled(DecisionMode::Both)), Some(long_analysis())).await;
     assert!(probe.trace.decision_brief_sha256.is_some());
-    assert_eq!(recorded(&probe).await[0].decision_id(), Some("decision_a"));
+    let records = recorded(&probe).await;
+    let outcome = records
+        .get(0)
+        .expect("both_mode_links_outcome_to_analysis_decision_id: recorded outcome missing");
+    assert_eq!(outcome.decision_id(), Some("decision_a"));
 }
 #[tokio::test]
 async fn zero_telemetry_cap_opens_no_store_and_still_renders_brief() {
