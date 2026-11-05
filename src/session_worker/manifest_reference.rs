@@ -68,23 +68,31 @@ impl PreparedManifest {
         );
         // Resolve the operator's workspace once, then reject symbolic links in
         // every component when opening the actual private snapshot directory.
-        let workspace = std::fs::canonicalize(&manifest.workspace_dir)?;
+        let workspace = std::fs::canonicalize(&manifest.workspace_dir)
+            .with_context(|| format!("resolve worker workspace {}", manifest.workspace_dir.display()))?;
         let directory = tempfile::Builder::new()
             .prefix(".prx-worker-")
             .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in(&workspace)?;
+            .tempdir_in(&workspace)
+            .with_context(|| format!("create worker snapshot directory in {}", workspace.display()))?;
         let dir = open_private_directory(directory.path())?;
         let fd = rustix::fs::openat(
             &dir,
             SNAPSHOT,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
-        )?;
+        )
+        .with_context(|| format!("create worker snapshot {}", directory.path().join(SNAPSHOT).display()))?;
+        let snapshot_path = directory.path().join(SNAPSHOT);
         let mut file = File::from(fd);
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o400))?;
-        file.sync_all()?;
+        file.write_all(&bytes)
+            .with_context(|| format!("write worker snapshot {}", snapshot_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync worker snapshot {}", snapshot_path.display()))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o400))
+            .with_context(|| format!("protect worker snapshot {}", snapshot_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync worker snapshot {}", snapshot_path.display()))?;
         drop(file); // No writable handle survives publication.
         let nonce = directory
             .path()
@@ -133,7 +141,10 @@ impl PreparedManifest {
     /// Call only after independently confirmed child reap.
     pub(crate) fn close(&mut self) -> Result<()> {
         if let Some(directory) = self.directory.take() {
-            directory.close().context("remove owned worker manifest snapshot")?;
+            let path = directory.path().to_owned();
+            directory
+                .close()
+                .with_context(|| format!("remove owned worker manifest snapshot {}", path.display()))?;
         }
         Ok(())
     }
@@ -155,15 +166,25 @@ impl Drop for PreparedManifest {
 fn open_private_directory(path: &Path) -> Result<OwnedFd> {
     anyhow::ensure!(path.is_absolute(), "worker snapshot directory must be absolute");
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut dir = rustix::fs::open("/", flags, Mode::empty())?;
+    let mut dir = rustix::fs::open("/", flags, Mode::empty())
+        .with_context(|| format!("open root for worker snapshot directory {}", path.display()))?;
     for component in path.components() {
         match component {
             Component::RootDir => {}
-            Component::Normal(name) => dir = rustix::fs::openat(&dir, name, flags, Mode::empty())?,
+            Component::Normal(name) => {
+                dir = rustix::fs::openat(&dir, name, flags, Mode::empty()).with_context(|| {
+                    format!(
+                        "open component {} of worker snapshot directory {}",
+                        Path::new(name).display(),
+                        path.display()
+                    )
+                })?
+            }
             _ => anyhow::bail!("worker snapshot directory is not a clean absolute path"),
         }
     }
-    let stat = rustix::fs::fstat(&dir)?;
+    let stat =
+        rustix::fs::fstat(&dir).with_context(|| format!("inspect worker snapshot directory {}", path.display()))?;
     anyhow::ensure!(
         stat.st_uid == rustix::process::geteuid().as_raw() && stat.st_mode & 0o777 == 0o700,
         "worker snapshot directory is not private and owned"
@@ -208,16 +229,25 @@ pub(crate) fn restore(
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     )
-    .context("worker manifest reference was already claimed or cannot be claimed")?;
+    .with_context(|| {
+        format!(
+            "claim worker manifest reference {} (already claimed or unavailable)",
+            body.directory.join(CLAIM).display()
+        )
+    })?;
     drop(claim);
     let fd = rustix::fs::openat(
         &dir,
         SNAPSHOT,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
-    )?;
+    )
+    .with_context(|| format!("open worker snapshot {}", body.directory.join(SNAPSHOT).display()))?;
+    let snapshot_path = body.directory.join(SNAPSHOT);
     let mut file = File::from(fd);
-    let before = file.metadata()?;
+    let before = file
+        .metadata()
+        .with_context(|| format!("inspect worker snapshot {}", snapshot_path.display()))?;
     anyhow::ensure!(
         before.is_file()
             && before.uid() == rustix::process::geteuid().as_raw()
@@ -227,8 +257,13 @@ pub(crate) fn restore(
         "worker snapshot is not an immutable owned regular file of the expected size"
     );
     let mut bytes = Vec::with_capacity(usize::try_from(body.bytes)?);
-    (&mut file).take(body.bytes.saturating_add(1)).read_to_end(&mut bytes)?;
-    let after = file.metadata()?;
+    (&mut file)
+        .take(body.bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read worker snapshot {}", snapshot_path.display()))?;
+    let after = file
+        .metadata()
+        .with_context(|| format!("inspect worker snapshot {}", snapshot_path.display()))?;
     anyhow::ensure!(
         u64::try_from(bytes.len())? == body.bytes
             && after.len() == before.len()
