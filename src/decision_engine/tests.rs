@@ -186,3 +186,90 @@ async fn observe_evicts_fifo_at_telemetry_cap() {
     store.append_fifo(outcome("d"), 2).unwrap();
     assert_eq!(store.outcomes().unwrap(), vec![outcome("c"), outcome("d")]);
 }
+
+#[test]
+fn observe_without_runtime_returns_typed_error_before_opening_store() {
+    let result = ObserveQueue::start(1, 1, CancellationToken::new(), || panic!("must not open"));
+    assert!(matches!(result, Err(observe::ObserveStartError::Runtime(_))));
+}
+
+#[test]
+fn dedicated_observation_worker_does_not_hold_runtime_shutdown() {
+    struct Writer;
+    impl TelemetryWriter for Writer {
+        fn append_fifo(&mut self, _: TurnOutcome, _: usize) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let cancel = CancellationToken::new();
+    let (queue, worker) =
+        runtime.block_on(async { ObserveQueue::start(1, 1, cancel.clone(), || Ok(Box::new(Writer))).unwrap() });
+    let (done, shutdown) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        drop(runtime);
+        done.send(()).unwrap();
+    });
+    let result = shutdown.recv_timeout(std::time::Duration::from_secs(2));
+    cancel.cancel();
+    drop(queue);
+    thread.join().unwrap();
+    assert!(result.is_ok(), "idle telemetry must not hold runtime shutdown");
+    assert!(worker.unwrap().blocking_recv().is_ok());
+}
+
+#[test]
+fn disabled_direct_backend_timeout_obeys_legacy_upper_bound() {
+    let mut config = config::DecisionEngineConfig {
+        backend: Some(Default::default()),
+        ..Default::default()
+    };
+    for timeout in [9, 5_001, u32::MAX] {
+        config.backend.as_mut().unwrap().timeout_ms = timeout;
+        assert!(config.validate().is_err());
+    }
+    for timeout in [10, 2_000, 5_000] {
+        config.backend.as_mut().unwrap().timeout_ms = timeout;
+        assert!(config.validate().is_ok());
+    }
+}
+
+#[test]
+fn process_seal_matches_inherited_backend_and_rejects_changed_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config {
+        config_path: dir.path().join("config.toml"),
+        workspace_dir: dir.path().join("workspace"),
+        ..Default::default()
+    };
+    config.causal_tree.backend.timeout_ms = 2_000;
+    let generation = crate::config::new_shared(config.clone()).pin();
+    let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx-engine-seal-fixture");
+    let key = crate::decision::DecisionKey::from_worker_channel(&transport, "prx-workspace", "prx-run", "prx-config")
+        .unwrap();
+    let binding = generation.bind_process(&key).unwrap();
+    config.decision_engine.backend = Some(config.causal_tree.backend.clone());
+    crate::config::ConfigGeneration::restore_process(config.clone(), &binding, &key).unwrap();
+    config.decision_engine.backend.as_mut().unwrap().timeout_ms = 250;
+    assert!(crate::config::ConfigGeneration::restore_process(config, &binding, &key).is_err());
+}
+
+#[test]
+fn rendered_brief_is_bounded_redacted_deterministic() {
+    let mut analysis = IntentAnalysis::default();
+    for i in 0..100 {
+        analysis
+            .global
+            .insert(format!("question_{i:03}"), IntentValue::Probability(0.7));
+    }
+    analysis.global.insert(
+        "authorization: Bearer sk-test-private-credential-value".into(),
+        IntentValue::Probability(0.5),
+    );
+    let brief = render::render_decision_brief(&analysis, 50, 1);
+    assert_eq!(brief, render::render_decision_brief(&analysis, 50, 1));
+    assert!(crate::agent::context_budget::count_tokens(&brief) <= 50);
+    assert!(!brief.contains("sk-test-private-credential-value"));
+    assert!(brief.contains("question_"));
+    assert_eq!(render::render_decision_brief(&analysis, 0, 0), "");
+}

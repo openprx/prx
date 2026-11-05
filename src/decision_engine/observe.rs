@@ -16,6 +16,18 @@ pub struct ObserveCounters {
     pub dropped: AtomicU64,
     pub store_errors: AtomicU64,
 }
+#[derive(Debug, thiserror::Error)]
+pub enum ObserveStartError {
+    #[error("invalid observation bounds")]
+    Bounds,
+    #[error("observation worker requires a Tokio runtime")]
+    Runtime(#[from] tokio::runtime::TryCurrentError),
+    #[error("observation store could not be opened")]
+    Store(#[source] anyhow::Error),
+    #[error("observation worker could not be started")]
+    Worker(#[from] std::io::Error),
+}
+
 pub struct ObserveQueue {
     sender: Option<mpsc::Sender<TurnOutcome>>,
     pub counters: Arc<ObserveCounters>,
@@ -33,50 +45,53 @@ impl ObserveQueue {
         cap: usize,
         cancel: CancellationToken,
         open: F,
-    ) -> anyhow::Result<(Self, Option<tokio::task::JoinHandle<()>>)>
+    ) -> Result<(Self, Option<tokio::sync::oneshot::Receiver<()>>), ObserveStartError>
     where
         F: FnOnce() -> anyhow::Result<Box<dyn TelemetryWriter>>,
     {
-        anyhow::ensure!(
-            queue > 0 && queue <= 1_024 && cap <= 100_000,
-            "invalid observation bounds"
-        );
+        if queue == 0 || queue > 1_024 || cap > 100_000 {
+            return Err(ObserveStartError::Bounds);
+        }
         if cap == 0 {
             return Ok((Self::disabled(), None));
         }
-        let mut writer = open()?;
+        let runtime = tokio::runtime::Handle::try_current()?;
+        let mut writer = open().map_err(ObserveStartError::Store)?;
         let (sender, mut receiver) = mpsc::channel(queue);
         let counters = Arc::new(ObserveCounters::default());
         let worker_counters = Arc::clone(&counters);
-        let runtime = tokio::runtime::Handle::current();
-        let worker = tokio::task::spawn_blocking(move || {
-            loop {
-                let outcome = runtime.block_on(async {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            // Stop admission, then persist every accepted outcome.
-                            receiver.close();
-                            None
+        let (finished, worker) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("decision-telemetry".into())
+            .spawn(move || {
+                loop {
+                    let outcome = runtime.block_on(async {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                // Stop admission, then persist every accepted outcome.
+                                receiver.close();
+                                None
+                            }
+                            outcome = receiver.recv() => outcome,
                         }
-                        outcome = receiver.recv() => outcome,
+                    });
+                    let Some(outcome) = outcome else {
+                        break;
+                    };
+                    if writer.append_fifo(outcome, cap).is_err() {
+                        worker_counters.store_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!("decision engine telemetry write failed");
                     }
-                });
-                let Some(outcome) = outcome else {
-                    break;
-                };
-                if writer.append_fifo(outcome, cap).is_err() {
-                    worker_counters.store_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!("decision engine telemetry write failed");
                 }
-            }
-            while let Some(outcome) = receiver.blocking_recv() {
-                if writer.append_fifo(outcome, cap).is_err() {
-                    worker_counters.store_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!("decision engine telemetry write failed");
+                while let Some(outcome) = receiver.blocking_recv() {
+                    if writer.append_fifo(outcome, cap).is_err() {
+                        worker_counters.store_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!("decision engine telemetry write failed");
+                    }
                 }
-            }
-        });
+                let _ = finished.send(());
+            })?;
         Ok((
             Self {
                 sender: Some(sender),

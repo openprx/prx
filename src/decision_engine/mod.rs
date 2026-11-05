@@ -4,6 +4,7 @@ pub mod config;
 pub mod contract;
 pub mod noop;
 pub mod observe;
+pub mod render;
 pub use contract::*;
 #[cfg(test)]
 mod tests;

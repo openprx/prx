@@ -85,7 +85,7 @@ impl DecisionEngineConfig {
                     "backend.timeout_ms",
                     backend.timeout_ms,
                     10,
-                    if self.enabled { self.timeout_ms } else { u32::MAX },
+                    if self.enabled { self.timeout_ms } else { 5_000 },
                 ),
                 ("backend.max_request_bytes", backend.max_request_bytes, 4_096, 1_048_576),
                 (
@@ -127,6 +127,14 @@ impl DecisionEngineConfig {
     }
 }
 
+/// Resolve the same inherited backend for disk migration and process seals.
+pub(crate) fn effective_backend<'a>(
+    explicit: Option<&'a DecisionBackendConfig>,
+    legacy: &'a DecisionBackendConfig,
+) -> &'a DecisionBackendConfig {
+    explicit.unwrap_or(legacy)
+}
+
 pub(crate) fn migrate_backend(root: &mut toml::Value) -> anyhow::Result<()> {
     let legacy = root.get("causal_tree").and_then(|v| v.get("backend")).cloned();
     let explicit = root.get("decision_engine").and_then(|v| v.get("backend")).cloned();
@@ -149,7 +157,18 @@ pub(crate) fn migrate_backend(root: &mut toml::Value) -> anyhow::Result<()> {
     };
     // Materialize full defaults before empty-table pruning. An empty explicit
     // table is still an override, and must never inherit a legacy backend.
-    if let Some(raw) = explicit.or(legacy) {
+    let inherited = if explicit.is_none() {
+        legacy
+            .as_ref()
+            .map(|raw| -> anyhow::Result<toml::Value> {
+                let parsed: DecisionBackendConfig = raw.clone().try_into()?;
+                Ok(toml::Value::try_from(effective_backend(None, &parsed))?)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(raw) = explicit.or(inherited) {
         let full = if empty_tables_only(&raw) {
             toml::Value::try_from(DecisionBackendConfig::default())?
         } else {

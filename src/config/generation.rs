@@ -141,9 +141,15 @@ impl ProcessGenerationBinding {
         // Disk migration materializes an absent advisory backend from the
         // legacy backend. Bind that same effective representation for in-memory
         // parents, while preserving every explicit override in the seal.
-        let mut normalized = config.clone();
-        if normalized.decision_engine.backend.is_none() {
-            normalized.decision_engine.backend = Some(normalized.causal_tree.backend.clone());
+        let mut normalized = serde_json::to_value(config)?;
+        let backend = crate::decision_engine::config::effective_backend(
+            config.decision_engine.backend.as_ref(),
+            &config.causal_tree.backend,
+        );
+        let mut engine = config.decision_engine.clone();
+        engine.backend = Some(backend.clone());
+        if let Some(root) = normalized.as_object_mut() {
+            root.insert("decision_engine".into(), serde_json::to_value(engine)?);
         }
         let mut value = serde_json::to_value((
             self.id,
