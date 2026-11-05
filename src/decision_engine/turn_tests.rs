@@ -314,7 +314,7 @@ impl Provider for RequestSpy {
             tool_calls: if first {
                 vec![ToolCall {
                     id: "call_a".into(),
-                    name: "advice_probe".into(),
+                    name: "file_read".into(),
                     arguments: "{}".into(),
                 }]
             } else {
@@ -327,10 +327,13 @@ struct DispatchSpy(Arc<AtomicUsize>);
 #[async_trait::async_trait]
 impl crate::tools::Tool for DispatchSpy {
     fn name(&self) -> &str {
-        "advice_probe"
+        "file_read"
     }
     fn description(&self) -> &str {
         "Records one admitted dispatch"
+    }
+    fn categories(&self) -> &'static [crate::tools::ToolCategory] {
+        &[crate::tools::ToolCategory::FileSystem]
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({"type":"object","properties":{}})
@@ -359,23 +362,28 @@ async fn exercise(config: Option<DecisionEngineConfig>, advice: Option<IntentAna
         ..Default::default()
     };
     runtime.autonomy.level = crate::security::AutonomyLevel::Full;
-    // Custom tools are searchable by default. Publish this fixture's tool
-    // directly so its scripted provider call is admitted before dispatch.
-    runtime.tool_tiering.always_include.push("advice_probe".into());
+    // Give the builtin selector a read-only filesystem identity and concrete
+    // path intent; a generic native spy abstains at the commit threshold.
+    // Publish the spy directly and retain real admission and execution gates.
+    runtime.tool_tiering.always_include.push("file_read".into());
     if let Some(config) = config {
         runtime.decision_engine = config;
     }
     let calls = Arc::new(AtomicUsize::new(0));
     let tools: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![Box::new(DispatchSpy(Arc::clone(&calls)))]);
-    let admission =
-        crate::agent::test_admission::AdmittedTurn::with_config(runtime, "Use advice_probe.", Arc::clone(&tools)).await;
+    let admission = crate::agent::test_admission::AdmittedTurn::with_config(
+        runtime,
+        "Use file_read to inspect ./fixture.txt.",
+        Arc::clone(&tools),
+    )
+    .await;
     let provider = RequestSpy {
         store: Some(directory.path().join("decision-engine.sqlite")),
         ..Default::default()
     };
     let mut history = vec![
         ChatMessage::system("system policy"),
-        ChatMessage::user("Use advice_probe."),
+        ChatMessage::user("Use file_read to inspect ./fixture.txt."),
     ];
     let (_, trace) = crate::agent::turn_engine::run_turn(
         &mut history,
@@ -494,11 +502,17 @@ async fn disabled_engine_is_byte_identical_in_one_build() {
         .and_then(|request| request.get("tools"))
         .expect("disabled_engine_is_byte_identical_in_one_build: disabled request tools missing");
     assert_eq!(before_tools, after_tools);
+    let tools = before_tools.as_array().expect("baseline tools must be published");
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(serde_json::Value::as_str) == Some("file_read"))
+    );
     assert_eq!(
         crate::agent::prompt::prompt_sha256(&before_tools.to_string()),
         crate::agent::prompt::prompt_sha256(&after_tools.to_string())
     );
-    assert_eq!(before.dispatches, 1);
+    assert_eq!(before.dispatches, 1, "provider requests: {:?}", before.requests);
     assert_eq!(after.dispatches, 1);
     assert!(!before.store.exists());
     assert!(!after.store.exists());
@@ -557,6 +571,7 @@ async fn both_mode_links_outcome_to_analysis_decision_id() {
         .get(0)
         .expect("both_mode_links_outcome_to_analysis_decision_id: recorded outcome missing");
     assert_eq!(outcome.decision_id(), Some("decision_a"));
+    assert_eq!(probe.dispatches, 1);
 }
 #[tokio::test]
 async fn zero_telemetry_cap_opens_no_store_and_still_renders_brief() {
