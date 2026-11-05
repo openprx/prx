@@ -1223,9 +1223,9 @@ impl SessionsSpawnTool {
                                     )
                                 }
                                 Err(error) => {
-                                    let msg = format!("Sub-agent process error: {error}");
+                                    let msg = format!("Sub-agent process error: {error:#}");
                                     (
-                                        SubAgentStatus::Failed(error.to_string()),
+                                        SubAgentStatus::Failed(format!("{error:#}")),
                                         msg,
                                         Vec::new(),
                                         if is_ordinary_process || is_operator_process || current_spawn_execution_context().as_ref()
