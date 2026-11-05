@@ -61,3 +61,25 @@ impl ApprovalAuthority for RunCallAuthority {
         format!("{}:resolution", self.namespace())
     }
 }
+
+impl RunCallAuthority {
+    pub(crate) fn call_id(&self) -> String {
+        format!(
+            "call.{}.{}",
+            hex::encode(self.run_id.as_bytes()),
+            hex::encode(self.call_digest)
+        )
+    }
+    pub(crate) fn parse_call_id(id: &str) -> anyhow::Result<Self> {
+        let mut parts = id.split('.');
+        anyhow::ensure!(parts.next() == Some("call"), "invalid call id");
+        let run_id = String::from_utf8(hex::decode(
+            parts.next().ok_or_else(|| anyhow::anyhow!("invalid call id"))?,
+        )?)?;
+        let call_digest = hex::decode(parts.next().ok_or_else(|| anyhow::anyhow!("invalid call id"))?)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid call digest"))?;
+        anyhow::ensure!(!run_id.is_empty() && parts.next().is_none(), "invalid call id");
+        Ok(Self { run_id, call_digest })
+    }
+}

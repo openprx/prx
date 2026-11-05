@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Case {
     Controlled,
+    Call,
     Builtin,
     Multiple,
     Abstain,
@@ -153,6 +154,9 @@ async fn exercise(
     scope: crate::memory::MemoryPrincipal,
     case: Case,
 ) -> anyhow::Result<()> {
+    if case == Case::Call {
+        return exercise_call(state, scope).await;
+    }
     let config = state.config.pin();
     let config_parent = config.effective.config_path.parent().context("fixture config root")?;
     let filesystem = crate::tools::owner_filesystem::OwnerFilesystem::open(
@@ -859,3 +863,129 @@ fn check_decision_accounting(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 mod two_owner;
+
+#[tokio::test]
+async fn call_keyed_pending_is_listed_and_reviewable() -> anyhow::Result<()> {
+    run_owned_case(Case::Call).await
+}
+
+async fn exercise_call(state: AppState, scope: crate::memory::MemoryPrincipal) -> anyhow::Result<()> {
+    use crate::causal_tree::branch::{
+        CapabilityId, CapabilityRef, CapabilityTarget, CatalogGeneration, SchemaFingerprint,
+    };
+    let runtime = state.pin_turn_runtime();
+    let service = runtime.decision_slot.publish(&runtime, &state).await?;
+    let principal = super::super::super::ApiPrincipal::of_token("prx-test-token");
+    assert_eq!(scope.owner_id.as_deref(), Some(principal.owner_id.as_str()));
+    let mut envelope = RuntimeEnvelope::console(&scope.workspace_id, SESSION);
+    envelope.owner_id = Some(principal.owner_id.clone());
+    envelope.run_id = Some("prx_call_run".into());
+    let source = crate::memory::MemoryFabric::new(state.mem.clone(), &scope.workspace_id)
+        .record_inbound_user_message(envelope.message_scope(), "project call approval", None, None)
+        .await?;
+    envelope.source_message_event_id = Some(source.event_id.clone());
+    let adapter = service.call_approval_strategy(envelope)?;
+    let capability = CapabilityRef {
+        id: CapabilityId::new(CapabilityTarget::NativeTool, "prx", "memory_reindex")?,
+        fingerprint: SchemaFingerprint([7; 32]),
+        generation: CatalogGeneration([8; 32]),
+    };
+    let pending = adapter
+        .port
+        .record_pending(&adapter.envelope, &capability, "memory_reindex", &serde_json::json!({}))
+        .await?;
+    let id = pending.authority().call_id();
+    let (status, listed) = body(
+        get_session_approvals(
+            State(state.clone()),
+            Query(ApprovalInboxQuery {
+                limit: Some(1),
+                cursor: None,
+            }),
+            axum::Extension(principal.clone()),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        listed
+            .pointer("/approvals/0/call_id")
+            .and_then(serde_json::Value::as_str),
+        Some(id.as_str())
+    );
+    assert_eq!(
+        body(
+            get_decision_approval(
+                State(state.clone()),
+                Path((SESSION.into(), id.clone())),
+                axum::Extension(principal.clone())
+            )
+            .await
+        )
+        .await?
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        change_decision_approval(
+            state.clone(),
+            SESSION.into(),
+            id.clone(),
+            super::super::super::ApiPrincipal::of_token("prx-foreign-token"),
+            DecisionApprovalChange::Review(true)
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let (status, receipt) = body(
+        change_decision_approval(
+            state.clone(),
+            SESSION.into(),
+            id.clone(),
+            principal.clone(),
+            DecisionApprovalChange::Review(true),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        receipt.get("call_id").and_then(serde_json::Value::as_str),
+        Some(id.as_str())
+    );
+    assert_eq!(receipt.get("approved").and_then(serde_json::Value::as_bool), Some(true));
+    assert_eq!(receipt.get("grant_count").and_then(serde_json::Value::as_u64), Some(1));
+    adapter
+        .port
+        .claim(&principal.owner_id, &adapter.envelope.session_key, pending.authority())
+        .await?;
+    assert!(
+        adapter
+            .port
+            .claim(&principal.owner_id, &adapter.envelope.session_key, pending.authority())
+            .await
+            .is_err()
+    );
+    let (_, listed) = body(
+        get_session_approvals(
+            State(state),
+            Query(ApprovalInboxQuery {
+                limit: None,
+                cursor: None,
+            }),
+            axum::Extension(principal),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(
+        listed
+            .get("approvals")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    Ok(())
+}

@@ -104,6 +104,8 @@ pub(crate) struct DecisionRevocationReceipt {
 
 #[derive(Serialize)]
 pub(crate) struct DecisionApprovalView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) call_id: Option<String>,
     pub(crate) decision_id: String,
     pub(crate) tool: Option<String>,
     pub(crate) arguments: Option<serde_json::Value>,
@@ -202,6 +204,7 @@ impl ApprovalLedger<'_> {
         self.port.check_live_parity()?;
         anyhow::ensure!(Utc::now() < pending.record.expires_at, "pending approval expired");
         Ok(DecisionApprovalView {
+            call_id: None,
             decision_id: pending.record.binding.decision_id.clone(),
             tool: call.as_ref().map(|call| call.name.clone()),
             arguments,
