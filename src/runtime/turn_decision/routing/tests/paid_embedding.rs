@@ -117,39 +117,47 @@ struct ServerState {
     requests: Arc<AtomicUsize>,
     known_usage: bool,
     observed: Arc<parking_lot::Mutex<Option<Arc<ObservedSqlite>>>>,
+    failures: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 async fn embedding(State(state): State<ServerState>, Json(body): Json<Value>) -> Json<Value> {
-    let observed = state
-        .observed
-        .lock()
-        .clone()
-        .expect("actual memory owner published before turn");
-    assert_eq!(
-        observed.observations.lock().read_calls,
-        1,
-        "actual selected history read must complete before physical embedding"
-    );
-    // Check the real SQLite causal decision exists before the paid physical send.
-    let database = Connection::open_with_flags(
-        state.workspace.join("self/causal_tree/decisions.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    let count: i64 = database
-        .query_row(
+    // Count arrival even when an invariant fails; never panic in axum's task
+    // and turn the useful failure into a dropped connection / router fallback.
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    let checked = (|| -> anyhow::Result<()> {
+        let observed = state
+            .observed
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("actual memory owner missing before turn"))?;
+        anyhow::ensure!(
+            observed.observations.lock().read_calls == 1,
+            "actual selected history read must complete before physical embedding"
+        );
+        let database = Connection::open_with_flags(
+            state.workspace.join("self/causal_tree/decisions.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let count: i64 = database.query_row(
             "SELECT count(*) FROM decisions WHERE source_event_id IS NOT NULL",
             [],
             |row| row.get(0),
-        )
-        .unwrap();
-    assert!(count > 0, "physical embedding requires an already persisted decision");
-    assert_eq!(body.get("model").and_then(Value::as_str), Some(EMBED_MODEL));
-    assert!(
-        body.get("input")
-            .and_then(Value::as_array)
-            .is_some_and(|inputs| inputs.len() == 1)
-    );
-    state.requests.fetch_add(1, Ordering::SeqCst);
+        )?;
+        anyhow::ensure!(count > 0, "physical embedding requires an already persisted decision");
+        anyhow::ensure!(
+            body.get("model").and_then(Value::as_str) == Some(EMBED_MODEL),
+            "physical embedding model differs"
+        );
+        anyhow::ensure!(
+            body.get("input")
+                .and_then(Value::as_array)
+                .is_some_and(|inputs| inputs.len() == 1),
+            "physical embedding input cardinality differs"
+        );
+        Ok(())
+    })();
+    if let Err(error) = checked {
+        state.failures.lock().push(format!("{error:#}"));
+    }
     let mut response = serde_json::json!({"data":[{"index":0,"embedding":vec![0.25_f32;384]}]});
     if state.known_usage {
         response.as_object_mut().expect("embedding response object").insert(
@@ -166,6 +174,7 @@ async fn run(known_usage: bool) {
     let endpoint = format!("custom:http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(AtomicUsize::new(0));
     let observed_slot = Arc::new(parking_lot::Mutex::new(None));
+    let failures = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let app = Router::new()
         .route("/v1/embeddings", post(embedding))
         .with_state(ServerState {
@@ -173,6 +182,7 @@ async fn run(known_usage: bool) {
             requests: Arc::clone(&requests),
             known_usage,
             observed: Arc::clone(&observed_slot),
+            failures: Arc::clone(&failures),
         });
     let stop = CancellationToken::new();
     let shutdown = stop.clone();
@@ -185,8 +195,21 @@ async fn run(known_usage: bool) {
     let result = AssertUnwindSafe(Box::pin(async {
         let (mut agent, observed, calls) = build(workspace.path(), &endpoint).await;
         *observed_slot.lock() = Some(Arc::clone(&observed));
-        let turn = cleanup.scope(Box::pin(agent.turn(INPUT)));
-        let reply = tokio::time::timeout(Duration::from_secs(5), turn).await.unwrap();
+        // This accounting fixture must wait for the real persisted read and
+        // HTTP response. Runner preemption must not spend the 100 ms history
+        // deadline (or the 500 ms decision budget). Adjacent routing fixtures
+        // use the same logical clock; retain a separate wall watchdog for hangs.
+        let clock = crate::causal_tree::logical_clock::ManualClock::new();
+        let turn = cleanup.scope(Box::pin(crate::causal_tree::logical_clock::scope(
+            clock,
+            agent.turn(INPUT),
+        )));
+        let reply = tokio::time::timeout(Duration::from_secs(60), turn).await.unwrap();
+        assert!(
+            failures.lock().is_empty(),
+            "embedding handler invariants: {:?}",
+            *failures.lock()
+        );
         assert_eq!(
             requests.load(Ordering::SeqCst),
             1,
@@ -286,14 +309,14 @@ async fn run(known_usage: bool) {
     .catch_unwind()
     .await;
     let drained = cleanup
-        .drain(tokio::time::Instant::now() + Duration::from_secs(2))
+        .drain(tokio::time::Instant::now() + Duration::from_secs(30))
         .await;
     stop.cancel();
-    let joined = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+    let joined = tokio::time::timeout(Duration::from_secs(30), &mut server).await;
     let server_confirmed = matches!(joined, Ok(Ok(Ok(()))));
     if !server_confirmed {
         server.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(30), server).await;
     }
     if drained.is_err() || !server_confirmed {
         let retained = workspace.keep();
