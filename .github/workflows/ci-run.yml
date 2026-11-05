@@ -106,15 +106,15 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}/{1}', runner.name, github.job) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
                   echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
                   if [ "$TARGET_DIR" != "$GITHUB_WORKSPACE/target" ]; then
-                      mkdir -p /srv/ci-runner/cache/cargo/bin
-                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo" >> "$GITHUB_ENV"
-                      echo "/srv/ci-runner/cache/cargo/bin" >> "$GITHUB_PATH"
+                      mkdir -p /srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin
+                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}" >> "$GITHUB_ENV"
+                      echo "/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin" >> "$GITHUB_PATH"
                   fi
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
@@ -154,15 +154,15 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}/{1}', runner.name, github.job) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
                   echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
                   if [ "$TARGET_DIR" != "$GITHUB_WORKSPACE/target" ]; then
-                      mkdir -p /srv/ci-runner/cache/cargo/bin
-                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo" >> "$GITHUB_ENV"
-                      echo "/srv/ci-runner/cache/cargo/bin" >> "$GITHUB_PATH"
+                      mkdir -p /srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin
+                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}" >> "$GITHUB_ENV"
+                      echo "/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin" >> "$GITHUB_PATH"
                   fi
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
@@ -197,15 +197,15 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}/{1}', runner.name, github.job) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
                   echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
                   if [ "$TARGET_DIR" != "$GITHUB_WORKSPACE/target" ]; then
-                      mkdir -p /srv/ci-runner/cache/cargo/bin
-                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo" >> "$GITHUB_ENV"
-                      echo "/srv/ci-runner/cache/cargo/bin" >> "$GITHUB_PATH"
+                      mkdir -p /srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin
+                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}" >> "$GITHUB_ENV"
+                      echo "/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin" >> "$GITHUB_PATH"
                   fi
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -269,15 +269,15 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}{1}', github.job, matrix.name && format('-{0}', matrix.name) || '') }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}/{1}{2}', runner.name, github.job, matrix.name && format('-{0}', matrix.name) || '') }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
                   echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
                   if [ "$TARGET_DIR" != "$GITHUB_WORKSPACE/target" ]; then
-                      mkdir -p /srv/ci-runner/cache/cargo/bin
-                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo" >> "$GITHUB_ENV"
-                      echo "/srv/ci-runner/cache/cargo/bin" >> "$GITHUB_PATH"
+                      mkdir -p /srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin
+                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}" >> "$GITHUB_ENV"
+                      echo "/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin" >> "$GITHUB_PATH"
                   fi
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -289,7 +289,7 @@ jobs:
                   shared-key: test-archive-${{ matrix.name }}
                   cache-on-failure: true
             - name: Install cargo-nextest
-              run: command -v cargo-nextest >/dev/null || curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
+              run: cargo nextest --version 2>/dev/null | grep -q "^cargo-nextest 0.9.151 " || curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
             - name: Build the test archive
               run: cargo nextest archive --locked --all-features ${{ matrix.targets }} --archive-file prx-tests-${{ matrix.name }}.tar.zst
             - name: List every test (the sharded runs must add up to this)
@@ -341,7 +341,7 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/test-shards-{0}', matrix.archive) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}/test-shards-{1}', runner.name, matrix.archive) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
@@ -353,16 +353,16 @@ jobs:
                           echo "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true"
                           echo "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true"
                       } >> "$GITHUB_ENV"
-                      mkdir -p /srv/ci-runner/cache/cargo/bin
-                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo" >> "$GITHUB_ENV"
-                      echo "/srv/ci-runner/cache/cargo/bin" >> "$GITHUB_PATH"
+                      mkdir -p /srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin
+                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}" >> "$GITHUB_ENV"
+                      echo "/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin" >> "$GITHUB_PATH"
                   fi
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.99.0
             - name: Install cargo-nextest
-              run: command -v cargo-nextest >/dev/null || curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
+              run: cargo nextest --version 2>/dev/null | grep -q "^cargo-nextest 0.9.151 " || curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
             - if: needs.changes.outputs.heavy_timeout == '45'
               uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
               with:
@@ -472,15 +472,15 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}/{1}', runner.name, github.job) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
                   echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
                   if [ "$TARGET_DIR" != "$GITHUB_WORKSPACE/target" ]; then
-                      mkdir -p /srv/ci-runner/cache/cargo/bin
-                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo" >> "$GITHUB_ENV"
-                      echo "/srv/ci-runner/cache/cargo/bin" >> "$GITHUB_PATH"
+                      mkdir -p /srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin
+                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}" >> "$GITHUB_ENV"
+                      echo "/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin" >> "$GITHUB_PATH"
                   fi
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
@@ -537,15 +537,15 @@ jobs:
         steps:
             - name: Configure runner paths
               env:
-                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}', github.job) }}
+                  TARGET_DIR: ${{ needs.changes.outputs.heavy_timeout == '45' && format('{0}/target', github.workspace) || format('/srv/ci-runner/target/{0}/{1}', runner.name, github.job) }}
               run: |
                   # Targets may be wiped by the host disk guard; builds recreate them.
                   echo "CARGO_TARGET_DIR=$TARGET_DIR" >> "$GITHUB_ENV"
                   echo "PRX_GUARD_HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
                   if [ "$TARGET_DIR" != "$GITHUB_WORKSPACE/target" ]; then
-                      mkdir -p /srv/ci-runner/cache/cargo/bin
-                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo" >> "$GITHUB_ENV"
-                      echo "/srv/ci-runner/cache/cargo/bin" >> "$GITHUB_PATH"
+                      mkdir -p /srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin
+                      echo "CARGO_HOME=/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}" >> "$GITHUB_ENV"
+                      echo "/srv/ci-runner/cache/cargo-${{ github.event_name == 'push' && 'main' || 'pr' }}/bin" >> "$GITHUB_PATH"
                   fi
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -710,6 +710,10 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+                  if [ "${{ needs.changes.result }}" != "success" ]; then
+                      echo "Detect Change Scope did not succeed (${{ needs.changes.result }})."
+                      exit 1
+                  fi
 
                   if [ "${{ needs.contracts.result }}" != "success" ] || [ "${{ needs.windows-installer.result }}" != "success" ]; then
                     echo "Contracts did not pass."
