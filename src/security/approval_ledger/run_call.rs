@@ -25,7 +25,11 @@ impl RunCallAuthority {
             .context("approval run missing")?
             .to_owned();
         let argument_hash = serde_json::json!(hex::encode(Sha256::digest(serde_json::to_vec(arguments)?)));
-        let call_digest = decision_call_digest("", capability, source, &argument_hash, operation, risk)?;
+        let bound_call = decision_call_digest("", capability, source, &argument_hash, operation, risk)?;
+        let mut digest = Sha256::new();
+        digest.update(b"prx.call.approval.v1");
+        digest.update(bound_call);
+        let call_digest = digest.finalize().into();
         Ok(Self { run_id, call_digest })
     }
 }
@@ -404,7 +408,13 @@ impl ApprovalLedgerPort<'_> {
                 });
             };
             cursor = event.id;
-            let signed: Signed<PendingCall> = self.decode(event, b"call.pending")?;
+            let signed: Signed<PendingCall> = match self.decode(event, b"call.pending") {
+                Ok(signed) => signed,
+                Err(error) => {
+                    tracing::warn!(event_id = %event.event_id, error = %error, "skipping corrupt call approval pending event");
+                    continue;
+                }
+            };
             let record = signed.record;
             if self
                 .load(
@@ -430,7 +440,13 @@ impl ApprovalLedgerPort<'_> {
                 .find_message_event_by_idempotency_key(self.workspace, &record.authority.review_key())
                 .await?
             {
-                let review: Signed<CallReview> = self.decode(&review, b"call.review")?;
+                let review: Signed<CallReview> = match self.decode(&review, b"call.review") {
+                    Ok(review) => review,
+                    Err(error) => {
+                        tracing::warn!(event_id = %review.event_id, error = %error, "skipping corrupt call approval review event");
+                        continue;
+                    }
+                };
                 if !review.record.approved {
                     continue;
                 }
