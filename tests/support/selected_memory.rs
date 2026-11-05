@@ -608,6 +608,9 @@ pub fn configure(config: &mut openprx::config::Config, endpoint: &str) -> Result
         config.causal_tree.policy.extra_latency_budget_ms == 500 && config.causal_tree.rehearsal.timeout_ms == 100,
         "original decision budgets"
     );
+    // Orchestration evidence must survive CPU contention on shared CI runners.
+    config.causal_tree.policy.extra_latency_budget_ms = 10_000;
+    config.causal_tree.rehearsal.timeout_ms = 2_000;
     Ok(())
 }
 

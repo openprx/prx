@@ -486,6 +486,9 @@ impl AdmittedTurn {
         assert!(!capabilities.vision, "mechanics fixture has no vision operation");
         crate::agent::agent::native_decision_fixture::configure(&mut config, endpoint)
             .expect("owned mechanics decision endpoint");
+        // configure checked the production default; mechanics must reach Execute
+        // even when another nextest process monopolizes the runner's CPUs.
+        config.causal_tree.policy.extra_latency_budget_ms = 10_000;
         let admitted = Self::build_mode(
             config,
             input,

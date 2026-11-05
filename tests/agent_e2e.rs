@@ -707,3 +707,81 @@ async fn e2e_live_openai_codex_multi_turn() {
         "Model should recall 'zephyr' from history, got: {r2}",
     );
 }
+
+struct ListenerTask(tokio::task::JoinHandle<()>);
+impl Drop for ListenerTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The real default still takes the deadline fallback when HTTP never replies.
+#[tokio::test]
+async fn e2e_default_decision_budget_falls_back_on_stalled_endpoint() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let received = Arc::new(tokio::sync::Notify::new());
+    let observed = Arc::clone(&received);
+    let app = axum::Router::new().fallback(move || {
+        let observed = Arc::clone(&observed);
+        async move {
+            observed.notify_one();
+            // A physical request reaches loopback, but its response never completes.
+            std::future::pending::<axum::http::StatusCode>().await
+        }
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let _server = ListenerTask(server);
+    let mut config = openprx::config::Config {
+        workspace_dir: workspace.path().to_owned(),
+        config_path: workspace.path().join("config.toml"),
+        default_model: Some("prx-local-model".to_owned()),
+        ..openprx::config::Config::default()
+    };
+    selected_memory::configure(&mut config, &endpoint).unwrap();
+    // This control deliberately keeps the production budgets, unlike the
+    // successful orchestration fixtures above.
+    let defaults = openprx::config::Config::default();
+    config.causal_tree.policy.extra_latency_budget_ms = defaults.causal_tree.policy.extra_latency_budget_ms;
+    config.causal_tree.rehearsal.timeout_ms = defaults.causal_tree.rehearsal.timeout_ms;
+    assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+    assert_eq!(config.causal_tree.rehearsal.timeout_ms, 100);
+    config.memory.auto_save = false;
+    config.providers.models.push(
+        serde_json::from_value(json!({
+            "provider": "ollama", "model": "prx-local-model", "operations": ["chat"], "native_tools": true
+        }))
+        .unwrap(),
+    );
+    config.cost.prices.insert(
+        "prx-local-model".to_owned(),
+        openprx::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let (provider, recorded) = RecordingProvider::new(vec![text_response("unexpected provider call")]);
+    let memory = Arc::new(openprx::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let mut agent = openprx::agent::agent::Agent::builder()
+        .runtime_config(config, "ollama")
+        .provider(Box::new(provider))
+        .tools(vec![])
+        .memory(memory)
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .build()
+        .unwrap();
+    let turn = async {
+        let reply = agent.turn("hello").await.unwrap();
+        assert_eq!(reply, "Could you narrow your request so I can finish it in time?");
+        assert!(recorded.lock().unwrap().is_empty());
+    };
+    // Bound only the test's failure path; no sleep races with the deadline.
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::join!(received.notified(), turn);
+    })
+    .await
+    .expect("stalled request must be observed and the default deadline must finish");
+}

@@ -371,13 +371,12 @@ where
             },
         );
         anyhow::ensure!(
-            config.causal_tree.rehearsal.timeout_ms == 100,
-            "unchanged rehearsal budget"
+            config.causal_tree.policy.extra_latency_budget_ms == 500 && config.causal_tree.rehearsal.timeout_ms == 100,
+            "original decision budgets"
         );
-        anyhow::ensure!(
-            config.causal_tree.policy.extra_latency_budget_ms == 500,
-            "unchanged turn budget"
-        );
+        // These fixtures test orchestration, not runner scheduling latency.
+        config.causal_tree.policy.extra_latency_budget_ms = 10_000;
+        config.causal_tree.rehearsal.timeout_ms = 2_000;
         let memory = Arc::new(SqliteMemory::new(workspace.path())?);
         let builder = Agent::builder()
             .runtime_config(config, "ollama")
