@@ -299,6 +299,10 @@ pub struct Config {
     #[serde(default)]
     pub causal_tree: crate::causal_tree::CausalTreeConfig,
 
+    /// Optional advisory decision engine, disabled by default.
+    #[serde(default)]
+    pub decision_engine: crate::decision_engine::config::DecisionEngineConfig,
+
     /// Security configuration: sandboxing, resource limits, audit, tool policy (`[security]`).
     #[serde(default)]
     pub security: SecurityConfig,
@@ -490,6 +494,7 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             media: MediaConfig::default(),
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
+            decision_engine: crate::decision_engine::config::DecisionEngineConfig::default(),
             security: SecurityConfig::default(),
             compliance: ComplianceConfig::default(),
             tool_tiering: ToolTieringConfig::default(),
@@ -583,3 +588,6 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod causal_tree_config_tests;
+
+#[cfg(test)]
+mod decision_engine_config_tests;

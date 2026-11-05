@@ -171,6 +171,7 @@ pub(super) fn migrate_legacy_config_keys(root: &mut toml::Value, config_path: Op
     // instead of failing to start. Only the paths on the published list are
     // absorbed; every other unrecognised key still stops the load, because a
     // typo must not inherit the leniency built for deliberate removals.
+    crate::decision_engine::config::migrate_backend(root)?;
     crate::config::deprecations::strip_deprecated_keys(root, config_path);
     prune_empty_toml_tables(root);
     Ok(())

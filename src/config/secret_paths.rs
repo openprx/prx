@@ -3069,9 +3069,9 @@ bot_token = "***"
         for entry in std::fs::read_dir(split_dir).expect("read schema split sources") {
             let path = entry.expect("schema source entry").path();
             if path.extension().is_some_and(|ext| ext == "rs")
-                && path
-                    .file_name()
-                    .is_none_or(|name| name != "causal_tree_config_tests.rs")
+                && path.file_name().is_none_or(|name| {
+                    name != "causal_tree_config_tests.rs" && name != "decision_engine_config_tests.rs"
+                })
             {
                 let relative = format!("config/schema/{}", path.file_name().unwrap().to_string_lossy());
                 assert!(

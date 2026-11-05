@@ -242,6 +242,19 @@
         "max_run_history": 50
       }
     },
+    "decision_engine": {
+      "description": "Optional advisory decision engine, disabled by default.",
+      "$ref": "#/$defs/DecisionEngineConfig",
+      "default": {
+        "candidates": 5,
+        "enabled": false,
+        "mode": "pre",
+        "observe_queue": 64,
+        "prompt_budget_tokens": 300,
+        "telemetry_cap": 1000,
+        "timeout_ms": 1500
+      }
+    },
     "default_model": {
       "description": "Default model routed through the selected provider (e.g. `\"anthropic/claude-sonnet-4-6\"`).\n\n`None` when the file omits it; see `default_provider`.",
       "type": [
@@ -1790,7 +1803,7 @@
       ]
     },
     "DecisionBackendConfig": {
-      "description": "The decision backend (`[causal_tree.backend]`).",
+      "description": "The decision backend (`[decision_engine.backend]`; legacy alias `[causal_tree.backend]`).",
       "type": "object",
       "properties": {
         "circuit_breaker": {
@@ -1852,6 +1865,67 @@
           "minimum": 0
         }
       }
+    },
+    "DecisionEngineConfig": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionBackendConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidates": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 5,
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "mode": {
+          "$ref": "#/$defs/DecisionMode",
+          "default": "pre"
+        },
+        "observe_queue": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 64,
+          "minimum": 0
+        },
+        "prompt_budget_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 300,
+          "minimum": 0
+        },
+        "telemetry_cap": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 1000,
+          "minimum": 0
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 1500,
+          "minimum": 0
+        }
+      }
+    },
+    "DecisionMode": {
+      "type": "string",
+      "enum": [
+        "pre",
+        "post",
+        "both"
+      ]
     },
     "DecisionStoreConfig": {
       "description": "The decision store (`[causal_tree.store]`).",

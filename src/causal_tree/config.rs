@@ -166,7 +166,7 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
-/// The decision backend (`[causal_tree.backend]`).
+/// The decision backend (`[decision_engine.backend]`; legacy alias `[causal_tree.backend]`).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct DecisionBackendConfig {
@@ -215,6 +215,52 @@ impl Default for DecisionBackendConfig {
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             circuit_breaker: CircuitBreakerConfig::default(),
         }
+    }
+}
+
+impl DecisionBackendConfig {
+    /// Validate shared endpoint, hosted model and snapshot rules.
+    pub fn validate_shared(&self) -> Result<(), CausalConfigError> {
+        let backend = self;
+        let hosted = match backend.kind {
+            BackendSelection::Fixed(kind @ (BackendKind::TypeSafe | BackendKind::OpenRouter)) => Some(kind),
+            _ => None,
+        };
+        // 1-2. The endpoint.
+        if !backend.endpoint.trim().is_empty() {
+            let locality = check_endpoint(&backend.endpoint).map_err(CausalConfigError::Endpoint)?;
+            // SP-CDP-C V2.05, CXR 4.4: decision state leaves the machine only
+            // with the operator's remote switch. A hosted service is remote
+            // whatever its URL, and the backend order leaves it out until the
+            // switch is on (COORD-6).
+            if locality == EndpointLocality::Remote && !backend.remote_enabled && hosted.is_none() {
+                return Err(CausalConfigError::RemoteNotEnabled);
+            }
+        } else if backend.kind == BackendSelection::Fixed(BackendKind::CompatibleHttp) {
+            return Err(CausalConfigError::EndpointRequired);
+        }
+        // 3. A hosted service answers with one pinned model, and the exact
+        // snapshot is pinned too (D-043 C-8).
+        let snapshot = backend.pinned_snapshot.trim();
+        match hosted {
+            Some(kind) => {
+                if is_unpinned_model(&backend.model) {
+                    return Err(CausalConfigError::HostedModelNotPinned(kind.as_str()));
+                }
+                if kind == BackendKind::OpenRouter && snapshot.is_empty() {
+                    return Err(CausalConfigError::SnapshotRequired);
+                }
+                let invalid = is_unpinned_model(snapshot)
+                    || snapshot.chars().count() > MAX_SNAPSHOT_CHARS
+                    || snapshot.chars().any(char::is_control);
+                if !snapshot.is_empty() && invalid {
+                    return Err(CausalConfigError::SnapshotInvalid);
+                }
+            }
+            None if !snapshot.is_empty() => return Err(CausalConfigError::SnapshotNotHosted),
+            None => {}
+        }
+        Ok(())
     }
 }
 
@@ -753,44 +799,7 @@ impl CausalTreeConfig {
             "causal_tree.schema_version",
             "1; a newer schema needs a newer prx",
         )?;
-        let hosted = match backend.kind {
-            BackendSelection::Fixed(kind @ (BackendKind::TypeSafe | BackendKind::OpenRouter)) => Some(kind),
-            _ => None,
-        };
-        // 1-2. The endpoint.
-        if !backend.endpoint.trim().is_empty() {
-            let locality = check_endpoint(&backend.endpoint).map_err(CausalConfigError::Endpoint)?;
-            // SP-CDP-C V2.05, CXR 4.4: decision state leaves the machine only
-            // with the operator's remote switch. A hosted service is remote
-            // whatever its URL, and the backend order leaves it out until the
-            // switch is on (COORD-6).
-            if locality == EndpointLocality::Remote && !backend.remote_enabled && hosted.is_none() {
-                return Err(CausalConfigError::RemoteNotEnabled);
-            }
-        } else if backend.kind == BackendSelection::Fixed(BackendKind::CompatibleHttp) {
-            return Err(CausalConfigError::EndpointRequired);
-        }
-        // 3. A hosted service answers with one pinned model, and the exact
-        // snapshot is pinned too (D-043 C-8).
-        let snapshot = backend.pinned_snapshot.trim();
-        match hosted {
-            Some(kind) => {
-                if is_unpinned_model(&backend.model) {
-                    return Err(CausalConfigError::HostedModelNotPinned(kind.as_str()));
-                }
-                if kind == BackendKind::OpenRouter && snapshot.is_empty() {
-                    return Err(CausalConfigError::SnapshotRequired);
-                }
-                let invalid = is_unpinned_model(snapshot)
-                    || snapshot.chars().count() > MAX_SNAPSHOT_CHARS
-                    || snapshot.chars().any(char::is_control);
-                if !snapshot.is_empty() && invalid {
-                    return Err(CausalConfigError::SnapshotInvalid);
-                }
-            }
-            None if !snapshot.is_empty() => return Err(CausalConfigError::SnapshotNotHosted),
-            None => {}
-        }
+        backend.validate_shared()?;
         // 4. A calibration needs the exact pinned model it was measured on:
         // never an alias or a `latest` spelling (D-074), whatever the kind.
         if let Some(profile) = &policy.calibration_profile {

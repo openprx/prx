@@ -120,6 +120,7 @@ pub mod cost;
 pub mod cron;
 pub mod daemon;
 pub mod decision;
+pub mod decision_engine;
 pub mod doctor;
 pub mod evolution_cli;
 pub mod fitness_cli;

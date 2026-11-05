@@ -111,6 +111,7 @@ async fn config_save_and_load_tmpdir() {
         agents: HashMap::new(),
         media: MediaConfig::default(),
         causal_tree: crate::causal_tree::CausalTreeConfig::default(),
+        decision_engine: Default::default(),
         security: SecurityConfig::default(),
         compliance: ComplianceConfig::default(),
         tool_tiering: ToolTieringConfig::default(),

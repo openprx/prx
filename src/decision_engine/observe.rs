@@ -1,0 +1,131 @@
+//! Non-blocking bounded admission with one cancellable telemetry writer.
+use super::contract::{ObserveAdmission, TurnOutcome};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+/// The writer must insert then evict oldest records to `cap` atomically.
+pub trait TelemetryWriter: Send + 'static {
+    fn append_fifo(&mut self, outcome: TurnOutcome, cap: usize) -> anyhow::Result<()>;
+}
+#[derive(Default)]
+pub struct ObserveCounters {
+    pub dropped: AtomicU64,
+    pub store_errors: AtomicU64,
+}
+pub struct ObserveQueue {
+    sender: Option<mpsc::Sender<TurnOutcome>>,
+    pub counters: Arc<ObserveCounters>,
+}
+impl ObserveQueue {
+    pub fn disabled() -> Self {
+        Self {
+            sender: None,
+            counters: Arc::default(),
+        }
+    }
+    /// A zero cap never calls the store factory or starts a worker.
+    pub fn start<F>(
+        queue: usize,
+        cap: usize,
+        cancel: CancellationToken,
+        open: F,
+    ) -> anyhow::Result<(Self, Option<tokio::task::JoinHandle<()>>)>
+    where
+        F: FnOnce() -> anyhow::Result<Box<dyn TelemetryWriter>>,
+    {
+        anyhow::ensure!(
+            queue > 0 && queue <= 1024 && cap <= 100000,
+            "invalid observation bounds"
+        );
+        if cap == 0 {
+            return Ok((Self::disabled(), None));
+        }
+        let mut writer = open()?;
+        let (sender, mut receiver) = mpsc::channel(queue);
+        let counters = Arc::new(ObserveCounters::default());
+        let worker_counters = Arc::clone(&counters);
+        let worker = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    outcome = receiver.recv() => {
+                        let Some(outcome) = outcome else { break; };
+                        if writer.append_fifo(outcome, cap).is_err() {
+                            worker_counters.store_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!("decision engine telemetry write failed");
+                        }
+                    }
+                }
+            }
+        });
+        Ok((
+            Self {
+                sender: Some(sender),
+                counters,
+            },
+            Some(worker),
+        ))
+    }
+    pub fn observe(&self, outcome: TurnOutcome) -> ObserveAdmission {
+        let Some(sender) = &self.sender else {
+            return ObserveAdmission::Disabled;
+        };
+        match sender.try_send(outcome) {
+            Ok(()) => ObserveAdmission::Accepted,
+            Err(_) => {
+                self.counters.dropped.fetch_add(1, Ordering::Relaxed);
+                ObserveAdmission::Dropped
+            }
+        }
+    }
+}
+
+/// Dedicated observation store; only the worker owns the connection.
+pub struct SqliteTelemetryWriter {
+    connection: rusqlite::Connection,
+}
+impl SqliteTelemetryWriter {
+    pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        let connection = rusqlite::Connection::open(path)?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS engine_outcomes (sequence INTEGER PRIMARY KEY, decision_id TEXT, tools TEXT NOT NULL, succeeded INTEGER NOT NULL)")?;
+        Ok(Self { connection })
+    }
+    pub fn outcomes(&self) -> anyhow::Result<Vec<TurnOutcome>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT decision_id, tools, succeeded FROM engine_outcomes ORDER BY sequence")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, tools, succeeded) = row?;
+            Ok(TurnOutcome::new(id, serde_json::from_str(&tools)?, succeeded)?)
+        })
+        .collect()
+    }
+}
+impl TelemetryWriter for SqliteTelemetryWriter {
+    fn append_fifo(&mut self, outcome: TurnOutcome, cap: usize) -> anyhow::Result<()> {
+        let transaction: rusqlite::Transaction<'_> = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO engine_outcomes (decision_id, tools, succeeded) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                outcome.decision_id(),
+                serde_json::to_string(outcome.tools())?,
+                outcome.succeeded()
+            ],
+        )?;
+        transaction.execute("DELETE FROM engine_outcomes WHERE sequence NOT IN (SELECT sequence FROM engine_outcomes ORDER BY sequence DESC LIMIT ?1)", [i64::try_from(cap)?])?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
