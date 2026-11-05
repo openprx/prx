@@ -3229,3 +3229,23 @@ Dropping an in-flight Docker call schedules bounded removal under the turn's
 cleanup owner, so the turn cannot acknowledge cleanup before that task settles.
 If work and terminal cleanup both fail, the error chain retains the original
 work failure as well as the unconfirmed-cleanup marker.
+
+## Advisory decision engine
+
+The default-off `[decision_engine]` is separate from causal admission. See the
+[decision engine reference](decision-engine.md) for modes, telemetry and cache cost.
+
+| Key | Default | Contract |
+| --- | --- | --- |
+| `enabled` | `false` | Disable to stop all advisory work; restart to apply |
+| `mode` | `"pre"` | `pre`, `post`, or `both`; disabled status is `off` |
+| `prompt_budget_tokens` | `300` | 50–2000 tokens in the system prompt brief |
+| `candidates` | `5` | 1–20 candidates in the brief |
+| `timeout_ms` | `1500` | 100–30000 ms; failed analysis yields no brief |
+| `telemetry_cap` | `1000` | 0–100000 FIFO outcomes; zero opens no store |
+| `observe_queue` | `64` | 1–1024 pending outcomes; overflow drops and counts |
+| `backend` | inherited | Optional decision backend table; explicit table wins over legacy |
+
+An explicit empty backend table selects defaults. Existing causal admission,
+approvals and remote-processing restrictions continue to apply. Roll back by
+setting `enabled = false` and restarting; retained telemetry stays in the workspace.

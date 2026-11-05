@@ -5,6 +5,7 @@ pub mod contract;
 pub mod noop;
 pub mod observe;
 pub mod render;
+pub(crate) mod status;
 pub(crate) mod turn;
 pub use contract::*;
 #[cfg(test)]

@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Default-off advisory decision engine with bounded pre-turn briefs, FIFO outcome
+  telemetry, and endpoint-free status and doctor diagnostics. See
+  [the decision engine reference](docs/decision-engine.md).
+
 - Prompt-cache metrics per provider/model (cache-read tokens, hit requests, system/tools prefix change counts) in the daemon state, `prx doctor` and the Console Overview.
 
 - Add a local `ramflux` channel: a same-user `0600` Unix socket bridge with
