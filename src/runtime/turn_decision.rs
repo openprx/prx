@@ -157,7 +157,7 @@ impl ChildExecutionPolicy {
 }
 
 pub(crate) struct TurnDecisionService {
-    advisory_engine: std::sync::OnceLock<Arc<crate::decision_engine::causal_adapter::CausalEngine>>,
+    advisory_engine: tokio::sync::OnceCell<advisory::AdvisoryRuntime>,
     child_recovery: child_recovery::ChildRecoveryState,
     recursive_allowances: recursive_allowance::RunAllowances,
     memory_loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
@@ -398,7 +398,7 @@ impl TurnDecisionService {
 
     /// Report queue acknowledgement to owners that must reject an incomplete exit.
     pub(crate) async fn drain_writes(&self, deadline: Instant) -> bool {
-        let mut drained = true;
+        let mut drained = self.drain_advisory(deadline).await;
         if let Some(writer) = self.store.writer() {
             #[cfg(test)]
             crate::runtime::turn_cleanup::diagnostic::queue_presence("decision_writer_present", true);

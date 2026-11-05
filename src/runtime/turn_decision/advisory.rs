@@ -3,40 +3,74 @@ use super::{TurnDecisionContext, TurnDecisionService};
 use crate::decision_engine::config::{DecisionEngineConfig, DecisionMode};
 use crate::decision_engine::observe::{ObserveQueue, SqliteTelemetryWriter};
 use crate::decision_engine::{DecisionEngine, IntentAnalysis, IntentInput, TurnOutcome};
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
 impl TurnDecisionService {
+    #[cfg(test)]
+    pub(crate) fn advisory_initialized(&self) -> bool {
+        self.advisory_engine.initialized()
+    }
+
     pub(crate) fn advisory_config(&self) -> &DecisionEngineConfig {
         &self.generation.effective.decision_engine
     }
 
-    fn advisory_engine(&self) -> Option<&Arc<crate::decision_engine::causal_adapter::CausalEngine>> {
+    async fn advisory_engine(&self) -> Option<&AdvisoryRuntime> {
         let config = self.advisory_config();
         if !config.enabled {
             return None;
         }
-        Some(self.advisory_engine.get_or_init(|| {
-            let cap = if config.mode == DecisionMode::Pre {
-                0
-            } else {
-                config.telemetry_cap
-            };
-            let path = self.generation.effective.workspace_dir.join("decision-engine.sqlite");
-            let observations = match ObserveQueue::start(
-                config.observe_queue as usize,
-                cap as usize,
-                CancellationToken::new(),
-                || Ok(Box::new(SqliteTelemetryWriter::open(&path)?)),
-            ) {
-                Ok((queue, _worker)) => queue,
-                Err(_) => {
-                    tracing::warn!("decision engine telemetry unavailable");
-                    ObserveQueue::disabled()
+        Some(
+            self.advisory_engine
+                .get_or_init(|| async {
+                    let cap = if config.mode == DecisionMode::Pre {
+                        0
+                    } else {
+                        config.telemetry_cap
+                    };
+                    let queue_size = config.observe_queue as usize;
+                    let path = self.generation.effective.workspace_dir.join("decision-engine.sqlite");
+                    let cancellation = CancellationToken::new();
+                    let worker_cancellation = cancellation.clone();
+                    let opened = tokio::task::spawn_blocking(move || {
+                        ObserveQueue::start(queue_size, cap as usize, worker_cancellation, || {
+                            Ok(Box::new(SqliteTelemetryWriter::open(&path)?))
+                        })
+                    })
+                    .await;
+                    let (observations, worker) = match opened {
+                        Ok(Ok(started)) => started,
+                        _ => {
+                            tracing::warn!("decision engine telemetry unavailable");
+                            (ObserveQueue::disabled(), None)
+                        }
+                    };
+                    AdvisoryRuntime {
+                        engine: crate::decision_engine::causal_adapter::CausalEngine { observations },
+                        cancellation,
+                        worker: tokio::sync::Mutex::new(worker),
+                    }
+                })
+                .await,
+        )
+    }
+
+    pub(super) async fn drain_advisory(&self, deadline: std::time::Instant) -> bool {
+        let Some(runtime) = self.advisory_engine.get() else {
+            return true;
+        };
+        runtime.cancellation.cancel();
+        let mut worker = runtime.worker.lock().await;
+        if let Some(completion) = worker.as_mut() {
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), completion).await {
+                Ok(Ok(())) => {
+                    worker.take();
                 }
-            };
-            Arc::new(crate::decision_engine::causal_adapter::CausalEngine { observations })
-        }))
+                _ => return false,
+            }
+        }
+        true
     }
 
     pub(crate) async fn analyze_advisory(
@@ -90,12 +124,17 @@ impl TurnDecisionService {
         .await
     }
 
-    pub(crate) fn observe_advisory(&self, context: &TurnDecisionContext, decision_id: Option<String>, succeeded: bool) {
+    pub(crate) async fn observe_advisory(
+        &self,
+        context: &TurnDecisionContext,
+        decision_id: Option<String>,
+        succeeded: bool,
+    ) {
         let config = self.advisory_config();
         if !config.enabled || config.mode == DecisionMode::Pre {
             return;
         }
-        let Some(engine) = self.advisory_engine() else {
+        let Some(engine) = self.advisory_engine().await else {
             return;
         };
         let tools = context
@@ -106,9 +145,20 @@ impl TurnDecisionService {
             .collect();
         match TurnOutcome::new(decision_id, tools, succeeded) {
             Ok(outcome) => {
-                engine.observe(outcome);
+                engine.engine.observe(outcome);
             }
             Err(_) => tracing::warn!("decision engine outcome exceeds observation bounds"),
         }
+    }
+}
+
+pub(super) struct AdvisoryRuntime {
+    engine: crate::decision_engine::causal_adapter::CausalEngine,
+    cancellation: CancellationToken,
+    worker: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+impl Drop for AdvisoryRuntime {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
     }
 }

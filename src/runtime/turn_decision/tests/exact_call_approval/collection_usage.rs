@@ -38,6 +38,13 @@ impl Provider for ReportedApprovalProvider<'_> {
             self.calls.fetch_add(1, Ordering::SeqCst) == 0,
             "approval must stop the loop"
         );
+        assert!(
+            request
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("Decision advice")),
+            "approval requests must not carry advisory briefs"
+        );
         let specs = request.tools.expect("collection singleton schema");
         assert_eq!(specs.len(), 1);
         assert_eq!(specs.first().unwrap().name, self.tool_name);
@@ -133,7 +140,10 @@ async fn exercise_owned(f: &Fixture<'_>) {
     let (outcome, trace) = Box::pin(crate::agent::turn_engine::run_turn(
         &mut history,
         TurnRequest {
-            advice: None,
+            advice: Some(crate::decision_engine::IntentAnalysis {
+                decision_id: "prx_advisory_approval_probe".into(),
+                ..Default::default()
+            }),
             channel_name: f.proof.policy_channel(),
             scope: None,
             mode: ChatMode::Edit,
@@ -185,6 +195,7 @@ async fn exercise_owned(f: &Fixture<'_>) {
     .unwrap();
     assert!(matches!(outcome, ToolLoopOutcome::AwaitingApproval { .. }));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert!(trace.decision_brief_sha256.is_none());
     assert_eq!(trace.tokens_used, TokenUsage::reported(Some(31), Some(7), Some(38)));
     let physical = trace
         .execution_trace

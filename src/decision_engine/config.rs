@@ -71,6 +71,14 @@ fn ensure_range(key: &'static str, value: u32, min: u32, max: u32) -> Result<(),
 
 impl DecisionEngineConfig {
     pub fn validate(&self) -> Result<(), DecisionEngineConfigError> {
+        self.validate_with_latency_budget(
+            crate::causal_tree::config::CausalTreeConfig::default()
+                .policy
+                .extra_latency_budget_ms,
+        )
+    }
+
+    pub(crate) fn validate_with_latency_budget(&self, latency_budget_ms: u64) -> Result<(), DecisionEngineConfigError> {
         for (key, value, min, max) in [
             ("prompt_budget_tokens", self.prompt_budget_tokens, 50, 2_000),
             ("candidates", self.candidates, 1, 20),
@@ -86,7 +94,11 @@ impl DecisionEngineConfig {
                     "backend.timeout_ms",
                     backend.timeout_ms,
                     10,
-                    if self.enabled { self.timeout_ms } else { 5_000 },
+                    if self.enabled {
+                        self.timeout_ms
+                    } else {
+                        u32::try_from(latency_budget_ms).unwrap_or(u32::MAX)
+                    },
                 ),
                 ("backend.max_request_bytes", backend.max_request_bytes, 4_096, 1_048_576),
                 (
@@ -133,7 +145,11 @@ pub(crate) fn effective_backend<'a>(
     explicit: Option<&'a DecisionBackendConfig>,
     legacy: &'a DecisionBackendConfig,
 ) -> &'a BackendConfig {
-    explicit.unwrap_or(legacy)
+    inherited_backend(explicit, Some(legacy)).unwrap_or(legacy)
+}
+
+fn inherited_backend<T>(explicit: Option<T>, legacy: Option<T>) -> Option<T> {
+    explicit.or(legacy)
 }
 
 pub(crate) fn migrate_backend(root: &mut toml::Value) -> anyhow::Result<()> {
@@ -158,8 +174,7 @@ pub(crate) fn migrate_backend(root: &mut toml::Value) -> anyhow::Result<()> {
     };
     // Materialize full defaults before empty-table pruning. An empty explicit
     // table is still an override, and must never inherit a legacy backend.
-    let inherited = if explicit.is_none() { legacy } else { None };
-    if let Some(raw) = explicit.or(inherited) {
+    if let Some(raw) = inherited_backend(explicit, legacy) {
         let full = if empty_tables_only(&raw) {
             toml::Value::try_from(DecisionBackendConfig::default())?
         } else {

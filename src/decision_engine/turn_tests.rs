@@ -230,7 +230,7 @@ fn disabled_direct_backend_timeout_obeys_legacy_upper_bound() {
         config.backend.as_mut().unwrap().timeout_ms = timeout;
         assert!(config.validate().is_err());
     }
-    for timeout in [10, 2_000, 5_000] {
+    for timeout in [10, 200, 500] {
         config.backend.as_mut().unwrap().timeout_ms = timeout;
         assert!(config.validate().is_ok());
     }
@@ -352,11 +352,14 @@ struct TurnProbe {
     trace: crate::agent::turn_contracts::ToolLoopTrace,
     store: std::path::PathBuf,
     dispatches: usize,
+    store_opens: usize,
+    credential_reads: usize,
     _directory: tempfile::TempDir,
 }
 async fn exercise(config: Option<DecisionEngineConfig>, advice: Option<IntentAnalysis>) -> TurnProbe {
     use crate::agent::turn_request::*;
     let directory = tempfile::tempdir().unwrap();
+    let spy = access_spy::AccessSpy::new(directory.path());
     let mut runtime = crate::config::Config {
         workspace_dir: directory.path().to_path_buf(),
         ..Default::default()
@@ -425,12 +428,21 @@ async fn exercise(config: Option<DecisionEngineConfig>, advice: Option<IntentAna
     .await
     .unwrap();
     let store = directory.path().join("decision-engine.sqlite");
+    assert!(
+        admission
+            .decision()
+            .service
+            .drain_writes(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await
+    );
     drop(admission);
     TurnProbe {
         requests: provider.requests.into_inner(),
         trace,
         store,
         dispatches: calls.load(Ordering::SeqCst),
+        store_opens: spy.counts.stores.load(Ordering::SeqCst),
+        credential_reads: spy.counts.credentials.load(Ordering::SeqCst),
         _directory: directory,
     }
 }
@@ -514,6 +526,10 @@ async fn disabled_engine_is_byte_identical_in_one_build() {
     );
     assert_eq!(before.dispatches, 1, "provider requests: {:?}", before.requests);
     assert_eq!(after.dispatches, 1);
+    assert_eq!(before.store_opens, 0);
+    assert_eq!(after.store_opens, 0);
+    assert_eq!(before.credential_reads, 0);
+    assert_eq!(after.credential_reads, 0);
     assert!(!before.store.exists());
     assert!(!after.store.exists());
     assert!(after.trace.decision_brief_sha256.is_none());
@@ -528,13 +544,17 @@ async fn pre_mode_brief_is_bounded_redacted_deterministic_and_traced() {
         .and_then(|request| request.get("messages"))
         .and_then(serde_json::Value::as_array)
         .expect("pre_mode_brief_is_bounded_redacted_deterministic_and_traced: request messages missing");
-    let brief = messages
+    let system_messages = messages
         .iter()
-        .rev()
-        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
-        .and_then(|message| message.get("content"))
-        .and_then(serde_json::Value::as_str)
-        .expect("pre_mode_brief_is_bounded_redacted_deterministic_and_traced: system brief missing");
+        .enumerate()
+        .filter(|(_, message)| message["role"] == "system")
+        .collect::<Vec<_>>();
+    assert_eq!(system_messages.len(), 1);
+    assert_eq!(system_messages[0].0, 0);
+    let system = system_messages[0].1["content"].as_str().unwrap();
+    let expected_brief = render::render_decision_brief(&long_analysis(), 50, enabled(DecisionMode::Pre).candidates);
+    assert!(system.ends_with(&expected_brief));
+    let brief = &system[system.len() - expected_brief.len()..];
     assert!(crate::agent::context_budget::count_tokens(brief) <= 50);
     assert!(!brief.contains("sk-test-private-credential-value"));
     assert_eq!(first.requests, second.requests);
@@ -668,4 +688,58 @@ async fn cancelled_analysis_is_not_polled() {
     .await;
     assert!(advice.is_none());
     assert_eq!(engine.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn render_top_k_uses_highest_expected_gain() {
+    let mut analysis = IntentAnalysis::default();
+    for (name, expected) in [("a_low", 0.1), ("z_high", 0.9)] {
+        analysis.candidates.insert(
+            name.into(),
+            BTreeMap::from([(
+                "gain".into(),
+                IntentValue::Score {
+                    distribution: vec![],
+                    expected,
+                    confidence: 1.0,
+                },
+            )]),
+        );
+    }
+    let brief = render::render_decision_brief(&analysis, 2000, 1);
+    assert!(brief.contains("z_high"));
+    assert!(!brief.contains("a_low"));
+}
+
+#[tokio::test]
+async fn pre_and_both_preserve_disabled_serving_tools_and_fingerprint() {
+    let disabled = exercise(None, None).await;
+    let baseline = &disabled.requests[0]["tools"];
+    assert!(baseline.is_array());
+    for mode in [DecisionMode::Pre, DecisionMode::Both] {
+        let enabled = exercise(Some(enabled(mode)), Some(long_analysis())).await;
+        let tools = &enabled.requests[0]["tools"];
+        assert_eq!(tools, baseline);
+        assert_eq!(
+            crate::agent::prompt::prompt_sha256(&tools.to_string()),
+            crate::agent::prompt::prompt_sha256(&baseline.to_string())
+        );
+    }
+}
+
+#[test]
+fn access_spies_observe_actual_store_and_credential_sites() {
+    use crate::providers::credentials::{ConfigCredentialSource, CredentialRef, CredentialSource};
+    let directory = tempfile::tempdir().unwrap();
+    let spy = access_spy::AccessSpy::new(directory.path());
+    let config = crate::config::Config {
+        workspace_dir: directory.path().to_owned(),
+        ..Default::default()
+    };
+    SqliteTelemetryWriter::open(&directory.path().join("decision-engine.sqlite")).unwrap();
+    ConfigCredentialSource::new(&config)
+        .material(&CredentialRef::None)
+        .unwrap();
+    assert_eq!(spy.counts.stores.load(Ordering::SeqCst), 1);
+    assert_eq!(spy.counts.credentials.load(Ordering::SeqCst), 1);
 }

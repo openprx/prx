@@ -212,3 +212,24 @@ fn disabled_engine_legacy_migration_preserves_process_binding() {
     loaded.decision_engine.backend.as_mut().unwrap().timeout_ms += 1;
     assert!(crate::config::ConfigGeneration::restore_process(loaded, &binding, &key).is_err());
 }
+
+#[test]
+fn disabled_direct_backend_obeys_configured_causal_latency_budget() {
+    let mut config = Config::default();
+    config.causal_tree.policy.extra_latency_budget_ms = 300;
+    config.decision_engine.backend = Some(DecisionBackendConfig {
+        timeout_ms: 400,
+        ..Default::default()
+    });
+    let error = config.validate().unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<DecisionEngineConfigError>(),
+        Some(DecisionEngineConfigError::OutOfRange {
+            key: "backend.timeout_ms",
+            max: 300,
+            ..
+        })
+    ));
+    config.causal_tree.policy.extra_latency_budget_ms = 500;
+    config.validate().unwrap();
+}

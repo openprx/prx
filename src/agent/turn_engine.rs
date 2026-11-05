@@ -148,7 +148,9 @@ pub(crate) async fn run_turn(
         inner,
     )
     .await;
-    advisory_service.observe_advisory(advisory_context, advisory_id, result.is_ok());
+    advisory_service
+        .observe_advisory(advisory_context, advisory_id, result.is_ok())
+        .await;
     result
 }
 
@@ -412,7 +414,6 @@ async fn run_turn_unguarded(
                 ),
             )
             .await?;
-        crate::decision_engine::turn::append_brief(&mut proposal_messages, decision_brief.as_deref());
         let system_prompt = proposal_messages.iter().find(|message| message.role == "system");
         let system_prompt_sha256 = system_prompt.map(|message| crate::agent::prompt::prompt_sha256(&message.content));
         hooks
@@ -426,7 +427,7 @@ async fn run_turn_unguarded(
                         "proposal_schema_sha256": hex::encode(proposal_schema.0),
                         "tool_count": 1, "executable_capability_count": 0,
                     }),
-                    decision_brief_sha256.as_deref(),
+                    None,
                 ),
             )
             .await;
@@ -450,7 +451,7 @@ async fn run_turn_unguarded(
         .await?;
         let pending = outcome.pending?;
         let mut trace = outcome.trace;
-        trace.decision_brief_sha256 = decision_brief_sha256.clone();
+        trace.decision_brief_sha256 = None;
         trace.execution_trace = Some(context.terminal_execution_trace());
         if !pending {
             return Ok((
@@ -1025,8 +1026,8 @@ async fn run_turn_unguarded(
         // Corrective retries, recalled pages, and middleware are all allowed to
         // contribute request-local system context, so canonicalize only the
         // prepared request after every contributor has run.
-        coalesce_system_messages_at_front(&mut prepared_messages.messages);
         crate::decision_engine::turn::append_brief(&mut prepared_messages.messages, decision_brief.as_deref());
+        coalesce_system_messages_at_front(&mut prepared_messages.messages);
         let final_system_prompt = prepared_messages
             .messages
             .iter()

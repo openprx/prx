@@ -1661,8 +1661,17 @@ pub(crate) mod admission_failure_tests {
         record_input: bool,
         enabled: bool,
     ) -> (tempfile::TempDir, MemoryFabric, Arc<ChatTurnBinding>) {
+        fixture_with_advisory(record_input, enabled, Default::default()).await
+    }
+
+    async fn fixture_with_advisory(
+        record_input: bool,
+        enabled: bool,
+        advisory: crate::decision_engine::config::DecisionEngineConfig,
+    ) -> (tempfile::TempDir, MemoryFabric, Arc<ChatTurnBinding>) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
+        config.decision_engine = advisory;
         config.workspace_dir = dir.path().to_path_buf();
         config.causal_tree.enabled = enabled;
         config.memory.events.record_user_messages = record_input;
@@ -1898,6 +1907,57 @@ pub(crate) mod admission_failure_tests {
         .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn advisory_decide_mode_projects_prediction_and_lazily_opens_store() {
+        use crate::decision_engine::config::{DecisionEngineConfig, DecisionMode};
+        for (enabled, mode) in [
+            (false, DecisionMode::Pre),
+            (true, DecisionMode::Pre),
+            (true, DecisionMode::Post),
+            (true, DecisionMode::Both),
+        ] {
+            let (dir, fabric, binding) = fixture_with_advisory(
+                true,
+                true,
+                DecisionEngineConfig {
+                    enabled,
+                    mode,
+                    ..Default::default()
+                },
+            )
+            .await;
+            let service = service(&fabric, &binding).await;
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let context = binding.decide(&service, &cancellation).await.unwrap();
+            let advice = binding.decision_advice();
+            if enabled && mode != DecisionMode::Post {
+                let advice = advice.expect("pre/both analysis from actual chat decision");
+                assert_eq!(advice.decision_id, context.decision_id().to_string());
+                assert!(!advice.global.is_empty(), "real prediction answers must be projected");
+            } else {
+                assert!(advice.is_none());
+            }
+            assert!(!service.advisory_initialized());
+            assert!(!dir.path().join("decision-engine.sqlite").exists());
+            service
+                .observe_advisory(context, binding.decision_advice().map(|a| a.decision_id), true)
+                .await;
+            assert_eq!(service.advisory_initialized(), enabled && mode != DecisionMode::Pre);
+            assert!(
+                service
+                    .drain_writes(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                    .await
+            );
+            if enabled && mode != DecisionMode::Pre {
+                let store = crate::decision_engine::observe::SqliteTelemetryWriter::open(
+                    &dir.path().join("decision-engine.sqlite"),
+                )
+                .unwrap();
+                assert_eq!(store.outcomes().unwrap().len(), 1, "shutdown flushes accepted outcome");
+            }
+        }
     }
 
     #[tokio::test]

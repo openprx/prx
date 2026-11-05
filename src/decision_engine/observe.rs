@@ -120,6 +120,10 @@ pub struct SqliteTelemetryWriter {
 }
 impl SqliteTelemetryWriter {
     pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        #[cfg(test)]
+        if let Some(workspace) = path.parent() {
+            super::access_spy::record(workspace, false);
+        }
         let connection = rusqlite::Connection::open(path)?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS engine_outcomes (sequence INTEGER PRIMARY KEY, decision_id TEXT, tools TEXT NOT NULL, succeeded INTEGER NOT NULL)")?;
         Ok(Self { connection })

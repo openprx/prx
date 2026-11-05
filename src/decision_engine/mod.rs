@@ -10,3 +10,6 @@ pub use contract::*;
 #[cfg(test)]
 #[path = "turn_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod access_spy;

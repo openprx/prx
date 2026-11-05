@@ -285,6 +285,8 @@ impl<'a> ConfigCredentialSource<'a> {
 
 impl CredentialSource for ConfigCredentialSource<'_> {
     fn owner_of(&self, reference: &CredentialRef) -> Result<Option<ProviderId>, CredentialLookupError> {
+        #[cfg(test)]
+        crate::decision_engine::access_spy::record(&self.config.workspace_dir, true);
         match reference {
             CredentialRef::None | CredentialRef::ProviderStore => Ok(None),
             CredentialRef::Profile { id } => Ok(self
@@ -299,6 +301,8 @@ impl CredentialSource for ConfigCredentialSource<'_> {
     }
 
     fn material(&self, reference: &CredentialRef) -> Result<Option<CredentialMaterial>, CredentialLookupError> {
+        #[cfg(test)]
+        crate::decision_engine::access_spy::record(&self.config.workspace_dir, true);
         match reference {
             CredentialRef::None | CredentialRef::ProviderStore => Ok(None),
             CredentialRef::Profile { id } => Ok(self.profiles()?.profiles.get(id).and_then(|profile| {

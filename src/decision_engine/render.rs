@@ -7,6 +7,17 @@ use crate::security::redaction::redact_provider_text;
 /// Whole rows are omitted rather than cutting a redaction marker or UTF-8 text.
 pub fn render_decision_brief(analysis: &IntentAnalysis, budget_tokens: u32, top_k: u32) -> String {
     let mut brief = String::new();
+    // Rank by expected gain, with candidate identity as the stable tie-breaker.
+    let mut candidates = analysis.candidates.iter().collect::<Vec<_>>();
+    let gain = |values: &std::collections::BTreeMap<String, IntentValue>| match values.get("gain") {
+        Some(IntentValue::Score { expected, .. }) => *expected,
+        _ => 0.0,
+    };
+    candidates.sort_by(|(left_name, left), (right_name, right)| {
+        gain(right)
+            .total_cmp(&gain(left))
+            .then_with(|| left_name.cmp(right_name))
+    });
     let rows = std::iter::once("Decision advice (advisory only):".to_owned())
         .chain(
             analysis
@@ -15,9 +26,8 @@ pub fn render_decision_brief(analysis: &IntentAnalysis, budget_tokens: u32, top_
                 .map(|(question, value)| format!("{question}: {}", render_value(value))),
         )
         .chain(
-            analysis
-                .candidates
-                .iter()
+            candidates
+                .into_iter()
                 .take(top_k as usize)
                 .flat_map(|(candidate, values)| {
                     values

@@ -164,9 +164,12 @@ impl ProcessGenerationBinding {
             &self.deferred_changes,
             workspace,
             config_path,
-            &normalized,
         ))?;
         value.sort_all_objects();
+        value
+            .as_array_mut()
+            .context("process signing metadata must serialize as an array")?
+            .push(normalized);
         Ok(serde_json::to_vec(&value)?)
     }
 }

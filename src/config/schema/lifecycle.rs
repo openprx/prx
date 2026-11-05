@@ -518,7 +518,8 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         codex_effort::validate(self.runtime.codex_reasoning_effort.as_deref())?;
         self.causal_tree.validate()?;
-        self.decision_engine.validate()?;
+        self.decision_engine
+            .validate_with_latency_budget(self.causal_tree.policy.extra_latency_budget_ms)?;
         // The JWKS URI is published in the public, signed Agent Card: a
         // `user:password@` there would be handed to every peer.
         if let Some(uri) = self.a2a.card_jwks_uri.as_deref() {
