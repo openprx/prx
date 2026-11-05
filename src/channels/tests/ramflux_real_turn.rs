@@ -107,6 +107,9 @@ impl Tool for CountingTool {
 struct Host {
     read: BufReader<tokio::net::unix::OwnedReadHalf>,
     write: tokio::net::unix::OwnedWriteHalf,
+    // Bytes of a partly read frame. `recv` races a sleep in `select!`, so a
+    // cancelled read must keep what it consumed for the next call.
+    pending: Vec<u8>,
 }
 
 impl Host {
@@ -129,6 +132,7 @@ impl Host {
         Self {
             read: BufReader::new(read),
             write,
+            pending: Vec::new(),
         }
     }
 
@@ -140,13 +144,11 @@ impl Host {
     }
 
     async fn recv(&mut self) -> Value {
-        let frame = tokio::time::timeout(Duration::from_secs(30), async {
-            let mut buf = Vec::new();
-            self.read.read_until(b'\n', &mut buf).await.expect("test: read");
-            buf
-        })
-        .await
-        .expect("test: frame timeout");
+        tokio::time::timeout(Duration::from_secs(30), self.read.read_until(b'\n', &mut self.pending))
+            .await
+            .expect("test: frame timeout")
+            .expect("test: read");
+        let frame = std::mem::take(&mut self.pending);
         serde_json::from_slice(&frame).expect("test: json")
     }
 }
