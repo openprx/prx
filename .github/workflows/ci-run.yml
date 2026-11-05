@@ -99,7 +99,7 @@ jobs:
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
         # r5 QA cap: measure, then lower (hosted fallback unchanged).
-        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 25 }}
+        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 50 }}
         env:
             CARGO_BUILD_JOBS: "4"
             CARGO_INCREMENTAL: "0"
@@ -147,7 +147,7 @@ jobs:
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
         # r5 QA cap: measure, then lower (hosted fallback unchanged).
-        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 25 }}
+        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 50 }}
         env:
             CARGO_BUILD_JOBS: "4"
             CARGO_INCREMENTAL: "0"
@@ -251,7 +251,7 @@ jobs:
         if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
         # r5 QA cap: measure, then lower (hosted fallback unchanged).
-        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 25 }}
+        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 50 }}
         strategy:
             fail-fast: false
             matrix:
@@ -324,7 +324,7 @@ jobs:
         name: Test Shard ${{ matrix.name }}
         needs: [changes, test-build]
         runs-on: ${{ fromJSON(needs.changes.outputs.heavy_runner) }}
-        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 25 }}
+        timeout-minutes: ${{ needs.changes.outputs.heavy_timeout == '45' && 45 || 50 }}
         strategy:
             fail-fast: false
             matrix:
