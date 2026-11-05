@@ -71,8 +71,9 @@ async fn review_denial_blocks_issue() {
 fn consumed_grant_claim_keeps_pre_extraction_bytes() {
     const EXPECTED: &str = r#"{"disposition":"consumed","grant_id":"prx_grant","signed_payload_sha256":"prx_signed_payload","binding":{"decision_id":"00000000-0000-0000-0000-000000000001","catalog_generation":[32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63],"call_digest":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]},"nonce":"prx_nonce","execution":{"decision_id":"prx_resume","source_event_id":"prx_source","run_id":"prx_run"}}"#;
     let value: super::resolution::GrantClaim = serde_json::from_str(EXPECTED).unwrap();
-    assert_eq!(serde_json::to_string(&value).unwrap(), EXPECTED);
-    let restored: super::resolution::GrantClaim = serde_json::from_str(EXPECTED).unwrap();
+    let serialized = serde_json::to_string(&value).unwrap();
+    assert_eq!(serialized, EXPECTED);
+    let restored: super::resolution::GrantClaim = serde_json::from_str(&serialized).unwrap();
     assert!(value == restored);
 }
 
@@ -81,8 +82,9 @@ fn consumed_grant_claim_keeps_pre_extraction_bytes() {
 fn revoked_grant_claim_keeps_pre_extraction_bytes() {
     const EXPECTED: &str = r#"{"disposition":"revoked","grant_id":"prx_grant","signed_payload_sha256":"prx_signed_payload","binding":{"decision_id":"00000000-0000-0000-0000-000000000001","catalog_generation":[32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63],"call_digest":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]},"nonce":"prx_nonce"}"#;
     let value: super::resolution::GrantClaim = serde_json::from_str(EXPECTED).unwrap();
-    assert_eq!(serde_json::to_string(&value).unwrap(), EXPECTED);
-    let restored: super::resolution::GrantClaim = serde_json::from_str(EXPECTED).unwrap();
+    let serialized = serde_json::to_string(&value).unwrap();
+    assert_eq!(serialized, EXPECTED);
+    let restored: super::resolution::GrantClaim = serde_json::from_str(&serialized).unwrap();
     assert!(value == restored);
 }
 
@@ -91,7 +93,350 @@ fn revoked_grant_claim_keeps_pre_extraction_bytes() {
 fn signed_resume_intent_keeps_pre_extraction_bytes() {
     const EXPECTED: &str = r#"{"record":{"binding":{"decision_id":"00000000-0000-0000-0000-000000000001","catalog_generation":[32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63],"call_digest":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]},"source_event_id":"prx_source","source_mac":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32],"run_id":"prx_run","policy_version":"prx_policy","reviewed_grants_mac":[32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63]},"mac":[32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1]}"#;
     let value: super::resume::SignedResumeIntent = serde_json::from_str(EXPECTED).unwrap();
-    assert_eq!(serde_json::to_string(&value).unwrap(), EXPECTED);
-    let restored: super::resume::SignedResumeIntent = serde_json::from_str(EXPECTED).unwrap();
+    let serialized = serde_json::to_string(&value).unwrap();
+    assert_eq!(serialized, EXPECTED);
+    let restored: super::resume::SignedResumeIntent = serde_json::from_str(&serialized).unwrap();
     assert!(value == restored);
+}
+
+use super::pending::{PendingRecord, VerifiedPendingDecisionApproval, scope_from_source};
+use super::resolution::ResumeClaimScope;
+use super::{ApprovalLedger, ApprovalRuntime, GrantScope};
+use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject, WitnessKeyring};
+use crate::causal_tree::store::{CausalDecisionStore, DecisionScope, Retention, StoreMode};
+use crate::decision::{DecisionKey, KeyDomain};
+use crate::memory::{Memory, MemoryFabric, MemoryVisibility, MessageEventScope, SqliteMemory};
+use std::sync::Arc;
+
+// This port isolates ledger persistence; runtime admission is outside this test scope.
+struct LedgerTestPort;
+#[async_trait::async_trait]
+impl ApprovalRuntime for LedgerTestPort {
+    fn check_live_parity(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn verify_pending_console_file_operation(&self, _: &VerifiedPendingDecisionApproval) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn open_pending_call(
+        &self,
+        _: &VerifiedPendingDecisionApproval,
+    ) -> anyhow::Result<crate::tools::ToolExecutionCommand> {
+        anyhow::bail!("fixture has no sealed call")
+    }
+    fn verify_h2_review_requirement(
+        &self,
+        _: &VerifiedPendingDecisionApproval,
+        _: bool,
+        _: Option<&crate::runtime::h2_entry::LocalOwnerReviewStamp>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn retire_pending(&self, _: &PendingRecord) {}
+}
+
+struct LifecycleFixture {
+    memory: Arc<dyn Memory>,
+    key: Arc<DecisionKey>,
+    store: Arc<CausalDecisionStore>,
+    subject: Subject,
+    binding: DecisionApprovalBinding,
+    scope: MessageEventScope,
+    grant: ApprovalGrantV2,
+}
+
+impl LifecycleFixture {
+    async fn new(path: &std::path::Path) -> Self {
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(path).unwrap());
+        let key = DecisionKey::load_or_create(path).unwrap();
+        let store = CausalDecisionStore::open_shared(
+            path,
+            Retention::days(0, 0),
+            Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+            StoreMode::ReadWrite,
+        )
+        .unwrap();
+        let workspace = store.workspace_id().unwrap();
+        let subject = Subject {
+            agent_id: "prx_agent".into(),
+            principal_id: "prx_principal".into(),
+            owner_id: "prx_owner".into(),
+            workspace_id: workspace.to_string(),
+            session_key: Some("prx_session".into()),
+        };
+        let id = DecisionId::new_runtime();
+        let binding = DecisionApprovalBinding {
+            decision_id: id.to_string(),
+            catalog_generation: [7; 32],
+            call_digest: [8; 32],
+        };
+        let mut scope = MessageEventScope::new("cli", MemoryVisibility::Private);
+        scope.owner_id = Some(subject.owner_id.clone());
+        scope.session_key = subject.session_key.clone();
+        scope.run_id = Some("prx_run".into());
+        let source = MemoryFabric::new(memory.clone(), workspace.to_string())
+            .record_inbound_user_message(scope, "project operation", None, None)
+            .await
+            .unwrap();
+        let scope = scope_from_source(&source);
+        let mut row = crate::causal_tree::store::testing::record(
+            id,
+            &workspace,
+            Some(&subject.owner_id),
+            chrono::Utc::now().timestamp_millis(),
+        );
+        row.lineage.session_key = Some(Arc::from("prx_session"));
+        row.lineage.run_id = Some(Arc::from("prx_run"));
+        let writer = store.writer().unwrap();
+        writer.record_decision(row);
+        assert!(
+            writer
+                .drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await
+        );
+        let digest = store
+            .reader()
+            .replay_record(
+                &DecisionScope::Owner {
+                    workspace_id: workspace.clone(),
+                    owner_id: Arc::from("prx_owner"),
+                },
+                &id,
+            )
+            .unwrap()
+            .unwrap()
+            .digest;
+        let expires_at = chrono::Utc::now() + chrono::Duration::minutes(4);
+        let grant = ApprovalGrantV2::issue_decision_one_shot(
+            WitnessKeyring::global_for_tests(),
+            subject.clone(),
+            "prx_operation",
+            RiskLevel::Medium,
+            binding.clone(),
+            expires_at,
+        )
+        .unwrap();
+        let fixture = Self {
+            memory,
+            key,
+            store,
+            subject,
+            binding,
+            scope,
+            grant,
+        };
+        fixture
+            .ledger()
+            .persist_pending_record_receipt(
+                PendingRecord {
+                    h2_origin: None,
+                    subject: fixture.subject.clone(),
+                    binding: fixture.binding.clone(),
+                    source_event_id: source.event_id.clone(),
+                    source_mac: fixture.key.hmac(
+                        KeyDomain::ApprovalState,
+                        &[b"source", &serde_json::to_vec(&source).unwrap()],
+                    ),
+                    run_id: "prx_run".into(),
+                    decision_digests: vec![(id.to_string(), digest)],
+                    policy_version: "prx_policy".into(),
+                    capabilities: vec![],
+                    op_ids: vec!["prx_operation".into()],
+                    effect: "local_write".into(),
+                    risk: None,
+                    schema_dialect: None,
+                    sealed_call: None,
+                    expires_at,
+                },
+                &source,
+            )
+            .await
+            .unwrap();
+        fixture
+            .ledger()
+            .store_decision_grant(
+                fixture.scope.clone(),
+                &fixture.grant,
+                &fixture.expected(),
+                WitnessKeyring::global_for_tests(),
+            )
+            .await
+            .unwrap();
+        fixture
+    }
+    fn ledger(&self) -> ApprovalLedger<'_> {
+        ApprovalLedger {
+            memory: &self.memory,
+            state_key: &self.key,
+            store: &self.store,
+            workspace: self.subject.workspace_id.clone(),
+            catalog_generation: self.binding.catalog_generation,
+            policy_version: "prx_policy",
+            enabled: true,
+            port: &LedgerTestPort,
+        }
+    }
+    fn expected(&self) -> GrantScope<'_> {
+        GrantScope {
+            subject: &self.subject,
+            binding: &self.binding,
+            op_id: "prx_operation",
+            risk: RiskLevel::Medium,
+        }
+    }
+    async fn claim(&self) -> anyhow::Result<crate::memory::MessageEvent> {
+        self.ledger()
+            .claim_decision_grant(
+                self.scope.clone(),
+                &self.grant,
+                &self.expected(),
+                WitnessKeyring::global_for_tests(),
+                ResumeClaimScope {
+                    decision_id: "prx_resume".into(),
+                    source_event_id: self.scope.causation_event_id.clone().unwrap(),
+                    run_id: "prx_run".into(),
+                },
+            )
+            .await
+    }
+    async fn revoke(&self) -> anyhow::Result<crate::memory::MessageEvent> {
+        self.ledger()
+            .revoke_decision_grant(
+                self.scope.clone(),
+                &self.grant,
+                &self.expected(),
+                WitnessKeyring::global_for_tests(),
+            )
+            .await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claim_and_revoke_race_has_exactly_one_winner() {
+    let workspace = tempfile::tempdir().unwrap();
+    let fixture = Arc::new(LifecycleFixture::new(workspace.path()).await);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let claimant = fixture.clone();
+    let claim_barrier = barrier.clone();
+    let claim = tokio::spawn(async move {
+        claim_barrier.wait().await;
+        claimant.claim().await
+    });
+    let revoker = fixture.clone();
+    let revoke = tokio::spawn(async move {
+        barrier.wait().await;
+        revoker.revoke().await
+    });
+    let claimed = claim.await.unwrap();
+    let revoked = revoke.await.unwrap();
+    assert_ne!(claimed.is_ok(), revoked.is_ok(), "exactly one resolution wins");
+    let key = super::keys::decision_resolution_key(&fixture.binding, "prx_operation");
+    let durable = fixture
+        .memory
+        .find_message_event_by_idempotency_key(&fixture.subject.workspace_id, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    let winner = claimed.as_ref().or(revoked.as_ref()).unwrap();
+    assert_eq!(durable.event_id, winner.event_id);
+    let payload: serde_json::Value = serde_json::from_str(durable.raw_payload_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        payload.get("disposition").expect("durable disposition"),
+        if claimed.is_ok() { "consumed" } else { "revoked" }
+    );
+    assert!(fixture.claim().await.is_err());
+}
+
+#[tokio::test]
+async fn consumed_grant_cannot_be_revoked_or_reclaimed_after_restart() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut fixture = LifecycleFixture::new(workspace.path()).await;
+    let consumed = fixture.claim().await.unwrap();
+    // Release the last SQLite memory handle before reopening the same database.
+    drop(fixture.memory);
+    fixture.memory = Arc::new(SqliteMemory::new(workspace.path()).unwrap());
+    assert!(fixture.revoke().await.is_err(), "consumption cannot become revocation");
+    assert!(
+        fixture.claim().await.is_err(),
+        "a new nonce cannot reclaim a consumed grant"
+    );
+    let key = super::keys::decision_resolution_key(&fixture.binding, "prx_operation");
+    let durable = fixture
+        .memory
+        .find_message_event_by_idempotency_key(&fixture.subject.workspace_id, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.event_id, consumed.event_id);
+    assert_eq!(durable.raw_payload_json, consumed.raw_payload_json);
+}
+
+#[tokio::test]
+async fn revoked_grant_cannot_be_claimed_after_restart() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut fixture = LifecycleFixture::new(workspace.path()).await;
+    let revoked = fixture.revoke().await.unwrap();
+    drop(fixture.memory);
+    fixture.memory = Arc::new(SqliteMemory::new(workspace.path()).unwrap());
+    assert!(fixture.claim().await.is_err());
+    let repeated = fixture.revoke().await.unwrap();
+    assert_eq!(repeated.event_id, revoked.event_id);
+    assert_eq!(repeated.raw_payload_json, revoked.raw_payload_json);
+}
+
+#[tokio::test]
+async fn wrong_owner_or_session_cannot_review_or_claim() {
+    let workspace = tempfile::tempdir().unwrap();
+    let fixture = LifecycleFixture::new(workspace.path()).await;
+    let id = DecisionId::parse(&fixture.binding.decision_id).unwrap();
+    // A valid pending read proves the negative reviews have a real authenticated target.
+    fixture
+        .ledger()
+        .load_pending_decision_approval("prx_owner", "prx_session", id)
+        .await
+        .unwrap();
+    for (owner, session) in [("prx_other_owner", "prx_session"), ("prx_owner", "prx_other_session")] {
+        let error = fixture
+            .ledger()
+            .review_pending_decision_approval(owner, session, id, true)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("belongs to another scope"), "{error}");
+        let mut scope = fixture.scope.clone();
+        scope.owner_id = Some(owner.into());
+        scope.session_key = Some(session.into());
+        let error = fixture
+            .ledger()
+            .claim_decision_grant(
+                scope,
+                &fixture.grant,
+                &fixture.expected(),
+                WitnessKeyring::global_for_tests(),
+                ResumeClaimScope {
+                    decision_id: "prx_resume".into(),
+                    source_event_id: fixture.scope.causation_event_id.clone().unwrap(),
+                    run_id: "prx_run".into(),
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("scope differs from pinned authority"),
+            "{error}"
+        );
+    }
+    assert!(
+        fixture
+            .memory
+            .find_message_event_by_idempotency_key(&fixture.subject.workspace_id, &DecisionAuthority(id).review_key())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture.claim().await.is_ok(),
+        "rejected attempts must not consume the grant"
+    );
 }
