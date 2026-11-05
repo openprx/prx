@@ -598,7 +598,6 @@ mod auxiliary_registration_tests {
         let temp = tempfile::tempdir().expect("test: workspace");
         let mut config = crate::config::Config::default();
         config.workspace_dir = temp.path().to_path_buf();
-        config.causal_tree.enabled = false;
         let memory: Arc<dyn crate::memory::Memory> =
             Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("test: sqlite"));
         let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), temp.path().to_string_lossy())
@@ -632,7 +631,6 @@ mod auxiliary_registration_tests {
         let temp = tempfile::tempdir().expect("test: workspace");
         let mut config = crate::config::Config::default();
         config.workspace_dir = temp.path().to_path_buf();
-        config.causal_tree.enabled = false;
         let memory: Arc<dyn crate::memory::Memory> =
             Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("test: sqlite"));
         let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), temp.path().to_string_lossy())
@@ -685,6 +683,7 @@ async fn finalize_and_rejoin(
     #[cfg(test)]
     let mut stage =
         super::turn_cleanup::diagnostic::Stage::current(super::turn_cleanup::diagnostic::StageName::TerminalFinalize);
+    let recorded = proposal.decision.as_ref().is_some_and(|link| link.is_recorded());
     let receipt = crate::agent::terminal::finalize_turn(fabric, proposal, &config.cost, &config.workspace_dir).await?;
     #[cfg(test)]
     stage.next(super::turn_cleanup::diagnostic::StageName::TerminalReceiptOwner);
@@ -695,8 +694,11 @@ async fn finalize_and_rejoin(
         .ok_or_else(|| anyhow::anyhow!("runtime terminal owner missing"))?;
     #[cfg(test)]
     stage.next(super::turn_cleanup::diagnostic::StageName::TerminalRejoin);
-    if config.causal_tree.enabled {
-        service.rejoin_terminal(&receipt.terminal_id, owner).await?;
+    if recorded {
+        service
+            .recovery_scope()
+            .rejoin_terminal(&receipt.terminal_id, owner)
+            .await?;
     }
     #[cfg(test)]
     stage.finish();

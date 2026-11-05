@@ -848,7 +848,6 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.memory.backend = "sqlite".to_string();
-        config.causal_tree.enabled = true;
         let config = Arc::new(config);
         let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
         let ticket = owner.register(tokio_util::sync::CancellationToken::new()).unwrap();

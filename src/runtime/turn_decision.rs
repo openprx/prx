@@ -1672,6 +1672,7 @@ impl TurnDecisionService {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn rejoin_terminal(&self, terminal_id: &str, owner_id: &str) -> anyhow::Result<Enqueue> {
         self.recovery_scope().rejoin_terminal(terminal_id, owner_id).await
     }

@@ -2125,8 +2125,11 @@ pub(crate) async fn run_with_runtime_envelope(
                 {
                     return Err(error);
                 }
-                if terminal_guard.get().is_none() && config.causal_tree.enabled {
+                if terminal_guard.get().is_none()
+                    && decision_settlement_snapshot(&decision_settlement).is_some_and(|link| link.is_recorded())
+                {
                     decision_service
+                        .recovery_scope()
                         .rejoin_terminal(&turn_run_id, decision_proof.owner_id())
                         .await?;
                 }

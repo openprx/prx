@@ -814,14 +814,18 @@ impl ChatTurnBinding {
         ))
     }
 
-    pub(super) async fn rejoin_terminal(&self, terminal_id: &str) -> anyhow::Result<()> {
+    pub(super) async fn rejoin_recovery_terminal(&self, terminal_id: &str) -> anyhow::Result<()> {
         if let Some(decided) = self.decision.get() {
             anyhow::ensure!(
                 self.envelope.run_id.as_deref() == Some(terminal_id),
                 "chat terminal id differs from its source"
             );
             if self.settlement_ref(terminal_id)?.is_some_and(|link| link.is_recorded()) {
-                decided.service.rejoin_terminal(terminal_id, &self.owner_id).await?;
+                decided
+                    .service
+                    .recovery_scope()
+                    .rejoin_terminal(terminal_id, &self.owner_id)
+                    .await?;
             }
         }
         Ok(())

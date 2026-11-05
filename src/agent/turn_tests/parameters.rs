@@ -176,6 +176,7 @@ async fn prepared_parameters_survive_scope_drop_without_fabricating_a_provider_o
             let receipt = crate::agent::terminal::finalize_turn(&fabric, draft, &cost, workspace.path()).await?;
             let rejoined = decision
                 .service
+                .recovery_scope()
                 .rejoin_terminal(&receipt.terminal_id, receipt.terminal_event.owner_id.as_deref().unwrap())
                 .await?;
             let events = memory.list_message_events_since(&admission.principal(), 0, 100).await?;

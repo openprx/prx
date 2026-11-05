@@ -218,7 +218,7 @@ pub(super) async fn finalize_chat_success_turn(
             workspace_dir,
         )
         .await?;
-    binding.rejoin_terminal(chat_run_id).await?;
+    binding.rejoin_recovery_terminal(chat_run_id).await?;
     Ok(receipt)
 }
 
@@ -276,7 +276,7 @@ pub(super) async fn finalize_chat_non_success_turn(
             workspace_dir,
         )
         .await?;
-    binding.rejoin_terminal(chat_run_id).await?;
+    binding.rejoin_recovery_terminal(chat_run_id).await?;
     Ok(())
 }
 

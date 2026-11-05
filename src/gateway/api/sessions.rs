@@ -256,7 +256,7 @@ async fn recover_console_history(
                     .filter(|id| !id.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Console terminal owner missing"))?;
                 let service = runtime.decision_slot.publish(runtime, state).await?;
-                service.rejoin_terminal(terminal_id, owner).await?;
+                service.recovery_scope().rejoin_terminal(terminal_id, owner).await?;
             }
         }
         Ok::<(), anyhow::Error>(())

@@ -146,6 +146,7 @@ async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &
                     .replace_event_payload_for_test(&receipt.terminal_event.event_id, &payload.to_string())
                     .unwrap();
                 let error = service
+                    .recovery_scope()
                     .rejoin_terminal("prx-first-run", source.owner_id.as_deref().unwrap())
                     .await
                     .unwrap_err();
