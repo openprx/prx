@@ -190,6 +190,8 @@ mod tests {
             workspace_dir: temp.path().into(),
             ..Default::default()
         };
+        // NoneMemory cannot persist causal events. Install the advisory runtime
+        // below so this fixture still exercises the real telemetry drain.
         config.causal_tree.enabled = false;
         let generation = crate::config::new_shared(config.clone()).pin();
         let service = super::super::tests::disabled_agent_service(
@@ -227,7 +229,12 @@ mod tests {
             .await;
         // The worker is still gated, but catalog acknowledgement permits the chat loop to continue.
         assert!(drained);
-        assert!(service.advisory_engine.get().unwrap().worker.lock().await.is_some());
+        let runtime = service.advisory_engine.get().unwrap();
+        assert!(
+            runtime.cancellation.is_cancelled(),
+            "drain must close observation admission"
+        );
+        assert!(runtime.worker.lock().await.is_some());
         release_tx.send(()).unwrap();
         tokio::time::resume();
         assert!(
