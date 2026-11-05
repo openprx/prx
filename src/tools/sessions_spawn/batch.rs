@@ -98,7 +98,7 @@ pub(super) fn join_summary(batch_id: &str, settled: &[JoinedMember]) -> serde_js
                 completed.push(json!({"run_id": member.run_id, "task": member.task, "output": output}));
             }
             JoinedVerdict::Failed(error) => {
-                failed.push(json!({"run_id": member.run_id, "task": member.task, "error": error}));
+                failed.push(json!({"run_id": member.run_id, "task": member.task, "error": super::failure::llm_visible_error(error)}));
             }
             JoinedVerdict::Killed(reason) => {
                 killed.push(json!({"run_id": member.run_id, "task": member.task, "reason": reason}));

@@ -63,12 +63,20 @@ pub(crate) const SUB_AGENT_REPORTED_PREFIX: &str = "sub-agent reported:";
 /// after it cannot drift, and so a test can build the exact reason production
 /// would from an adversarial worker payload.
 pub(super) fn sub_agent_reported_failure(detail: &str) -> String {
-    let detail = detail.trim();
+    let detail = llm_visible_error(detail.trim());
     if detail.is_empty() {
         SUB_AGENT_REPORTED_PREFIX.to_string()
     } else {
         format!("{SUB_AGENT_REPORTED_PREFIX} {detail}")
     }
+}
+
+/// Error text that reaches the model or an operator listing. Full error
+/// chains carry inner causes (provider URLs with `?key=`, userinfo,
+/// recognised secrets), so every failure string a run records or returns
+/// goes through the one provider-text redactor first.
+pub(crate) fn llm_visible_error(text: &str) -> String {
+    crate::security::redaction::redact_provider_text(text)
 }
 
 /// Which of the three ways a run can stop this reason describes.
@@ -208,4 +216,21 @@ pub(super) fn failure_gave_no_conclusion(reason: &str) -> bool {
         || reason.ends_with(PANICKED_BEFORE_RESULT_SUFFIX)
         || reason.starts_with(PROCESS_OWNER_PANICKED_PREFIX)
         || crate::agent::idle::message_describes_hang_termination(reason)
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::{SUB_AGENT_REPORTED_PREFIX, llm_visible_error, sub_agent_reported_failure};
+
+    #[test]
+    fn failure_text_hides_provider_url_secrets_from_the_model() {
+        let chain = "run and clean up worker in /tmp/w: provider request failed: \
+                     error sending request for url (https://user:pw@generativelanguage.googleapis.com/v1/models?key=AIzaSECRETKEY123456)";
+        for text in [llm_visible_error(chain), sub_agent_reported_failure(chain)] {
+            assert!(!text.contains("AIzaSECRETKEY123456"), "query secret leaked: {text}");
+            assert!(!text.contains("user:pw"), "userinfo leaked: {text}");
+            assert!(text.contains("provider request failed"), "cause lost: {text}");
+        }
+        assert!(sub_agent_reported_failure(chain).starts_with(SUB_AGENT_REPORTED_PREFIX));
+    }
 }

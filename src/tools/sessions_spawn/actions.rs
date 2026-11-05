@@ -84,7 +84,7 @@ impl SessionsSpawnTool {
                         let ellipsis = if msg.len() > 60 { "…" } else { "" };
                         format!("✅ completed: {preview}{ellipsis}")
                     }
-                    SubAgentStatus::Failed(e) => format!("❌ failed: {e}"),
+                    SubAgentStatus::Failed(e) => format!("❌ failed: {}", super::failure::llm_visible_error(e)),
                 };
                 let age = (Utc::now() - r.started_at).num_seconds();
                 let parent = r.parent_run_id.as_deref().unwrap_or("root");
