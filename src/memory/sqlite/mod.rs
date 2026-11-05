@@ -535,6 +535,16 @@ impl SqliteMemory {
         Ok(())
     }
 
+    /// Corrupt the owner anchor to exercise authenticated ledger reads.
+    pub(crate) fn replace_event_owner_for_test(&self, key: &str, owner: &str) -> anyhow::Result<()> {
+        let updated = self.pool.write().execute(
+            "UPDATE message_events SET owner_id = ?1 WHERE idempotency_key = ?2",
+            params![owner, key],
+        )?;
+        anyhow::ensure!(updated == 1, "historical event not found");
+        Ok(())
+    }
+
     pub(crate) fn reject_user_events_for_test(&self) -> anyhow::Result<()> {
         self.pool.write().execute_batch(
             "CREATE TRIGGER reject_test_ingress BEFORE INSERT ON message_events

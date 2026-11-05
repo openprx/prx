@@ -706,6 +706,22 @@ async fn run_keyed_and_decision_keyed_listings_do_not_mix() {
         .list_pending_decision_approvals("prx_owner", 0, 10)
         .await
         .unwrap();
+    let raw_decisions = decision
+        .memory
+        .list_owned_message_events_by_type(
+            &decision.subject.workspace_id,
+            "prx_owner",
+            "approval.decision.pending",
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        raw_decisions.len(),
+        1,
+        "call events must not change the raw decision event count"
+    );
     assert_eq!(decisions.items.len(), 1);
     assert_eq!(
         decisions.items.first().unwrap().view.decision_id,
@@ -745,15 +761,71 @@ async fn run_keyed_review_by_wrong_owner_is_refused() {
 async fn decision_claim_checks_stored_grant_owner() {
     let path = tempfile::tempdir().unwrap();
     let fixture = LifecycleFixture::new(path.path()).await;
-    let connection = rusqlite::Connection::open(path.path().join("memory/brain.db")).unwrap();
-    connection
-        .execute(
-            "UPDATE message_events SET owner_id = 'prx_other_owner' WHERE idempotency_key = ?1",
-            [format!("decision-approval:{}:issued", fixture.grant.grant_id)],
+    SqliteMemory::new(path.path())
+        .unwrap()
+        .replace_event_owner_for_test(
+            &format!("decision-approval:{}:issued", fixture.grant.grant_id),
+            "prx_other_owner",
         )
         .unwrap();
     assert_eq!(
         fixture.claim().await.unwrap_err().to_string(),
         "stored approval belongs to another scope"
     );
+}
+
+#[test]
+fn run_keyed_authorities_cannot_share_delimited_keys() {
+    let first = RunCallAuthority {
+        run_id: "prx_run".into(),
+        call_digest: [1; 32],
+    };
+    let second = RunCallAuthority {
+        run_id: format!("prx_run:{}:resume:prx_source", hex::encode(first.call_digest)),
+        call_digest: [2; 32],
+    };
+    assert_ne!(
+        first.resume_key(&format!("prx_source:{}:pending", hex::encode(second.call_digest))),
+        second.pending_key()
+    );
+    assert_ne!(first.pending_key(), second.pending_key());
+}
+
+#[tokio::test]
+async fn corrupt_run_keyed_pending_is_skipped() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = CallFixture::new(path.path()).await;
+    let event = fixture
+        .memory
+        .find_message_event_by_idempotency_key("prx_workspace", &fixture.pending.authority.pending_key())
+        .await
+        .unwrap()
+        .unwrap();
+    SqliteMemory::new(path.path())
+        .unwrap()
+        .replace_event_payload_for_test(&event.event_id, "invalid")
+        .unwrap();
+    let page = fixture.port().list_pending_calls("prx_owner", 0, 10).await.unwrap();
+    assert!(page.items.is_empty());
+    assert!(page.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn corrupt_run_keyed_review_is_skipped() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = CallFixture::new(path.path()).await;
+    fixture.review().await;
+    let event = fixture
+        .memory
+        .find_message_event_by_idempotency_key("prx_workspace", &fixture.pending.authority.review_key())
+        .await
+        .unwrap()
+        .unwrap();
+    SqliteMemory::new(path.path())
+        .unwrap()
+        .replace_event_payload_for_test(&event.event_id, "invalid")
+        .unwrap();
+    let page = fixture.port().list_pending_calls("prx_owner", 0, 10).await.unwrap();
+    assert!(page.items.is_empty());
+    assert!(page.next_cursor.is_none());
 }

@@ -49,7 +49,10 @@ pub(crate) struct RunCallAuthority {
 
 impl ApprovalAuthority for RunCallAuthority {
     fn namespace(&self) -> String {
-        format!("call-approval:{}:{}", self.run_id, hex::encode(self.call_digest))
+        // Hash the run component so delimiters in an untrusted run id cannot
+        // cross the fixed key boundaries (including resume suffixes).
+        let run = hex::encode(Sha256::digest(self.run_id.as_bytes()));
+        format!("call-approval:{run}:{}", hex::encode(self.call_digest))
     }
     fn issued_key(&self, _grant_id: &str) -> String {
         format!("{}:issued", self.namespace())
