@@ -123,30 +123,49 @@ pub(super) async fn run_sub_agent_process(
     {
         if let Some(artifact) = test_worker_executable.filter(|artifact| artifact.protocol.is_some()) {
             use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-            artifact.verify()?;
-            let home = std::fs::canonicalize(&artifact.private_home)?;
-            let root = std::fs::canonicalize(worker_workspace_root)?;
+            artifact
+                .verify()
+                .with_context(|| format!("verify session worker executable `{}`", artifact.path.display()))?;
+            let home = std::fs::canonicalize(&artifact.private_home)
+                .with_context(|| format!("resolve worker private HOME `{}`", artifact.private_home.display()))?;
+            let root = std::fs::canonicalize(worker_workspace_root)
+                .with_context(|| format!("resolve worker workspace root `{}`", worker_workspace_root.display()))?;
             anyhow::ensure!(
                 root != home && root.starts_with(&home),
                 "protocol workspace root must be inside owned private HOME"
             );
             for path in [&home, &root] {
                 anyhow::ensure!(
-                    std::fs::symlink_metadata(path)?.permissions().mode() & 0o777 == 0o700,
+                    std::fs::symlink_metadata(path)
+                        .with_context(|| format!("inspect worker directory `{}`", path.display()))?
+                        .permissions()
+                        .mode()
+                        & 0o777
+                        == 0o700,
                     "protocol HOME and workspace root must be private"
                 );
             }
-            std::fs::DirBuilder::new().mode(0o700).create(&worker_workspace)?;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&worker_workspace)
+                .with_context(|| format!("create private worker workspace `{}`", worker_workspace.display()))?;
             anyhow::ensure!(
-                std::fs::symlink_metadata(&worker_workspace)?.permissions().mode() & 0o777 == 0o700,
+                std::fs::symlink_metadata(&worker_workspace)
+                    .with_context(|| format!("inspect worker workspace `{}`", worker_workspace.display()))?
+                    .permissions()
+                    .mode()
+                    & 0o777
+                    == 0o700,
                 "protocol worker workspace must be private at creation"
             );
         } else {
-            std::fs::create_dir_all(&worker_workspace)?;
+            std::fs::create_dir_all(&worker_workspace)
+                .with_context(|| format!("create worker workspace `{}`", worker_workspace.display()))?;
         }
     }
     #[cfg(any(not(test), not(unix)))]
-    std::fs::create_dir_all(&worker_workspace)?;
+    std::fs::create_dir_all(&worker_workspace)
+        .with_context(|| format!("create worker workspace `{}`", worker_workspace.display()))?;
     let shared_memory_db_path = shared_worker_memory_db_path(logical_workspace_root);
     let worker_memory_db_path = private_worker_memory_db_path(&worker_workspace);
     let normalized_memory_strategy = normalize_process_memory_strategy(memory_strategy)?;
@@ -166,7 +185,13 @@ pub(super) async fn run_sub_agent_process(
         let source_identity = workspace_root.join(identity_dir);
         if source_identity.is_dir() {
             let copied_identity_dir = worker_workspace.join("identity");
-            copy_dir_recursive(&source_identity, &copied_identity_dir)?;
+            copy_dir_recursive(&source_identity, &copied_identity_dir).with_context(|| {
+                format!(
+                    "copy worker identity `{}` to `{}`",
+                    source_identity.display(),
+                    copied_identity_dir.display()
+                )
+            })?;
             Some("identity".to_string())
         } else {
             tracing::warn!(path = %source_identity.display(), "configured agent identity directory is missing or is not a directory");
@@ -227,10 +252,12 @@ pub(super) async fn run_sub_agent_process(
     let executable = std::env::current_exe().context("resolve the current executable for the session worker child")?;
     #[cfg(test)]
     let executable = if let Some(artifact) = test_worker_executable {
-        artifact.verify()?;
+        artifact
+            .verify()
+            .with_context(|| format!("verify session worker executable `{}`", artifact.path.display()))?;
         artifact.path.clone()
     } else {
-        std::env::current_exe()?
+        std::env::current_exe().context("resolve the current executable path for the session worker child")?
     };
     #[cfg(test)]
     if let Some(observer) = test_worker_executable.and_then(|artifact| artifact.route_observer.as_ref()) {
@@ -286,7 +313,13 @@ pub(super) async fn run_sub_agent_process(
         &manifest,
         &source_transport_key.clone().unwrap_or_else(session_worker_signing_key),
         capability_expiry,
-    )?;
+    )
+    .with_context(|| {
+        format!(
+            "prepare worker manifest snapshot in `{}`",
+            manifest.workspace_dir.display()
+        )
+    })?;
     #[cfg(unix)]
     let payload = prepared_manifest.line().to_owned();
     #[cfg(not(unix))]
@@ -341,7 +374,9 @@ pub(super) async fn run_sub_agent_process(
         Err(error) => {
             let status = start_kill_and_reap_direct_child(&mut child)
                 .await
-                .map_err(|cleanup_error| anyhow::anyhow!("{error}; direct-child cleanup failed: {cleanup_error}"))?;
+                .map_err(|cleanup_error| {
+                    anyhow::anyhow!("{error:#}; direct-child cleanup failed: {cleanup_error:#}")
+                })?;
             #[cfg(not(test))]
             let _ = status;
             #[cfg(test)]
@@ -354,9 +389,11 @@ pub(super) async fn run_sub_agent_process(
                 control.diagnostic.lock().registration_marked_reaped = true;
             }
             #[cfg(unix)]
-            prepared_manifest.close().map_err(|cleanup_error| {
+            prepared_manifest.close().with_context(|| {
+                format!("close worker manifest snapshot in `{}`", manifest.workspace_dir.display())
+            }).map_err(|cleanup_error| {
                 anyhow::anyhow!(
-                    "session-worker process group setup failed: {error}; snapshot cleanup failed: {cleanup_error}"
+                    "session-worker process group setup failed: {error:#}; snapshot cleanup failed: {cleanup_error:#}"
                 )
             })?;
             if let Some(recovery) = recovery {
@@ -415,18 +452,24 @@ pub(super) async fn run_sub_agent_process(
                 "stdin protocol control requires a recorded operator launch"
             );
             let artifact = test_worker_executable.context("worker protocol artifact missing")?;
-            let home = std::fs::canonicalize(&artifact.private_home)?;
-            let config_dir = std::fs::canonicalize(&manifest.config_dir)?;
+            let home = std::fs::canonicalize(&artifact.private_home)
+                .with_context(|| format!("resolve worker private HOME `{}`", artifact.private_home.display()))?;
+            let config_dir = std::fs::canonicalize(&manifest.config_dir)
+                .with_context(|| format!("resolve worker config directory `{}`", manifest.config_dir.display()))?;
             anyhow::ensure!(
                 config_dir != home && config_dir.starts_with(&home),
                 "protocol config must be inside owned private HOME"
             );
             let config_path = config_dir.join("config.toml");
             anyhow::ensure!(
-                std::fs::symlink_metadata(&config_path)?.file_type().is_file(),
+                std::fs::symlink_metadata(&config_path)
+                    .with_context(|| format!("inspect worker config `{}`", config_path.display()))?
+                    .file_type()
+                    .is_file(),
                 "protocol config must be a regular file"
             );
-            std::fs::remove_file(config_path)?;
+            std::fs::remove_file(&config_path)
+                .with_context(|| format!("remove worker config `{}`", config_path.display()))?;
         }
         run_spawned_child_lifecycle(
             &mut child,
@@ -471,7 +514,7 @@ pub(super) async fn run_sub_agent_process(
                 });
             }
             cleanup.map_err(|cleanup_error| {
-                anyhow::anyhow!("session-worker lifecycle failed: {error}; cleanup failed: {cleanup_error}")
+                anyhow::anyhow!("session-worker lifecycle failed: {error:#}; cleanup failed: {cleanup_error:#}")
             })?;
             worker_registration.mark_reaped();
             #[cfg(test)]
@@ -479,9 +522,19 @@ pub(super) async fn run_sub_agent_process(
                 control.diagnostic.lock().registration_marked_reaped = true;
             }
             #[cfg(unix)]
-            prepared_manifest.close().map_err(|cleanup_error| {
-                anyhow::anyhow!("session-worker lifecycle failed: {error}; snapshot cleanup failed: {cleanup_error}")
-            })?;
+            prepared_manifest
+                .close()
+                .with_context(|| {
+                    format!(
+                        "close worker manifest snapshot in `{}`",
+                        manifest.workspace_dir.display()
+                    )
+                })
+                .map_err(|cleanup_error| {
+                    anyhow::anyhow!(
+                        "session-worker lifecycle failed: {error:#}; snapshot cleanup failed: {cleanup_error:#}"
+                    )
+                })?;
             if let Some(recovery) = recovery {
                 recovery.confirm_exit(run_id)?;
             }
@@ -505,16 +558,24 @@ pub(super) async fn run_sub_agent_process(
                     Err(error) => test_worker_cleanup_error_class(error),
                 });
             }
-            cleanup.map_err(|error| anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; cleanup failed: {error}"))?;
+            cleanup.map_err(|error| anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; cleanup failed: {error:#}"))?;
             worker_registration.mark_reaped();
             #[cfg(test)]
             if let Some(control) = protocol {
                 control.diagnostic.lock().registration_marked_reaped = true;
             }
             #[cfg(unix)]
-            prepared_manifest.close().map_err(|cleanup_error| {
-                anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; snapshot cleanup failed: {cleanup_error}")
-            })?;
+            prepared_manifest
+                .close()
+                .with_context(|| {
+                    format!(
+                        "close worker manifest snapshot in `{}`",
+                        manifest.workspace_dir.display()
+                    )
+                })
+                .map_err(|cleanup_error| {
+                    anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; snapshot cleanup failed: {cleanup_error:#}")
+                })?;
             if let Some(recovery) = recovery {
                 recovery.confirm_exit(run_id)?;
             }
@@ -530,7 +591,12 @@ pub(super) async fn run_sub_agent_process(
                 control.diagnostic.lock().registration_marked_reaped = true;
             }
             #[cfg(unix)]
-            prepared_manifest.close()?;
+            prepared_manifest.close().with_context(|| {
+                format!(
+                    "close worker manifest snapshot in `{}`",
+                    manifest.workspace_dir.display()
+                )
+            })?;
             if let Some(recovery) = recovery {
                 recovery.confirm_exit(run_id)?;
             }
@@ -543,7 +609,12 @@ pub(super) async fn run_sub_agent_process(
                 control.diagnostic.lock().registration_marked_reaped = true;
             }
             #[cfg(unix)]
-            prepared_manifest.close()?;
+            prepared_manifest.close().with_context(|| {
+                format!(
+                    "close worker manifest snapshot in `{}`",
+                    manifest.workspace_dir.display()
+                )
+            })?;
             if let Some(recovery) = recovery {
                 recovery.confirm_exit(run_id)?;
             }
@@ -599,18 +670,28 @@ pub(super) async fn run_sub_agent_process(
                     use std::io::Write as _;
                     use std::os::unix::fs::OpenOptionsExt as _;
                     anyhow::ensure!(
-                        std::fs::symlink_metadata(&artifact.private_home)?.file_type().is_dir(),
+                        std::fs::symlink_metadata(&artifact.private_home)
+                            .with_context(|| format!(
+                                "inspect worker diagnostic HOME `{}`",
+                                artifact.private_home.display()
+                            ))?
+                            .file_type()
+                            .is_dir(),
                         "worker diagnostic home is not an owned directory"
                     );
                     let redacted = crate::agent::terminal::redact_persisted_text(error);
                     let bounded: String = redacted.chars().take(4096).collect();
+                    let diagnostic_path = artifact.private_home.join("unsigned-worker-error.txt");
                     let mut file = std::fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .mode(0o600)
-                        .open(artifact.private_home.join("unsigned-worker-error.txt"))?;
-                    file.write_all(bounded.as_bytes())?;
-                    file.sync_all()?;
+                        .open(&diagnostic_path)
+                        .with_context(|| format!("create worker diagnostic `{}`", diagnostic_path.display()))?;
+                    file.write_all(bounded.as_bytes())
+                        .with_context(|| format!("write worker diagnostic `{}`", diagnostic_path.display()))?;
+                    file.sync_all()
+                        .with_context(|| format!("sync worker diagnostic `{}`", diagnostic_path.display()))?;
                     Ok(())
                 })();
                 if retained.is_err() {
