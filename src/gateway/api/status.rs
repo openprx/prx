@@ -5,6 +5,7 @@ use serde::Serialize;
 
 #[derive(Serialize)]
 pub(super) struct StatusResponse {
+    decision_engine: crate::decision_engine::status::DecisionEngineStatus,
     prompt_cache: Vec<PromptCacheStatus>,
     version: String,
     uptime_seconds: u64,
@@ -64,6 +65,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     );
 
     Json(StatusResponse {
+        decision_engine: crate::decision_engine::status::snapshot(&config),
         prompt_cache: crate::agent::prompt_cache_metrics::snapshot()
             .into_iter()
             .map(|(provider_model, stats)| PromptCacheStatus {

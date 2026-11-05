@@ -399,7 +399,8 @@ impl TurnDecisionService {
 
     /// Report queue acknowledgement to owners that must reject an incomplete exit.
     pub(crate) async fn drain_writes(&self, deadline: Instant) -> bool {
-        let mut drained = self.drain_advisory(deadline).await;
+        // Catalog and causal writes remain authoritative; advisory telemetry is best effort.
+        let mut drained = true;
         if let Some(writer) = self.store.writer() {
             #[cfg(test)]
             crate::runtime::turn_cleanup::diagnostic::queue_presence("decision_writer_present", true);
@@ -425,6 +426,9 @@ impl TurnDecisionService {
             if !events_drained {
                 tracing::warn!("causal event queue did not drain before shutdown deadline");
             }
+        }
+        if !self.drain_advisory(deadline).await {
+            tracing::warn!("decision engine telemetry did not drain before shutdown deadline");
         }
         drained
     }

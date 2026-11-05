@@ -528,6 +528,9 @@ async fn disabled_engine_is_byte_identical_in_one_build() {
     assert_eq!(after.dispatches, 1);
     assert_eq!(before.store_opens, 0);
     assert_eq!(after.store_opens, 0);
+    // Kept as a disabled-path guard against future credential work. Current advisory
+    // projection reads validated answers only; actual-site positive control lives in
+    // access_spies_observe_actual_store_and_credential_sites.
     assert_eq!(before.credential_reads, 0);
     assert_eq!(after.credential_reads, 0);
     assert!(!before.store.exists());
@@ -575,6 +578,7 @@ async fn pre_mode_brief_is_bounded_redacted_deterministic_and_traced() {
 #[tokio::test]
 async fn post_mode_records_outcome_without_brief() {
     let probe = exercise(Some(enabled(DecisionMode::Post)), None).await;
+    assert_eq!(probe.store_opens, 1, "post mode must open the telemetry store once");
     assert!(probe.trace.decision_brief_sha256.is_none());
     assert!(
         !serde_json::to_string(&probe.requests)
@@ -593,6 +597,7 @@ async fn post_mode_records_outcome_without_brief() {
 #[tokio::test]
 async fn both_mode_links_outcome_to_analysis_decision_id() {
     let probe = exercise(Some(enabled(DecisionMode::Both)), Some(long_analysis())).await;
+    assert_eq!(probe.store_opens, 1, "both mode must open the telemetry store once");
     assert!(probe.trace.decision_brief_sha256.is_some());
     let records = recorded(&probe).await;
     let outcome = records

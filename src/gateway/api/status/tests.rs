@@ -230,3 +230,26 @@ async fn get_status_exposes_redacted_prompt_cache_row() {
         assert!(!text.contains(&secret), "credential leaked");
     }
 }
+
+#[tokio::test]
+async fn decision_engine_status_reports_configuration_without_secrets() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut config = config(&temp);
+    config.decision_engine.enabled = true;
+    config.decision_engine.mode = crate::decision_engine::config::DecisionMode::Post;
+    config.causal_tree.backend.endpoint = "https://prx_user:PRIVATE@example.test/?token=QUERYSECRET".into();
+    let Json(response) = get_status(State(super::super::test_support::app_state(config))).await;
+    let body = serde_json::to_value(response)?;
+    let row = body.get("decision_engine").context("missing engine status")?;
+    assert_eq!(row.get("enabled"), Some(&serde_json::json!(true)));
+    assert_eq!(row.get("mode"), Some(&serde_json::json!("post")));
+    assert_eq!(row.get("backend_kind"), Some(&serde_json::json!("auto")));
+    assert_eq!(row.get("telemetry_cap"), Some(&serde_json::json!(1000)));
+    assert_eq!(row.get("queue_depth"), Some(&serde_json::json!(0)));
+    assert_eq!(row.get("dropped"), Some(&serde_json::json!(0)));
+    let text = row.to_string();
+    for secret in ["PRIVATE", "QUERYSECRET", "prx_user", "https://"] {
+        assert!(!text.contains(secret));
+    }
+    Ok(())
+}

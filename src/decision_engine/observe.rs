@@ -100,6 +100,11 @@ impl ObserveQueue {
             Some(worker),
         ))
     }
+    pub(crate) fn register_status(&self, workspace: &std::path::Path) {
+        if let Some(sender) = &self.sender {
+            super::status::register(workspace, sender.downgrade(), Arc::downgrade(&self.counters));
+        }
+    }
     pub fn observe(&self, outcome: TurnOutcome) -> ObserveAdmission {
         let Some(sender) = &self.sender else {
             return ObserveAdmission::Disabled;

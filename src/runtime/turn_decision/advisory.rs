@@ -46,6 +46,7 @@ impl TurnDecisionService {
                             (ObserveQueue::disabled(), None)
                         }
                     };
+                    observations.register_status(&self.generation.effective.workspace_dir);
                     AdvisoryRuntime {
                         engine: crate::decision_engine::causal_adapter::CausalEngine { observations },
                         cancellation,
@@ -160,5 +161,79 @@ pub(super) struct AdvisoryRuntime {
 impl Drop for AdvisoryRuntime {
     fn drop(&mut self) {
         self.cancellation.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decision_engine::observe::TelemetryWriter;
+
+    struct GatedWriter {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl TelemetryWriter for GatedWriter {
+        fn append_fifo(&mut self, _: TurnOutcome, _: usize) -> anyhow::Result<()> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            self.release.recv()?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_advisory_drain_preserves_catalog_acknowledgement() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            workspace_dir: temp.path().into(),
+            ..Default::default()
+        };
+        config.causal_tree.enabled = false;
+        let generation = crate::config::new_shared(config.clone()).pin();
+        let service = super::super::tests::disabled_agent_service(
+            &generation,
+            &crate::providers::catalog::CatalogView::from_config(&config),
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (observations, worker) = ObserveQueue::start(2, 10, cancellation.clone(), || {
+            Ok(Box::new(GatedWriter {
+                entered: Some(entered_tx),
+                release: release_rx,
+            }))
+        })
+        .unwrap();
+        assert_eq!(
+            observations.observe(TurnOutcome::new(None, vec![], true).unwrap()),
+            crate::decision_engine::ObserveAdmission::Accepted
+        );
+        entered_rx.await.unwrap();
+        assert!(
+            service
+                .advisory_engine
+                .set(AdvisoryRuntime {
+                    engine: crate::decision_engine::causal_adapter::CausalEngine { observations },
+                    cancellation,
+                    worker: tokio::sync::Mutex::new(worker),
+                })
+                .is_ok()
+        );
+        let drained = service
+            .drain_writes(std::time::Instant::now() + std::time::Duration::from_millis(20))
+            .await;
+        // The worker is still gated, but catalog acknowledgement permits the chat loop to continue.
+        assert!(drained);
+        assert!(service.advisory_engine.get().unwrap().worker.lock().await.is_some());
+        release_tx.send(()).unwrap();
+        tokio::time::resume();
+        assert!(
+            service
+                .drain_advisory(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                .await
+        );
     }
 }
