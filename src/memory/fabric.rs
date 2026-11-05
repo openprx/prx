@@ -278,11 +278,7 @@ impl MemoryFabric {
         ticket: &crate::runtime::turn_cleanup::CleanupTicket,
     ) -> anyhow::Result<Self> {
         let recording = config.memory.event_recording_config();
-        if self.memory.name() == "none"
-            || !config.causal_tree.enabled
-            || !recording.enabled
-            || !recording.record_user_messages
-        {
+        if self.memory.name() == "none" || !recording.enabled || !recording.record_user_messages {
             return Ok(self);
         }
         anyhow::ensure!(

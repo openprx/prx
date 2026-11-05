@@ -11,6 +11,66 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Pinned recovery authority. A decision store supplies historical evidence only;
+/// reception and interruption recovery do not require a decision service.
+pub(crate) struct RecoveryScope {
+    pub(super) memory: Arc<dyn Memory>,
+    pub(super) workspace: std::path::PathBuf,
+    pub(super) recordable: bool,
+    pub(super) durable_key: bool,
+    pub(super) surface: crate::causal_tree::state::TurnSurfaceKind,
+    pub(super) state_key: Arc<DecisionKey>,
+    pub(super) store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
+    pub(super) parent_grant: Option<Arc<super::child_source::IssuedChildGrant>>,
+    pub(super) durable_events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
+}
+
+impl RecoveryScope {
+    pub(crate) const fn ingress_recovery_enabled(&self) -> bool {
+        self.recordable && self.durable_key
+    }
+
+    pub(crate) fn accepts_ingress_recovery(
+        &self,
+        memory: &Arc<dyn Memory>,
+        workspace: &str,
+        surface: crate::causal_tree::state::TurnSurfaceKind,
+    ) -> bool {
+        Arc::ptr_eq(memory, &self.memory)
+            && self.workspace.to_string_lossy() == workspace
+            && self.surface == surface
+            && self.ingress_recovery_enabled()
+    }
+
+    /// Reads only the pinned memory/workspace and authenticates the owner.
+    /// It grants no execution authority.
+    pub(crate) async fn rejoin_terminal(
+        &self,
+        terminal_id: &str,
+        owner_id: &str,
+    ) -> anyhow::Result<crate::causal_tree::store::Enqueue> {
+        self.rejoin_terminal_inner(terminal_id, owner_id, None).await
+    }
+
+    pub(crate) async fn rejoin_ingress_terminal(
+        &self,
+        capsule: &IngressCapsule,
+        deadline: Instant,
+        owner: &Arc<super::turn_cleanup::CleanupTracker>,
+    ) -> anyhow::Result<crate::causal_tree::store::Enqueue> {
+        anyhow::ensure!(
+            capsule.scope.workspace_id == self.workspace.to_string_lossy(),
+            "recovery service workspace differs from capsule"
+        );
+        self.rejoin_terminal_inner(
+            &capsule.run_id,
+            &capsule.scope.owner_id,
+            Some((&capsule.scope, deadline, owner)),
+        )
+        .await
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("input already accepted; execution was not repeated and its outcome remains unconfirmed")]
 pub(crate) struct AlreadyAccepted;
@@ -58,7 +118,7 @@ impl IngressRecorder {
         ticket: &super::turn_cleanup::CleanupTicket,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         let recording = config.memory.event_recording_config();
-        if !config.causal_tree.enabled || !recording.enabled || !recording.record_user_messages {
+        if !recording.enabled || !recording.record_user_messages {
             return Ok(None);
         }
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -217,7 +277,7 @@ impl IngressRecorder {
     async fn recover(
         &self,
         scope: &IngressRecoveryScope,
-        service: Option<&super::turn_decision::TurnDecisionService>,
+        recovery: Option<&RecoveryScope>,
         deadline: Instant,
     ) -> anyhow::Result<()> {
         let _barrier = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), self.barrier.lock())
@@ -230,7 +290,7 @@ impl IngressRecorder {
                 .list_ingress_recovery_candidates(
                     scope,
                     self.lifetime.clone(),
-                    if service.is_some() {
+                    if recovery.is_some() {
                         IngressRecoveryScan::IncludeUnconfirmed
                     } else {
                         IngressRecoveryScan::PendingOnly
@@ -283,7 +343,7 @@ impl IngressRecorder {
                         }
                         Err(error) => return Err(error),
                     };
-                    let final_event = if service.is_some() {
+                    let final_event = if recovery.is_some() {
                         self.memory
                             .read_ingress_event(
                                 scope,
@@ -294,8 +354,8 @@ impl IngressRecorder {
                     } else {
                         None
                     };
-                    let state = if let (Some(service), Some(_)) = (service, final_event.as_ref()) {
-                        match service.rejoin_ingress_terminal(&capsule, deadline, &self.owner).await {
+                    let state = if let (Some(recovery), Some(_)) = (recovery, final_event.as_ref()) {
+                        match recovery.rejoin_ingress_terminal(&capsule, deadline, &self.owner).await {
                             Ok(_) => IngressRecoveryState::Reconciled,
                             Err(error) if unverifiable_ingress(&error).is_some() => {
                                 self.boxed_record_quarantine(scope, &capsule, unverifiable_ingress(&error).unwrap_or("unverifiable terminal"))
@@ -382,11 +442,11 @@ impl IngressRecorder {
     fn boxed_recover<'a>(
         &'a self,
         scope: &'a IngressRecoveryScope,
-        service: Option<&'a super::turn_decision::TurnDecisionService>,
+        recovery: Option<&'a RecoveryScope>,
         deadline: Instant,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.recover(scope, service, deadline).await.map_err(|error| {
+            self.recover(scope, recovery, deadline).await.map_err(|error| {
                 if error.downcast_ref::<IngressRecoveryDiagnostic>().is_some() {
                     error
                 } else {
@@ -725,10 +785,10 @@ fn register_recorder(recorder: &Arc<IngressRecorder>) -> anyhow::Result<()> {
     registry.push(Arc::downgrade(recorder));
     Ok(())
 }
-/// Called after real publication and again before source-bound admission, so a
-/// cold startup can consume final evidence that pre-proof reception could not.
-pub(crate) async fn service_ready(service: &super::turn_decision::TurnDecisionService) -> anyhow::Result<()> {
-    if !service.ingress_recovery_enabled() {
+/// Recover matching pinned recorders without a decision service. Historical
+/// terminal repair uses the optional evidence store carried by the scope.
+pub(crate) async fn recovery_ready(recovery: Arc<RecoveryScope>) -> anyhow::Result<()> {
+    if !recovery.ingress_recovery_enabled() {
         return Ok(());
     }
     let active = {
@@ -741,7 +801,46 @@ pub(crate) async fn service_ready(service: &super::turn_decision::TurnDecisionSe
         let Some((scope, surface)) = recorder.source.get() else {
             continue;
         };
-        if service.accepts_ingress_recovery(&recorder.memory, &scope.workspace_id, *surface) {
+        if !recovery.accepts_ingress_recovery(&recorder.memory, &scope.workspace_id, *surface) {
+            continue;
+        }
+        let scope = scope.clone();
+        let recovery = Arc::clone(&recovery);
+        let ownership = recorder.owner.register(tokio_util::sync::CancellationToken::new())?;
+        let (sent, received) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = recorder.boxed_recover(&scope, Some(&recovery), deadline).await;
+            ownership.finish(result.is_ok());
+            let _ = sent.send(result);
+        });
+        received
+            .await
+            .context("ingress recovery worker ended without a receipt")??;
+    }
+    Ok(())
+}
+
+/// Called after real publication and again before source-bound admission, so a
+/// cold startup can consume final evidence that pre-proof reception could not.
+pub(crate) async fn service_ready(service: &super::turn_decision::TurnDecisionService) -> anyhow::Result<()> {
+    recovery_ready(Arc::new(service.recovery_scope())).await?;
+    if !service.recovery_scope().ingress_recovery_enabled() {
+        return Ok(());
+    }
+    let active = {
+        let mut registry = recorders().lock();
+        registry.retain(|item| item.strong_count() > 0);
+        registry.iter().filter_map(std::sync::Weak::upgrade).collect::<Vec<_>>()
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for recorder in active {
+        let Some((scope, surface)) = recorder.source.get() else {
+            continue;
+        };
+        if service
+            .recovery_scope()
+            .accepts_ingress_recovery(&recorder.memory, &scope.workspace_id, *surface)
+        {
             let service = {
                 let mut registry = services().lock();
                 registry.retain(|item| item.strong_count() > 0);
@@ -756,7 +855,6 @@ pub(crate) async fn service_ready(service: &super::turn_decision::TurnDecisionSe
             let (sent, received) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
                 let result = async {
-                    recorder.boxed_recover(&scope, Some(&service), deadline).await?;
                     // Historical child repair is independent of the ordinary
                     // ingress capsule state; its report cannot mark that input
                     // reconciled or authorize execution of a child again.
@@ -796,7 +894,7 @@ fn services() -> &'static parking_lot::Mutex<Vec<std::sync::Weak<super::turn_dec
     SERVICES.get_or_init(Default::default)
 }
 pub(crate) fn register_service(service: &Arc<super::turn_decision::TurnDecisionService>) -> anyhow::Result<()> {
-    if !service.ingress_recovery_enabled() {
+    if !service.recovery_scope().ingress_recovery_enabled() {
         return Ok(());
     }
     let mut registry = services().lock();

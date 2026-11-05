@@ -540,3 +540,150 @@ async fn copied_workspace_terminals_verify_through_the_real_store() {
     }
     println!("historical terminal replay verified: {verified}");
 }
+
+fn recovery_config(workspace: &Path) -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.to_path_buf();
+    config.causal_tree.enabled = false;
+    config
+}
+
+fn recovery_input(workspace: &Path, run: &str) -> MessageEventInput {
+    serde_json::from_value(serde_json::json!({
+        "event_id": null, "idempotency_key": format!("turn:{run}:input"),
+        "workspace_id": workspace.to_string_lossy(), "owner_id": "prx_user",
+        "source": "agent", "channel": "agent_api", "session_key": "prx_session",
+        "run_id": run, "role": "user", "event_type": "message.created",
+        "content": "recovery fixture", "raw_payload_json": null,
+        "visibility": "session"
+    }))
+    .unwrap()
+}
+
+async fn recovery_recorder(
+    memory: Arc<dyn Memory>,
+    config: &crate::config::Config,
+) -> (Arc<IngressRecorder>, super::super::turn_cleanup::CleanupTicket) {
+    let tracker = Arc::new(super::super::turn_cleanup::CleanupTracker::default());
+    let ticket = tracker.register(tokio_util::sync::CancellationToken::new()).unwrap();
+    let recorder = IngressRecorder::prepare(memory, config, &ticket)
+        .await
+        .unwrap()
+        .unwrap();
+    (recorder, ticket)
+}
+
+#[tokio::test]
+async fn ingress_recovery_runs_with_causal_tree_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(recovery_config(dir.path()));
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+    let tracker = Arc::new(super::super::turn_cleanup::CleanupTracker::default());
+    let ticket = tracker.register(tokio_util::sync::CancellationToken::new()).unwrap();
+    let fabric = crate::memory::MemoryFabric::new(memory.clone(), dir.path().to_string_lossy().into_owned())
+        .with_ingress_recovery(&config, &ticket)
+        .await
+        .unwrap();
+    // The fabric must attach the recorder even when the decision plane is disabled.
+    let (recorder, second_ticket) = recovery_recorder(memory, &config).await;
+    let event = recorder.append(recovery_input(dir.path(), "prx_run")).await.unwrap();
+    fabric
+        .verify_ingress_input(&event)
+        .expect("fabric must retain its ingress verifier with causal tree disabled");
+    second_ticket.finish(true);
+    ticket.finish(true);
+}
+
+#[tokio::test]
+async fn crash_after_ingress_record_rejoins_after_restart_without_decision_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = recovery_config(dir.path());
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+    let (recorder, ticket) = recovery_recorder(memory.clone(), &config).await;
+    let event = recorder
+        .append(recovery_input(dir.path(), "prx_old_run"))
+        .await
+        .unwrap();
+    ticket.finish(true);
+    drop(recorder);
+    drop(memory);
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+    let (recorder, ticket) = recovery_recorder(memory.clone(), &config).await;
+    recorder
+        .append(recovery_input(dir.path(), "prx_next_run"))
+        .await
+        .unwrap();
+    let interrupted = memory
+        .find_owned_message_event_by_idempotency_key(
+            &dir.path().to_string_lossy(),
+            "prx_user",
+            &format!("ingress:{}:unconfirmed", event.event_id),
+        )
+        .await
+        .unwrap()
+        .expect("interrupted input must recover without a decision service");
+    assert_eq!(interrupted.event_type, "turn.ingress.interrupted");
+    ticket.finish(true);
+}
+
+fn terminal_scope(memory: Arc<dyn Memory>, workspace: &Path) -> RecoveryScope {
+    RecoveryScope {
+        memory,
+        workspace: workspace.to_path_buf(),
+        recordable: true,
+        durable_key: true,
+        surface: crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        state_key: DecisionKey::load_or_create(workspace).unwrap(),
+        store: None,
+        parent_grant: None,
+        durable_events: None,
+    }
+}
+
+#[tokio::test]
+async fn rejoin_with_wrong_owner_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+    let mut input = recovery_input(dir.path(), "prx_run");
+    input.idempotency_key = Some("turn:prx_run:final".into());
+    memory.append_message_event(input).await.unwrap();
+    let error = terminal_scope(memory, dir.path())
+        .rejoin_terminal("prx_run", "prx_other")
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "terminal replay scope does not match its owner");
+}
+
+#[tokio::test]
+async fn rejoin_with_foreign_workspace_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+    let scope = terminal_scope(memory.clone(), dir.path());
+    let (recorder, ticket) = recovery_recorder(memory, &recovery_config(dir.path())).await;
+    let event = recorder.append(recovery_input(dir.path(), "prx_run")).await.unwrap();
+    let mut capsule = capsule_from_event(&event).unwrap();
+    capsule.scope.workspace_id = "prx_foreign_workspace".into();
+    let error = scope
+        .rejoin_ingress_terminal(&capsule, Instant::now() + Duration::from_secs(5), &ticket.owner())
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "recovery service workspace differs from capsule");
+    ticket.finish(true);
+}
+
+#[tokio::test]
+async fn recovery_off_when_user_message_recording_is_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = recovery_config(dir.path());
+    config.memory.events.record_user_messages = false;
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+    let tracker = Arc::new(super::super::turn_cleanup::CleanupTracker::default());
+    let ticket = tracker.register(tokio_util::sync::CancellationToken::new()).unwrap();
+    assert!(
+        IngressRecorder::prepare(memory, &config, &ticket)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    ticket.finish(true);
+}

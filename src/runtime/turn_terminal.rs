@@ -1,6 +1,13 @@
 //! Exact terminal proposals retained across cancellation and future drop.
+use super::turn_decision::VerifiedDirectiveApplication;
+use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
+use crate::causal_tree::state::TurnSurfaceKind;
+use crate::causal_tree::store::{DecisionScope, Enqueue};
+use crate::decision::telemetry::{CausalEvent, CausalEventFields, CausalEventKind, CausalLineage};
 use crate::runtime::turn_decision::TurnDecisionService;
+use anyhow::Context;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Observer-owned projection of confirmed segment usage, bounded by this task's
 /// completed segments rather than the workspace event catalog.
@@ -815,5 +822,284 @@ pub(crate) async fn commit_terminal(
         guard.commit(proposal).await
     } else {
         crate::agent::terminal::finalize_turn(fabric, proposal, &config.cost, &config.workspace_dir).await
+    }
+}
+
+// Authenticated historical decision evidence remains readable during migration.
+impl super::ingress_recovery::RecoveryScope {
+    pub(super) async fn rejoin_terminal_inner(
+        &self,
+        terminal_id: &str,
+        owner_id: &str,
+        bounded: Option<(
+            &crate::memory::ingress_recovery::IngressRecoveryScope,
+            Instant,
+            &Arc<super::turn_cleanup::CleanupTracker>,
+        )>,
+    ) -> anyhow::Result<Enqueue> {
+        #[cfg(test)]
+        let mut stage = super::turn_cleanup::diagnostic::Stage::current(
+            super::turn_cleanup::diagnostic::StageName::RejoinPreconditions,
+        );
+        let workspace_id = self.workspace.to_string_lossy();
+        anyhow::ensure!(
+            matches!(
+                self.surface,
+                TurnSurfaceKind::AgentLoop
+                    | TurnSurfaceKind::Interactive
+                    | TurnSurfaceKind::Server
+                    | TurnSurfaceKind::Cron
+                    | TurnSurfaceKind::Xin
+                    | TurnSurfaceKind::Worker
+                    | TurnSurfaceKind::Channel
+            ) && self.recordable
+                && self.durable_key,
+            "terminal rejoin requires an enabled pinned ingress store"
+        );
+        anyhow::ensure!(
+            !terminal_id.is_empty() && !owner_id.is_empty(),
+            "terminal rejoin scope is empty"
+        );
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinLookup);
+        let final_key = format!("turn:{terminal_id}:final");
+        let event = if let Some((scope, deadline, _)) = bounded {
+            self.memory
+                .read_ingress_event(
+                    scope,
+                    &crate::memory::ingress_recovery::IngressEventLookup::IdempotencyKey(final_key.clone()),
+                    deadline,
+                )
+                .await?
+        } else {
+            self.memory
+                .find_message_event_by_idempotency_key(&workspace_id, &final_key)
+                .await?
+        }
+        .context("committed terminal marker is missing")?;
+        anyhow::ensure!(
+            event.idempotency_key.as_deref() == Some(final_key.as_str()),
+            "terminal lookup returned a different marker"
+        );
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinReplay);
+        anyhow::ensure!(
+            event.workspace_id == workspace_id && event.owner_id.as_deref() == Some(owner_id),
+            "terminal replay scope does not match its owner"
+        );
+        let store = self
+            .store
+            .as_ref()
+            .context("historical terminal evidence store is unavailable")?;
+        let store_workspace_id = store.workspace_id().context("store workspace scope is missing")?;
+        let replay = if let Some((_, deadline, owner)) = bounded {
+            crate::agent::terminal::verify_terminal_replay_until(
+                self.memory.as_ref(),
+                &store.reader(),
+                &self.state_key,
+                &store_workspace_id,
+                &workspace_id,
+                owner_id,
+                terminal_id,
+                &event,
+                deadline,
+                owner,
+            )
+            .await?
+        } else {
+            crate::agent::terminal::verify_terminal_replay(
+                self.memory.as_ref(),
+                &store.reader(),
+                &self.state_key,
+                &store_workspace_id,
+                &workspace_id,
+                owner_id,
+                terminal_id,
+                &event,
+            )
+            .await?
+        };
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinReplayScope);
+        anyhow::ensure!(
+            super::turn_source::ingress_event_surface(
+                &replay.source().source,
+                replay.source().channel.as_deref(),
+                &replay.source().visibility
+            ) == Some(self.surface),
+            "terminal replay belongs to another ingress surface"
+        );
+        anyhow::ensure!(
+            replay.parent_decision_id()
+                == self
+                    .parent_grant
+                    .as_ref()
+                    .map(|grant| grant.scope().gate_inputs().0.parent_decision_id),
+            "terminal replay belongs to another parent decision"
+        );
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinFacts);
+        let decision = replay.decision();
+        let facts = TerminalFacts::from_persisted_marker(&event, decision, owner_id, &workspace_id)?
+            .with_verified_resume(&replay);
+        let writer = store.writer().context("terminal rejoin writer is missing")?;
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinCorrelator);
+        let expected = OutcomeCorrelator::persisted_record(decision, &facts)?;
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinRecord);
+        let queued = writer.record_outcome(expected.clone());
+        anyhow::ensure!(queued == Enqueue::Queued, "rejoined outcome could not be queued");
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinDrain);
+        anyhow::ensure!(
+            writer
+                .drain(bounded.map_or_else(|| Instant::now() + Duration::from_secs(5), |(_, deadline, _)| deadline))
+                .await,
+            "rejoined outcome persistence timed out"
+        );
+        #[cfg(test)]
+        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinConfirmAndRepairs);
+        let scope = DecisionScope::Owner {
+            workspace_id: store_workspace_id,
+            owner_id: Arc::from(owner_id),
+        };
+        anyhow::ensure!(
+            if let Some((_, deadline, owner)) = bounded {
+                let reader = store.reader();
+                let scope = scope.clone();
+                let expected = expected.clone();
+                super::ingress_recovery::owned_store_read(owner, move || {
+                    Ok(reader.outcome_matches_until(&scope, &expected, deadline)?)
+                })
+                .await?
+            } else {
+                store.reader().outcome_matches(&scope, &expected)?
+            },
+            "rejoined outcome is absent or conflicts with the authenticated terminal"
+        );
+        let (terminal_status, awaiting_approval, verified) = facts.recovered_signals(&decision.directive_kind);
+        crate::skills::lifecycle::spawn_settle_task_terminal(
+            self.workspace.clone(),
+            Some(owner_id.to_owned()),
+            crate::skills::lifecycle::task_key(
+                super::turn_source::subject_task_id(event.subject.as_ref()),
+                event.run_id.as_deref(),
+                event.parent_run_id.as_deref(),
+            ),
+            terminal_id.to_owned(),
+            crate::skills::lifecycle::TerminalObservation {
+                recovered: true,
+                root: event.parent_run_id.is_none(),
+                ..terminal_status.skill_observation(awaiting_approval, verified)
+            },
+        );
+        if replay.parent_decision_id().is_some() {
+            let link = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &expected)
+                .context("child outcome lineage is inconsistent")?;
+            anyhow::ensure!(
+                writer.record_child_outcome(link) == Enqueue::Queued,
+                "child outcome link could not be queued"
+            );
+            anyhow::ensure!(
+                writer
+                    .drain(bounded.map_or_else(|| Instant::now() + Duration::from_secs(5), |(_, deadline, _)| deadline))
+                    .await,
+                "child outcome link persistence timed out"
+            );
+            let expected_link = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &expected)
+                .context("child outcome lineage changed")?;
+            anyhow::ensure!(
+                if let Some((_, deadline, owner)) = bounded {
+                    let reader = store.reader();
+                    let scope = scope.clone();
+                    super::ingress_recovery::owned_store_read(owner, move || {
+                        Ok(reader.child_outcome_matches_until(&scope, &expected_link, deadline)?)
+                    })
+                    .await?
+                } else {
+                    store.reader().child_outcome_matches(&scope, &expected_link)?
+                },
+                "child outcome link is absent or conflicts with authenticated facts"
+            );
+        }
+        if replay.fixed_close()
+            || facts.has_completed_run_evidence(decision, replay.run_capabilities())
+            || (decision
+                .selected()
+                .is_some_and(|candidate| candidate.action == "use_tool")
+                && facts.has_completed_resume_evidence(replay.run_capabilities()))
+        {
+            anyhow::ensure!(
+                !replay.fixed_close() || facts.is_completed_local_close(),
+                "replay is not a completed local close"
+            );
+            let source = replay.source();
+            let original_generation = (
+                source
+                    .config_generation_id
+                    .context("original source generation is missing")?,
+                Arc::from(
+                    source
+                        .config_source_revision
+                        .as_deref()
+                        .context("original source revision is missing")?,
+                ),
+            );
+            let application = VerifiedDirectiveApplication {
+                event: CausalEvent {
+                    kind: CausalEventKind::DirectiveApplied,
+                    lineage: CausalLineage {
+                        workspace_id: Arc::from(workspace_id.as_ref()),
+                        owner_id: Some(Arc::from(owner_id)),
+                        session_key: source.session_key.as_deref().map(Arc::from),
+                        run_id: source.run_id.as_deref().map(Arc::from),
+                        source_event_id: Some(Arc::from(source.event_id.as_str())),
+                        causation_event_id: Some(Arc::from(event.event_id.as_str())),
+                        decision_id: Some(Arc::from(decision.decision_id.to_string())),
+                        ..CausalLineage::default()
+                    },
+                    fields: CausalEventFields {
+                        item_count: Some(1),
+                        ..CausalEventFields::default()
+                    },
+                },
+                idempotency_key: format!("causal:{}:directive-applied", decision.decision_id),
+                original_generation: Some(original_generation),
+            };
+            let sink = self
+                .durable_events
+                .as_ref()
+                .context("applied replay sink is unavailable")?;
+            if let Some((_, deadline, _)) = bounded {
+                sink.repair_applied_until(application, deadline).await?;
+            } else {
+                anyhow::ensure!(
+                    sink.repair_applied(application, Instant::now() + Duration::from_secs(5))
+                        .await,
+                    "rejoined applied event is absent or conflicts with the authenticated terminal"
+                );
+            }
+        }
+        if replay.source().source == crate::memory::MessageEventSource::Console {
+            // Only authenticated replay reaches this projection. Each event is
+            // rechecked in the backend transaction; replay cannot duplicate it.
+            if let Some((_, deadline, _)) = bounded {
+                self.memory
+                    .project_console_message_until(replay.source(), deadline)
+                    .await?;
+                if let Some(assistant) = replay.assistant() {
+                    self.memory.project_console_message_until(assistant, deadline).await?;
+                }
+            } else {
+                self.memory.project_console_message(replay.source()).await?;
+                if let Some(assistant) = replay.assistant() {
+                    self.memory.project_console_message(assistant).await?;
+                }
+            }
+        }
+        #[cfg(test)]
+        stage.finish();
+        Ok(queued)
     }
 }

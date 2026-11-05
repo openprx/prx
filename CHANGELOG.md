@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Ingress crash recovery remains enabled when `[causal_tree].enabled = false`;
+  it follows memory event recording and user message recording instead.
+
 ### Removed
 
 - BREAKING (operators): automix reply escalation was removed in 0.8.171.
