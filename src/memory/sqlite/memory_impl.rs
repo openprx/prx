@@ -34,6 +34,10 @@ fn checkpoint_truncate(conn: &rusqlite::Connection) -> anyhow::Result<i64> {
 
 #[async_trait]
 impl Memory for SqliteMemory {
+    fn recovery_repository(&self) -> Option<&dyn crate::memory::recovery_authority::RecoveryRepository> {
+        Some(self)
+    }
+
     fn with_erasure_origin(
         &self,
         origin: crate::memory::erasure::ErasureOrigin,

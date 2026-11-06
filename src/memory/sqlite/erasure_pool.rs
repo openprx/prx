@@ -17,6 +17,7 @@ const TABLES: &[&str] = &[
     "conversation_turns",
     "message_events",
     "ingress_recovery",
+    "recovery_attestations",
     "memory_events",
     "memory_drafts",
     "memory_trash",
@@ -140,6 +141,10 @@ pub(super) fn install_table_triggers(conn: &rusqlite::Connection, table: &str) -
             "NEW.causation_event_id",
             "AND e.rowid <> NEW.rowid",
         )],
+        "recovery_attestations" => vec![
+            ("message_events", "event_id", "NEW.input_event_id", ""),
+            ("message_events", "event_id", "NEW.terminal_event_id", ""),
+        ],
         "ingress_recovery" => vec![("message_events", "event_id", "NEW.input_event_id", "")],
         "memories" => vec![
             ("message_events", "event_id", "NEW.source_event_id", ""),

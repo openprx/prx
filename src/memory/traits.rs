@@ -1282,6 +1282,11 @@ const fn enforced_read_mode(context: Option<&MemoryWriteContext>, requested: Mem
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
+    /// Unavailable for backends without repository-owned durable authority.
+    fn recovery_repository(&self) -> Option<&dyn crate::memory::recovery_authority::RecoveryRepository> {
+        None
+    }
+
     /// Whether execution requires this exact in-process memory capability.
     fn requires_scoped_execution(&self) -> bool {
         false

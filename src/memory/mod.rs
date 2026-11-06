@@ -16,6 +16,7 @@ pub mod none;
 pub mod owner_predicate;
 pub mod postgres;
 pub mod principal;
+pub mod recovery_authority;
 pub mod retrieval;
 mod router_history;
 pub mod session_predicate;

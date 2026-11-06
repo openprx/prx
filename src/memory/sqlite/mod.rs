@@ -8,6 +8,8 @@ mod ingress_recovery;
 mod memory_impl;
 mod mirror;
 mod recall;
+mod recovery_authority;
+mod recovery_keys;
 mod router_history;
 mod router_learning;
 mod rows;

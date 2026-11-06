@@ -142,11 +142,18 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
 const SQLITE_SEPARATE_MODULES: &[&str] = &[
     "event_batch.rs",
     "ingress_recovery.rs",
+    // AUTH-01 repository capability; no database opens outside the backend.
+    "recovery_authority.rs",
+    "recovery_keys.rs",
     "router_history.rs",
     "router_learning.rs",
 ];
 
 const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
+    // AUTH-01: repository-owned key activation and authenticated event evidence;
+    // derived from message_events, erased with their referenced input/final.
+    "src/memory/sqlite/recovery_authority.rs::recovery_authority",
+    "src/memory/sqlite/recovery_authority.rs::recovery_attestations",
     // Dedicated Article 73 compliance ledger: it stores immutable event hashes,
     // is owned by IncidentStore, and is intentionally separate from message/memory events.
     "src/compliance/incident.rs::serious_incident_audit_events",
@@ -251,7 +258,10 @@ fn persisted_event_tables_are_explicitly_allowlisted() {
             };
             let table =
                 table.trim_matches(|character: char| matches!(character, '`' | '\'' | '"' | '(' | ')' | ',' | ';'));
-            if table.contains("event") || table.contains("ledger") {
+            if table.contains("event")
+                || table.contains("ledger")
+                || matches!(table, "recovery_authority" | "recovery_attestations")
+            {
                 actual.push(format!("{relative}::{table}"));
             }
         }

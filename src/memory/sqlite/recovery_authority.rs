@@ -1,0 +1,395 @@
+//! Lazy recovery authority, owned by the SQLite writer transaction.
+use super::{SqliteMemory, recovery_keys::KeyDirectory};
+use crate::memory::recovery_authority::{
+    RecoveryChain, RecoveryEvidence, RecoveryPublication, RecoveryReceipt, RecoveryRepository,
+};
+use anyhow::Context;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::ValueRef};
+use serde::{Deserialize, Serialize};
+
+const MAX_FACTS: usize = 65_536;
+const MAX_RECORD: usize = 1_048_576;
+
+pub(super) fn schema(conn: &Connection) -> anyhow::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='recovery_authority' AND type='table')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch(
+            "CREATE TABLE recovery_authority (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            version INTEGER NOT NULL CHECK(version=1), backend_namespace TEXT NOT NULL,
+            active_key_id TEXT NOT NULL
+        );
+        CREATE TABLE recovery_attestations (
+            workspace_id TEXT NOT NULL, owner_id TEXT NOT NULL, source TEXT NOT NULL, run_id TEXT NOT NULL,
+            input_event_id TEXT REFERENCES message_events(event_id) ON DELETE CASCADE,
+            terminal_event_id TEXT REFERENCES message_events(event_id) ON DELETE CASCADE,
+            version INTEGER NOT NULL CHECK(version=1), key_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending','settled')),
+            facts BLOB NOT NULL CHECK(length(facts)<=262144), mac BLOB NOT NULL CHECK(length(mac)=32),
+            PRIMARY KEY(workspace_id,owner_id,source,run_id),
+            CHECK((state='pending' AND input_event_id IS NOT NULL AND terminal_event_id IS NULL)
+                  OR (state='settled' AND terminal_event_id IS NOT NULL)),
+            UNIQUE(workspace_id,owner_id,source,input_event_id),
+            UNIQUE(workspace_id,owner_id,source,terminal_event_id)
+        );
+        CREATE TRIGGER recovery_settled_immutable BEFORE UPDATE ON recovery_attestations
+        WHEN OLD.state='settled' OR NEW.state<>'settled'
+             OR OLD.workspace_id IS NOT NEW.workspace_id OR OLD.owner_id IS NOT NEW.owner_id
+             OR OLD.source IS NOT NEW.source OR OLD.run_id IS NOT NEW.run_id
+             OR OLD.input_event_id IS NOT NEW.input_event_id
+        BEGIN SELECT RAISE(ABORT,'immutable recovery receipt'); END;",
+        )?;
+    }
+    super::erasure_pool::install_table_triggers(conn, "recovery_attestations")?;
+    Ok(())
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct BoundEvent {
+    id: String,
+    digest: Vec<u8>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct BoundFacts {
+    chain: RecoveryChain,
+    input: Option<BoundEvent>,
+    terminal: Option<BoundEvent>,
+    pending: Vec<u8>,
+    completion: Vec<u8>,
+}
+
+fn validate_chain(chain: &RecoveryChain) -> anyhow::Result<()> {
+    for field in [&chain.workspace_id, &chain.owner_id, &chain.source, &chain.run_id] {
+        anyhow::ensure!(!field.is_empty() && field.len() <= 1024, "invalid recovery identity");
+    }
+    Ok(())
+}
+
+/// Encode every persisted column (including raw source/capsule bytes), with
+/// explicit type/length framing. No lossy MessageEvent normalization is used.
+fn event(conn: &Connection, chain: &RecoveryChain, id: &str) -> anyhow::Result<RecoveryEvidence> {
+    validate_chain(chain)?;
+    anyhow::ensure!(!id.is_empty() && id.len() <= 1024, "invalid recovery event id");
+    let record = conn.query_row("SELECT * FROM message_events WHERE event_id=?1 AND workspace_id=?2 AND owner_id=?3 AND source=?4 AND run_id=?5", params![id,chain.workspace_id,chain.owner_id,chain.source,chain.run_id], |row| {
+        let mut record = Vec::new();
+        for index in 0..row.as_ref().column_count() {
+            let value = row.get_ref(index)?;
+            let (tag, bytes) = match value {
+                ValueRef::Null => (0, Vec::new()),
+                ValueRef::Integer(value) => (1, value.to_be_bytes().to_vec()),
+                ValueRef::Real(value) => (2, value.to_bits().to_be_bytes().to_vec()),
+                ValueRef::Text(value) | ValueRef::Blob(value) => {
+                    if value.len() > MAX_RECORD { return Err(rusqlite::Error::InvalidQuery); }
+                    (if matches!(row.get_ref(index)?, ValueRef::Text(_)) { 3 } else { 4 }, value.to_vec())
+                }
+            };
+            if record.len().saturating_add(bytes.len()).saturating_add(9) > MAX_RECORD {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            record.push(tag);
+            record.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            record.extend_from_slice(&bytes);
+        }
+        Ok(record)
+    })?;
+    Ok(RecoveryEvidence {
+        event_id: id.to_owned(),
+        record,
+    })
+}
+
+fn domain_mac(key: &ring::hmac::Key, domain: &[u8], bytes: &[u8]) -> Vec<u8> {
+    let mut context = ring::hmac::Context::with_key(key);
+    context.update(&(domain.len() as u64).to_be_bytes());
+    context.update(domain);
+    context.update(&(bytes.len() as u64).to_be_bytes());
+    context.update(bytes);
+    context.sign().as_ref().to_vec()
+}
+fn bind(
+    conn: &Connection,
+    chain: &RecoveryChain,
+    evidence: &RecoveryEvidence,
+    key: &ring::hmac::Key,
+) -> anyhow::Result<BoundEvent> {
+    anyhow::ensure!(
+        evidence.record.len() <= MAX_RECORD && event(conn, chain, &evidence.event_id)? == *evidence,
+        "recovery event changed"
+    );
+    Ok(BoundEvent {
+        id: evidence.event_id.clone(),
+        digest: domain_mac(key, b"prx.recovery.event.v1", &evidence.record),
+    })
+}
+fn receipt_bytes(receipt: &RecoveryReceipt) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&(
+        receipt.version,
+        &receipt.backend_namespace,
+        &receipt.key_id,
+        &receipt.state,
+        &receipt.facts,
+    ))?)
+}
+fn receipt_domain(state: &str) -> anyhow::Result<&'static [u8]> {
+    match state {
+        "pending" => Ok(b"prx.recovery.pending.v1"),
+        "settled" => Ok(b"prx.recovery.settled.v1"),
+        _ => anyhow::bail!("invalid recovery state"),
+    }
+}
+fn sign(receipt: &mut RecoveryReceipt, key: &ring::hmac::Key) -> anyhow::Result<()> {
+    receipt.mac = domain_mac(key, receipt_domain(&receipt.state)?, &receipt_bytes(receipt)?);
+    Ok(())
+}
+fn active(conn: &Connection) -> anyhow::Result<(String, String)> {
+    let (version, namespace, id): (i64, String, String) = conn.query_row(
+        "SELECT version,backend_namespace,active_key_id FROM recovery_authority WHERE singleton=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    anyhow::ensure!(
+        version == 1 && uuid::Uuid::parse_str(&namespace)?.to_string() == namespace,
+        "invalid recovery authority"
+    );
+    Ok((namespace, id))
+}
+fn stored(conn: &Connection, chain: &RecoveryChain) -> anyhow::Result<Option<RecoveryReceipt>> {
+    validate_chain(chain)?;
+    let namespace = active(conn)?.0;
+    Ok(conn.query_row("SELECT version,key_id,state,facts,mac FROM recovery_attestations WHERE workspace_id=?1 AND owner_id=?2 AND source=?3 AND run_id=?4", params![chain.workspace_id,chain.owner_id,chain.source,chain.run_id], |r| Ok(RecoveryReceipt { version:r.get(0)?,backend_namespace:namespace,key_id:r.get(1)?,state:r.get(2)?,facts:r.get(3)?,mac:r.get(4)? })).optional()?)
+}
+fn verify(
+    conn: &Connection,
+    directory: &KeyDirectory,
+    chain: &RecoveryChain,
+    receipt: &RecoveryReceipt,
+) -> anyhow::Result<BoundFacts> {
+    anyhow::ensure!(
+        receipt.version == 1 && receipt.facts.len() <= 262_144,
+        "invalid recovery receipt"
+    );
+    let key = directory.load(&receipt.key_id)?;
+    // ring verifies the domain-framed receipt in constant time.
+    let domain = receipt_domain(&receipt.state)?;
+    let bytes = receipt_bytes(receipt)?;
+    let mut framed = Vec::new();
+    framed.extend_from_slice(&(domain.len() as u64).to_be_bytes());
+    framed.extend_from_slice(domain);
+    framed.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    framed.extend_from_slice(&bytes);
+    ring::hmac::verify(&key, &framed, &receipt.mac).map_err(|_| anyhow::anyhow!("invalid recovery authentication"))?;
+    let facts: BoundFacts = serde_json::from_slice(&receipt.facts)?;
+    anyhow::ensure!(
+        facts.chain == *chain
+            && ((receipt.state == "pending" && facts.input.is_some() && facts.terminal.is_none())
+                || (receipt.state == "settled" && facts.terminal.is_some())),
+        "recovery scope or state mismatch"
+    );
+    let references: (Option<String>, Option<String>) = conn.query_row(
+        "SELECT input_event_id,terminal_event_id FROM recovery_attestations WHERE workspace_id=?1 AND owner_id=?2 AND source=?3 AND run_id=?4",
+        params![chain.workspace_id,chain.owner_id,chain.source,chain.run_id], |r| Ok((r.get(0)?,r.get(1)?)))?;
+    anyhow::ensure!(
+        references.0.as_deref() == facts.input.as_ref().map(|e| e.id.as_str())
+            && references.1.as_deref() == facts.terminal.as_ref().map(|e| e.id.as_str()),
+        "recovery reference mismatch"
+    );
+    for bound in [&facts.input, &facts.terminal].into_iter().flatten() {
+        let current = event(conn, chain, &bound.id)?;
+        anyhow::ensure!(
+            domain_mac(&key, b"prx.recovery.event.v1", &current.record) == bound.digest,
+            "recovery evidence changed"
+        );
+    }
+    Ok(facts)
+}
+
+// Recovery commits require SQLite FULL synchronization, independent of the
+// ordinary memory writer's NORMAL policy. Restore the connection on all paths.
+struct FullSync<'a>(&'a Connection, i64);
+impl<'a> FullSync<'a> {
+    fn new(conn: &'a Connection) -> anyhow::Result<Self> {
+        let previous = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        Ok(Self(conn, previous))
+    }
+}
+impl Drop for FullSync<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.pragma_update(None, "synchronous", self.1) {
+            tracing::error!(%error, "failed to restore SQLite synchronization");
+        }
+    }
+}
+
+impl SqliteMemory {
+    fn recovery_activate(&self, rotate: bool) -> anyhow::Result<String> {
+        let writer = self.pool.write();
+        let sync = FullSync::new(&writer)?;
+        let tx = rusqlite::Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
+        let initialized: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='recovery_authority')",
+            [],
+            |r| r.get(0),
+        )?;
+        schema(&tx)?;
+        let established: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM recovery_authority)", [], |r| r.get(0))?;
+        anyhow::ensure!(!initialized || established, "missing established recovery authority");
+        let directory = KeyDirectory::open(self.db_path.parent().context("missing memory directory")?, !established)?;
+        let namespace = if established {
+            let (namespace, id) = active(&tx)?;
+            directory.load(&id)?;
+            // Every retained generation stays available, even during rotation.
+            let mut stmt = tx.prepare("SELECT DISTINCT key_id FROM recovery_attestations")?;
+            for id in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                directory.load(&id?)?;
+            }
+            drop(stmt);
+            if !rotate {
+                tx.commit()?;
+                drop(sync);
+                return Ok(id);
+            }
+            namespace
+        } else {
+            anyhow::ensure!(!rotate, "cannot rotate missing recovery authority");
+            let history: i64 = tx.query_row("SELECT count(*) FROM recovery_attestations", [], |r| r.get(0))?;
+            anyhow::ensure!(history == 0, "missing established recovery authority");
+            uuid::Uuid::new_v4().to_string()
+        };
+        let id = directory.create()?;
+        directory.load(&id)?;
+        tx.execute("INSERT INTO recovery_authority(singleton,version,backend_namespace,active_key_id) VALUES(1,1,?1,?2) ON CONFLICT(singleton) DO UPDATE SET active_key_id=excluded.active_key_id", params![namespace,id])?;
+        tx.commit()?;
+        drop(sync);
+        // Retain every generation, including orphan files from failed commits.
+        Ok(id)
+    }
+
+    fn recovery_publish(&self, publication: &RecoveryPublication, settle: bool) -> anyhow::Result<RecoveryReceipt> {
+        validate_chain(&publication.chain)?;
+        anyhow::ensure!(
+            publication
+                .input
+                .as_ref()
+                .zip(publication.terminal.as_ref())
+                .is_none_or(|(input, terminal)| input.event_id != terminal.event_id),
+            "input cannot be terminal evidence"
+        );
+        anyhow::ensure!(
+            publication.facts.len() <= MAX_FACTS && (settle == publication.terminal.is_some()),
+            "invalid recovery publication"
+        );
+        anyhow::ensure!(settle || publication.input.is_some(), "pending reception needs input");
+        let writer = self.pool.write();
+        let sync = FullSync::new(&writer)?;
+        let tx = rusqlite::Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
+        // Publication is load-only: activation is a separate explicit operation.
+        let (namespace, active_id) = active(&tx)?;
+        let directory = KeyDirectory::open(self.db_path.parent().context("missing memory directory")?, false)?;
+        let previous = stored(&tx, &publication.chain)?;
+        let key_id = previous
+            .as_ref()
+            .filter(|r| !settle || r.state == "settled")
+            .map_or(active_id, |r| r.key_id.clone());
+        let key = directory.load(&key_id)?;
+        let input = publication
+            .input
+            .as_ref()
+            .map(|e| bind(&tx, &publication.chain, e, &key))
+            .transpose()?;
+        let terminal = publication
+            .terminal
+            .as_ref()
+            .map(|e| bind(&tx, &publication.chain, e, &key))
+            .transpose()?;
+
+        let terminal_bytes = serde_json::to_vec(&terminal)?;
+        let old_facts = previous
+            .as_ref()
+            .map(|r| verify(&tx, &directory, &publication.chain, r))
+            .transpose()?;
+        if let Some(old) = &old_facts {
+            anyhow::ensure!(
+                old.input.as_ref().map(|e| &e.id) == input.as_ref().map(|e| &e.id),
+                "conflicting recovery input"
+            );
+            if !settle || previous.as_ref().is_some_and(|r| r.state == "settled") {
+                anyhow::ensure!(
+                    if settle {
+                        serde_json::to_vec(&old.terminal)? == terminal_bytes && old.completion == publication.facts
+                    } else {
+                        old.pending == publication.facts
+                    },
+                    "conflicting recovery publication"
+                );
+                let receipt = previous.context("missing prior receipt")?;
+                tx.commit()?;
+                drop(sync);
+                return Ok(receipt);
+            }
+        } else {
+            anyhow::ensure!(!settle || input.is_none(), "settlement requires pending reception");
+        }
+        let facts = BoundFacts {
+            chain: publication.chain.clone(),
+            input,
+            terminal,
+            pending: if settle {
+                old_facts.map_or_else(Vec::new, |f| f.pending)
+            } else {
+                publication.facts.clone()
+            },
+            completion: if settle { publication.facts.clone() } else { Vec::new() },
+        };
+        let mut receipt = RecoveryReceipt {
+            version: 1,
+            backend_namespace: namespace,
+            key_id,
+            state: if settle { "settled" } else { "pending" }.into(),
+            facts: serde_json::to_vec(&facts)?,
+            mac: Vec::new(),
+        };
+        sign(&mut receipt, &key)?;
+        tx.execute("INSERT INTO recovery_attestations(workspace_id,owner_id,source,run_id,input_event_id,terminal_event_id,version,key_id,state,facts,mac) VALUES(?1,?2,?3,?4,?5,?6,1,?7,?8,?9,?10) ON CONFLICT(workspace_id,owner_id,source,run_id) DO UPDATE SET terminal_event_id=excluded.terminal_event_id,key_id=excluded.key_id,state=excluded.state,facts=excluded.facts,mac=excluded.mac", params![publication.chain.workspace_id,publication.chain.owner_id,publication.chain.source,publication.chain.run_id,facts.input.as_ref().map(|e| &e.id),facts.terminal.as_ref().map(|e| &e.id),receipt.key_id,receipt.state,receipt.facts,receipt.mac])?;
+        tx.commit()?;
+        drop(sync);
+        Ok(receipt)
+    }
+}
+
+impl RecoveryRepository for SqliteMemory {
+    fn activate_recovery_authority(&self) -> anyhow::Result<String> {
+        self.recovery_activate(false)
+    }
+    fn rotate_recovery_authority(&self) -> anyhow::Result<String> {
+        self.recovery_activate(true)
+    }
+    fn recovery_event_evidence(&self, chain: &RecoveryChain, id: &str) -> anyhow::Result<RecoveryEvidence> {
+        event(&self.pool.write(), chain, id)
+    }
+    fn record_recovery_pending(&self, publication: &RecoveryPublication) -> anyhow::Result<RecoveryReceipt> {
+        self.recovery_publish(publication, false)
+    }
+    fn settle_recovery(&self, publication: &RecoveryPublication) -> anyhow::Result<RecoveryReceipt> {
+        self.recovery_publish(publication, true)
+    }
+    fn read_recovery_receipt(&self, chain: &RecoveryChain) -> anyhow::Result<Option<RecoveryReceipt>> {
+        let writer = self.pool.write();
+        let tx = writer.unchecked_transaction()?;
+        let directory = KeyDirectory::open(self.db_path.parent().context("missing memory directory")?, false)?;
+        let receipt = stored(&tx, chain)?;
+        if let Some(receipt) = &receipt {
+            verify(&tx, &directory, chain, receipt)?;
+        }
+        tx.commit()?;
+        Ok(receipt)
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "tests/recovery_authority.rs"]
+mod tests;
