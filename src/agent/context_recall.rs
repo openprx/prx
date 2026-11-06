@@ -4,8 +4,8 @@ use crate::memory;
 use crate::memory::principal::{MemoryWriteContext, OwnerPrincipal, Role};
 use crate::memory::traits::MemoryEntryOrigin;
 use crate::memory::{
-    ConversationTurn, DocumentSearchResult, Memory, MemoryPrincipal, MessageEvent, RetrievalTraceInput,
-    RetrievedContextItem, SessionContextQuery, SharedContextQuery,
+    ConversationTurn, DocumentSearchResult, Memory, MemoryPrincipal, MessageEvent, MessageEventSource,
+    MessageEventSubject, RetrievalTraceInput, RetrievedContextItem, SessionContextQuery, SharedContextQuery,
 };
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -41,6 +41,10 @@ pub(crate) struct RecallScope {
     record_user_messages: bool,
     current_input_key: Option<String>,
     current_input_event: Option<String>,
+    /// Logical task identity of a child run (`envelope.task_id`, falling back
+    /// to the run id). `Some` restricts recall to this child's own task events;
+    /// `None` leaves main, operator and shared-context turns unchanged.
+    child_task: Option<String>,
 }
 
 impl RecallScope {
@@ -69,6 +73,79 @@ impl RecallScope {
             record_user_messages: config.events.record_user_messages,
             current_input_key: envelope.run_id.as_deref().map(current_input_memory_key),
             current_input_event: envelope.source_message_event_id.clone(),
+            child_task: child_runtime_source(envelope.source).then(|| {
+                envelope
+                    .task_id
+                    .clone()
+                    .or_else(|| envelope.run_id.clone())
+                    .unwrap_or_default()
+            }),
+        }
+    }
+}
+
+/// Child runs are the sessions_spawn, session-worker and delegate sources; a
+/// child's input and history events are recorded under those sources.
+const fn child_runtime_source(source: crate::runtime::envelope::RuntimeSource) -> bool {
+    use crate::runtime::envelope::RuntimeSource;
+    matches!(
+        source,
+        RuntimeSource::SessionWorker | RuntimeSource::SessionsSpawn | RuntimeSource::Delegate
+    )
+}
+
+const fn child_origin_event(source: &MessageEventSource) -> bool {
+    matches!(
+        source,
+        MessageEventSource::SessionWorker | MessageEventSource::SessionsSpawn | MessageEventSource::Delegate
+    )
+}
+
+/// Child-scoped admission of a stored event. An event whose subject names a
+/// task is visible only to that task, so a sibling's task never reaches this
+/// child. Child-origin events without a task subject cannot establish their
+/// eligibility and are dropped. Other (main, operator, shared-fact) events
+/// stay visible. An empty identity admits no child-origin event.
+fn child_event_visible(event: &MessageEvent, task_id: &str) -> bool {
+    match event.subject.as_ref() {
+        Some(MessageEventSubject::Task(task)) => !task_id.is_empty() && task == task_id,
+        _ => !child_origin_event(&event.source),
+    }
+}
+
+/// Document copies carry a stored task identity. A chunk naming another task is
+/// dropped; a shared chunk (no task) or this child's own chunk is kept.
+fn child_chunk_visible(chunk_task: Option<&str>, task_id: &str) -> bool {
+    chunk_task.is_none_or(|task| task == task_id)
+}
+
+/// Identity under which a child turn admits recall hits.
+struct ChildRecallGate<'a> {
+    workspace_id: &'a str,
+    owner_id: Option<&'a str>,
+    task_id: &'a str,
+}
+
+/// Semantic copies are admitted through their stored source-event provenance.
+/// A hit without provenance is an explicit or shared fact and is kept. A hit
+/// whose source event cannot be resolved (missing owner, unsupported lookup,
+/// lookup error, or no row) is dropped.
+async fn child_hit_admitted(mem: &dyn Memory, gate: &ChildRecallGate<'_>, source_event_id: Option<&str>) -> bool {
+    let Some(event_id) = source_event_id else {
+        return true;
+    };
+    let Some(owner_id) = gate.owner_id else {
+        return false;
+    };
+    match mem
+        .find_owned_message_event(gate.workspace_id, owner_id, event_id)
+        .await
+    {
+        Ok(Some(event)) => child_event_visible(&event, gate.task_id),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(error = %error, "child recall dropped a hit whose source event did not resolve");
+            false
         }
     }
 }
@@ -105,6 +182,7 @@ pub(crate) async fn scoped_recall(
         Some(&scope.semantic),
         Some(scope.record_user_messages),
         (scope.current_input_key.as_deref(), scope.current_input_event.as_deref()),
+        scope.child_task.as_deref(),
     )
     .await;
     let semantic_start = bundle.current_session_context.len() + bundle.recent_shared_context.len();
@@ -165,7 +243,7 @@ pub(crate) async fn build_context_with_scope(
     min_relevance_score: f64,
     scope_ctx: Option<&MemoryWriteContext>,
 ) -> RecalledMemoryContext {
-    build_semantic_context(mem, user_msg, min_relevance_score, scope_ctx, false, None, None).await
+    build_semantic_context(mem, user_msg, min_relevance_score, scope_ctx, false, None, None, None).await
 }
 
 fn fresh_timestamp(timestamp: &str) -> bool {
@@ -196,6 +274,7 @@ async fn build_semantic_context(
     fresh_only: bool,
     excluded_key: Option<&str>,
     excluded_event: Option<&str>,
+    child: Option<&ChildRecallGate<'_>>,
 ) -> RecalledMemoryContext {
     let mut summaries = Vec::new();
     let mut context = String::new();
@@ -213,7 +292,7 @@ async fn build_semantic_context(
         .filter(|entry| excluded_key != Some(entry.key.as_str()))
         .filter(|entry| excluded_event.is_none() || entry.source_event_id.as_deref() != excluded_event)
         .filter(|entry| !unscoped_remote_hit(entry.origin, entry.source_event_id.as_deref()))
-        .map(|entry| (entry.id, entry.key, entry.content))
+        .map(|entry| (entry.id, entry.key, entry.content, entry.source_event_id))
         .collect::<Vec<_>>();
     let entries = if fresh_only && scored_entries.is_empty() {
         // When scored recall has no matches, scoped prompt reads also use the
@@ -275,15 +354,28 @@ async fn build_semantic_context(
         .filter(|hit| excluded_event.is_none() || hit.source_event_id.as_deref() != excluded_event)
         .map(|hit| {
             let content = crate::causal_tree::projection::bounded_artifact_summary(&hit.content).0;
-            (hit.id, hit.key, content)
+            let source_event_id = hit.source_event_id;
+            (hit.id, hit.key, content, source_event_id)
         })
         .collect::<Vec<_>>()
     } else {
         scored_entries
     };
+    let entries = match child {
+        Some(gate) => {
+            let mut admitted = Vec::with_capacity(entries.len());
+            for (id, key, content, source_event_id) in entries {
+                if child_hit_admitted(mem, gate, source_event_id.as_deref()).await {
+                    admitted.push((id, key, content, source_event_id));
+                }
+            }
+            admitted
+        }
+        None => entries,
+    };
     if !entries.is_empty() {
         context.push_str("[Memory context]\n");
-        for (id, key, content) in entries {
+        for (id, key, content, _) in entries {
             if memory::is_assistant_autosave_key(&key) {
                 continue;
             }
@@ -651,6 +743,7 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
         semantic_scope,
         None,
         (None, None),
+        None,
     )
     .await
 }
@@ -664,8 +757,14 @@ async fn build_agent_context(
     semantic_scope: Option<&MemoryWriteContext>,
     record_user_messages: Option<bool>,
     exclusion: (Option<&str>, Option<&str>),
+    child_task: Option<&str>,
 ) -> AgentContextBundle {
     let (excluded_key, excluded_event) = exclusion;
+    let gate = child_task.map(|task_id| ChildRecallGate {
+        workspace_id: principal.workspace_id.as_str(),
+        owner_id: principal.owner_id.as_deref(),
+        task_id,
+    });
     let semantic = if record_user_messages.is_some() {
         build_semantic_context(
             mem,
@@ -675,6 +774,7 @@ async fn build_agent_context(
             true,
             excluded_key,
             excluded_event,
+            gate.as_ref(),
         )
         .await
     } else {
@@ -688,12 +788,13 @@ async fn build_agent_context(
     // session id, the principal carries no `legacy_session_key`, so the candidate
     // set degrades to the single canonical key and recall behaviour is unchanged
     // while unrelated runs stay isolated.
+    // Conversation turns carry no source provenance, so a child never reads them.
     let mut current_session_turns = match principal.session_key.as_deref() {
-        Some(session_key) => mem
+        Some(session_key) if child_task.is_none() => mem
             .list_conversation_turns(&principal, session_key, 12, 0)
             .await
             .unwrap_or_default(),
-        None => Vec::new(),
+        _ => Vec::new(),
     };
     let mut current_session_events = mem
         .load_recent_session_context(SessionContextQuery {
@@ -720,6 +821,11 @@ async fn build_agent_context(
     if let Some(event_id) = excluded_event {
         current_session_events.retain(|event| event.event_id != event_id);
         shared_events.retain(|event| event.event_id != event_id);
+    }
+    if let Some(task_id) = child_task {
+        current_session_events.retain(|event| child_event_visible(event, task_id));
+        shared_events.retain(|event| child_event_visible(event, task_id));
+        document_results.retain(|result| child_chunk_visible(result.chunk.task_id.as_deref(), task_id));
     }
     if let Some(record) = record_user_messages {
         current_session_turns.retain(|turn| fresh_timestamp(&turn.timestamp) && (record || turn.role != "user"));

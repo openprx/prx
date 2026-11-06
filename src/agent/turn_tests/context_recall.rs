@@ -1440,3 +1440,478 @@ async fn prior_key_value_memory_equal_to_live_text_survives() {
     );
     assert_eq!(recalled.ids.len(), 1);
 }
+
+/// A child envelope for `task`: source `sessions_spawn`, owner-isolated, with
+/// the logical task identity the child segment carries.
+fn child_recall_scope(owner: &str, workspace: &str, session: &str, task: &str) -> RecallScope {
+    let mut envelope = crate::runtime::envelope::RuntimeEnvelope::sessions_spawn(workspace, session, task);
+    envelope.owner_id = Some(owner.to_owned());
+    envelope.owner_isolated = true;
+    envelope.task_id = Some(task.to_owned());
+    // Same channel and sender shape as the scoped fixtures that recall admits.
+    envelope.channel = Some("mcp".to_owned());
+    envelope.sender = Some("shared-subject".to_owned());
+    RecallScope::from_envelope(
+        &envelope,
+        &crate::config::MemoryConfig {
+            min_relevance_score: 0.0,
+            ..Default::default()
+        },
+        "private",
+    )
+}
+
+fn seed_event(
+    owner: &str,
+    workspace: &str,
+    session: &str,
+    source: &str,
+    subject: Option<&str>,
+    content: &str,
+) -> MessageEventInput {
+    MessageEventInput {
+        event_id: None,
+        idempotency_key: None,
+        workspace_id: workspace.to_string(),
+        owner_id: Some(owner.to_string()),
+        source: source.into(),
+        channel: Some("chat".to_string()),
+        session_key: Some(session.to_string()),
+        parent_session_key: None,
+        run_id: None,
+        parent_run_id: None,
+        agent_id: None,
+        persona_id: None,
+        sender: Some("batch-user".to_string()),
+        recipient: None,
+        role: "user".to_string(),
+        event_type: "message.created".to_string(),
+        subject: subject.map(|task| crate::memory::MessageEventSubject::Task(task.to_string())),
+        goal_id: None,
+        causation_event_id: None,
+        correlation_id: None,
+        attempt_id: None,
+        lease_epoch: None,
+        config_generation_id: Some(0),
+        config_source_revision: None,
+        content: content.to_string(),
+        raw_payload_json: None,
+        visibility: MemoryVisibility::Workspace,
+    }
+}
+
+#[tokio::test]
+async fn child_recall_excludes_sibling_task_events_from_session_and_shared_feeds() {
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let session = "sessions:batch-1";
+    for input in [
+        // Sibling task in the child's own session feed and in another session.
+        seed_event(
+            "owner-a",
+            "workspace-a",
+            session,
+            "sessions_spawn",
+            Some("task-sibling"),
+            "childrecall SIBLING-SENTINEL",
+        ),
+        seed_event(
+            "owner-a",
+            "workspace-a",
+            "sessions:other",
+            "sessions_spawn",
+            Some("task-sibling"),
+            "childrecall SIBLING-SHARED-SENTINEL",
+        ),
+        // This child's own prior-segment history.
+        seed_event(
+            "owner-a",
+            "workspace-a",
+            session,
+            "sessions_spawn",
+            Some("task-own"),
+            "childrecall OWN-PRIOR-SEGMENT",
+        ),
+        // Shared, non-child fact from the owner's channel.
+        seed_event(
+            "owner-a",
+            "workspace-a",
+            "telegram:chat-1",
+            "channel",
+            None,
+            "childrecall SHARED-FACT-POSITIVE",
+        ),
+        // Foreign owner negative control.
+        seed_event(
+            "owner-b",
+            "workspace-a",
+            "telegram:chat-2",
+            "channel",
+            None,
+            "childrecall FOREIGN-OWNER-NEGATIVE",
+        ),
+    ] {
+        mem.append_message_event(input).await.unwrap();
+    }
+    let scope = child_recall_scope("owner-a", "workspace-a", session, "task-own");
+    let recalled = scoped_recall(&mem, &scope, "childrecall live request", RECALL_CONTEXT_BUDGET).await;
+    assert!(!recalled.preamble.contains("SIBLING-SENTINEL"), "{}", recalled.preamble);
+    assert!(
+        !recalled.preamble.contains("SIBLING-SHARED-SENTINEL"),
+        "{}",
+        recalled.preamble
+    );
+    assert!(
+        !recalled.preamble.contains("FOREIGN-OWNER-NEGATIVE"),
+        "{}",
+        recalled.preamble
+    );
+    assert!(recalled.preamble.contains("OWN-PRIOR-SEGMENT"), "{}", recalled.preamble);
+    assert!(
+        recalled.preamble.contains("SHARED-FACT-POSITIVE"),
+        "{}",
+        recalled.preamble
+    );
+}
+
+#[tokio::test]
+async fn child_recall_drops_semantic_and_document_copies_of_sibling_tasks() {
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let session = "sessions:batch-2";
+    let sibling = mem
+        .append_message_event(seed_event(
+            "owner-a",
+            "workspace-a",
+            session,
+            "sessions_spawn",
+            Some("task-sibling"),
+            "childrecall sibling semantic source",
+        ))
+        .await
+        .unwrap();
+    let own = mem
+        .append_message_event(seed_event(
+            "owner-a",
+            "workspace-a",
+            session,
+            "sessions_spawn",
+            Some("task-own"),
+            "childrecall own semantic source",
+        ))
+        .await
+        .unwrap();
+    let scope = child_recall_scope("owner-a", "workspace-a", session, "task-own");
+    let metadata = |source: Option<&str>| crate::memory::MemoryStoreMetadata {
+        workspace_id: Some("workspace-a".into()),
+        owner_id: Some("owner-a".into()),
+        source_event_id: source.map(str::to_owned),
+        ..Default::default()
+    };
+    for (key, content, source) in [
+        (
+            "sibling-copy",
+            "childrecall SIBLING-SEMANTIC-SENTINEL",
+            Some(sibling.event_id.as_str()),
+        ),
+        (
+            "own-copy",
+            "childrecall OWN-SEMANTIC-POSITIVE",
+            Some(own.event_id.as_str()),
+        ),
+        ("shared-fact", "childrecall SHARED-SEMANTIC-FACT", None),
+    ] {
+        // Context-free stores skip the classification path recall admits rows
+        // through, so stage the copies through the child's own write context.
+        mem.store_with_context_and_metadata(
+            key,
+            content,
+            MemoryCategory::Core,
+            None,
+            Some(&scope.semantic),
+            metadata(source),
+        )
+        .await
+        .unwrap();
+    }
+    mem.ingest_document(DocumentIngestInput {
+        document_id: None,
+        workspace_id: "workspace-a".into(),
+        owner_id: Some("owner-a".into()),
+        topic_id: None,
+        task_id: Some("task-sibling".into()),
+        source_message_event_id: Some(sibling.event_id.clone()),
+        source_kind: "tool_output".into(),
+        source_uri: None,
+        title: None,
+        content: "childrecall SIBLING-DOCUMENT-SENTINEL".into(),
+        mime_type: Some("text/plain".into()),
+        visibility: MemoryVisibility::Private,
+        metadata_json: None,
+        session_key: None,
+        agent_id: None,
+        persona_id: None,
+    })
+    .await
+    .unwrap();
+    let recalled = scoped_recall(&mem, &scope, "childrecall live request", RECALL_CONTEXT_BUDGET).await;
+    assert!(
+        !recalled.preamble.contains("SIBLING-SEMANTIC-SENTINEL"),
+        "{}",
+        recalled.preamble
+    );
+    assert!(
+        !recalled.preamble.contains("SIBLING-DOCUMENT-SENTINEL"),
+        "{}",
+        recalled.preamble
+    );
+    assert!(
+        recalled.preamble.contains("OWN-SEMANTIC-POSITIVE"),
+        "{}",
+        recalled.preamble
+    );
+    assert!(
+        recalled.preamble.contains("SHARED-SEMANTIC-FACT"),
+        "{}",
+        recalled.preamble
+    );
+}
+
+/// Backend whose owner-scoped event lookup is the trait default (fails fast),
+/// returning one event-derived hit and one shared fact from semantic recall.
+struct FailFastLookupMemory;
+
+fn fail_fast_hit(key: &str, content: &str, source_event_id: Option<&str>) -> crate::memory::MemoryEntry {
+    crate::memory::MemoryEntry {
+        source_event_id: source_event_id.map(str::to_owned),
+        origin: crate::memory::traits::MemoryEntryOrigin::Stored,
+        id: format!("id-{key}"),
+        key: key.to_owned(),
+        content: content.to_owned(),
+        category: MemoryCategory::Core,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        session_id: None,
+        score: Some(1.0),
+        tags: None,
+        access_count: None,
+        useful_count: None,
+        source: None,
+        source_confidence: None,
+        verification_status: None,
+        lifecycle_state: None,
+        compressed_from: None,
+    }
+}
+
+#[async_trait::async_trait]
+impl Memory for FailFastLookupMemory {
+    fn name(&self) -> &str {
+        "fail-fast-lookup-memory"
+    }
+    async fn store(&self, _: &str, _: &str, _: MemoryCategory, _: Option<&str>) -> anyhow::Result<()> {
+        panic!("unexpected mutation in a recall-only fixture")
+    }
+    async fn recall(&self, _: &str, _: usize, _: Option<&str>) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+        Ok(Vec::new())
+    }
+    async fn recall_with_context(
+        &self,
+        _: &str,
+        _: usize,
+        _: Option<&str>,
+        _: Option<&MemoryWriteContext>,
+    ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+        Ok(vec![
+            fail_fast_hit("event-derived", "childrecall EVENT-DERIVED-HIT", Some("event-x")),
+            fail_fast_hit("shared-fact", "childrecall SHARED-FACT-HIT", None),
+        ])
+    }
+    async fn get(&self, _: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+        Ok(None)
+    }
+    async fn list(
+        &self,
+        _: Option<&MemoryCategory>,
+        _: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+        Ok(Vec::new())
+    }
+    async fn forget(&self, _: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    async fn count(&self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+    async fn health_check(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn child_recall_on_fail_fast_lookup_backend_drops_event_derived_hits_and_runs() {
+    let mem = FailFastLookupMemory;
+    let child = child_recall_scope("owner-a", "workspace-a", "sessions:batch-3", "task-own");
+    let recalled = scoped_recall(&mem, &child, "childrecall live request", RECALL_CONTEXT_BUDGET).await;
+    assert!(
+        !recalled.preamble.contains("EVENT-DERIVED-HIT"),
+        "{}",
+        recalled.preamble
+    );
+    assert!(recalled.preamble.contains("SHARED-FACT-HIT"), "{}", recalled.preamble);
+
+    // A main turn on the same backend keeps its unchanged behaviour.
+    let main = recall_test_scope("owner-a", "workspace-a");
+    let recalled = scoped_recall(&mem, &main, "childrecall live request", RECALL_CONTEXT_BUDGET).await;
+    assert!(recalled.preamble.contains("EVENT-DERIVED-HIT"), "{}", recalled.preamble);
+}
+
+/// Child envelope of `kind` (`session_worker`, `sessions_spawn`, `delegate`).
+fn child_envelope(kind: &str, session: &str, run: &str) -> crate::runtime::envelope::RuntimeEnvelope {
+    use crate::runtime::envelope::RuntimeEnvelope;
+    match kind {
+        "session_worker" => RuntimeEnvelope::session_worker("workspace-a", session, run),
+        "sessions_spawn" => RuntimeEnvelope::sessions_spawn("workspace-a", session, run),
+        "delegate" => RuntimeEnvelope::delegate("workspace-a", session, run),
+        other => panic!("unknown child source kind {other}"),
+    }
+}
+
+/// End-to-end cell for one child source. The child entry used by
+/// `ChildSegmentTurn::admit` is `scoped_recall` over `RecallScope::from_envelope`
+/// of the child envelope. It takes no parent grant, so the cell drives it
+/// directly. The live input is excluded by design, so the child's own prior
+/// segment stands in for "its own input". The sibling copy must be absent.
+async fn child_entry_drops_sibling(kind: &str) {
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let session = "sessions:batch-1";
+    for input in [
+        seed_event(
+            "owner-a",
+            "workspace-a",
+            session,
+            kind,
+            Some("task-sibling"),
+            "childrecall SIBLING-SENTINEL",
+        ),
+        seed_event(
+            "owner-a",
+            "workspace-a",
+            session,
+            kind,
+            Some("task-own"),
+            "childrecall OWN-PRIOR-SEGMENT",
+        ),
+        seed_event(
+            "owner-a",
+            "workspace-a",
+            "telegram:chat-1",
+            "channel",
+            None,
+            "childrecall SHARED-FACT-POSITIVE",
+        ),
+        seed_event(
+            "owner-b",
+            "workspace-a",
+            "telegram:chat-2",
+            "channel",
+            None,
+            "childrecall FOREIGN-OWNER-NEGATIVE",
+        ),
+    ] {
+        mem.append_message_event(input).await.unwrap();
+    }
+    let mut envelope = child_envelope(kind, session, "run-own").with_task_id("task-own");
+    envelope.owner_id = Some("owner-a".to_owned());
+    envelope.owner_isolated = true;
+    envelope.channel = Some("mcp".to_owned());
+    envelope.sender = Some("shared-subject".to_owned());
+    let scope = RecallScope::from_envelope(
+        &envelope,
+        &crate::config::MemoryConfig {
+            min_relevance_score: 0.0,
+            ..Default::default()
+        },
+        "private",
+    );
+    let recalled = scoped_recall(&mem, &scope, "childrecall live request", RECALL_CONTEXT_BUDGET).await;
+    assert!(
+        !recalled.preamble.contains("SIBLING-SENTINEL"),
+        "{kind}: sibling leaked: {}",
+        recalled.preamble
+    );
+    assert!(
+        recalled.preamble.contains("OWN-PRIOR-SEGMENT"),
+        "{kind}: own input missing: {}",
+        recalled.preamble
+    );
+    assert!(
+        recalled.preamble.contains("SHARED-FACT-POSITIVE"),
+        "{kind}: shared positive missing: {}",
+        recalled.preamble
+    );
+    assert!(
+        !recalled.preamble.contains("FOREIGN-OWNER-NEGATIVE"),
+        "{kind}: foreign owner leaked: {}",
+        recalled.preamble
+    );
+}
+
+/// Wiring proof for H1. The filtering itself is covered by the unit cells
+/// above. This test pins that the production `RecallScope::from_envelope`
+/// binds `child_task` for every child source and for no main-turn source, and
+/// that the child recall entry, driven from a real child envelope, drops the
+/// sibling.
+#[tokio::test]
+async fn child_turn_recall_scope_binds_child_task() {
+    let config = crate::config::MemoryConfig {
+        min_relevance_score: 0.0,
+        ..Default::default()
+    };
+    let scope_for =
+        |envelope: &crate::runtime::envelope::RuntimeEnvelope| RecallScope::from_envelope(envelope, &config, "private");
+    for kind in ["session_worker", "sessions_spawn", "delegate"] {
+        let run_only = child_envelope(kind, "sessions:batch-1", "run-own");
+        assert_eq!(run_only.task_id, None, "{kind} starts without a task subject");
+        assert_eq!(
+            scope_for(&run_only).child_task.as_deref(),
+            Some("run-own"),
+            "{kind} falls back to the run id"
+        );
+        let tasked = run_only.clone().with_task_id("task-own");
+        assert_eq!(
+            scope_for(&tasked).child_task.as_deref(),
+            Some("task-own"),
+            "{kind} binds the task subject"
+        );
+    }
+    let mains = [
+        (
+            "chat",
+            crate::runtime::envelope::RuntimeEnvelope::chat("workspace-a", "chat-1"),
+        ),
+        (
+            "gateway",
+            crate::runtime::envelope::RuntimeEnvelope::gateway(
+                "workspace-a",
+                "gateway:1",
+                "webhook",
+                "sender-1",
+                "recipient-1",
+                MemoryVisibility::Workspace,
+            ),
+        ),
+        (
+            "channel",
+            crate::runtime::envelope::RuntimeEnvelope::channel("workspace-a", "wacli", "sender-1", None),
+        ),
+    ];
+    for (kind, envelope) in mains {
+        let tasked = envelope.clone().with_task_id("task-x");
+        assert_eq!(scope_for(&envelope).child_task, None, "{kind} is a main turn");
+        assert_eq!(scope_for(&tasked).child_task, None, "{kind} ignores a task id");
+    }
+    for kind in ["session_worker", "sessions_spawn", "delegate"] {
+        child_entry_drops_sibling(kind).await;
+    }
+}
