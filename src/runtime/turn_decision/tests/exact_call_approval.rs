@@ -127,23 +127,33 @@ impl DecisionBackend for FilesystemApprovalBackend {
 
 #[tokio::test]
 async fn unmentioned_file_write_stays_outside_collection_and_execution() {
-    Box::pin(exact_file_without_intent(false)).await;
+    Box::pin(exact_file_without_intent(false, None)).await;
 }
 
 #[tokio::test]
 async fn unmentioned_file_edit_has_no_filesystem_discovery_offer() {
-    Box::pin(exact_file_without_intent(true)).await;
+    Box::pin(exact_file_without_intent(true, None)).await;
 }
 
 #[tokio::test]
 async fn unrelated_chat_input_cannot_create_pending_file_approval() {
-    Box::pin(exact_file_without_intent(false)).await;
+    Box::pin(exact_file_without_intent(false, None)).await;
 }
 
 #[path = "exact_call_approval/reported_usage.rs"]
 mod reported_usage;
 
-async fn exact_file_without_intent(edit: bool) {
+#[tokio::test]
+async fn bind_keeps_no_ledger_for_tui_line_mode_and_cli() {
+    Box::pin(exact_file_without_intent(false, Some(false))).await;
+}
+
+#[tokio::test]
+async fn bind_keeps_ledger_for_console_gateway_h2_and_bg() {
+    Box::pin(exact_file_without_intent(false, Some(true))).await;
+}
+
+async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().unwrap();
     let tool_name = if edit { "file_edit" } else { "file_write" };
@@ -252,7 +262,7 @@ async fn exact_file_without_intent(edit: bool) {
             SlotLimits::default(),
         );
         assert!(service.recordable && service.durable_key);
-        let (proof, _envelope) = recorded_approval_source(
+        let (proof, envelope) = recorded_approval_source(
             &generation,
             Arc::clone(&memory),
             "Inspect project context",
@@ -273,6 +283,46 @@ async fn exact_file_without_intent(edit: bool) {
         );
         assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
         let selected = service.agent_execution_specs(proof.as_ref(), &context).unwrap();
+        if let Some(with_ledger) = bind_ledger {
+            assert!(
+                service.execution_approval_ledger().is_some(),
+                "fixture must have a live durable ledger"
+            );
+            let incoming = if with_ledger {
+                ["console", "gateway", "h2", "bg"]
+                    .into_iter()
+                    .map(|surface| {
+                        (
+                            surface,
+                            ToolExecutionContext::new(envelope.clone(), proof.policy_chat_type())
+                                .with_approval_ledger(service.execution_approval_ledger()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![
+                    ("tui", crate::chat::approval_context::tui(envelope.clone())),
+                    ("line_mode", crate::chat::approval_context::line_mode(envelope.clone())),
+                    ("cli", crate::agent::entry::cli_tool_execution_context(envelope.clone())),
+                ]
+            };
+            for (surface, incoming) in incoming {
+                let (_, bound) = service
+                    .bind_agent_execution_with_runtime(proof.as_ref(), &context, &incoming, &selected.specs, None)
+                    .expect("real decision execution bind");
+                assert_eq!(
+                    bound.approval_ledger.is_some(),
+                    with_ledger,
+                    "bind must preserve {surface} approval routing"
+                );
+                if let (Some(before), Some(after)) = (&incoming.approval_ledger, &bound.approval_ledger) {
+                    assert!(Arc::ptr_eq(&before.memory, &after.memory));
+                    assert!(Arc::ptr_eq(&before.state_key, &after.state_key));
+                    assert!(Arc::ptr_eq(&before.catalog, &after.catalog));
+                }
+            }
+        }
+
         assert_eq!(
             selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
             ["file_read"]

@@ -572,7 +572,7 @@ impl TurnDecisionService {
         }
         self.verify_console_filesystem_context(proof, context)?;
         let mut execution_context = execution_context.clone();
-        execution_context.approval_ledger = self.execution_approval_ledger();
+        // Approval routing belongs to the ingress builder, including an explicit None.
         execution_context.owner_filesystem = context.owner_filesystem.clone();
         execution_context.set_h2_origin(proof.h2_entry_origin().cloned());
         if let Some(case) = execution_context.controlled_case().cloned() {

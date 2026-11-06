@@ -1200,7 +1200,10 @@ impl EffectExecutor {
                                 &draft_id,
                             )
                         },
-                        |binding| super::approval_context::tui(binding.envelope().clone()),
+                        |binding| {
+                            super::approval_context::tui(binding.envelope().clone())
+                                .with_approval_ledger(binding.h2_approval_ledger())
+                        },
                     )
                     .with_schema_dialect(provider.tool_schema_dialect_for(&model));
                 let request_event_fabric = MemoryFabric::new(

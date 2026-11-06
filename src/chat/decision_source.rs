@@ -1051,6 +1051,14 @@ impl ChatTurnBinding {
         decided.service.agent_prompt_skills(self, &decided.context)
     }
 
+    /// Only the verified h2 ingress opts foreground chat into durable review.
+    pub(super) fn h2_approval_ledger(
+        &self,
+    ) -> Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger> {
+        self.h2_origin.get()?;
+        self.decision.get()?.service.execution_approval_ledger()
+    }
+
     pub(super) fn decision_advice(&self) -> Option<crate::decision_engine::IntentAnalysis> {
         self.decision.get().and_then(|decided| decided.advice.clone())
     }

@@ -296,10 +296,14 @@ pub(super) async fn run_sub_agent_task(
         let initial_task = history.is_empty().then(|| task.to_owned());
         let mut task_history = history;
         let provider_instance = provider.clone();
-        let child_source_owned = child_source.clone().context("task segment source missing")?;
+        let mut child_source_owned = child_source.clone().context("task segment source missing")?;
         let ordinary_runtime_owned = ordinary_runtime.clone();
         let parent_hooks_owned = parent_hooks.clone();
         let child_service_owned = child_service.clone().context("task segment service missing")?;
+        if operator_authority.is_some() {
+            // Explicit operator /bg calls opt into durable approval; ordinary children do not.
+            child_source_owned.1.approval_ledger = child_service_owned.execution_approval_ledger();
+        }
         let child_config_owned = child_config.clone().context("task segment configuration missing")?;
         let child_fabric_owned = child_fabric.clone().context("task segment fabric missing")?;
         let child_usage_owned = child_usage.clone();

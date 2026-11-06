@@ -190,7 +190,8 @@ approval context also use durable approval when no decision binding is present.
 With the causal plane enabled, a modelled side-effecting call under Supervised
 autonomy waits for review before execution. Unmodelled operations use the existing
 approval strategy. Foreground TUI, line-mode chat, and `prx agent` retain their
-interactive prompts, resolver and session allowlist.
+interactive prompts, resolver and session allowlist. Decision binding preserves
+the approval routing chosen by each surface builder.
 Approval binds the source, capability and complete arguments; changing arguments
 requires a new review. A claimed approval can execute at most once, including across restart.
 Channel approval runs first, and tool policy and execution gates still apply.
