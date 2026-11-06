@@ -94,6 +94,7 @@ fn untrusted_test_runtime(memory: Arc<dyn Memory>) -> DocumentIngestRuntime {
         config_generation_id: Some(0),
         config_source_revision: None,
         visibility: MemoryVisibility::Workspace,
+        child_turn: false,
     }
 }
 

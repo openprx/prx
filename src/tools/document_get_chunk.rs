@@ -158,6 +158,7 @@ impl Tool for DocumentGetChunkTool {
             // intentional provenance lookup, not the agent recall path, so leaving
             // this `None` is correct.
             source_kind: None,
+            source_message_event_id: None,
         };
         let selected = vec![document_result_to_context_item(&selected_result)];
         let trace_id = append_document_tool_retrieval_trace(

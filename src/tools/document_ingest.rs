@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const USER_DOCUMENT_SOURCE_KIND: &str = "user_document";
 
 #[derive(Clone)]
 struct DocumentIngestRuntime {
@@ -197,7 +198,7 @@ impl DocumentIngestRuntime {
                 topic_id: None,
                 task_id: None,
                 source_message_event_id: None,
-                source_kind: "user_document".to_string(),
+                source_kind: USER_DOCUMENT_SOURCE_KIND.to_string(),
                 source_uri,
                 title,
                 content,

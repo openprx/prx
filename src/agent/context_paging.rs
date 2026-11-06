@@ -265,6 +265,11 @@ pub(super) async fn recall_context_pages(
         if !result.chunk.document_id.starts_with("context-page:") {
             continue;
         }
+        // A child turn sees only pages its own logical task wrote. A page with
+        // no task label cannot establish that and is skipped (fail closed).
+        if runtime.child_turn && (result.chunk.task_id.is_none() || result.chunk.task_id != runtime.task_id) {
+            continue;
+        }
         // A page is a verbatim transcript of older turns: its media markers
         // belong to those turns, not to the one being assembled now, and any
         // fabricated `[Used tools: ...]` those turns carried must not be handed

@@ -3239,7 +3239,7 @@ impl Memory for PostgresMemory {
                        c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
                        c.token_estimate, c.created_at,
                        ts_rank_cd(to_tsvector('simple', c.content), plainto_tsquery('simple', $1)) AS score,
-                       d.source_kind AS source_kind
+                       d.source_kind AS source_kind, d.source_message_event_id AS source_message_event_id
                 FROM {qualified_document_chunks_table} c
                 JOIN {qualified_documents_table} d ON d.document_id = c.document_id
                 WHERE c.workspace_id = $2
@@ -3275,10 +3275,12 @@ impl Memory for PostgresMemory {
                     let chunk = Self::row_to_document_chunk(row)?;
                     let score: f32 = row.try_get::<_, f32>(14).unwrap_or(0.0);
                     let source_kind: Option<String> = row.try_get::<_, Option<String>>(15).unwrap_or(None);
+                    let source_message_event_id: Option<String> = row.try_get::<_, Option<String>>(16)?;
                     DocumentSearchResult {
                         chunk,
                         score,
                         source_kind,
+                        source_message_event_id,
                     }
                 };
                 result.score *= keyword_weight;
@@ -3294,7 +3296,7 @@ impl Memory for PostgresMemory {
                                    c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
                                    c.token_estimate, c.created_at,
                                    (1.0 - (c.embedding_vector <=> $1::text::vector))::REAL AS score,
-                                   d.source_kind AS source_kind
+                                   d.source_kind AS source_kind, d.source_message_event_id AS source_message_event_id
                             FROM {qualified_document_chunks_table} c
                             JOIN {qualified_documents_table} d ON d.document_id = c.document_id
                             WHERE c.embedding_vector IS NOT NULL
@@ -3342,6 +3344,7 @@ impl Memory for PostgresMemory {
                             }
                             let chunk = Self::row_to_document_chunk(row)?;
                             let source_kind: Option<String> = row.try_get::<_, Option<String>>(15).unwrap_or(None);
+                            let source_message_event_id: Option<String> = row.try_get::<_, Option<String>>(16)?;
                             by_chunk
                                 .entry(chunk.chunk_id.clone())
                                 .and_modify(|existing| {
@@ -3351,6 +3354,7 @@ impl Memory for PostgresMemory {
                                     chunk,
                                     score,
                                     source_kind,
+                                    source_message_event_id,
                                 });
                         }
                     }
@@ -3368,7 +3372,7 @@ impl Memory for PostgresMemory {
                         "
                         SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
                                c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
-                               c.token_estimate, c.created_at, c.embedding, d.source_kind AS source_kind
+                               c.token_estimate, c.created_at, c.embedding, d.source_kind AS source_kind, d.source_message_event_id AS source_message_event_id
                         FROM {qualified_document_chunks_table} c
                         JOIN {qualified_documents_table} d ON d.document_id = c.document_id
                         WHERE c.embedding IS NOT NULL
@@ -3425,6 +3429,7 @@ impl Memory for PostgresMemory {
                         }
                         let chunk = Self::row_to_document_chunk(row)?;
                         let source_kind: Option<String> = row.try_get::<_, Option<String>>(15).unwrap_or(None);
+                        let source_message_event_id: Option<String> = row.try_get::<_, Option<String>>(16)?;
                         by_chunk
                             .entry(chunk.chunk_id.clone())
                             .and_modify(|existing| {
@@ -3434,6 +3439,7 @@ impl Memory for PostgresMemory {
                                 chunk,
                                 score,
                                 source_kind,
+                                source_message_event_id,
                             });
                     }
                 }

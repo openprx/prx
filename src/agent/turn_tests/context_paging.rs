@@ -297,7 +297,7 @@ async fn owner_isolated_spawn_child_recall_excludes_another_owners_workspace_pag
             workspace_id: workspace.clone(),
             owner_id: Some(owner.to_string()),
             topic_id: None,
-            task_id: None,
+            task_id: Some("child-run".to_string()),
             source_message_event_id: None,
             source_kind: OS_PAGING_SOURCE_KIND.to_string(),
             source_uri: None,
@@ -331,6 +331,7 @@ async fn owner_isolated_spawn_child_recall_excludes_another_owners_workspace_pag
     assert_eq!(runtime.owner_id.as_deref(), Some("owner-a"));
     assert!(runtime.require_owner_match);
     assert_eq!(runtime.session_key.as_deref(), Some("child-session"));
+    assert_eq!(runtime.task_id.as_deref(), Some("child-run"));
 
     let recalled = recall_context_pages("child isolation beacon", &paging_test_config(true), Some(&runtime))
         .await
@@ -617,4 +618,92 @@ fn inject_recalled_context_inserts_after_system() {
     assert_eq!(history[0].content, "sys");
     assert_eq!(history[1].content, "recalled");
     assert_eq!(history[2].content, "hello");
+}
+
+/// Two delegates share one session key, so a sibling's evicted page is in the
+/// same owner-scoped store. Both child pages are written by the real
+/// `apply_os_paging` through `from_scope` runtimes of different runs, so the
+/// task label the recall filter compares is the one production writes. A child
+/// turn recalls only the pages its own logical task wrote (the sibling and
+/// unlabelled pages are excluded). A main turn with the same query still
+/// recalls every page.
+#[tokio::test]
+async fn child_page_recall_is_bound_to_the_child_task() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().to_string_lossy().to_string();
+    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let policy = crate::security::SecurityPolicy {
+        workspace_dir: tmp.path().to_path_buf(),
+        ..crate::security::SecurityPolicy::default()
+    };
+    let child_runtime = |run: &str| {
+        let envelope = RuntimeEnvelope::delegate(&workspace, "delegate:shared", run)
+            .with_channel("console")
+            .with_sender("prx_user")
+            .with_recipient("child-recipient")
+            .with_owner_id("owner-a")
+            .with_owner_isolation();
+        let context = crate::tools::ToolExecutionContext::new(envelope, "private");
+        let scope = ScopeContext::from_execution_context(&policy, &context, "child-recipient");
+        DocumentIngestRuntime::from_scope(Arc::clone(&mem), &scope).into_nested_turn()
+    };
+    let config = paging_test_config(true);
+    for (run, marker) in [("run-own", "OWN-PAGE"), ("run-sibling", "SIBLING-PAGE")] {
+        let runtime = child_runtime(run);
+        assert!(runtime.child_turn);
+        assert_eq!(runtime.task_id.as_deref(), Some(run));
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(format!("child page beacon {marker} request. ").repeat(40)),
+            ChatMessage::assistant(format!("child page beacon {marker} reply. ").repeat(40)),
+            ChatMessage::user("latest question please summarize"),
+        ];
+        assert!(
+            apply_os_paging(&mut history, &config, Some(&runtime)).await.unwrap(),
+            "{run} history should be paged out"
+        );
+    }
+    // Legacy page written before pages carried a task label. No current
+    // writer produces it, so it is seeded directly to prove children fail closed.
+    mem.ingest_document(DocumentIngestInput {
+        document_id: Some("context-page:delegate:shared:unlabelled".to_string()),
+        workspace_id: workspace.clone(),
+        owner_id: Some("owner-a".to_string()),
+        topic_id: None,
+        task_id: None,
+        source_message_event_id: None,
+        source_kind: OS_PAGING_SOURCE_KIND.to_string(),
+        source_uri: None,
+        title: None,
+        content: "child page beacon UNLABELLED-PAGE".to_string(),
+        mime_type: Some("text/plain".to_string()),
+        visibility: crate::memory::MemoryVisibility::Workspace,
+        metadata_json: None,
+        session_key: Some("delegate:shared".to_string()),
+        agent_id: None,
+        persona_id: None,
+    })
+    .await
+    .unwrap();
+
+    let child = child_runtime("run-own");
+
+    let recalled = recall_context_pages("child page beacon", &paging_test_config(true), Some(&child))
+        .await
+        .expect("the child's own page should be recalled");
+    assert!(recalled.content.contains("OWN-PAGE"), "{}", recalled.content);
+    assert!(!recalled.content.contains("SIBLING-PAGE"), "{}", recalled.content);
+    assert!(!recalled.content.contains("UNLABELLED-PAGE"), "{}", recalled.content);
+
+    let main_envelope = RuntimeEnvelope::channel(&workspace, "console", "prx_user", None)
+        .with_owner_id("owner-a")
+        .with_owner_isolation();
+    let main = DocumentIngestRuntime::from_envelope(Arc::clone(&mem), &main_envelope);
+    assert!(!main.child_turn);
+    let all = recall_context_pages("child page beacon", &paging_test_config(true), Some(&main))
+        .await
+        .expect("the main turn should recall pages");
+    assert!(all.content.contains("OWN-PAGE"), "{}", all.content);
+    assert!(all.content.contains("SIBLING-PAGE"), "{}", all.content);
+    assert!(all.content.contains("UNLABELLED-PAGE"), "{}", all.content);
 }

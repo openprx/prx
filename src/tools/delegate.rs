@@ -423,7 +423,10 @@ fn delegate_event_scope(
 ) -> MessageEventScope {
     let mut envelope = RuntimeEnvelope::delegate(workspace_id, delegate_session_key(scope), delegate_run_id)
         .with_channel(scope.map_or("delegate", |scope| scope.channel.as_str()))
-        .with_agent_id(agent_name);
+        .with_agent_id(agent_name)
+        // A delegate's logical task is its own run. The caller's task is lineage
+        // (`parent_task_id` in the task payloads), never child authority.
+        .with_task_id(delegate_run_id);
     if let Some(scope) = scope {
         envelope = envelope
             .with_sender(scope.sender.as_str())
@@ -433,9 +436,6 @@ fn delegate_event_scope(
         }
         if let Some(topic_id) = &scope.topic_id {
             envelope = envelope.with_topic_id(topic_id.clone());
-        }
-        if let Some(task_id) = &scope.task_id {
-            envelope = envelope.with_task_id(task_id.clone());
         }
         if let Some(source_message_event_id) = &scope.source_message_event_id {
             envelope = envelope.with_source_message_event_id(source_message_event_id.clone());
@@ -2556,6 +2556,101 @@ mod tests {
         assert_eq!(event_scope.sender.as_deref(), Some("alice"));
         assert_eq!(event_scope.recipient.as_deref(), Some("chat-1"));
         assert_eq!(event_scope.owner_id.as_deref(), Some("owner:/tmp/ws:telegram:alice"));
+        assert_eq!(
+            event_scope.subject,
+            Some(crate::memory::MessageEventSubject::Task("run-delegate".into()))
+        );
+    }
+
+    /// Two delegates under one parent task write their own task identity, so a
+    /// sibling's live request and prior segment never reach the other child,
+    /// while the shared main-channel event stays visible to both.
+    #[tokio::test]
+    async fn delegates_under_one_parent_task_recall_only_their_own_task() {
+        use crate::agent::context_recall::{RECALL_CONTEXT_BUDGET, RecallScope, scoped_recall};
+        use crate::memory::{MessageEventSource, MessageEventSubject, SqliteMemory};
+
+        let tmp = tempfile::TempDir::new().expect("test: temp dir");
+        let ws = tmp.path().to_string_lossy().to_string();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite"));
+        let fabric = MemoryFabric::new(Arc::clone(&memory), ws.clone());
+        let parent = DelegateScope {
+            sender: "alice".to_string(),
+            channel: "telegram".to_string(),
+            chat_id: "chat-1".to_string(),
+            owner_id: Some("owner-T".to_string()),
+            topic_id: None,
+            task_id: Some("task-T".to_string()),
+            source_message_event_id: None,
+            config_generation_id: Some(1),
+            config_source_revision: Some("rev-1".to_string()),
+        };
+        let mut shared = delegate_event_scope(&ws, "run-main", "tester", Some(&parent));
+        shared.source = MessageEventSource::Channel;
+        shared.subject = None;
+        fabric
+            .record_inbound_user_message(shared, "SHARED-MAIN-POSITIVE", None, None)
+            .await
+            .expect("test: shared record");
+
+        let mut lanes = Vec::new();
+        for run in ["run-a", "run-b"] {
+            let scope = delegate_event_scope(&ws, run, "tester", Some(&parent));
+            assert_eq!(scope.subject, Some(MessageEventSubject::Task(run.to_string())));
+            assert_ne!(scope.subject, Some(MessageEventSubject::Task("task-T".to_string())));
+            assert_eq!(scope.session_key.as_deref(), Some("delegate:telegram:chat-1:alice"));
+            let live = fabric
+                .record_inbound_user_message(scope.clone(), format!("SENTINEL-{run}"), None, None)
+                .await
+                .expect("test: live record");
+            assert!(live.id > 0);
+            let mut prior = scope.clone();
+            prior.run_id = Some(format!("child-segment:{run}:1"));
+            fabric
+                .record_inbound_user_message(prior, format!("OWN-PRIOR-{run}"), None, None)
+                .await
+                .expect("test: prior record");
+            lanes.push((run, live));
+        }
+
+        for (run, live) in &lanes {
+            let mut env = RuntimeEnvelope::delegate(&ws, "delegate:telegram:chat-1:alice", *run)
+                .with_agent_id("tester")
+                .with_channel("telegram")
+                .with_sender("alice")
+                .with_owner_id("owner-T")
+                .with_owner_isolation();
+            env.task_id = crate::runtime::turn_source::subject_task_id(live.subject.as_ref()).map(str::to_owned);
+            env.source_message_event_id = Some(live.event_id.clone());
+            let config = crate::config::MemoryConfig {
+                min_relevance_score: 0.0,
+                ..Default::default()
+            };
+            let scope = RecallScope::from_envelope(&env, &config, "private");
+            let recalled = scoped_recall(memory.as_ref(), &scope, "delegate live request", RECALL_CONTEXT_BUDGET).await;
+            let preamble = recalled.preamble;
+            let (own, other) = if *run == "run-a" {
+                ("run-a", "run-b")
+            } else {
+                ("run-b", "run-a")
+            };
+            assert!(
+                preamble.contains(&format!("OWN-PRIOR-{own}")),
+                "{run} lost its own prior segment: {preamble}"
+            );
+            assert!(
+                preamble.contains("SHARED-MAIN-POSITIVE"),
+                "{run} lost the shared main event: {preamble}"
+            );
+            assert!(
+                !preamble.contains(&format!("SENTINEL-{other}")),
+                "{run} recalled the sibling live request: {preamble}"
+            );
+            assert!(
+                !preamble.contains(&format!("OWN-PRIOR-{other}")),
+                "{run} recalled the sibling prior segment: {preamble}"
+            );
+        }
     }
 
     #[test]
@@ -4351,6 +4446,162 @@ mod credential_containment_tests {
         // The workspace, the SQLite memory and the provider runtime dir are
         // all this temp dir.
         assert_nothing_under_persists_the_probe_secret(temp.path());
+    }
+
+    /// Loopback OpenAI-compatible endpoint that keeps every chat request body
+    /// (unlike `CredentialProbe`, which retains no prompt content).
+    async fn capturing_endpoint() -> (
+        String,
+        Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::<serde_json::Value>::new()));
+        let capture = Arc::clone(&requests);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind capture endpoint");
+        let addr = listener.local_addr().expect("test: capture endpoint address");
+        let chat = axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                capture.lock().push(request);
+                axum::Json(json!({
+                    "id": "chatcmpl-capture",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": PROBE_MODEL,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "CAPTURE-DONE"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            }
+        });
+        let models = axum::routing::get(|| async {
+            axum::Json(json!({
+                "object": "list",
+                "data": [{"id": PROBE_MODEL, "object": "model", "created": 1, "owned_by": "probe"}]
+            }))
+        });
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", chat)
+            .route("/v1/models", models);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1"), requests, server)
+    }
+
+    /// One ordinary delegate turn through the admitted path; returns its
+    /// recorded input event.
+    async fn sibling_lane(
+        temp: &tempfile::TempDir,
+        memory: &Arc<dyn Memory>,
+        agents: &HashMap<String, DelegateAgentConfig>,
+        sentinel: &str,
+    ) -> crate::memory::MessageEvent {
+        let config = admitted_config(temp, agents.clone());
+        assert!(!config.causal_tree.enabled);
+        let tool = DelegateTool::new(agents.clone(), security(temp)).with_shared_memory(Arc::clone(memory));
+        let args = json!({"agent": "a", "prompt": "lane a", "context": sentinel});
+        let result = super::tests::dispatch_admitted_delegate(config, tool, args).await;
+        assert!(result.success, "{:?}", result.error);
+        workspace_events(memory, temp)
+            .await
+            .into_iter()
+            .find(|event| event.role == "user" && event.source == "delegate" && event.content.contains(sentinel))
+            .expect("test: the delegate input must be recorded")
+    }
+
+    /// Seeds a durable event that belongs to the same owner, session, channel,
+    /// sender and agent as `origin`, so it is in scope for that lane's recall.
+    fn sibling_scope(
+        origin: &crate::memory::MessageEvent,
+        source: crate::memory::MessageEventSource,
+        run_id: Option<&str>,
+        subject: Option<crate::memory::MessageEventSubject>,
+    ) -> MessageEventScope {
+        let mut scope = MessageEventScope::new(source, crate::memory::MemoryVisibility::Workspace);
+        scope.owner_id = origin.owner_id.clone();
+        scope.session_key = origin.session_key.clone();
+        scope.channel = origin.channel.clone();
+        scope.sender = origin.sender.clone();
+        scope.agent_id = origin.agent_id.clone();
+        scope.run_id = run_id.map(str::to_owned);
+        scope.subject = subject;
+        scope
+    }
+
+    /// Two sibling delegates from the same parent loop, admitted through the
+    /// real ordinary path, record distinct task identities. A sibling's prior
+    /// segment never reaches the other child's provider request, while a shared
+    /// main-channel event does.
+    #[tokio::test]
+    async fn ordinary_sibling_delegates_get_distinct_task_identities_in_admitted_requests() {
+        use crate::memory::{MessageEventSource, MessageEventSubject};
+
+        let temp = tempfile::tempdir().expect("test: temp dir");
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("test: sqlite"));
+        let workspace = temp.path().to_string_lossy().to_string();
+        let (base, requests, server) = capturing_endpoint().await;
+        let agents = HashMap::from([("a".to_string(), agent(&format!("custom:{base}"), Some(AGENT_SENTINEL)))]);
+
+        let a_in = sibling_lane(&temp, &memory, &agents, "A2-SIBLING-A-SENTINEL").await;
+        let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.clone());
+        fabric
+            .record_inbound_user_message(
+                sibling_scope(
+                    &a_in,
+                    MessageEventSource::Delegate,
+                    Some("child-segment:a2:1"),
+                    a_in.run_id.clone().map(MessageEventSubject::Task),
+                ),
+                "A2-SIBLING-A-SEGMENT",
+                None,
+                None,
+            )
+            .await
+            .expect("test: sibling segment record");
+        fabric
+            .record_inbound_user_message(
+                sibling_scope(&a_in, MessageEventSource::Channel, None, None),
+                "A2-SHARED-POSITIVE",
+                None,
+                None,
+            )
+            .await
+            .expect("test: shared record");
+
+        let b_in = sibling_lane(&temp, &memory, &agents, "A2-SIBLING-B-SENTINEL").await;
+        let bodies = requests.lock().clone();
+        server.abort();
+
+        for lane in [&a_in, &b_in] {
+            assert_eq!(
+                lane.subject,
+                Some(MessageEventSubject::Task(lane.run_id.clone().expect("test: lane run")))
+            );
+        }
+        assert_ne!(a_in.run_id, b_in.run_id, "sibling delegates must not share a run");
+        assert_eq!(a_in.session_key, b_in.session_key);
+        assert_eq!(a_in.owner_id, b_in.owner_id);
+
+        let b_bodies: Vec<String> = bodies
+            .iter()
+            .map(|body| body.to_string())
+            .filter(|body| body.contains("A2-SIBLING-B-SENTINEL"))
+            .collect();
+        assert!(!b_bodies.is_empty(), "sibling B must reach the provider");
+        assert!(
+            b_bodies.iter().all(|body| !body.contains("A2-SIBLING-A-SEGMENT")),
+            "sibling A's segment reached sibling B's provider request"
+        );
+        assert!(
+            b_bodies.iter().any(|body| body.contains("A2-SHARED-POSITIVE")),
+            "the shared main event must reach sibling B's provider request"
+        );
     }
 }
 

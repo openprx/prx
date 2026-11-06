@@ -105,7 +105,7 @@ impl<'a> ScopeContext<'a> {
             owner_id: envelope.owner_id.as_deref(),
             owner_isolated: envelope.owner_isolated,
             topic_id: envelope.topic_id.as_deref(),
-            task_id: envelope.task_id.as_deref(),
+            task_id: envelope.resolved_task_id(),
             source_message_event_id: envelope.source_message_event_id.as_deref(),
             config_generation_id: envelope.config_generation_id,
             config_source_revision: envelope.config_source_revision.as_deref(),

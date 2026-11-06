@@ -137,6 +137,9 @@ impl ParentSource {
                 .child_scope()
                 .filter(|scope| scope.gate_inputs().0.authority.delegation.is_some())
                 .and_then(|_| proof.task_id())
+                // An initial child turn is its own task (task == run); only a later
+                // segment names a distinct task run as its spawn parent.
+                .filter(|task| *task != proof.run_id())
                 .map(str::to_owned),
             routing_input: proof.routing_input().to_owned(),
             config_source_revision: proof.config_source_revision().to_owned(),

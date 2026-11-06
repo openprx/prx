@@ -892,6 +892,7 @@ fn quoted_turns_and_document_chunks_drop_fabricated_markers_too() {
         },
         score: 1.0,
         source_kind: Some("context_page".to_string()),
+        source_message_event_id: None,
     };
     let line = format_document_result_line(&chunk);
     assert!(
@@ -1913,5 +1914,132 @@ async fn child_turn_recall_scope_binds_child_task() {
     }
     for kind in ["session_worker", "sessions_spawn", "delegate"] {
         child_entry_drops_sibling(kind).await;
+    }
+}
+
+/// Ingests one tool output through the real child scope and returns the
+/// runtime it was written with, so the test can read its resolved task.
+async fn ingest_child_document(
+    memory: &std::sync::Arc<dyn Memory>,
+    policy: &crate::security::SecurityPolicy,
+    context: &crate::tools::ToolExecutionContext,
+    content: &str,
+) -> crate::agent::document_ingest::DocumentIngestRuntime {
+    let scope = crate::agent::turn_contracts::ScopeContext::from_execution_context(policy, context, "chat");
+    let runtime =
+        crate::agent::document_ingest::DocumentIngestRuntime::from_scope(std::sync::Arc::clone(memory), &scope);
+    let status = crate::agent::document_ingest::persist_tool_output_document(Some(&runtime), "shell", content, 0).await;
+    assert_eq!(status, Some("persisted_document_backend"), "{content}");
+    runtime
+}
+
+/// Task-less document copies are admitted only through their source event
+/// (owned, fail-closed) or as an explicit user document. A copy from a sibling
+/// task, a missing source event, or an orphan tool output is refused, while the
+/// child's own task copy and the shared user document are kept.
+#[tokio::test]
+async fn child_recall_resolves_taskless_document_copies_through_source_events() {
+    use crate::tools::document_ingest::USER_DOCUMENT_SOURCE_KIND;
+
+    let tmp = TempDir::new().unwrap();
+    let ws = tmp.path().to_string_lossy().to_string();
+    let memory: std::sync::Arc<dyn Memory> = std::sync::Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let policy = crate::security::SecurityPolicy {
+        workspace_dir: tmp.path().to_path_buf(),
+        ..crate::security::SecurityPolicy::default()
+    };
+    let ctx = |run: Option<&str>, src: Option<&str>| {
+        let mut env = crate::runtime::envelope::RuntimeEnvelope::delegate(&ws, "delegate:docs", "unused")
+            .with_owner_id("owner-a")
+            .with_owner_isolation();
+        env.run_id = run.map(str::to_owned);
+        env.task_id = None;
+        env.source_message_event_id = src.map(str::to_owned);
+        crate::tools::ToolExecutionContext::new(env, "private")
+    };
+    let sib = memory
+        .append_message_event(seed_event(
+            "owner-a",
+            &ws,
+            "delegate:docs",
+            "delegate",
+            Some("task-sibling"),
+            "doc sibling source",
+        ))
+        .await
+        .unwrap();
+    let own = memory
+        .append_message_event(seed_event(
+            "owner-a",
+            &ws,
+            "delegate:docs",
+            "delegate",
+            Some("run-own"),
+            "doc own source",
+        ))
+        .await
+        .unwrap();
+
+    let sibling_null = ingest_child_document(
+        &memory,
+        &policy,
+        &ctx(None, Some(sib.event_id.as_str())),
+        "childdoc SIBLING-NULL-TASK-DOC",
+    )
+    .await;
+    assert_eq!(
+        sibling_null.task_id, None,
+        "a copy without a run has no task of its own"
+    );
+    ingest_child_document(
+        &memory,
+        &policy,
+        &ctx(None, Some("event-missing")),
+        "childdoc MISSING-SOURCE-DOC",
+    )
+    .await;
+    ingest_child_document(&memory, &policy, &ctx(None, None), "childdoc ORPHAN-TOOL-DOC").await;
+    let own_copy = ingest_child_document(
+        &memory,
+        &policy,
+        &ctx(Some("run-own"), Some(own.event_id.as_str())),
+        "childdoc OWN-TASK-DOC",
+    )
+    .await;
+    assert_eq!(own_copy.task_id.as_deref(), Some("run-own"));
+    memory
+        .ingest_document(DocumentIngestInput {
+            document_id: None,
+            workspace_id: ws.clone(),
+            owner_id: Some("owner-a".into()),
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+            source_kind: USER_DOCUMENT_SOURCE_KIND.to_string(),
+            source_uri: None,
+            title: None,
+            content: "childdoc SHARED-USER-DOC".into(),
+            mime_type: Some("text/plain".into()),
+            visibility: MemoryVisibility::Workspace,
+            metadata_json: None,
+            session_key: None,
+            agent_id: None,
+            persona_id: None,
+        })
+        .await
+        .unwrap();
+
+    // Exactly five documents, the search limit used by child recall.
+    let scope = child_recall_scope("owner-a", &ws, "delegate:docs", "run-own");
+    let recalled = scoped_recall(memory.as_ref(), &scope, "childdoc live request", RECALL_CONTEXT_BUDGET).await;
+    for refused in ["SIBLING-NULL-TASK-DOC", "MISSING-SOURCE-DOC", "ORPHAN-TOOL-DOC"] {
+        assert!(!recalled.preamble.contains(refused), "{refused}: {}", recalled.preamble);
+    }
+    for admitted in ["OWN-TASK-DOC", "SHARED-USER-DOC"] {
+        assert!(
+            recalled.preamble.contains(admitted),
+            "{admitted}: {}",
+            recalled.preamble
+        );
     }
 }

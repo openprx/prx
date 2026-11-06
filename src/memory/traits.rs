@@ -1069,6 +1069,8 @@ pub struct DocumentSearchResult {
     /// they are injected as trusted agent context. `None` when the backend cannot
     /// resolve it (e.g. backends without a documents table).
     pub source_kind: Option<String>,
+    /// Source event of the owning document (`documents.source_message_event_id`).
+    pub source_message_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

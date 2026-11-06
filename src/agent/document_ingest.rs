@@ -42,6 +42,9 @@ pub(crate) struct DocumentIngestRuntime {
     pub(super) config_generation_id: Option<u64>,
     pub(super) config_source_revision: Option<String>,
     pub(super) visibility: MemoryVisibility,
+    /// Set only for a child tool loop (`from_scope`). A child recalls only
+    /// context pages its own logical task wrote; main turns are unrestricted.
+    pub(super) child_turn: bool,
 }
 
 impl DocumentIngestRuntime {
@@ -68,6 +71,7 @@ impl DocumentIngestRuntime {
             config_generation_id: envelope.config_generation_id,
             config_source_revision: envelope.config_source_revision.clone(),
             visibility: envelope.visibility.clone(),
+            child_turn: false,
         }
     }
 
@@ -109,6 +113,7 @@ impl DocumentIngestRuntime {
             config_generation_id: scope.config_generation_id,
             config_source_revision: scope.config_source_revision.map(ToString::to_string),
             visibility: MemoryVisibility::Session,
+            child_turn: true,
         }
     }
 

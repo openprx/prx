@@ -346,7 +346,7 @@ impl SqliteMemory {
                     "SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
                             c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
                             c.token_estimate, c.created_at, bm25(document_chunks_fts) AS score,
-                            d.source_kind AS source_kind
+                            d.source_kind AS source_kind, d.source_message_event_id AS source_message_event_id
                      FROM document_chunks_fts f
                      JOIN document_chunks c ON c.rowid = f.rowid
                      JOIN documents d ON d.document_id = c.document_id
@@ -363,10 +363,12 @@ impl SqliteMemory {
                     let chunk = Self::document_chunk_from_row(row)?;
                     let score: f32 = row.get(14)?;
                     let source_kind: Option<String> = row.get(15)?;
+                    let source_message_event_id: Option<String> = row.get(16)?;
                     Ok(DocumentSearchResult {
                         chunk,
                         score,
                         source_kind,
+                        source_message_event_id,
                     })
                 })?;
                 for row in rows {
@@ -380,7 +382,7 @@ impl SqliteMemory {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
                             c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
-                            c.token_estimate, c.created_at, c.embedding, d.source_kind AS source_kind
+                            c.token_estimate, c.created_at, c.embedding, d.source_kind AS source_kind, d.source_message_event_id AS source_message_event_id
                      FROM document_chunks c
                      JOIN documents d ON d.document_id = c.document_id
                      WHERE c.embedding IS NOT NULL
@@ -405,12 +407,13 @@ impl SqliteMemory {
                         let chunk = Self::document_chunk_from_row(row)?;
                         let embedding_blob: Vec<u8> = row.get(14)?;
                         let source_kind: Option<String> = row.get(15)?;
-                        Ok((chunk, embedding_blob, source_kind))
+                        let source_message_event_id: Option<String> = row.get(16)?;
+                        Ok((chunk, embedding_blob, source_kind, source_message_event_id))
                     },
                 )?;
                 let mut vector_results = Vec::new();
                 for row in rows {
-                    let (chunk, embedding_blob, source_kind) = row?;
+                    let (chunk, embedding_blob, source_kind, source_message_event_id) = row?;
                     if seen.contains(&chunk.chunk_id) {
                         continue;
                     }
@@ -430,6 +433,7 @@ impl SqliteMemory {
                             chunk,
                             score,
                             source_kind,
+                            source_message_event_id,
                         });
                     }
                 }

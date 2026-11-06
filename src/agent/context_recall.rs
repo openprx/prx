@@ -113,12 +113,6 @@ fn child_event_visible(event: &MessageEvent, task_id: &str) -> bool {
     }
 }
 
-/// Document copies carry a stored task identity. A chunk naming another task is
-/// dropped; a shared chunk (no task) or this child's own chunk is kept.
-fn child_chunk_visible(chunk_task: Option<&str>, task_id: &str) -> bool {
-    chunk_task.is_none_or(|task| task == task_id)
-}
-
 /// Identity under which a child turn admits recall hits.
 struct ChildRecallGate<'a> {
     workspace_id: &'a str,
@@ -147,6 +141,20 @@ async fn child_hit_admitted(mem: &dyn Memory, gate: &ChildRecallGate<'_>, source
             tracing::debug!(error = %error, "child recall dropped a hit whose source event did not resolve");
             false
         }
+    }
+}
+
+/// Child admission of a document copy. A stored task admits only this child's
+/// task. A task-less copy is admitted through its document's source event
+/// (owned lookup, fail-closed); without one, only an explicitly ingested user
+/// document is shared. A null task alone never admits a copy.
+async fn child_chunk_admitted(mem: &dyn Memory, gate: &ChildRecallGate<'_>, result: &DocumentSearchResult) -> bool {
+    if let Some(task) = result.chunk.task_id.as_deref() {
+        return !gate.task_id.is_empty() && task == gate.task_id;
+    }
+    match result.source_message_event_id.as_deref() {
+        Some(event_id) => child_hit_admitted(mem, gate, Some(event_id)).await,
+        None => result.source_kind.as_deref() == Some(crate::tools::document_ingest::USER_DOCUMENT_SOURCE_KIND),
     }
 }
 
@@ -822,10 +830,16 @@ async fn build_agent_context(
         current_session_events.retain(|event| event.event_id != event_id);
         shared_events.retain(|event| event.event_id != event_id);
     }
-    if let Some(task_id) = child_task {
-        current_session_events.retain(|event| child_event_visible(event, task_id));
-        shared_events.retain(|event| child_event_visible(event, task_id));
-        document_results.retain(|result| child_chunk_visible(result.chunk.task_id.as_deref(), task_id));
+    if let Some(gate) = gate.as_ref() {
+        current_session_events.retain(|event| child_event_visible(event, gate.task_id));
+        shared_events.retain(|event| child_event_visible(event, gate.task_id));
+        let mut admitted = Vec::with_capacity(document_results.len());
+        for result in document_results {
+            if child_chunk_admitted(mem, gate, &result).await {
+                admitted.push(result);
+            }
+        }
+        document_results = admitted;
     }
     if let Some(record) = record_user_messages {
         current_session_turns.retain(|turn| fresh_timestamp(&turn.timestamp) && (record || turn.role != "user"));
