@@ -1,10 +1,17 @@
+#![cfg(test)]
+
 use super::*;
 use crate::memory::Memory;
 use std::sync::{Arc, Barrier};
 use tempfile::TempDir;
 
 fn store() -> anyhow::Result<(TempDir, SqliteMemory)> {
-    let directory = TempDir::new()?;
+    // Recovery authority rejects group-writable ancestors; a build harness's
+    // shared TMPDIR is not necessarily suitable for these private fixtures.
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("fixture HOME is unavailable"))?;
+    let directory = tempfile::Builder::new()
+        .prefix(".prx-recovery-test-")
+        .tempdir_in(home)?;
     let path = directory.path().canonicalize()?.join("memory/brain.db");
     let memory = SqliteMemory::new_with_path(path)?;
     Ok((directory, memory))
@@ -116,9 +123,13 @@ fn recovery_key_rejects_unsafe_paths() {
         let alias = keys.with_file_name("memory_alias");
         symlink(memory.db_path.parent().unwrap(), &alias).unwrap();
         assert!(KeyDirectory::open(&alias, false).is_err());
-        let (_other, other) = store().unwrap();
+        let (other_directory, other) = store().unwrap();
         let parent = other.db_path.parent().unwrap();
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(other.activate_recovery_authority().is_err());
+        assert!(!parent.join(".recovery_keys").exists());
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(other_directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(other.activate_recovery_authority().is_err());
         assert!(!parent.join(".recovery_keys").exists());
     }
