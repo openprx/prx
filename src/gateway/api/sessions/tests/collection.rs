@@ -1,6 +1,7 @@
 #![cfg(test)]
 //! Actual Console source, pending owner review and fresh exact-call resume.
 use super::*;
+use crate::security::approval_ledger::keys::ApprovalAuthority;
 use anyhow::Context;
 use futures_util::FutureExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -938,6 +939,13 @@ async fn exercise_call(state: AppState, scope: crate::memory::MemoryPrincipal) -
         .await
         .status(),
         StatusCode::CONFLICT
+    );
+    assert!(
+        state
+            .mem
+            .find_message_event_by_idempotency_key(&scope.workspace_id, &pending.authority().review_key())
+            .await?
+            .is_none()
     );
     let (status, receipt) = body(
         change_decision_approval(

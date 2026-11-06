@@ -535,6 +535,16 @@ impl SqliteMemory {
         Ok(())
     }
 
+    /// Corrupt source metadata while retaining the durable event identity.
+    pub(crate) fn replace_event_channel_for_test(&self, event_id: &str, channel: &str) -> anyhow::Result<()> {
+        let updated = self.pool.write().execute(
+            "UPDATE message_events SET channel = ?1 WHERE event_id = ?2",
+            params![channel, event_id],
+        )?;
+        anyhow::ensure!(updated == 1, "source event not found");
+        Ok(())
+    }
+
     /// Corrupt the owner anchor to exercise authenticated ledger reads.
     pub(crate) fn replace_event_owner_for_test(&self, key: &str, owner: &str) -> anyhow::Result<()> {
         let updated = self.pool.write().execute(

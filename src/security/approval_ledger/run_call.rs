@@ -443,6 +443,17 @@ impl ApprovalLedgerPort<'_> {
         session: &str,
         authority: &RunCallAuthority,
     ) -> anyhow::Result<Option<ApprovalGrantV2>> {
+        let (pending, source) = self.load(owner, session, authority).await?;
+        if let Some(event) = self
+            .memory
+            .find_message_event_by_idempotency_key(self.workspace, &authority.review_key())
+            .await?
+        {
+            self.check_event(&event, &source, &authority.review_key(), "approval.call.reviewed")?;
+            let review: Signed<CallReview> = self.decode(&event, b"call.review")?;
+            anyhow::ensure!(review.record.pending_mac == pending.mac, "call approval review changed");
+            anyhow::ensure!(review.record.approved, "call approval was denied");
+        }
         let Some(issued) = self
             .memory
             .find_message_event_by_idempotency_key(self.workspace, &authority.issued_key(""))

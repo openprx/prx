@@ -5,6 +5,8 @@
 //! migration; callers submit a typed command and runtime context instead of
 //! resolving and invoking adapters directly.
 
+mod approval_route;
+
 use super::schema::ToolSchemaDialect;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier, is_tool_cancelled_result};
 use crate::capability::CapabilityAvailability;
@@ -526,6 +528,7 @@ struct H2ExecutionMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionContext {
     h2_metadata: Option<Box<H2ExecutionMetadata>>,
+    pub(crate) approval_ledger: Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger>,
     pub(crate) owner_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
     pub(crate) capability_search: Option<super::capability::search_tool::CapabilitySearchPort>,
     pub(crate) ordinary_child_publication: Option<crate::runtime::turn_decision::OrdinaryChildPublication>,
@@ -600,6 +603,7 @@ impl ToolExecutionContext {
             .unwrap_or_else(|| envelope.session_key.clone());
         Self {
             h2_metadata: None,
+            approval_ledger: None,
             owner_filesystem: None,
             capability_search: None,
             ordinary_child_publication: None,
@@ -2837,16 +2841,15 @@ impl ToolExecutionService {
                     started,
                 );
             }
-            match self
-                .approval
-                .resolve(ToolApprovalRequest {
+            let (approval, ledger_route) = self
+                .resolve_ordinary_approval(ToolApprovalRequest {
                     command: command.clone(),
                     descriptor: descriptor.clone(),
                     context: context.clone(),
                     decision_call,
                 })
-                .await
-            {
+                .await;
+            match approval {
                 ToolApprovalDecision::Approved {
                     runtime_approval_granted: approved,
                     runtime_grant: grant,
@@ -2876,7 +2879,11 @@ impl ToolExecutionService {
                         input_sha256,
                         Some(descriptor),
                         Some(decision),
-                        ToolExecutionStatus::Cancelled,
+                        if ledger_route {
+                            ToolExecutionStatus::AwaitingApproval
+                        } else {
+                            ToolExecutionStatus::Cancelled
+                        },
                         format!("Error: {reason}"),
                         None,
                         Some(reason),

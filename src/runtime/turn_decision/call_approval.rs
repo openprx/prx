@@ -4,6 +4,19 @@ use crate::acl::approval_grant::WitnessKeyring;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::approval_ledger::{run_call::ApprovalLedgerPort, strategy::LedgerApprovalStrategy};
 impl TurnDecisionService {
+    pub(crate) fn execution_approval_ledger(
+        &self,
+    ) -> Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger> {
+        (self.recordable && self.durable_key).then(|| {
+            crate::security::approval_ledger::strategy::ExecutionApprovalLedger {
+                memory: std::sync::Arc::clone(&self.memory),
+                state_key: std::sync::Arc::clone(&self.state_key),
+                workspace: self.generation.effective.workspace_dir.to_string_lossy().into_owned(),
+                catalog: std::sync::Arc::clone(&self.catalog),
+            }
+        })
+    }
+
     pub(crate) fn call_approval_strategy(
         &self,
         envelope: RuntimeEnvelope,

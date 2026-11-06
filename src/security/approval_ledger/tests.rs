@@ -849,44 +849,58 @@ async fn run_keyed_pending_uses_durable_source_identity() {
             1 => changed.sender = Some("prx_sender".into()),
             _ => changed.config_generation_id = Some(42),
         }
-        let mut scope = MessageEventScope::new("cli", MemoryVisibility::Private);
-        scope.owner_id = changed.owner_id;
-        scope.session_key = changed.session_key;
-        scope.run_id = changed.run_id;
-        scope.channel = changed.channel;
-        scope.sender = changed.sender;
-        scope.config_generation_id = changed.config_generation_id;
-        let durable = MemoryFabric::new(fixture.memory.clone(), "prx_workspace")
-            .record_inbound_user_message(scope, "changed source", None, None)
-            .await
-            .unwrap();
-        let mut envelope = crate::runtime::envelope::RuntimeEnvelope::console("prx_workspace", "prx_session");
-        envelope.session_key = "prx_session".into();
-        envelope.owner_id = Some("prx_owner".into());
-        envelope.run_id = durable.run_id.clone();
-        envelope.source_message_event_id = Some(durable.event_id.clone());
-        let pending = fixture
-            .port()
-            .record_pending(
-                &envelope,
-                &call_capability(),
-                "memory_reindex",
-                &serde_json::json!({"path":"project_a"}),
-            )
-            .await
-            .unwrap();
-        assert_ne!(pending.authority(), &original);
-        fixture
-            .port()
-            .review("prx_owner", "prx_session", pending.authority(), true)
-            .await
-            .unwrap();
+        assert_eq!(changed.event_id, source.event_id);
+        assert_ne!(
+            call_authority(&changed, &serde_json::json!({"path":"project_a"})),
+            original
+        );
     }
-    assert!(
+    fixture.review().await;
+    SqliteMemory::new(path.path())
+        .unwrap()
+        .replace_event_channel_for_test(&source.event_id, "prx_changed_channel")
+        .unwrap();
+    assert_eq!(
+        fixture.claim().await.unwrap_err().to_string(),
+        "call approval source authentication failed"
+    );
+}
+
+#[tokio::test]
+async fn expired_run_keyed_pending_cannot_be_reviewed_or_claimed() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = CallFixture::new(path.path()).await;
+    let event = fixture
+        .memory
+        .find_message_event_by_idempotency_key("prx_workspace", &fixture.pending.authority().pending_key())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut payload: serde_json::Value = serde_json::from_str(event.raw_payload_json.as_deref().unwrap()).unwrap();
+    let record = payload.get_mut("record").unwrap();
+    *record.get_mut("expires_at").unwrap() =
+        serde_json::to_value(chrono::Utc::now() - chrono::Duration::seconds(1)).unwrap();
+    let typed: PendingCall = serde_json::from_value(record.clone()).unwrap();
+    let mac = fixture.key.hmac(
+        KeyDomain::ApprovalState,
+        &[b"call.pending", &serde_json::to_vec(&typed).unwrap()],
+    );
+    *payload.get_mut("mac").unwrap() = serde_json::to_value(mac).unwrap();
+    SqliteMemory::new(path.path())
+        .unwrap()
+        .replace_event_payload_for_test(&event.event_id, &payload.to_string())
+        .unwrap();
+    assert_eq!(
         fixture
             .port()
-            .claim("prx_owner", "prx_session", &original)
+            .review("prx_owner", "prx_session", fixture.pending.authority(), true)
             .await
-            .is_err()
+            .unwrap_err()
+            .to_string(),
+        "pending call approval expired"
+    );
+    assert_eq!(
+        fixture.claim().await.unwrap_err().to_string(),
+        "pending call approval expired"
     );
 }

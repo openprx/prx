@@ -1,4 +1,4 @@
-//! Persisted approval adapter; construction does not install it into dispatch.
+//! Persisted approval adapter, borrowed for the duration of one call.
 use super::run_call::ApprovalLedgerPort;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::tools::execution::{ApprovalStrategy, ToolApprovalDecision, ToolApprovalRequest};
@@ -32,7 +32,7 @@ impl ApprovalStrategy for LedgerApprovalStrategy<'_> {
                     &request.command.arguments,
                 )
                 .await?;
-            // Issuance/claim is deliberately separate from dispatch (card 02a).
+            // Claim is atomic and precedes backend dispatch.
             let grant = self
                 .port
                 .claim_if_approved(
@@ -59,5 +59,52 @@ impl ApprovalStrategy for LedgerApprovalStrategy<'_> {
                 reason: error.to_string(),
             },
         }
+    }
+}
+
+/// Shared pinned authority for execution contexts. Cloning shares keys; it never copies secrets.
+#[derive(Clone)]
+pub(crate) struct ExecutionApprovalLedger {
+    pub(crate) memory: std::sync::Arc<dyn crate::memory::Memory>,
+    pub(crate) state_key: std::sync::Arc<crate::decision::DecisionKey>,
+    pub(crate) workspace: String,
+    pub(crate) catalog: std::sync::Arc<crate::tools::capability::catalog::CapabilityCatalog>,
+}
+impl std::fmt::Debug for ExecutionApprovalLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionApprovalLedger").finish_non_exhaustive()
+    }
+}
+impl PartialEq for ExecutionApprovalLedger {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.memory, &other.memory)
+            && std::sync::Arc::ptr_eq(&self.state_key, &other.state_key)
+            && std::sync::Arc::ptr_eq(&self.catalog, &other.catalog)
+            && self.workspace == other.workspace
+    }
+}
+impl Eq for ExecutionApprovalLedger {}
+impl ExecutionApprovalLedger {
+    pub(crate) async fn resolve(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        let keyring = match crate::acl::approval_grant::WitnessKeyring::global() {
+            Ok(keyring) => keyring,
+            Err(error) => {
+                return ToolApprovalDecision::Denied {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        LedgerApprovalStrategy {
+            port: ApprovalLedgerPort {
+                memory: &self.memory,
+                state_key: &self.state_key,
+                workspace: &self.workspace,
+                keyring,
+            },
+            envelope: request.context.envelope.clone(),
+            catalog: &self.catalog,
+        }
+        .resolve(request)
+        .await
     }
 }
