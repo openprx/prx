@@ -6,6 +6,7 @@ use super::{
     MessageEventSubject, RecoveredProcessOutcome, RecoveredProcessRun, RecoveredWorkerUsage, Sha256,
     TurnTerminalStatus, WorkerResult, read_terminal, verify_terminal_replay,
 };
+use crate::runtime::child_source::completion::ChildOutcomeHook;
 use crate::session_worker::protocol::WorkerManifest;
 
 /// Read-only completion provenance. Deliberately excludes task text, credentials,
@@ -503,6 +504,13 @@ async fn verify_segment_replay(
         )?
         .with_verified_resume(&replay);
         let outcome = crate::causal_tree::outcome::OutcomeCorrelator::persisted_record(replay.decision(), &facts)?;
+        crate::runtime::child_source::completion::JournalChildOutcomeHook::new(
+            workspace.to_path_buf(),
+            std::sync::Arc::clone(&decision_key),
+            std::sync::Arc::clone(&store_workspace),
+        )
+        .persist(&replay, event, None, None)
+        .await?;
         let scope = crate::causal_tree::store::DecisionScope::Owner {
             workspace_id: store_workspace,
             owner_id: std::sync::Arc::from(owner),

@@ -586,8 +586,16 @@ fn verify_child_outcome_row(
         anyhow::ensure!(!required, "child outcome row is missing");
         return Ok(false);
     };
-    let payload = open_entry(key, CHILD_OUTCOME_DOMAIN, "child outcome", &entry)?;
-    let row: ChildOutcomeRow = serde_json::from_str(&payload)?;
+    let entry: Entry = serde_json::from_str(&entry)?;
+    anyhow::ensure!(
+        key.verify_hmac(
+            KeyDomain::StateFingerprint,
+            &[CHILD_OUTCOME_DOMAIN, entry.payload.as_bytes()],
+            &entry.seal,
+        ),
+        "child outcome journal seal is invalid"
+    );
+    let row: ChildOutcomeRow = serde_json::from_str(&entry.payload)?;
     anyhow::ensure!(
         run == row.run
             && settlement == row.settlement

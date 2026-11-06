@@ -5,6 +5,7 @@ use super::{
 use crate::causal_tree::store::{ChildRecoveryCursor, ChildRecoveryLineage};
 use crate::memory::MessageEvent;
 use crate::memory::ingress_recovery::{IngressEventLookup, IngressLifetime, IngressRecoveryScope, remaining};
+use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
 use crate::runtime::turn_cleanup::CleanupTracker;
 
 #[derive(Default)]
@@ -252,6 +253,25 @@ impl TurnDecisionService {
         owner: &Arc<CleanupTracker>,
         deadline: Instant,
     ) -> anyhow::Result<Option<bool>> {
+        // Runs before the matching-row check and outside its error-to-None
+        // conversion. A journal error propagates; it is never a recorded success.
+        let store_workspace = self
+            .store
+            .workspace_id()
+            .context("child recovery store scope missing")?;
+        if remaining(deadline).is_err() || lifetime.validate(deadline).await.is_err() {
+            return Ok(None);
+        }
+        JournalChildOutcomeHook::new(
+            self.generation.effective.workspace_dir.clone(),
+            Arc::clone(&self.state_key),
+            store_workspace,
+        )
+        .persist(replay, event, Some(owner), Some(deadline))
+        .await?;
+        if remaining(deadline).is_err() || lifetime.validate(deadline).await.is_err() {
+            return Ok(None);
+        }
         let prepared = async {
             remaining(deadline)?;
             let workspace = self.generation.effective.workspace_dir.to_string_lossy();
