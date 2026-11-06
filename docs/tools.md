@@ -1935,3 +1935,14 @@ decision credential reference lookup. Runtime state and artifacts remain in the
 isolated trial workspace. Auth-profile files and encryption keys are never copied
 into that workspace; its native file tools cannot read the caller credential
 store, and suites cannot offer configuration-management tools.
+
+### Turn publication safety
+
+Model turns retain a snapshot of admitted tool names and schema fingerprints.
+Publication intersects the registered tools with the source ACL, operator and
+channel exclusions, the exact model allowlist, and channel eligibility. Canonical
+dispatch denies names outside the published surface before policy or backend
+execution, independently of decision selection. Owner isolation and private
+filesystem owner/workspace matching remain mandatory. This check prevents a
+model from invoking a withheld tool by guessing its name. Reverting the safety
+surface change restores the previous dispatch behavior.

@@ -5,6 +5,7 @@
 //! migration; callers submit a typed command and runtime context instead of
 //! resolving and invoking adapters directly.
 
+pub(crate) mod admission;
 mod approval_route;
 
 use super::schema::ToolSchemaDialect;
@@ -528,6 +529,7 @@ struct H2ExecutionMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionContext {
     h2_metadata: Option<Box<H2ExecutionMetadata>>,
+    pub(crate) turn_surface: Option<Arc<admission::TurnSurface>>,
     pub(crate) approval_ledger: Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger>,
     pub(crate) owner_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
     pub(crate) capability_search: Option<super::capability::search_tool::CapabilitySearchPort>,
@@ -603,6 +605,7 @@ impl ToolExecutionContext {
             .unwrap_or_else(|| envelope.session_key.clone());
         Self {
             h2_metadata: None,
+            turn_surface: None,
             approval_ledger: None,
             owner_filesystem: None,
             capability_search: None,
@@ -2442,6 +2445,21 @@ impl ToolExecutionService {
         // this is the one place every production tool call passes through.
         crate::agent::idle::beat(crate::agent::idle::ProgressKind::ToolStart);
         let input_sha256 = format!("{:x}", Sha256::digest(command.arguments.to_string().as_bytes()));
+        if let Err(error) = admission::admit(&context, &command.name) {
+            return self.finish(
+                &command,
+                &context,
+                input_sha256,
+                None,
+                None,
+                ToolExecutionStatus::Denied,
+                format!("Error: {error}"),
+                None,
+                Some(error),
+                None,
+                started,
+            );
+        }
         let Some(resolved) = self.resolve(&command.name) else {
             let available = self
                 .descriptors()
