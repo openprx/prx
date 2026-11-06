@@ -1044,6 +1044,7 @@ impl SqliteMemory {
                 for scored in &merged {
                     if let Some((key, content, cat, ts, sid, useful_count)) = entry_map.remove(&scored.id) {
                         let entry = MemoryEntry {
+                            origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                             source_event_id: None,
                             id: scored.id.clone(),
                             key,
@@ -1106,6 +1107,7 @@ impl SqliteMemory {
                     let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(AsRef::as_ref).collect();
                     let rows = stmt.query_map(params_ref.as_slice(), |row| {
                         Ok(MemoryEntry {
+                            origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                             source_event_id: None,
                             id: row.get(0)?,
                             key: row.get(1)?,
@@ -1372,6 +1374,7 @@ impl SqliteMemory {
                         crate::memory::topic::query_topic_context(&conn, &topic.id, &topic_principal, limit.max(1))?
                     {
                         rows.push(MemoryEntry {
+                            origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                             source_event_id: None,
                             id: entry.id,
                             key: entry.key,
@@ -1453,6 +1456,7 @@ impl SqliteMemory {
 
             let mut rows = stmt.query_map(params![key], |row| {
                 Ok(MemoryEntry {
+                    origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                     source_event_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
@@ -1503,6 +1507,7 @@ impl SqliteMemory {
             let entry = conn
                 .query_row(&sql, params_from_iter(query_params), |row| {
                     Ok(MemoryEntry {
+                        origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                         source_event_id: None,
                         id: row.get(0)?,
                         key: row.get(1)?,
@@ -1598,6 +1603,7 @@ impl SqliteMemory {
 
             let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<MemoryEntry> {
                 Ok(MemoryEntry {
+                    origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                     source_event_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,

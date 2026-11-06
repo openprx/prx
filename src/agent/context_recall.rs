@@ -2,6 +2,7 @@ use crate::agent::document_ingest::drop_untrusted_external_results;
 use crate::agent::response_guard::strip_quoted_fabricated_tool_markers;
 use crate::memory;
 use crate::memory::principal::{MemoryWriteContext, OwnerPrincipal, Role};
+use crate::memory::traits::MemoryEntryOrigin;
 use crate::memory::{
     ConversationTurn, DocumentSearchResult, Memory, MemoryPrincipal, MessageEvent, RetrievalTraceInput,
     RetrievedContextItem, SessionContextQuery, SharedContextQuery,
@@ -91,11 +92,15 @@ pub(crate) async fn scoped_recall(
             summaries: Vec::new(),
         };
     }
-    let query = recall_query(query);
+    // Retrieval uses the projected, bounded query; exclusions compare against
+    // the untransformed live input.
+    let live_input = query;
+    let query = recall_query(live_input);
     let bundle = build_agent_context(
         memory,
         scope.principal.clone(),
         &query,
+        live_input,
         scope.min_relevance_score,
         Some(&scope.semantic),
         Some(scope.record_user_messages),
@@ -170,23 +175,11 @@ fn fresh_timestamp(timestamp: &str) -> bool {
         .is_some_and(|age| age <= crate::decision::builtin::weights::STALE_ARTIFACT_MS)
 }
 
-/// Live-input echo rule shared by every recall path. A hit is an echo of the
-/// current turn when its trimmed content equals the trimmed live input, or is
-/// a Lucid `key: content` echo: the content ends with `": " + live input` and
-/// the part before `": "` contains no whitespace (a key, not prose).
-pub(crate) fn is_live_input_echo(content: &str, live: &str) -> bool {
-    let content = content.trim();
-    let live = live.trim();
-    if content == live {
-        return true;
-    }
-    if live.is_empty() {
-        return false;
-    }
-    content
-        .strip_suffix(live)
-        .and_then(|rest| rest.strip_suffix(": "))
-        .is_some_and(|key| !key.chars().any(char::is_whitespace))
+/// A remote-service hit without stored event provenance cannot prove owner or
+/// workspace scope, so scoped prompt recall never uses it. Stored rows keep the
+/// key and source-event exclusions; the content of a row is never compared.
+fn unscoped_remote_hit(origin: MemoryEntryOrigin, source_event_id: Option<&str>) -> bool {
+    origin == MemoryEntryOrigin::RemoteUnscoped && source_event_id.is_none()
 }
 
 pub(crate) fn recall_query(input: &str) -> String {
@@ -219,7 +212,7 @@ async fn build_semantic_context(
         .filter(|entry| !fresh_only || fresh_timestamp(&entry.timestamp))
         .filter(|entry| excluded_key != Some(entry.key.as_str()))
         .filter(|entry| excluded_event.is_none() || entry.source_event_id.as_deref() != excluded_event)
-        .filter(|entry| !is_live_input_echo(&entry.content, user_msg))
+        .filter(|entry| !unscoped_remote_hit(entry.origin, entry.source_event_id.as_deref()))
         .map(|entry| (entry.id, entry.key, entry.content))
         .collect::<Vec<_>>();
     let entries = if fresh_only && scored_entries.is_empty() {
@@ -280,7 +273,6 @@ async fn build_semantic_context(
         .filter(|hit| fresh_timestamp(&hit.created_at))
         .filter(|hit| excluded_key != Some(hit.key.as_str()))
         .filter(|hit| excluded_event.is_none() || hit.source_event_id.as_deref() != excluded_event)
-        .filter(|hit| !is_live_input_echo(&hit.content, user_msg))
         .map(|hit| {
             let content = crate::causal_tree::projection::bounded_artifact_summary(&hit.content).0;
             (hit.id, hit.key, content)
@@ -654,6 +646,7 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
         mem,
         principal,
         user_msg,
+        user_msg,
         min_relevance_score,
         semantic_scope,
         None,
@@ -666,6 +659,7 @@ async fn build_agent_context(
     mem: &dyn Memory,
     principal: MemoryPrincipal,
     user_msg: &str,
+    live_input: &str,
     min_relevance_score: f64,
     semantic_scope: Option<&MemoryWriteContext>,
     record_user_messages: Option<bool>,
@@ -750,9 +744,9 @@ async fn build_agent_context(
     )
     .await;
     let current_session_context = {
-        let from_events = build_current_session_events_preamble(&principal, &current_session_events, user_msg);
+        let from_events = build_current_session_events_preamble(&principal, &current_session_events, live_input);
         if from_events.is_empty() {
-            build_current_session_preamble(&current_session_turns, user_msg)
+            build_current_session_preamble(&current_session_turns, live_input)
         } else {
             from_events
         }

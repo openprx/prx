@@ -110,6 +110,7 @@ impl PostgresMemory {
         let timestamp: DateTime<Utc> = row.get(4);
 
         Ok(MemoryEntry {
+            origin: crate::memory::traits::MemoryEntryOrigin::Stored,
             source_event_id: row.try_get("source_event_id")?,
             id: row.get(0),
             key: row.get(1),

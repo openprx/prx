@@ -1221,15 +1221,20 @@ repository’s bounded keyword read (up to five fresh, redacted summaries). This
 fallback skips content retrieval when the source-scoped keyword count is empty.
 It can add up to five seconds before the prompt; backend errors and timeouts
 produce a warning without query text or backend error details.
-The current turn’s semantic promotion is excluded by its autosave key, its source
-message event ID when available, and a content backstop: hits whose trimmed
-content equals or ends with the trimmed live input are dropped. Scored and keyword
-recall apply these rules across CLI, chat, channels, gateway (webhook, WhatsApp and
-Linq), and child turns; custom-loader reads in agent turns apply all three too.
-The key exclusion also applies when user-message recording or the causal tree is
-disabled or event persistence fails. The content rule covers Lucid service hits
-and Markdown continuation lines that invent keys and omit event provenance; it
-also excludes prior rows with the same content or suffix. Keyword
+The current turn’s semantic promotion is excluded by its autosave key and, when
+available, its source message event ID. Scored and keyword recall apply these
+exclusions across CLI, chat, channels, gateway (webhook, WhatsApp and Linq), and
+child turns; custom-loader reads in agent turns apply both too. The key exclusion
+also applies when user-message recording or the causal tree is disabled or event
+persistence fails. Recall never compares memory content with the live input, so a
+prior fact whose text equals the live input is kept. Historical user turns whose
+trimmed text equals the trimmed live input are still skipped in the current-session
+context; this comparison uses the untransformed input, not the 1024-byte retrieval
+query. Unscoped remote hits are never used for scoped prompt recall: a Lucid service
+hit carries no owner or event provenance, so it is dropped even when its text
+matches. Markdown entries are stored on one line (embedded line breaks become
+spaces), so each stored value reads back as one entry with its own key. Remaining
+limitation: a Markdown key that contains `**:` is split at that marker on read. Keyword
 hits have no semantic score; `memory.min_relevance_score` continues to filter
 scored semantic recall. Decision-selected retrieval remains available to the
 decision engine. Channel and child turns that close without execution skip prompt

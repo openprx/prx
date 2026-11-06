@@ -131,7 +131,6 @@ pub(crate) async fn load_selected_memory(
         scope,
         session,
         deadline,
-        current_input: input,
         excluded_key: exclusion.0,
         excluded_event: exclusion.1,
         calls: std::sync::atomic::AtomicUsize::new(0),
@@ -184,7 +183,6 @@ struct SelectedMemoryView<'a> {
     scope: &'a crate::memory::principal::MemoryWriteContext,
     session: &'a str,
     deadline: std::time::Instant,
-    current_input: &'a str,
     excluded_key: Option<&'a str>,
     excluded_event: Option<&'a str>,
     calls: std::sync::atomic::AtomicUsize,
@@ -252,7 +250,6 @@ impl Memory for SelectedMemoryView<'_> {
         hits.retain(|hit| {
             self.excluded_key != Some(hit.key.as_str())
                 && (self.excluded_event.is_none() || hit.source_event_id.as_deref() != self.excluded_event)
-                && !crate::agent::context_recall::is_live_input_echo(&hit.content, self.current_input)
                 && !hit.content.trim().is_empty()
                 && chrono::DateTime::parse_from_rfc3339(&hit.created_at)
                     .ok()
@@ -263,6 +260,7 @@ impl Memory for SelectedMemoryView<'_> {
         let entries = hits
             .iter()
             .map(|hit| crate::memory::MemoryEntry {
+                origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                 source_event_id: hit.source_event_id.clone(),
                 id: hit.id.clone(),
                 key: hit.key.clone(),
@@ -663,6 +661,7 @@ mod tests {
                 return Ok(vec![]);
             }
             Ok(vec![MemoryEntry {
+                origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                 source_event_id: None,
                 id: "1".into(),
                 key: "k".into(),
@@ -775,6 +774,7 @@ mod tests {
         let memory = MockMemoryWithEntries {
             entries: Arc::new(vec![
                 MemoryEntry {
+                    origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                     source_event_id: None,
                     id: "1".into(),
                     key: "assistant_resp_legacy".into(),
@@ -793,6 +793,7 @@ mod tests {
                     compressed_from: None,
                 },
                 MemoryEntry {
+                    origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                     source_event_id: None,
                     id: "2".into(),
                     key: "user_fact".into(),

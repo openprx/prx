@@ -98,6 +98,7 @@ impl MarkdownMemory {
                     parse_markdown_entry(clean).unwrap_or_else(|| (format!("{filename}:{i}"), clean.to_string()));
                 let timestamp = normalized_entry_timestamp(filename, &parsed_content);
                 MemoryEntry {
+                    origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                     source_event_id: None,
                     id: format!("{filename}:{i}"),
                     key,
@@ -205,6 +206,10 @@ impl Memory for MarkdownMemory {
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
         validate_memory_write_target(key, session_id)?;
+        // One stored value is one Markdown line: an embedded line break would
+        // read back as a separate `{file}:{i}` entry with no key of its own.
+        let key = key.replace(['\r', '\n'], " ");
+        let content = content.replace(['\r', '\n'], " ");
         let entry = format!("- **{key}**: {content}");
         let path = match category {
             MemoryCategory::Core => self.core_path(),
@@ -449,5 +454,20 @@ mod tests {
             .unwrap()
             .expect("decision entry");
         assert_eq!(entry.timestamp, "2026-03-10T12:34:56Z");
+    }
+
+    #[tokio::test]
+    async fn markdown_multiline_autosave_is_one_entry() {
+        let (_tmp, mem) = temp_workspace();
+        let key = "user_msg:prx_run";
+        let content = "Remember PRX123 tomorrow\nRemember PRX123 tomorrow";
+        mem.store(key, content, MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+        let entries = mem.list(None, None).await.unwrap();
+        assert_eq!(entries.len(), 1, "one stored value must read back as one entry");
+        let entry = entries.first().expect("one entry");
+        assert_eq!(entry.key, key);
+        assert_eq!(entry.content, "Remember PRX123 tomorrow Remember PRX123 tomorrow");
     }
 }

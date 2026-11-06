@@ -1292,31 +1292,27 @@ async fn scoped_recall_excludes_source_event_with_arbitrary_save_key() {
     }
 }
 
-struct ProvenanceLessEchoMemory;
+struct RemoteUnscopedMemory;
 
 #[async_trait::async_trait]
-impl Memory for ProvenanceLessEchoMemory {
+impl Memory for RemoteUnscopedMemory {
     fn name(&self) -> &str {
-        "provenance-less-echo"
+        "remote-unscoped"
     }
     async fn store(&self, _: &str, _: &str, _: MemoryCategory, _: Option<&str>) -> anyhow::Result<()> {
         anyhow::bail!("read-only fixture")
     }
     async fn recall(&self, _: &str, _: usize, _: Option<&str>) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
-        Ok([
-            ("lucid_0", "  prxquery live input  "),
-            ("lucid_1", "user_msg: prxquery live input "),
-            ("lucid_2", "prxquery unrelated prior fact"),
-        ]
-        .into_iter()
-        .map(|(key, content)| crate::memory::MemoryEntry {
-            id: key.into(),
-            key: key.into(),
-            content: content.into(),
+        // Shaped like a Lucid service hit: invented key, no event provenance.
+        Ok(vec![crate::memory::MemoryEntry {
+            origin: crate::memory::traits::MemoryEntryOrigin::RemoteUnscoped,
+            source_event_id: None,
+            id: "lucid:0".into(),
+            key: "lucid_0".into(),
+            content: "remoteprov lucid fact".into(),
             category: MemoryCategory::Conversation,
             timestamp: chrono::Utc::now().to_rfc3339(),
             session_id: None,
-            source_event_id: None,
             score: Some(1.0),
             tags: None,
             access_count: None,
@@ -1326,8 +1322,7 @@ impl Memory for ProvenanceLessEchoMemory {
             verification_status: None,
             lifecycle_state: None,
             compressed_from: None,
-        })
-        .collect())
+        }])
     }
     async fn get(&self, _: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
         Ok(None)
@@ -1343,7 +1338,7 @@ impl Memory for ProvenanceLessEchoMemory {
         anyhow::bail!("read-only fixture")
     }
     async fn count(&self) -> anyhow::Result<usize> {
-        Ok(3)
+        Ok(1)
     }
     async fn health_check(&self) -> bool {
         true
@@ -1351,34 +1346,97 @@ impl Memory for ProvenanceLessEchoMemory {
 }
 
 #[tokio::test]
-async fn scoped_recall_excludes_provenance_less_live_input_echo() {
-    let mut scope = recall_test_scope("prx_owner", "prx_workspace");
-    // Channel/gateway scopes can reach the Lucid service via legacy recall.
-    scope.principal.require_owner_match = false;
-    scope.semantic.require_owner_match = false;
-    let recalled = scoped_recall(
-        &ProvenanceLessEchoMemory,
-        &scope,
-        " prxquery live input ",
+async fn scoped_recall_drops_unscoped_remote_hits() {
+    // Channel and gateway scopes reach the Lucid service through legacy recall.
+    let mut remote_scope = recall_test_scope("prx_owner", "prx_workspace");
+    remote_scope.principal.require_owner_match = false;
+    remote_scope.semantic.require_owner_match = false;
+    let remote = scoped_recall(
+        &RemoteUnscopedMemory,
+        &remote_scope,
+        "remoteprov",
         RECALL_CONTEXT_BUDGET,
     )
     .await;
-    assert_eq!(recalled.ids, vec!["lucid_2"]);
-    assert!(recalled.preamble.contains("unrelated prior fact"));
-    assert!(!recalled.preamble.contains("live input"));
+    assert!(remote.ids.is_empty(), "{:?}", remote.ids);
+    assert!(!remote.preamble.contains("remoteprov"), "{}", remote.preamble);
+
+    // The same text stored locally under the owner's scope is still recalled.
+    let dir = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(dir.path()).unwrap();
+    let owned = recall_test_scope("prx_owner", "prx_workspace");
+    seed_recall_memory(&mem, &owned, "local_fact", "remoteprov lucid fact").await;
+    let local = scoped_recall(&mem, &owned, "remoteprov", RECALL_CONTEXT_BUDGET).await;
+    assert_eq!(local.ids.len(), 1);
+    assert!(local.preamble.contains("remoteprov lucid fact"), "{}", local.preamble);
 }
 
-#[test]
-fn live_input_echo_rule_is_exact() {
-    // Exact echo of the live input is dropped.
-    assert!(is_live_input_echo("prxquery live input", " prxquery live input "));
-    // Lucid `key: content` echo is dropped when the key has no whitespace.
-    assert!(is_live_input_echo("lucid_3: status updates", "status updates"));
-    // Prose that merely ends with the live input is kept.
-    assert!(!is_live_input_echo(
-        "User asked for concise status updates",
-        "status updates"
-    ));
-    // A labelled echo whose label contains whitespace is prose, so it is kept.
-    assert!(!is_live_input_echo("user msg: status updates", "status updates"));
+#[tokio::test]
+async fn exclusion_uses_full_live_input_not_projected_query() {
+    let dir = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(dir.path()).unwrap();
+    let mut scope = recall_test_scope("prx_owner", "prx_workspace");
+    // The tail lies beyond the 1024-byte retrieval query, so only the full input carries it.
+    let live = format!("prxlongquery {} tailmarker", "filler ".repeat(200));
+    scope.current_input_key = Some("user_msg:prx_long_run".into());
+    scope.current_input_event = Some("prx_long_event".into());
+    for (key, event, content) in [
+        ("user_msg:prx_long_run", None, live.as_str()),
+        ("arbitrary-save-key", Some("prx_long_event"), live.as_str()),
+        ("prior-save-key", Some("prx_prior_event"), "prxlongquery prior fact"),
+    ] {
+        mem.store_with_context_and_metadata(
+            key,
+            content,
+            MemoryCategory::Conversation,
+            None,
+            Some(&scope.semantic),
+            crate::memory::MemoryStoreMetadata {
+                source_event_id: event.map(str::to_owned),
+                workspace_id: Some("prx_workspace".into()),
+                owner_id: Some("prx_owner".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    // A historical user turn equal to the full live input is skipped; another turn is kept.
+    let session_key = scope.principal.session_key.clone().unwrap();
+    for text in [live.as_str(), "prxlongquery other turn"] {
+        mem.append_conversation_turn(
+            &session_key,
+            "mcp",
+            "shared-subject",
+            "user",
+            text,
+            None,
+            None,
+            Some("prx_owner"),
+        )
+        .await
+        .unwrap();
+    }
+    let recalled = scoped_recall(&mem, &scope, &live, RECALL_CONTEXT_BUDGET).await;
+    assert!(recalled.preamble.contains("prior fact"), "{}", recalled.preamble);
+    assert!(recalled.preamble.contains("other turn"), "{}", recalled.preamble);
+    assert!(!recalled.preamble.contains("tailmarker"), "{}", recalled.preamble);
+    assert_eq!(recalled.ids.len(), 1);
+}
+
+#[tokio::test]
+async fn prior_key_value_memory_equal_to_live_text_survives() {
+    let dir = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(dir.path()).unwrap();
+    let mut scope = recall_test_scope("prx_owner", "prx_workspace");
+    scope.current_input_key = Some("user_msg:prx_run".into());
+    seed_recall_memory(&mem, &scope, "preferred_format", "status updates").await;
+    seed_recall_memory(&mem, &scope, "user_msg:prx_run", "status updates").await;
+    let recalled = scoped_recall(&mem, &scope, "status updates", RECALL_CONTEXT_BUDGET).await;
+    assert!(
+        recalled.preamble.contains("preferred_format: status updates"),
+        "{}",
+        recalled.preamble
+    );
+    assert_eq!(recalled.ids.len(), 1);
 }

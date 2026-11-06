@@ -154,6 +154,7 @@ mod tests {
             entries.insert(
                 key.to_string(),
                 MemoryEntry {
+                    origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                     source_event_id: None,
                     id: key.to_string(),
                     key: key.to_string(),

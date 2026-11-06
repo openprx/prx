@@ -981,6 +981,7 @@ mod mode_tests {
 
     fn test_entry(key: &str, category: MemoryCategory) -> MemoryEntry {
         MemoryEntry {
+            origin: crate::memory::traits::MemoryEntryOrigin::Stored,
             source_event_id: None,
             id: key.to_string(),
             key: key.to_string(),

@@ -516,6 +516,7 @@ impl WasmStorage {
             .flatten();
 
         Ok(MemoryEntry {
+            origin: crate::memory::traits::MemoryEntryOrigin::Stored,
             source_event_id: None,
             id,
             key,

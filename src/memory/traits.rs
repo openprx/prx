@@ -6,12 +6,28 @@ use std::collections::HashMap;
 
 use crate::memory::principal::MemoryWriteContext;
 
+/// Where a recalled entry came from, as known to the backend that returned it.
+///
+/// Not serialized: it is a runtime fact about the read, never wire data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemoryEntryOrigin {
+    /// Returned by a backend that stores and scopes the row itself.
+    #[default]
+    Stored,
+    /// Returned by a remote service that cannot prove owner or workspace scope.
+    /// Such hits are never used for scoped prompt recall.
+    RemoteUnscoped,
+}
+
 /// A single memory entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     /// Stored source provenance for excluding a live input from prompt recall.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_event_id: Option<String>,
+    /// Backend provenance of this read result; see [`MemoryEntryOrigin`].
+    #[serde(skip)]
+    pub origin: MemoryEntryOrigin,
     pub id: String,
     pub key: String,
     pub content: String,
@@ -2660,6 +2676,7 @@ mod tests {
     impl DeletableUnscopedBackend {
         fn entry(key: &str, content: &str) -> MemoryEntry {
             MemoryEntry {
+                origin: crate::memory::traits::MemoryEntryOrigin::Stored,
                 source_event_id: None,
                 id: key.to_string(),
                 key: key.to_string(),
@@ -2887,6 +2904,7 @@ mod tests {
     #[test]
     fn memory_entry_roundtrip_preserves_optional_fields() {
         let entry = MemoryEntry {
+            origin: crate::memory::traits::MemoryEntryOrigin::Stored,
             source_event_id: None,
             id: "id-1".into(),
             key: "favorite_language".into(),

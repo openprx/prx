@@ -188,6 +188,7 @@ impl LucidMemory {
 
             let rank = entries.len();
             entries.push(MemoryEntry {
+                origin: crate::memory::traits::MemoryEntryOrigin::RemoteUnscoped,
                 source_event_id: None,
                 id: format!("lucid:{rank}"),
                 key: format!("lucid_{rank}"),

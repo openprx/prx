@@ -63,6 +63,7 @@ impl Memory for RecallMemory {
     ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
         self.recalls.fetch_add(1, Ordering::SeqCst);
         Ok(vec![crate::memory::MemoryEntry {
+            origin: crate::memory::traits::MemoryEntryOrigin::Stored,
             source_event_id: None,
             id: "entry-1".to_string(),
             key: "memory_key_1".to_string(),
