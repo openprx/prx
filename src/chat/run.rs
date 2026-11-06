@@ -3221,19 +3221,10 @@ Retry with a compatible model: /provider {shown} <model>",
 
         // Auto-save user message to memory
         if !direct_decision_turn && config.memory.should_auto_promote_user_message(&user_input) {
-            let user_key = crate::agent::context_recall::current_input_memory_key(admitted_binding.envelope().run_id.as_deref().context("chat turn run id missing")?);
             let safe_user_input = sanitize_chat_semantic_memory_content(&user_input);
-            let _ = memory_fabric
-                .record_semantic_memory_from_event(
-                    &user_key,
-                    &safe_user_input,
-                    MemoryCategory::Conversation,
-                    None,
-                    chat_user_event.as_ref().map(|event| event.event_id.as_str()),
-                    None,
-                    None,
-                )
-                .await;
+            let _ = crate::agent::entry::save_current_input(&memory_fabric,
+                admitted_binding.envelope().run_id.as_deref().context("chat turn run id missing")?,
+                &safe_user_input, chat_user_event.as_ref().map(|event| event.event_id.as_str())).await;
         }
 
         // Inject memory context

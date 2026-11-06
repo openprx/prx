@@ -111,27 +111,27 @@ async fn quoted_events_reach_the_prompt_without_live_media_markers() {
 }
 
 #[test]
-fn autosave_memory_key_has_prefix_and_uniqueness() {
-    let key1 = autosave_memory_key("user_msg");
-    let key2 = autosave_memory_key("user_msg");
+fn current_input_memory_key_is_per_run() {
+    let key1 = current_input_memory_key("run-a");
+    let key2 = current_input_memory_key("run-b");
 
-    assert!(key1.starts_with("user_msg_"));
-    assert!(key2.starts_with("user_msg_"));
+    assert!(key1.starts_with("user_msg:"));
+    assert!(key2.starts_with("user_msg:"));
     assert_ne!(key1, key2);
 }
 
 #[tokio::test]
-async fn autosave_memory_keys_preserve_multiple_turns() {
+async fn current_input_memory_keys_preserve_multiple_turns() {
     let tmp = TempDir::new().unwrap();
     let mem = SqliteMemory::new(tmp.path()).unwrap();
 
-    let key1 = autosave_memory_key("user_msg");
-    let key2 = autosave_memory_key("user_msg");
+    let key1 = current_input_memory_key("run-a");
+    let key2 = current_input_memory_key("run-b");
 
-    mem.store(&key1, "I'm Paul", MemoryCategory::Conversation, None)
+    mem.store(&key1, "prx_user prefers Rust", MemoryCategory::Conversation, None)
         .await
         .unwrap();
-    mem.store(&key2, "I'm 45", MemoryCategory::Conversation, None)
+    mem.store(&key2, "prx_user uses port 45", MemoryCategory::Conversation, None)
         .await
         .unwrap();
 
@@ -1254,4 +1254,40 @@ async fn scoped_recall_empty_keyword_store_skips_content_fallback() {
     let recalled = scoped_recall(&EmptyKeywordMemory, &scope, "emptykeyword", RECALL_CONTEXT_BUDGET).await;
     assert_eq!(recalled.preamble, "");
     assert_eq!(recalled.ids, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn scoped_recall_excludes_source_event_with_arbitrary_save_key() {
+    let dir = TempDir::new().unwrap();
+    let memory = SqliteMemory::new(dir.path()).unwrap();
+    let mut scope = recall_test_scope("prx_owner", "prx_workspace");
+    scope.current_input_event = Some("prx_live_event".into());
+    for (key, event, content) in [
+        ("arbitrary-save-key", "prx_live_event", "prxquery current input"),
+        ("prior-save-key", "prx_prior_event", "prxquery prior fact"),
+    ] {
+        memory
+            .store_with_context_and_metadata(
+                key,
+                content,
+                MemoryCategory::Conversation,
+                None,
+                Some(&scope.semantic),
+                crate::memory::MemoryStoreMetadata {
+                    source_event_id: Some(event.into()),
+                    workspace_id: Some("prx_workspace".into()),
+                    owner_id: Some("prx_owner".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    for relevance in [0.0, 1.1] {
+        scope.min_relevance_score = relevance;
+        let recalled = scoped_recall(&memory, &scope, "prxquery", RECALL_CONTEXT_BUDGET).await;
+        assert!(recalled.preamble.contains("prior fact"));
+        assert!(!recalled.preamble.contains("current input"));
+        assert_eq!(recalled.ids.len(), 1);
+    }
 }

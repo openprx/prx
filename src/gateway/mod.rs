@@ -2403,6 +2403,7 @@ async fn run_gateway_chat_with_multimodal(
     provider_label: &str,
     message: &str,
     fabric_ctx: &GatewayFabricContext,
+    autosave_key: Option<&str>,
 ) -> anyhow::Result<String> {
     let turn_runtime = state.pin_turn_runtime();
     turn_runtime
@@ -2496,6 +2497,19 @@ async fn run_gateway_chat_with_multimodal(
         .await?;
     let runtime_envelope = source_receipt.envelope().clone();
     let gateway_proof = source_receipt.bind(&turn_runtime, fabric_ctx)?;
+    if let Some(key) = autosave_key {
+        let _ = fabric
+            .record_semantic_memory_from_event(
+                key,
+                message,
+                MemoryCategory::Conversation,
+                None,
+                gateway_user_event.as_ref().map(|event| event.event_id.as_str()),
+                None,
+                None,
+            )
+            .await;
+    }
     // A spawned webhook job cannot inherit the caller's cleanup task-local.
     // Prediction and later work must retain the same concrete cleanup owner.
     let child_cleanup = match crate::runtime::turn_cleanup::CleanupScope::new(
@@ -3208,20 +3222,23 @@ async fn run_webhook_job_work(
     let mut idempotency_claim = idempotency_claim;
     let message = webhook_body.message.as_str();
 
-    if state.auto_save && should_autosave_gateway_message(webhook_body.reply_target.as_deref(), message) {
-        if let Err((status, body)) =
-            authorize_gateway_resource_mutation(&state, "gateway:webhook:autosave", ResourceRiskLevel::Low)
-        {
-            return Ok(jobs::JobOutput::new(status, body.0));
-        }
-        // First observable side effect of the attempt: past this point a
-        // redelivery of the same key would duplicate it.
-        if let Some(claim) = idempotency_claim.as_mut() {
-            claim.mark_dispatched();
-        }
-        let key = webhook_memory_key(idempotency_digest.as_deref());
-        let _ = state.mem.store(&key, message, MemoryCategory::Conversation, None).await;
-    }
+    let autosave_key =
+        if state.auto_save && should_autosave_gateway_message(webhook_body.reply_target.as_deref(), message) {
+            if let Err((status, body)) =
+                authorize_gateway_resource_mutation(&state, "gateway:webhook:autosave", ResourceRiskLevel::Low)
+            {
+                return Ok(jobs::JobOutput::new(status, body.0));
+            }
+            // First observable side effect of the attempt: past this point a
+            // redelivery of the same key would duplicate it.
+            if let Some(claim) = idempotency_claim.as_mut() {
+                claim.mark_dispatched();
+            }
+            let key = webhook_memory_key(idempotency_digest.as_deref());
+            Some(key)
+        } else {
+            None
+        };
 
     let provider_label = state
         .config
@@ -3258,7 +3275,8 @@ async fn run_webhook_job_work(
     if let Some(claim) = idempotency_claim.as_mut() {
         claim.mark_dispatched();
     }
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message, &fabric_ctx).await {
+    match run_gateway_chat_with_multimodal(&state, &provider_label, message, &fabric_ctx, autosave_key.as_deref()).await
+    {
         Ok(response) => {
             let response_id = Uuid::new_v4();
             let result_hash = webhook_result_hash(&response, &model_label);
@@ -3493,7 +3511,8 @@ async fn run_channel_webhook_job_work(
         );
 
         // Auto-save to memory
-        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content) {
+        let autosave_key = if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content)
+        {
             if let Err((status, body)) = authorize_gateway_resource_mutation(
                 &state,
                 &gateway_channel_webhook_operation(channel_key, "autosave"),
@@ -3505,17 +3524,24 @@ async fn run_channel_webhook_job_work(
             // duplicate it, so the claim must outlive the run.
             claim.mark_dispatched();
             let key = memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
+            Some(key)
+        } else {
+            None
+        };
 
         let fabric_ctx = GatewayFabricContext::channel_message(msg);
         // The turn records the inbound message and may call tools, so from here
         // the delivery is not replayable by re-execution.
         claim.mark_dispatched();
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content, &fabric_ctx).await {
+        match run_gateway_chat_with_multimodal(
+            &state,
+            &provider_label,
+            &msg.content,
+            &fabric_ctx,
+            autosave_key.as_deref(),
+        )
+        .await
+        {
             Ok(response) => {
                 if let Err((status, body)) = authorize_gateway_resource_mutation(
                     &state,

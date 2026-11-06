@@ -86,6 +86,7 @@ impl Memory for StaticMemory {
 
 fn entry(key: &str, content: &str) -> MemoryEntry {
     MemoryEntry {
+        source_event_id: None,
         id: key.to_string(),
         key: key.to_string(),
         content: content.to_string(),

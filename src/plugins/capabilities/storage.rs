@@ -516,6 +516,7 @@ impl WasmStorage {
             .flatten();
 
         Ok(MemoryEntry {
+            source_event_id: None,
             id,
             key,
             content,

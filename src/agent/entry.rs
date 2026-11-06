@@ -99,6 +99,19 @@ pub async fn run(
     .await
 }
 
+/// Persist a live CLI or chat input under its per-run semantic identity.
+pub(crate) async fn save_current_input(
+    fabric: &crate::memory::MemoryFabric,
+    run: &str,
+    input: &str,
+    event: Option<&str>,
+) -> anyhow::Result<()> {
+    let key = current_input_memory_key(run);
+    fabric
+        .record_semantic_memory_from_event(&key, input, MemoryCategory::Conversation, None, event, None, None)
+        .await
+}
+
 /// Build one CLI turn's memory handles from the turn's own, user-authored text.
 ///
 /// Both CLI branches need the identical handles: the single-shot branch (which
@@ -1926,18 +1939,13 @@ pub(crate) async fn run_with_runtime_envelope(
 
                 // Auto-save user message to memory (skip short/trivial messages)
                 if config.memory.should_auto_promote_user_message(&msg) {
-                    let user_key = current_input_memory_key(&turn_run_id);
-                    let _ = memory_fabric
-                        .record_semantic_memory_from_event(
-                            &user_key,
-                            &msg,
-                            MemoryCategory::Conversation,
-                            None,
-                            agent_user_event.as_ref().map(|event| event.event_id.as_str()),
-                            None,
-                            None,
-                        )
-                        .await;
+                    let _ = save_current_input(
+                        &memory_fabric,
+                        &turn_run_id,
+                        &msg,
+                        agent_user_event.as_ref().map(|event| event.event_id.as_str()),
+                    )
+                    .await;
                 }
 
                 // Inject memory context into user message. The routing input is
@@ -2437,18 +2445,8 @@ pub(crate) async fn run_with_runtime_envelope(
 
                 // Auto-save conversation turns (skip short/trivial messages)
                 if config.memory.should_auto_promote_user_message(&user_input) {
-                    let user_key = current_input_memory_key(&turn_run_id);
-                    let _ = memory_fabric
-                        .record_semantic_memory_from_event(
-                            &user_key,
-                            &user_input,
-                            MemoryCategory::Conversation,
-                            None,
-                            agent_user_event.as_ref().map(|event| event.event_id.as_str()),
-                            None,
-                            None,
-                        )
-                        .await;
+                    let _ = save_current_input(&memory_fabric, &turn_run_id, &user_input,
+                        agent_user_event.as_ref().map(|event| event.event_id.as_str())).await;
                 }
 
                 // Inject memory context into user message. The routing input is

@@ -555,3 +555,92 @@ fn webhook_token_hash_is_deterministic_and_nonempty() {
     assert_ne!(one, other);
     assert_eq!(one.len(), 64);
 }
+
+#[derive(Default)]
+struct NoSelfRecallProvider {
+    calls: AtomicUsize,
+}
+#[async_trait]
+impl Provider for NoSelfRecallProvider {
+    async fn chat_with_system(
+        &self,
+        _system: Option<&str>,
+        message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        assert!(
+            !message.contains("[Memory context]"),
+            "live input echoed into memory context: {message}"
+        );
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok("ok".into())
+    }
+}
+#[tokio::test]
+async fn webhook_autosave_excludes_live_input_from_prompt() {
+    let workspace = tempfile::TempDir::new().expect("test: autosave workspace");
+    let provider_impl = Arc::new(NoSelfRecallProvider::default());
+    let provider: Arc<dyn Provider> = provider_impl.clone();
+    let sqlite = Arc::new(SqliteMemory::new(workspace.path()).expect("test: autosave sqlite"));
+    let memory: Arc<dyn Memory> = sqlite.clone();
+    let mut config = webhook_test_config();
+    config.workspace_dir = workspace.path().to_path_buf();
+
+    let mut state = AppState {
+        config: crate::config::new_shared(config),
+        provider,
+        model: "test-model".into(),
+        temperature: 0.0,
+        mem: memory,
+        auto_save: true,
+        tools_registry: Arc::new(vec![]),
+        mcp_tool: None,
+        turn_runtime: None,
+        hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+        webhook_token_hash: None,
+        webhook_signing_secret: None,
+        pairing: Arc::new(PairingGuard::new(false, &[])),
+        trust_forwarded_headers: false,
+        rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+        idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
+        whatsapp: None,
+        signal: None,
+        whatsapp_app_secret: None,
+        linq: None,
+        linq_signing_secret: None,
+        nextcloud_talk: None,
+        nextcloud_talk_webhook_secret: None,
+        observer: Arc::new(crate::observability::NoopObserver),
+        start_time: Instant::now(),
+        gateway_port: 0,
+        logs_broadcast_tx: broadcast::channel(16).0,
+        #[cfg(feature = "wasm-plugins")]
+        plugin_runtime: None,
+    };
+    install_webhook_turn_runtime(&mut state);
+
+    let headers = HeaderMap::new();
+
+    let first = handle_webhook(
+        State(state),
+        test_connect_info(),
+        test_uri(),
+        headers,
+        Bytes::from_static(br#"{"message":"Remember webhook autosave message number one for later"}"#),
+    )
+    .await
+    .into_response();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let keys = sqlite
+        .list(Some(&MemoryCategory::Conversation), None)
+        .await
+        .expect("test: list autosaved messages")
+        .into_iter()
+        .map(|entry| entry.key)
+        .collect::<Vec<_>>();
+    assert_eq!(keys.len(), 1);
+    assert!(keys[0].starts_with("webhook_msg_"));
+    assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+}

@@ -1666,21 +1666,17 @@ pub(crate) mod admission_failure_tests {
     }
 
     #[tokio::test]
-    async fn chat_binding_excludes_saved_live_input_without_useful_feedback() {
+    async fn chat_production_save_excludes_live_input_without_useful_feedback() {
         let (_dir, fabric, binding) = fixture(true).await;
         let key = crate::agent::context_recall::current_input_memory_key(binding.envelope().run_id.as_deref().unwrap());
-        fabric
-            .record_semantic_memory_from_event(
-                &key,
-                "prx input",
-                crate::memory::MemoryCategory::Conversation,
-                None,
-                binding.envelope().source_message_event_id.as_deref(),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+        crate::agent::entry::save_current_input(
+            &fabric,
+            binding.envelope().run_id.as_deref().unwrap(),
+            "prx input",
+            binding.envelope().source_message_event_id.as_deref(),
+        )
+        .await
+        .unwrap();
         let memory = fabric.memory();
         let before = memory.get(&key).await.unwrap().unwrap();
         let recalled = binding.recalled_context(memory.as_ref()).await;

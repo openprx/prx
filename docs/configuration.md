@@ -1221,7 +1221,9 @@ repository’s bounded keyword read (up to five fresh, redacted summaries). This
 fallback skips content retrieval when the source-scoped keyword count is empty.
 It can add up to five seconds before the prompt; backend errors and timeouts
 produce a warning without query text or backend error details.
-The current turn’s semantic promotion is excluded from recall. Keyword
+The current turn’s semantic promotion is excluded by its source message event ID
+in scored and keyword recall and custom-loader reads across CLI, chat, channels,
+gateway (webhook, WhatsApp and Linq), and child turns. Keyword
 hits have no semantic score; `memory.min_relevance_score` continues to filter
 scored semantic recall. Decision-selected retrieval remains available to the
 decision engine. Channel and child turns that close without execution skip prompt

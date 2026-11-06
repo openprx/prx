@@ -8,8 +8,6 @@ use crate::memory::{
 };
 use std::borrow::Cow;
 use std::collections::BTreeSet;
-#[cfg(test)]
-use uuid::Uuid;
 
 /// Maximum bytes for the total memory context preamble injected into prompts.
 /// 🟡 Behavior-limits Phase 1: raised 4096 -> 24576 (6x).
@@ -41,6 +39,7 @@ pub(crate) struct RecallScope {
     min_relevance_score: f64,
     record_user_messages: bool,
     current_input_key: Option<String>,
+    current_input_event: Option<String>,
 }
 
 impl RecallScope {
@@ -61,6 +60,7 @@ impl RecallScope {
             min_relevance_score: config.min_relevance_score,
             record_user_messages: config.events.record_user_messages,
             current_input_key: envelope.run_id.as_deref().map(current_input_memory_key),
+            current_input_event: envelope.source_message_event_id.clone(),
         }
     }
 }
@@ -92,7 +92,7 @@ pub(crate) async fn scoped_recall(
         scope.min_relevance_score,
         Some(&scope.semantic),
         Some(scope.record_user_messages),
-        scope.current_input_key.as_deref(),
+        (scope.current_input_key.as_deref(), scope.current_input_event.as_deref()),
     )
     .await;
     let semantic_start = bundle.current_session_context.len() + bundle.recent_shared_context.len();
@@ -144,11 +144,6 @@ pub(crate) fn current_input_memory_key(run_id: &str) -> String {
     format!("user_msg:{run_id}")
 }
 
-#[cfg(test)]
-pub(super) fn autosave_memory_key(prefix: &str) -> String {
-    format!("{prefix}_{}", Uuid::new_v4())
-}
-
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
@@ -158,7 +153,7 @@ pub(crate) async fn build_context_with_scope(
     min_relevance_score: f64,
     scope_ctx: Option<&MemoryWriteContext>,
 ) -> RecalledMemoryContext {
-    build_semantic_context(mem, user_msg, min_relevance_score, scope_ctx, false, None).await
+    build_semantic_context(mem, user_msg, min_relevance_score, scope_ctx, false, None, None).await
 }
 
 fn fresh_timestamp(timestamp: &str) -> bool {
@@ -181,6 +176,7 @@ async fn build_semantic_context(
     scope_ctx: Option<&MemoryWriteContext>,
     fresh_only: bool,
     excluded_key: Option<&str>,
+    excluded_event: Option<&str>,
 ) -> RecalledMemoryContext {
     let mut summaries = Vec::new();
     let mut context = String::new();
@@ -196,6 +192,7 @@ async fn build_semantic_context(
         .filter(|entry| entry.score.map_or(true, |score| score >= min_relevance_score))
         .filter(|entry| !fresh_only || fresh_timestamp(&entry.timestamp))
         .filter(|entry| excluded_key != Some(entry.key.as_str()))
+        .filter(|entry| excluded_event.is_none() || entry.source_event_id.as_deref() != excluded_event)
         .map(|entry| (entry.id, entry.key, entry.content))
         .collect::<Vec<_>>();
     let entries = if fresh_only && scored_entries.is_empty() {
@@ -255,6 +252,7 @@ async fn build_semantic_context(
         .into_iter()
         .filter(|hit| fresh_timestamp(&hit.created_at))
         .filter(|hit| excluded_key != Some(hit.key.as_str()))
+        .filter(|hit| excluded_event.is_none() || hit.source_event_id.as_deref() != excluded_event)
         .map(|hit| {
             let content = crate::causal_tree::projection::bounded_artifact_summary(&hit.content).0;
             (hit.id, hit.key, content)
@@ -631,7 +629,7 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
         min_relevance_score,
         semantic_scope,
         None,
-        None,
+        (None, None),
     )
     .await
 }
@@ -643,10 +641,20 @@ async fn build_agent_context(
     min_relevance_score: f64,
     semantic_scope: Option<&MemoryWriteContext>,
     record_user_messages: Option<bool>,
-    excluded_key: Option<&str>,
+    exclusion: (Option<&str>, Option<&str>),
 ) -> AgentContextBundle {
+    let (excluded_key, excluded_event) = exclusion;
     let semantic = if record_user_messages.is_some() {
-        build_semantic_context(mem, user_msg, min_relevance_score, semantic_scope, true, excluded_key).await
+        build_semantic_context(
+            mem,
+            user_msg,
+            min_relevance_score,
+            semantic_scope,
+            true,
+            excluded_key,
+            excluded_event,
+        )
+        .await
     } else {
         build_context_with_scope(mem, user_msg, min_relevance_score, semantic_scope).await
     };
@@ -687,6 +695,10 @@ async fn build_agent_context(
         .search_document_chunks(&principal, user_msg, 5)
         .await
         .unwrap_or_default();
+    if let Some(event_id) = excluded_event {
+        current_session_events.retain(|event| event.event_id != event_id);
+        shared_events.retain(|event| event.event_id != event_id);
+    }
     if let Some(record) = record_user_messages {
         current_session_turns.retain(|turn| fresh_timestamp(&turn.timestamp) && (record || turn.role != "user"));
         current_session_events.retain(|event| fresh_timestamp(&event.created_at) && (record || event.role != "user"));

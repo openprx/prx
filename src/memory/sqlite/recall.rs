@@ -1044,6 +1044,7 @@ impl SqliteMemory {
                 for scored in &merged {
                     if let Some((key, content, cat, ts, sid, useful_count)) = entry_map.remove(&scored.id) {
                         let entry = MemoryEntry {
+                            source_event_id: None,
                             id: scored.id.clone(),
                             key,
                             content,
@@ -1105,6 +1106,7 @@ impl SqliteMemory {
                     let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(AsRef::as_ref).collect();
                     let rows = stmt.query_map(params_ref.as_slice(), |row| {
                         Ok(MemoryEntry {
+                            source_event_id: None,
                             id: row.get(0)?,
                             key: row.get(1)?,
                             content: row.get(2)?,
@@ -1151,7 +1153,7 @@ impl SqliteMemory {
             return self.recall(query, limit, session_id).await;
         };
 
-        let entries = self
+        let mut entries = self
             .recall(query, limit.saturating_mul(3).max(limit), session_id)
             .await?;
         if entries.is_empty() {
@@ -1173,16 +1175,26 @@ impl SqliteMemory {
             let mut allowed_ids = std::collections::HashSet::new();
             if !entries.is_empty() {
                 let id_placeholders = (0..entries.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-                let sql = format!("SELECT id FROM memories WHERE id IN ({id_placeholders}) AND ({scope_sql})");
+                let sql = format!(
+                    "SELECT id, source_event_id FROM memories WHERE id IN ({id_placeholders}) AND ({scope_sql})"
+                );
                 let mut params = entries
                     .iter()
                     .map(|entry| Value::from(entry.id.clone()))
                     .collect::<Vec<_>>();
                 params.extend(scope_params);
                 let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map(params_from_iter(params), |row| row.get::<_, String>(0))?;
+                let rows = stmt.query_map(params_from_iter(params), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?;
                 for row in rows {
-                    allowed_ids.insert(row?);
+                    let (id, event) = row?;
+                    for entry in &mut entries {
+                        if entry.id == id {
+                            entry.source_event_id = event.clone();
+                        }
+                    }
+                    allowed_ids.insert(id);
                 }
             }
 
@@ -1360,6 +1372,7 @@ impl SqliteMemory {
                         crate::memory::topic::query_topic_context(&conn, &topic.id, &topic_principal, limit.max(1))?
                     {
                         rows.push(MemoryEntry {
+                            source_event_id: None,
                             id: entry.id,
                             key: entry.key,
                             content: entry.content,
@@ -1440,6 +1453,7 @@ impl SqliteMemory {
 
             let mut rows = stmt.query_map(params![key], |row| {
                 Ok(MemoryEntry {
+                    source_event_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
                     content: row.get(2)?,
@@ -1489,6 +1503,7 @@ impl SqliteMemory {
             let entry = conn
                 .query_row(&sql, params_from_iter(query_params), |row| {
                     Ok(MemoryEntry {
+                        source_event_id: None,
                         id: row.get(0)?,
                         key: row.get(1)?,
                         content: row.get(2)?,
@@ -1583,6 +1598,7 @@ impl SqliteMemory {
 
             let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<MemoryEntry> {
                 Ok(MemoryEntry {
+                    source_event_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
                     content: row.get(2)?,

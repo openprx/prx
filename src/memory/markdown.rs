@@ -98,6 +98,7 @@ impl MarkdownMemory {
                     parse_markdown_entry(clean).unwrap_or_else(|| (format!("{filename}:{i}"), clean.to_string()));
                 let timestamp = normalized_entry_timestamp(filename, &parsed_content);
                 MemoryEntry {
+                    source_event_id: None,
                     id: format!("{filename}:{i}"),
                     key,
                     content: parsed_content,

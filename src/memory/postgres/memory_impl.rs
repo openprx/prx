@@ -482,7 +482,7 @@ impl Memory for PostgresMemory {
                          CASE WHEN key ILIKE '%' || $1 || '%' THEN 2.0 ELSE 0.0 END +
                          CASE WHEN content ILIKE '%' || $1 || '%' THEN 1.0 ELSE 0.0 END
                        ) AS score,
-                       useful_count
+                       useful_count, source_event_id
                 FROM {qualified_table}
                 WHERE ($2::TEXT IS NULL OR session_id = $2)
                   AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
@@ -509,7 +509,7 @@ impl Memory for PostgresMemory {
                             "
                             SELECT id, key, content, category, created_at, session_id,
                                    (1.0 - (embedding_vector <=> $1::text::vector))::DOUBLE PRECISION AS score,
-                                   useful_count
+                                   useful_count, source_event_id
                             FROM {qualified_table}
                             WHERE embedding_vector IS NOT NULL
                               AND embedding_provider = $2
@@ -570,7 +570,7 @@ impl Memory for PostgresMemory {
                         SELECT id, key, content, category, created_at, session_id,
                                NULL::DOUBLE PRECISION AS score,
                                useful_count,
-                               embedding
+                               embedding, source_event_id
                         FROM {qualified_table}
                         WHERE embedding IS NOT NULL
                           AND embedding_provider = $1
@@ -804,7 +804,7 @@ impl Memory for PostgresMemory {
                          CASE WHEN key ILIKE '%' || $1 || '%' THEN 2.0 ELSE 0.0 END +
                          CASE WHEN content ILIKE '%' || $1 || '%' THEN 1.0 ELSE 0.0 END
                        ) AS score,
-                       useful_count
+                       useful_count, source_event_id
                 FROM {qualified_table}
                 WHERE ($2::TEXT IS NULL OR session_id = $2)
                   AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
@@ -905,7 +905,7 @@ impl Memory for PostgresMemory {
                 "
                 SELECT id, key, content, category, created_at, session_id,
                        NULL::DOUBLE PRECISION AS score,
-                       useful_count
+                       useful_count, source_event_id
                 FROM {qualified_table}
                 WHERE key = $1
                 LIMIT 1
@@ -960,7 +960,7 @@ impl Memory for PostgresMemory {
         tokio::task::spawn_blocking(move || -> Result<Option<MemoryEntry>> {
             let stmt = format!(
                 "SELECT id, key, content, category, created_at, session_id,
-                        NULL::DOUBLE PRECISION AS score, useful_count
+                        NULL::DOUBLE PRECISION AS score, useful_count, source_event_id
                    FROM {qualified_table}
                   WHERE key = $1 AND ({scope_sql})
                   LIMIT 1"
@@ -1050,7 +1050,7 @@ impl Memory for PostgresMemory {
                 "
                 SELECT id, key, content, category, created_at, session_id,
                        NULL::DOUBLE PRECISION AS score,
-                       useful_count
+                       useful_count, source_event_id
                 FROM {qualified_table}
                 WHERE ($1::TEXT IS NULL OR category = $1)
                   AND ($2::TEXT IS NULL OR session_id = $2)

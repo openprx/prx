@@ -9,6 +9,9 @@ use crate::memory::principal::MemoryWriteContext;
 /// A single memory entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
+    /// Stored source provenance for excluding a live input from prompt recall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_id: Option<String>,
     pub id: String,
     pub key: String,
     pub content: String,
@@ -2657,6 +2660,7 @@ mod tests {
     impl DeletableUnscopedBackend {
         fn entry(key: &str, content: &str) -> MemoryEntry {
             MemoryEntry {
+                source_event_id: None,
                 id: key.to_string(),
                 key: key.to_string(),
                 content: content.to_string(),
@@ -2883,6 +2887,7 @@ mod tests {
     #[test]
     fn memory_entry_roundtrip_preserves_optional_fields() {
         let entry = MemoryEntry {
+            source_event_id: None,
             id: "id-1".into(),
             key: "favorite_language".into(),
             content: "Rust".into(),

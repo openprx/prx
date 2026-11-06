@@ -63,6 +63,7 @@ impl Memory for RecallMemory {
     ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
         self.recalls.fetch_add(1, Ordering::SeqCst);
         Ok(vec![crate::memory::MemoryEntry {
+            source_event_id: None,
             id: "entry-1".to_string(),
             key: "memory_key_1".to_string(),
             content: "Age is 45".to_string(),
@@ -842,6 +843,100 @@ async fn process_channel_message_answers_plain_turn_with_scoped_recall_without_s
         .expect("history should be stored for sender");
     assert_eq!(turns[0].role, "user");
     assert_eq!(turns[0].content, "hello");
+    assert!(!turns[0].content.contains("[Memory context]"));
+}
+
+#[tokio::test]
+async fn channel_dm_autosave_excludes_live_input_from_prompt() {
+    let workspace = TempDir::new().expect("test: private channel workspace");
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    let provider_impl = Arc::new(HistoryCaptureProvider::default());
+    let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        config: crate::config::new_shared(Config::default()),
+        config_generation: crate::config::new_shared(Config::default()).pin(),
+        channels_by_name: Arc::new(channels_by_name),
+        provider: provider_impl.clone(),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: memory.clone(),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        hooks: Arc::new(crate::hooks::HookManager::new(workspace.path().to_path_buf())),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: true,
+        memory_event_recording: MemoryEventRecording::default(),
+        read_only_tool_concurrency_window: 2,
+        priority_scheduling_enabled: false,
+        low_priority_tools: Vec::new(),
+
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(workspace.path().to_path_buf()),
+
+        tool_tiering: crate::config::ToolTieringConfig::default(),
+        signal_inbound_policy: None,
+        whatsapp_inbound_policy: None,
+        bot_names: vec!["prx".to_string()],
+        bot_uuids: vec![],
+        mention_only_by_channel: HashMap::new(),
+        group_reply_mode_by_channel: HashMap::new(),
+        smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+        })),
+        test_inbound_authorizer: None,
+    });
+
+    run_owned_channel_probe(
+        runtime_ctx.clone(),
+        traits::ChannelMessage {
+            id: "msg-ctx-1".to_string(),
+            sender: "prx_user".to_string(),
+            reply_target: "chat-ctx".to_string(),
+            content: "Remember the PRX flight code PRX123 tomorrow".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
+            mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert!(memory.count().await.unwrap() > 0, "production autosave wrote a row");
+    let calls = provider_impl.calls.lock();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].len(), 2);
+    assert_eq!(calls[0][1].0, "user");
+    assert!(calls[0][1].1.contains("Remember the PRX flight code PRX123 tomorrow"));
+    assert!(!calls[0][1].1.contains("[Memory context]"));
+    assert!(!calls[0][1].1.contains("Age is 45"));
+    let histories = runtime_ctx.conversation_histories.lock();
+    let turns = histories
+        .get("channel:test-channel:prx_user:chat-ctx")
+        .expect("history should be stored for sender");
+    assert_eq!(turns[0].role, "user");
+    assert_eq!(turns[0].content, "Remember the PRX flight code PRX123 tomorrow");
     assert!(!turns[0].content.contains("[Memory context]"));
 }
 

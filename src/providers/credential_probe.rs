@@ -34,6 +34,8 @@ pub(crate) struct ProbeRequest {
     /// Only the policy-denial marker is retained; provider request bodies may
     /// carry sensitive data and must not be kept by this probe.
     pub tool_policy_denial_in_body: bool,
+    /// Presence only; no prompt content is retained.
+    pub memory_context_in_body: bool,
 }
 
 impl ProbeRequest {
@@ -167,12 +169,23 @@ impl CredentialProbe {
                         buffer.get(head_end..).unwrap_or_default(),
                         denial_marker,
                     );
+                    let mut memory_tail = Vec::new();
+                    let mut memory_context_in_body = scan_marker(
+                        &mut memory_tail,
+                        buffer.get(head_end..).unwrap_or_default(),
+                        b"[Memory context]",
+                    );
                     let mut body_read = buffer.len().saturating_sub(head_end);
                     while body_read < content_length {
                         match socket.read(&mut chunk).await {
                             Ok(0) | Err(_) => break,
                             Ok(read) => {
                                 body_read += read;
+                                memory_context_in_body |= scan_marker(
+                                    &mut memory_tail,
+                                    chunk.get(..read).unwrap_or_default(),
+                                    b"[Memory context]",
+                                );
                                 tool_policy_denial_in_body |=
                                     scan_marker(&mut marker_tail, chunk.get(..read).unwrap_or_default(), denial_marker);
                             }
@@ -193,6 +206,7 @@ impl CredentialProbe {
                         path,
                         headers,
                         tool_policy_denial_in_body,
+                        memory_context_in_body,
                     });
 
                     let reason = match status {

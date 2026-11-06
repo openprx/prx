@@ -1051,6 +1051,7 @@ mod tests {
             self.rows.lock().insert(
                 key.to_string(),
                 MemoryEntry {
+                    source_event_id: None,
                     id: key.to_string(),
                     key: key.to_string(),
                     content: content.to_string(),

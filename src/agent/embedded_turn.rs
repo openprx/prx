@@ -513,7 +513,7 @@ async fn run_work(
             &scope,
             &source.envelope().session_key,
             std::time::Instant::now() + std::time::Duration::from_secs(5),
-            Some(&crate::agent::context_recall::current_input_memory_key(source.run_id())),
+            source.envelope().source_message_event_id.as_deref(),
         )
         .await;
         match loaded {

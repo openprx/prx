@@ -119,7 +119,7 @@ pub(crate) async fn load_selected_memory(
     scope: &crate::memory::principal::MemoryWriteContext,
     session: &str,
     deadline: std::time::Instant,
-    excluded_key: Option<&str>,
+    excluded_event: Option<&str>,
 ) -> anyhow::Result<LoadedSelectedMemory> {
     anyhow::ensure!(
         scope.workspace_id.as_deref().is_some_and(|id| !id.trim().is_empty())
@@ -131,7 +131,7 @@ pub(crate) async fn load_selected_memory(
         scope,
         session,
         deadline,
-        excluded_key,
+        excluded_event,
         calls: std::sync::atomic::AtomicUsize::new(0),
         reserved: std::sync::atomic::AtomicUsize::new(0),
         hits: parking_lot::Mutex::new(Vec::new()),
@@ -182,7 +182,7 @@ struct SelectedMemoryView<'a> {
     scope: &'a crate::memory::principal::MemoryWriteContext,
     session: &'a str,
     deadline: std::time::Instant,
-    excluded_key: Option<&'a str>,
+    excluded_event: Option<&'a str>,
     calls: std::sync::atomic::AtomicUsize,
     reserved: std::sync::atomic::AtomicUsize,
     hits: parking_lot::Mutex<Vec<crate::memory::traits::DecisionMemoryHit>>,
@@ -246,7 +246,7 @@ impl Memory for SelectedMemoryView<'_> {
         );
         let now = chrono::Utc::now();
         hits.retain(|hit| {
-            self.excluded_key != Some(hit.key.as_str())
+            (self.excluded_event.is_none() || hit.source_event_id.as_deref() != self.excluded_event)
                 && !hit.content.trim().is_empty()
                 && chrono::DateTime::parse_from_rfc3339(&hit.created_at)
                     .ok()
@@ -257,6 +257,7 @@ impl Memory for SelectedMemoryView<'_> {
         let entries = hits
             .iter()
             .map(|hit| crate::memory::MemoryEntry {
+                source_event_id: hit.source_event_id.clone(),
                 id: hit.id.clone(),
                 key: hit.key.clone(),
                 content: hit.content.clone(),
@@ -656,6 +657,7 @@ mod tests {
                 return Ok(vec![]);
             }
             Ok(vec![MemoryEntry {
+                source_event_id: None,
                 id: "1".into(),
                 key: "k".into(),
                 content: "v".into(),
@@ -767,6 +769,7 @@ mod tests {
         let memory = MockMemoryWithEntries {
             entries: Arc::new(vec![
                 MemoryEntry {
+                    source_event_id: None,
                     id: "1".into(),
                     key: "assistant_resp_legacy".into(),
                     content: "fabricated detail".into(),
@@ -784,6 +787,7 @@ mod tests {
                     compressed_from: None,
                 },
                 MemoryEntry {
+                    source_event_id: None,
                     id: "2".into(),
                     key: "user_fact".into(),
                     content: "User prefers concise answers".into(),

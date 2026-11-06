@@ -302,6 +302,7 @@ impl Memory for SqliteMemory {
             )?;
             let rows = stmt.query_map(rusqlite::params![pattern, limit], |row| {
                 Ok(MemoryEntry {
+                    source_event_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
                     content: row.get(2)?,

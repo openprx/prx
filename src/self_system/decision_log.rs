@@ -146,6 +146,7 @@ mod tests {
             entries.insert(
                 key.to_string(),
                 MemoryEntry {
+                    source_event_id: None,
                     id: key.to_string(),
                     key: key.to_string(),
                     content: content.to_string(),
@@ -289,6 +290,7 @@ mod tests {
             entries.insert(
                 key.to_string(),
                 MemoryEntry {
+                    source_event_id: None,
                     id: key.to_string(),
                     key: key.to_string(),
                     content: content.to_string(),

@@ -1040,3 +1040,66 @@ async fn cli_saved_live_input_is_excluded_without_useful_feedback() {
         before.useful_count
     );
 }
+
+#[tokio::test]
+async fn cli_production_autosave_excludes_live_input() {
+    use crate::providers::credential_probe::CredentialProbe;
+    let tmp = TempDir::new().unwrap();
+    let probe = CredentialProbe::start().await;
+    let mut config = cli_agent_probe_config(tmp.path(), &probe);
+    config.memory.auto_save = true;
+    let workspace = config.workspace_dir.clone();
+    let input = "Remember the PRX flight code PRX123 tomorrow";
+    run_with_runtime_envelope(
+        config,
+        Some(input.into()),
+        None,
+        None,
+        0.0,
+        CancellationToken::new(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(cli_agent_probe_saw_a_chat_request(&probe));
+    assert!(probe.requests().iter().all(|request| !request.memory_context_in_body));
+    let memory = SqliteMemory::new(&workspace).unwrap();
+    let rows = memory
+        .list(Some(&crate::memory::MemoryCategory::Conversation), None)
+        .await
+        .unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.content == input)
+        .expect("production live-input save");
+    let conn = rusqlite::Connection::open(workspace.join("memory/brain.db")).unwrap();
+    let (event, run): (String, String) = conn
+        .query_row(
+            "SELECT event_id, run_id FROM message_events WHERE role='user' AND content=?1 LIMIT 1",
+            [input],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        row.key,
+        current_input_memory_key(&run),
+        "production save uses the current run key"
+    );
+    let envelope =
+        resolve_agent_turn_envelope(None, &workspace.to_string_lossy(), &run).with_source_message_event_id(event);
+    let recalled = crate::agent::context_recall::scoped_recall(
+        &memory,
+        &crate::agent::context_recall::RecallScope::from_envelope(
+            &envelope,
+            &crate::config::MemoryConfig::default(),
+            "private",
+        ),
+        input,
+        crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+    )
+    .await;
+    assert!(!recalled.preamble.contains("[Memory context]"));
+    assert!(!recalled.ids.contains(&row.id));
+}
