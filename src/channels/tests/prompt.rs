@@ -747,7 +747,7 @@ async fn channel_plain_greeting_and_follow_up_reach_provider_with_default_causal
 }
 
 #[tokio::test]
-async fn process_channel_message_answers_plain_turn_without_retrieval_or_persisted_context() {
+async fn process_channel_message_answers_plain_turn_with_scoped_recall_without_stale_context() {
     let workspace = TempDir::new().expect("test: private channel workspace");
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -832,8 +832,8 @@ async fn process_channel_message_answers_plain_turn_without_retrieval_or_persist
     assert!(!calls[0][1].1.contains("Age is 45"));
     assert_eq!(
         memory.recalls.load(Ordering::SeqCst),
-        0,
-        "a plain direct-answer turn must not retrieve memory"
+        1,
+        "prompt recall runs independently of the selected direct answer"
     );
 
     let histories = runtime_ctx.conversation_histories.lock();

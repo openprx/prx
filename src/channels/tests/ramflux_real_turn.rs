@@ -1007,11 +1007,13 @@ impl Provider for ScriptProvider {
 }
 
 fn scripted_reply(user: &str) -> String {
-    if user.contains("turn-one") {
+    // Recall prepends quoted history; this fixture answers the live turn.
+    let live_turn = user.lines().last().unwrap_or(user).trim();
+    if live_turn == "turn-one" {
         "reply-one".to_string()
-    } else if user.contains("turn-two") {
+    } else if live_turn == "turn-two" {
         "reply-two".to_string()
-    } else if user.contains("turn-three") {
+    } else if live_turn == "turn-three" {
         "reply-three".to_string()
     } else if user.contains("CANARY-7f3a") {
         "reply-canary-9c2e".to_string()

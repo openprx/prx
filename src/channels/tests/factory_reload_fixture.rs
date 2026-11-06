@@ -18,6 +18,7 @@ struct SelectedMemory {
     local: SqliteMemory,
     scope: MemoryWriteContext,
     selected: AtomicUsize,
+    prompt_reads: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -96,8 +97,22 @@ impl Memory for SelectedMemory {
         assert_eq!(context.chat_id, self.scope.chat_id);
         assert_eq!(context.sender_id, self.scope.sender_id);
         assert_eq!(context.raw_sender, self.scope.raw_sender);
-        assert_eq!(context.chat_type.as_deref(), Some("dm"));
-        assert!(context.owner_id.is_none());
+        let prompt_read = context.owner_id.is_some();
+        if prompt_read {
+            // Prompt recall has its own runtime scope, independent of selection.
+            assert_eq!(context.chat_type.as_deref(), Some("direct"));
+            let expected = crate::runtime::envelope::RuntimeEnvelope::channel(
+                self.scope.workspace_id.clone().expect("fixture workspace"),
+                "telegram",
+                "prx_user",
+                Some("prx_channel".to_owned()),
+            )
+            .resolved_owner_id();
+            assert_eq!(context.owner_id.as_deref(), Some(expected.as_str()));
+        } else {
+            assert_eq!(context.chat_type.as_deref(), Some("dm"));
+            assert!(context.owner_id.is_none());
+        }
         assert!(!context.require_owner_match);
         assert!(session.is_none());
         let hits = self
@@ -112,7 +127,11 @@ impl Memory for SelectedMemory {
             hits.iter().all(|hit| hit.key != FOREIGN),
             "foreign private chat must be excluded by the actual reader"
         );
-        self.selected.fetch_add(1, Ordering::SeqCst);
+        if prompt_read {
+            self.prompt_reads.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.selected.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(hits)
     }
 }
@@ -425,6 +444,7 @@ pub(super) async fn run() {
         local: SqliteMemory::new(tmp.path()).expect("real semantic ledger"),
         scope: scope.clone(),
         selected: AtomicUsize::new(0),
+        prompt_reads: AtomicUsize::new(0),
     });
     memory
         .store_with_context(SEED, INPUT, MemoryCategory::Core, None, Some(&scope))
@@ -577,6 +597,7 @@ pub(super) async fn run() {
         let g2 = reload(&config, KEYS[2], &b.url, &["api_key", "api_url"]);
         run_owned_channel_probe(context(&tmp, Arc::clone(&config), recorded, channel.clone(), Arc::clone(&cache), histories), message(2), CancellationToken::new()).await;
         assert_eq!(memory.selected.load(Ordering::SeqCst), 0, "plain G2 turn must not retrieve memory");
+        assert_eq!(memory.prompt_reads.load(Ordering::SeqCst), 3, "each generation performs one independent scoped prompt read");
         assert_eq!(*a.calls.lock(), vec![0, 1]); assert_eq!(*b.calls.lock(), vec![2]);
         assert_eq!(a.invalid.load(Ordering::SeqCst), 0); assert_eq!(b.invalid.load(Ordering::SeqCst), 0);
         assert_eq!(cached_calls.load(Ordering::SeqCst), 0, "admitted turns must build the provider from each pinned selection");

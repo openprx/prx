@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Weak};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -9,11 +9,12 @@ use crate::channels::{Channel, SendMessage};
 use crate::config::schema::{InteractionNoticeApplicability, InteractionNoticeConfig};
 use crate::memory::{Memory, MemoryCategory};
 
-// Serialize the read-send-ack sequence so concurrent first messages for the
-// same peer cannot both observe a missing acknowledgement and duplicate the
-// legally significant notice. First-contact notices are rare, so a process-wide
-// lock keeps the backend-neutral contract deterministic without storing peers.
-static NOTICE_EMISSION_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+// Serialize each acknowledgement independently: a slow channel send must not
+// hold up unrelated peers. Weak entries retain no completed notice locks.
+type NoticeLocks = HashMap<String, Weak<tokio::sync::Mutex<()>>>;
+
+static NOTICE_EMISSION_LOCKS: LazyLock<parking_lot::Mutex<NoticeLocks>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractionNotice {
@@ -59,7 +60,16 @@ pub async fn ensure_interaction_notice(
     anyhow::ensure!(!notice.text.is_empty(), "AI interaction notice text is empty");
 
     let key = acknowledgement_key(channel_name, peer, &notice.version);
-    let _emission_guard = NOTICE_EMISSION_LOCK.lock().await;
+    let emission_lock = {
+        let mut locks = NOTICE_EMISSION_LOCKS.lock();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        locks.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(key.clone(), Arc::downgrade(&lock));
+            lock
+        })
+    };
+    let _emission_guard = emission_lock.lock().await;
     if memory.get(&key).await?.is_some() {
         return Ok(InteractionNoticeOutcome::AlreadyAcknowledged {
             acknowledgement_key: key,
@@ -165,5 +175,98 @@ mod tests {
         let entries = memory.list(Some(&MemoryCategory::Conversation), None).await.unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|entry| !entry.content.contains("private-peer")));
+    }
+
+    #[tokio::test]
+    async fn blocked_notice_for_one_peer_does_not_block_another_peer() {
+        struct HeldChannel {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl Channel for HeldChannel {
+            fn name(&self) -> &str {
+                "held-notice"
+            }
+            async fn send(&self, _: &SendMessage) -> anyhow::Result<()> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(tmp.path()).unwrap());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let held: Arc<dyn Channel> = Arc::new(HeldChannel {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let held_memory = Arc::clone(&memory);
+        let first = tokio::spawn(async move {
+            ensure_interaction_notice(
+                &InteractionNoticeConfig::default(),
+                &held_memory,
+                &held,
+                "held-notice",
+                "prx_peer_a",
+                None,
+            )
+            .await
+        });
+        entered.notified().await;
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let other: Arc<dyn Channel> = Arc::new(RecordingChannel {
+            sent: Arc::clone(&sent),
+        });
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ensure_interaction_notice(
+                &InteractionNoticeConfig::default(),
+                &memory,
+                &other,
+                "recording",
+                "prx_peer_b",
+                None,
+            ),
+        )
+        .await;
+        // Always release and join the held sender before asserting the outcome.
+        release.notify_one();
+        first.await.unwrap().unwrap();
+        assert!(matches!(
+            completed
+                .expect("unrelated peer notice must complete while first send is held")
+                .unwrap(),
+            InteractionNoticeOutcome::Emitted { .. }
+        ));
+        assert_eq!(sent.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_notices_for_same_peer_emit_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(tmp.path()).unwrap());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel {
+            sent: Arc::clone(&sent),
+        });
+        let config = InteractionNoticeConfig::default();
+        let (first, second) = tokio::join!(
+            ensure_interaction_notice(&config, &memory, &channel, "recording", "prx_peer", None),
+            ensure_interaction_notice(&config, &memory, &channel, "recording", "prx_peer", None),
+        );
+        assert!(matches!(first.unwrap(), InteractionNoticeOutcome::Emitted { .. }));
+        assert!(matches!(
+            second.unwrap(),
+            InteractionNoticeOutcome::AlreadyAcknowledged { .. }
+        ));
+        assert_eq!(sent.lock().len(), 1);
     }
 }

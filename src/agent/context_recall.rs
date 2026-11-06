@@ -212,6 +212,24 @@ async fn build_semantic_context(
             };
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // An empty source-scoped keyword store needs no content retrieval.
+        // Unsupported count ports retain the bounded fallback below.
+        let empty = matches!(
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                mem.count_rehearsal_hits(user_msg, 5, scope, deadline),
+            )
+            .await,
+            Ok(Ok(0))
+        );
+        if empty {
+            return RecalledMemoryContext {
+                preamble: context,
+                ids,
+                semantic_range: 0..0,
+                summaries,
+            };
+        }
         let hits = match tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             mem.retrieve_decision_memory(user_msg, 5, scope, None, deadline),

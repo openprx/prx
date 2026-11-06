@@ -1012,7 +1012,8 @@ child runtime envelope, scope policy, side-effect gate, approval, or audit.
 Compliance controls are operator-classified and evidence-bearing. Generated
 server/full configurations enable the first-contact AI interaction notice but
 leave the EU risk classification as `unclassified`; PRX does not infer legal
-applicability. See [Evidence-bearing compliance controls](compliance-controls.md)
+applicability. First-contact notices serialize per channel, peer and notice
+version; a slow peer does not hold up notices for other peers. See [Evidence-bearing compliance controls](compliance-controls.md)
 for high-risk classification, declaration, incident workflow, evidence, and
 rollback examples.
 
@@ -1217,7 +1218,8 @@ available. Scoped recall excludes stale and future-dated rows and projects image
 markers before bounding the retrieval query to 1024 bytes, including in traces.
 When scored semantic recall has no matches, scoped prompt recall also uses the
 repository’s bounded keyword read (up to five fresh, redacted summaries). This
-fallback can add up to five seconds before the prompt; backend errors and timeouts
+fallback skips content retrieval when the source-scoped keyword count is empty.
+It can add up to five seconds before the prompt; backend errors and timeouts
 produce a warning without query text or backend error details.
 The current turn’s semantic promotion is excluded from recall. Keyword
 hits have no semantic score; `memory.min_relevance_score` continues to filter

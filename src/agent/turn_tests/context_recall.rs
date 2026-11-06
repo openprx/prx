@@ -1191,3 +1191,67 @@ async fn live_input_is_not_recalled_or_rewarded(mut envelope: crate::runtime::en
         assert_eq!(mem.get(&key).await.unwrap().unwrap().useful_count, before);
     }
 }
+
+struct EmptyKeywordMemory;
+
+#[async_trait::async_trait]
+impl Memory for EmptyKeywordMemory {
+    fn name(&self) -> &str {
+        "empty-keyword-memory"
+    }
+    async fn store(&self, _: &str, _: &str, _: MemoryCategory, _: Option<&str>) -> anyhow::Result<()> {
+        panic!("unexpected mutation of empty keyword memory")
+    }
+    async fn recall(&self, _: &str, _: usize, _: Option<&str>) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+        Ok(Vec::new())
+    }
+    async fn get(&self, _: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+        Ok(None)
+    }
+    async fn list(
+        &self,
+        _: Option<&MemoryCategory>,
+        _: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+        Ok(Vec::new())
+    }
+    async fn forget(&self, _: &str) -> anyhow::Result<bool> {
+        panic!("unexpected mutation of empty keyword memory")
+    }
+    async fn count(&self) -> anyhow::Result<usize> {
+        panic!("empty check must be source-scoped")
+    }
+    async fn health_check(&self) -> bool {
+        true
+    }
+    async fn count_rehearsal_hits(
+        &self,
+        _: &str,
+        limit: u8,
+        context: &MemoryWriteContext,
+        _: std::time::Instant,
+    ) -> anyhow::Result<u32> {
+        assert_eq!(limit, 5);
+        assert_eq!(context.owner_id.as_deref(), Some("owner-a"));
+        assert!(context.require_owner_match);
+        Ok(0)
+    }
+    async fn retrieve_decision_memory(
+        &self,
+        _: &str,
+        _: u8,
+        _: &MemoryWriteContext,
+        _: Option<&str>,
+        _: std::time::Instant,
+    ) -> anyhow::Result<Vec<crate::memory::traits::DecisionMemoryHit>> {
+        panic!("empty source-scoped store must skip content fallback")
+    }
+}
+
+#[tokio::test]
+async fn scoped_recall_empty_keyword_store_skips_content_fallback() {
+    let scope = recall_test_scope("owner-a", "workspace-a");
+    let recalled = scoped_recall(&EmptyKeywordMemory, &scope, "emptykeyword", RECALL_CONTEXT_BUDGET).await;
+    assert_eq!(recalled.preamble, "");
+    assert_eq!(recalled.ids, Vec::<String>::new());
+}
