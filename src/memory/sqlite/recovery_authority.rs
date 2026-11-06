@@ -1,8 +1,8 @@
 //! Lazy recovery authority, owned by the SQLite writer transaction.
 use super::{SqliteMemory, recovery_keys::KeyDirectory};
 use crate::memory::recovery_authority::{
-    RecoveryChain, RecoveryEvidence, RecoveryFactsTooLarge, RecoveryMacDomain, RecoveryPublication, RecoveryReceipt,
-    RecoveryRepository, RecoveryTag,
+    RecoveryChain, RecoveryEvidence, RecoveryFactsTooLarge, RecoveryKeyUnavailable, RecoveryMacDomain,
+    RecoveryPublication, RecoveryReceipt, RecoveryRepository, RecoveryTag,
 };
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::ValueRef};
@@ -17,10 +17,6 @@ const MAX_RECORD: usize = 1_048_576;
 
 /// Key material could not be loaded or trusted. Only this class is memoized
 /// per handle; schema and database failures stay retryable.
-#[derive(Debug, thiserror::Error)]
-#[error("recovery authority unavailable: {0}")]
-struct RecoveryKeyUnavailable(String);
-
 fn key_unavailable(error: anyhow::Error) -> anyhow::Error {
     anyhow::Error::new(RecoveryKeyUnavailable(format!("{error:#}")))
 }
@@ -238,6 +234,34 @@ impl Drop for FullSync<'_> {
 }
 
 impl SqliteMemory {
+    /// The single shared warning for this handle; never repeated.
+    fn warn_unavailable_once(&self) {
+        if self.recovery_warned.set(()).is_ok() {
+            tracing::warn!("recovery authority unavailable; activation will not be retried");
+        }
+    }
+
+    /// Load a capsule's key. A key that cannot be loaded is remembered for this
+    /// handle: later artifacts needing it fail at once, without a file read and
+    /// without regeneration.
+    fn capsule_key(&self, id: &str) -> anyhow::Result<ring::hmac::Key> {
+        if self.recovery_unusable.lock().contains(id) {
+            return Err(anyhow::Error::new(RecoveryKeyUnavailable(format!(
+                "recovery key {id} unusable"
+            ))));
+        }
+        let loaded = KeyDirectory::open(self.db_path.parent().context("missing memory directory")?, false)
+            .and_then(|directory| directory.load(id));
+        match loaded {
+            Ok(key) => Ok(key),
+            Err(error) => {
+                self.recovery_unusable.lock().insert(id.to_owned());
+                self.warn_unavailable_once();
+                Err(key_unavailable(error))
+            }
+        }
+    }
+
     fn recovery_activate(&self, rotate: bool) -> anyhow::Result<String> {
         let writer = self.pool.write();
         let sync = FullSync::new(&writer)?;
@@ -395,10 +419,9 @@ impl RecoveryRepository for SqliteMemory {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match self.recovery_activate(false) {
             Ok(id) => Ok(id),
-            Err(error) if error.is::<RecoveryKeyUnavailable>() => {
-                if self.recovery_unavailable.set(()).is_ok() {
-                    tracing::warn!("recovery authority unavailable; activation will not be retried");
-                }
+            Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => {
+                let _ = self.recovery_unavailable.set(());
+                self.warn_unavailable_once();
                 Err(error)
             }
             Err(error) => Err(error),
@@ -416,16 +439,14 @@ impl RecoveryRepository for SqliteMemory {
             Some(id) => id.to_owned(),
             None => active(&writer)?.1,
         };
-        let directory = KeyDirectory::open(self.db_path.parent().context("missing memory directory")?, false)?;
-        let key = directory.load(&id)?;
+        let key = self.capsule_key(&id)?;
         let signed = ring::hmac::sign(&key, &framed(domain.bytes(), bytes));
         let tag = signed.as_ref().try_into().context("invalid recovery MAC length")?;
         Ok(RecoveryTag { key_id: id, tag })
     }
     fn verify_recovery_mac(&self, tag: &RecoveryTag, domain: RecoveryMacDomain, bytes: &[u8]) -> anyhow::Result<()> {
         anyhow::ensure!(bytes.len() <= MAX_SERIALIZED_FACTS, "oversized recovery MAC input");
-        let directory = KeyDirectory::open(self.db_path.parent().context("missing memory directory")?, false)?;
-        let key = directory.load(&tag.key_id)?;
+        let key = self.capsule_key(&tag.key_id)?;
         ring::hmac::verify(&key, &framed(domain.bytes(), bytes), &tag.tag)
             .map_err(|_| anyhow::anyhow!("invalid recovery authentication"))
     }

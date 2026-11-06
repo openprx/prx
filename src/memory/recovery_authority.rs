@@ -4,6 +4,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The key a v3 artifact needs is missing, retired or unusable. Recovery for
+/// that artifact is unavailable; startup and chat continue, with no marker,
+/// no replay and no regeneration.
+#[derive(Debug, thiserror::Error)]
+#[error("recovery key unavailable: {0}")]
+pub struct RecoveryKeyUnavailable(pub String);
+
+#[must_use]
+pub fn is_key_unavailable(error: &anyhow::Error) -> bool {
+    error.is::<RecoveryKeyUnavailable>()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryChain {
     pub workspace_id: String,

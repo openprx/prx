@@ -471,5 +471,85 @@ async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()
         !dir.path().join("self/causal_tree/.decision_key").exists(),
         "legacy authority created"
     );
+    // Cell: a v3 capsule whose key is retired. Startup and the next append still
+    // succeed; the capsule stays pending (no marker, no replay, no interruption
+    // or reconciliation evidence); the shared warning appears exactly once.
+    let (cell_dir, cell_store) = store()?;
+    let workspace = cell_dir.path().to_owned();
+    let db_path = cell_store.db_path.clone();
+    let mut cell_config = crate::config::Config::default();
+    cell_config.workspace_dir = workspace.clone();
+    cell_config.causal_tree.enabled = true;
+    let cell_input = |run: &str, key: &str| -> anyhow::Result<crate::memory::MessageEventInput> {
+        Ok(serde_json::from_value(serde_json::json!({
+            "workspace_id": workspace.to_string_lossy(), "owner_id": "prx_user",
+            "source": "agent", "channel": "agent_api", "session_key": "prx_session",
+            "run_id": run, "idempotency_key": key, "role": "user",
+            "event_type": "message.created", "content": "recovery fixture", "visibility": "session"
+        }))?)
+    };
+    let prepare = |memory: Arc<dyn crate::memory::Memory>| {
+        let config = cell_config.clone();
+        async move {
+            let tracker = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+            let ticket = tracker.register(tokio_util::sync::CancellationToken::new())?;
+            let result = IngressRecorder::prepare(memory, &config, &ticket).await;
+            ticket.finish(result.is_ok());
+            result?.context("recorder unavailable")
+        }
+    };
+    let first_memory = Arc::new(cell_store);
+    let first_recorder = prepare(first_memory.clone()).await?;
+    let first = first_recorder
+        .append(cell_input("prx-cell-1", "prx-cell-input-1")?)
+        .await?;
+    // Retire the capsule's key: rotate to a new active generation, then remove
+    // the old file. The active authority stays usable.
+    let retired = first_memory.activate_recovery_authority()?;
+    first_memory.rotate_recovery_authority()?;
+    std::fs::remove_file(
+        db_path
+            .parent()
+            .context("memory directory")?
+            .join(".recovery_keys")
+            .join(format!("{retired}.key")),
+    )?;
+    drop(first_recorder);
+    drop(first_memory);
+    let second_memory = Arc::new(SqliteMemory::new_with_path(db_path.clone())?);
+    #[derive(Clone)]
+    struct CellLogs(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for CellLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let cell_logs = CellLogs(Arc::new(parking_lot::Mutex::new(Vec::new())));
+    let sink = cell_logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+    let second_recorder = prepare(second_memory.clone()).await?;
+    let second = second_recorder
+        .append(cell_input("prx-cell-2", "prx-cell-input-2")?)
+        .await?;
+    anyhow::ensure!(second.id > 0, "chat append after a retired capsule key did not persist");
+    let decided: i64 = second_memory.pool.write().query_row(
+        "SELECT count(*) FROM message_events WHERE idempotency_key LIKE ?1",
+        params![format!("ingress:{}:%", first.event_id)],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(decided == 0, "a retired capsule produced marker or outcome evidence");
+    let warnings = String::from_utf8(cell_logs.0.lock().clone())?
+        .matches("recovery authority unavailable; activation will not be retried")
+        .count();
+    anyhow::ensure!(warnings == 1, "shared warning emitted {warnings} times");
     Ok(())
 }

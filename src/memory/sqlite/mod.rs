@@ -176,6 +176,11 @@ pub struct SqliteMemory {
     recovery_activation_attempts: Arc<std::sync::atomic::AtomicUsize>,
     /// Set once when key material is unavailable; never cleared or retried.
     recovery_unavailable: Arc<std::sync::OnceLock<()>>,
+    /// The one shared, once-only "unavailable" warning for this handle.
+    recovery_warned: Arc<std::sync::OnceLock<()>>,
+    /// Capsule keys that failed to load (and the sentinel "" for an unusable
+    /// key directory). Remembered so no capsule retries them.
+    recovery_unusable: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     ingress_owners: Arc<super::ingress_recovery::IngressOwnerCache>,
     db_path: PathBuf,
     acl_enabled: bool,
@@ -378,6 +383,8 @@ impl SqliteMemory {
             pool,
             ingress_owners: Default::default(),
             recovery_unavailable: Default::default(),
+            recovery_warned: Default::default(),
+            recovery_unusable: Default::default(),
             #[cfg(test)]
             recovery_activation_attempts: Default::default(),
             db_path,

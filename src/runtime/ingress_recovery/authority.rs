@@ -50,7 +50,13 @@ impl IngressRecorder {
                 key_id: capsule.key_id.clone().context("missing recovery key id")?,
                 tag: tag.try_into().context("invalid recovery tag length")?,
             };
-            return Ok(repository.verify_recovery_mac(&tag, domain, bytes).is_ok());
+            // An unusable key is not a bad tag: propagate it so the candidate is
+            // left pending instead of being quarantined.
+            return match repository.verify_recovery_mac(&tag, domain, bytes) {
+                Ok(()) => Ok(true),
+                Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => Err(error),
+                Err(_) => Ok(false),
+            };
         }
         Ok(self.legacy_key()?.verify_hmac(KeyDomain::IngressRecovery, legacy, tag))
     }
