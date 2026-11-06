@@ -639,6 +639,7 @@ async fn run_turn_unguarded(
     // surface simply by asking for a spawn or a delegate. Read once: the spawn
     // context is fixed for the lifetime of this turn.
     let inherited_exclusions = crate::tools::sessions_spawn::ambient_channel_excluded_tools();
+    let safety_surface = Arc::new(service.agent_turn_surface(proof, model, &inherited_exclusions));
     let mut iteration = 0usize;
     loop {
         iteration = iteration.saturating_add(1);
@@ -984,6 +985,7 @@ async fn run_turn_unguarded(
         if tool_specs_rewritten {
             tool_surface = request_tool_surface_cache.measure(mode_capabilities.native_tool_calling, &tool_specs);
         }
+        tool_specs.retain(|spec| safety_surface.contains(&spec.name));
         let (core_specs, appended_specs) = if appended_names.is_empty() {
             (tool_specs, Vec::new())
         } else {
@@ -1010,6 +1012,9 @@ async fn run_turn_unguarded(
             )?;
             execution_adapter.tool_execution_service = Some(execution);
             execution_adapter.tool_execution_context = bound_context;
+            execution_adapter.tool_execution_context.turn_surface = Some(Arc::new(
+                safety_surface.for_publication(compiled_tool_context.tool_specs()),
+            ));
         }
         // Argument validation enforces the contract the model was shown, and
         // what it was shown depends on which provider and model serve the
@@ -2077,6 +2082,9 @@ async fn run_turn_unguarded(
             ) {
                 continue;
             }
+            if !safety_surface.contains(&proposal.spec.name) {
+                continue;
+            }
             call.name.clone_from(&proposal.spec.name);
             let specs = discovery_dispatch_specs.get_or_insert_with(|| compiled_tool_context.tool_specs().to_vec());
             if !specs.iter().any(|spec| spec.name == proposal.spec.name) {
@@ -2096,6 +2104,8 @@ async fn run_turn_unguarded(
             ));
             execution_adapter.tool_execution_service = Some(execution);
             execution_adapter.tool_execution_context = bound_context;
+            execution_adapter.tool_execution_context.turn_surface =
+                Some(Arc::new(safety_surface.for_publication(&specs)));
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)

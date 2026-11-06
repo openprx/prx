@@ -19,6 +19,40 @@ use crate::causal_tree::gates::{GateOutcome, HardGates};
 use crate::tools::ToolSpec;
 
 impl TurnDecisionService {
+    /// Build the safety ceiling once, independently of decision selection.
+    pub(crate) fn agent_turn_surface(
+        &self,
+        proof: &dyn TurnSourceProof,
+        model: &str,
+        inherited_exclusions: &[String],
+    ) -> crate::tools::execution::admission::TurnSurface {
+        let mut config = self.generation.effective.tool_tiering.clone();
+        config.always_exclude.extend(inherited_exclusions.iter().cloned());
+        let channel = self.surface == TurnSurfaceKind::Channel;
+        let view = self.catalog_view();
+        crate::tools::execution::admission::TurnSurface::build(
+            &self.execution.current_descriptors(),
+            &config,
+            model,
+            channel,
+            |descriptor| {
+                self.catalog
+                    .entry_for_public_name(&descriptor.public_name)
+                    .is_some_and(|entry| {
+                        !view.surface_excludes(entry)
+                            && (!channel || entry.channel_eligible)
+                            && crate::tools::execution::decide_tool_execution(
+                                &self.security,
+                                entry.policy_tool_name(),
+                                proof.policy_sender(),
+                                proof.policy_channel(),
+                                proof.policy_chat_type(),
+                            ) != crate::tools::execution::ToolExecutionDecision::Deny
+                    })
+            },
+        )
+    }
+
     /// Local operator commands retain the actual Interactive publication.
     /// This validates source provenance without inventing a model decision.
     pub(crate) fn verify_operator_spawn_source(
