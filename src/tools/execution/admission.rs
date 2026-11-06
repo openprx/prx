@@ -1,11 +1,13 @@
 //! Decision-free publication and dispatch boundary for model turns.
-use super::{ToolDescriptor, ToolExecutionContext};
+use super::{ToolDescriptor, ToolExecutionContext, ToolExecutionService, ToolExecutionStatus};
 use crate::causal_tree::branch::SchemaFingerprint;
 use crate::config::ToolTieringConfig;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnSurface {
+    registry_generation: [u8; 32],
     published: BTreeMap<String, SchemaFingerprint>,
     exclusions: BTreeSet<String>,
     model_allowlist: Option<BTreeSet<String>>,
@@ -16,7 +18,7 @@ impl TurnSurface {
     /// The caller supplies trusted ACL and channel eligibility from its pinned
     /// registry. Neither a decision context nor a model-provided name grants access.
     pub(crate) fn build(
-        descriptors: &[ToolDescriptor],
+        service: &ToolExecutionService,
         config: &ToolTieringConfig,
         model: &str,
         channel: bool,
@@ -33,17 +35,18 @@ impl TurnSurface {
             .get(model)
             .map(|names| names.iter().cloned().collect());
         let mut surface = Self {
+            registry_generation: registry_generation(service),
             published: BTreeMap::new(),
             exclusions,
             model_allowlist,
             channel_eligible: BTreeSet::new(),
         };
-        for descriptor in descriptors {
+        for descriptor in service.current_descriptors() {
             let name = &descriptor.public_name;
             if surface.exclusions.contains(name)
                 || surface.exclusions.contains(&descriptor.backend_name)
                 || !crate::tools::capability::policy::model_allows_tool_name(model, name, &config.model_allowlists)
-                || !eligible(descriptor)
+                || !eligible(&descriptor)
             {
                 continue;
             }
@@ -58,6 +61,13 @@ impl TurnSurface {
             );
         }
         surface
+    }
+
+    pub(crate) fn with_tool_calls(mut self, allowed: bool) -> Self {
+        if !allowed {
+            self.published.clear();
+        }
+        self
     }
 
     /// Freeze the exact published subset without widening the turn ceiling.
@@ -76,13 +86,61 @@ impl TurnSurface {
     }
 }
 
-pub(super) fn admit(context: &ToolExecutionContext, name: &str) -> Result<(), String> {
-    if context
-        .turn_surface
-        .as_ref()
-        .is_some_and(|surface| !surface.contains(name))
-    {
-        return Err(format!("tool '{name}' is outside the turn surface"));
+// Bind the complete live registry, including dynamic destination/epoch digests.
+// Sorting makes backend enumeration order irrelevant to the generation.
+fn registry_generation(service: &ToolExecutionService) -> [u8; 32] {
+    let mut entries: Vec<_> = service
+        .current_descriptors()
+        .into_iter()
+        .map(|descriptor| {
+            let binding = service
+                .current_descriptor_with_binding(&descriptor.public_name, true)
+                .and_then(|(_, binding)| binding);
+            let fingerprint = crate::tools::capability::fingerprint::tool_spec_fingerprint(
+                &descriptor.public_name,
+                &descriptor.backend_name,
+                &serde_json::json!([descriptor, binding]),
+            );
+            fingerprint.0
+        })
+        .collect();
+    entries.sort_unstable();
+    let mut digest = Sha256::new();
+    for entry in entries {
+        digest.update(entry);
+    }
+    digest.finalize().into()
+}
+
+pub(super) fn admit(
+    service: &ToolExecutionService,
+    context: &ToolExecutionContext,
+    name: &str,
+) -> Result<(), (ToolExecutionStatus, String)> {
+    let Some(surface) = &context.turn_surface else {
+        return Ok(());
+    };
+    if !surface.contains(name) {
+        return Err((
+            ToolExecutionStatus::Denied,
+            format!("tool '{name}' is outside the turn surface"),
+        ));
+    }
+    let descriptor = service.current_descriptor(name);
+    let stale = descriptor.as_ref().is_none_or(|descriptor| {
+        descriptor.availability.level < crate::capability::CapabilityAvailabilityLevel::Configured
+            || surface.published.get(name)
+                != Some(&crate::tools::capability::fingerprint::tool_spec_fingerprint(
+                    name,
+                    &descriptor.description,
+                    &descriptor.parameters,
+                ))
+    });
+    if stale || surface.registry_generation != registry_generation(service) {
+        return Err((
+            ToolExecutionStatus::StaleCapability,
+            format!("tool '{name}' changed after turn publication"),
+        ));
     }
     Ok(())
 }

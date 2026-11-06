@@ -1941,6 +1941,11 @@ Publication intersects the registered tools with the source ACL, operator and
 channel exclusions, the exact model allowlist, and channel eligibility. Canonical
 dispatch denies names outside the published surface before policy or backend
 execution, independently of decision selection. Owner isolation and private
-filesystem owner/workspace matching remain mandatory. This check prevents a
+filesystem owner/workspace matching remain mandatory. A changed live registry,
+backend binding or schema, or availability below Configured, returns
+`StaleCapability` before policy or backend execution. Ingress model bindings
+reject a different execution provider/model. Models without verified native tool
+support, and sources with tool calls disabled, receive an empty tool surface.
+This check prevents a
 model from invoking a withheld tool by guessing its name. Reverting the safety
 surface change restores the previous dispatch behavior.

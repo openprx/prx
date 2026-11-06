@@ -1390,6 +1390,11 @@ pub(crate) struct AgentModelBinding {
 }
 
 impl AgentModelBinding {
+    /// Admit only the source spelling or the provider/model pinned at ingress.
+    pub(crate) fn admits_execution(&self, source: (&str, &str), execution: (&str, &str)) -> bool {
+        execution == source || execution == (self.provider_label.as_ref(), self.model.as_ref())
+    }
+
     pub(crate) const fn credential_reference(&self) -> &crate::providers::credentials::CredentialRef {
         &self.credential_ref
     }

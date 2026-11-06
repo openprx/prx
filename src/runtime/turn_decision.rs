@@ -112,9 +112,7 @@ use crate::decision::{DecisionKey, KeyDomain, RequestLimits};
 use crate::memory::Memory;
 use crate::memory::principal::MemoryWriteContext;
 use crate::memory::traits::DecisionMemoryHit;
-use crate::providers::catalog::{
-    CatalogView as ProviderCatalogView, Feature, Requirement, ResolvedModel, UnknownPolicy, Verification,
-};
+use crate::providers::catalog::{CatalogView as ProviderCatalogView, Requirement, ResolvedModel, UnknownPolicy};
 use crate::security::SecurityPolicy;
 use crate::tools::capability::catalog::{
     CapabilityCatalog, CatalogError, CatalogScope, CatalogSources, CatalogView, Exposure, ParityError, SurfacePolicy,
@@ -3040,28 +3038,18 @@ impl TurnDecisionService {
             .or_else(|| self.ordinary_process.as_ref().map(|process| &process.snapshots().scope))
     }
 
-    /// Resolve the exact selected model again against this service's pinned
-    /// PMM catalog and credential owner. The proof carries only the source's
-    /// selected spelling; it cannot install a model capability fact.
-    /// A routed provider receives either the original hint pair or its
-    /// source-bound destination, never a mixture of those two identities.
-    /// The original spelling keeps its fast path; execution admission still
-    /// validates the full binding and gates before any provider call.
+    /// Retain the existing source/catalog gate around decision-free binding admission.
     pub(crate) fn validate_agent_execution_model(
         &self,
         proof: &dyn TurnSourceProof,
         provider: &str,
         model: &str,
     ) -> Result<(), TurnModelError> {
-        if proof.provider_name() == provider && proof.model_name() == model {
-            return Ok(());
+        if (proof.provider_name(), proof.model_name()) != (provider, model) {
+            self.resolve_agent_model(proof)?;
         }
-        let resolved = self.resolve_agent_model(proof)?;
-        if resolved.provider_label() == provider && resolved.model() == model {
-            Ok(())
-        } else {
-            Err(TurnModelError::SelectionDrift)
-        }
+        crate::runtime::turn_model::validate_execution(proof, provider, model)
+            .map_err(|_| TurnModelError::SelectionDrift)
     }
 
     pub(crate) fn resolve_agent_model(&self, proof: &dyn TurnSourceProof) -> Result<ResolvedModel, TurnModelError> {
@@ -3163,19 +3151,12 @@ impl TurnDecisionService {
         if !proof.tool_calls_allowed() || self.resolve_agent_model(proof).is_err() {
             return false;
         }
-        let config = &self.generation.effective;
-        crate::providers::selection::check_with(
-            config,
+        crate::runtime::turn_model::can_call_tools(
+            &self.generation.effective,
             &self.provider_catalog,
-            proof.provider_name(),
-            proof.model_name(),
+            proof,
             self.credential_for_proof(proof),
-            &Requirement::chat().with(Feature::NativeTools),
-            UnknownPolicy::Invocation,
         )
-        .is_ok_and(|resolved| {
-            resolved.verification() == &Verification::Verified && proof.model_binding().matches_identity(&resolved)
-        })
     }
 }
 
