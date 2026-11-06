@@ -1034,7 +1034,7 @@ impl super::ingress_recovery::RecoveryScope {
                 !replay.fixed_close() || facts.is_completed_local_close(),
                 "replay is not a completed local close"
             );
-            let application = VerifiedDirectiveApplication::from_replay(&replay, &event)?;
+            let application = VerifiedDirectiveApplication::from_replay(&replay)?;
             let sink = self
                 .durable_events
                 .as_ref()
