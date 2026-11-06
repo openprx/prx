@@ -24,6 +24,12 @@ impl DecisionId {
         self.0
     }
 
+    /// Wrap a UUID that is already a decision identity. Callers are limited to
+    /// `ParentAuthorityId::decision_grant_id`.
+    pub(crate) const fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
     /// A new runtime decision. UUIDv7 keeps locally recorded decisions in
     /// creation order without encoding any turn content or owner identity.
     pub(crate) fn new_runtime() -> Self {

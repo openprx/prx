@@ -317,7 +317,7 @@ impl PreparedReplay {
             None
         };
         let parent = if let Some(grant) = &link.parent_grant {
-            let parent_id = DecisionId::parse(&grant.scope().gate_inputs().0.parent_authority_id.to_string())?;
+            let parent_id = grant.scope().gate_inputs().0.parent_authority_id.decision_grant_id();
             let (store_workspace, expected_digest) = grant.parent_record_binding();
             let row = recorded
                 .reader

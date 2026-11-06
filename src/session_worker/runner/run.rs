@@ -377,10 +377,7 @@ pub(super) fn verify_worker_parent_authority(
     };
     let record = store
         .reader()
-        .replay_record(
-            &scope,
-            &crate::causal_tree::ids::DecisionId::parse(&parent.parent_authority_id.to_string())?,
-        )?
+        .replay_record(&scope, &parent.parent_authority_id.decision_grant_id())?
         .context("session-worker parent decision is unavailable")?;
     anyhow::ensure!(
         record.digest == source.parent_decision_digest
@@ -704,7 +701,7 @@ async fn run_owned_manifest(
         let provider_catalog = crate::providers::catalog::CatalogView::restore_process(
             &source.provider_catalog,
             &constraints.key,
-            crate::causal_tree::ids::DecisionId::parse(&constraints.parent_authority_id.to_string())?,
+            constraints.parent_authority_id,
         )?;
         Some(crate::runtime::child_source::IssuedChildGrant::restore_process(
             Arc::clone(&authority.scope),

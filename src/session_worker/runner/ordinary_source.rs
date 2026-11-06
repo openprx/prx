@@ -63,7 +63,7 @@ pub(super) fn restore(
     let provider_catalog = crate::providers::catalog::CatalogView::restore_process(
         &source.provider_catalog,
         &key,
-        crate::causal_tree::ids::DecisionId::parse(&parent.parent_authority_id.to_string())?,
+        parent.parent_authority_id,
     )?;
     let selection = &source.provider_selection;
     let resolved = crate::providers::selection::check_with(
