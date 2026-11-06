@@ -28,6 +28,8 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/runtime/turn_decision/routing/tests.rs::latest_router_receipt::let store = Connection::open(self.workspace.path().join(\"self/causal_tree/decisions.db\")).unwrap();",
     "src/agent/turn_tests/context_recall.rs::build_agent_context_includes_document_evidence_with_source_ids::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/agent/turn_tests/compaction.rs::configurable_compaction_records_run_and_summary_memory::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
+    // Test-only: tamper the durable v3 capsule authentication to simulate an unverifiable capsule (AUTH-02-1a).
+    "src/chat/tests/persist_recovery_tests.rs::chat_inbound_on_an_agent_store_survives_an_unverifiable_capsule::rusqlite::Connection::open(dir.path().join(\"memory\").join(\"brain.db\")).expect(\"agent store database\");",
     "src/chat/tests/legacy_chat_compaction_audit_tests.rs::legacy_chat_compaction_downgrades_fidelity_when_event_provenance_is_unavailable::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/chat/tests/legacy_chat_compaction_audit_tests.rs::legacy_chat_compaction_persists_run_and_summary_memory::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/cron/store.rs::add_job_persists_owner_topic_lineage_and_event::let memory_conn = Connection::open(config.workspace_dir.join(\"memory\").join(\"brain.db\")).unwrap();",
