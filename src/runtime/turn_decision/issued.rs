@@ -3,6 +3,7 @@ use super::{
     AgentDecisionError, Arc, CancellationToken, Context, DecisionRecordBuilder, Ordering, TurnDecisionContext,
     TurnDecisionService, TurnExecutionDirective, TurnSourceProof, accounting,
 };
+use crate::runtime::child_source::authority_journal;
 
 impl TurnDecisionService {
     pub(super) async fn record_issued_decision(
@@ -25,6 +26,33 @@ impl TurnDecisionService {
                 true,
                 self.generation.effective.causal_tree.store.record_redacted_projection,
             )?;
+            if cancellation.is_cancelled() && !context.router_cleanup_close() {
+                return Err(AgentDecisionError::Cancelled);
+            }
+            // Replay evidence is durable before admission. Its physical write
+            // runs on a blocking thread and is always awaited, so cancellation
+            // cannot drop it midway.
+            let store_workspace = self.store.workspace_id().ok_or_else(|| {
+                AgentDecisionError::DecisionEvidence(anyhow::anyhow!("decision store has no workspace id"))
+            })?;
+            let evidence = authority_journal::decision_evidence_rows(&records, &store_workspace)
+                .map_err(AgentDecisionError::DecisionEvidence)?;
+            let workspace = self.generation.effective.workspace_dir.clone();
+            let key = Arc::clone(&self.state_key);
+            let ticket = crate::runtime::turn_cleanup::current_tracker()
+                .map(|owner| owner.register(CancellationToken::new()))
+                .transpose()
+                .map_err(AgentDecisionError::DecisionEvidence)?;
+            let written = crate::runtime::blocking::spawn_blocking(move || {
+                let result = authority_journal::write_decision_evidence(&workspace, &key, &evidence);
+                if let Some(ticket) = ticket {
+                    ticket.finish(result.is_ok());
+                }
+                result
+            })
+            .await
+            .map_err(|error| AgentDecisionError::DecisionEvidence(error.into()))?;
+            written.map_err(AgentDecisionError::DecisionEvidence)?;
             if cancellation.is_cancelled() && !context.router_cleanup_close() {
                 return Err(AgentDecisionError::Cancelled);
             }

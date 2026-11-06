@@ -73,3 +73,119 @@ async fn batch_v4_refuses_missing_parent_row() -> Result<()> {
     })
     .await
 }
+
+/// Replaces one named column, failing if the schema has no such column.
+fn set_column(
+    columns: &mut [(&'static str, rusqlite::types::Value)],
+    name: &str,
+    value: rusqlite::types::Value,
+) -> Result<()> {
+    let column = columns
+        .iter_mut()
+        .find(|(column, _)| *column == name)
+        .with_context(|| format!("test: column {name}"))?;
+    column.1 = value;
+    Ok(())
+}
+
+/// Equality that compares reals by bits, so NaN payloads and -0.0 are exact.
+fn same_value(left: &rusqlite::types::Value, right: &rusqlite::types::Value) -> bool {
+    match (left, right) {
+        (rusqlite::types::Value::Real(left), rusqlite::types::Value::Real(right)) => left.to_bits() == right.to_bits(),
+        _ => left == right,
+    }
+}
+
+#[test]
+fn decision_evidence_roundtrips_typed_columns() -> Result<()> {
+    use crate::causal_tree::ids::DecisionId;
+    use crate::causal_tree::store::testing;
+    use crate::runtime::child_source::authority_journal as journal;
+    use rusqlite::types::Value;
+
+    let tmp = tempfile::tempdir()?;
+    let key = crate::decision::DecisionKey::load_or_create(tmp.path())?;
+    let record = testing::record(
+        DecisionId::new_runtime(),
+        "store-ws-1",
+        Some("owner-1"),
+        1_700_000_000_000,
+    );
+    let decision = record.decision_id.to_string();
+    let mut columns = record.replay_columns("store-ws-1")?;
+    // A NaN payload, a negative zero, a non-ASCII JSON text and the integer extremes.
+    set_column(
+        &mut columns,
+        "propensity",
+        Value::Real(f64::from_bits(0x7ff8_0000_0000_1234)),
+    )?;
+    set_column(&mut columns, "explored", Value::Real(-0.0))?;
+    set_column(&mut columns, "latency_ms", Value::Integer(i64::MIN))?;
+    set_column(
+        &mut columns,
+        "features_json",
+        Value::Text("{\"α\":\"\\u0000\"}".to_owned()),
+    )?;
+    journal::write_decision_evidence(tmp.path(), &key, std::slice::from_ref(&columns))?;
+
+    let read = journal::read_decision_evidence(tmp.path(), "store-ws-1", "owner-1", &decision, &key)?
+        .context("test: decision evidence row")?;
+    assert_eq!(read.len(), 42);
+    for ((name, expected), (read_name, actual)) in columns.iter().zip(&read) {
+        assert_eq!(name, read_name);
+        assert!(same_value(expected, actual), "column {name} changed on readback");
+    }
+    assert!(read.iter().any(|(_, value)| matches!(value, Value::Null)));
+
+    // Ownerless issuance writes no row and still succeeds. Owned records in the
+    // same chain still produce their rows.
+    let ownerless = testing::record(DecisionId::new_runtime(), "store-ws-1", None, 1_700_000_000_001);
+    let rows = journal::decision_evidence_rows(std::slice::from_ref(&ownerless), "store-ws-1")?;
+    anyhow::ensure!(rows.is_empty(), "ownerless record produced an evidence row");
+    let fresh = tempfile::tempdir()?;
+    journal::write_decision_evidence(fresh.path(), &key, &rows)?;
+    assert!(!journal::path(fresh.path()).exists());
+    let mixed = journal::decision_evidence_rows(&[ownerless, record], "store-ws-1")?;
+    assert_eq!(mixed.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn decision_evidence_rejects_scope_substitution() -> Result<()> {
+    use crate::causal_tree::ids::DecisionId;
+    use crate::causal_tree::store::testing;
+    use crate::runtime::child_source::authority_journal as journal;
+
+    let tmp = tempfile::tempdir()?;
+    let key = crate::decision::DecisionKey::load_or_create(tmp.path())?;
+    let record = testing::record(
+        DecisionId::new_runtime(),
+        "store-ws-1",
+        Some("owner-1"),
+        1_700_000_000_000,
+    );
+    let decision = record.decision_id.to_string();
+    let rows = journal::decision_evidence_rows(std::slice::from_ref(&record), "store-ws-1")?;
+    journal::write_decision_evidence(tmp.path(), &key, &rows)?;
+
+    // Positive control: the matching SQL key reads its own sealed row.
+    anyhow::ensure!(
+        journal::read_decision_evidence(tmp.path(), "store-ws-1", "owner-1", &decision, &key)?.is_some(),
+        "test: matching key must read"
+    );
+
+    // Copy the otherwise valid sealed entry under a different workspace and a different owner.
+    let db = rusqlite::Connection::open(journal::path(tmp.path()))?;
+    let entry: String = db.query_row("SELECT entry FROM decision_evidence", [], |row| row.get(0))?;
+    for (workspace, owner) in [("store-ws-2", "owner-1"), ("store-ws-1", "owner-2")] {
+        db.execute(
+            "INSERT INTO decision_evidence(workspace, owner, decision, entry) VALUES (?1, ?2, ?3, ?4)",
+            (workspace, owner, &decision, &entry),
+        )?;
+        anyhow::ensure!(
+            journal::read_decision_evidence(tmp.path(), workspace, owner, &decision, &key).is_err(),
+            "substituted decision evidence key was accepted: {workspace}/{owner}"
+        );
+    }
+    Ok(())
+}

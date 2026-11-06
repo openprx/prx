@@ -698,6 +698,46 @@ impl DecisionRecord {
         }
         Ok(hex::encode(digest.finalize()))
     }
+
+    /// Typed replay columns in [`replay_column_names`] order. The workspace is
+    /// the durable store ID, as in [`Self::replay_digest`].
+    pub(crate) fn replay_columns(
+        &self,
+        store_workspace_id: &str,
+    ) -> Result<Vec<(&'static str, rusqlite::types::Value)>, StoreError> {
+        let encoded = EncodedDecision::of(self)?;
+        let mut columns = Vec::with_capacity(replay_column_names().len());
+        for name in replay_column_names() {
+            let (_, value) = encoded
+                .columns
+                .iter()
+                .find(|(column, _)| *column == name)
+                .ok_or_else(|| StoreError::Unsafe("incomplete decision replay encoding".to_owned()))?;
+            let value = if name == "workspace_id" {
+                rusqlite::types::Value::Text(store_workspace_id.to_owned())
+            } else {
+                match value {
+                    DecisionValue::Null => rusqlite::types::Value::Null,
+                    DecisionValue::Integer(number) => rusqlite::types::Value::Integer(*number),
+                    DecisionValue::Real(number) => rusqlite::types::Value::Real(*number),
+                    DecisionValue::Text(text) => rusqlite::types::Value::Text(text.to_string()),
+                }
+            };
+            columns.push((name, value));
+        }
+        Ok(columns)
+    }
+}
+
+/// The replay columns in their fixed order: the record-hash columns, then
+/// `prior_decision_id` and `backend_endpoint`. This is the 42-column layout of
+/// the replay evidence.
+pub(crate) fn replay_column_names() -> Vec<&'static str> {
+    RECORD_HASH_COLUMNS
+        .iter()
+        .copied()
+        .chain(["prior_decision_id", "backend_endpoint"])
+        .collect()
 }
 
 /// Decision fields borrow their record; only generated UUID/JSON text is owned.

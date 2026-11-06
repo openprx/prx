@@ -3,10 +3,11 @@
 //! Three sealed tables live in `self/child_authority/journal.db`. Each row is
 //! `(key, entry)`, where `entry` is `{payload, seal}`. The seal domain differs per
 //! table, and the seal is checked before the payload is interpreted.
-use crate::causal_tree::store::DecisionRecord;
+use crate::causal_tree::store::{DecisionRecord, replay_column_names};
 use crate::decision::key::{DecisionKey, KeyDomain};
 use crate::session_worker::protocol::WorkerManifest;
 use anyhow::Context;
+use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,9 @@ pub(crate) const BATCH_PARENT_VERSION: u8 = 4;
 const AUTHORITY_DOMAIN: &[u8] = b"worker-launch-authority-v1";
 const LAUNCH_PARENT_DOMAIN: &[u8] = b"child-launch-parent-authority-v1";
 const BATCH_PARENT_DOMAIN: &[u8] = b"child-batch-parent-authority-v1";
+const DECISION_EVIDENCE_DOMAIN: &[u8] = b"child-decision-evidence-v1";
+/// Version of the `decision_evidence` payload.
+const DECISION_EVIDENCE_VERSION: u8 = 1;
 
 const SELECT_AUTHORITY: &str = "SELECT entry FROM authority WHERE run=?1";
 const INSERT_AUTHORITY: &str = "INSERT OR IGNORE INTO authority(run, entry) VALUES (?1, ?2)";
@@ -28,6 +32,10 @@ const SELECT_LAUNCH_PARENT: &str = "SELECT entry FROM launch_parent WHERE run=?1
 const INSERT_LAUNCH_PARENT: &str = "INSERT OR IGNORE INTO launch_parent(run, entry) VALUES (?1, ?2)";
 const SELECT_BATCH_PARENT: &str = "SELECT entry FROM batch_parent WHERE batch=?1";
 const INSERT_BATCH_PARENT: &str = "INSERT OR IGNORE INTO batch_parent(batch, entry) VALUES (?1, ?2)";
+const INSERT_DECISION_EVIDENCE: &str =
+    "INSERT OR IGNORE INTO decision_evidence(workspace, owner, decision, entry) VALUES (?1, ?2, ?3, ?4)";
+const SELECT_DECISION_EVIDENCE: &str =
+    "SELECT entry FROM decision_evidence WHERE workspace=?1 AND owner=?2 AND decision=?3";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -178,7 +186,14 @@ fn open_writer(workspace: &Path) -> anyhow::Result<Connection> {
         "PRAGMA synchronous=FULL;
          CREATE TABLE IF NOT EXISTS authority (run TEXT PRIMARY KEY, entry TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS launch_parent (run TEXT PRIMARY KEY, entry TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS batch_parent (batch TEXT PRIMARY KEY, entry TEXT NOT NULL);",
+         CREATE TABLE IF NOT EXISTS batch_parent (batch TEXT PRIMARY KEY, entry TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS decision_evidence (
+             workspace TEXT NOT NULL, owner TEXT NOT NULL, decision TEXT NOT NULL, entry TEXT NOT NULL,
+             PRIMARY KEY(workspace, owner, decision)
+         );
+         CREATE TABLE IF NOT EXISTS child_outcome (run TEXT NOT NULL, settlement TEXT NOT NULL, entry TEXT NOT NULL,
+             PRIMARY KEY(run, settlement)
+         );",
     )?;
     Ok(conn)
 }
@@ -292,6 +307,196 @@ pub(crate) fn read_batch_parent(
     };
     let payload = open_entry(key, BATCH_PARENT_DOMAIN, "batch parent authority", &entry)?;
     Ok(Some(serde_json::from_str(&payload)?))
+}
+
+/// One replay column in the sealed `decision_evidence` payload.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceColumn {
+    name: String,
+    value: EvidenceValue,
+}
+
+/// A SQLite value kept exactly. A real is stored as its IEEE-754 bits, so NaN
+/// payloads and the sign of zero survive the round trip.
+#[derive(Serialize, Deserialize)]
+enum EvidenceValue {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Text(String),
+}
+
+impl EvidenceValue {
+    fn of(value: &SqlValue) -> anyhow::Result<Self> {
+        Ok(match value {
+            SqlValue::Null => Self::Null,
+            SqlValue::Integer(number) => Self::Integer(*number),
+            SqlValue::Real(number) => Self::Real(number.to_bits()),
+            SqlValue::Text(text) => Self::Text(text.clone()),
+            SqlValue::Blob(_) => anyhow::bail!("decision evidence contains a blob column"),
+        })
+    }
+
+    #[cfg(test)]
+    fn into_value(self) -> SqlValue {
+        match self {
+            Self::Null => SqlValue::Null,
+            Self::Integer(number) => SqlValue::Integer(number),
+            Self::Real(bits) => SqlValue::Real(f64::from_bits(bits)),
+            Self::Text(text) => SqlValue::Text(text),
+        }
+    }
+}
+
+/// `decision_evidence` payload: the 42 replay columns in canonical order.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecisionEvidencePayload {
+    version: u8,
+    columns: Vec<EvidenceColumn>,
+}
+
+/// Typed replay rows for every owned record of an issued chain, keyed later by
+/// the durable store ID. An ownerless record writes no row, so issuance continues
+/// and a v3+ child of that chain is refused at its use site.
+pub(crate) fn decision_evidence_rows(
+    records: &[DecisionRecord],
+    store_workspace: &str,
+) -> anyhow::Result<Vec<Vec<(&'static str, SqlValue)>>> {
+    records
+        .iter()
+        .filter(|record| record.lineage.owner_id.is_some())
+        .map(|record| Ok(record.replay_columns(store_workspace)?))
+        .collect()
+}
+
+/// The composite SQL key and the sealed entry of one evidence row. The key is
+/// read from the typed columns, so it cannot differ from the sealed identity.
+fn decision_evidence_entry(
+    key: &DecisionKey,
+    columns: &[(&'static str, SqlValue)],
+) -> anyhow::Result<(String, String, String, String)> {
+    let names = replay_column_names();
+    anyhow::ensure!(
+        columns.len() == names.len() && columns.iter().zip(&names).all(|((name, _), expected)| name == expected),
+        "decision evidence columns differ from the replay schema"
+    );
+    let text = |name: &str| -> anyhow::Result<String> {
+        match columns.iter().find(|(column, _)| *column == name) {
+            Some((_, SqlValue::Text(text))) => Ok(text.clone()),
+            _ => anyhow::bail!("decision evidence {name} is not text"),
+        }
+    };
+    let workspace = text("workspace_id")?;
+    let owner = text("owner_id")?;
+    let decision = text("decision_id")?;
+    let payload = DecisionEvidencePayload {
+        version: DECISION_EVIDENCE_VERSION,
+        columns: columns
+            .iter()
+            .map(|(name, value)| {
+                Ok(EvidenceColumn {
+                    name: (*name).to_owned(),
+                    value: EvidenceValue::of(value)?,
+                })
+            })
+            .collect::<anyhow::Result<_>>()?,
+    };
+    let entry = seal_entry(key, DECISION_EVIDENCE_DOMAIN, serde_json::to_string(&payload)?)?;
+    Ok((workspace, owner, decision, entry))
+}
+
+/// Writes the chain in one FULL transaction, then reads every row back and
+/// requires equality. A chain with no owned rows opens nothing.
+pub(crate) fn write_decision_evidence(
+    workspace: &Path,
+    key: &DecisionKey,
+    rows: &[Vec<(&'static str, SqlValue)>],
+) -> anyhow::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut conn = open_writer(workspace)?;
+    let transaction = conn.transaction()?;
+    for columns in rows {
+        let (workspace_id, owner, decision, entry) = decision_evidence_entry(key, columns)?;
+        transaction.execute(INSERT_DECISION_EVIDENCE, (&workspace_id, &owner, &decision, &entry))?;
+        let stored: String =
+            transaction.query_row(SELECT_DECISION_EVIDENCE, (&workspace_id, &owner, &decision), |row| {
+                row.get(0)
+            })?;
+        anyhow::ensure!(stored == entry, "decision evidence journal conflict");
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Authenticated read by SQL key. Seal first, then the payload identity guard
+/// (sealed workspace, owner and decision must equal the SQL key), then the schema.
+#[cfg(test)]
+pub(crate) fn read_decision_evidence(
+    workspace: &Path,
+    store_workspace: &str,
+    owner: &str,
+    decision: &str,
+    key: &DecisionKey,
+) -> anyhow::Result<Option<Vec<(String, SqlValue)>>> {
+    let path = path(workspace);
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        result => {
+            result?;
+        }
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    let Some(entry): Option<String> = conn
+        .query_row(SELECT_DECISION_EVIDENCE, (store_workspace, owner, decision), |row| {
+            row.get(0)
+        })
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let payload = open_entry(key, DECISION_EVIDENCE_DOMAIN, "decision evidence", &entry)?;
+    let payload: DecisionEvidencePayload = serde_json::from_str(&payload)?;
+    anyhow::ensure!(
+        payload.version == DECISION_EVIDENCE_VERSION,
+        "decision evidence version differs"
+    );
+    let sealed = |name: &str| {
+        payload
+            .columns
+            .iter()
+            .find(|column| column.name == name)
+            .and_then(|column| match &column.value {
+                EvidenceValue::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+    };
+    anyhow::ensure!(
+        sealed("workspace_id") == Some(store_workspace)
+            && sealed("owner_id") == Some(owner)
+            && sealed("decision_id") == Some(decision),
+        "decision evidence key differs from its sealed identity"
+    );
+    let names = replay_column_names();
+    anyhow::ensure!(
+        payload.columns.len() == names.len()
+            && payload
+                .columns
+                .iter()
+                .zip(&names)
+                .all(|(column, expected)| column.name == *expected),
+        "decision evidence columns differ from the replay schema"
+    );
+    Ok(Some(
+        payload
+            .columns
+            .into_iter()
+            .map(|column| (column.name, column.value.into_value()))
+            .collect(),
+    ))
 }
 
 /// A version-3+ child with no authority row is refused, never downgraded to the
