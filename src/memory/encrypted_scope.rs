@@ -197,6 +197,10 @@ impl Memory for EncryptedScope {
         self.inner.erasure_store()
     }
 
+    fn recovery_repository(&self) -> Option<&dyn crate::memory::recovery_authority::RecoveryRepository> {
+        self.inner.recovery_repository()
+    }
+
     fn name(&self) -> &str {
         // The ledger and event recorder select a backend by this name. The
         // inner store is that backend; this view only seals the bytes it writes.

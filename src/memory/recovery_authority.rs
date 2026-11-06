@@ -46,10 +46,45 @@ pub struct RecoveryFactsTooLarge {
     pub limit: usize,
 }
 
+/// Repository-owned MAC; key material never crosses this interface.
+#[derive(Clone, Debug)]
+pub struct RecoveryTag {
+    pub key_id: String,
+    pub tag: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RecoveryMacDomain {
+    CapsuleV3,
+    InputDigestV3,
+    StateV3,
+    QuarantineKeyV3,
+    QuarantineV3,
+}
+
+impl RecoveryMacDomain {
+    pub(crate) const fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::CapsuleV3 => b"prx-recovery-capsule-v3",
+            Self::InputDigestV3 => b"prx-recovery-input-digest-v3",
+            Self::StateV3 => b"prx-recovery-state-v3",
+            Self::QuarantineKeyV3 => b"prx-recovery-quarantine-key-v3",
+            Self::QuarantineV3 => b"prx-recovery-quarantine-v3",
+        }
+    }
+}
+
 /// Supported only by durable repositories; ordinary memory operations never
 /// initialize this capability. Rotation is an operator operation after drain.
 pub trait RecoveryRepository: Send + Sync {
     fn activate_recovery_authority(&self) -> anyhow::Result<String>;
+    fn recovery_mac(
+        &self,
+        key_id: Option<&str>,
+        domain: RecoveryMacDomain,
+        bytes: &[u8],
+    ) -> anyhow::Result<RecoveryTag>;
+    fn verify_recovery_mac(&self, tag: &RecoveryTag, domain: RecoveryMacDomain, bytes: &[u8]) -> anyhow::Result<()>;
     fn rotate_recovery_authority(&self) -> anyhow::Result<String>;
     fn recovery_event_evidence(&self, chain: &RecoveryChain, event_id: &str) -> anyhow::Result<RecoveryEvidence>;
     fn record_recovery_pending(&self, publication: &RecoveryPublication) -> anyhow::Result<RecoveryReceipt>;

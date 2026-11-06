@@ -5,6 +5,7 @@ use crate::memory::ingress_recovery::{
     IngressRecoveryScan, IngressRecoveryScope, IngressRecoveryState, MAX_CAPSULE_BYTES, MAX_RECOVERY_EVENT_BYTES,
     MAX_RECOVERY_PAGE, input_within_bounds, remaining, serialized_within,
 };
+use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
 use crate::memory::{Memory, MemoryVisibility, MessageEvent, MessageEventInput};
 use anyhow::Context;
 use sha2::{Digest, Sha256};
@@ -217,7 +218,6 @@ impl std::error::Error for IngressRecoveryDiagnostic {}
 
 pub(crate) struct IngressRecorder {
     memory: Arc<dyn Memory>,
-    key: Arc<DecisionKey>,
     lifetime: Arc<dyn IngressLifetime>,
     deadline: Instant,
     owner: Arc<super::turn_cleanup::CleanupTracker>,
@@ -241,11 +241,16 @@ impl IngressRecorder {
         }
         let deadline = Instant::now() + Duration::from_secs(15);
         let workspace_path = config.workspace_dir.clone();
-        let key = owned_store_operation(&ticket.owner(), move || {
+        let prepared_memory = Arc::clone(&memory);
+        owned_store_operation(&ticket.owner(), move || {
             remaining(deadline)?;
-            let key = DecisionKey::load_or_create(&workspace_path)?;
+            if let Some(repository) = prepared_memory.recovery_repository() {
+                repository.activate_recovery_authority()?;
+            } else {
+                DecisionKey::load_or_create(&workspace_path)?;
+            }
             remaining(deadline)?;
-            Ok(key)
+            Ok(())
         })
         .await?;
         let workspace = config.workspace_dir.to_string_lossy().into_owned();
@@ -257,7 +262,6 @@ impl IngressRecorder {
         let barrier = recovery_gate(&lifetime)?;
         Ok(Some(Arc::new(Self {
             memory,
-            key,
             lifetime,
             deadline,
             owner: ticket.owner(),
@@ -276,22 +280,31 @@ impl IngressRecorder {
     pub(crate) fn duplicate(&self) -> bool {
         self.duplicate.load(std::sync::atomic::Ordering::Acquire)
     }
-    fn input_digest(&self, input: &MessageEventInput) -> anyhow::Result<String> {
-        // A durable unkeyed digest would permit offline guesses of message text.
-        Ok(hex::encode(self.key.hmac(
-            KeyDomain::IngressRecovery,
-            &[b"input-digest-v2", digest(input)?.as_bytes()],
-        )))
+    fn input_digest(&self, input: &MessageEventInput) -> anyhow::Result<(Option<String>, String)> {
+        if let Some(repository) = self.memory.recovery_repository() {
+            input_within_bounds(input, MAX_RECOVERY_EVENT_BYTES - MAX_CAPSULE_BYTES)?;
+            let tag = repository.recovery_mac(None, RecoveryMacDomain::InputDigestV3, &serde_json::to_vec(input)?)?;
+            return Ok((Some(tag.key_id), hex::encode(tag.tag)));
+        }
+        Ok((
+            None,
+            hex::encode(self.legacy_key()?.hmac(
+                KeyDomain::IngressRecovery,
+                &[b"input-digest-v2", digest(input)?.as_bytes()],
+            )),
+        ))
     }
 
     fn sign(&self, capsule: &IngressCapsule) -> anyhow::Result<String> {
         serialized_within(capsule, MAX_CAPSULE_BYTES - 64)?;
         let mut unsigned = capsule.clone();
         unsigned.authentication.clear();
-        Ok(hex::encode(
-            self.key
-                .hmac(KeyDomain::IngressRecovery, &[&serde_json::to_vec(&unsigned)?]),
-        ))
+        Ok(hex::encode(self.slot_mac(
+            capsule,
+            RecoveryMacDomain::CapsuleV3,
+            &[&serde_json::to_vec(&unsigned)?],
+            &serde_json::to_vec(&unsigned)?,
+        )?))
     }
     fn verify(&self, capsule: &IngressCapsule, input: &MessageEvent) -> anyhow::Result<MessageEventInput> {
         capsule.validate_bounds()?;
@@ -303,23 +316,32 @@ impl IngressRecorder {
         unsigned.authentication.clear();
         let tag = hex::decode(&capsule.authentication)?;
         anyhow::ensure!(
-            self.key
-                .verify_hmac(KeyDomain::IngressRecovery, &[&serde_json::to_vec(&unsigned)?], &tag),
+            self.verify_slot(
+                capsule,
+                RecoveryMacDomain::CapsuleV3,
+                &[&serde_json::to_vec(&unsigned)?],
+                &serde_json::to_vec(&unsigned)?,
+                &tag
+            )?,
             "invalid ingress capsule authentication"
         );
         let normalized = original_input(input, capsule)?;
-        anyhow::ensure!(
-            (if capsule.version == 1 {
-                anyhow::ensure!(
-                    !self.memory.requires_scoped_execution(),
-                    "legacy unkeyed ingress capsule cannot be recovered in a protected scope"
-                );
-                digest(&normalized)?
-            } else {
-                self.input_digest(&normalized)?
-            }) == capsule.input_digest,
-            "ingress input digest differs from its capsule"
-        );
+        let digest_matches = if capsule.version == 1 {
+            anyhow::ensure!(
+                !self.memory.requires_scoped_execution(),
+                "legacy unkeyed ingress capsule cannot be recovered in a protected scope"
+            );
+            digest(&normalized)? == capsule.input_digest
+        } else {
+            self.verify_slot(
+                capsule,
+                RecoveryMacDomain::InputDigestV3,
+                &[b"input-digest-v2", digest(&normalized)?.as_bytes()],
+                &serde_json::to_vec(&normalized)?,
+                &hex::decode(&capsule.input_digest)?,
+            )?
+        };
+        anyhow::ensure!(digest_matches, "ingress input digest differs from its capsule");
         Ok(normalized)
     }
     pub(crate) async fn append(self: &Arc<Self>, mut input: MessageEventInput) -> anyhow::Result<MessageEvent> {
@@ -343,8 +365,10 @@ impl IngressRecorder {
         register_recorder(self)?;
         self.boxed_recover(&scope, None, self.deadline).await?;
         input.event_id = Some(uuid::Uuid::new_v4().to_string());
+        let (key_id, input_digest) = self.input_digest(&input)?;
         let mut capsule = IngressCapsule {
-            version: 2,
+            version: if key_id.is_some() { 3 } else { 2 },
+            key_id,
             backend_namespace: self.lifetime.namespace().to_owned(),
             scope,
             lifetime: self.lifetime.token().to_owned(),
@@ -354,7 +378,7 @@ impl IngressRecorder {
                 .clone()
                 .context("durable ingress requires stable input key")?,
             run_id: input.run_id.clone().context("durable ingress requires run identity")?,
-            input_digest: self.input_digest(&input)?,
+            input_digest,
             authentication: String::new(),
         };
         capsule.authentication = self.sign(&capsule)?;
@@ -510,14 +534,15 @@ impl IngressRecorder {
                         "turn.ingress.interrupted outcome and usage remain unconfirmed"
                     }
                     .into();
-                    let authentication = hex::encode(self.key.hmac(
-                        KeyDomain::IngressRecovery,
+                    let authentication = hex::encode(self.slot_mac(
+                        &capsule, RecoveryMacDomain::StateV3,
                         &[
                             b"recovery-state",
                             state_label.as_bytes(),
                             &serde_json::to_vec(&capsule)?,
                         ],
-                    ));
+                        &serde_json::to_vec(&(state_label, &capsule))?,
+                    )?);
                     evidence.raw_payload_json = Some(serde_json::to_string(
                         &serde_json::json!({"ingress_recovery":{"capsule":capsule,"state":state_label,"evidence_authentication":authentication}}),
                     )?);
@@ -607,10 +632,12 @@ impl IngressRecorder {
     }
 
     fn authenticated_quarantine_key(&self, capsule: &IngressCapsule) -> anyhow::Result<String> {
-        let tag = self.key.hmac(
-            KeyDomain::IngressRecovery,
+        let tag = self.slot_mac(
+            capsule,
+            RecoveryMacDomain::QuarantineKeyV3,
             &[b"quarantine-key-v1", &serde_json::to_vec(capsule)?],
-        );
+            &serde_json::to_vec(capsule)?,
+        )?;
         Ok(format!("{}:{}", Self::quarantine_key(capsule), hex::encode(tag)))
     }
 
@@ -639,11 +666,13 @@ impl IngressRecorder {
         let Ok(tag) = hex::decode(tag) else { return Ok(false) };
         Ok(payload.get("capsule") == Some(&serde_json::to_value(capsule)?)
             && payload.get("reason").and_then(serde_json::Value::as_str).is_some()
-            && self.key.verify_hmac(
-                KeyDomain::IngressRecovery,
+            && self.verify_slot(
+                capsule,
+                RecoveryMacDomain::QuarantineV3,
                 &[b"quarantine-v1", &serde_json::to_vec(&payload)?],
+                &serde_json::to_vec(&payload)?,
                 &tag,
-            ))
+            )?)
     }
 
     async fn quarantine_marker_present(
@@ -699,10 +728,12 @@ impl IngressRecorder {
             primary
         };
         let mut payload = serde_json::json!({"capsule": capsule, "reason": reason});
-        let authentication = hex::encode(self.key.hmac(
-            KeyDomain::IngressRecovery,
+        let authentication = hex::encode(self.slot_mac(
+            capsule,
+            RecoveryMacDomain::QuarantineV3,
             &[b"quarantine-v1", &serde_json::to_vec(&payload)?],
-        ));
+            &serde_json::to_vec(&payload)?,
+        )?);
         payload
             .as_object_mut()
             .context("quarantine payload is not an object")?
@@ -1045,3 +1076,8 @@ fn recovery_gate(lifetime: &Arc<dyn IngressLifetime>) -> anyhow::Result<Arc<toki
 
 #[cfg(test)]
 mod tests;
+
+mod authority;
+
+#[cfg(test)]
+mod authority_tests;
