@@ -1,5 +1,5 @@
 #![cfg(unix)]
-use super::probe::with_worker_probe_manifest;
+use super::probe::{with_prepared_worker_manifest, with_worker_probe_manifest};
 use crate::runtime::child_source::authority_journal;
 use crate::session_worker::runner::run::{run_validated_manifest, verify_worker_parent_authority};
 use anyhow::Result;
@@ -7,7 +7,7 @@ use anyhow::Result;
 #[tokio::test]
 async fn worker_verifies_parent_from_authority_journal_without_decision_store() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    with_worker_probe_manifest(&tmp, "ollama".into(), false, |worker| async move {
+    with_prepared_worker_manifest(&tmp, "ollama".into(), None, |worker| async move {
         let workspace = std::path::Path::new(&worker.child_source.as_ref().unwrap().parent_constraints.workspace);
         let db = crate::causal_tree::store::db_path(workspace);
         std::fs::rename(&db, db.with_extension("unavailable"))?;
@@ -21,15 +21,20 @@ async fn worker_verifies_parent_from_authority_journal_without_decision_store() 
 #[tokio::test]
 async fn forged_parent_authority_seal_is_refused_after_restart() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    with_worker_probe_manifest(&tmp, "ollama".into(), false, |worker| async move {
+    with_prepared_worker_manifest(&tmp, "ollama".into(), None, |worker| async move {
         let workspace = std::path::Path::new(&worker.child_source.as_ref().unwrap().parent_constraints.workspace);
         let conn = rusqlite::Connection::open(authority_journal::path(workspace))?;
         let entry: String = conn.query_row("SELECT entry FROM authority WHERE run=?1", [&worker.run_id], |row| {
             row.get(0)
         })?;
         let mut entry: serde_json::Value = serde_json::from_str(&entry)?;
-        let old = entry["seal"][0].as_u64().unwrap();
-        entry["seal"][0] = serde_json::json!(old ^ 1);
+        let seal_byte = entry
+            .get_mut("seal")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|seal| seal.first_mut())
+            .expect("authority entry has a first seal byte");
+        let old = seal_byte.as_u64().expect("seal byte is an unsigned integer");
+        *seal_byte = serde_json::json!(old ^ 1);
         conn.execute(
             "UPDATE authority SET entry=?1 WHERE run=?2",
             (serde_json::to_string(&entry)?, &worker.run_id),
@@ -47,7 +52,7 @@ async fn forged_parent_authority_seal_is_refused_after_restart() -> Result<()> {
 #[tokio::test]
 async fn worker_child_cannot_widen_parent_capabilities() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    with_worker_probe_manifest(&tmp, "ollama".into(), false, |mut worker| async move {
+    with_prepared_worker_manifest(&tmp, "ollama".into(), None, |mut worker| async move {
         let workspace = std::path::PathBuf::from(&worker.child_source.as_ref().unwrap().parent_constraints.workspace);
         worker.capability_manifest.as_mut().unwrap().allowed =
             worker.child_source.as_ref().unwrap().parent_constraints.allowed.clone();
@@ -60,7 +65,7 @@ async fn worker_child_cannot_widen_parent_capabilities() -> Result<()> {
 #[tokio::test]
 async fn pre_upgrade_child_verifies_through_causal_store_fallback() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    with_worker_probe_manifest(&tmp, "ollama".into(), false, |worker| async move {
+    with_prepared_worker_manifest(&tmp, "ollama".into(), None, |worker| async move {
         let workspace = std::path::Path::new(&worker.child_source.as_ref().unwrap().parent_constraints.workspace);
         std::fs::remove_file(authority_journal::path(workspace))?;
         assert!(verify_worker_parent_authority(&worker, workspace)?.is_some());

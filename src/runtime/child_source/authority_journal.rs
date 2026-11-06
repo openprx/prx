@@ -106,7 +106,7 @@ pub(crate) fn verify(worker: &WorkerManifest, workspace: &Path, key: &DecisionKe
     );
     anyhow::ensure!(
         entry.payload == binding(worker)?,
-        "worker authority journal differs from issued parent"
+        "session-worker parent decision differs from issued authority"
     );
     Ok(true)
 }

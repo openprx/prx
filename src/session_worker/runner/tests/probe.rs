@@ -42,7 +42,6 @@ where
     F: FnOnce(WorkerManifest) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    use crate::providers::credential_probe::PROBE_MODEL;
     // Retain only the existing driver's neutral decision request/reply evidence.
     // A fresh directory under the owned scratch cannot reuse an external target.
     let diagnostics = tmp.path().join("decision-evidence");
@@ -72,49 +71,67 @@ where
     let endpoint = driver.endpoint().to_owned();
     driver
         .run_factory(!generation_negative, || async {
-            let config_dir = tmp.path().join("config");
-            let workspace = config_dir.join("workspace");
-            std::fs::create_dir_all(&workspace)?;
-            let mut config = crate::config::Config::default();
-            config.config_path = config_dir.join("config.toml");
-            config.workspace_dir = workspace.clone();
-            config.default_provider = Some("ollama".into());
-            config.default_model = Some("prx-local-model".into());
-            config.memory.backend = "sqlite".into();
-            config.autonomy.level = crate::security::AutonomyLevel::Full;
-            config.sessions_spawn.default_mode = "process".into();
-            config.sessions_spawn.cleanup_on_complete = false;
-            config.providers.models.push(toml::from_str(
-                "provider='ollama'\nmodel='prx-local-model'\noperations=['chat']\nnative_tools=true\n",
-            )?);
-            config.providers.models.push(serde_json::from_value(serde_json::json!({
-                "provider":provider_name,"model":PROBE_MODEL,"operations":["chat"]
-            }))?);
-            config.cost.prices.insert(
-                format!("{provider_name}/{PROBE_MODEL}"),
-                crate::config::schema::ModelPricing {
-                    input: 0.1,
-                    output: 0.2,
-                    cache_write: 0.3,
-                    cache_read: 0.1,
-                },
-            );
-            crate::agent::agent::native_decision_fixture::configure(&mut config, &endpoint)?;
-            std::fs::write(&config.config_path, toml::to_string(&config)?)?;
-            let mut manifest = base_manifest(&tmp.path().join("worker"), "unused-for-direct-validation");
-            manifest.config_dir = config_dir;
-            manifest.provider_name = provider_name;
-            manifest.model = PROBE_MODEL.to_owned();
-            manifest.task = "Describe the project.".to_owned();
-            manifest.allowed_tools = Vec::new();
-            manifest.identity_dir = None;
-            manifest.memory_db_path = workspace.join("memory/brain.db");
-            manifest.shared_memory_db_path = Some(manifest.memory_db_path.clone());
-            manifest.memory_workspace_id = Some(workspace.to_string_lossy().into_owned());
-            manifest.memory_event_recording = config.memory.event_recording_config();
-            crate::runtime::turn_decision::with_worker_probe_manifest(config, manifest, consume).await
+            with_prepared_worker_manifest(tmp, provider_name, Some(&endpoint), consume).await
         })
         .await
+}
+
+/// Prepare live parent-issued authority without requiring child execution or a
+/// child decision endpoint. Authority-only tests consume the sealed manifest.
+pub(super) async fn with_prepared_worker_manifest<T, F, Fut>(
+    tmp: &tempfile::TempDir,
+    provider_name: String,
+    endpoint: Option<&str>,
+    consume: F,
+) -> Result<T>
+where
+    F: FnOnce(WorkerManifest) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    use crate::providers::credential_probe::PROBE_MODEL;
+    let config_dir = tmp.path().join("config");
+    let workspace = config_dir.join("workspace");
+    std::fs::create_dir_all(&workspace)?;
+    let mut config = crate::config::Config::default();
+    config.config_path = config_dir.join("config.toml");
+    config.workspace_dir = workspace.clone();
+    config.default_provider = Some("ollama".into());
+    config.default_model = Some("prx-local-model".into());
+    config.memory.backend = "sqlite".into();
+    config.autonomy.level = crate::security::AutonomyLevel::Full;
+    config.sessions_spawn.default_mode = "process".into();
+    config.sessions_spawn.cleanup_on_complete = false;
+    config.providers.models.push(toml::from_str(
+        "provider='ollama'\nmodel='prx-local-model'\noperations=['chat']\nnative_tools=true\n",
+    )?);
+    config.providers.models.push(serde_json::from_value(serde_json::json!({
+        "provider":provider_name,"model":PROBE_MODEL,"operations":["chat"]
+    }))?);
+    config.cost.prices.insert(
+        format!("{provider_name}/{PROBE_MODEL}"),
+        crate::config::schema::ModelPricing {
+            input: 0.1,
+            output: 0.2,
+            cache_write: 0.3,
+            cache_read: 0.1,
+        },
+    );
+    if let Some(endpoint) = endpoint {
+        crate::agent::agent::native_decision_fixture::configure(&mut config, endpoint)?;
+    }
+    std::fs::write(&config.config_path, toml::to_string(&config)?)?;
+    let mut manifest = base_manifest(&tmp.path().join("worker"), "unused-for-direct-validation");
+    manifest.config_dir = config_dir;
+    manifest.provider_name = provider_name;
+    manifest.model = PROBE_MODEL.to_owned();
+    manifest.task = "Describe the project.".to_owned();
+    manifest.allowed_tools = Vec::new();
+    manifest.identity_dir = None;
+    manifest.memory_db_path = workspace.join("memory/brain.db");
+    manifest.shared_memory_db_path = Some(manifest.memory_db_path.clone());
+    manifest.memory_workspace_id = Some(workspace.to_string_lossy().into_owned());
+    manifest.memory_event_recording = config.memory.event_recording_config();
+    crate::runtime::turn_decision::with_worker_probe_manifest(config, manifest, consume).await
 }
 
 /// Event types the worker's shared-fabric memory recorded for its workspace.
