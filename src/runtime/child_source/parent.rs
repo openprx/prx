@@ -428,7 +428,7 @@ impl ParentSource {
 
     pub(crate) async fn restore_process(
         worker: &crate::session_worker::protocol::WorkerManifest,
-        store: &crate::causal_tree::store::CausalDecisionStore,
+        store: Option<&crate::causal_tree::store::CausalDecisionStore>,
         scope: &crate::tools::capability::child::VerifiedChildScope,
         fabric: &MemoryFabric,
         generation: &crate::config::ConfigGeneration,
@@ -477,40 +477,47 @@ impl ParentSource {
                 && fields.config_source_revision == generation.source_revision.fingerprint_sha256,
             "worker parent provenance differs from verified scope"
         );
-        let store_workspace = store.workspace_id().context("worker parent store namespace missing")?;
-        anyhow::ensure!(
-            store_workspace.as_ref() == source.parent_store_workspace,
-            "worker parent store namespace differs from signed source"
-        );
-        let owner_scope = DecisionScope::Owner {
-            workspace_id: store_workspace,
-            owner_id: Arc::from(fields.owner_id.as_str()),
+        let journal = super::authority_journal::verify(worker, &generation.effective.workspace_dir, &constraints.key)?;
+        let row = if journal {
+            None
+        } else {
+            let store = store.context("legacy worker parent store missing")?;
+            let store_workspace = store.workspace_id().context("worker parent store namespace missing")?;
+            anyhow::ensure!(
+                store_workspace.as_ref() == source.parent_store_workspace,
+                "worker parent store namespace differs from signed source"
+            );
+            let owner_scope = DecisionScope::Owner {
+                workspace_id: store_workspace,
+                owner_id: Arc::from(fields.owner_id.as_str()),
+            };
+            let row = store
+                .reader()
+                .replay_record(
+                    &owner_scope,
+                    &crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
+                )?
+                .context("worker parent decision is unavailable")?;
+            anyhow::ensure!(
+                row.digest == source.parent_decision_digest
+                    && snapshot.matches_worker_parent_run(worker, &row.decision)
+                    && row.decision.admits_issued_child()
+                    && row.decision.enabled_snapshot
+                    && !row.decision.legacy_v1
+                    && row.source_event_id.as_deref() == Some(source_id)
+                    && row.decision.run_id.as_deref() == Some(fields.run_id.as_str())
+                    && fields.task_run_id.as_deref().is_none_or(|task| {
+                        surface == TurnSurfaceKind::Worker
+                            && child.authority.delegation.is_some()
+                            && !task.is_empty()
+                            && task != fields.run_id
+                            && row.decision.task_id.as_deref() == Some(task)
+                    })
+                    && row.decision.session_key.as_deref() == Some(fields.session_key.as_str()),
+                "worker parent provenance differs from durable decision"
+            );
+            Some(row)
         };
-        let row = store
-            .reader()
-            .replay_record(
-                &owner_scope,
-                &crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
-            )?
-            .context("worker parent decision is unavailable")?;
-        anyhow::ensure!(
-            row.digest == source.parent_decision_digest
-                && snapshot.matches_worker_parent_run(worker, &row.decision)
-                && row.decision.admits_issued_child()
-                && row.decision.enabled_snapshot
-                && !row.decision.legacy_v1
-                && row.source_event_id.as_deref() == Some(source_id)
-                && row.decision.run_id.as_deref() == Some(fields.run_id.as_str())
-                && fields.task_run_id.as_deref().is_none_or(|task| {
-                    surface == TurnSurfaceKind::Worker
-                        && child.authority.delegation.is_some()
-                        && !task.is_empty()
-                        && task != fields.run_id
-                        && row.decision.task_id.as_deref() == Some(task)
-                })
-                && row.decision.session_key.as_deref() == Some(fields.session_key.as_str()),
-            "worker parent provenance differs from durable decision"
-        );
         let event = fabric
             .memory()
             .find_owned_message_event(&fields.workspace_id, &fields.owner_id, source_id)
@@ -534,10 +541,10 @@ impl ParentSource {
                 && input.workspace_id == fields.workspace_id
                 && input.owner_id == event.owner_id
                 && input.parent_run_id.as_deref() == Some(fields.task_run_id.as_deref().unwrap_or(&fields.run_id))
-                && fields
-                    .task_run_id
-                    .as_deref()
-                    .is_none_or(|task| { matches_parent_task_segment(task, &row, &event) })
+                && fields.task_run_id.as_deref().is_none_or(|task| {
+                    row.as_ref()
+                        .is_none_or(|row| matches_parent_task_segment(task, row, &event))
+                })
                 && input.parent_session_key == event.session_key
                 && input.causation_event_id.as_deref() == Some(source_id)
                 && input.run_id != event.run_id

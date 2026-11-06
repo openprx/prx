@@ -1,4 +1,5 @@
 //! Durable child-input receipts, independent of parent message provenance.
+pub(crate) mod authority_journal;
 mod parent_authority;
 pub(crate) mod recursive_allowance;
 pub(crate) use parent_authority::ParentAuthority;
@@ -547,7 +548,7 @@ mod recursive;
 
 pub(crate) struct ChildGrantRuntime {
     pub(crate) recursive_child_claimed: Option<Arc<recursive_allowance::RecursiveAllowance>>,
-    pub(crate) decision_store: Arc<crate::causal_tree::store::CausalDecisionStore>,
+    pub(crate) decision_store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
     pub(crate) source_fabric: MemoryFabric,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
 }
@@ -599,6 +600,10 @@ impl IssuedChildGrant {
         runtime: ChildGrantRuntime,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
+            runtime.decision_store.is_some(),
+            "live child issuer requires its admitted store"
+        );
+        anyhow::ensure!(
             execution_policy.matches(&runtime.security),
             "child execution policy differs from admitted service"
         );
@@ -639,9 +644,10 @@ impl IssuedChildGrant {
             source_fabric,
             security,
         } = runtime;
-        let actual_store = decision_store
-            .workspace_id()
-            .context("child decision store namespace missing")?;
+        let actual_store = match decision_store {
+            Some(store) => store.workspace_id().context("child decision store namespace missing")?,
+            None => Arc::clone(&parent_record_binding.0),
+        };
         let (manifest, _) = scope.gate_inputs();
         anyhow::ensure!(
             source_fabric.workspace_id() == parent.workspace_id()
@@ -692,6 +698,11 @@ impl IssuedChildGrant {
         transport: &crate::session_worker::runner::AuthenticatedWorkerTransport,
     ) -> anyhow::Result<Arc<Self>> {
         transport.verify_manifest(worker)?;
+        anyhow::ensure!(
+            runtime.decision_store.is_some()
+                || authority_journal::verify(worker, &generation.effective.workspace_dir, &scope.gate_inputs().1.key)?,
+            "worker restoration requires journal or legacy store"
+        );
         receipt.verify_backend(&runtime.source_fabric.memory())?;
         verify_worker_input(runtime.source_fabric.workspace_id(), worker, &scope, receipt.event())?;
         let source = worker.child_source.as_ref().context("worker child source missing")?;
@@ -817,6 +828,7 @@ impl IssuedChildGrant {
             config_generation,
             catalog,
         });
+        authority_journal::persist(worker, &constraints.key)?;
         Ok(())
     }
 

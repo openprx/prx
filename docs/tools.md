@@ -387,8 +387,17 @@ worker admission. Their transport binds
 the child capability subset, durable input identifier, and parent decision digest
 inside the worker signature. Parent constraints carry a separate decision-key
 signature. The worker loads existing authority without creating keys or repairing
-permissions, verifies the strict subset and inner seals, and reads the original
-owner-scoped parent decision to compare its actual record digest. A separate
+permissions, and verifies the strict subset and inner seals. New delegated
+launches persist an immutable, signed authority binding in the logical workspace's
+`self/child_authority/journal.db` before handing off the worker manifest. Parent
+verification and source restoration use that binding without reading the decision
+store. Only a missing journal file or launch row falls back to the original
+owner-scoped parent decision and record digest; corrupt or mismatched journal
+entries are refused. Segment admission still runs the existing decision gate,
+and completion retains its admitted terminal settlement reference. Batch and
+parent-side process-terminal recovery retain their existing decision-store paths.
+Reverting this change restores the legacy reader; journal entries can remain in
+place. A separate
 keyed binding covers the parent's effective configuration, logical workspace,
 configuration path and generation metadata without transporting configuration
 values. A worker may restore that generation only when its loaded source and

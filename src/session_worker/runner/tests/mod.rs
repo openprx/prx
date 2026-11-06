@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+#[cfg(unix)]
+mod authority;
 mod credentials;
 mod hybrid;
 #[cfg(unix)]
