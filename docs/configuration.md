@@ -441,8 +441,6 @@ backend = "sqlite"
 # Compatibility gate for semantic promotion. Message events are controlled below.
 auto_save = true
 
-# Ingress crash recovery follows user-message recording, including when
-# an explicit versioned [causal_tree] enabled = false disables decisions.
 [memory.events]
 record_user_messages = true
 record_assistant_messages = true

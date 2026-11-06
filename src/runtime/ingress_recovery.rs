@@ -47,7 +47,8 @@ impl RecoveryScope {
     }
 
     /// Initialize durable recovery from pinned runtime inputs, without building
-    /// a decision engine, catalog, or execution service.
+    /// a decision engine, catalog, or execution service. The caller supplies its
+    /// single key-preparation result; missing authority never triggers a retry.
     pub(crate) async fn prepare(
         generation: &crate::config::ConfigGeneration,
         memory: Arc<dyn Memory>,
@@ -55,10 +56,13 @@ impl RecoveryScope {
         observer: Arc<dyn crate::decision::telemetry::CausalEventSink>,
         parent_grant: Option<&super::child_source::IssuedChildGrant>,
         owner: &Arc<super::turn_cleanup::CleanupTracker>,
+        workspace_key: Option<Arc<DecisionKey>>,
     ) -> anyhow::Result<Arc<Self>> {
         let config = &generation.effective;
         let recording = config.memory.event_recording_config();
-        let recordable = crate::memory::serves_tool_execution_ledger(memory.name())
+        let recordable = config.causal_tree.enabled
+            && workspace_key.is_some()
+            && crate::memory::serves_tool_execution_ledger(memory.name())
             && recording.enabled
             && recording.record_user_messages;
         let mut scope = Self {
@@ -67,15 +71,12 @@ impl RecoveryScope {
             recordable,
             durable_key: false,
             surface,
-            state_key: DecisionKey::ephemeral(),
+            state_key: workspace_key.unwrap_or_else(DecisionKey::ephemeral),
             store: None,
             parent_decision_id: parent_grant.map(|grant| grant.scope().gate_inputs().0.parent_decision_id),
             durable_events: None,
         };
         if recordable {
-            let workspace = config.workspace_dir.clone();
-            scope.state_key =
-                owned_store_operation(owner, move || Ok(DecisionKey::load_or_create(&workspace)?)).await?;
             scope.durable_key = true;
             let events = Arc::new(super::causal_events::DurableCausalEventSink::new(
                 generation, memory, observer,
@@ -234,7 +235,7 @@ impl IngressRecorder {
         ticket: &super::turn_cleanup::CleanupTicket,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         let recording = config.memory.event_recording_config();
-        if !recording.enabled || !recording.record_user_messages {
+        if !config.causal_tree.enabled || !recording.enabled || !recording.record_user_messages {
             return Ok(None);
         }
         let deadline = Instant::now() + Duration::from_secs(15);

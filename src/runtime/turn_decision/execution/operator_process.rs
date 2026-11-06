@@ -66,6 +66,7 @@ impl TurnDecisionService {
             Arc::clone(&build.events),
             None,
             &recovery_owner,
+            workspace_key.clone(),
         )
         .await?;
         let durable_events = if durable_key {

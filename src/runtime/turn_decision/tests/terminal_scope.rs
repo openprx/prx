@@ -349,8 +349,9 @@ async fn disabled_terminal_validates_source_without_decision_store_writes() {
     assert!(receipt.assistant_event.is_some());
     assert_eq!(fixture.marker_presence(&fabric).await, [false, true, false, true]);
     assert!(fixture.service.store.writer().is_none());
-    assert!(fixture.workspace.path().join("self/causal_tree/.decision_key").exists());
-    assert!(fixture.service.recovery_scope().ingress_recovery_enabled());
+    assert!(!fixture.workspace.path().join("self/causal_tree/.decision_key").exists());
+    assert!(!fixture.workspace.path().join("self/causal_tree/decisions.db").exists());
+    assert!(!fixture.service.recovery_scope().ingress_recovery_enabled());
     fixture.assert_no_outcome().await;
 }
 
@@ -439,6 +440,7 @@ async fn recorded_terminal_rejoins_after_service_drop_with_independent_recovery(
         Arc::new(RecordingSink::default()),
         None,
         &cleanup,
+        Some(DecisionKey::load_existing(&generation.effective.workspace_dir).unwrap()),
     )
     .await
     .expect("independent recovery initialization");

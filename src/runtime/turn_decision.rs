@@ -3164,7 +3164,8 @@ pub(crate) async fn build_turn_decision_service(
         return Err(TurnServiceBuildError::InboundEventsDisabled);
     }
     // `load_key` deliberately does not touch the workspace key while the
-    // plane is disabled. An unavailable key leaves the factory builtin-only.
+    // plane is disabled. Its single preparation result is shared with recovery;
+    // an unavailable key leaves both the factory builtin-only and recovery unrecorded.
     let workspace_key = store_preparation::load_key(Arc::clone(&build.generation)).await?;
     let durable_key = config.causal_tree.enabled && workspace_key.is_some();
     if let Some(grant) = &build.parent_grant {
@@ -3206,6 +3207,7 @@ pub(crate) async fn build_turn_decision_service(
         Arc::clone(&build.events),
         build.parent_grant.as_deref(),
         &recovery_owner,
+        workspace_key.clone(),
     )
     .await
     .map_err(TurnServiceBuildError::RecoveryPreparation)?;
