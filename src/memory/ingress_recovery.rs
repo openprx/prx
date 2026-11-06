@@ -14,6 +14,8 @@ pub struct IngressRecoveryScope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngressCapsule {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
     pub backend_namespace: String,
     pub scope: IngressRecoveryScope,
     pub lifetime: String,
@@ -99,7 +101,14 @@ pub const MAX_ID_BYTES: usize = 4096;
 
 impl IngressCapsule {
     pub fn validate_bounds(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(matches!(self.version, 1 | 2), "unsupported ingress capsule version");
+        match (self.version, self.key_id.as_deref()) {
+            (1 | 2, None) => {}
+            (3, Some(id)) => anyhow::ensure!(
+                uuid::Uuid::parse_str(id)?.to_string() == id,
+                "non-canonical recovery key id"
+            ),
+            _ => anyhow::bail!("unsupported ingress capsule version or key id"),
+        }
         for value in [
             &self.scope.workspace_id,
             &self.scope.owner_id,

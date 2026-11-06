@@ -172,6 +172,9 @@ fn restrict_owner_mode(_db_path: &Path) -> anyhow::Result<()> {
 #[derive(Clone)]
 pub struct SqliteMemory {
     pool: Arc<SqliteConnectionPool>,
+    #[cfg(test)]
+    recovery_activation_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    recovery_availability: Arc<std::sync::OnceLock<Result<(), String>>>,
     ingress_owners: Arc<super::ingress_recovery::IngressOwnerCache>,
     db_path: PathBuf,
     acl_enabled: bool,
@@ -373,6 +376,9 @@ impl SqliteMemory {
         Ok(Self {
             pool,
             ingress_owners: Default::default(),
+            recovery_availability: Default::default(),
+            #[cfg(test)]
+            recovery_activation_attempts: Default::default(),
             db_path,
             acl_enabled,
             embedder,

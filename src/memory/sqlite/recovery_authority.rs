@@ -1,7 +1,8 @@
 //! Lazy recovery authority, owned by the SQLite writer transaction.
 use super::{SqliteMemory, recovery_keys::KeyDirectory};
 use crate::memory::recovery_authority::{
-    RecoveryChain, RecoveryEvidence, RecoveryFactsTooLarge, RecoveryPublication, RecoveryReceipt, RecoveryRepository,
+    RecoveryChain, RecoveryEvidence, RecoveryFactsTooLarge, RecoveryMacDomain, RecoveryPublication, RecoveryReceipt,
+    RecoveryRepository, RecoveryTag,
 };
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::ValueRef};
@@ -370,7 +371,42 @@ impl SqliteMemory {
 
 impl RecoveryRepository for SqliteMemory {
     fn activate_recovery_authority(&self) -> anyhow::Result<String> {
-        self.recovery_activate(false)
+        let availability = self.recovery_availability.get_or_init(|| {
+            #[cfg(test)]
+            self.recovery_activation_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.recovery_activate(false).map(|_| ()).map_err(|_| {
+                tracing::warn!("recovery authority unavailable; activation will not be retried");
+                "recovery authority unavailable".to_owned()
+            })
+        });
+        availability.as_ref().map_err(|error| anyhow::anyhow!(error.clone()))?;
+        Ok(active(&self.pool.write())?.1)
+    }
+    fn recovery_mac(
+        &self,
+        key_id: Option<&str>,
+        domain: RecoveryMacDomain,
+        bytes: &[u8],
+    ) -> anyhow::Result<RecoveryTag> {
+        anyhow::ensure!(bytes.len() <= MAX_SERIALIZED_FACTS, "oversized recovery MAC input");
+        let writer = self.pool.write();
+        let id = match key_id {
+            Some(id) => id.to_owned(),
+            None => active(&writer)?.1,
+        };
+        let directory = KeyDirectory::open(self.db_path.parent().context("missing memory directory")?, false)?;
+        let key = directory.load(&id)?;
+        let signed = ring::hmac::sign(&key, &framed(domain.bytes(), bytes));
+        let tag = signed.as_ref().try_into().context("invalid recovery MAC length")?;
+        Ok(RecoveryTag { key_id: id, tag })
+    }
+    fn verify_recovery_mac(&self, tag: &RecoveryTag, domain: RecoveryMacDomain, bytes: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(bytes.len() <= MAX_SERIALIZED_FACTS, "oversized recovery MAC input");
+        let directory = KeyDirectory::open(self.db_path.parent().context("missing memory directory")?, false)?;
+        let key = directory.load(&tag.key_id)?;
+        ring::hmac::verify(&key, &framed(domain.bytes(), bytes), &tag.tag)
+            .map_err(|_| anyhow::anyhow!("invalid recovery authentication"))
     }
     fn rotate_recovery_authority(&self) -> anyhow::Result<String> {
         self.recovery_activate(true)

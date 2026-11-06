@@ -273,6 +273,10 @@ impl LucidMemory {
 
 #[async_trait]
 impl Memory for LucidMemory {
+    fn recovery_repository(&self) -> Option<&dyn crate::memory::recovery_authority::RecoveryRepository> {
+        self.local.recovery_repository()
+    }
+
     fn name(&self) -> &str {
         "lucid"
     }

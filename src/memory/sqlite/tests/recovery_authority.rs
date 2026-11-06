@@ -390,3 +390,86 @@ fn recovery_max_size_facts_still_settle() {
         settled
     );
 }
+
+#[tokio::test]
+async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()> {
+    use crate::runtime::ingress_recovery::IngressRecorder;
+    let (dir, memory) = store()?;
+    let id = memory.activate_recovery_authority()?;
+    let key_file = memory
+        .db_path
+        .parent()
+        .context("memory directory")?
+        .join(".recovery_keys")
+        .join(format!("{id}.key"));
+    // Reopen so activation observes corruption on its first attempt.
+    std::fs::write(&key_file, [0u8; 32])?;
+    drop(memory);
+    let memory = Arc::new(SqliteMemory::new(dir.path())?);
+    #[derive(Clone)]
+    struct Logs(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let logs = Logs(Arc::new(parking_lot::Mutex::new(Vec::new())));
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    // The first forwarded activation establishes the failure; preparations must
+    // share this same result, including its one warning, without reading again.
+    tracing::subscriber::with_default(subscriber, || {
+        anyhow::ensure!(
+            memory
+                .recovery_repository()
+                .context("repository")?
+                .activate_recovery_authority()
+                .is_err(),
+            "corrupt key accepted"
+        );
+        Ok::<_, anyhow::Error>(())
+    })?;
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = dir.path().to_owned();
+    config.causal_tree.enabled = true;
+    for _ in 0..2 {
+        let tracker = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+        let ticket = tracker.register(tokio_util::sync::CancellationToken::new())?;
+        let result = IngressRecorder::prepare(memory.clone(), &config, &ticket).await;
+        ticket.finish(true);
+        anyhow::ensure!(result.is_err(), "corrupt authority made recorder available");
+    }
+    anyhow::ensure!(
+        memory
+            .recovery_activation_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 1,
+        "activation retried"
+    );
+    let output = String::from_utf8(logs.0.lock().clone())?;
+    anyhow::ensure!(
+        output
+            .matches("recovery authority unavailable; activation will not be retried")
+            .count()
+            == 1,
+        "warning not emitted exactly once"
+    );
+    anyhow::ensure!(
+        std::fs::read_dir(key_file.parent().context("key directory")?)?.count() == 1,
+        "additional key created"
+    );
+    anyhow::ensure!(std::fs::read(&key_file)? == [0u8; 32], "corrupt key was replaced");
+    anyhow::ensure!(
+        !dir.path().join("self/causal_tree/.decision_key").exists(),
+        "legacy authority created"
+    );
+    Ok(())
+}
