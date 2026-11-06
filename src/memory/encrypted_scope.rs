@@ -643,7 +643,7 @@ impl Memory for EncryptedScope {
                 session_id: entry.session_id,
                 content: entry.content,
                 created_at: entry.timestamp,
-                source_event_id: None,
+                source_event_id: entry.source_event_id,
             })
             .collect())
     }

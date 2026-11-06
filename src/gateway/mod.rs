@@ -2632,7 +2632,8 @@ async fn run_gateway_chat_with_multimodal(
                     } else {
                         "private"
                     },
-                ),
+                )
+                .with_current_input_key(autosave_key.map(str::to_owned)),
                 message,
                 crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
             )

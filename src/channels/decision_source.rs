@@ -24,6 +24,7 @@ pub(super) struct ChannelSourceReceipt {
     generation: Arc<ConfigGeneration>,
     chat_type: String,
     pub(super) message_id: String,
+    pub(super) current_input_key: String,
 }
 
 pub(super) struct ChannelAdmissionGuard {
@@ -430,6 +431,7 @@ impl ChannelSourceReceipt {
         }
         Ok(Self {
             message_id: message.id.clone(),
+            current_input_key: super::inbound_policy::conversation_memory_key(message),
             envelope,
             input: Arc::from(message.content.as_str()),
             generation: Arc::clone(generation),

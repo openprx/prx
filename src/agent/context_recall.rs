@@ -43,6 +43,13 @@ pub(crate) struct RecallScope {
 }
 
 impl RecallScope {
+    pub(crate) fn with_current_input_key(mut self, key: Option<String>) -> Self {
+        if key.is_some() {
+            self.current_input_key = key;
+        }
+        self
+    }
+
     pub(crate) fn from_envelope(
         envelope: &crate::runtime::envelope::RuntimeEnvelope,
         config: &crate::config::MemoryConfig,

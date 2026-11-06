@@ -92,6 +92,23 @@ async fn selected_custom_loader_reads_actual_owner_rows_only() {
         )
         .await
         .unwrap();
+    let key_without_event = "user_msg:prx_run";
+    memory
+        .store_with_context_and_metadata(
+            key_without_event,
+            "prx_query live input without provenance",
+            crate::memory::MemoryCategory::Conversation,
+            Some("prx_session"),
+            Some(&scope),
+            crate::memory::MemoryStoreMetadata {
+                workspace_id: Some("prx_workspace".into()),
+                owner_id: Some("prx_owner".into()),
+                channel: Some("agent_api".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let loaded = crate::agent::memory_loader::load_selected_memory(
         &Loader,
         &memory,
@@ -99,7 +116,7 @@ async fn selected_custom_loader_reads_actual_owner_rows_only() {
         &scope,
         "prx_session",
         std::time::Instant::now() + std::time::Duration::from_millis(500),
-        Some(excluded_event),
+        (Some(key_without_event), Some(excluded_event)),
     )
     .await
     .unwrap();

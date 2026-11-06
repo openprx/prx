@@ -144,7 +144,8 @@ impl ChannelDecisionTurn {
                     &envelope,
                     &generation.effective.memory,
                     proof.policy_chat_type(),
-                ),
+                )
+                .with_current_input_key(Some(source.current_input_key.clone())),
                 proof.routing_input(),
                 crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
             )

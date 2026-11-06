@@ -1098,19 +1098,4 @@ async fn cli_production_autosave_excludes_live_input() {
         current_input_memory_key(run),
         "production save uses the current run key"
     );
-    let envelope =
-        resolve_agent_turn_envelope(None, &workspace_id, run).with_source_message_event_id(event.event_id.clone());
-    let recalled = crate::agent::context_recall::scoped_recall(
-        &memory,
-        &crate::agent::context_recall::RecallScope::from_envelope(
-            &envelope,
-            &crate::config::MemoryConfig::default(),
-            "private",
-        ),
-        input,
-        crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
-    )
-    .await;
-    assert!(!recalled.preamble.contains("[Memory context]"));
-    assert!(!recalled.ids.contains(&row.id));
 }

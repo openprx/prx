@@ -848,6 +848,15 @@ async fn process_channel_message_answers_plain_turn_with_scoped_recall_without_s
 
 #[tokio::test]
 async fn channel_dm_autosave_excludes_live_input_from_prompt() {
+    assert_channel_dm_autosave_excludes_live_input(true).await;
+}
+
+#[tokio::test]
+async fn channel_dm_autosave_excludes_live_input_when_user_message_recording_off() {
+    assert_channel_dm_autosave_excludes_live_input(false).await;
+}
+
+async fn assert_channel_dm_autosave_excludes_live_input(record_user_messages: bool) {
     let workspace = TempDir::new().expect("test: private channel workspace");
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -857,10 +866,18 @@ async fn channel_dm_autosave_excludes_live_input_from_prompt() {
 
     let provider_impl = Arc::new(HistoryCaptureProvider::default());
     let memory = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
+    let mut config = Config::default();
+    config.memory.events.record_user_messages = record_user_messages;
+    // Enabled decision admission requires a durable user event. Exercise the
+    // supported recording-disabled turn with the decision plane disabled too.
+    config.causal_tree.enabled = record_user_messages;
+    config.memory.auto_save = true;
+    config.default_model = Some("test-model".into());
+    let config = crate::config::new_shared(config);
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
-        config: crate::config::new_shared(Config::default()),
-        config_generation: crate::config::new_shared(Config::default()).pin(),
+        config: config.clone(),
+        config_generation: config.pin(),
         channels_by_name: Arc::new(channels_by_name),
         provider: provider_impl.clone(),
         default_provider: Arc::new("test-provider".to_string()),
@@ -871,7 +888,7 @@ async fn channel_dm_autosave_excludes_live_input_from_prompt() {
         model: Arc::new("test-model".to_string()),
         temperature: 0.0,
         auto_save_memory: true,
-        memory_event_recording: MemoryEventRecording::default(),
+        memory_event_recording: config.pin().effective.memory.event_recording_config(),
         read_only_tool_concurrency_window: 2,
         priority_scheduling_enabled: false,
         low_priority_tools: Vec::new(),
