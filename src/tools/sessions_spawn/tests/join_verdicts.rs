@@ -22,10 +22,14 @@ impl TaskRoutingProvider {
     const FAILURE_TEXT: &'static str = "I looked at this and it cannot be done";
 
     async fn route(&self, prompt: &str) -> anyhow::Result<String> {
-        if prompt.contains(Self::FAILS) {
+        // Child prompts now carry a scoped `[Current session context]` recall
+        // block (#105) listing sibling batch tasks. Route on the member's own
+        // task, which is the final line of the prompt, never on sibling text.
+        let task = prompt.rsplit('\n').next().unwrap_or(prompt);
+        if task.contains(Self::FAILS) {
             anyhow::bail!(Self::FAILURE_TEXT);
         }
-        if prompt.contains(Self::PARKS) {
+        if task.contains(Self::PARKS) {
             if let Ok(permit) = self.gate.acquire().await {
                 drop(permit);
             }

@@ -278,11 +278,18 @@ impl Fixture {
         assert_eq!(count, 1, "positive control must create a real training receipt");
         {
             let observed = self.observed.observations.lock();
+            // Two query-memory reads by design: the selected decision read and
+            // the independent prompt recall (#105). Router history is counted
+            // separately below and never counts as query evidence.
             assert_eq!(
-                observed.query_reads, 1,
-                "query evidence requires its own actual selected read"
+                observed.query_reads, 2,
+                "query evidence requires its own actual selected read plus one independent prompt recall"
             );
-            assert_eq!(observed.last_query_hit_count, Some(1));
+            assert_eq!(
+                observed.first_query_hit_count,
+                Some(1),
+                "the selected decision read (first query read) must carry its own hit"
+            );
             assert_eq!(observed.read_calls, 1);
             assert_eq!(observed.last_read.as_ref().unwrap().as_ref().unwrap().count, 0);
             assert_eq!(observed.commit_calls, 1);

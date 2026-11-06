@@ -44,6 +44,7 @@ pub(super) struct ReadSummary {
 #[derive(Debug, Default)]
 pub(super) struct Observations {
     pub query_reads: usize,
+    pub first_query_hit_count: Option<usize>,
     pub last_query_hit_count: Option<usize>,
     pub read_calls: usize,
     pub last_read: Option<Result<ReadSummary, Vec<String>>>,
@@ -255,12 +256,24 @@ impl Memory for ObservedSqlite {
         session_id: Option<&str>,
         deadline: std::time::Instant,
     ) -> anyhow::Result<Vec<DecisionMemoryHit>> {
-        self.observations.lock().query_reads += 1;
+        // The selected decision read is the first query read of a turn; the
+        // prompt recall that follows it is an independent read (#105).
+        let is_first_query = {
+            let mut observations = self.observations.lock();
+            observations.query_reads += 1;
+            observations.query_reads == 1
+        };
         let result = self
             .inner
             .retrieve_decision_memory(query, limit, context, session_id, deadline)
             .await;
-        self.observations.lock().last_query_hit_count = result.as_ref().ok().map(Vec::len);
+        let hit_count = result.as_ref().ok().map(Vec::len);
+        let mut observations = self.observations.lock();
+        if is_first_query {
+            observations.first_query_hit_count = hit_count;
+        }
+        observations.last_query_hit_count = hit_count;
+        drop(observations);
         result
     }
 
