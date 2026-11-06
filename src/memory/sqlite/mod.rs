@@ -181,6 +181,10 @@ pub struct SqliteMemory {
     /// Capsule keys that failed to load (and the sentinel "" for an unusable
     /// key directory). Remembered so no capsule retries them.
     recovery_unusable: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// Serializes check, load and failure publication for this handle's activation.
+    recovery_activation: Arc<parking_lot::Mutex<()>>,
+    /// One gate per capsule key id, serializing its check, load and failure publication.
+    recovery_key_gates: Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<parking_lot::Mutex<()>>>>>,
     ingress_owners: Arc<super::ingress_recovery::IngressOwnerCache>,
     db_path: PathBuf,
     acl_enabled: bool,
@@ -385,6 +389,8 @@ impl SqliteMemory {
             recovery_unavailable: Default::default(),
             recovery_warned: Default::default(),
             recovery_unusable: Default::default(),
+            recovery_activation: Default::default(),
+            recovery_key_gates: Default::default(),
             #[cfg(test)]
             recovery_activation_attempts: Default::default(),
             db_path,

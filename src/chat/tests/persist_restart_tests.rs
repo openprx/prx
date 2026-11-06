@@ -81,6 +81,19 @@ async fn guarded_input(
     crate::chat::decision_source::ChatAdmissionGuard,
 )> {
     let provider: Arc<dyn Provider> = Arc::new(crate::providers::ollama::OllamaProvider::new(None, None));
+    guarded_input_with(provider, memory, generation, run).await
+}
+
+async fn guarded_input_with(
+    provider: Arc<dyn Provider>,
+    memory: Arc<dyn Memory>,
+    generation: &Arc<crate::config::ConfigGeneration>,
+    run: &str,
+) -> Result<(
+    MessageEvent,
+    Arc<crate::chat::decision_source::ChatTurnBinding>,
+    crate::chat::decision_source::ChatAdmissionGuard,
+)> {
     let selected = ChatProviderBinding::capture(generation, &provider, "ollama", "prx-local-model")?
         .context("selected provider")?;
     let fabric = MemoryFabric::new(memory, generation.effective.workspace_dir.to_string_lossy())
@@ -105,6 +118,26 @@ async fn guarded_input(
         )
         .await?;
     Ok((source.context("durable source")?, binding, guard))
+}
+
+/// Counts every provider dispatch; admission must never reach one.
+#[derive(Default)]
+struct DispatchCounter(std::sync::atomic::AtomicUsize);
+
+struct CountingProvider(Arc<DispatchCounter>);
+
+#[async_trait::async_trait]
+impl Provider for CountingProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> Result<String> {
+        self.0.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!("dispatch fixture")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -302,6 +335,52 @@ async fn chat_drained_service_releases_ingress_lease_before_restart() {
     let next = restarted_chat(dir.path(), "prx-after-drain").await;
     assert!(next.id > first.id);
     drop(retained_sink);
+}
+
+#[tokio::test]
+async fn retry_after_active_key_loss_is_refused_at_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let _first = completed_chat(dir.path(), Fault::None).await;
+    // Corrupt the active recovery key: preparation now yields no recorder.
+    let key_id = SqliteMemory::new(dir.path())
+        .unwrap()
+        .recovery_repository()
+        .expect("repository-backed store")
+        .activate_recovery_authority()
+        .unwrap();
+    std::fs::write(
+        dir.path()
+            .join("memory")
+            .join(".recovery_keys")
+            .join(format!("{key_id}.key")),
+        [0u8; 32],
+    )
+    .unwrap();
+    let generation = crate::config::new_shared(config_at(dir.path())).pin();
+    let counter = Arc::new(DispatchCounter::default());
+    let provider: Arc<dyn Provider> = Arc::new(CountingProvider(Arc::clone(&counter)));
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+    let cleanup = CleanupScope::new(None, CancellationToken::new()).unwrap();
+    // Same run, generation, scope and input as the accepted turn.
+    let refused = cleanup
+        .scope_admission(async move {
+            Ok(guarded_input_with(provider, memory, &generation, "prx-first-run")
+                .await
+                .err())
+        })
+        .await
+        .unwrap();
+    assert!(
+        refused
+            .as_ref()
+            .is_some_and(|error| error.is::<crate::runtime::ingress_recovery::AlreadyAccepted>()),
+        "retry of an accepted input was admitted: {refused:?}"
+    );
+    assert_eq!(
+        counter.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "dispatch reached"
+    );
 }
 
 #[tokio::test]
