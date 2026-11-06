@@ -13,7 +13,7 @@ fn surface_context(
 ) -> ToolExecutionContext {
     let mut context = context();
     context.turn_surface = Some(Arc::new(TurnSurface::build(
-        &service.descriptors(),
+        service,
         config,
         "prx_model",
         channel,
@@ -155,4 +155,99 @@ async fn admitted_tool_reaches_backend_without_decision_context() {
         ToolExecutionStatus::Succeeded
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+struct MutableSurfaceTool {
+    state: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Tool for MutableSurfaceTool {
+    fn name(&self) -> &str {
+        "project_tool"
+    }
+    fn description(&self) -> &str {
+        "mutable publication fixture"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        if self.state.load(Ordering::SeqCst) == 1 {
+            serde_json::json!({"type":"object", "properties":{"changed":{"type":"string"}}})
+        } else {
+            serde_json::json!({"type":"object", "properties":{}})
+        }
+    }
+    fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+        let mut specs = vec![self.spec()];
+        if self.state.load(Ordering::SeqCst) == 2 {
+            let mut extra = self.spec();
+            extra.name = "project_extra".into();
+            specs.push(extra);
+        }
+        specs
+    }
+    fn availability(&self) -> crate::capability::CapabilityAvailability {
+        if self.state.load(Ordering::SeqCst) == 3 {
+            crate::capability::CapabilityAvailability::declared("fixture unavailable")
+        } else {
+            crate::capability::CapabilityAvailability::configured("fixture configured")
+        }
+    }
+    async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        })
+    }
+}
+async fn assert_stale_after_change(state_value: usize) {
+    let fixture = fixture();
+    let state = Arc::new(AtomicUsize::new(0));
+    let service = ToolExecutionService::new(
+        vec![Arc::new(MutableSurfaceTool {
+            state: Arc::clone(&state),
+            calls: Arc::clone(&fixture.calls),
+        })],
+        Arc::new(FixedPolicy {
+            decision: ToolExecutionDecision::Allow,
+            stages: Arc::clone(&fixture.stages),
+        }),
+        Arc::new(FixedApproval {
+            decision: approved(),
+            stages: Arc::clone(&fixture.stages),
+        }),
+        Arc::new(RecordingPreparation {
+            allowed: true,
+            stages: Arc::clone(&fixture.stages),
+        }),
+        Arc::new(RecordingAudit {
+            records: Arc::clone(&fixture.records),
+            stages: Arc::clone(&fixture.stages),
+        }),
+    );
+    let context = surface_context(&service, &crate::config::ToolTieringConfig::default(), false, true);
+    state.store(state_value, Ordering::SeqCst);
+    let outcome = service
+        .execute(
+            ToolExecutionCommand::new("project_tool", serde_json::json!({})),
+            context,
+            None,
+        )
+        .await;
+    assert_eq!(outcome.status, ToolExecutionStatus::StaleCapability);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(&*fixture.stages.lock(), &["audit"]);
+}
+#[tokio::test]
+async fn registry_generation_change_mid_turn_is_stale() {
+    assert_stale_after_change(2).await;
+}
+#[tokio::test]
+async fn unavailable_tool_is_refused() {
+    assert_stale_after_change(3).await;
+}
+#[tokio::test]
+async fn schema_changed_after_publication_is_stale() {
+    assert_stale_after_change(1).await;
 }

@@ -30,27 +30,22 @@ impl TurnDecisionService {
         config.always_exclude.extend(inherited_exclusions.iter().cloned());
         let channel = self.surface == TurnSurfaceKind::Channel;
         let view = self.catalog_view();
-        crate::tools::execution::admission::TurnSurface::build(
-            &self.execution.current_descriptors(),
-            &config,
-            model,
-            channel,
-            |descriptor| {
-                self.catalog
-                    .entry_for_public_name(&descriptor.public_name)
-                    .is_some_and(|entry| {
-                        !view.surface_excludes(entry)
-                            && (!channel || entry.channel_eligible)
-                            && crate::tools::execution::decide_tool_execution(
-                                &self.security,
-                                entry.policy_tool_name(),
-                                proof.policy_sender(),
-                                proof.policy_channel(),
-                                proof.policy_chat_type(),
-                            ) != crate::tools::execution::ToolExecutionDecision::Deny
-                    })
-            },
-        )
+        crate::tools::execution::admission::TurnSurface::build(&self.execution, &config, model, channel, |descriptor| {
+            self.catalog
+                .entry_for_public_name(&descriptor.public_name)
+                .is_some_and(|entry| {
+                    !view.surface_excludes(entry)
+                        && (!channel || entry.channel_eligible)
+                        && crate::tools::execution::decide_tool_execution(
+                            &self.security,
+                            entry.policy_tool_name(),
+                            proof.policy_sender(),
+                            proof.policy_channel(),
+                            proof.policy_chat_type(),
+                        ) != crate::tools::execution::ToolExecutionDecision::Deny
+                })
+        })
+        .with_tool_calls(self.model_can_call_tools(proof))
     }
 
     /// Local operator commands retain the actual Interactive publication.

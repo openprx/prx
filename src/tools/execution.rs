@@ -2445,14 +2445,14 @@ impl ToolExecutionService {
         // this is the one place every production tool call passes through.
         crate::agent::idle::beat(crate::agent::idle::ProgressKind::ToolStart);
         let input_sha256 = format!("{:x}", Sha256::digest(command.arguments.to_string().as_bytes()));
-        if let Err(error) = admission::admit(&context, &command.name) {
+        if let Err((status, error)) = admission::admit(self, &context, &command.name) {
             return self.finish(
                 &command,
                 &context,
                 input_sha256,
                 None,
                 None,
-                ToolExecutionStatus::Denied,
+                status,
                 format!("Error: {error}"),
                 None,
                 Some(error),
