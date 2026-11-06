@@ -293,7 +293,7 @@ impl WorkerChildSegments {
             }
             WorkerSegmentSource::Operator { sequence, authority } => {
                 authority.verify()?;
-                let source = sequence.lock().await.record(input, &self.service).await?;
+                let source = sequence.lock().await.record(input, &self.admission.service).await?;
                 (source, Arc::clone(&authority.snapshots().generation.effective))
             }
         };
