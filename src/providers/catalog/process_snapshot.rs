@@ -3,8 +3,8 @@ use super::{
     Arc, CatalogView, CuratedModel, DescriptorSource, Dialects, FeatureSet, ModelDescriptor, ModelOperation,
     ProviderId, RouteTarget, Support,
 };
-use crate::causal_tree::ids::DecisionId;
 use crate::decision::key::{DecisionKey, KeyDomain};
+use crate::tools::capability::child::ParentAuthorityId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -59,7 +59,11 @@ fn provider(raw: &str) -> anyhow::Result<ProviderId> {
         .ok_or_else(|| anyhow::anyhow!("process provider identity is not canonical"))
 }
 impl CatalogView {
-    pub(crate) fn bind_process(&self, key: &DecisionKey, parent: DecisionId) -> anyhow::Result<ProcessProviderCatalog> {
+    pub(crate) fn bind_process(
+        &self,
+        key: &DecisionKey,
+        parent: ParentAuthorityId,
+    ) -> anyhow::Result<ProcessProviderCatalog> {
         let payload = self.process_payload()?;
         let seal = key.hmac(
             KeyDomain::StateFingerprint,
@@ -74,7 +78,7 @@ impl CatalogView {
     pub(crate) fn restore_process(
         snapshot: &ProcessProviderCatalog,
         key: &DecisionKey,
-        parent: DecisionId,
+        parent: ParentAuthorityId,
     ) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(
             key.verify_hmac(
@@ -231,6 +235,7 @@ impl CatalogView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::causal_tree::ids::DecisionId;
 
     fn catalog() -> CatalogView {
         let identities = [
@@ -263,7 +268,7 @@ mod tests {
     #[test]
     fn authenticated_catalog_roundtrips_provider_namespaces_in_both_process_domains() {
         let key = DecisionKey::ephemeral();
-        let parent = DecisionId::new_runtime();
+        let parent = ParentAuthorityId::from(DecisionId::new_runtime());
         let publication = uuid::Uuid::new_v4();
         let original = catalog();
         let child = original.bind_process(&key, parent).expect("child snapshot");
@@ -283,7 +288,9 @@ mod tests {
         }
         assert!(CatalogView::restore_operator_process(&child, &key, publication).is_err());
         assert!(CatalogView::restore_process(&operator, &key, parent).is_err());
-        assert!(CatalogView::restore_process(&child, &key, DecisionId::new_runtime()).is_err());
+        assert!(
+            CatalogView::restore_process(&child, &key, ParentAuthorityId::from(DecisionId::new_runtime())).is_err()
+        );
         assert!(CatalogView::restore_operator_process(&operator, &key, uuid::Uuid::new_v4()).is_err());
         let mut tampered = child;
         tampered.payload = "not json".to_owned();
@@ -329,7 +336,7 @@ mod tests {
         parent_release.revision.push_str("-different-binary");
         let parent_catalog = CatalogView::default().with_release_catalog(parent_release);
         let key = DecisionKey::ephemeral();
-        let parent = DecisionId::new_runtime();
+        let parent = ParentAuthorityId::from(DecisionId::new_runtime());
         let snapshot = parent_catalog
             .bind_process(&key, parent)
             .expect("test: parent snapshot binds");
@@ -357,7 +364,7 @@ mod tests {
 
         let parent_catalog = CatalogView::default().with_release_catalog(changed);
         let key = DecisionKey::ephemeral();
-        let parent = DecisionId::new_runtime();
+        let parent = ParentAuthorityId::from(DecisionId::new_runtime());
         let snapshot = parent_catalog
             .bind_process(&key, parent)
             .expect("test: parent snapshot binds");

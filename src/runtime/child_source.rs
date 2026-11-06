@@ -707,10 +707,7 @@ impl IssuedChildGrant {
         verify_worker_input(runtime.source_fabric.workspace_id(), worker, &scope, receipt.event())?;
         let source = worker.child_source.as_ref().context("worker child source missing")?;
         let (child, constraints) = scope.gate_inputs();
-        let expected_parent = parent.bind_process(
-            crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
-            &constraints.key,
-        )?;
+        let expected_parent = parent.bind_process(child.parent_authority_id, &constraints.key)?;
         anyhow::ensure!(
             source.parent_store_workspace == parent_record_binding.0.as_ref()
                 && source.parent_decision_digest == parent_record_binding.1
@@ -768,14 +765,13 @@ impl IssuedChildGrant {
         let parent_constraints = constraints.to_worker_constraints()?;
         let config_generation = self.generation().bind_process(&constraints.key)?;
         let catalog = self.catalog().bind_process(&constraints.key)?;
-        let provider_catalog = self.provider_catalog().bind_process(
-            &constraints.key,
-            crate::causal_tree::ids::DecisionId::parse(&manifest.parent_authority_id.to_string())?,
-        )?;
-        let parent_source = self.0.parent.bind_process(
-            crate::causal_tree::ids::DecisionId::parse(&manifest.parent_authority_id.to_string())?,
-            &constraints.key,
-        )?;
+        let provider_catalog = self
+            .provider_catalog()
+            .bind_process(&constraints.key, manifest.parent_authority_id)?;
+        let parent_source = self
+            .0
+            .parent
+            .bind_process(manifest.parent_authority_id, &constraints.key)?;
         let input_event_mac = constraints.key.hmac(
             crate::decision::key::KeyDomain::StateFingerprint,
             &[

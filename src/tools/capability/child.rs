@@ -28,6 +28,19 @@ impl ParentAuthorityId {
     fn parse(text: &str) -> Result<Self, uuid::Error> {
         uuid::Uuid::parse_str(text).map(Self)
     }
+
+    /// The authority UUID. Process binders and journals use this identity
+    /// directly; it is never printed and parsed back as a decision id.
+    pub(crate) const fn as_uuid(self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// The only conversion from parent authority to a decision id. It is for
+    /// decision-store grant lookups; the authority identity itself stays a
+    /// `ParentAuthorityId` everywhere else.
+    pub(crate) const fn decision_grant_id(self) -> DecisionId {
+        DecisionId::from_uuid(self.as_uuid())
+    }
 }
 
 impl From<DecisionId> for ParentAuthorityId {

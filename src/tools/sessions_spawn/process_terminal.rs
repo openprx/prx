@@ -413,7 +413,7 @@ struct RecoveryProvenance<'a> {
     workspace: &'a std::path::Path,
     store_workspace: &'a str,
     owner: &'a str,
-    parent_decision: crate::causal_tree::ids::DecisionId,
+    parent_decision: crate::tools::capability::child::ParentAuthorityId,
     parent_digest: &'a str,
     input: &'a MessageEvent,
     key: &'a crate::decision::DecisionKey,
@@ -432,7 +432,7 @@ pub(super) async fn verify(
         workspace: &grant.generation().effective.workspace_dir,
         store_workspace,
         owner: &child.authority.owner,
-        parent_decision: crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
+        parent_decision: child.parent_authority_id,
         parent_digest,
         input: input.event(),
         key: &constraints.key,
@@ -584,7 +584,7 @@ async fn verify_bound(
         )
         .await?;
         anyhow::ensure!(
-            replay.parent_decision_id() == Some(provenance.parent_decision)
+            replay.parent_decision_id() == Some(provenance.parent_decision.decision_grant_id())
                 && replay.parent_digest() == Some(provenance.parent_digest)
                 && replay.source().subject == Some(MessageEventSubject::Task(evidence.run_id.clone())),
             "worker segment replay differs from issued parent"
@@ -680,7 +680,7 @@ pub(super) async fn recover_usage(
         workspace: &grant.generation().effective.workspace_dir,
         store_workspace,
         owner: &child.authority.owner,
-        parent_decision: crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
+        parent_decision: child.parent_authority_id,
         parent_digest,
         input: input.event(),
         key: &constraints.key,
@@ -755,7 +755,7 @@ async fn recover_usage_bound(
             )
             .await?;
             anyhow::ensure!(
-                replay.parent_decision_id() == Some(provenance.parent_decision)
+                replay.parent_decision_id() == Some(provenance.parent_decision.decision_grant_id())
                     && replay.parent_digest() == Some(provenance.parent_digest)
                     && replay.source().event_id == segment_input.event_id,
                 "recovered worker terminal belongs to another input or parent"
@@ -826,8 +826,7 @@ async fn read_bound_launch(
     };
     let provenance = launch.provenance();
     anyhow::ensure!(
-        crate::tools::capability::child::ParentAuthorityId::from(provenance.parent_decision)
-            == child.parent_authority_id
+        provenance.parent_decision == child.parent_authority_id
             && provenance.store_workspace == grant.parent_record_binding().0
             && provenance.parent_digest == grant.parent_record_binding().1
             && provenance.input.event_id == input.event().event_id,

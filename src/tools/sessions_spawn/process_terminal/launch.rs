@@ -139,7 +139,7 @@ pub(super) struct VerifiedLaunch {
     workspace: std::path::PathBuf,
     input: crate::memory::MessageEvent,
     key: std::sync::Arc<crate::decision::DecisionKey>,
-    parent_decision: crate::causal_tree::ids::DecisionId,
+    parent_decision: crate::tools::capability::child::ParentAuthorityId,
     store_workspace_id: String,
 }
 
@@ -341,7 +341,7 @@ pub(super) async fn read(
         workspace: workspace.to_path_buf(),
         input,
         key,
-        parent_decision: decision,
+        parent_decision: crate::tools::capability::child::ParentAuthorityId::from(decision),
         store_workspace_id,
     }))
 }

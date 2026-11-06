@@ -200,7 +200,7 @@ impl ParentSource {
 
     pub(crate) fn bind_process(
         &self,
-        decision: crate::causal_tree::ids::DecisionId,
+        parent: crate::tools::capability::child::ParentAuthorityId,
         key: &DecisionKey,
     ) -> anyhow::Result<ParentSourceSnapshot> {
         let payload = self.process_payload()?;
@@ -208,7 +208,7 @@ impl ParentSource {
             KeyDomain::StateFingerprint,
             &[
                 b"worker-parent-source-v1",
-                decision.to_string().as_bytes(),
+                parent.to_string().as_bytes(),
                 payload.as_bytes(),
             ],
         );
@@ -493,10 +493,7 @@ impl ParentSource {
             };
             let row = store
                 .reader()
-                .replay_record(
-                    &owner_scope,
-                    &crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
-                )?
+                .replay_record(&owner_scope, &child.parent_authority_id.decision_grant_id())?
                 .context("worker parent decision is unavailable")?;
             anyhow::ensure!(
                 row.digest == source.parent_decision_digest
@@ -611,7 +608,9 @@ mod tests {
     #[test]
     fn recursive_parent_snapshot_seals_the_task_and_segment_separately() {
         let key = DecisionKey::ephemeral();
-        let decision = crate::causal_tree::ids::DecisionId::new_runtime();
+        let decision = crate::tools::capability::child::ParentAuthorityId::from(
+            crate::causal_tree::ids::DecisionId::new_runtime(),
+        );
         let mut parent = parent(true);
         let legacy: serde_json::Value = serde_json::from_str(&parent.process_payload().unwrap()).unwrap();
         assert!(legacy.get("task_run_id").is_none());
@@ -647,7 +646,9 @@ mod tests {
     #[test]
     fn parent_snapshots_bind_explicit_execution_isolation() {
         let key = DecisionKey::ephemeral();
-        let decision = crate::causal_tree::ids::DecisionId::new_runtime();
+        let decision = crate::tools::capability::child::ParentAuthorityId::from(
+            crate::causal_tree::ids::DecisionId::new_runtime(),
+        );
         let publication = uuid::Uuid::new_v4();
         for owner_isolated in [false, true] {
             let parent = parent(owner_isolated);

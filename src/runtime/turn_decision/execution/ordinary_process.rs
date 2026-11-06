@@ -167,14 +167,10 @@ impl OrdinaryProcessLaunch {
             input,
             provider_selection: selection.clone(),
             parent_source: crate::runtime::child_source::parent::ParentSource::capture(&publication.0.source)
-                .bind_process(
-                    crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
-                    &parent.key,
-                )?,
-            provider_catalog: publication.provider_catalog().bind_process(
-                &parent.key,
-                crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
-            )?,
+                .bind_process(child.parent_authority_id, &parent.key)?,
+            provider_catalog: publication
+                .provider_catalog()
+                .bind_process(&parent.key, child.parent_authority_id)?,
             parent_constraints: parent.to_worker_constraints()?,
             capability_manifest: child.to_worker_manifest(),
             config_generation: publication.generation().bind_process(&parent.key)?,
