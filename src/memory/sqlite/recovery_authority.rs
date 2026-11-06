@@ -7,6 +7,7 @@ use crate::memory::recovery_authority::{
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::ValueRef};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 const MAX_SERIALIZED_FACTS: usize = 262_144;
 // Six identity/event-id strings of at most 1024 bytes expand by at most 6x.
@@ -244,7 +245,11 @@ impl SqliteMemory {
     /// Load a capsule's key. A key that cannot be loaded is remembered for this
     /// handle: later artifacts needing it fail at once, without a file read and
     /// without regeneration.
+    /// Check, load and failure publication for one key id are serialized, so a
+    /// queued caller never reloads a key after its failure was recorded.
     fn capsule_key(&self, id: &str) -> anyhow::Result<ring::hmac::Key> {
+        let gate = Arc::clone(self.recovery_key_gates.lock().entry(id.to_owned()).or_default());
+        let _serial = gate.lock();
         if self.recovery_unusable.lock().contains(id) {
             return Err(anyhow::Error::new(RecoveryKeyUnavailable(format!(
                 "recovery key {id} unusable"
@@ -409,6 +414,9 @@ impl RecoveryRepository for SqliteMemory {
         // Unavailable key material is sticky for this handle: never retried or
         // regenerated. A successful activation is not memoized, so every call
         // re-loads the active key and refuses one lost or corrupted afterwards.
+        // The gate covers the check, the load and the failure publication, so
+        // queued callers observe the recorded failure instead of loading again.
+        let _serial = self.recovery_activation.lock();
         if self.recovery_unavailable.get().is_some() {
             return Err(anyhow::Error::new(RecoveryKeyUnavailable(
                 "recovery authority unavailable; activation was refused earlier".to_owned(),

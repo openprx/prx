@@ -59,6 +59,9 @@ pub struct MemoryFabric {
     workspace_id: String,
     event_recording: MemoryEventRecording,
     ingress: Option<Arc<crate::runtime::ingress_recovery::IngressRecorder>>,
+    /// Set by a no-recorder admission whose stable input key already exists.
+    /// Reset for each admission by `with_ingress_recovery`.
+    input_accepted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -263,6 +266,7 @@ impl MemoryFabric {
             workspace_id: workspace_id.into(),
             event_recording: MemoryEventRecording::default(),
             ingress: None,
+            input_accepted: Arc::default(),
         }
     }
 
@@ -277,6 +281,7 @@ impl MemoryFabric {
         config: &Arc<crate::config::Config>,
         ticket: &crate::runtime::turn_cleanup::CleanupTicket,
     ) -> anyhow::Result<Self> {
+        self.input_accepted = Arc::default();
         let recording = config.memory.event_recording_config();
         if self.memory.name() == "none"
             || !config.causal_tree.enabled
@@ -316,7 +321,10 @@ impl MemoryFabric {
         }
     }
     pub(crate) fn ingress_already_accepted(&self) -> bool {
-        self.ingress.as_ref().is_some_and(|ingress| ingress.duplicate())
+        self.ingress.as_ref().map_or_else(
+            || self.input_accepted.load(std::sync::atomic::Ordering::Acquire),
+            |ingress| ingress.duplicate(),
+        )
     }
 
     #[must_use]
@@ -758,6 +766,21 @@ impl MemoryFabric {
         if role == "user" && event_type == "message.created" {
             if let Some(ingress) = &self.ingress {
                 return ingress.append(input).await;
+            }
+            if input.idempotency_key.is_some() {
+                // Without a recorder the stable input key still fences admission:
+                // the append names a fresh event id, so a row that already holds
+                // the workspace/input key comes back with a different id. That
+                // comparison is made inside the same insert transaction.
+                let mut input = input;
+                let event_id = uuid::Uuid::new_v4().to_string();
+                input.event_id = Some(event_id.clone());
+                let event = self.memory.append_message_event(input).await?;
+                if event.event_id != event_id {
+                    self.input_accepted.store(true, std::sync::atomic::Ordering::Release);
+                    return Err(crate::runtime::ingress_recovery::AlreadyAccepted.into());
+                }
+                return Ok(event);
             }
         }
         self.memory.append_message_event(input).await

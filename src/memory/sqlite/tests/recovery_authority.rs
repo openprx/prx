@@ -556,3 +556,45 @@ async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()
     anyhow::ensure!(warnings == 1, "shared warning emitted {warnings} times");
     Ok(())
 }
+
+#[test]
+fn recovery_activation_failure_is_attempted_once_under_contention() -> anyhow::Result<()> {
+    let (dir, memory) = store()?;
+    let id = memory.activate_recovery_authority()?;
+    // Corrupt the active key: every activation attempt must fail as unavailable.
+    std::fs::write(key_path(&memory, &id)?, [0u8; 32])?;
+    let before = memory
+        .recovery_activation_attempts
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let memory = Arc::new(memory);
+    let callers = 8;
+    let barrier = Arc::new(Barrier::new(callers));
+    let handles = (0..callers)
+        .map(|_| {
+            let memory = Arc::clone(&memory);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                memory
+                    .activate_recovery_authority()
+                    .map(|_| ())
+                    .map_err(|error| crate::memory::recovery_authority::is_key_unavailable(&error))
+            })
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        let outcome = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("activation thread panicked"))?;
+        anyhow::ensure!(outcome == Err(true), "queued caller was not refused as key-unavailable");
+    }
+    anyhow::ensure!(
+        memory
+            .recovery_activation_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == before + 1,
+        "activation attempted more than once under contention"
+    );
+    drop(dir);
+    Ok(())
+}
