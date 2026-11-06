@@ -271,25 +271,17 @@ a content-free warning. Assistant replies are not automatically promoted by
 this API. Disable `memory.auto_save` to stop promotion; this does not disable
 input event recording. Existing legacy keys are left intact.
 
-Migration limitation: every builder rejects an explicit custom `MemoryLoader`
-at construction, including a builder without `runtime_config`. The source-bound
-builder also rejects an injected `RouterEngine`. Neither callback is silently
-ignored. Legacy memory callbacks receive an unscoped backend, and legacy router
-callbacks do not bind the selected provider/model to the new turn source.
-Their selected-retrieval and source-bound routing integrations remain open;
-callers depending on them are not yet migration-ready. Do not remove these
-options merely to make a dependent application pass construction.
+Embedded custom `MemoryLoader` callbacks require `runtime_config`. The runtime
+invokes the callback when authenticated scoped semantic recall finds memory,
+using the bounded read facade described in `decision-plane.md`. Its returned
+text reaches the prompt under `[Untrusted custom memory context]`; it is never
+decision evidence. An injected `RouterEngine` remains unsupported.
 
-For presentation customization, implement
-`agent::memory_loader::SelectedMemoryFormatter` and supply it with
-`AgentBuilder::selected_memory_formatter`. Its `format_context` receives only
-summaries from the current decision's selected memory read. It receives no
-memory backend and is skipped when no memory was selected. The returned string
-is prompt context; it cannot alter the selected tools or source proof. Formatter
-errors terminate the turn through failure settlement instead of performing a
-fallback recall. The default presentation remains one summary per line.
-This is a replacement for formatting responsibilities of a legacy loader;
-custom retrieval behavior still requires integration with decision admission.
+`SelectedMemoryFormatter::format_context` receives one bounded summary per
+recalled semantic memory, without the memory-context header. It is skipped when
+there are no complete semantic entries. Document and session context bypass it.
+Formatter and loader errors terminate the turn through failure settlement.
+Both callback outputs remain subject to the prompt recall budget.
 
 For non-delegated embedded turns, task-routing model hints take precedence over
 query-classification rules. Selection uses original input and the pinned

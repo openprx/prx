@@ -489,8 +489,8 @@ async fn run_work(
         .as_deref()
         .filter(|_| !recalled.ids.is_empty())
     {
-        let semantic = enriched.get(recalled.semantic_range.clone()).unwrap_or_default();
-        let formatted = match formatter.format_context(&[semantic]) {
+        let summaries: Vec<&str> = recalled.summaries.iter().map(String::as_str).collect();
+        let formatted = match formatter.format_context(&summaries) {
             Ok(context) => context,
             Err(error) => {
                 guard.finish_failure(&error, cancellation.is_cancelled()).await?;
@@ -499,6 +499,35 @@ async fn run_work(
         };
         enriched.replace_range(recalled.semantic_range, &formatted);
         enriched.truncate(enriched.floor_char_boundary(crate::agent::context_recall::RECALL_CONTEXT_BUDGET));
+    }
+    if let Some(loader) = service.prompt_memory_loader().filter(|_| !recalled.ids.is_empty()) {
+        let scope = crate::runtime::turn_decision::selected_custom_memory_read_scope(
+            &source.envelope().memory_write_context(source.policy_chat_type()),
+            &source.envelope().workspace_id,
+            &source.envelope().resolved_owner_id(),
+        )?;
+        let loaded = crate::agent::memory_loader::load_selected_memory(
+            loader,
+            agent.memory.as_ref(),
+            &crate::agent::context_recall::recall_query(input),
+            &scope,
+            &source.envelope().session_key,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
+        match loaded {
+            Ok(loaded) if !loaded.hits.is_empty() && !loaded.context.is_empty() => {
+                enriched.push_str("[Untrusted custom memory context]\n");
+                enriched.push_str(&crate::multimodal::neutralize_media_markers(&loaded.context));
+                enriched.push('\n');
+                enriched.truncate(enriched.floor_char_boundary(crate::agent::context_recall::RECALL_CONTEXT_BUDGET));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                guard.finish_failure(&error, cancellation.is_cancelled()).await?;
+                return Err(error);
+            }
+        }
     }
     if !enriched.is_empty() && !enriched.ends_with('\n') {
         enriched.push('\n');

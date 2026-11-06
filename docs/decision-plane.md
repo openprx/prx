@@ -756,12 +756,13 @@ implemented boundaries do not make the candidate ready for adoption.
 
 ## Embedded MemoryLoader compatibility
 
-An embedded custom `MemoryLoader` requires `runtime_config` and runs only for
-selected Memory retrieval. Its callback receives a restricted `Memory` facade,
+An embedded custom `MemoryLoader` requires `runtime_config` and runs when
+authenticated scoped semantic recall finds memory. Its callback receives a
+restricted `Memory` facade,
 not the original backend. Only bounded `recall` is supported: queries are at most
 1024 bytes, each limit is 1–5, at most five recall calls may reserve a total of
 five hits, and any supplied session must match the admitted session. The source
-workspace, owner and decision deadline remain authoritative.
+workspace, owner and bounded callback deadline remain authoritative.
 
 `get`, list/count, context-aware recall variants, writes and conversation/profile
 APIs are refused and require callback migration; accepting `&dyn Memory` does
@@ -769,8 +770,10 @@ not preserve unrestricted backend access. Returned context must fit 1280
 characters, 5120 bytes and 2048 tokens, survive redaction within those bounds,
 and have actual retrieved Memory hits when nonempty. Extension text is prompt
 presentation, not retrieval or execution authority. Document/Session artifacts
-use their own typed presentation. `SelectedMemoryFormatter` receives already
-selected summaries only. Runtime and performance validation remain pending.
+use their own typed presentation. `SelectedMemoryFormatter` receives one bounded
+summary per recalled semantic entry, without a pre-formatted header. The loader
+output reaches the prompt under `[Untrusted custom memory context]`, within the
+recall budget.
 
 Chat ingress derives the event owner from the actual memory-fabric workspace.
 Request events retain the verified ingress envelope, including its configuration

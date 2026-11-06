@@ -996,7 +996,9 @@ async fn owner_isolated_origin_recall_is_private() {
     let dir = TempDir::new().unwrap();
     let mem = SqliteMemory::new(dir.path()).unwrap();
     let scope_a = recall_test_scope("issuer-a", "workspace-a");
-    let scope_b = recall_test_scope("issuer-b", "workspace-a");
+    let mut scope_b = recall_test_scope("issuer-a", "workspace-a");
+    scope_b.semantic.channel = Some("other-origin".into());
+    scope_b.principal.channel = Some("other-origin".into());
     seed_recall_memory(&mem, &scope_a, "issuer-a-note", "recallkeyword issuer-a private").await;
     seed_recall_memory(&mem, &scope_b, "issuer-b-note", "recallkeyword issuer-b private").await;
     let recalled = scoped_recall(&mem, &scope_b, "recallkeyword", RECALL_CONTEXT_BUDGET).await;
@@ -1009,17 +1011,32 @@ async fn recall_respects_disabled_user_message_recording() {
     let dir = TempDir::new().unwrap();
     let mem = SqliteMemory::new(dir.path()).unwrap();
     let mut scope = recall_test_scope("owner-a", "workspace-a");
-    seed_recall_memory(&mem, &scope, "user-note", "recallkeyword historical user text").await;
-    assert_ne!(
-        scoped_recall(&mem, &scope, "recallkeyword", RECALL_CONTEXT_BUDGET)
-            .await
-            .preamble,
-        ""
+    seed_recall_memory(&mem, &scope, "fact-note", "recallkeyword semantic fact").await;
+    seed_recall_document(&mem, "owner-a", "workspace-a", "recallkeyword document fact").await;
+    mem.append_conversation_turn(
+        scope.principal.session_key.as_deref().unwrap(),
+        "mcp",
+        "shared-subject",
+        "user",
+        "recallkeyword historical user text",
+        None,
+        None,
+        Some("owner-a"),
+    )
+    .await
+    .unwrap();
+    let enabled = scoped_recall(&mem, &scope, "recallkeyword", RECALL_CONTEXT_BUDGET).await;
+    assert!(
+        enabled.preamble.contains("historical user text"),
+        "{}",
+        enabled.preamble
     );
     scope.record_user_messages = false;
     let recalled = scoped_recall(&mem, &scope, "recallkeyword", RECALL_CONTEXT_BUDGET).await;
-    assert_eq!(recalled.preamble, "");
-    assert_eq!(recalled.ids, Vec::<String>::new());
+    assert!(!recalled.preamble.contains("historical user text"));
+    assert!(recalled.preamble.contains("semantic fact"));
+    assert!(recalled.preamble.contains("document fact"));
+    assert_ne!(recalled.ids, Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -1035,11 +1052,63 @@ async fn recall_is_bounded_by_context_budget() {
     )
     .await;
     let full = scoped_recall(&mem, &scope, "recallkeyword", RECALL_CONTEXT_BUDGET).await;
-    assert!(full.preamble.len() > 65);
-    let bounded = scoped_recall(&mem, &scope, "recallkeyword", 65).await;
+    assert!(full.preamble.len() > 66);
+    let bounded = scoped_recall(&mem, &scope, "recallkeyword", 66).await;
     assert_ne!(bounded.preamble, "");
-    assert!(bounded.preamble.len() <= 65);
+    assert!(!full.preamble.is_char_boundary(66));
+    assert_eq!(bounded.preamble.len(), 65);
     assert_eq!(bounded.ids, Vec::<String>::new());
     let empty = scoped_recall(&mem, &scope, "recallkeyword", 0).await;
     assert_eq!(empty.preamble, "");
+}
+
+#[test]
+fn scoped_recall_query_projects_images_and_bounds_utf8() {
+    let input = format!("{}[IMAGE:/private/image.png]{}", "é".repeat(510), "é".repeat(40));
+    let projected = crate::multimodal::project_image_markers_for_routing(&input);
+    let query = recall_query(&input);
+    assert_eq!(query, projected[..projected.floor_char_boundary(1024)]);
+    assert!(query.len() <= 1024);
+    assert!(!query.contains("/private/image.png"));
+}
+
+#[tokio::test]
+async fn scoped_recall_excludes_stale_and_future_history() {
+    let dir = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(dir.path()).unwrap();
+    let scope = recall_test_scope("owner-a", "workspace-a");
+    for (text, timestamp) in [
+        ("stale history", "2000-01-01T00:00:00Z"),
+        ("future history", "2099-01-01T00:00:00Z"),
+    ] {
+        mem.append_conversation_turn(
+            scope.principal.session_key.as_deref().unwrap(),
+            "mcp",
+            "shared-subject",
+            "user",
+            text,
+            Some(timestamp),
+            None,
+            Some("owner-a"),
+        )
+        .await
+        .unwrap();
+    }
+    mem.append_conversation_turn(
+        scope.principal.session_key.as_deref().unwrap(),
+        "mcp",
+        "shared-subject",
+        "assistant",
+        "fresh history",
+        None,
+        None,
+        Some("owner-a"),
+    )
+    .await
+    .unwrap();
+    let recalled = scoped_recall(&mem, &scope, "history", RECALL_CONTEXT_BUDGET).await;
+    assert!(recalled.preamble.contains("fresh history"));
+    assert!(!recalled.preamble.contains("stale history"));
+    assert!(!recalled.preamble.contains("future history"));
+    assert!(!fresh_timestamp("invalid"));
 }

@@ -1733,11 +1733,11 @@ impl TurnDecisionService {
         Ok(refs)
     }
 
-    async fn retrieve_selected_agent_evidence_with_context(
+    async fn retrieve_selected_agent_evidence(
         &self,
         proof: &dyn TurnSourceProof,
         decision: &EngineDecision,
-    ) -> Result<(Vec<ObservedArtifact>, Option<String>), AgentRetrievalError> {
+    ) -> Result<Vec<ObservedArtifact>, AgentRetrievalError> {
         let model = self.resolve_agent_model(proof)?;
         self.check_live_parity()?;
         let catalog = self.catalog_view();
@@ -1774,44 +1774,28 @@ impl TurnDecisionService {
         let artifacts = crate::causal_tree::logical_clock::timeout_at_std(decision.deadline, async {
             match selected_family {
                 crate::causal_tree::branch::CapabilityTarget::Memory => {
-                    if let Some(loader) = &self.memory_loader {
-                        // memory_scope is also the legacy write projection and may
-                        // omit owner_id. Bind this selected read to the already
-                        // validated source owner instead of accepting an unscoped
-                        // extension callback or refusing every embedded caller.
-                        let scope = selected_custom_memory_read_scope(
-                            proof.memory_scope(),
-                            proof.workspace_id(),
-                            proof.owner_id(),
-                        )?;
-                        let loaded = crate::agent::memory_loader::load_selected_memory(
-                            loader.as_ref(),
-                            self.memory.as_ref(),
+                    let custom_scope = self
+                        .memory_loader
+                        .as_ref()
+                        .map(|_| {
+                            selected_custom_memory_read_scope(
+                                proof.memory_scope(),
+                                proof.workspace_id(),
+                                proof.owner_id(),
+                            )
+                        })
+                        .transpose()?;
+                    let hits = self
+                        .memory
+                        .retrieve_decision_memory(
                             projected_input.as_ref(),
-                            &scope,
-                            proof.session_key(),
+                            5,
+                            custom_scope.as_ref().unwrap_or_else(|| proof.memory_scope()),
+                            None,
                             decision.deadline,
                         )
                         .await?;
-                        let artifacts = memory_artifacts_from_selected_read(&loaded.hits, chrono::Utc::now());
-                        let context = artifacts
-                            .iter()
-                            .all(|artifact| artifact.age_ms <= STALE_ARTIFACT_MS)
-                            .then_some(loaded.context);
-                        Ok((artifacts, context))
-                    } else {
-                        let hits = self
-                            .memory
-                            .retrieve_decision_memory(
-                                projected_input.as_ref(),
-                                5,
-                                proof.memory_scope(),
-                                None,
-                                decision.deadline,
-                            )
-                            .await?;
-                        Ok((memory_artifacts_from_selected_read(&hits, chrono::Utc::now()), None))
-                    }
+                    Ok(memory_artifacts_from_selected_read(&hits, chrono::Utc::now()))
                 }
                 crate::causal_tree::branch::CapabilityTarget::Document
                 | crate::causal_tree::branch::CapabilityTarget::Session => {
@@ -1828,7 +1812,7 @@ impl TurnDecisionService {
                             .memory
                             .retrieve_decision_documents(projected_input.as_ref(), 5, &principal, decision.deadline)
                             .await?;
-                        Ok((document_artifacts_from_selected_read(&hits, chrono::Utc::now()), None))
+                        Ok(document_artifacts_from_selected_read(&hits, chrono::Utc::now()))
                     } else {
                         let source = proof
                             .source_event_id()
@@ -1837,7 +1821,7 @@ impl TurnDecisionService {
                             .memory
                             .retrieve_decision_session(&principal, source, 5, decision.deadline)
                             .await?;
-                        Ok((session_artifacts_from_selected_read(&hits, chrono::Utc::now()), None))
+                        Ok(session_artifacts_from_selected_read(&hits, chrono::Utc::now()))
                     }
                 }
                 _ => anyhow::bail!("unsupported selected retrieval source"),
@@ -1851,6 +1835,10 @@ impl TurnDecisionService {
         }
         self.check_live_parity()?;
         Ok(artifacts)
+    }
+
+    pub(crate) fn prompt_memory_loader(&self) -> Option<&dyn crate::agent::memory_loader::MemoryLoader> {
+        self.memory_loader.as_deref()
     }
 
     /// Advance a final-gated selected evidence read into runtime-owned evidence.
@@ -1875,13 +1863,10 @@ impl TurnDecisionService {
             | crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => candidate_id.clone(),
             _ => return Err(AgentRetrievalError::Selected(RetrievalIssueError)),
         };
-        let (artifacts, _custom_context, status) = match self
-            .retrieve_selected_agent_evidence_with_context(proof, decision)
-            .await
-        {
-            Ok((artifacts, context)) => (artifacts, context, ObservedStepStatus::Ok),
-            Err(AgentRetrievalError::Backend(_)) => (Vec::new(), None, ObservedStepStatus::Failed),
-            Err(AgentRetrievalError::Deadline) => (Vec::new(), None, ObservedStepStatus::Cancelled),
+        let (artifacts, status) = match self.retrieve_selected_agent_evidence(proof, decision).await {
+            Ok(artifacts) => (artifacts, ObservedStepStatus::Ok),
+            Err(AgentRetrievalError::Backend(_)) => (Vec::new(), ObservedStepStatus::Failed),
+            Err(AgentRetrievalError::Deadline) => (Vec::new(), ObservedStepStatus::Cancelled),
             Err(error) => return Err(error),
         };
         let mut next = decision.state.clone();
@@ -1895,7 +1880,7 @@ impl TurnDecisionService {
         let mut all_artifacts = next.observed.artifacts().to_vec();
         let mut fresh_read = false;
         // Fresh evidence remains decision input. Prompt recall has its own
-        // authenticated scope and never consumes loader presentation text.
+        // authenticated scope and never consumes these decision observations.
         #[cfg(test)]
         let selected_artifacts = artifacts
             .iter()
@@ -3343,7 +3328,7 @@ pub(crate) use tests::with_worker_probe_manifest;
 #[cfg(test)]
 mod tests;
 
-fn selected_custom_memory_read_scope(
+pub(crate) fn selected_custom_memory_read_scope(
     write_scope: &crate::memory::principal::MemoryWriteContext,
     workspace: &str,
     owner: &str,

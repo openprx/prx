@@ -1197,6 +1197,31 @@ mod tests {
     }
 
     async fn custom_memory_loader_fixture(record_decisions: bool) {
+        struct CustomContextSpy(ModelSpy);
+        #[async_trait]
+        impl Provider for CustomContextSpy {
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> Result<String> {
+                anyhow::bail!("fixture requires structured messages")
+            }
+            async fn chat_traced(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: f64,
+            ) -> Result<crate::providers::traits::ChatTrace> {
+                let user = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "user")
+                    .unwrap();
+                if user.content.contains("memory_search:") {
+                    assert!(user.content.contains("[Untrusted custom memory context]"));
+                    assert!(user.content.contains("PRX_CUSTOM_PRESENTATION"));
+                }
+                self.0.chat_traced(request, model, temperature).await
+            }
+        }
         struct CountingLoader(Arc<AtomicUsize>);
         #[async_trait]
         impl MemoryLoader for CountingLoader {
@@ -1214,18 +1239,20 @@ mod tests {
                     !hits.is_empty(),
                     "selected loader must obtain actual bounded Memory hits"
                 );
-                Ok(hits
-                    .iter()
-                    .map(|hit| hit.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n"))
+                Ok(format!(
+                    "PRX_CUSTOM_PRESENTATION {}",
+                    hits.iter()
+                        .map(|hit| hit.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ))
             }
         }
         let workspace = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let models = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut builder = embedded_provider_builder(workspace.path())
-            .provider(Box::new(ModelSpy(Arc::clone(&models), "ollama")))
+            .provider(Box::new(CustomContextSpy(ModelSpy(Arc::clone(&models), "ollama"))))
             .memory_loader(Box::new(CountingLoader(Arc::clone(&calls))));
         if record_decisions {
             let config = &mut builder.runtime_config.as_mut().unwrap().0;
@@ -2681,6 +2708,7 @@ mod tests {
         impl SelectedMemoryFormatter for ObservedMemoryFormatter {
             fn format_context(&self, summaries: &[&str]) -> Result<String> {
                 assert_eq!(summaries.len(), 1);
+                assert!(!summaries[0].contains("[Memory context]"));
                 assert!(summaries[0].contains("PRX_RECALLED_BROWSER_INSTRUCTION"));
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(summaries.join("\n"))

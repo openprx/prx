@@ -30,6 +30,7 @@ pub(crate) struct RecalledMemoryContext {
     pub(crate) preamble: String,
     pub(crate) ids: Vec<String>,
     pub(crate) semantic_range: std::ops::Range<usize>,
+    pub(crate) summaries: Vec<String>,
 }
 
 /// Read scope authored by the runtime, independent of decision admission.
@@ -72,19 +73,22 @@ pub(crate) async fn scoped_recall(
     budget: usize,
 ) -> RecalledMemoryContext {
     // Historical user text must not be reintroduced when recording is off.
-    if !scope.record_user_messages || budget == 0 {
+    if budget == 0 {
         return RecalledMemoryContext {
             preamble: String::new(),
             ids: Vec::new(),
             semantic_range: 0..0,
+            summaries: Vec::new(),
         };
     }
-    let bundle = build_agent_context_with_semantic_scope(
+    let query = recall_query(query);
+    let bundle = build_agent_context(
         memory,
         scope.principal.clone(),
-        query,
+        &query,
         scope.min_relevance_score,
         Some(&scope.semantic),
+        Some(scope.record_user_messages),
     )
     .await;
     let semantic_start = bundle.current_session_context.len() + bundle.recent_shared_context.len();
@@ -100,6 +104,11 @@ pub(crate) async fn scoped_recall(
     let semantic_range = semantic_start.min(preamble.len())..semantic_end.min(preamble.len());
     RecalledMemoryContext {
         preamble,
+        summaries: if ids.is_empty() {
+            Vec::new()
+        } else {
+            bundle.semantic_summaries
+        },
         ids,
         semantic_range,
     }
@@ -111,6 +120,7 @@ pub(crate) struct AgentContextBundle {
     pub(crate) semantic_memory_context: String,
     pub(crate) document_context: String,
     pub(crate) recalled_memory_ids: Vec<String>,
+    semantic_summaries: Vec<String>,
 }
 
 impl AgentContextBundle {
@@ -138,6 +148,30 @@ pub(crate) async fn build_context_with_scope(
     min_relevance_score: f64,
     scope_ctx: Option<&MemoryWriteContext>,
 ) -> RecalledMemoryContext {
+    build_semantic_context(mem, user_msg, min_relevance_score, scope_ctx, false).await
+}
+
+fn fresh_timestamp(timestamp: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .and_then(|created| u64::try_from(chrono::Utc::now().signed_duration_since(created).num_milliseconds()).ok())
+        .is_some_and(|age| age <= crate::decision::builtin::weights::STALE_ARTIFACT_MS)
+}
+
+pub(crate) fn recall_query(input: &str) -> String {
+    let mut query = crate::multimodal::project_image_markers_for_routing(input).into_owned();
+    query.truncate(query.floor_char_boundary(1024));
+    query
+}
+
+async fn build_semantic_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+    scope_ctx: Option<&MemoryWriteContext>,
+    fresh_only: bool,
+) -> RecalledMemoryContext {
+    let mut summaries = Vec::new();
     let mut context = String::new();
     let mut ids = Vec::new();
 
@@ -146,6 +180,7 @@ pub(crate) async fn build_context_with_scope(
         let relevant: Vec<_> = entries
             .iter()
             .filter(|e| e.score.map_or(true, |score| score >= min_relevance_score))
+            .filter(|e| !fresh_only || fresh_timestamp(&e.timestamp))
             .collect();
 
         if !relevant.is_empty() {
@@ -154,7 +189,6 @@ pub(crate) async fn build_context_with_scope(
                 if memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
-                ids.push(entry.id.clone());
 
                 // Quoted material: strip the marker syntax before it is spliced
                 // into the live user turn, then cap the entry so a single huge
@@ -173,6 +207,8 @@ pub(crate) async fn build_context_with_scope(
                 if context.len() + line.len() > MAX_MEMORY_PREAMBLE_BYTES {
                     break;
                 }
+                ids.push(entry.id.clone());
+                summaries.push(crate::causal_tree::projection::bounded_artifact_summary(&entry.content).0);
                 context.push_str(&line);
             }
             if context != "[Memory context]\n" {
@@ -188,6 +224,7 @@ pub(crate) async fn build_context_with_scope(
         preamble: context,
         ids,
         semantic_range,
+        summaries,
     }
 }
 
@@ -513,7 +550,22 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
     min_relevance_score: f64,
     semantic_scope: Option<&MemoryWriteContext>,
 ) -> AgentContextBundle {
-    let semantic = build_context_with_scope(mem, user_msg, min_relevance_score, semantic_scope).await;
+    build_agent_context(mem, principal, user_msg, min_relevance_score, semantic_scope, None).await
+}
+
+async fn build_agent_context(
+    mem: &dyn Memory,
+    principal: MemoryPrincipal,
+    user_msg: &str,
+    min_relevance_score: f64,
+    semantic_scope: Option<&MemoryWriteContext>,
+    record_user_messages: Option<bool>,
+) -> AgentContextBundle {
+    let semantic = if record_user_messages.is_some() {
+        build_semantic_context(mem, user_msg, min_relevance_score, semantic_scope, true).await
+    } else {
+        build_context_with_scope(mem, user_msg, min_relevance_score, semantic_scope).await
+    };
     // D4 C3: the agent recall path read-merges canonical + legacy session keys
     // through `MemoryPrincipal::session_key_candidates` (wired into
     // `list_conversation_turns` and `load_recent_session_context`). The agent
@@ -522,14 +574,14 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
     // session id, the principal carries no `legacy_session_key`, so the candidate
     // set degrades to the single canonical key and recall behaviour is unchanged
     // while unrelated runs stay isolated.
-    let current_session_turns = match principal.session_key.as_deref() {
+    let mut current_session_turns = match principal.session_key.as_deref() {
         Some(session_key) => mem
             .list_conversation_turns(&principal, session_key, 12, 0)
             .await
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    let current_session_events = mem
+    let mut current_session_events = mem
         .load_recent_session_context(SessionContextQuery {
             principal: principal.clone(),
             since_event_id: None,
@@ -538,7 +590,7 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
         })
         .await
         .unwrap_or_default();
-    let shared_events = mem
+    let mut shared_events = mem
         .load_recent_shared_context(SharedContextQuery {
             principal: principal.clone(),
             since_event_id: None,
@@ -551,6 +603,12 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
         .search_document_chunks(&principal, user_msg, 5)
         .await
         .unwrap_or_default();
+    if let Some(record) = record_user_messages {
+        current_session_turns.retain(|turn| fresh_timestamp(&turn.timestamp) && (record || turn.role != "user"));
+        current_session_events.retain(|event| fresh_timestamp(&event.created_at) && (record || event.role != "user"));
+        shared_events.retain(|event| fresh_timestamp(&event.created_at) && (record || event.role != "user"));
+        document_results.retain(|result| fresh_timestamp(&result.chunk.created_at));
+    }
     // FIX-P2-02: hard-filter untrusted external content copies (web_fetch /
     // http_request / file_read ingests) out of the trusted recall context before
     // it is assembled into the prompt. These copies are retained in the store for
@@ -582,6 +640,7 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
         semantic_memory_context: semantic.preamble,
         document_context,
         recalled_memory_ids: semantic.ids,
+        semantic_summaries: semantic.summaries,
     }
 }
 
@@ -602,6 +661,7 @@ pub(crate) async fn build_context_with_shared_events_and_scope(
         preamble: bundle.preamble(),
         ids: bundle.recalled_memory_ids,
         semantic_range,
+        summaries: bundle.semantic_summaries,
     }
 }
 

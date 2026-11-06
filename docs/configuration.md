@@ -1211,8 +1211,10 @@ does not authorize another provider or tool execution.
 Prompt memory recall is produced independently of decision selection. Each turn
 uses its authenticated owner, workspace and session scope, including owner
 isolation for external origins. The composed recalled context is capped at
-24,576 bytes. When `memory.events.record_user_messages = false`, automatic
-prompt recall is suppressed so historical user text is not reintroduced.
+24,576 bytes. When `memory.events.record_user_messages = false`, historical user-message
+recall is suppressed; semantic facts, documents and assistant history remain
+available. Scoped recall excludes stale and future-dated rows and projects image
+markers before bounding the retrieval query to 1024 bytes, including in traces.
 Decision-selected retrieval remains available to the decision engine.
 
 ### Embeddings and vector recall
