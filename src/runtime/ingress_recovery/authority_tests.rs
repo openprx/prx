@@ -1,7 +1,7 @@
 #![cfg(test)]
 use super::*;
 use crate::memory::SqliteMemory;
-use crate::memory::recovery_authority::RecoveryRepository;
+use crate::memory::recovery_authority::{RecoveryRepository, RecoveryTag};
 
 fn directory() -> anyhow::Result<tempfile::TempDir> {
     let home = std::env::var_os("HOME").context("fixture HOME unavailable")?;

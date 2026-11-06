@@ -174,7 +174,8 @@ pub struct SqliteMemory {
     pool: Arc<SqliteConnectionPool>,
     #[cfg(test)]
     recovery_activation_attempts: Arc<std::sync::atomic::AtomicUsize>,
-    recovery_availability: Arc<std::sync::OnceLock<Result<(), String>>>,
+    /// Set once when key material is unavailable; never cleared or retried.
+    recovery_unavailable: Arc<std::sync::OnceLock<()>>,
     ingress_owners: Arc<super::ingress_recovery::IngressOwnerCache>,
     db_path: PathBuf,
     acl_enabled: bool,
@@ -376,7 +377,7 @@ impl SqliteMemory {
         Ok(Self {
             pool,
             ingress_owners: Default::default(),
-            recovery_availability: Default::default(),
+            recovery_unavailable: Default::default(),
             #[cfg(test)]
             recovery_activation_attempts: Default::default(),
             db_path,

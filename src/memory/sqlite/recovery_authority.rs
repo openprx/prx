@@ -15,6 +15,16 @@ const MAX_SERIALIZED_FACTS: usize = 262_144;
 const MAX_FACTS: usize = (MAX_SERIALIZED_FACTS - 40 * 1024) / 8;
 const MAX_RECORD: usize = 1_048_576;
 
+/// Key material could not be loaded or trusted. Only this class is memoized
+/// per handle; schema and database failures stay retryable.
+#[derive(Debug, thiserror::Error)]
+#[error("recovery authority unavailable: {0}")]
+struct RecoveryKeyUnavailable(String);
+
+fn key_unavailable(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(RecoveryKeyUnavailable(format!("{error:#}")))
+}
+
 pub(super) fn schema(conn: &Connection) -> anyhow::Result<()> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='recovery_authority' AND type='table')",
@@ -240,14 +250,15 @@ impl SqliteMemory {
         schema(&tx)?;
         let established: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM recovery_authority)", [], |r| r.get(0))?;
         anyhow::ensure!(!initialized || established, "missing established recovery authority");
-        let directory = KeyDirectory::open(self.db_path.parent().context("missing memory directory")?, !established)?;
+        let directory = KeyDirectory::open(self.db_path.parent().context("missing memory directory")?, !established)
+            .map_err(key_unavailable)?;
         let namespace = if established {
             let (namespace, id) = active(&tx)?;
-            directory.load(&id)?;
+            directory.load(&id).map_err(key_unavailable)?;
             // Every retained generation stays available, even during rotation.
             let mut stmt = tx.prepare("SELECT DISTINCT key_id FROM recovery_attestations")?;
             for id in stmt.query_map([], |r| r.get::<_, String>(0))? {
-                directory.load(&id?)?;
+                directory.load(&id?).map_err(key_unavailable)?;
             }
             drop(stmt);
             if !rotate {
@@ -262,8 +273,8 @@ impl SqliteMemory {
             anyhow::ensure!(history == 0, "missing established recovery authority");
             uuid::Uuid::new_v4().to_string()
         };
-        let id = directory.create()?;
-        directory.load(&id)?;
+        let id = directory.create().map_err(key_unavailable)?;
+        directory.load(&id).map_err(key_unavailable)?;
         tx.execute("INSERT INTO recovery_authority(singleton,version,backend_namespace,active_key_id) VALUES(1,1,?1,?2) ON CONFLICT(singleton) DO UPDATE SET active_key_id=excluded.active_key_id", params![namespace,id])?;
         tx.commit()?;
         drop(sync);
@@ -371,17 +382,27 @@ impl SqliteMemory {
 
 impl RecoveryRepository for SqliteMemory {
     fn activate_recovery_authority(&self) -> anyhow::Result<String> {
-        let availability = self.recovery_availability.get_or_init(|| {
-            #[cfg(test)]
-            self.recovery_activation_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.recovery_activate(false).map(|_| ()).map_err(|_| {
-                tracing::warn!("recovery authority unavailable; activation will not be retried");
-                "recovery authority unavailable".to_owned()
-            })
-        });
-        availability.as_ref().map_err(|error| anyhow::anyhow!(error.clone()))?;
-        Ok(active(&self.pool.write())?.1)
+        // Unavailable key material is sticky for this handle: never retried or
+        // regenerated. A successful activation is not memoized, so every call
+        // re-loads the active key and refuses one lost or corrupted afterwards.
+        if self.recovery_unavailable.get().is_some() {
+            return Err(anyhow::Error::new(RecoveryKeyUnavailable(
+                "recovery authority unavailable; activation was refused earlier".to_owned(),
+            )));
+        }
+        #[cfg(test)]
+        self.recovery_activation_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.recovery_activate(false) {
+            Ok(id) => Ok(id),
+            Err(error) if error.is::<RecoveryKeyUnavailable>() => {
+                if self.recovery_unavailable.set(()).is_ok() {
+                    tracing::warn!("recovery authority unavailable; activation will not be retried");
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
     fn recovery_mac(
         &self,
