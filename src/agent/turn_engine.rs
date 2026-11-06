@@ -639,7 +639,7 @@ async fn run_turn_unguarded(
     // surface simply by asking for a spawn or a delegate. Read once: the spawn
     // context is fixed for the lifetime of this turn.
     let inherited_exclusions = crate::tools::sessions_spawn::ambient_channel_excluded_tools();
-    let safety_surface = Arc::new(service.agent_turn_surface(proof, model, &inherited_exclusions));
+    let safety_surface = Arc::new(service.turn_tool_surface(proof, model, &inherited_exclusions));
     let mut iteration = 0usize;
     loop {
         iteration = iteration.saturating_add(1);
