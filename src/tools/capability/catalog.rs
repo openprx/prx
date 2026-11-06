@@ -584,6 +584,12 @@ impl CapabilityCatalog {
         }
     }
 
+    /// Every pinned public name, for surface enumeration. Callers resolve each
+    /// name live before treating it as a candidate.
+    pub(crate) fn public_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.by_name.keys().map(String::as_str)
+    }
+
     pub(crate) fn entry_for_public_name(&self, name: &str) -> Option<&CapabilityEntry> {
         self.by_name.get(name).and_then(|index| self.entries.get(*index))
     }

@@ -2519,6 +2519,21 @@ impl ToolExecutionService {
                 started,
             );
         };
+        if let Err((status, error)) = admission::recheck_resolved(&context, &command.name) {
+            return self.finish(
+                &command,
+                &context,
+                input_sha256,
+                None,
+                None,
+                status,
+                format!("Error: {error}"),
+                None,
+                Some(error),
+                None,
+                started,
+            );
+        }
         let descriptor = resolved.descriptor;
         if let Some(stage) = crate::runtime::experiment_stage::current() {
             if let Err(error) = stage.claim_tool(&descriptor.backend_name) {
