@@ -58,15 +58,8 @@ async fn restored_operator_process_decision_accounts_physical_send_without_os_sp
     run_operator_case(true).await
 }
 
-#[tokio::test]
-async fn task_mode_operator_child_gets_ledger_ordinary_child_none() -> anyhow::Result<()> {
-    run_operator_case(false).await
-}
-
-#[tokio::test]
-async fn operator_process_bg_child_gets_ledger() -> anyhow::Result<()> {
-    run_operator_case(true).await
-}
+// Both cases also assert the operator child approval-ledger opt-in (task mode and
+// restored process mode) inside `run_operator_case`.
 
 async fn run_operator_case(process: bool) -> anyhow::Result<()> {
     let workspace = tempfile::tempdir()?;
