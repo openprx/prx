@@ -2498,15 +2498,27 @@ async fn run_gateway_chat_with_multimodal(
     let runtime_envelope = source_receipt.envelope().clone();
     let gateway_proof = source_receipt.bind(&turn_runtime, fabric_ctx)?;
     if let Some(key) = autosave_key {
-        let _ = fabric
-            .record_semantic_memory_from_event(
+        let write_scope = runtime_envelope.memory_write_context(if fabric_ctx.channel == "webhook" {
+            "webhook"
+        } else {
+            "private"
+        });
+        let _ = state
+            .mem
+            .store_with_context_and_metadata(
                 key,
                 message,
                 MemoryCategory::Conversation,
                 None,
-                gateway_user_event.as_ref().map(|event| event.event_id.as_str()),
-                None,
-                None,
+                Some(&write_scope),
+                crate::memory::MemoryStoreMetadata {
+                    workspace_id: Some(runtime_envelope.workspace_id.clone()),
+                    owner_id: Some(runtime_envelope.resolved_owner_id()),
+                    source_event_id: runtime_envelope.source_message_event_id.clone(),
+                    source: Some("semantic_promotion".into()),
+                    channel: Some(fabric_ctx.channel.clone()),
+                    ..Default::default()
+                },
             )
             .await;
     }

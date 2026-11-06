@@ -1073,22 +1073,33 @@ async fn cli_production_autosave_excludes_live_input() {
         .iter()
         .find(|row| row.content == input)
         .expect("production live-input save");
-    let conn = rusqlite::Connection::open(workspace.join("memory/brain.db")).unwrap();
-    let (event, run): (String, String) = conn
-        .query_row(
-            "SELECT event_id, run_id FROM message_events WHERE role='user' AND content=?1 LIMIT 1",
-            [input],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+    let workspace_id = workspace.to_string_lossy().to_string();
+    let events = memory
+        .list_message_events_time_range(
+            &crate::memory::MemoryPrincipal {
+                workspace_id: workspace_id.clone(),
+                agent_id: Some("system".into()),
+                ..Default::default()
+            },
+            Some(&workspace_id),
+            "1970-01-01T00:00:00+00:00",
+            "2999-01-01T00:00:00+00:00",
+            100,
         )
+        .await
         .unwrap();
-    drop(conn);
+    let event = events
+        .iter()
+        .find(|event| event.role == "user" && event.content == input)
+        .expect("production input event");
+    let run = event.run_id.as_deref().expect("production input run id");
     assert_eq!(
         row.key,
-        current_input_memory_key(&run),
+        current_input_memory_key(run),
         "production save uses the current run key"
     );
     let envelope =
-        resolve_agent_turn_envelope(None, &workspace.to_string_lossy(), &run).with_source_message_event_id(event);
+        resolve_agent_turn_envelope(None, &workspace_id, run).with_source_message_event_id(event.event_id.clone());
     let recalled = crate::agent::context_recall::scoped_recall(
         &memory,
         &crate::agent::context_recall::RecallScope::from_envelope(

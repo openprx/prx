@@ -597,58 +597,6 @@ impl Provider for OversizeResponseProvider {
     }
 }
 
-#[derive(Default)]
-struct TrackingMemory {
-    keys: Mutex<Vec<String>>,
-}
-
-#[async_trait]
-impl Memory for TrackingMemory {
-    fn name(&self) -> &str {
-        "tracking"
-    }
-
-    async fn store(
-        &self,
-        key: &str,
-        _content: &str,
-        _category: MemoryCategory,
-        _session_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.keys.lock().push(key.to_string());
-        Ok(())
-    }
-
-    async fn recall(&self, _query: &str, _limit: usize, _session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
-        Ok(Vec::new())
-    }
-
-    async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        Ok(None)
-    }
-
-    async fn list(
-        &self,
-        _category: Option<&MemoryCategory>,
-        _session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        Ok(Vec::new())
-    }
-
-    async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-
-    async fn count(&self) -> anyhow::Result<usize> {
-        let size = self.keys.lock().len();
-        Ok(size)
-    }
-
-    async fn health_check(&self) -> bool {
-        true
-    }
-}
-
 /// Webhook requests in these tests use the default synchronous mode; async
 /// submission is opted into with `?mode=async`.
 fn test_uri() -> axum::http::Uri {

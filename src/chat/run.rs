@@ -120,7 +120,6 @@ use crate::llm::route_decision::ProviderExecutionOutcome;
 use crate::llm::route_decision::RouteDecision;
 use crate::llm::route_decision::route_event_scope;
 use crate::memory::Memory;
-use crate::memory::MemoryCategory;
 use crate::memory::MemoryFabric;
 use crate::observability::ObserverEvent;
 use crate::providers;

@@ -71,29 +71,37 @@ async fn webhook_idempotency_failed_attempt_is_not_reexecuted() {
 async fn webhook_idempotency_autosave_key_is_derived_not_leaked() {
     let provider_impl = Arc::new(FailFirstProvider::default());
     let provider: Arc<dyn Provider> = provider_impl.clone();
-    let tracking_impl = Arc::new(TrackingMemory::default());
     let mut state = webhook_test_state(provider);
-    state.mem = tracking_impl.clone();
     state.auto_save = true;
-    let mut headers = HeaderMap::new();
-    headers.insert("X-Idempotency-Key", HeaderValue::from_static("stable-autosave"));
-
-    let first = handle_webhook(
-        State(state),
-        test_connect_info(),
-        test_uri(),
-        headers,
-        Bytes::from_static(br#"{"message":"remember this stable autosave payload across the retry attempt"}"#),
-    )
-    .await
-    .into_response();
-    assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-    let keys = tracking_impl.keys.lock();
-    assert_eq!(keys.len(), 1);
-    let key = keys.first().expect("autosave key recorded");
-    assert!(key.starts_with("webhook_msg_"));
-    assert!(!key.contains("stable-autosave"));
+    owned_bound_gateway_fixture(state, |state| async move {
+        let memory = Arc::clone(&state.mem);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("stable-autosave"));
+        let first = handle_webhook(
+            State(state),
+            test_connect_info(),
+            test_uri(),
+            headers,
+            Bytes::from_static(br#"{"message":"remember this stable autosave payload across the retry attempt"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            provider_impl.calls.load(Ordering::SeqCst),
+            1,
+            "the bound serving attempt failed after autosave"
+        );
+        let entries = memory
+            .list(Some(&MemoryCategory::Conversation), None)
+            .await
+            .expect("actual autosaved rows");
+        assert_eq!(entries.len(), 1);
+        let key = &entries.first().expect("autosave key recorded").key;
+        assert!(key.starts_with("webhook_msg_"));
+        assert!(!key.contains("stable-autosave"));
+    })
+    .await;
 }
 
 /// A cancelled *caller* is not a cancelled *run*. The turn lives in a
