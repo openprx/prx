@@ -100,14 +100,23 @@ struct SourceFields {
 
 /// Join an already authenticated decision/source to its logical task. Callers
 /// still verify record digests, source MACs and exact owner/workspace scope.
-pub(crate) fn matches_parent_task_segment(
+/// Parent decision facts that a task segment must match. Journal readers take
+/// them from the sealed row; store readers take them from the decision record.
+pub(crate) struct ParentTaskFacts<'a> {
+    pub(crate) task_id: Option<&'a str>,
+    pub(crate) source_event_id: Option<&'a str>,
+    pub(crate) run_id: Option<&'a str>,
+    pub(crate) session_key: Option<&'a str>,
+}
+
+pub(crate) fn matches_parent_task_facts(
     task: &str,
-    record: &crate::causal_tree::store::DecisionReplayRecord,
+    facts: &ParentTaskFacts<'_>,
     source: &crate::memory::MessageEvent,
 ) -> bool {
     !task.is_empty()
-        && record.decision.task_id.as_deref() == Some(task)
-        && record.source_event_id.as_deref() == Some(source.event_id.as_str())
+        && facts.task_id == Some(task)
+        && facts.source_event_id == Some(source.event_id.as_str())
         && source.id > 0
         && source.role == "user"
         && source.event_type == "message.created"
@@ -121,9 +130,26 @@ pub(crate) fn matches_parent_task_segment(
             .run_id
             .as_deref()
             .is_some_and(|run| !run.is_empty() && run != task)
-        && source.run_id == record.decision.run_id
+        && source.run_id.as_deref() == facts.run_id
         && source.session_key.as_deref().is_some_and(|session| !session.is_empty())
-        && source.session_key == record.decision.session_key
+        && source.session_key.as_deref() == facts.session_key
+}
+
+pub(crate) fn matches_parent_task_segment(
+    task: &str,
+    record: &crate::causal_tree::store::DecisionReplayRecord,
+    source: &crate::memory::MessageEvent,
+) -> bool {
+    matches_parent_task_facts(
+        task,
+        &ParentTaskFacts {
+            task_id: record.decision.task_id.as_deref(),
+            source_event_id: record.source_event_id.as_deref(),
+            run_id: record.decision.run_id.as_deref(),
+            session_key: record.decision.session_key.as_deref(),
+        },
+        source,
+    )
 }
 impl ParentSource {
     pub(crate) fn capture(proof: &dyn crate::runtime::turn_source::TurnSourceProof) -> Self {

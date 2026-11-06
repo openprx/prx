@@ -22,6 +22,7 @@ use crate::memory::{Memory, MemoryFabric, MessageEventScope};
 use crate::observability::NoopObserver;
 use crate::providers::{ChatMessage, Provider};
 use crate::runtime;
+use crate::runtime::child_source::completion::ChildCompletionPort;
 use crate::security::policy::ResourceRiskLevel;
 use crate::security::{SecurityPolicy, SideEffectGate};
 use crate::session_worker::protocol::{WorkerManifest, WorkerResult, config_source_generation};
@@ -230,32 +231,6 @@ impl LegacyGatedAdmission {
             Some(Arc::clone(&completion.usage)),
         )
         .await
-    }
-}
-
-/// Completion uses the admitted segment's prebound terminal and usage owner.
-/// It cannot admit a segment or reconstruct parent authority from a decision row.
-struct ChildCompletionPort {
-    usage: Arc<crate::runtime::turn_terminal::TerminalUsageCollector>,
-}
-
-impl ChildCompletionPort {
-    async fn complete(
-        &self,
-        turn: &crate::runtime::child_turn::ChildSegmentTurn,
-        outcome: &crate::agent::turn_contracts::ToolLoopOutcome,
-        trace: &crate::agent::turn_contracts::ToolLoopTrace,
-    ) -> Result<()> {
-        turn.complete(outcome, trace).await.map(|_| ())
-    }
-
-    async fn fail(
-        &self,
-        turn: &crate::runtime::child_turn::ChildSegmentTurn,
-        error: &anyhow::Error,
-        cancelled: bool,
-    ) -> Result<()> {
-        turn.fail(error, cancelled).await
     }
 }
 
@@ -721,6 +696,7 @@ async fn run_owned_manifest(
                     .context("worker logical source fabric missing")?
                     .clone(),
                 security: Arc::clone(&security),
+                parent_issuer: None,
             },
             source_receipt.as_deref().context("worker child input missing")?,
             &manifest,

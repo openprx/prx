@@ -101,6 +101,7 @@ impl IssuedChildGrant {
             manifest, parent,
         )?);
         Ok(Arc::new(Self(Arc::new(ChildGrantData {
+            parent_issuer: self.0.parent_issuer.clone(),
             recursive_child_claimed: Some(recursive_child_claimed),
             parent_model: self.0.parent_model.clone(),
             source_fabric: self.0.source_fabric.clone(),

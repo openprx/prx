@@ -249,14 +249,18 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
                     let mut segments = authority.segments()?;
                     let mut source = segments.record(task).await?;
                     assert!(source.1.approval_ledger.is_none());
-                    crate::tools::sessions_spawn::configure_operator_child_approval(&mut source.1, &service, None);
+                    crate::tools::sessions_spawn::configure_operator_child_approval(
+                        &mut source.1,
+                        service.execution_approval_ledger(),
+                        None,
+                    );
                     assert!(
                         source.1.approval_ledger.is_none(),
                         "ordinary child path must not opt in"
                     );
                     crate::tools::sessions_spawn::configure_operator_child_approval(
                         &mut source.1,
-                        &service,
+                        service.execution_approval_ledger(),
                         Some(&authority),
                     );
                     assert!(source.1.approval_ledger.is_some(), "operator task child must opt in");

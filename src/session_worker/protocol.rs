@@ -41,6 +41,11 @@ pub struct WorkerChildSource {
     pub parent_constraints: crate::tools::capability::child::wire::WorkerParentConstraints,
     pub config_generation: crate::config::generation::ProcessGenerationBinding,
     pub catalog: crate::tools::capability::catalog::process_snapshot::ProcessCatalogSnapshot,
+    /// Authenticated journal version. Absent means a pre-upgrade (legacy) child,
+    /// and the field is omitted from JSON so historical manifests stay byte-identical.
+    /// Version 3 and later require the authority journal row to be present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_version: Option<u8>,
 }
 
 /// Optional durable input evidence for an ordinary worker. Absence means

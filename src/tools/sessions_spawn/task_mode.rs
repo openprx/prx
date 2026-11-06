@@ -16,11 +16,11 @@ use tokio_util::sync::CancellationToken;
 /// Only an explicitly issued operator task opts into durable child review.
 pub(crate) fn configure_operator_child_approval(
     context: &mut crate::tools::ToolExecutionContext,
-    service: &crate::runtime::turn_decision::TurnDecisionService,
+    ledger: Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger>,
     authority: Option<&Arc<crate::runtime::operator_spawn::task::OperatorTaskAuthority>>,
 ) {
     if authority.is_some() {
-        context.approval_ledger = service.execution_approval_ledger();
+        context.approval_ledger = ledger;
     }
 }
 
@@ -313,7 +313,7 @@ pub(super) async fn run_sub_agent_task(
         let child_service_owned = child_service.clone().context("task segment service missing")?;
         configure_operator_child_approval(
             &mut child_source_owned.1,
-            &child_service_owned,
+            child_service_owned.execution_approval_ledger(),
             operator_authority.as_ref(),
         );
         let child_config_owned = child_config.clone().context("task segment configuration missing")?;
