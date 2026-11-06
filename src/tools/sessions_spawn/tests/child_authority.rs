@@ -279,14 +279,21 @@ fn decision_evidence_rejects_scope_substitution() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn batch_child_completion_settles_after_restart_through_completion_port() -> Result<()> {
+/// Everything a reopened restart needs. Plain data only, with no live handle.
+struct ReopenedChild {
+    workspace: PathBuf,
+    key: Arc<crate::decision::DecisionKey>,
+    expected: ChildOutcomeRow,
+    launch_version: u8,
+}
+
+/// Reopens every handle and rebuilds the expected row from an independently
+/// verified segment replay. Nothing from the run crosses this boundary.
+async fn reopened_child_evidence(manifest: &WorkerManifest, result: &WorkerResult) -> Result<ReopenedChild> {
     use crate::agent::terminal::verify_terminal_replay;
     use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
     use crate::causal_tree::store::CausalDecisionStore;
 
-    let tmp = tempfile::tempdir()?;
-    let (manifest, result) = completed_child_fixture(&tmp).await?;
     let source = manifest.child_source.as_ref().context("test: child source")?;
     let owner = manifest.owner_id.clone().context("test: owner")?;
     let workspace = PathBuf::from(&source.parent_constraints.workspace);
@@ -300,14 +307,14 @@ async fn batch_child_completion_settles_after_restart_through_completion_port() 
             evidence.segments.len()
         );
     };
-
-    // Reopen every handle. Nothing from the run crosses this boundary.
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.as_path())?);
     let fabric = MemoryFabric::new(
         memory,
         manifest.memory_workspace_id.clone().context("test: memory workspace")?,
     );
     let key = crate::decision::DecisionKey::load_existing(&workspace)?;
+    let launch = authority_journal::read_launch_parent(&workspace, &manifest.run_id, &key)?
+        .context("test: launch parent authority row")?;
     let store = CausalDecisionStore::open_unshared_read_only(&workspace);
     let store_workspace = store.workspace_id().context("test: store namespace")?;
     anyhow::ensure!(
@@ -365,26 +372,146 @@ async fn batch_child_completion_settles_after_restart_through_completion_port() 
         child_digest: replay.decision_digest().to_owned(),
         outcome_hash: outcome.journal_hash()?,
     };
+    Ok(ReopenedChild {
+        workspace,
+        key,
+        expected,
+        launch_version: launch.version,
+    })
+}
+
+#[tokio::test]
+async fn batch_child_completion_settles_after_restart_through_completion_port() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let (manifest, result) = completed_child_fixture(&tmp).await?;
+    let child = reopened_child_evidence(&manifest, &result).await?;
 
     // The completion port settled the row during the run. The normal reader
     // confirms it and must not repair it, so the raw rows stay identical.
-    let before = child_outcome_rows(&workspace)?;
+    let before = child_outcome_rows(&child.workspace)?;
     anyhow::ensure!(
-        before.len() == 1 && before[0].0 == expected.run && before[0].1 == expected.settlement,
+        before.len() == 1 && before[0].0 == child.expected.run && before[0].1 == child.expected.settlement,
         "test: completion must leave exactly one settled child outcome row: {before:?}"
     );
     anyhow::ensure!(
         authority_journal::verify_child_outcome(
-            &workspace,
-            &key,
-            &expected,
+            &child.workspace,
+            &child.key,
+            &child.expected,
             Some(authority_journal::JOURNAL_REQUIRED_VERSION),
         )?,
         "test: the settled child outcome row must verify"
     );
     anyhow::ensure!(
-        child_outcome_rows(&workspace)? == before,
+        child_outcome_rows(&child.workspace)? == before,
         "test: the normal reader changed the child outcome journal"
+    );
+    Ok(())
+}
+
+/// Raw seal-bearing entry, mirrored here so a test can flip one seal byte.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedEntry {
+    payload: String,
+    seal: [u8; 32],
+}
+
+#[tokio::test]
+async fn child_outcome_seal_tamper_is_refused_after_restart() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let (manifest, result) = completed_child_fixture(&tmp).await?;
+    let child = reopened_child_evidence(&manifest, &result).await?;
+    let (run, settlement) = (child.expected.run.clone(), child.expected.settlement.clone());
+
+    // Positive control: the matching row reads through the normal reader.
+    anyhow::ensure!(
+        authority_journal::verify_child_outcome(
+            &child.workspace,
+            &child.key,
+            &child.expected,
+            Some(child.launch_version),
+        )?,
+        "test: matching child outcome must verify before tampering"
+    );
+
+    // Flip only the seal. The payload, SQL keys and seal length stay identical.
+    let db = rusqlite::Connection::open(authority_journal::path(&child.workspace))?;
+    let stored: String = db.query_row(
+        "SELECT entry FROM child_outcome WHERE run = ?1 AND settlement = ?2",
+        (&run, &settlement),
+        |row| row.get(0),
+    )?;
+    let mut entry: SealedEntry = serde_json::from_str(&stored)?;
+    entry.seal[0] ^= 1;
+    let tampered = serde_json::to_string(&entry)?;
+    db.execute(
+        "UPDATE child_outcome SET entry = ?1 WHERE run = ?2 AND settlement = ?3",
+        (&tampered, &run, &settlement),
+    )?;
+    drop(db);
+
+    // Independent replay still succeeds after reopen. Only the journal read refuses.
+    let reopened = reopened_child_evidence(&manifest, &result).await?;
+    let error = authority_journal::verify_child_outcome(
+        &reopened.workspace,
+        &reopened.key,
+        &reopened.expected,
+        Some(reopened.launch_version),
+    )
+    .expect_err("a child outcome with a tampered seal must be refused");
+    assert!(error.to_string().contains("seal is invalid"), "{error:#}");
+    anyhow::ensure!(
+        child_outcome_rows(&reopened.workspace)? == vec![(run, settlement, tampered)],
+        "test: the refused child outcome row must stay unchanged"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn child_outcome_missing_row_is_refused_for_v3() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let (manifest, result) = completed_child_fixture(&tmp).await?;
+    let child = reopened_child_evidence(&manifest, &result).await?;
+    let (run, settlement) = (child.expected.run.clone(), child.expected.settlement.clone());
+
+    // Positive control: the matching row reads through the normal reader.
+    anyhow::ensure!(
+        authority_journal::verify_child_outcome(
+            &child.workspace,
+            &child.key,
+            &child.expected,
+            Some(child.launch_version),
+        )?,
+        "test: matching child outcome must verify before deletion"
+    );
+
+    // Delete only this row. Terminal, parent and hop evidence stay intact.
+    let db = rusqlite::Connection::open(authority_journal::path(&child.workspace))?;
+    let deleted = db.execute(
+        "DELETE FROM child_outcome WHERE run = ?1 AND settlement = ?2",
+        (&run, &settlement),
+    )?;
+    anyhow::ensure!(deleted == 1, "test: exactly one child outcome row must be deleted");
+    drop(db);
+
+    // The replay still verifies after reopen, so only the journal row is missing.
+    let reopened = reopened_child_evidence(&manifest, &result).await?;
+    let error = authority_journal::verify_child_outcome(
+        &reopened.workspace,
+        &reopened.key,
+        &reopened.expected,
+        Some(reopened.launch_version),
+    )
+    .expect_err("a version-3 child without its outcome row must be refused");
+    assert!(error.to_string().contains("child outcome row is missing"), "{error:#}");
+    anyhow::ensure!(
+        child_outcome_rows(&reopened.workspace)?.is_empty(),
+        "test: the refused read must not insert a row"
+    );
+    anyhow::ensure!(
+        !authority_journal::verify_child_outcome(&reopened.workspace, &reopened.key, &reopened.expected, None)?,
+        "test: an absent row without a journal version must be Ok(false)"
     );
     Ok(())
 }

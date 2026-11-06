@@ -5,6 +5,7 @@ pub(super) mod ordinary;
 use crate::agent::terminal::{TurnTerminalStatus, verify_terminal_replay};
 use crate::causal_tree::store::CausalDecisionStore;
 use crate::memory::{MemoryFabric, MessageEvent, MessageEventSource, MessageEventSubject};
+use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
 use crate::runtime::child_source::{ChildInputReceipt, IssuedChildGrant};
 use crate::session_worker::protocol::WorkerResult;
 use anyhow::Context;
@@ -416,7 +417,7 @@ struct RecoveryProvenance<'a> {
     parent_decision: crate::tools::capability::child::ParentAuthorityId,
     parent_digest: &'a str,
     input: &'a MessageEvent,
-    key: &'a crate::decision::DecisionKey,
+    key: &'a std::sync::Arc<crate::decision::DecisionKey>,
 }
 
 pub(super) async fn verify(
@@ -599,6 +600,13 @@ async fn verify_bound(
         )?
         .with_verified_resume(&replay);
         let outcome = crate::causal_tree::outcome::OutcomeCorrelator::persisted_record(replay.decision(), &facts)?;
+        JournalChildOutcomeHook::new(
+            provenance.workspace.to_path_buf(),
+            std::sync::Arc::clone(provenance.key),
+            std::sync::Arc::from(provenance.store_workspace),
+        )
+        .persist(&replay, &event, None, None)
+        .await?;
         let link = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &outcome)
             .context("worker segment outcome lineage is inconsistent")?;
         if !reader.child_outcome_matches(&scope, &link)? {

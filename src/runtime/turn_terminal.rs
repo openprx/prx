@@ -3,6 +3,7 @@ use super::turn_decision::VerifiedDirectiveApplication;
 use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
 use crate::causal_tree::state::TurnSurfaceKind;
 use crate::causal_tree::store::{DecisionScope, Enqueue};
+use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
 use crate::runtime::turn_decision::TurnDecisionService;
 use anyhow::Context;
 use std::sync::Arc;
@@ -948,6 +949,17 @@ impl super::ingress_recovery::RecoveryScope {
         let expected = OutcomeCorrelator::persisted_record(decision, &facts)?;
         #[cfg(test)]
         stage.next(super::turn_cleanup::diagnostic::StageName::RejoinRecord);
+        let (child_owner, child_deadline) = match bounded {
+            Some((_, deadline, owner)) => (Some(owner), Some(deadline)),
+            None => (None, None),
+        };
+        JournalChildOutcomeHook::new(
+            self.workspace.clone(),
+            Arc::clone(&self.state_key),
+            Arc::clone(&store_workspace_id),
+        )
+        .persist(&replay, &event, child_owner, child_deadline)
+        .await?;
         let queued = writer.record_outcome(expected.clone());
         anyhow::ensure!(queued == Enqueue::Queued, "rejoined outcome could not be queued");
         #[cfg(test)]
