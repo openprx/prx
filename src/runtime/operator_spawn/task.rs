@@ -7,6 +7,7 @@ use anyhow::Context;
 
 pub(crate) struct OperatorTaskAuthority {
     id: uuid::Uuid,
+    allowance: Arc<crate::runtime::child_source::recursive_allowance::RecursiveAllowance>,
     source_event_id: Option<String>,
     scope: crate::memory::MessageEventScope,
     sequence_claimed: AtomicBool,
@@ -111,9 +112,15 @@ impl OperatorSpawnSource {
                 .is_ok(),
             "operator command already issued a task authority"
         );
+        let parent = self.publication.parent_authority();
+        parent.ensure_child_available()?;
+        let (_, allowance) = parent
+            .allowance
+            .carve_ordinary_child(parent.constraints.authority.max_cost_cents)?;
         let cancellation = cancellation.child_token();
         let authority = Arc::new(OperatorTaskAuthority {
             id: uuid::Uuid::now_v7(),
+            allowance,
             source_event_id: receipt.map(|receipt| receipt.event().event_id.clone()),
             scope: scope.clone(),
             sequence_claimed: AtomicBool::new(false),
@@ -130,6 +137,12 @@ impl OperatorSpawnSource {
 }
 
 impl OperatorTaskAuthority {
+    pub(crate) const fn allowance(
+        &self,
+    ) -> &Arc<crate::runtime::child_source::recursive_allowance::RecursiveAllowance> {
+        &self.allowance
+    }
+
     pub(crate) fn parent_source(&self) -> crate::runtime::child_source::parent::ParentSource {
         crate::runtime::child_source::parent::ParentSource::capture(&self.source.proof)
     }

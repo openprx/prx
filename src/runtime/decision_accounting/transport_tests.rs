@@ -662,7 +662,7 @@ async fn real_nested_responses_fallback_accounts_both_physical_sends() {
 
 #[tokio::test]
 async fn recursive_parent_child_and_leaf_reservations_share_the_original_money() -> anyhow::Result<()> {
-    use crate::runtime::turn_decision::recursive_allowance::RecursiveAllowance;
+    use crate::runtime::child_source::recursive_allowance::RecursiveAllowance;
     let workspace = tempfile::tempdir()?;
     let mut config = Config::default();
     config.workspace_dir = workspace.path().to_owned();

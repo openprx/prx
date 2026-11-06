@@ -77,3 +77,56 @@ async fn context_drop_and_denied_pending_remove_every_run_alias() {
     );
     assert!(registry.lock().is_empty());
 }
+
+#[test]
+fn recursive_allowance_exhausted_refuses_spawn_without_decision_service() -> anyhow::Result<()> {
+    use crate::causal_tree::branch::{
+        CapabilityId, CapabilityRef, CapabilityTarget, CatalogGeneration, SchemaFingerprint,
+    };
+    use crate::tools::capability::child::{AuthorityEnvelope, ChildCapabilityManifest};
+    let generation = CatalogGeneration([7; 32]);
+    let allowed = ["prx_read", "sessions_spawn"]
+        .into_iter()
+        .map(|name| {
+            Ok(CapabilityRef {
+                id: CapabilityId::new(CapabilityTarget::NativeTool, "native", name)?,
+                fingerprint: SchemaFingerprint([1; 32]),
+                generation,
+            })
+        })
+        .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+    let parent = crate::runtime::child_source::ParentAuthority::for_run(
+        "prx_run",
+        allowed,
+        AuthorityEnvelope {
+            owner: "prx_user".into(),
+            workspace: "prx_workspace".into(),
+            level: crate::security::AutonomyLevel::Supervised,
+            max_cost_cents: 10,
+            remaining_depth: 2,
+            delegation: None,
+        },
+        generation,
+        crate::decision::key::DecisionKey::ephemeral(),
+        Arc::new(RecursiveAllowance::new(100_000)),
+    );
+    let child = ChildCapabilityManifest::derive_strict_subset(&parent.constraints, &[])?;
+    child.verify(&parent.constraints)?;
+    let (cents, child_allowance) = parent.allowance.carve_child(child.authority.max_cost_cents)?;
+    assert_eq!(cents, 5);
+    assert_eq!(child_allowance.money().load(Ordering::Acquire), 50_000);
+    assert!(parent.allowance.ensure_available().is_err());
+    let retained = Arc::clone(&parent.allowance);
+    let refusal = retained
+        .carve_child(child.authority.max_cost_cents)
+        .err()
+        .expect("test: exhausted recursive authority must refuse another child");
+    assert!(
+        refusal
+            .to_string()
+            .contains("already allocated its one child allowance")
+    );
+    assert_eq!(parent.allowance.money().load(Ordering::Acquire), 50_000);
+    assert!(RecursiveAllowance::new(0).carve_child(10).is_err());
+    Ok(())
+}

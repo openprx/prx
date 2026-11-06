@@ -15,8 +15,6 @@ use subtle::ConstantTimeEq;
 pub(crate) struct ParentAuthorityId(uuid::Uuid);
 
 impl ParentAuthorityId {
-    // R1 supplies the identity; run-rooted publication is connected in R2.
-    #[cfg_attr(not(test), expect(dead_code, reason = "run-rooted publication lands in R2"))]
     pub(crate) fn for_run(run_id: &str, key: &DecisionKey) -> Self {
         let digest = key.hmac(
             KeyDomain::StateFingerprint,

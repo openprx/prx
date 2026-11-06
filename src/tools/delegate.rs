@@ -568,6 +568,7 @@ impl Tool for DelegateTool {
             .and_then(|caller| caller.context().ordinary_child_publication.as_ref());
         if let (Some(publication), Some(caller)) = (ordinary_publication, caller.as_ref()) {
             publication.verify_caller(caller.context())?;
+            publication.parent_authority().ensure_child_available()?;
         }
         if child_grant.is_none() && ordinary_publication.is_none() {
             return Ok(ToolResult {

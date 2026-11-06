@@ -1,4 +1,7 @@
 //! Durable child-input receipts, independent of parent message provenance.
+mod parent_authority;
+pub(crate) mod recursive_allowance;
+pub(crate) use parent_authority::ParentAuthority;
 pub(crate) mod operator_process;
 pub(crate) mod operator_process_input;
 pub(crate) mod ordinary_process;
@@ -543,7 +546,7 @@ pub(crate) struct IssuedChildGrant(Arc<ChildGrantData>);
 mod recursive;
 
 pub(crate) struct ChildGrantRuntime {
-    pub(crate) recursive_child_claimed: Option<Arc<super::turn_decision::recursive_allowance::RecursiveAllowance>>,
+    pub(crate) recursive_child_claimed: Option<Arc<recursive_allowance::RecursiveAllowance>>,
     pub(crate) decision_store: Arc<crate::causal_tree::store::CausalDecisionStore>,
     pub(crate) source_fabric: MemoryFabric,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
@@ -557,7 +560,7 @@ struct ParentModelSelection {
 }
 
 struct ChildGrantData {
-    recursive_child_claimed: Option<Arc<super::turn_decision::recursive_allowance::RecursiveAllowance>>,
+    recursive_child_claimed: Option<Arc<recursive_allowance::RecursiveAllowance>>,
     // Only a live parent decision can issue default child-model selection.
     // Restored incoming authority is used to admit that child, not to spawn
     // another child without a fresh decision-issued outgoing grant.
@@ -659,7 +662,7 @@ impl IssuedChildGrant {
         );
         Ok(Self(Arc::new(ChildGrantData {
             recursive_child_claimed: Some(recursive_child_claimed.unwrap_or_else(|| {
-                Arc::new(super::turn_decision::recursive_allowance::RecursiveAllowance::new(
+                Arc::new(recursive_allowance::RecursiveAllowance::new(
                     u64::from(manifest.authority.max_cost_cents) * 10_000,
                 ))
             })),

@@ -1827,7 +1827,9 @@ do. Each ordinary sibling atomically takes half of the smaller current balance
 and manifest ceiling, rounded down to cents. A failed launch keeps its reservation;
 no speculative refund can finance another child. Recursive ancestry still has its
 single-child rule. Cloned/reissued grants use the same parent balance. Disabled
-causal-plane publications also share the parent accounting owner, and process
+causal-plane publications also share the parent accounting owner. In-process
+ordinary and operator children retain run-rooted parent constraints; operator
+tasks reserve from their command's remaining allowance before launch. Process
 workers carry the narrowed ceiling in their authenticated manifest. A parent
 unable to fund one cent refuses the launch. This is monetary admission; it does
 not merge the distinct per-turn token/context windows or claim a vendor billing cap.

@@ -87,6 +87,7 @@ pub(crate) struct OrdinaryChildPublication(Arc<OrdinaryChildPublicationInner>);
 
 struct OrdinaryChildPublicationInner {
     context: Arc<TurnDecisionContext>,
+    authority: crate::runtime::child_source::ParentAuthority,
     scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
     service: Arc<TurnDecisionService>,
     source: super::super::turn_source::OwnedTurnSourceProof,
@@ -106,6 +107,10 @@ impl PartialEq for OrdinaryChildPublication {
 impl Eq for OrdinaryChildPublication {}
 
 impl OrdinaryChildPublication {
+    pub(crate) fn parent_authority(&self) -> &crate::runtime::child_source::ParentAuthority {
+        &self.0.authority
+    }
+
     pub(crate) fn intercepts_writes(&self) -> bool {
         self.0.source.intercepts_writes()
     }
@@ -114,19 +119,25 @@ impl OrdinaryChildPublication {
         service: &Arc<TurnDecisionService>,
         context: &Arc<TurnDecisionContext>,
         source: &dyn TurnSourceProof,
+        authority: crate::runtime::child_source::ParentAuthority,
+        requested: &[CapabilityRef],
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !service.generation.effective.causal_tree.enabled,
             "ordinary publication requires disabled plane"
         );
-        // Bind the parent monetary owner before its main model call can spend.
-        // Later child launches carve from that same balance, including builtin admission.
-        service
-            .issue_recursive_allowance(source, context)
-            .context("ordinary parent budget owner missing")?;
+        let manifest = crate::tools::capability::child::ChildCapabilityManifest::derive_strict_subset(
+            &authority.constraints,
+            requested,
+        )?;
+        let scope = Arc::new(crate::tools::capability::child::VerifiedChildScope::new(
+            manifest,
+            &authority.constraints,
+        )?);
         Ok(Self(Arc::new(OrdinaryChildPublicationInner {
             context: Arc::clone(context),
-            scope: Arc::new(service.verified_delegation_scope(context)?),
+            authority,
+            scope,
             service: Arc::clone(service),
             source: super::super::turn_source::OwnedTurnSourceProof::capture(source),
         })))
@@ -189,12 +200,10 @@ impl OrdinaryChildPublication {
     }
 
     fn allocate_child_budget(&self) -> anyhow::Result<(u32, Arc<super::recursive_allowance::RecursiveAllowance>)> {
-        let owner = self
-            .0
-            .service
-            .issue_recursive_allowance(&self.0.source, &self.0.context)
-            .context("ordinary parent budget owner missing")?;
-        owner.carve_ordinary_child(self.scope().gate_inputs().0.authority.max_cost_cents)
+        self.0
+            .authority
+            .allowance
+            .carve_ordinary_child(self.scope().gate_inputs().0.authority.max_cost_cents)
     }
 
     /// Derive an in-process worker from the actual parent publication. It
@@ -588,7 +597,29 @@ impl TurnDecisionService {
             && bindings
                 .keys()
                 .any(|name| matches!(name.as_str(), "delegate" | "sessions_spawn")))
-        .then(|| OrdinaryChildPublication::capture(self, context, proof))
+        .then(|| {
+            let scope = self.verified_delegation_scope(context)?;
+            let (issued, parent) = scope.gate_inputs();
+            // Retain the accounting owner before the parent model can spend.
+            let allowance = self
+                .issue_recursive_allowance(proof, context)
+                .context("ordinary parent budget owner missing")?;
+            let authority = crate::runtime::child_source::ParentAuthority::for_run(
+                proof.run_id(),
+                parent.allowed.clone(),
+                parent.authority.clone(),
+                parent.catalog_generation,
+                Arc::clone(&parent.key),
+                allowance,
+            );
+            OrdinaryChildPublication::capture(
+                self,
+                context,
+                proof,
+                authority,
+                &issued.allowed.iter().cloned().collect::<Vec<_>>(),
+            )
+        })
         .transpose()?;
         let delegation_bound = bindings
             .keys()

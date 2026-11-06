@@ -10,7 +10,7 @@ use super::{
 pub(crate) struct OperatorChildPublication {
     service: Arc<TurnDecisionService>,
     source: super::super::super::turn_source::OwnedTurnSourceProof,
-    allowed: BTreeSet<CapabilityRef>,
+    authority: crate::runtime::child_source::ParentAuthority,
 }
 
 impl OperatorChildPublication {
@@ -22,7 +22,7 @@ impl OperatorChildPublication {
         security: &Arc<SecurityPolicy>,
     ) -> anyhow::Result<Self> {
         service.verify_operator_spawn_source(source, generation, memory, security)?;
-        let allowed = service
+        let allowed: BTreeSet<_> = service
             .catalog_view()
             .iter_entries()
             .filter(|entry| entry.availability.level >= CapabilityAvailabilityLevel::Configured)
@@ -41,13 +41,45 @@ impl OperatorChildPublication {
                 generation: entry.generation,
             })
             .collect();
-        let publication = Self {
-            service,
-            source: super::super::super::turn_source::OwnedTurnSourceProof::capture(source),
-            allowed,
-        };
+        let remaining = crate::cost::tracker::remaining_micro_usd_read_only_with_security_ceiling(
+            &generation.effective.cost,
+            &generation.effective.workspace_dir,
+            security.max_cost_per_day_cents,
+        )?;
+        let authority = crate::runtime::child_source::ParentAuthority::for_run(
+            source.run_id(),
+            allowed.clone(),
+            crate::tools::capability::child::AuthorityEnvelope {
+                owner: source.owner_id().to_owned(),
+                workspace: source.workspace_id().to_owned(),
+                level: security.autonomy,
+                max_cost_cents: security.max_cost_per_day_cents,
+                remaining_depth: u8::try_from(allowed.len()).unwrap_or(u8::MAX),
+                delegation: None,
+            },
+            *service.catalog.generation(),
+            Arc::clone(&service.state_key),
+            Arc::new(crate::runtime::child_source::recursive_allowance::RecursiveAllowance::new(remaining)),
+        );
+        let publication = Self::from_authority(service, source, authority);
         publication.verify(source, generation, memory, security)?;
         Ok(publication)
+    }
+
+    fn from_authority(
+        service: Arc<TurnDecisionService>,
+        source: &dyn TurnSourceProof,
+        authority: crate::runtime::child_source::ParentAuthority,
+    ) -> Self {
+        Self {
+            service,
+            source: super::super::super::turn_source::OwnedTurnSourceProof::capture(source),
+            authority,
+        }
+    }
+
+    pub(crate) const fn parent_authority(&self) -> &crate::runtime::child_source::ParentAuthority {
+        &self.authority
     }
 
     pub(crate) fn verify(
@@ -69,7 +101,7 @@ impl OperatorChildPublication {
             "operator capability publication belongs to another source"
         );
         let view = self.service.catalog_view();
-        for reference in &self.allowed {
+        for reference in &self.authority.constraints.allowed {
             let entry = view
                 .entry_any(&reference.id)
                 .context("operator capability disappeared from publication")?;
@@ -135,7 +167,7 @@ impl OperatorChildPublication {
                 fingerprint: entry.fingerprint,
                 generation: entry.generation,
             };
-            if self.allowed.contains(&reference) {
+            if self.authority.constraints.allowed.contains(&reference) {
                 names.insert(entry.public_name.clone());
             } else {
                 // Explicit exclusions also prevent root aliases from admitting
@@ -176,7 +208,7 @@ impl OperatorChildPublication {
             operator_task: Some(Arc::clone(&task)),
             operator_process: None,
             ordinary_parent: None,
-            ordinary_money: None,
+            ordinary_money: Some(task.allowance().money()),
             ordinary_task: None,
             ordinary_process: None,
             parent_grant: None,
@@ -219,6 +251,8 @@ impl OperatorChildPublication {
             level: parent.security.autonomy,
             max_cost_cents: parent.security.max_cost_per_day_cents,
             allowed: self
+                .authority
+                .constraints
                 .allowed
                 .iter()
                 .map(

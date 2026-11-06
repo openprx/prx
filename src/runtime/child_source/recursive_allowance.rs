@@ -1,5 +1,5 @@
 //! A recursive publication allocates money from its run, never duplicates it.
-use super::{TurnDecisionContext, TurnDecisionService, TurnSourceProof};
+use crate::runtime::turn_source::TurnSourceProof;
 use std::collections::BTreeMap;
 use std::sync::{
     Arc, OnceLock, Weak,
@@ -13,7 +13,7 @@ type Registry = parking_lot::Mutex<BTreeMap<[u8; 32], Arc<RecursiveAllowance>>>;
 static RUN_ALLOWANCES: OnceLock<Arc<Registry>> = OnceLock::new();
 
 #[derive(Default)]
-pub(super) struct RunAllowances(OnceLock<Arc<Registry>>);
+pub(in crate::runtime) struct RunAllowances(OnceLock<Arc<Registry>>);
 
 pub(crate) struct RecursiveAllowance {
     money: Arc<AtomicU64>,
@@ -95,7 +95,7 @@ impl RecursiveAllowance {
         }
     }
 
-    fn retire(self: &Arc<Self>) {
+    pub(in crate::runtime) fn retire(self: &Arc<Self>) {
         self.retire_if(|| true);
     }
 
@@ -112,7 +112,7 @@ impl RecursiveAllowance {
 }
 
 impl RunAllowances {
-    fn existing(&self) -> Option<&Arc<Registry>> {
+    pub(in crate::runtime) fn existing(&self) -> Option<&Arc<Registry>> {
         self.0.get().or_else(|| RUN_ALLOWANCES.get())
     }
 
@@ -130,7 +130,7 @@ impl RunAllowances {
         hash.finalize().into()
     }
 
-    pub(super) fn retain(&self, proof: &dyn TurnSourceProof) -> OnceLock<ContextAllowance> {
+    pub(in crate::runtime) fn retain(&self, proof: &dyn TurnSourceProof) -> OnceLock<ContextAllowance> {
         let Some(registry) = self.existing() else {
             return OnceLock::new();
         };
@@ -142,7 +142,11 @@ impl RunAllowances {
             .map_or_else(OnceLock::new, OnceLock::from)
     }
 
-    pub(super) fn inherit_resume(&self, proof: &dyn TurnSourceProof, original_run: &str) -> ContextAllowance {
+    pub(in crate::runtime) fn inherit_resume(
+        &self,
+        proof: &dyn TurnSourceProof,
+        original_run: &str,
+    ) -> ContextAllowance {
         let registry = self
             .0
             .get_or_init(|| Arc::clone(RUN_ALLOWANCES.get_or_init(|| Arc::new(Registry::default()))));
@@ -167,11 +171,11 @@ impl RunAllowances {
         ContextAllowance::new(original)
     }
 
-    fn lookup(&self, proof: &dyn TurnSourceProof) -> Option<Arc<RecursiveAllowance>> {
+    pub(in crate::runtime) fn lookup(&self, proof: &dyn TurnSourceProof) -> Option<Arc<RecursiveAllowance>> {
         self.existing()?.lock().get(&Self::key(proof)).cloned()
     }
 
-    fn issue(&self, proof: &dyn TurnSourceProof, money: Arc<AtomicU64>) -> ContextAllowance {
+    pub(in crate::runtime) fn issue(&self, proof: &dyn TurnSourceProof, money: Arc<AtomicU64>) -> ContextAllowance {
         let registry = self
             .0
             .get_or_init(|| Arc::clone(RUN_ALLOWANCES.get_or_init(|| Arc::new(Registry::default()))));
@@ -190,54 +194,9 @@ impl RunAllowances {
     }
 }
 
-impl TurnDecisionService {
-    pub(super) fn recursive_money(&self, proof: &dyn TurnSourceProof) -> Option<Arc<AtomicU64>> {
-        if let Some(incoming) = &self.parent_grant {
-            return incoming
-                .recursive_child_allowance()
-                .and_then(|owner| owner.funded_money());
-        }
-        if let Some(money) = &self.ordinary_money {
-            return Some(Arc::clone(money));
-        }
-        self.recursive_allowances
-            .lookup(proof)
-            .and_then(|owner| owner.funded_money())
-    }
-
-    pub(super) fn issue_recursive_allowance(
-        &self,
-        proof: &dyn TurnSourceProof,
-        context: &TurnDecisionContext,
-    ) -> Option<Arc<RecursiveAllowance>> {
-        if let Some(incoming) = &self.parent_grant {
-            return incoming.recursive_child_allowance();
-        }
-        Some(Arc::clone(context.recursive_allowance.get_or_init(|| {
-            let money = context.accounting.as_ref().map_or_else(
-                || {
-                    self.recursive_money(proof).unwrap_or_else(|| {
-                        Arc::new(AtomicU64::new(context.engine.state.trusted.parts().budgets.micro_usd))
-                    })
-                },
-                |scope| scope.money_owner(),
-            );
-            self.recursive_allowances.issue(proof, money)
-        })))
-    }
-}
-
-impl TurnDecisionContext {
-    pub(crate) fn retire_recursive_allowance(&self) {
-        if let Some(owner) = self.recursive_allowance.get() {
-            owner.retire();
-        }
-    }
-}
-
 /// A registry entry is active only while a context or a durable pending
 /// approval owns it. Dropping admission on any error releases its lease.
-pub(super) struct ContextAllowance(Arc<RecursiveAllowance>);
+pub(in crate::runtime) struct ContextAllowance(Arc<RecursiveAllowance>);
 impl ContextAllowance {
     fn new(owner: Arc<RecursiveAllowance>) -> Self {
         owner.contexts.fetch_add(1, Ordering::AcqRel);
@@ -263,7 +222,7 @@ impl Drop for ContextAllowance {
 }
 
 impl RecursiveAllowance {
-    pub(super) fn retain_pending(self: &Arc<Self>, expires_at: chrono::DateTime<chrono::Utc>) {
+    pub(in crate::runtime) fn retain_pending(self: &Arc<Self>, expires_at: chrono::DateTime<chrono::Utc>) {
         let remaining = (expires_at - chrono::Utc::now()).to_std().unwrap_or_default();
         let Some(deadline) = std::time::Instant::now().checked_add(remaining) else {
             self.retire();
@@ -290,7 +249,7 @@ impl RecursiveAllowance {
 }
 
 impl RunAllowances {
-    pub(super) fn retire_pending(&self, workspace: &str, owner: &str, session: &str, run: &str) {
+    pub(in crate::runtime) fn retire_pending(&self, workspace: &str, owner: &str, session: &str, run: &str) {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         for part in [workspace, owner, session, run] {
