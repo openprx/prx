@@ -278,6 +278,12 @@ impl OrdinaryChildPublication {
         )?
         .with_unproven_budget_gate();
         Ok(Arc::new(TurnDecisionService {
+            recovery: Arc::new(crate::runtime::ingress_recovery::RecoveryScope::unrecorded(
+                Arc::clone(&parent.memory),
+                parent.generation.effective.workspace_dir.clone(),
+                TurnSurfaceKind::Worker,
+                Arc::clone(&parent.state_key),
+            )),
             advisory_engine: Default::default(),
             child_recovery: Default::default(),
             recursive_allowances: Default::default(),

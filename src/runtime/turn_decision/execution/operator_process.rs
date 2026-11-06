@@ -58,12 +58,18 @@ impl TurnDecisionService {
         );
         let workspace_key = super::super::store_preparation::load_key(Arc::clone(&build.generation)).await?;
         let durable_key = config.causal_tree.enabled && workspace_key.is_some();
+        let recovery_owner = crate::runtime::turn_cleanup::current_tracker().unwrap_or_default();
+        let recovery = crate::runtime::ingress_recovery::RecoveryScope::prepare(
+            &build.generation,
+            Arc::clone(&build.memory),
+            TurnSurfaceKind::Worker,
+            Arc::clone(&build.events),
+            None,
+            &recovery_owner,
+        )
+        .await?;
         let durable_events = if durable_key {
-            Some(Arc::new(crate::runtime::causal_events::DurableCausalEventSink::new(
-                &build.generation,
-                Arc::clone(&build.memory),
-                Arc::clone(&build.events),
-            )?))
+            recovery.durable_events.clone()
         } else {
             None
         };
@@ -71,13 +77,15 @@ impl TurnDecisionService {
             || Arc::clone(&build.events),
             |events| Arc::clone(events) as Arc<dyn CausalEventSink>,
         );
-        let store = super::super::store_preparation::open_store(
-            Arc::clone(&build.generation),
-            Arc::clone(&events),
-            durable_events.clone(),
-            durable_key,
-        )
-        .await?;
+        let store = if durable_key {
+            recovery
+                .store
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("operator recovery store is unavailable"))?
+        } else {
+            super::super::store_preparation::open_store(Arc::clone(&build.generation), Arc::clone(&events), None, false)
+                .await?
+        };
         let state_key = workspace_key.clone().unwrap_or_else(DecisionKey::ephemeral);
         let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
             .map_err(TurnServiceBuildError::PolicyFingerprint)?;
@@ -94,6 +102,7 @@ impl TurnDecisionService {
         )?;
         let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
         let service = Arc::new(Self {
+            recovery,
             advisory_engine: Default::default(),
             child_recovery: Default::default(),
             recursive_allowances: Default::default(),

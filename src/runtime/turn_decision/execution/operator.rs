@@ -162,6 +162,11 @@ impl OperatorChildPublication {
             },
         )?;
         let service = Arc::new(TurnDecisionService {
+            recovery: Arc::new(crate::runtime::ingress_recovery::RecoveryScope {
+                surface: TurnSurfaceKind::Worker,
+                parent_decision_id: None,
+                ..parent.recovery.as_ref().clone()
+            }),
             advisory_engine: Default::default(),
             child_recovery: Default::default(),
             recursive_allowances: Default::default(),

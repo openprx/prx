@@ -590,8 +590,31 @@ async fn ingress_recovery_runs_with_causal_tree_disabled() {
     fabric
         .verify_ingress_input(&event)
         .expect("fabric must retain its ingress verifier with causal tree disabled");
+    let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
+    let observer = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+        crate::observability::NoopObserver,
+    )));
+    let recovery = RecoveryScope::prepare(
+        &generation,
+        Arc::clone(&recorder.memory),
+        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        observer,
+        None,
+        &tracker,
+    )
+    .await
+    .expect("recovery initializes without a decision service");
+    assert!(recovery.ingress_recovery_enabled());
+    assert!(recovery.store.as_ref().unwrap().writer().is_some());
+    let retained = Arc::downgrade(&recovery);
+    drop(recovery);
+    assert!(retained.upgrade().is_some(), "cleanup independently retains recovery");
     second_ticket.finish(true);
     ticket.finish(true);
+    tracker
+        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -635,7 +658,7 @@ fn terminal_scope(memory: Arc<dyn Memory>, workspace: &Path) -> RecoveryScope {
         surface: crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
         state_key: DecisionKey::load_or_create(workspace).unwrap(),
         store: None,
-        parent_grant: None,
+        parent_decision_id: None,
         durable_events: None,
     }
 }

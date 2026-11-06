@@ -3,6 +3,8 @@ use super::{CatalogError, FactoryBuildError, ParityError, StoreError};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TurnServiceBuildError {
+    #[error("durable recovery initialization failed")]
+    RecoveryPreparation(#[source] anyhow::Error),
     #[error("child service does not match its issued parent authority")]
     ChildAuthority,
     #[error("catalog sources do not match the pinned configuration generation")]
@@ -17,10 +19,6 @@ pub(crate) enum TurnServiceBuildError {
     Factory(#[from] FactoryBuildError),
     #[error("pinned decision policy cannot be fingerprinted")]
     PolicyFingerprint(#[source] serde_json::Error),
-    #[error("causal event memory could not bind the store namespace")]
-    EventNamespace(#[source] anyhow::Error),
-    #[error("durable causal events require an active runtime")]
-    EventRuntime(#[from] tokio::runtime::TryCurrentError),
     #[error("decision service storage preparation task failed")]
     PreparationTask(#[from] tokio::task::JoinError),
     #[error("decision service preparation cleanup owner is unavailable")]

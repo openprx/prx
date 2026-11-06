@@ -19,6 +19,7 @@ struct State {
     next_id: u64,
     pending: BTreeMap<u64, CancellationToken>,
     services: Vec<Arc<TurnDecisionService>>,
+    recovery_scopes: Vec<Arc<super::ingress_recovery::RecoveryScope>>,
     prepared_stores: Vec<PreparedStoreQueues>,
     ingress_monitors: Vec<IngressMonitor>,
     ingress_lifetimes: BTreeMap<String, Arc<dyn crate::memory::ingress_recovery::IngressLifetime>>,
@@ -90,12 +91,39 @@ impl CleanupTracker {
         })
     }
 
+    /// Recovery owns only its pinned storage queues; no decision service is retained.
+    pub(crate) fn retain_recovery(&self, recovery: Arc<super::ingress_recovery::RecoveryScope>) -> anyhow::Result<()> {
+        let mut state = self.state.lock();
+        anyhow::ensure!(
+            !state.closed && !state.failed,
+            "runtime recovery owner is closed or has unconfirmed failures"
+        );
+        Self::retain_recovery_locked(&mut state, recovery);
+        Ok(())
+    }
+
+    fn retain_recovery_locked(state: &mut State, recovery: Arc<super::ingress_recovery::RecoveryScope>) {
+        state
+            .prepared_stores
+            .retain(|prepared| !recovery.owns_prepared_queues(prepared.store.as_ref(), prepared.events.as_ref()));
+        if !state
+            .recovery_scopes
+            .iter()
+            .any(|current| Arc::ptr_eq(current, &recovery))
+        {
+            state.recovery_scopes.push(recovery);
+        }
+    }
+
     pub(crate) fn retain_service(&self, service: Arc<TurnDecisionService>) {
         let mut state = self.state.lock();
         state
             .prepared_stores
             .retain(|prepared| !service.owns_prepared_queues(prepared.store.as_ref(), prepared.events.as_ref()));
-        state.services.push(service);
+        Self::retain_recovery_locked(&mut state, service.recovery_scope());
+        if service.has_decision_work() {
+            state.services.push(service);
+        }
     }
 
     /// Child publication must finish before its owner starts draining. Keeping
@@ -109,7 +137,10 @@ impl CleanupTracker {
         state
             .prepared_stores
             .retain(|prepared| !service.owns_prepared_queues(prepared.store.as_ref(), prepared.events.as_ref()));
-        state.services.push(service);
+        Self::retain_recovery_locked(&mut state, service.recovery_scope());
+        if service.has_decision_work() {
+            state.services.push(service);
+        }
         Ok(())
     }
 
@@ -119,6 +150,9 @@ impl CleanupTracker {
         let mut state = self.state.lock();
         let ticket = self.register_locked(&mut state, CancellationToken::new())?;
         state.services.retain(|retained| !Arc::ptr_eq(retained, service));
+        state
+            .recovery_scopes
+            .retain(|scope| !Arc::ptr_eq(scope, &service.recovery_scope()));
         Ok(ticket)
     }
 
@@ -134,7 +168,7 @@ impl CleanupTracker {
         for cancel in cancellations {
             cancel.cancel();
         }
-        let (services, prepared_stores, failed) = loop {
+        let (services, recovery_scopes, prepared_stores, failed) = loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
@@ -144,7 +178,12 @@ impl CleanupTracker {
                     #[cfg(test)]
                     self.diagnostic
                         .record("pending_empty", 0, 0, state.failed, Some(!state.failed));
-                    break (state.services.clone(), state.prepared_stores.clone(), state.failed);
+                    break (
+                        state.services.clone(),
+                        state.recovery_scopes.clone(),
+                        state.prepared_stores.clone(),
+                        state.failed,
+                    );
                 }
             }
             tokio::time::timeout_at(deadline, changed).await.map_err(|_| {
@@ -160,13 +199,19 @@ impl CleanupTracker {
         let mut queues_drained = true;
         for service in services {
             #[cfg(test)]
-            let drained = self.diagnostic.scope(service.drain_writes(deadline.into_std())).await;
+            let drained = self
+                .diagnostic
+                .scope(service.drain_decision_work(deadline.into_std()))
+                .await;
             #[cfg(not(test))]
-            let drained = service.drain_writes(deadline.into_std()).await;
+            let drained = service.drain_decision_work(deadline.into_std()).await;
             queues_drained &= drained;
             #[cfg(test)]
             self.diagnostic
                 .record("service_queues_drained", 0, 0, failed, Some(drained));
+        }
+        for recovery in recovery_scopes {
+            queues_drained &= recovery.drain(deadline.into_std()).await;
         }
         for prepared in prepared_stores {
             if let Some(writer) = prepared.store.and_then(|store| store.writer()) {

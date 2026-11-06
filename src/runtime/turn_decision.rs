@@ -158,6 +158,7 @@ impl ChildExecutionPolicy {
 }
 
 pub(crate) struct TurnDecisionService {
+    recovery: Arc<super::ingress_recovery::RecoveryScope>,
     advisory_engine: tokio::sync::OnceCell<advisory::AdvisoryRuntime>,
     child_recovery: child_recovery::ChildRecoveryState,
     recursive_allowances: recursive_allowance::RunAllowances,
@@ -399,40 +400,8 @@ impl TurnDecisionService {
 
     /// Report queue acknowledgement to owners that must reject an incomplete exit.
     pub(crate) async fn drain_writes(&self, deadline: Instant) -> bool {
-        // Close advisory telemetry first (as before R2b) so its owners release before the
-        // catalog/causal drains, but do not let a late telemetry drain fail the acknowledgement:
-        // catalog and causal writes remain authoritative; advisory telemetry is best effort.
-        if !self.drain_advisory(deadline).await {
-            tracing::warn!("decision engine telemetry did not drain before shutdown deadline");
-        }
-        let mut drained = true;
-        if let Some(writer) = self.store.writer() {
-            #[cfg(test)]
-            crate::runtime::turn_cleanup::diagnostic::queue_presence("decision_writer_present", true);
-            let writer_drained = writer.drain(deadline).await;
-            #[cfg(test)]
-            crate::runtime::turn_cleanup::diagnostic::queue("decision_writer_drained", writer_drained);
-            drained &= writer_drained;
-            if !writer_drained {
-                tracing::warn!("causal decision writer did not drain before shutdown deadline");
-            }
-        }
-        #[cfg(test)]
-        if self.store.writer().is_none() {
-            crate::runtime::turn_cleanup::diagnostic::queue_presence("decision_writer_present", false);
-        }
-        #[cfg(test)]
-        crate::runtime::turn_cleanup::diagnostic::queue_presence("event_queue_present", self.durable_events.is_some());
-        if let Some(events) = &self.durable_events {
-            let events_drained = events.drain(deadline).await;
-            #[cfg(test)]
-            crate::runtime::turn_cleanup::diagnostic::queue("event_queue_drained", events_drained);
-            drained &= events_drained;
-            if !events_drained {
-                tracing::warn!("causal event queue did not drain before shutdown deadline");
-            }
-        }
-        drained
+        let decision_drained = self.drain_decision_work(deadline).await;
+        self.recovery.drain(deadline).await && decision_drained
     }
 }
 
@@ -1657,19 +1626,22 @@ impl TurnDecisionService {
         ))
     }
 
-    /// Transitional facade until recovery callers move in R2.
-    pub(crate) fn recovery_scope(&self) -> super::ingress_recovery::RecoveryScope {
-        super::ingress_recovery::RecoveryScope {
-            memory: Arc::clone(&self.memory),
-            workspace: self.generation.effective.workspace_dir.clone(),
-            recordable: self.recordable,
-            durable_key: self.durable_key,
-            surface: self.surface,
-            state_key: Arc::clone(&self.state_key),
-            store: Some(Arc::clone(&self.store)),
-            parent_grant: self.parent_grant.clone(),
-            durable_events: self.durable_events.clone(),
+    /// Recovery retains its own pins and queues independently of this service.
+    pub(crate) fn recovery_scope(&self) -> Arc<super::ingress_recovery::RecoveryScope> {
+        Arc::clone(&self.recovery)
+    }
+
+    pub(super) fn has_decision_work(&self) -> bool {
+        self.generation.effective.causal_tree.enabled
+    }
+
+    pub(super) async fn drain_decision_work(&self, deadline: Instant) -> bool {
+        // Advisory telemetry is closed first so its owners release before the recovery drains,
+        // but a late telemetry drain only warns: catalog and causal writes stay authoritative.
+        if !self.drain_advisory(deadline).await {
+            tracing::warn!("decision engine telemetry did not drain before shutdown deadline");
         }
+        true
     }
 
     #[cfg(test)]
@@ -3226,12 +3198,19 @@ pub(crate) async fn build_turn_decision_service(
         }
         grant.catalog().check_child_parity(&build.execution, grant.scope())?;
     }
+    let recovery_owner = super::turn_cleanup::current_tracker().unwrap_or_default();
+    let recovery = super::ingress_recovery::RecoveryScope::prepare(
+        &build.generation,
+        Arc::clone(&build.memory),
+        surface,
+        Arc::clone(&build.events),
+        build.parent_grant.as_deref(),
+        &recovery_owner,
+    )
+    .await
+    .map_err(TurnServiceBuildError::RecoveryPreparation)?;
     let durable_events = if durable_key {
-        Some(Arc::new(super::causal_events::DurableCausalEventSink::new(
-            &build.generation,
-            Arc::clone(&build.memory),
-            Arc::clone(&build.events),
-        )?))
+        recovery.durable_events.clone()
     } else {
         None
     };
@@ -3239,18 +3218,15 @@ pub(crate) async fn build_turn_decision_service(
         || Arc::clone(&build.events),
         |events| Arc::clone(events) as Arc<dyn CausalEventSink>,
     );
-    let store = store_preparation::open_store(
-        Arc::clone(&build.generation),
-        Arc::clone(&events),
-        durable_events.clone(),
-        durable_key,
-    )
-    .await?;
-    if let (Some(events), Some(namespace)) = (&durable_events, store.workspace_id()) {
-        events
-            .bind_store_namespace(namespace)
-            .map_err(TurnServiceBuildError::EventNamespace)?;
-    }
+    let store = if durable_key {
+        recovery.store.clone().ok_or_else(|| {
+            TurnServiceBuildError::RecoveryPreparation(anyhow::anyhow!(
+                "enabled decision service requires a durable recovery store"
+            ))
+        })?
+    } else {
+        store_preparation::open_store(Arc::clone(&build.generation), Arc::clone(&events), None, false).await?
+    };
     let state_key = workspace_key.clone().unwrap_or_else(DecisionKey::ephemeral);
     let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
         .map_err(TurnServiceBuildError::PolicyFingerprint)?;
@@ -3289,6 +3265,7 @@ pub(crate) async fn build_turn_decision_service(
     let factory = ordinary_child_fixture::wrap_factory(factory, Arc::clone(&state_key), Arc::clone(&events));
     let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
     Ok(Arc::new(TurnDecisionService {
+        recovery,
         advisory_engine: Default::default(),
         child_recovery: Default::default(),
         recursive_allowances: Default::default(),

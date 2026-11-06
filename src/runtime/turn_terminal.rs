@@ -932,11 +932,7 @@ impl super::ingress_recovery::RecoveryScope {
             "terminal replay belongs to another ingress surface"
         );
         anyhow::ensure!(
-            replay.parent_decision_id()
-                == self
-                    .parent_grant
-                    .as_ref()
-                    .map(|grant| grant.scope().gate_inputs().0.parent_decision_id),
+            replay.parent_decision_id() == self.parent_decision_id,
             "terminal replay belongs to another parent decision"
         );
         #[cfg(test)]

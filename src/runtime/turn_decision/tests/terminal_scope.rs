@@ -349,7 +349,8 @@ async fn disabled_terminal_validates_source_without_decision_store_writes() {
     assert!(receipt.assistant_event.is_some());
     assert_eq!(fixture.marker_presence(&fabric).await, [false, true, false, true]);
     assert!(fixture.service.store.writer().is_none());
-    assert!(!fixture.workspace.path().join("self/causal_tree/.decision_key").exists());
+    assert!(fixture.workspace.path().join("self/causal_tree/.decision_key").exists());
+    assert!(fixture.service.recovery_scope().ingress_recovery_enabled());
     fixture.assert_no_outcome().await;
 }
 
@@ -409,4 +410,48 @@ async fn linked_finalizer_rejects_changed_or_double_encoded_persisted_fingerprin
         assert!(!fixture.workspace.path().join("state/costs.jsonl").exists());
         fixture.service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
+}
+
+#[tokio::test]
+async fn recorded_terminal_rejoins_after_service_drop_with_independent_recovery() {
+    let fixture = LinkedFixture::new().await;
+    let fabric = fixture.fabric(Arc::clone(&fixture.memory));
+    let receipt = crate::agent::terminal::finalize_turn(
+        &fabric,
+        fixture.commit.clone(),
+        &fixture.config.cost,
+        fixture.workspace.path(),
+    )
+    .await
+    .expect("authenticated historical terminal");
+    let generation = Arc::clone(&fixture.service.generation);
+    let service = Arc::downgrade(&fixture.service);
+    drop(fixture.service);
+    assert!(
+        service.upgrade().is_none(),
+        "recovery must not retain the decision service"
+    );
+    let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+    let recovery = crate::runtime::ingress_recovery::RecoveryScope::prepare(
+        &generation,
+        Arc::clone(&fixture.memory),
+        TurnSurfaceKind::AgentLoop,
+        Arc::new(RecordingSink::default()),
+        None,
+        &cleanup,
+    )
+    .await
+    .expect("independent recovery initialization");
+    assert_eq!(
+        recovery
+            .rejoin_terminal(&receipt.terminal_id, fixture.proof.owner_id())
+            .await
+            .expect("authenticated terminal rejoins without a decision service"),
+        Enqueue::Queued,
+    );
+    drop(recovery);
+    cleanup
+        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("independently retained recovery queues drain");
 }

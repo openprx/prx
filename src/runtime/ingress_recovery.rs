@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 /// Pinned recovery authority. A decision store supplies historical evidence only;
 /// reception and interruption recovery do not require a decision service.
+#[derive(Clone)]
 pub(crate) struct RecoveryScope {
     pub(super) memory: Arc<dyn Memory>,
     pub(super) workspace: std::path::PathBuf,
@@ -21,11 +22,126 @@ pub(crate) struct RecoveryScope {
     pub(super) surface: crate::causal_tree::state::TurnSurfaceKind,
     pub(super) state_key: Arc<DecisionKey>,
     pub(super) store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
-    pub(super) parent_grant: Option<Arc<super::child_source::IssuedChildGrant>>,
+    pub(super) parent_decision_id: Option<crate::causal_tree::ids::DecisionId>,
     pub(super) durable_events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
 }
 
 impl RecoveryScope {
+    pub(super) const fn unrecorded(
+        memory: Arc<dyn Memory>,
+        workspace: std::path::PathBuf,
+        surface: crate::causal_tree::state::TurnSurfaceKind,
+        state_key: Arc<DecisionKey>,
+    ) -> Self {
+        Self {
+            memory,
+            workspace,
+            recordable: false,
+            durable_key: false,
+            surface,
+            state_key,
+            store: None,
+            parent_decision_id: None,
+            durable_events: None,
+        }
+    }
+
+    /// Initialize durable recovery from pinned runtime inputs, without building
+    /// a decision engine, catalog, or execution service.
+    pub(crate) async fn prepare(
+        generation: &crate::config::ConfigGeneration,
+        memory: Arc<dyn Memory>,
+        surface: crate::causal_tree::state::TurnSurfaceKind,
+        observer: Arc<dyn crate::decision::telemetry::CausalEventSink>,
+        parent_grant: Option<&super::child_source::IssuedChildGrant>,
+        owner: &Arc<super::turn_cleanup::CleanupTracker>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let config = &generation.effective;
+        let recording = config.memory.event_recording_config();
+        let recordable = crate::memory::serves_tool_execution_ledger(memory.name())
+            && recording.enabled
+            && recording.record_user_messages;
+        let mut scope = Self {
+            memory: Arc::clone(&memory),
+            workspace: config.workspace_dir.clone(),
+            recordable,
+            durable_key: false,
+            surface,
+            state_key: DecisionKey::ephemeral(),
+            store: None,
+            parent_decision_id: parent_grant.map(|grant| grant.scope().gate_inputs().0.parent_decision_id),
+            durable_events: None,
+        };
+        if recordable {
+            let workspace = config.workspace_dir.clone();
+            scope.state_key =
+                owned_store_operation(owner, move || Ok(DecisionKey::load_or_create(&workspace)?)).await?;
+            scope.durable_key = true;
+            let events = Arc::new(super::causal_events::DurableCausalEventSink::new(
+                generation, memory, observer,
+            )?);
+            let ticket = owner.register(tokio_util::sync::CancellationToken::new())?;
+            let prepared_events = Arc::clone(&events);
+            let store = crate::causal_tree::store_preparation::open_store(
+                config.workspace_dir.clone(),
+                crate::causal_tree::store::Retention::days(
+                    config.causal_tree.store.retention_days,
+                    config.self_system.fitness.retention_days,
+                ),
+                events.clone(),
+                Some(crate::causal_tree::store::StoreMode::ReadWrite),
+                move |result| {
+                    ticket.retain_prepared_store(result.as_ref().ok().cloned(), Some(prepared_events));
+                    ticket.finish(result.is_ok());
+                },
+            )
+            .await?;
+            if let Some(namespace) = store.workspace_id() {
+                events.bind_store_namespace(namespace)?;
+            }
+            scope.store = Some(store);
+            scope.durable_events = Some(events);
+        }
+        let scope = Arc::new(scope);
+        owner.retain_recovery(Arc::clone(&scope))?;
+        recovery_ready(Arc::clone(&scope)).await?;
+        Ok(scope)
+    }
+
+    pub(super) fn owns_prepared_queues(
+        &self,
+        store: Option<&Arc<crate::causal_tree::store::CausalDecisionStore>>,
+        events: Option<&Arc<super::causal_events::DurableCausalEventSink>>,
+    ) -> bool {
+        matches!((&self.store, store), (Some(left), Some(right)) if Arc::ptr_eq(left, right))
+            && match (&self.durable_events, events) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    pub(crate) async fn drain(&self, deadline: Instant) -> bool {
+        let mut drained = true;
+        if let Some(writer) = self.store.as_ref().and_then(|store| store.writer()) {
+            #[cfg(test)]
+            super::turn_cleanup::diagnostic::queue_presence("decision_writer_present", true);
+            let writer_drained = writer.drain(deadline).await;
+            #[cfg(test)]
+            super::turn_cleanup::diagnostic::queue("decision_writer_drained", writer_drained);
+            drained &= writer_drained;
+        }
+        #[cfg(test)]
+        super::turn_cleanup::diagnostic::queue_presence("event_queue_present", self.durable_events.is_some());
+        if let Some(events) = &self.durable_events {
+            let events_drained = events.drain(deadline).await;
+            #[cfg(test)]
+            super::turn_cleanup::diagnostic::queue("event_queue_drained", events_drained);
+            drained &= events_drained;
+        }
+        drained
+    }
+
     pub(crate) const fn ingress_recovery_enabled(&self) -> bool {
         self.recordable && self.durable_key
     }
@@ -823,7 +939,7 @@ pub(crate) async fn recovery_ready(recovery: Arc<RecoveryScope>) -> anyhow::Resu
 /// Called after real publication and again before source-bound admission, so a
 /// cold startup can consume final evidence that pre-proof reception could not.
 pub(crate) async fn service_ready(service: &super::turn_decision::TurnDecisionService) -> anyhow::Result<()> {
-    recovery_ready(Arc::new(service.recovery_scope())).await?;
+    recovery_ready(service.recovery_scope()).await?;
     if !service.recovery_scope().ingress_recovery_enabled() {
         return Ok(());
     }
