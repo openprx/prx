@@ -445,7 +445,10 @@ async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()
         let ticket = tracker.register(tokio_util::sync::CancellationToken::new())?;
         let result = IngressRecorder::prepare(memory.clone(), &config, &ticket).await;
         ticket.finish(true);
-        anyhow::ensure!(result.is_err(), "corrupt authority made recorder available");
+        anyhow::ensure!(
+            matches!(result, Ok(None)),
+            "corrupt authority did not yield a recovery-unavailable preparation"
+        );
     }
     anyhow::ensure!(
         memory

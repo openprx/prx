@@ -242,7 +242,7 @@ impl IngressRecorder {
         let deadline = Instant::now() + Duration::from_secs(15);
         let workspace_path = config.workspace_dir.clone();
         let prepared_memory = Arc::clone(&memory);
-        owned_store_operation(&ticket.owner(), move || {
+        let activation = owned_store_operation(&ticket.owner(), move || {
             remaining(deadline)?;
             if let Some(repository) = prepared_memory.recovery_repository() {
                 repository.activate_recovery_authority()?;
@@ -252,7 +252,16 @@ impl IngressRecorder {
             remaining(deadline)?;
             Ok(())
         })
-        .await?;
+        .await;
+        if let Err(error) = activation {
+            // Matrix "K = no": an unusable repository key leaves recovery
+            // unavailable (the shared warning was emitted by the memory layer).
+            // This recorder never records, replays or quarantines; startup goes on.
+            if crate::memory::recovery_authority::is_key_unavailable(&error) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
         let workspace = config.workspace_dir.to_string_lossy().into_owned();
         let lifetime = memory
             .acquire_ingress_lifetime(&workspace, &uuid::Uuid::new_v4().to_string(), deadline)
