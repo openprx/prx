@@ -704,7 +704,7 @@ async fn terminal_replay_refuses_hop_digest_substitution() -> Result<()> {
             std::fs::rename(&path, format!("{}.unavailable", path.display()))?;
         }
     }
-    anyhow::ensure!(!db.exists(), "test: decisions.db must be quarantined");
+    anyhow::ensure!(!db.exists(), "test: the decision store database must be quarantined");
 
     let baseline = verify_terminal_replay_journal(
         fabric.memory().as_ref(),
@@ -754,6 +754,9 @@ async fn terminal_replay_refuses_hop_digest_substitution() -> Result<()> {
         format!("{error:?}").contains("terminal replay decision chain changed"),
         "test: substitution must fail the hop digest check: {error:?}"
     );
-    anyhow::ensure!(!db.exists(), "test: the journal replay must not create decisions.db");
+    anyhow::ensure!(
+        !db.exists(),
+        "test: the journal replay must not create the decision store database"
+    );
     Ok(())
 }
