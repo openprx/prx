@@ -661,13 +661,7 @@ pub(crate) struct TurnDecisionContext {
     main_compaction: crate::config::AgentCompactionConfig,
     hop_ids: Vec<DecisionId>,
     execution_refs: BTreeSet<CapabilityRef>,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Retained decision-engine input during recall migration; prompt readers are independent"
-        )
-    )]
+    #[cfg(test)]
     selected_retrieved: Vec<ObservedArtifact>,
     #[cfg(feature = "llm-router")]
     router_transition: Option<Arc<routing::RouterTransition>>,
@@ -1272,13 +1266,7 @@ impl TurnDecisionContext {
     /// The selected evidence belongs to the issued turn, not a fresh read.
     /// Decision-stage timeouts do not expire the subsequent provider turn;
     /// closing that turn prevents its evidence from re-entering execution.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Retained decision-engine input during recall migration; prompt readers are independent"
-        )
-    )]
+    #[cfg(test)]
     pub(crate) fn retrieved(&self) -> Result<&[ObservedArtifact], DirectiveError> {
         if self.execution_closed.load(Ordering::Acquire) {
             return Err(DirectiveError::NotAdmitted);
@@ -1325,6 +1313,7 @@ struct MemoryHopObservation {
     fresh_read: bool,
     /// The read completed with status Ok, even when it returned nothing new.
     completed_ok: bool,
+    #[cfg(test)]
     selected_artifacts: Vec<ObservedArtifact>,
 }
 
@@ -1907,6 +1896,7 @@ impl TurnDecisionService {
         let mut fresh_read = false;
         // Fresh evidence remains decision input. Prompt recall has its own
         // authenticated scope and never consumes loader presentation text.
+        #[cfg(test)]
         let selected_artifacts = artifacts
             .iter()
             .filter(|artifact| artifact.age_ms <= STALE_ARTIFACT_MS)
@@ -1930,6 +1920,7 @@ impl TurnDecisionService {
             state: next,
             fresh_read,
             completed_ok: status == ObservedStepStatus::Ok,
+            #[cfg(test)]
             selected_artifacts,
         })
     }
@@ -2386,6 +2377,7 @@ impl TurnDecisionService {
                 directive,
                 main_compaction: budget.main_compaction.clone(),
                 execution_refs: BTreeSet::new(),
+                #[cfg(test)]
                 selected_retrieved: Vec::new(),
                 #[cfg(feature = "llm-router")]
                 router_transition: router_transition.clone(),
@@ -2436,6 +2428,7 @@ impl TurnDecisionService {
                         main_compaction: budget.main_compaction,
                         hop_ids,
                         execution_refs,
+                        #[cfg(test)]
                         selected_retrieved: Vec::new(),
                         router_transition: None,
                     }),
@@ -2444,6 +2437,7 @@ impl TurnDecisionService {
             }
             prior_hops.push(decision);
         }
+        #[cfg(test)]
         let mut selected_retrieved = Vec::new();
         let max_hops = config.causal_tree.policy.max_decision_hops;
         for hop in state.lineage.hop()..=max_hops {
@@ -2599,7 +2593,10 @@ impl TurnDecisionService {
                         return Err(AgentDecisionError::Cancelled);
                     }
                     allow_terminal_answer = read_finishes_retrieval(&observed, proof.routing_input());
-                    selected_retrieved = observed.selected_artifacts;
+                    #[cfg(test)]
+                    {
+                        selected_retrieved = observed.selected_artifacts;
+                    }
                     let mut comparison = observed.state.clone();
                     comparison.derived = decision.state.derived.clone();
                     retrieval_progress = Some(comparison.evidence_fingerprint(&self.state_key) != prior_evidence);
@@ -2711,6 +2708,7 @@ impl TurnDecisionService {
                             main_compaction: budget.main_compaction,
                             hop_ids,
                             execution_refs,
+                            #[cfg(test)]
                             selected_retrieved,
                             #[cfg(feature = "llm-router")]
                             router_transition: router_transition.clone(),
@@ -2753,6 +2751,7 @@ impl TurnDecisionService {
                             main_compaction: budget.main_compaction,
                             hop_ids,
                             execution_refs: BTreeSet::new(),
+                            #[cfg(test)]
                             selected_retrieved,
                             #[cfg(feature = "llm-router")]
                             router_transition: router_transition.clone(),
@@ -2806,6 +2805,7 @@ impl TurnDecisionService {
                             main_compaction: budget.main_compaction,
                             hop_ids,
                             execution_refs,
+                            #[cfg(test)]
                             selected_retrieved,
                             #[cfg(feature = "llm-router")]
                             router_transition: router_transition.clone(),
