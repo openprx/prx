@@ -196,10 +196,67 @@ enum WorkerSegmentSource {
 
 struct WorkerChildSegments {
     source: WorkerSegmentSource,
-    service: Arc<crate::runtime::turn_decision::TurnDecisionService>,
+    admission: LegacyGatedAdmission,
+    completion: ChildCompletionPort,
     fabric: MemoryFabric,
     owner: Arc<crate::runtime::turn_cleanup::CleanupTracker>,
+}
+
+/// Temporary admission adapter; every segment still executes the decision gate.
+struct LegacyGatedAdmission {
+    service: Arc<crate::runtime::turn_decision::TurnDecisionService>,
+}
+
+impl LegacyGatedAdmission {
+    async fn admit(
+        &self,
+        source: (
+            Arc<crate::runtime::turn_source::OwnedTurnSourceProof>,
+            crate::tools::ToolExecutionContext,
+        ),
+        fabric: MemoryFabric,
+        config: Arc<Config>,
+        owner: &Arc<crate::runtime::turn_cleanup::CleanupTracker>,
+        cancel: &CancellationToken,
+        completion: &ChildCompletionPort,
+    ) -> Result<crate::runtime::child_turn::ChildSegmentTurn> {
+        crate::runtime::child_turn::ChildSegmentTurn::admit(
+            Arc::clone(&self.service),
+            source,
+            fabric,
+            config,
+            owner,
+            cancel,
+            Some(Arc::clone(&completion.usage)),
+        )
+        .await
+    }
+}
+
+/// Completion uses the admitted segment's prebound terminal and usage owner.
+/// It cannot admit a segment or reconstruct parent authority from a decision row.
+struct ChildCompletionPort {
     usage: Arc<crate::runtime::turn_terminal::TerminalUsageCollector>,
+}
+
+impl ChildCompletionPort {
+    async fn complete(
+        &self,
+        turn: &crate::runtime::child_turn::ChildSegmentTurn,
+        outcome: &crate::agent::turn_contracts::ToolLoopOutcome,
+        trace: &crate::agent::turn_contracts::ToolLoopTrace,
+    ) -> Result<()> {
+        turn.complete(outcome, trace).await.map(|_| ())
+    }
+
+    async fn fail(
+        &self,
+        turn: &crate::runtime::child_turn::ChildSegmentTurn,
+        error: &anyhow::Error,
+        cancelled: bool,
+    ) -> Result<()> {
+        turn.fail(error, cancelled).await
+    }
 }
 
 impl WorkerChildSegments {
@@ -241,14 +298,13 @@ impl WorkerChildSegments {
             }
         };
         Ok(boxed_worker_segments(|| {
-            crate::runtime::child_turn::ChildSegmentTurn::admit(
-                Arc::clone(&self.service),
+            self.admission.admit(
                 source,
                 self.fabric.clone(),
                 config,
                 &self.owner,
                 cancel,
-                Some(Arc::clone(&self.usage)),
+                &self.completion,
             )
         })
         .await?
@@ -256,15 +312,15 @@ impl WorkerChildSegments {
     }
 }
 
-struct VerifiedWorkerParent {
-    store: Arc<crate::causal_tree::store::CausalDecisionStore>,
+pub(super) struct VerifiedWorkerParent {
+    store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
     scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
     catalog: Arc<crate::tools::capability::catalog::CapabilityCatalog>,
 }
 
 /// Reconstruct the signed scope and inherited catalog. Actual executor parity,
 /// source proof and child terminal ownership remain required before execution.
-fn verify_worker_parent_authority(
+pub(super) fn verify_worker_parent_authority(
     manifest: &WorkerManifest,
     logical_workspace: &Path,
 ) -> Result<Option<VerifiedWorkerParent>> {
@@ -298,6 +354,17 @@ fn verify_worker_parent_authority(
     for reference in &parent.allowed {
         catalog.resolve(std::slice::from_ref(reference))?;
     }
+    if crate::runtime::child_source::authority_journal::verify(manifest, logical_workspace, &parent.key)? {
+        anyhow::ensure!(
+            manifest.owner_id.as_deref() == Some(parent.authority.owner.as_str()),
+            "worker owner differs from parent authority"
+        );
+        return Ok(Some(VerifiedWorkerParent {
+            store: None,
+            scope: Arc::new(VerifiedChildScope::new(child, &parent)?),
+            catalog,
+        }));
+    }
     let store = CausalDecisionStore::open_unshared_read_only(logical_workspace);
     let store_workspace = store.workspace_id().context("worker parent store namespace missing")?;
     anyhow::ensure!(
@@ -328,7 +395,7 @@ fn verify_worker_parent_authority(
         "session-worker parent decision differs from issued authority"
     );
     Ok(Some(VerifiedWorkerParent {
-        store,
+        store: Some(store),
         scope: Arc::new(VerifiedChildScope::new(child, &parent)?),
         catalog,
     }))
@@ -613,7 +680,7 @@ async fn run_owned_manifest(
         Some(
             crate::runtime::child_source::parent::ParentSource::restore_process(
                 &manifest,
-                &parent.store,
+                parent.store.as_deref(),
                 &parent.scope,
                 decision_fabric.as_ref().context("worker decision storage is missing")?,
                 child_generation
@@ -651,7 +718,7 @@ async fn run_owned_manifest(
             ),
             crate::runtime::child_source::ChildGrantRuntime {
                 recursive_child_claimed: None,
-                decision_store: Arc::clone(&authority.store),
+                decision_store: authority.store.clone(),
                 source_fabric: decision_fabric
                     .as_ref()
                     .context("worker logical source fabric missing")?
@@ -964,17 +1031,21 @@ async fn run_owned_manifest(
                 ),
                 provider: Arc::clone(&provider),
             },
-            service: Arc::clone(child_service.as_ref().context("worker child service missing")?),
+            admission: LegacyGatedAdmission {
+                service: Arc::clone(child_service.as_ref().context("worker child service missing")?),
+            },
             fabric: decision_fabric
                 .as_ref()
                 .context("worker decision storage missing")?
                 .clone(),
             owner: crate::runtime::turn_cleanup::current_tracker().context("worker cleanup owner missing")?,
-            usage: Arc::new(crate::runtime::turn_terminal::TerminalUsageCollector::new(
-                grant.parent().workspace_id().to_owned(),
-                grant.parent().owner_id().to_owned(),
-                manifest.run_id.clone(),
-            )),
+            completion: ChildCompletionPort {
+                usage: Arc::new(crate::runtime::turn_terminal::TerminalUsageCollector::new(
+                    grant.parent().workspace_id().to_owned(),
+                    grant.parent().owner_id().to_owned(),
+                    manifest.run_id.clone(),
+                )),
+            },
         }))
     } else if let Some(authority) = &ordinary_authority {
         Some(Arc::new(WorkerChildSegments {
@@ -982,25 +1053,31 @@ async fn run_owned_manifest(
                 sequence: tokio::sync::Mutex::new(authority.segments()?),
                 authority: Arc::clone(authority),
             },
-            service: Arc::clone(child_service.as_ref().context("ordinary worker service missing")?),
+            admission: LegacyGatedAdmission {
+                service: Arc::clone(child_service.as_ref().context("ordinary worker service missing")?),
+            },
             fabric: authority.source_fabric().clone(),
             owner: crate::runtime::turn_cleanup::current_tracker().context("ordinary worker cleanup owner missing")?,
-            usage: Arc::new(
-                crate::runtime::turn_terminal::TerminalUsageCollector::new_ordinary(
-                    authority.snapshots().parent.workspace_id().to_owned(),
-                    authority.snapshots().parent.owner_id().to_owned(),
-                    manifest.run_id.clone(),
-                    authority
-                        .snapshots()
-                        .generation
-                        .effective
-                        .memory
-                        .event_recording_config(),
-                )
-                .with_ordinary_journal(
-                    crate::runtime::child_source::ordinary_process::journal::OrdinarySegmentJournal::new(authority)?,
+            completion: ChildCompletionPort {
+                usage: Arc::new(
+                    crate::runtime::turn_terminal::TerminalUsageCollector::new_ordinary(
+                        authority.snapshots().parent.workspace_id().to_owned(),
+                        authority.snapshots().parent.owner_id().to_owned(),
+                        manifest.run_id.clone(),
+                        authority
+                            .snapshots()
+                            .generation
+                            .effective
+                            .memory
+                            .event_recording_config(),
+                    )
+                    .with_ordinary_journal(
+                        crate::runtime::child_source::ordinary_process::journal::OrdinarySegmentJournal::new(
+                            authority,
+                        )?,
+                    ),
                 ),
-            ),
+            },
         }))
     } else if let Some(authority) = &operator_authority {
         Some(Arc::new(WorkerChildSegments {
@@ -1008,25 +1085,31 @@ async fn run_owned_manifest(
                 sequence: tokio::sync::Mutex::new(authority.segments()?),
                 authority: Arc::clone(authority),
             },
-            service: Arc::clone(child_service.as_ref().context("operator worker service missing")?),
+            admission: LegacyGatedAdmission {
+                service: Arc::clone(child_service.as_ref().context("operator worker service missing")?),
+            },
             fabric: authority.source_fabric().clone(),
             owner: crate::runtime::turn_cleanup::current_tracker().context("operator worker cleanup owner missing")?,
-            usage: Arc::new(
-                crate::runtime::turn_terminal::TerminalUsageCollector::new_ordinary(
-                    authority.snapshots().parent.workspace_id().to_owned(),
-                    authority.snapshots().parent.owner_id().to_owned(),
-                    manifest.run_id.clone(),
-                    authority
-                        .snapshots()
-                        .generation
-                        .effective
-                        .memory
-                        .event_recording_config(),
-                )
-                .with_operator_journal(
-                    crate::runtime::child_source::operator_process::journal::OperatorSegmentJournal::new(authority)?,
+            completion: ChildCompletionPort {
+                usage: Arc::new(
+                    crate::runtime::turn_terminal::TerminalUsageCollector::new_ordinary(
+                        authority.snapshots().parent.workspace_id().to_owned(),
+                        authority.snapshots().parent.owner_id().to_owned(),
+                        manifest.run_id.clone(),
+                        authority
+                            .snapshots()
+                            .generation
+                            .effective
+                            .memory
+                            .event_recording_config(),
+                    )
+                    .with_operator_journal(
+                        crate::runtime::child_source::operator_process::journal::OperatorSegmentJournal::new(
+                            authority,
+                        )?,
+                    ),
                 ),
-            ),
+            },
         }))
     } else {
         None
@@ -1273,10 +1356,10 @@ async fn run_owned_manifest(
                             ),
                         ))
                         .await;
-                    if let Some(turn) = child_turn.as_ref() {
+                    if let (Some(turn), Some(segments)) = (child_turn.as_ref(), child_segments.as_ref()) {
                         let settlement = match &loop_result {
-                            Ok((outcome, trace)) => turn.complete(outcome, trace).await.map(|_| ()),
-                            Err(error) => turn.fail(error, cancel.is_cancelled()).await,
+                            Ok((outcome, trace)) => segments.completion.complete(turn, outcome, trace).await,
+                            Err(error) => segments.completion.fail(turn, error, cancel.is_cancelled()).await,
                         };
                         if let Err(error) = settlement {
                             return (segment_history, Err(error));
@@ -1296,7 +1379,9 @@ async fn run_owned_manifest(
         source_receipt,
         child_grant.clone(),
         child_provider_binding.clone(),
-        child_segments.as_ref().map(|segments| Arc::clone(&segments.usage)),
+        child_segments
+            .as_ref()
+            .map(|segments| Arc::clone(&segments.completion.usage)),
         run_future,
     );
 
@@ -1346,7 +1431,7 @@ async fn run_owned_manifest(
 
     if let Some(segments) = child_segments.as_ref() {
         let recorded = segments.recorded_count().await;
-        let confirmed = u64::try_from(segments.usage.confirmed_count())?;
+        let confirmed = u64::try_from(segments.completion.usage.confirmed_count())?;
         anyhow::ensure!(
             !worker_result.success || (recorded > 0 && recorded == confirmed),
             "worker cannot commit completion with unconfirmed segments"
@@ -1450,7 +1535,7 @@ async fn run_owned_manifest(
                 sha2::Sha256::digest(serde_json::to_vec(&terminal_receipt.terminal_event)?)
             ),
             recorded_segments: segments.recorded_count().await,
-            segments: segments.usage.terminal_references(),
+            segments: segments.completion.usage.terminal_references(),
             seal: [0; 32],
         };
         evidence.validate_inventory(worker_result.success)?;
@@ -1487,9 +1572,9 @@ async fn run_owned_manifest(
             recording_enabled: manifest.memory_event_recording.enabled,
             terminal,
             recorded_segments: segments.recorded_count().await,
-            confirmed_segments: segments.usage.confirmed_terminal_ids(),
-            segments: segments.usage.terminal_references(),
-            usage: segments.usage.snapshot(),
+            confirmed_segments: segments.completion.usage.confirmed_terminal_ids(),
+            segments: segments.completion.usage.terminal_references(),
+            usage: segments.completion.usage.snapshot(),
             seal: [0; 32],
         };
         evidence.validate_inventory(worker_result.success)?;
@@ -1511,7 +1596,7 @@ async fn run_owned_manifest(
             &mut worker_result,
             &terminal_receipt,
             segments.recorded_count().await,
-            &segments.usage,
+            &segments.completion.usage,
         )?;
     }
 

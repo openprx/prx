@@ -8,12 +8,18 @@ use crate::agent::turn_contracts::{ToolLoopOutcome, ToolLoopRuntimeAdapter, Tool
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static SEGMENT_GATE_SPY: Arc<std::sync::atomic::AtomicUsize>;
+}
+
 pub(crate) struct ChildSegmentTurn {
     service: Arc<TurnDecisionService>,
     proof: Arc<OwnedTurnSourceProof>,
     decision: Arc<TurnDecisionContext>,
     execution: crate::tools::ToolExecutionContext,
     terminal: super::turn_terminal::TurnTerminalGuard,
+    settlement: crate::agent::terminal::DecisionSettlementRef,
     provider_trace: Arc<crate::agent::turn_contracts::RetainedProviderTrace>,
     started_at: chrono::DateTime<chrono::Utc>,
     route: crate::llm::route_decision::RouteDecision,
@@ -68,6 +74,8 @@ impl ChildSegmentTurn {
             service.model_can_call_tools(proof.as_ref()),
             false,
         );
+        #[cfg(test)]
+        let _ = SEGMENT_GATE_SPY.try_with(|spy| spy.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
         let decision = service
             .decide_agent_segment(proof.as_ref(), previous_observation.as_deref(), cancellation)
             .await?;
@@ -125,6 +133,7 @@ impl ChildSegmentTurn {
         // This owner is outside the segment's child-drain scope. Registering
         // inside that scope would make it wait for its own terminal guard.
         let provider_trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
+        let settlement = service.terminal_settlement_ref(Arc::clone(&decision))?;
         let terminal = super::turn_terminal::TurnTerminalGuard::new(
             owner.register(cancellation.clone())?,
             Arc::clone(&service),
@@ -142,6 +151,7 @@ impl ChildSegmentTurn {
             decision,
             execution,
             terminal,
+            settlement,
             provider_trace,
             started_at: chrono::Utc::now(),
             route,
@@ -247,9 +257,9 @@ impl ChildSegmentTurn {
         status: TurnTerminalStatus,
         summary: String,
         provider_outcome: Option<crate::llm::route_decision::ProviderExecutionOutcome>,
-    ) -> anyhow::Result<TurnTerminalDraft> {
-        Ok(TurnTerminalDraft {
-            decision: Some(self.service.terminal_settlement_ref(Arc::clone(&self.decision))?),
+    ) -> TurnTerminalDraft {
+        TurnTerminalDraft {
+            decision: Some(self.settlement.clone()),
             terminal_id: self.proof.run_id().to_owned(),
             scope: self.execution.envelope.message_scope(),
             status,
@@ -268,7 +278,7 @@ impl ChildSegmentTurn {
                 finished_at: chrono::Utc::now(),
             },
             delivery_intent: TurnDeliveryIntent::ReturnToCaller,
-        })
+        }
     }
 
     pub(crate) async fn complete(
@@ -285,7 +295,7 @@ impl ChildSegmentTurn {
         let retained = self.provider_trace.snapshot().0.unwrap_or_else(|| trace.clone());
         let provider = crate::agent::terminal::provider_outcome_from_trace(&self.route, self.started_at, retained);
         self.terminal
-            .commit(self.proposal(status, summary, Some(provider))?)
+            .commit(self.proposal(status, summary, Some(provider)))
             .await
             .map_err(|error| error.context(super::turn_cleanup::CleanupIncomplete))
     }
@@ -308,7 +318,7 @@ impl CloseTurnPorts for ChildSegmentTurn {
     ) -> anyhow::Result<Self::Receipt> {
         anyhow::ensure!(Arc::ptr_eq(&context, &self.decision), "child close decision changed");
         self.terminal
-            .commit(self.proposal(TurnTerminalStatus::Completed, reply.to_owned(), None)?)
+            .commit(self.proposal(TurnTerminalStatus::Completed, reply.to_owned(), None))
             .await
     }
 }

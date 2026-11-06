@@ -198,7 +198,7 @@ impl TurnDecisionService {
             },
             crate::runtime::child_source::ChildGrantRuntime {
                 recursive_child_claimed: self.issue_recursive_allowance(proof, context),
-                decision_store: Arc::clone(&self.store),
+                decision_store: Some(Arc::clone(&self.store)),
                 source_fabric: crate::memory::MemoryFabric::new(Arc::clone(&self.memory), proof.workspace_id())
                     .with_event_recording(self.generation.effective.memory.event_recording_config()),
                 security: Arc::clone(&self.security),
