@@ -1,5 +1,5 @@
 use super::*;
-use crate::security::approval_ledger::keys::{ApprovalAuthority, RunCallAuthority};
+use crate::security::approval_ledger::keys::ApprovalAuthority;
 
 fn non_read_only_calls() -> [(&'static str, serde_json::Value); 6] {
     [
@@ -113,6 +113,7 @@ async fn child_call_ask_binds_to_child_context() {
         .await
         .is_err()
     );
+    review(&child, true).await;
     assert!(
         port.claim_if_approved(
             parent.envelope.owner_id.as_deref().unwrap(),
@@ -122,7 +123,6 @@ async fn child_call_ask_binds_to_child_context() {
         .await
         .is_err()
     );
-    review(&child, true).await;
     assert_eq!(
         service.execute(command(1), child.clone(), None).await.status,
         ToolExecutionStatus::Succeeded
@@ -137,18 +137,6 @@ async fn child_call_ask_binds_to_child_context() {
         .unwrap();
     assert_eq!(resolution.run_id, child.envelope.run_id);
     assert_eq!(resolution.owner_id, child.envelope.owner_id);
-    let parent_authority = RunCallAuthority {
-        run_id: parent.envelope.run_id.clone().unwrap(),
-        call_digest: pending.authority().call_digest,
-    };
-    assert!(
-        ledger
-            .memory
-            .find_message_event_by_idempotency_key(&ledger.workspace, &parent_authority.resolution_key(""))
-            .await
-            .unwrap()
-            .is_none()
-    );
     assert_eq!(
         service.execute(command(1), child.clone(), None).await.status,
         ToolExecutionStatus::ApprovalDenied
@@ -236,17 +224,13 @@ async fn policy_deny_refused_without_backend_call() {
     for (name, args) in [
         (
             "file_write",
-            serde_json::json!({"value":1,"path":"/etc/prx_forbidden","content":"project content"}),
+            serde_json::json!({"value":1,"path":"project.txt","content":"project content"}),
         ),
-        (
-            "shell",
-            serde_json::json!({"value":1,"command":"touch /etc/prx_forbidden"}),
-        ),
+        ("shell", serde_json::json!({"value":1,"command":"touch project.txt"})),
     ] {
         let fixture = fixture();
         let mut service = autonomy_service(&fixture, name, AutonomyLevel::Full);
-        // The service projects the real identity-scope Deny before approval.
-        // Argument-level path/command checks belong to the concrete backends.
+        // Path/command enforcement is not provable at the service layer; this row covers scope Deny.
         service.policy = Arc::new(SecurityEffectPolicy::new(Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
             scope_rules: vec![crate::config::ScopeRule {
