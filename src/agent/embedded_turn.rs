@@ -509,7 +509,7 @@ async fn run_work(
         let loaded = crate::agent::memory_loader::load_selected_memory(
             loader,
             agent.memory.as_ref(),
-            input,
+            &crate::agent::context_recall::recall_query(input),
             &scope,
             &source.envelope().session_key,
             std::time::Instant::now() + std::time::Duration::from_secs(5),

@@ -122,4 +122,23 @@ async fn selected_custom_loader_reads_actual_owner_rows_only() {
     .unwrap();
     assert_eq!(loaded.hits.len(), 1);
     assert_eq!(loaded.context, "prx_query owned evidence");
+
+    // A message over the 1024-byte retrieval bound still yields custom context
+    // when the caller passes the projected query, as the embedded turn does.
+    let long = format!("prx_query {}", "filler ".repeat(200));
+    let projected = crate::agent::context_recall::recall_query(&long);
+    assert!(projected.len() <= 1024 && long.len() > 1024);
+    let loaded = crate::agent::memory_loader::load_selected_memory(
+        &Loader,
+        &memory,
+        &projected,
+        &scope,
+        "prx_session",
+        std::time::Instant::now() + std::time::Duration::from_millis(500),
+        (Some(key_without_event), Some(excluded_event)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(loaded.hits.len(), 1);
+    assert_eq!(loaded.context, "prx_query owned evidence");
 }
