@@ -995,3 +995,48 @@ async fn cli_agent_preserves_existing_approval_without_pending() {
     assert!(context.approval_ledger.is_none());
     assert_existing_strategy(context, observer).await;
 }
+
+#[tokio::test]
+async fn cli_saved_live_input_is_excluded_without_useful_feedback() {
+    let dir = TempDir::new().unwrap();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+    let envelope = resolve_agent_turn_envelope(None, &dir.path().to_string_lossy(), "prx_run");
+    let fabric = crate::memory::MemoryFabric::new(memory.clone(), envelope.workspace_id.clone());
+    let event = fabric
+        .record_inbound_user_message(envelope.message_scope(), "prx input", None, None)
+        .await
+        .unwrap();
+    let key = current_input_memory_key("prx_run");
+    fabric
+        .record_semantic_memory_from_event(
+            &key,
+            "prx input",
+            crate::memory::MemoryCategory::Conversation,
+            None,
+            Some(&event.event_id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let scope = crate::agent::context_recall::RecallScope::from_envelope(
+        &envelope,
+        &crate::config::MemoryConfig::default(),
+        "private",
+    );
+    let before = memory.get(&key).await.unwrap().unwrap();
+    let recalled = crate::agent::context_recall::scoped_recall(
+        memory.as_ref(),
+        &scope,
+        "prx input",
+        crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+    )
+    .await;
+    assert!(!recalled.preamble.contains("[Memory context]"));
+    assert!(!recalled.ids.contains(&before.id));
+    increment_recalled_useful_counts(memory.as_ref(), &recalled.ids).await;
+    assert_eq!(
+        memory.get(&key).await.unwrap().unwrap().useful_count,
+        before.useful_count
+    );
+}

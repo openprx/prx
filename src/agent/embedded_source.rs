@@ -859,7 +859,7 @@ impl EmbeddedAgentSource {
         self.binding
             .memory
             .store_with_context_and_metadata(
-                &format!("user_msg:{}", self.run_id()),
+                &crate::agent::context_recall::current_input_memory_key(self.run_id()),
                 &self.input,
                 crate::memory::MemoryCategory::Conversation,
                 Some(self.session_key()),
@@ -978,7 +978,7 @@ mod tests {
             let (binding, memory) = autosave_fixture(workspace.path(), auto_save, promote, min_chars);
             let source = binding.record(input).await.unwrap();
             source.autosave_user_input().await.unwrap();
-            let key = format!("user_msg:{}", source.run_id());
+            let key = crate::agent::context_recall::current_input_memory_key(source.run_id());
             let entry = memory.get(&key).await.unwrap();
             assert_eq!(entry.is_some(), expected);
             if let Some(entry) = entry {
@@ -1029,7 +1029,7 @@ mod tests {
             .record("The project uses a weekly release schedule.")
             .await
             .unwrap();
-        let key = format!("user_msg:{}", source.run_id());
+        let key = crate::agent::context_recall::current_input_memory_key(source.run_id());
         memory
             .store_with_metadata(
                 &key,

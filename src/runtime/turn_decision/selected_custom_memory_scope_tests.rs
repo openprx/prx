@@ -73,6 +73,23 @@ async fn selected_custom_loader_reads_actual_owner_rows_only() {
             .unwrap();
     }
     let scope = selected_custom_memory_read_scope(&write, "prx_workspace", "prx_owner").unwrap();
+    let excluded_key = crate::agent::context_recall::current_input_memory_key("prx_run");
+    memory
+        .store_with_context_and_metadata(
+            &excluded_key,
+            "prx_query live input",
+            crate::memory::MemoryCategory::Conversation,
+            Some("prx_session"),
+            Some(&scope),
+            crate::memory::MemoryStoreMetadata {
+                workspace_id: Some("prx_workspace".into()),
+                owner_id: Some("prx_owner".into()),
+                channel: Some("agent_api".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let loaded = crate::agent::memory_loader::load_selected_memory(
         &Loader,
         &memory,
@@ -80,6 +97,7 @@ async fn selected_custom_loader_reads_actual_owner_rows_only() {
         &scope,
         "prx_session",
         std::time::Instant::now() + std::time::Duration::from_millis(500),
+        Some(&excluded_key),
     )
     .await
     .unwrap();

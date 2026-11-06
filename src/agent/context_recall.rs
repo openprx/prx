@@ -8,6 +8,7 @@ use crate::memory::{
 };
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+#[cfg(test)]
 use uuid::Uuid;
 
 /// Maximum bytes for the total memory context preamble injected into prompts.
@@ -59,7 +60,7 @@ impl RecallScope {
             semantic,
             min_relevance_score: config.min_relevance_score,
             record_user_messages: config.events.record_user_messages,
-            current_input_key: envelope.run_id.as_deref().map(|run| format!("user_msg:{run}")),
+            current_input_key: envelope.run_id.as_deref().map(current_input_memory_key),
         }
     }
 }
@@ -138,6 +139,12 @@ impl AgentContextBundle {
     }
 }
 
+/// Shared identity for the live input across CLI, chat and embedded turns.
+pub(crate) fn current_input_memory_key(run_id: &str) -> String {
+    format!("user_msg:{run_id}")
+}
+
+#[cfg(test)]
 pub(super) fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
@@ -205,14 +212,19 @@ async fn build_semantic_context(
             };
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        tokio::time::timeout_at(
+        let hits = match tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             mem.retrieve_decision_memory(user_msg, 5, scope, None, deadline),
         )
         .await
-        .ok()
-        .and_then(Result::ok)
-        .filter(|hits| {
+        {
+            Ok(Ok(hits)) => Some(hits),
+            outcome => {
+                tracing::warn!(timed_out = outcome.is_err(), "scoped memory keyword fallback failed");
+                None
+            }
+        };
+        hits.filter(|hits| {
             hits.len() <= 5
                 && hits.iter().all(|hit| {
                     hit.id.len() <= 128

@@ -119,6 +119,7 @@ pub(crate) async fn load_selected_memory(
     scope: &crate::memory::principal::MemoryWriteContext,
     session: &str,
     deadline: std::time::Instant,
+    excluded_key: Option<&str>,
 ) -> anyhow::Result<LoadedSelectedMemory> {
     anyhow::ensure!(
         scope.workspace_id.as_deref().is_some_and(|id| !id.trim().is_empty())
@@ -130,6 +131,7 @@ pub(crate) async fn load_selected_memory(
         scope,
         session,
         deadline,
+        excluded_key,
         calls: std::sync::atomic::AtomicUsize::new(0),
         reserved: std::sync::atomic::AtomicUsize::new(0),
         hits: parking_lot::Mutex::new(Vec::new()),
@@ -180,6 +182,7 @@ struct SelectedMemoryView<'a> {
     scope: &'a crate::memory::principal::MemoryWriteContext,
     session: &'a str,
     deadline: std::time::Instant,
+    excluded_key: Option<&'a str>,
     calls: std::sync::atomic::AtomicUsize,
     reserved: std::sync::atomic::AtomicUsize,
     hits: parking_lot::Mutex<Vec<crate::memory::traits::DecisionMemoryHit>>,
@@ -243,7 +246,8 @@ impl Memory for SelectedMemoryView<'_> {
         );
         let now = chrono::Utc::now();
         hits.retain(|hit| {
-            !hit.content.trim().is_empty()
+            self.excluded_key != Some(hit.key.as_str())
+                && !hit.content.trim().is_empty()
                 && chrono::DateTime::parse_from_rfc3339(&hit.created_at)
                     .ok()
                     .and_then(|created| u64::try_from(now.signed_duration_since(created).num_milliseconds()).ok())

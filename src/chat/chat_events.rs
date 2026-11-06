@@ -43,14 +43,6 @@ impl ReduxMode {
     }
 }
 
-pub(super) fn autosave_memory_key(prefix: &str) -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("{prefix}:{ts}")
-}
-
 /// Extract the raw chat session id from the legacy `chat:{id}` durable key.
 ///
 /// D4 C6: the durable `session_key` is migrated to a stable canonical derived

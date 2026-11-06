@@ -116,18 +116,6 @@ impl ChannelDecisionTurn {
         );
         let envelope = source.envelope().clone();
         let trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
-        let recalled_context = crate::agent::context_recall::scoped_recall(
-            turn_memory.as_ref(),
-            &crate::agent::context_recall::RecallScope::from_envelope(
-                &envelope,
-                &generation.effective.memory,
-                proof.policy_chat_type(),
-            ),
-            proof.routing_input(),
-            crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
-        )
-        .await
-        .preamble;
         let context = service
             .decide_agent_initial(
                 &proof,
@@ -139,13 +127,32 @@ impl ChannelDecisionTurn {
             admission.take_terminal_ticket()?,
             Arc::clone(&service),
             Arc::clone(&context),
-            crate::memory::MemoryFabric::new(turn_memory, envelope.workspace_id.clone())
+            crate::memory::MemoryFabric::new(Arc::clone(&turn_memory), envelope.workspace_id.clone())
                 .with_event_recording(generation.effective.memory.event_recording_config()),
             Arc::clone(&generation.effective),
             envelope.clone(),
             None,
         )?
         .with_provider_trace(Arc::clone(&trace), route.clone());
+        let recalled_context = if matches!(
+            context.disposition()?,
+            crate::runtime::turn_decision::TurnDisposition::Run
+        ) {
+            crate::agent::context_recall::scoped_recall(
+                turn_memory.as_ref(),
+                &crate::agent::context_recall::RecallScope::from_envelope(
+                    &envelope,
+                    &generation.effective.memory,
+                    proof.policy_chat_type(),
+                ),
+                proof.routing_input(),
+                crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+            )
+            .await
+            .preamble
+        } else {
+            String::new()
+        };
         Ok(Self {
             service,
             proof,

@@ -11,8 +11,8 @@ use super::bootstrap::{chat_model_switch, chat_provider_chain, initial_chat_disp
 #[cfg(feature = "terminal-tui")]
 use super::chat_events::{ReduxMode, collect_reasoning_from_history_slice};
 use super::chat_events::{
-    autosave_memory_key, chat_message_event_scope, chat_runtime_envelope, finalize_chat_non_success_turn,
-    finalize_chat_success_turn, record_route_decision_event, sanitize_chat_semantic_memory_content,
+    chat_message_event_scope, chat_runtime_envelope, finalize_chat_non_success_turn, finalize_chat_success_turn,
+    record_route_decision_event, sanitize_chat_semantic_memory_content,
 };
 #[cfg(feature = "terminal-tui")]
 use super::compaction::refresh_context_budget_for_tui;
@@ -3221,7 +3221,7 @@ Retry with a compatible model: /provider {shown} <model>",
 
         // Auto-save user message to memory
         if !direct_decision_turn && config.memory.should_auto_promote_user_message(&user_input) {
-            let user_key = autosave_memory_key("user_msg");
+            let user_key = crate::agent::context_recall::current_input_memory_key(admitted_binding.envelope().run_id.as_deref().context("chat turn run id missing")?);
             let safe_user_input = sanitize_chat_semantic_memory_content(&user_input);
             let _ = memory_fabric
                 .record_semantic_memory_from_event(

@@ -1665,6 +1665,34 @@ pub(crate) mod admission_failure_tests {
         }
     }
 
+    #[tokio::test]
+    async fn chat_binding_excludes_saved_live_input_without_useful_feedback() {
+        let (_dir, fabric, binding) = fixture(true).await;
+        let key = crate::agent::context_recall::current_input_memory_key(binding.envelope().run_id.as_deref().unwrap());
+        fabric
+            .record_semantic_memory_from_event(
+                &key,
+                "prx input",
+                crate::memory::MemoryCategory::Conversation,
+                None,
+                binding.envelope().source_message_event_id.as_deref(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let memory = fabric.memory();
+        let before = memory.get(&key).await.unwrap().unwrap();
+        let recalled = binding.recalled_context(memory.as_ref()).await;
+        assert!(!recalled.preamble.contains("[Memory context]"));
+        assert!(!recalled.ids.contains(&before.id));
+        crate::agent::context_recall::increment_recalled_useful_counts(memory.as_ref(), &recalled.ids).await;
+        assert_eq!(
+            memory.get(&key).await.unwrap().unwrap().useful_count,
+            before.useful_count
+        );
+    }
+
     async fn fixture(record_input: bool) -> (tempfile::TempDir, MemoryFabric, Arc<ChatTurnBinding>) {
         fixture_with_plane(record_input, false).await
     }

@@ -1153,3 +1153,41 @@ async fn scoped_recall_keyword_fallback_excludes_current_turn_and_foreign_owner(
     assert!(!recalled.preamble.contains("current turn"));
     assert!(!recalled.preamble.contains("foreign owner"));
 }
+
+#[tokio::test]
+async fn cli_live_input_is_not_recalled_or_rewarded() {
+    let envelope = crate::runtime::envelope::RuntimeEnvelope::agent("prx_workspace", "prx_run");
+    live_input_is_not_recalled_or_rewarded(envelope).await;
+}
+
+#[tokio::test]
+async fn chat_live_input_is_not_recalled_or_rewarded() {
+    let envelope =
+        crate::runtime::envelope::RuntimeEnvelope::chat("prx_workspace", "prx_session").with_run_id("prx_run");
+    live_input_is_not_recalled_or_rewarded(envelope).await;
+}
+
+async fn live_input_is_not_recalled_or_rewarded(mut envelope: crate::runtime::envelope::RuntimeEnvelope) {
+    envelope.owner_id = Some("prx_owner".into());
+    envelope.owner_isolated = true;
+    let dir = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(dir.path()).unwrap();
+    let mut scope = RecallScope::from_envelope(&envelope, &crate::config::MemoryConfig::default(), "private");
+    let key = current_input_memory_key(envelope.run_id.as_deref().unwrap());
+    // CLI single-shot, interactive CLI and chat save with this shared identity
+    // before constructing the prompt's authenticated recall scope.
+    seed_recall_memory(&mem, &scope, &key, "prxquery live input").await;
+    seed_recall_memory(&mem, &scope, "prior_fact", "prxquery prior fact").await;
+    for threshold in [0.0, 1.0] {
+        scope.min_relevance_score = threshold;
+        let recalled = scoped_recall(&mem, &scope, "prxquery", RECALL_CONTEXT_BUDGET).await;
+        assert!(recalled.preamble.contains("prior fact"));
+        assert!(!recalled.preamble.contains(&key));
+        assert!(!recalled.preamble.contains("live input"));
+        let current = mem.get(&key).await.unwrap().unwrap();
+        assert!(!recalled.ids.contains(&current.id));
+        let before = current.useful_count;
+        increment_recalled_useful_counts(&mem, &recalled.ids).await;
+        assert_eq!(mem.get(&key).await.unwrap().unwrap().useful_count, before);
+    }
+}

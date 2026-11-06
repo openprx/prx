@@ -1216,11 +1216,14 @@ recall is suppressed; semantic facts, documents and assistant history remain
 available. Scoped recall excludes stale and future-dated rows and projects image
 markers before bounding the retrieval query to 1024 bytes, including in traces.
 When scored semantic recall has no matches, scoped prompt recall also uses the
-repository’s bounded keyword read (up to five fresh, redacted summaries).
+repository’s bounded keyword read (up to five fresh, redacted summaries). This
+fallback can add up to five seconds before the prompt; backend errors and timeouts
+produce a warning without query text or backend error details.
 The current turn’s semantic promotion is excluded from recall. Keyword
 hits have no semantic score; `memory.min_relevance_score` continues to filter
 scored semantic recall. Decision-selected retrieval remains available to the
-decision engine.
+decision engine. Channel and child turns that close without execution skip prompt
+recall and its document trace.
 
 ### Embeddings and vector recall
 

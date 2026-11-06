@@ -1,6 +1,6 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use crate::agent::context_recall::{autosave_memory_key, increment_recalled_useful_counts};
+use crate::agent::context_recall::{current_input_memory_key, increment_recalled_useful_counts};
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::runtime_prompt::build_runtime_system_prompt;
 use crate::agent::turn_contracts::ChatMode;
@@ -1926,7 +1926,7 @@ pub(crate) async fn run_with_runtime_envelope(
 
                 // Auto-save user message to memory (skip short/trivial messages)
                 if config.memory.should_auto_promote_user_message(&msg) {
-                    let user_key = autosave_memory_key("user_msg");
+                    let user_key = current_input_memory_key(&turn_run_id);
                     let _ = memory_fabric
                         .record_semantic_memory_from_event(
                             &user_key,
@@ -2437,7 +2437,7 @@ pub(crate) async fn run_with_runtime_envelope(
 
                 // Auto-save conversation turns (skip short/trivial messages)
                 if config.memory.should_auto_promote_user_message(&user_input) {
-                    let user_key = autosave_memory_key("user_msg");
+                    let user_key = current_input_memory_key(&turn_run_id);
                     let _ = memory_fabric
                         .record_semantic_memory_from_event(
                             &user_key,

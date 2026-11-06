@@ -23,7 +23,6 @@ pub(crate) struct ChildSegmentTurn {
 
 // Resources consumed by the synchronous post-decision terminal admission.
 struct ChildTerminalAdmission {
-    recalled_context: String,
     fabric: crate::memory::MemoryFabric,
     config: Arc<crate::config::Config>,
     usage_collector: Option<Arc<super::turn_terminal::TerminalUsageCollector>>,
@@ -69,28 +68,21 @@ impl ChildSegmentTurn {
             service.model_can_call_tools(proof.as_ref()),
             false,
         );
-        let recalled_context = crate::agent::context_recall::scoped_recall(
-            fabric.memory().as_ref(),
-            &crate::agent::context_recall::RecallScope::from_envelope(
-                &execution.envelope,
-                &config.memory,
-                proof.policy_chat_type(),
-            ),
-            proof.routing_input(),
-            crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
-        )
-        .await
-        .preamble;
         let decision = service
             .decide_agent_segment(proof.as_ref(), previous_observation.as_deref(), cancellation)
             .await?;
-        Self::finish_admission(
+        let recall_memory = fabric.memory();
+        let recall_scope = crate::agent::context_recall::RecallScope::from_envelope(
+            &execution.envelope,
+            &config.memory,
+            proof.policy_chat_type(),
+        );
+        let mut turn = Self::finish_admission(
             service,
             proof,
             decision,
             execution,
             ChildTerminalAdmission {
-                recalled_context,
                 fabric,
                 config,
                 usage_collector,
@@ -98,7 +90,18 @@ impl ChildSegmentTurn {
             },
             owner,
             cancellation,
-        )
+        )?;
+        if matches!(turn.decision.disposition()?, TurnDisposition::Run) {
+            turn.recalled_context = crate::agent::context_recall::scoped_recall(
+                recall_memory.as_ref(),
+                &recall_scope,
+                turn.proof.routing_input(),
+                crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+            )
+            .await
+            .preamble;
+        }
+        Ok(turn)
     }
 
     // Construct the terminal only after segment work has returned. Keep its
@@ -114,7 +117,6 @@ impl ChildSegmentTurn {
         cancellation: &CancellationToken,
     ) -> anyhow::Result<Self> {
         let ChildTerminalAdmission {
-            recalled_context,
             fabric,
             config,
             usage_collector,
@@ -144,7 +146,7 @@ impl ChildSegmentTurn {
             started_at: chrono::Utc::now(),
             route,
             history_commit_len: None,
-            recalled_context,
+            recalled_context: String::new(),
         })
     }
 
