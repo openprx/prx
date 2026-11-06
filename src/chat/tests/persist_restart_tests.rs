@@ -3,10 +3,39 @@
 //! Restart regressions use the real SQLite memory and decision stores.
 use super::*;
 use crate::chat::decision_source::{ChatAdmissionMode, ChatProviderBinding};
+use crate::memory::ingress_recovery::IngressCapsule;
+use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
 use crate::memory::{MessageEvent, MessageEventInput, SqliteMemory};
 use crate::runtime::turn_cleanup::{CleanupScope, CleanupTracker};
 use anyhow::Context;
 use std::path::Path;
+
+/// v3 expectation: the MAC of a real v3 capsule's artifact is produced by the
+/// repository key named in that capsule, never by the legacy decision key.
+fn repository_tag(workspace: &Path, capsule: &IngressCapsule, domain: RecoveryMacDomain, bytes: &[u8]) -> RecoveryTag {
+    let store = SqliteMemory::new(workspace).expect("agent store");
+    let repository = store.recovery_repository().expect("repository-backed store");
+    repository
+        .recovery_mac(capsule.key_id.as_deref(), domain, bytes)
+        .expect("repository MAC for the capsule's key")
+}
+
+/// v3 verification of an authentication tag recorded by a real capsule's artifact.
+fn repository_verifies(
+    workspace: &Path,
+    capsule: &IngressCapsule,
+    domain: RecoveryMacDomain,
+    bytes: &[u8],
+    tag: &[u8],
+) -> bool {
+    let store = SqliteMemory::new(workspace).expect("agent store");
+    let repository = store.recovery_repository().expect("repository-backed store");
+    let tag = RecoveryTag {
+        key_id: capsule.key_id.clone().expect("v3 capsule key id"),
+        tag: tag.try_into().expect("32-byte recovery tag"),
+    };
+    repository.verify_recovery_mac(&tag, domain, bytes).is_ok()
+}
 
 fn config_at(workspace: &Path) -> crate::config::Config {
     let mut config = crate::config::Config::default();
@@ -285,10 +314,12 @@ async fn chat_recovers_a_real_seal_that_failed_verification_before_restart() {
     assert!(evidence.content.contains("terminal replay authentication failed"));
     let mut payload: serde_json::Value = serde_json::from_str(evidence.raw_payload_json.as_deref().unwrap()).unwrap();
     let authentication = payload.as_object_mut().unwrap().remove("authentication").unwrap();
-    let key = crate::decision::DecisionKey::load_or_create(dir.path()).unwrap();
-    assert!(key.verify_hmac(
-        crate::decision::KeyDomain::IngressRecovery,
-        &[b"quarantine-v1", &serde_json::to_vec(&payload).unwrap()],
+    let capsule: IngressCapsule = serde_json::from_value(payload.get("capsule").cloned().unwrap()).unwrap();
+    assert!(repository_verifies(
+        dir.path(),
+        &capsule,
+        RecoveryMacDomain::QuarantineV3,
+        &serde_json::to_vec(&payload).unwrap(),
         &hex::decode(authentication.as_str().unwrap()).unwrap()
     ));
     restarted_chat(dir.path(), "prx-third-run").await;
@@ -557,10 +588,11 @@ async fn unauthenticated_marker_warns_once_per_run_with_recovery_hint() {
         assert!(warning.contains(expected), "missing {expected}: {warning}");
     }
     assert!(!warning.contains("ERROR"), "{warning}");
-    let key = crate::decision::DecisionKey::load_or_create(dir.path()).unwrap();
-    let tag = key.hmac(
-        crate::decision::KeyDomain::IngressRecovery,
-        &[b"quarantine-key-v1", &serde_json::to_vec(&capsule).unwrap()],
+    let tag = repository_tag(
+        dir.path(),
+        &capsule,
+        RecoveryMacDomain::QuarantineKeyV3,
+        &serde_json::to_vec(&capsule).unwrap(),
     );
     let memory = SqliteMemory::new(dir.path()).unwrap();
     assert!(
@@ -568,7 +600,7 @@ async fn unauthenticated_marker_warns_once_per_run_with_recovery_hint() {
             .find_owned_message_event_by_idempotency_key(
                 &first.workspace_id,
                 first.owner_id.as_deref().unwrap(),
-                &format!("ingress:{}:quarantine:{}", first.event_id, hex::encode(tag)),
+                &format!("ingress:{}:quarantine:{}", first.event_id, hex::encode(tag.tag)),
             )
             .await
             .unwrap()

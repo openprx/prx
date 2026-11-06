@@ -152,10 +152,54 @@ async fn chat_inbound_on_an_agent_store_survives_an_unverifiable_capsule() {
         let first = write_chat(&config, &memory, "prx-session", "prx-run-1", "prx hello", "chat:1:user")
             .await
             .expect("first chat write");
+        // Make the first capsule unverifiable without touching the recovery
+        // authority: both durable copies of its v3 capsule (the recovery row and
+        // the input's wrapper) carry a wrong authentication. Their keys stay
+        // available, so the quarantine marker can still be signed.
+        let connection =
+            rusqlite::Connection::open(dir.path().join("memory").join("brain.db")).expect("agent store database");
+        let tamper = |capsule: serde_json::Value| -> serde_json::Value {
+            let mut capsule = capsule;
+            capsule
+                .as_object_mut()
+                .expect("capsule object")
+                .insert("authentication".to_owned(), serde_json::Value::String("00".repeat(32)));
+            capsule
+        };
+        let capsule_json: String = connection
+            .query_row(
+                "SELECT capsule_json FROM ingress_recovery WHERE input_event_id = ?1",
+                rusqlite::params![first.event_id],
+                |row| row.get(0),
+            )
+            .expect("first recovery capsule");
+        let tampered = tamper(serde_json::from_str(&capsule_json).expect("capsule json"));
+        connection
+            .execute(
+                "UPDATE ingress_recovery SET capsule_json = ?1 WHERE input_event_id = ?2",
+                rusqlite::params![tampered.to_string(), first.event_id],
+            )
+            .expect("tamper the recovery capsule");
+        let raw: String = connection
+            .query_row(
+                "SELECT raw_payload_json FROM message_events WHERE event_id = ?1",
+                rusqlite::params![first.event_id],
+                |row| row.get(0),
+            )
+            .expect("first capsule payload");
+        let mut payload: serde_json::Value = serde_json::from_str(&raw).expect("first capsule payload json");
+        let wrapped = payload.get_mut("prx_ingress_capsule").expect("wrapped capsule");
+        *wrapped = tamper(wrapped.clone());
+        connection
+            .execute(
+                "UPDATE message_events SET raw_payload_json = ?1 WHERE event_id = ?2",
+                rusqlite::params![payload.to_string(), first.event_id],
+            )
+            .expect("tamper the input wrapper");
+        drop(connection);
         drop(memory);
         first
     };
-    std::fs::rename(dir.path().join("self"), dir.path().join("self-previous")).expect("replace decision key directory");
     let memory = open_store(dir.path());
     let second = write_chat(&config, &memory, "prx-session", "prx-run-2", "prx again", "chat:2:user")
         .await
