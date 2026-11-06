@@ -1948,6 +1948,4 @@ backend binding or schema, or availability below Configured, returns
 `StaleCapability` before policy or backend execution. Ingress model bindings
 reject a different execution provider/model. Models without verified native tool
 support, and sources with tool calls disabled, receive an empty tool surface.
-This check prevents a
-model from invoking a withheld tool by guessing its name. Reverting the safety
-surface change restores the previous dispatch behavior.
+This check prevents a model from invoking a withheld tool by guessing its name.

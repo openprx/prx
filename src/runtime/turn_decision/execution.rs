@@ -23,28 +23,35 @@ impl TurnDecisionService {
     pub(crate) fn turn_tool_surface(
         &self,
         proof: &dyn TurnSourceProof,
-        model: &str,
         inherited_exclusions: &[String],
     ) -> crate::tools::execution::admission::TurnSurface {
         let mut config = self.generation.effective.tool_tiering.clone();
         config.always_exclude.extend(inherited_exclusions.iter().cloned());
         let channel = self.surface == TurnSurfaceKind::Channel;
         let view = self.catalog_view();
-        crate::tools::execution::admission::TurnSurface::build(&self.execution, &config, model, channel, |descriptor| {
-            self.catalog
-                .entry_for_public_name(&descriptor.public_name)
-                .is_some_and(|entry| {
-                    !view.surface_excludes(entry)
-                        && (!channel || entry.channel_eligible)
-                        && crate::tools::execution::decide_tool_execution(
-                            &self.security,
-                            entry.policy_tool_name(),
-                            proof.policy_sender(),
-                            proof.policy_channel(),
-                            proof.policy_chat_type(),
-                        ) != crate::tools::execution::ToolExecutionDecision::Deny
-                })
-        })
+        // Key the operator allowlist on the pinned model, never on a route spelling.
+        let pinned = proof.model_binding().pinned_model();
+        crate::tools::execution::admission::TurnSurface::build(
+            &self.execution,
+            &config,
+            pinned,
+            channel,
+            |descriptor| {
+                self.catalog
+                    .entry_for_public_name(&descriptor.public_name)
+                    .is_some_and(|entry| {
+                        !view.surface_excludes(entry)
+                            && (!channel || entry.channel_eligible)
+                            && crate::tools::execution::decide_tool_execution(
+                                &self.security,
+                                entry.policy_tool_name(),
+                                proof.policy_sender(),
+                                proof.policy_channel(),
+                                proof.policy_chat_type(),
+                            ) != crate::tools::execution::ToolExecutionDecision::Deny
+                    })
+            },
+        )
         .with_tool_calls(self.model_can_call_tools(proof))
     }
 

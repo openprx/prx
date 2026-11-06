@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnSurface {
-    registry_generation: [u8; 32],
+    registry_generation: Option<[u8; 32]>,
     published: BTreeMap<String, SchemaFingerprint>,
     exclusions: BTreeSet<String>,
     model_allowlist: Option<BTreeSet<String>>,
@@ -41,6 +41,11 @@ impl TurnSurface {
             model_allowlist,
             channel_eligible: BTreeSet::new(),
         };
+        if surface.registry_generation.is_none() {
+            // Fail closed: without a generation no later call can be proven current.
+            tracing::warn!("tool registry generation unavailable; publishing no tools for this turn");
+            return surface;
+        }
         for descriptor in service.current_descriptors() {
             let name = &descriptor.public_name;
             if surface.exclusions.contains(name)
@@ -88,28 +93,30 @@ impl TurnSurface {
 
 // Bind the complete live registry, including dynamic destination/epoch digests.
 // Sorting makes backend enumeration order irrelevant to the generation.
-fn registry_generation(service: &ToolExecutionService) -> [u8; 32] {
-    let mut entries: Vec<_> = service
+// `None` means an entry could not be serialized; callers treat that as stale.
+fn registry_generation(service: &ToolExecutionService) -> Option<[u8; 32]> {
+    let mut entries = service
         .current_descriptors()
         .into_iter()
         .map(|descriptor| {
             let binding = service
                 .current_descriptor_with_binding(&descriptor.public_name, true)
                 .and_then(|(_, binding)| binding);
+            let value = serde_json::to_value((&descriptor, &binding)).ok()?;
             let fingerprint = crate::tools::capability::fingerprint::tool_spec_fingerprint(
                 &descriptor.public_name,
                 &descriptor.backend_name,
-                &serde_json::json!([descriptor, binding]),
+                &value,
             );
-            fingerprint.0
+            Some(fingerprint.0)
         })
-        .collect();
+        .collect::<Option<Vec<[u8; 32]>>>()?;
     entries.sort_unstable();
     let mut digest = Sha256::new();
     for entry in entries {
         digest.update(entry);
     }
-    digest.finalize().into()
+    Some(digest.finalize().into())
 }
 
 pub(super) fn admit(
@@ -136,7 +143,7 @@ pub(super) fn admit(
                     &descriptor.parameters,
                 ))
     });
-    if stale || surface.registry_generation != registry_generation(service) {
+    if stale || surface.registry_generation.is_none() || surface.registry_generation != registry_generation(service) {
         return Err((
             ToolExecutionStatus::StaleCapability,
             format!("tool '{name}' changed after turn publication"),
