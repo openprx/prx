@@ -1341,6 +1341,8 @@ pub(crate) enum AgentDecisionError {
     Record(#[from] RecordBuildError),
     #[error("recordable decision store has no writer")]
     RecordWriterUnavailable,
+    #[error("decision evidence could not be durably recorded")]
+    DecisionEvidence(#[source] anyhow::Error),
     #[error("delegation parent could not be durably verified")]
     DelegationStorage(#[source] anyhow::Error),
     #[error("ordinary delegation scope could not be verified")]
