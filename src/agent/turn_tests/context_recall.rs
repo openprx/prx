@@ -1291,3 +1291,79 @@ async fn scoped_recall_excludes_source_event_with_arbitrary_save_key() {
         assert_eq!(recalled.ids.len(), 1);
     }
 }
+
+struct ProvenanceLessEchoMemory;
+
+#[async_trait::async_trait]
+impl Memory for ProvenanceLessEchoMemory {
+    fn name(&self) -> &str {
+        "provenance-less-echo"
+    }
+    async fn store(&self, _: &str, _: &str, _: MemoryCategory, _: Option<&str>) -> anyhow::Result<()> {
+        anyhow::bail!("read-only fixture")
+    }
+    async fn recall(&self, _: &str, _: usize, _: Option<&str>) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+        Ok([
+            ("lucid_0", "  prxquery live input  "),
+            ("lucid_1", "user_msg: prxquery live input "),
+            ("lucid_2", "prxquery unrelated prior fact"),
+        ]
+        .into_iter()
+        .map(|(key, content)| crate::memory::MemoryEntry {
+            id: key.into(),
+            key: key.into(),
+            content: content.into(),
+            category: MemoryCategory::Conversation,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            session_id: None,
+            source_event_id: None,
+            score: Some(1.0),
+            tags: None,
+            access_count: None,
+            useful_count: None,
+            source: None,
+            source_confidence: None,
+            verification_status: None,
+            lifecycle_state: None,
+            compressed_from: None,
+        })
+        .collect())
+    }
+    async fn get(&self, _: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+        Ok(None)
+    }
+    async fn list(
+        &self,
+        _: Option<&MemoryCategory>,
+        _: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+        Ok(Vec::new())
+    }
+    async fn forget(&self, _: &str) -> anyhow::Result<bool> {
+        anyhow::bail!("read-only fixture")
+    }
+    async fn count(&self) -> anyhow::Result<usize> {
+        Ok(3)
+    }
+    async fn health_check(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn scoped_recall_excludes_provenance_less_live_input_echo() {
+    let mut scope = recall_test_scope("prx_owner", "prx_workspace");
+    // Channel/gateway scopes can reach the Lucid service via legacy recall.
+    scope.principal.require_owner_match = false;
+    scope.semantic.require_owner_match = false;
+    let recalled = scoped_recall(
+        &ProvenanceLessEchoMemory,
+        &scope,
+        " prxquery live input ",
+        RECALL_CONTEXT_BUDGET,
+    )
+    .await;
+    assert_eq!(recalled.ids, vec!["lucid_2"]);
+    assert!(recalled.preamble.contains("unrelated prior fact"));
+    assert!(!recalled.preamble.contains("live input"));
+}

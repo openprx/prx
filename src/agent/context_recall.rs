@@ -200,6 +200,7 @@ async fn build_semantic_context(
         .filter(|entry| !fresh_only || fresh_timestamp(&entry.timestamp))
         .filter(|entry| excluded_key != Some(entry.key.as_str()))
         .filter(|entry| excluded_event.is_none() || entry.source_event_id.as_deref() != excluded_event)
+        .filter(|entry| !entry.content.trim().ends_with(user_msg.trim()))
         .map(|entry| (entry.id, entry.key, entry.content))
         .collect::<Vec<_>>();
     let entries = if fresh_only && scored_entries.is_empty() {
@@ -260,6 +261,7 @@ async fn build_semantic_context(
         .filter(|hit| fresh_timestamp(&hit.created_at))
         .filter(|hit| excluded_key != Some(hit.key.as_str()))
         .filter(|hit| excluded_event.is_none() || hit.source_event_id.as_deref() != excluded_event)
+        .filter(|hit| !hit.content.trim().ends_with(user_msg.trim()))
         .map(|hit| {
             let content = crate::causal_tree::projection::bounded_artifact_summary(&hit.content).0;
             (hit.id, hit.key, content)

@@ -131,6 +131,7 @@ pub(crate) async fn load_selected_memory(
         scope,
         session,
         deadline,
+        current_input: input,
         excluded_key: exclusion.0,
         excluded_event: exclusion.1,
         calls: std::sync::atomic::AtomicUsize::new(0),
@@ -183,6 +184,7 @@ struct SelectedMemoryView<'a> {
     scope: &'a crate::memory::principal::MemoryWriteContext,
     session: &'a str,
     deadline: std::time::Instant,
+    current_input: &'a str,
     excluded_key: Option<&'a str>,
     excluded_event: Option<&'a str>,
     calls: std::sync::atomic::AtomicUsize,
@@ -250,6 +252,7 @@ impl Memory for SelectedMemoryView<'_> {
         hits.retain(|hit| {
             self.excluded_key != Some(hit.key.as_str())
                 && (self.excluded_event.is_none() || hit.source_event_id.as_deref() != self.excluded_event)
+                && !hit.content.trim().ends_with(self.current_input.trim())
                 && !hit.content.trim().is_empty()
                 && chrono::DateTime::parse_from_rfc3339(&hit.created_at)
                     .ok()
