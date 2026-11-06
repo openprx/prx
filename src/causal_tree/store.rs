@@ -1333,8 +1333,13 @@ impl DecisionView {
     /// the same sealed child grant as a selected Delegate turn; callers must
     /// still verify that grant, its digest and all source lineage separately.
     pub(crate) fn admits_issued_child(&self) -> bool {
-        matches!(self.directive_kind.as_str(), "delegate" | "answer")
+        directive_admits_issued_child(&self.directive_kind)
     }
+}
+
+/// The directive kinds whose decisions may name an issued child as their parent.
+pub(crate) fn directive_admits_issued_child(directive_kind: &str) -> bool {
+    matches!(directive_kind, "delegate" | "answer")
 }
 
 /// The rows evaluation reads (CDP-10): the non-legacy decisions of a window

@@ -1,5 +1,6 @@
 //! Durable child-input receipts, independent of parent message provenance.
 pub(crate) mod authority_journal;
+pub(crate) mod completion;
 mod parent_authority;
 pub(crate) mod recursive_allowance;
 pub(crate) use parent_authority::ParentAuthority;
@@ -551,6 +552,8 @@ pub(crate) struct ChildGrantRuntime {
     pub(crate) decision_store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
     pub(crate) source_fabric: MemoryFabric,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
+    /// Present only for live issuance. Restored grants cannot write authority rows.
+    pub(crate) parent_issuer: Option<authority_journal::ParentIssuerEvidence>,
 }
 
 #[derive(Clone)]
@@ -569,6 +572,7 @@ struct ChildGrantData {
     source_fabric: MemoryFabric,
     security: Arc<crate::security::SecurityPolicy>,
     parent_record_binding: (Arc<str>, String),
+    parent_issuer: Option<authority_journal::ParentIssuerEvidence>,
     provider_catalog: Arc<crate::providers::catalog::CatalogView>,
     catalog: Arc<crate::tools::capability::catalog::CapabilityCatalog>,
     generation: Arc<crate::config::ConfigGeneration>,
@@ -643,6 +647,7 @@ impl IssuedChildGrant {
             decision_store,
             source_fabric,
             security,
+            parent_issuer,
         } = runtime;
         let actual_store = match decision_store {
             Some(store) => store.workspace_id().context("child decision store namespace missing")?,
@@ -676,6 +681,7 @@ impl IssuedChildGrant {
             source_fabric,
             security,
             parent_record_binding,
+            parent_issuer,
             provider_catalog,
             catalog,
             generation,
@@ -823,8 +829,27 @@ impl IssuedChildGrant {
             parent_constraints,
             config_generation,
             catalog,
+            journal_version: Some(authority_journal::JOURNAL_REQUIRED_VERSION),
         });
-        authority_journal::persist(worker, &constraints.key)?;
+        let issuer = self.parent_issuer_evidence()?;
+        let launch_parent = authority_journal::LaunchParentRow {
+            version: authority_journal::LAUNCH_PARENT_VERSION,
+            run: worker.run_id.clone(),
+            owner: parent.owner_id().to_owned(),
+            parent_decision: manifest.parent_authority_id.to_string(),
+            parent_digest: digest.to_owned(),
+            store_workspace: workspace.to_owned(),
+            parent_run_id: issuer.run_id.clone(),
+            session_key: issuer.session_key.clone(),
+            source_event_id: issuer.source_event_id.clone(),
+            parent_task_run_id: issuer.task_id.clone(),
+            config_generation_id: parent.config_generation_id(),
+            config_source_revision: parent.config_source_revision().to_owned(),
+            enabled_snapshot: issuer.enabled_snapshot,
+            legacy_v1: issuer.legacy_v1,
+            admits_issued_child: issuer.admits_issued_child,
+        };
+        authority_journal::persist(worker, &constraints.key, &launch_parent)?;
         Ok(())
     }
 
@@ -869,6 +894,7 @@ impl IssuedChildGrant {
             narrowed, parent,
         )?);
         Ok(Self(Arc::new(ChildGrantData {
+            parent_issuer: self.0.parent_issuer.clone(),
             recursive_child_claimed: self.0.recursive_child_claimed.clone(),
             parent_model: self.0.parent_model.clone(),
             source_fabric: self.0.source_fabric.clone(),
@@ -905,6 +931,14 @@ impl IssuedChildGrant {
 
     pub(crate) fn parent(&self) -> &parent::ParentSource {
         &self.0.parent
+    }
+
+    /// Only live issuance has this evidence. A restored grant cannot author rows.
+    pub(crate) fn parent_issuer_evidence(&self) -> anyhow::Result<&authority_journal::ParentIssuerEvidence> {
+        self.0
+            .parent_issuer
+            .as_ref()
+            .context("live parent issuer evidence missing for a restored grant")
     }
 
     /// Fill absent lineage only from the issued parent; contradictory existing

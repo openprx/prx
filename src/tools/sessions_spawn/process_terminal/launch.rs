@@ -1,6 +1,7 @@
 //! Minimal signed launch provenance for read-only restart reconciliation.
 pub(super) mod process_identity;
 use crate::memory::{MemoryFabric, MemoryVisibility, MessageEventScope};
+use crate::runtime::child_source::authority_journal;
 use crate::runtime::child_source::{ChildInputReceipt, IssuedChildGrant};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -55,7 +56,7 @@ pub(super) async fn persist(
         "worker launch identity differs from issued scope"
     );
     let fields = LaunchFields {
-        version: 2,
+        version: authority_journal::LAUNCH_PARENT_VERSION,
         workspace_id: fabric.workspace_id().to_owned(),
         store_workspace_id: Some(grant.parent_record_binding().0.to_owned()),
         owner_id: child.authority.owner.clone(),
@@ -176,6 +177,18 @@ impl VerifiedLaunch {
     }
 }
 
+/// Parent facts used by the eligibility checks. A sealed row or a store record supplies them.
+struct ParentFacts {
+    digest: String,
+    enabled_snapshot: bool,
+    legacy_v1: bool,
+    admits_issued_child: bool,
+    run_id: Option<String>,
+    session_key: Option<String>,
+    source_event_id: Option<String>,
+    task_id: Option<String>,
+}
+
 pub(super) async fn read(
     fabric: &MemoryFabric,
     workspace: &std::path::Path,
@@ -218,7 +231,7 @@ pub(super) async fn read(
     let fields = binding.fields;
     let decision = DecisionId::parse(&fields.parent_decision_id)?;
     anyhow::ensure!(
-        matches!(fields.version, 1 | 2)
+        matches!(fields.version, 1..=3)
             && fields.worker_pid > 0
             && fields.workspace_id == fabric.workspace_id()
             && fields.owner_id == owner
@@ -269,25 +282,63 @@ pub(super) async fn read(
     let store_workspace_id = fields
         .store_workspace_id
         .as_deref()
-        .filter(|_| fields.version == 2)
+        .filter(|_| fields.version >= 2)
         .context("legacy worker launch lacks its original store namespace; recovery remains unconfirmed")?
         .to_owned();
-    let store = CausalDecisionStore::open_unshared_read_only(workspace);
-    let actual_store = store
-        .workspace_id()
-        .context("worker launch decision store namespace missing")?;
-    anyhow::ensure!(
-        actual_store.as_ref() == store_workspace_id,
-        "worker launch original store namespace differs from configured store"
-    );
-    let scope = DecisionScope::Owner {
-        workspace_id: actual_store,
-        owner_id: Arc::from(owner),
+    let parent = if fields.version >= authority_journal::LAUNCH_PARENT_VERSION {
+        // Version 3: parent facts come only from the sealed row. No decision read.
+        let row = authority_journal::read_launch_parent(workspace, run, &key)?
+            .context("worker launch parent authority row is missing")?;
+        anyhow::ensure!(
+            row.version == authority_journal::LAUNCH_PARENT_VERSION
+                && row.run == run
+                && row.owner == owner
+                && row.parent_decision == fields.parent_decision_id
+                && row.parent_digest == fields.parent_decision_digest
+                && fields.store_workspace_id.as_deref() == Some(row.store_workspace.as_str())
+                && row.parent_task_run_id == fields.parent_task_run_id
+                && row.config_generation_id == fields.config_generation_id
+                && row.config_source_revision == fields.config_source_revision,
+            "worker launch parent authority differs from signed provenance"
+        );
+        ParentFacts {
+            digest: row.parent_digest,
+            enabled_snapshot: row.enabled_snapshot,
+            legacy_v1: row.legacy_v1,
+            admits_issued_child: row.admits_issued_child,
+            run_id: row.parent_run_id,
+            session_key: row.session_key,
+            source_event_id: row.source_event_id,
+            task_id: row.parent_task_run_id,
+        }
+    } else {
+        let store = CausalDecisionStore::open_unshared_read_only(workspace);
+        let actual_store = store
+            .workspace_id()
+            .context("worker launch decision store namespace missing")?;
+        anyhow::ensure!(
+            actual_store.as_ref() == store_workspace_id,
+            "worker launch original store namespace differs from configured store"
+        );
+        let scope = DecisionScope::Owner {
+            workspace_id: actual_store,
+            owner_id: Arc::from(owner),
+        };
+        let record = store
+            .reader()
+            .replay_record(&scope, &decision)?
+            .context("worker launch parent decision missing")?;
+        ParentFacts {
+            digest: record.digest,
+            enabled_snapshot: record.decision.enabled_snapshot,
+            legacy_v1: record.decision.legacy_v1,
+            admits_issued_child: record.decision.admits_issued_child(),
+            run_id: record.decision.run_id.clone(),
+            session_key: record.decision.session_key.clone(),
+            source_event_id: record.source_event_id.clone(),
+            task_id: record.decision.task_id,
+        }
     };
-    let parent = store
-        .reader()
-        .replay_record(&scope, &decision)?
-        .context("worker launch parent decision missing")?;
     let parent_run_matches = if let Some(task) = fields.parent_task_run_id.as_deref() {
         let source_id = parent
             .source_event_id
@@ -297,24 +348,32 @@ pub(super) async fn read(
             .find_owned_message_event(fabric.workspace_id(), owner, source_id)
             .await?
             .context("worker launch parent source event missing")?;
-        crate::runtime::child_source::parent::matches_parent_task_segment(task, &parent, &source)
-            && input.parent_run_id.as_deref() == Some(task)
+        crate::runtime::child_source::parent::matches_parent_task_facts(
+            task,
+            &crate::runtime::child_source::parent::ParentTaskFacts {
+                task_id: parent.task_id.as_deref(),
+                source_event_id: parent.source_event_id.as_deref(),
+                run_id: parent.run_id.as_deref(),
+                session_key: parent.session_key.as_deref(),
+            },
+            &source,
+        ) && input.parent_run_id.as_deref() == Some(task)
             && source.workspace_id == fields.workspace_id
             && source.owner_id.as_deref() == Some(owner)
             && source.config_generation_id == Some(fields.config_generation_id)
             && source.config_source_revision.as_deref() == Some(fields.config_source_revision.as_str())
     } else {
-        parent.decision.run_id == input.parent_run_id
+        parent.run_id == input.parent_run_id
     };
     anyhow::ensure!(
         parent.digest == fields.parent_decision_digest
-            && parent.decision.enabled_snapshot
-            && !parent.decision.legacy_v1
-            && parent.decision.admits_issued_child()
-            && parent.decision.run_id.is_some()
+            && parent.enabled_snapshot
+            && !parent.legacy_v1
+            && parent.admits_issued_child
+            && parent.run_id.is_some()
             && parent_run_matches
-            && parent.decision.session_key.is_some()
-            && parent.decision.session_key == input.parent_session_key
+            && parent.session_key.is_some()
+            && parent.session_key == input.parent_session_key
             && parent.source_event_id.is_some()
             && parent.source_event_id == input.causation_event_id,
         "worker launch parent decision differs from durable provenance"

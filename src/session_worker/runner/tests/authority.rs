@@ -65,10 +65,46 @@ async fn worker_child_cannot_widen_parent_capabilities() -> Result<()> {
 #[tokio::test]
 async fn pre_upgrade_child_verifies_through_causal_store_fallback() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    with_prepared_worker_manifest(&tmp, "ollama".into(), None, |worker| async move {
-        let workspace = std::path::Path::new(&worker.child_source.as_ref().unwrap().parent_constraints.workspace);
+    with_prepared_worker_manifest(&tmp, "ollama".into(), None, |mut worker| async move {
+        let workspace = worker
+            .child_source
+            .as_ref()
+            .unwrap()
+            .parent_constraints
+            .workspace
+            .clone();
+        let workspace = std::path::Path::new(&workspace);
+        // A pre-upgrade child carries no journal version, so it has no journal authority.
+        worker
+            .child_source
+            .as_mut()
+            .expect("test: child source")
+            .journal_version = None;
         std::fs::remove_file(authority_journal::path(workspace))?;
         assert!(verify_worker_parent_authority(&worker, workspace)?.is_some());
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn launch_v3_refuses_missing_parent_row() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    with_prepared_worker_manifest(&tmp, "ollama".into(), None, |worker| async move {
+        let workspace = std::path::Path::new(&worker.child_source.as_ref().unwrap().parent_constraints.workspace);
+        assert_eq!(
+            worker.child_source.as_ref().and_then(|source| source.journal_version),
+            Some(3)
+        );
+        // The causal store is left intact, so only the missing row can refuse the child.
+        let conn = rusqlite::Connection::open(authority_journal::path(workspace))?;
+        let deleted = conn.execute("DELETE FROM authority WHERE run=?1", [&worker.run_id])?;
+        drop(conn);
+        assert_eq!(deleted, 1, "test: the authority row existed before deletion");
+        let error = verify_worker_parent_authority(&worker, workspace)
+            .err()
+            .expect("a version-3 child without its journal row must be refused");
+        assert!(error.to_string().contains("journal row is missing"), "{error:#}");
         Ok(())
     })
     .await

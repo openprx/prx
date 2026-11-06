@@ -3,8 +3,10 @@ use super::{BatchMember, BatchRoster};
 use crate::decision::{DecisionKey, key::KeyDomain};
 use crate::memory::{MemoryFabric, MemoryVisibility, MessageEventScope};
 use crate::runtime::child_source::IssuedChildGrant;
+use crate::runtime::child_source::authority_journal::{self, BatchParentRow};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,8 +78,24 @@ impl PreparedBatch {
             fabric.workspace_id() == scope.authority.workspace,
             "batch workspace differs from grant"
         );
+        let issuer = grant.parent_issuer_evidence()?;
+        authority_journal::persist_batch_parent(
+            Path::new(&scope.authority.workspace),
+            &constraints.key,
+            &BatchParentRow {
+                version: authority_journal::BATCH_PARENT_VERSION,
+                batch: batch.to_owned(),
+                owner: scope.authority.owner.clone(),
+                parent_decision: scope.parent_authority_id.to_string(),
+                parent_digest: grant.parent_record_binding().1.to_owned(),
+                store_workspace: grant.parent_record_binding().0.to_owned(),
+                enabled_snapshot: issuer.enabled_snapshot,
+                legacy_v1: issuer.legacy_v1,
+                admits_issued_child: issuer.admits_issued_child,
+            },
+        )?;
         let fields = Fields {
-            version: 3,
+            version: authority_journal::BATCH_PARENT_VERSION,
             workspace: fabric.workspace_id().to_owned(),
             store_workspace: Some(grant.parent_record_binding().0.to_owned()),
             owner: scope.authority.owner.clone(),
@@ -269,32 +287,12 @@ pub(super) async fn read(
             decision.to_string() == plan_fields.parent_decision,
             "batch parent identity is not canonical"
         );
-        let original_store = plan_fields
-            .store_workspace
-            .as_deref()
-            .filter(|_| plan_fields.version == 3)
-            .context("legacy child batch lacks its original store namespace; membership remains unconfirmed")?;
-        let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace);
-        let store_workspace = store.workspace_id().context("batch decision store namespace missing")?;
-        anyhow::ensure!(
-            store_workspace.as_ref() == original_store,
-            "batch original store namespace differs from configured store"
-        );
-        let scope = crate::causal_tree::store::DecisionScope::Owner {
-            workspace_id: store_workspace,
-            owner_id: Arc::from(plan_fields.owner.as_str()),
-        };
-        let parent = store
-            .reader()
-            .replay_record(&scope, &decision)?
-            .context("batch parent decision missing")?;
-        anyhow::ensure!(
-            parent.digest == plan_fields.parent_digest
-                && parent.decision.enabled_snapshot
-                && !parent.decision.legacy_v1
-                && parent.decision.admits_issued_child(),
-            "batch parent differs from signed plan"
-        );
+        if plan_fields.version == authority_journal::BATCH_PARENT_VERSION {
+            // Version 4 authority comes only from the sealed row; no store read.
+            verify_batch_parent_row(workspace, batch, &plan_fields, &key)?;
+        } else {
+            verify_store_parent(workspace, &plan_fields, decision)?;
+        }
     }
     let dispatched = if let Some(event) = memory
         .find_owned_message_event_by_idempotency_key(
@@ -337,6 +335,69 @@ pub(super) async fn read(
     }))
 }
 
+/// Version 4: the parent authority is the sealed row, never the decision store.
+fn verify_batch_parent_row(
+    workspace: &Path,
+    batch: &str,
+    plan_fields: &Fields,
+    key: &DecisionKey,
+) -> anyhow::Result<()> {
+    let row = authority_journal::read_batch_parent(workspace, batch, key)?
+        .context("batch parent authority row is missing")?;
+    let store = plan_fields
+        .store_workspace
+        .as_deref()
+        .context("batch plan lacks its store namespace")?;
+    anyhow::ensure!(
+        row.version == authority_journal::BATCH_PARENT_VERSION
+            && row.batch == batch
+            && row.owner == plan_fields.owner
+            && row.parent_decision == plan_fields.parent_decision
+            && row.parent_digest == plan_fields.parent_digest
+            && row.store_workspace == store
+            && row.enabled_snapshot
+            && !row.legacy_v1
+            && row.admits_issued_child,
+        "batch parent authority differs from signed plan"
+    );
+    Ok(())
+}
+
+/// Version 3 and earlier: the parent must still exist in its original store.
+fn verify_store_parent(
+    workspace: &std::path::Path,
+    plan_fields: &Fields,
+    decision: crate::causal_tree::ids::DecisionId,
+) -> anyhow::Result<()> {
+    let original_store = plan_fields
+        .store_workspace
+        .as_deref()
+        .filter(|_| plan_fields.version == 3)
+        .context("legacy child batch lacks its original store namespace; membership remains unconfirmed")?;
+    let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace);
+    let store_workspace = store.workspace_id().context("batch decision store namespace missing")?;
+    anyhow::ensure!(
+        store_workspace.as_ref() == original_store,
+        "batch original store namespace differs from configured store"
+    );
+    let scope = crate::causal_tree::store::DecisionScope::Owner {
+        workspace_id: store_workspace,
+        owner_id: Arc::from(plan_fields.owner.as_str()),
+    };
+    let parent = store
+        .reader()
+        .replay_record(&scope, &decision)?
+        .context("batch parent decision missing")?;
+    anyhow::ensure!(
+        parent.digest == plan_fields.parent_digest
+            && parent.decision.enabled_snapshot
+            && !parent.decision.legacy_v1
+            && parent.decision.admits_issued_child(),
+        "batch parent differs from signed plan"
+    );
+    Ok(())
+}
+
 fn verify(
     event: &crate::memory::MessageEvent,
     workspace: &str,
@@ -364,7 +425,7 @@ fn verify(
                     && !source.parent_run.is_empty()
                     && !source.parent_session.is_empty()
                     && !source.config_revision.is_empty(),
-            None => matches!(fields.version, 1 | 3),
+            None => matches!(fields.version, 1 | 3 | 4),
         }) && fields.workspace == workspace
             && fields.batch == batch
             && !fields.owner.is_empty()
@@ -448,4 +509,44 @@ pub(super) async fn verify_ordinary_member(
         "ordinary worker was rejected by batch dispatch"
     );
     Ok(())
+}
+
+/// Test fixture: record a plan as `prepare` would, without a live grant.
+#[cfg(test)]
+pub(super) struct PlanFixture<'a> {
+    pub(super) version: u8,
+    pub(super) owner: &'a str,
+    pub(super) batch: &'a str,
+    pub(super) parent_decision: &'a str,
+    pub(super) parent_digest: &'a str,
+    pub(super) store_workspace: &'a str,
+    pub(super) run_ids: &'a [&'a str],
+}
+
+#[cfg(test)]
+pub(super) async fn record_plan_fixture(
+    fabric: MemoryFabric,
+    key: Arc<DecisionKey>,
+    plan: PlanFixture<'_>,
+) -> anyhow::Result<()> {
+    let fields = Fields {
+        version: plan.version,
+        workspace: fabric.workspace_id().to_owned(),
+        store_workspace: Some(plan.store_workspace.to_owned()),
+        owner: plan.owner.to_owned(),
+        batch: plan.batch.to_owned(),
+        parent_decision: plan.parent_decision.to_owned(),
+        parent_digest: plan.parent_digest.to_owned(),
+        ordinary_source: None,
+        members: plan
+            .run_ids
+            .iter()
+            .map(|run_id| Member {
+                run_id: (*run_id).to_owned(),
+                task: String::new(),
+            })
+            .collect(),
+        dispatched: None,
+    };
+    PreparedBatch { fabric, key, fields }.persist("plan").await
 }

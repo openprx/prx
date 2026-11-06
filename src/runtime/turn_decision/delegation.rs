@@ -182,10 +182,10 @@ impl TurnDecisionService {
             true,
             self.generation.effective.causal_tree.store.record_redacted_projection,
         )?;
-        let parent_digest = records
-            .last()
-            .context("parent decision record missing")?
-            .replay_digest(&store_workspace)?;
+        let parent_record = records.last().context("parent decision record missing")?;
+        let parent_digest = parent_record.replay_digest(&store_workspace)?;
+        let parent_issuer =
+            crate::runtime::child_source::authority_journal::ParentIssuerEvidence::from_record(parent_record)?;
         Ok(Arc::new(crate::runtime::child_source::IssuedChildGrant::new(
             Arc::new(scope),
             proof,
@@ -202,6 +202,7 @@ impl TurnDecisionService {
                 source_fabric: crate::memory::MemoryFabric::new(Arc::clone(&self.memory), proof.workspace_id())
                     .with_event_recording(self.generation.effective.memory.event_recording_config()),
                 security: Arc::clone(&self.security),
+                parent_issuer: Some(parent_issuer),
             },
         )?))
     }

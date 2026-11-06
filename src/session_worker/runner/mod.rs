@@ -8,7 +8,7 @@ mod provider;
 mod run;
 mod steering;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod tools;
 mod validate;
 

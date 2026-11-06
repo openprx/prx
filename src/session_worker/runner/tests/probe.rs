@@ -78,7 +78,7 @@ where
 
 /// Prepare live parent-issued authority without requiring child execution or a
 /// child decision endpoint. Authority-only tests consume the sealed manifest.
-pub(super) async fn with_prepared_worker_manifest<T, F, Fut>(
+pub(crate) async fn with_prepared_worker_manifest<T, F, Fut>(
     tmp: &tempfile::TempDir,
     provider_name: String,
     endpoint: Option<&str>,

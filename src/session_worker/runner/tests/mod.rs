@@ -7,7 +7,7 @@ mod hybrid;
 #[cfg(unix)]
 mod manifest_reference_tests;
 mod manifest_validation;
-mod probe;
+pub(crate) mod probe;
 mod spawn_context;
 mod steering;
 mod tool_selection;
