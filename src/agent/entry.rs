@@ -1395,6 +1395,11 @@ impl AgentModelBinding {
         execution == source || execution == (self.provider_label.as_ref(), self.model.as_ref())
     }
 
+    /// The model pinned at ingress, independent of any route spelling used to execute it.
+    pub(crate) fn pinned_model(&self) -> &str {
+        &self.model
+    }
+
     pub(crate) const fn credential_reference(&self) -> &crate::providers::credentials::CredentialRef {
         &self.credential_ref
     }

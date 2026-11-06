@@ -58,12 +58,45 @@ async fn model_allowlist_excluded_tool_is_refused() {
     assert_refused(&service, &fixture, context, "config_reload").await;
 }
 
+fn channel_message() -> crate::channels::traits::ChannelMessage {
+    crate::channels::traits::ChannelMessage {
+        id: "prx-channel-surface".to_owned(),
+        sender: "prx_user".to_owned(),
+        reply_target: "prx_channel".to_owned(),
+        content: "run the project tool".to_owned(),
+        channel: "wacli".to_owned(),
+        timestamp: 0,
+        chat_kind: crate::channels::traits::ChatKind::Dm,
+        chat_title: None,
+        sender_display: None,
+        thread_ts: None,
+        mentioned_uuids: Vec::new(),
+        mentioned: false,
+        is_group_hint: false,
+        sender_is_bot: false,
+    }
+}
+
+/// The channel surface comes from the production turn service, whose catalog
+/// entries carry `channel_eligible`, not from a caller-supplied closure.
 #[tokio::test]
 async fn channel_ineligible_tool_is_refused_on_channel_turn() {
+    let workspace = tempfile::tempdir().expect("channel workspace");
     let fixture = fixture();
-    let service = allow_service(&fixture);
-    let context = surface_context(&service, &crate::config::ToolTieringConfig::default(), true, false);
-    assert_refused(&service, &fixture, context, "config_reload").await;
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.tool_tiering.channel_exclude.push("project_tool".into());
+    let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![Box::new(RecordingTool {
+        root_name: "project_tool",
+        aliases: vec![],
+        calls: Arc::clone(&fixture.calls),
+        arguments: Arc::clone(&fixture.arguments),
+        stages: Arc::clone(&fixture.stages),
+    }) as Box<dyn crate::tools::Tool>]);
+    let admitted = crate::agent::test_admission::AdmittedTurn::with_channel(config, channel_message(), registry).await;
+    let decision = admitted.decision();
+    let surface = decision.service.turn_tool_surface(decision.proof, &[]);
+    assert!(!surface.contains("project_tool"), "channel-excluded tool was published");
 }
 
 #[tokio::test]
@@ -177,6 +210,9 @@ impl Tool for MutableSurfaceTool {
         }
     }
     fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+        if self.state.load(Ordering::SeqCst) == 5 {
+            return Vec::new();
+        }
         let mut specs = vec![self.spec()];
         if self.state.load(Ordering::SeqCst) == 2 {
             let mut extra = self.spec();
@@ -184,6 +220,13 @@ impl Tool for MutableSurfaceTool {
             specs.push(extra);
         }
         specs
+    }
+    fn catalog_binding_snapshot(&self) -> std::collections::BTreeMap<String, [u8; 32]> {
+        if self.state.load(Ordering::SeqCst) == 4 {
+            std::collections::BTreeMap::from([("project_tool".to_owned(), [7u8; 32])])
+        } else {
+            std::collections::BTreeMap::new()
+        }
     }
     fn availability(&self) -> crate::capability::CapabilityAvailability {
         if self.state.load(Ordering::SeqCst) == 3 {
@@ -202,8 +245,13 @@ impl Tool for MutableSurfaceTool {
     }
 }
 async fn assert_stale_after_change(state_value: usize) {
+    assert_stale_between(0, state_value).await;
+}
+/// Publish at `build_state`, then admit at `admit_state`. Equal states keep the
+/// registry generation stable, so only the per-tool checks can refuse the call.
+async fn assert_stale_between(build_state: usize, admit_state: usize) {
     let fixture = fixture();
-    let state = Arc::new(AtomicUsize::new(0));
+    let state = Arc::new(AtomicUsize::new(build_state));
     let service = ToolExecutionService::new(
         vec![Arc::new(MutableSurfaceTool {
             state: Arc::clone(&state),
@@ -227,7 +275,7 @@ async fn assert_stale_after_change(state_value: usize) {
         }),
     );
     let context = surface_context(&service, &crate::config::ToolTieringConfig::default(), false, true);
-    state.store(state_value, Ordering::SeqCst);
+    state.store(admit_state, Ordering::SeqCst);
     let outcome = service
         .execute(
             ToolExecutionCommand::new("project_tool", serde_json::json!({})),
@@ -250,4 +298,21 @@ async fn unavailable_tool_is_refused() {
 #[tokio::test]
 async fn schema_changed_after_publication_is_stale() {
     assert_stale_after_change(1).await;
+}
+/// Availability alone: declared at publication and at admission, so the
+/// generation and fingerprint match and only the availability check refuses.
+#[tokio::test]
+async fn unavailable_tool_alone_is_refused() {
+    assert_stale_between(3, 3).await;
+}
+/// Binding digest alone: the descriptor and schema are unchanged, only the
+/// backend binding appears after publication.
+#[tokio::test]
+async fn binding_drift_after_publication_is_stale() {
+    assert_stale_between(0, 4).await;
+}
+/// A tool that vanishes after publication has no current descriptor.
+#[tokio::test]
+async fn disappeared_tool_after_publication_is_stale() {
+    assert_stale_between(0, 5).await;
 }
