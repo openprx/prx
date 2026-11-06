@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Decision-free ingress model and publication admission.
 use super::*;
 use crate::runtime::turn_model;
