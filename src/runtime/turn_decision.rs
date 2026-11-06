@@ -720,9 +720,7 @@ pub(super) struct VerifiedDirectiveApplication {
 
 impl VerifiedDirectiveApplication {
     /// Reconstruct admission from authenticated source and decision evidence.
-    pub(super) fn from_replay(
-        replay: &crate::agent::terminal::VerifiedTerminalReplay,
-    ) -> anyhow::Result<Self> {
+    pub(super) fn from_replay(replay: &crate::agent::terminal::VerifiedTerminalReplay) -> anyhow::Result<Self> {
         let source = replay.source();
         let decision = replay.decision();
         let original_generation = (
