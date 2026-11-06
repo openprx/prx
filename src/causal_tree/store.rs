@@ -432,6 +432,16 @@ fn bounded_capability_id(value: &str) -> bool {
 }
 
 impl OutcomeRecord {
+    /// The terminal that settled this outcome, the child outcome journal key.
+    pub(crate) fn settlement_id(&self) -> &str {
+        &self.settlement_id
+    }
+
+    /// Digest of the canonical outcome columns, pinned by the child outcome journal.
+    pub(crate) fn journal_hash(&self) -> Result<String, serde_json::Error> {
+        EncodedOutcome::of(self).map(|encoded| encoded.record_hash)
+    }
+
     /// Reject unbounded or user-shaped metadata before the bounded queue.
     /// The causal correlator still owns source verification and canonical IDs.
     fn valid_for_queue(&self) -> bool {
