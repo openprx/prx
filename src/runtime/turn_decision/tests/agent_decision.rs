@@ -79,7 +79,6 @@ fn record_builder_distinguishes_local_terminal_from_failed_compiled_request() {
         hop_ids: vec![decision_id],
         execution_refs: BTreeSet::new(),
         selected_retrieved: Vec::new(),
-        selected_custom_memory_context: None,
         #[cfg(feature = "llm-router")]
         router_transition: None,
     };

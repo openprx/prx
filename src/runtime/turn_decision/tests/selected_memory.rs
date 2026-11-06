@@ -343,7 +343,6 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             main_compaction: config.agent.compaction.clone(),
             execution_refs,
             selected_retrieved: observed.selected_artifacts.clone(),
-            selected_custom_memory_context: None,
             #[cfg(feature = "llm-router")]
             router_transition: None,
         };

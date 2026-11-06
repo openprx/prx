@@ -14,13 +14,14 @@ pub trait MemoryLoader: Send + Sync {
     async fn load_context(&self, memory: &dyn Memory, user_message: &str) -> anyhow::Result<String>;
 }
 
-/// Formats memory summaries already selected and scoped by the turn decision.
+/// Formats authenticated semantic memory context supplied by the runtime.
 /// Implementations receive no backend, source credentials, or mutable decision.
 /// The returned text is prompt context, never retrieval or tool authority.
 pub trait SelectedMemoryFormatter: Send + Sync {
     fn format_context(&self, summaries: &[&str]) -> anyhow::Result<String>;
 }
 
+#[cfg(test)]
 pub(crate) fn format_selected_memory(
     formatter: Option<&dyn SelectedMemoryFormatter>,
     artifacts: &[crate::causal_tree::state::ObservedArtifact],
@@ -47,6 +48,7 @@ pub(crate) fn format_selected_memory(
 }
 
 /// Keep document and session context outside the caller's memory-only presentation hook.
+#[cfg(test)]
 pub(crate) fn format_selected_context(
     formatter: Option<&dyn SelectedMemoryFormatter>,
     artifacts: &[crate::causal_tree::state::ObservedArtifact],

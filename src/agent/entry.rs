@@ -1950,13 +1950,17 @@ pub(crate) async fn run_with_runtime_envelope(
                     &fabric_scope,
                     agent_user_event.as_ref().map(|event| event.event_id.as_str()),
                 );
-                let mem_context = crate::agent::context_recall::RecalledMemoryContext {
-                    preamble: crate::agent::memory_loader::format_selected_context(
-                        None,
-                        decision_context.retrieved()?,
-                    )?,
-                    ids: Vec::new(),
-                };
+                let mem_context = crate::agent::context_recall::scoped_recall(
+                    mem.as_ref(),
+                    &crate::agent::context_recall::RecallScope::from_envelope(
+                        &runtime_envelope,
+                        &config.memory,
+                        "private",
+                    ),
+                    &msg,
+                    crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+                )
+                .await;
                 let context = mem_context.preamble.clone();
                 let enriched = if context.is_empty() {
                     msg.clone()
@@ -2457,10 +2461,12 @@ pub(crate) async fn run_with_runtime_envelope(
                     &fabric_scope,
                     agent_user_event.as_ref().map(|event| event.event_id.as_str()),
                 );
-                let mem_context = crate::agent::context_recall::RecalledMemoryContext {
-                    preamble: crate::agent::memory_loader::format_selected_context(None, decision_context.retrieved()?)?,
-                    ids: Vec::new(),
-                };
+                let mem_context = crate::agent::context_recall::scoped_recall(
+                    mem.as_ref(),
+                    &crate::agent::context_recall::RecallScope::from_envelope(&runtime_envelope, &config.memory, "private"),
+                    &user_input,
+                    crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+                ).await;
                 let context = mem_context.preamble.clone();
                 let enriched = if context.is_empty() {
                     user_input.clone()

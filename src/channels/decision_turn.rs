@@ -10,6 +10,7 @@ pub(super) struct ChannelDecisionTurn {
     context: Arc<TurnDecisionContext>,
     terminal: crate::runtime::turn_terminal::TurnTerminalGuard,
     envelope: crate::runtime::envelope::RuntimeEnvelope,
+    recalled_context: String,
     config: Arc<crate::config::Config>,
     generation: Arc<crate::config::ConfigGeneration>,
     trace: Arc<crate::agent::turn_contracts::RetainedProviderTrace>,
@@ -113,6 +114,20 @@ impl ChannelDecisionTurn {
             service.model_can_call_tools(&proof),
             true,
         );
+        let envelope = source.envelope().clone();
+        let trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
+        let recalled_context = crate::agent::context_recall::scoped_recall(
+            turn_memory.as_ref(),
+            &crate::agent::context_recall::RecallScope::from_envelope(
+                &envelope,
+                &generation.effective.memory,
+                proof.policy_chat_type(),
+            ),
+            proof.routing_input(),
+            crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+        )
+        .await
+        .preamble;
         let context = service
             .decide_agent_initial(
                 &proof,
@@ -120,8 +135,6 @@ impl ChannelDecisionTurn {
                 cancellation,
             )
             .await?;
-        let envelope = source.envelope().clone();
-        let trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
         let terminal = crate::runtime::turn_terminal::TurnTerminalGuard::new(
             admission.take_terminal_ticket()?,
             Arc::clone(&service),
@@ -139,6 +152,7 @@ impl ChannelDecisionTurn {
             context,
             terminal,
             envelope,
+            recalled_context,
             config: Arc::clone(&generation.effective),
             generation: Arc::clone(generation),
             trace,
@@ -273,8 +287,8 @@ impl ChannelDecisionTurn {
     pub(super) fn prompt_skills(&self) -> anyhow::Result<Vec<crate::skills::Skill>> {
         self.service.agent_prompt_skills(&self.proof, &self.context)
     }
-    pub(super) fn memory_context(&self) -> anyhow::Result<String> {
-        crate::agent::memory_loader::format_selected_context(None, self.context.retrieved()?)
+    pub(super) fn memory_context(&self) -> String {
+        self.recalled_context.clone()
     }
     pub(super) fn adapter(&self) -> crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
         let mut execution =

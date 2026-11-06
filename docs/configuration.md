@@ -1208,6 +1208,13 @@ rollback must preserve these records; do not remove authentication fields or
 rewrite old markers to make them replayable. Recovery repairs telemetry and
 does not authorize another provider or tool execution.
 
+Prompt memory recall is produced independently of decision selection. Each turn
+uses its authenticated owner, workspace and session scope, including owner
+isolation for external origins. The composed recalled context is capped at
+24,576 bytes. When `memory.events.record_user_messages = false`, automatic
+prompt recall is suppressed so historical user text is not reintroduced.
+Decision-selected retrieval remains available to the decision engine.
+
 ### Embeddings and vector recall
 
 New installations enable credential-free local embeddings by default:

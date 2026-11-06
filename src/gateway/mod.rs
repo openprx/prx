@@ -2596,24 +2596,21 @@ async fn run_gateway_chat_with_multimodal(
                     .await?;
                 return Ok(reply.into_owned());
             }
-            let selected_context = crate::agent::memory_loader::format_selected_context(None, context.retrieved()?)?;
-            let semantic_scope = runtime_envelope.memory_write_context(if fabric_ctx.channel == "webhook" {
-                "webhook"
-            } else {
-                "private"
-            });
-            let recalled_context = crate::agent::context_recall::build_context_with_shared_events_and_scope(
+            let mem_context = crate::agent::context_recall::scoped_recall(
                 state.mem.as_ref(),
-                runtime_envelope.memory_principal(),
+                &crate::agent::context_recall::RecallScope::from_envelope(
+                    &runtime_envelope,
+                    &config_snapshot.memory,
+                    if fabric_ctx.channel == "webhook" {
+                        "webhook"
+                    } else {
+                        "private"
+                    },
+                ),
                 message,
-                config_snapshot.memory.min_relevance_score,
-                Some(&semantic_scope),
+                crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
             )
             .await;
-            let mem_context = crate::agent::context_recall::RecalledMemoryContext {
-                preamble: format!("{selected_context}{}", recalled_context.preamble),
-                ids: recalled_context.ids,
-            };
             let enriched_message = if mem_context.preamble.is_empty() {
                 message.to_string()
             } else {

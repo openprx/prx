@@ -3254,9 +3254,9 @@ Retry with a compatible model: /provider {shown} <model>",
         #[cfg(feature = "terminal-tui")]
         let routing_input = admitted_binding.routing_input().to_owned();
         let mem_context = if direct_decision_turn {
-            crate::agent::context_recall::RecalledMemoryContext { preamble: String::new(), ids: Vec::new() }
+            crate::agent::context_recall::RecalledMemoryContext { preamble: String::new(), ids: Vec::new(), semantic_range: 0..0 }
         } else {
-            admitted_binding.recalled_context()?
+            admitted_binding.recalled_context(mem.as_ref()).await
         };
         let context = mem_context.preamble.clone();
         let enriched = if context.is_empty() {

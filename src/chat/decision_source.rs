@@ -900,22 +900,22 @@ impl ChatTurnBinding {
         Ok(&decided.context)
     }
 
-    /// Read only the context selected by this turn's admitted decision.
-    pub(super) fn recalled_context(&self) -> anyhow::Result<crate::agent::context_recall::RecalledMemoryContext> {
-        let decided = self
-            .decision
-            .get()
-            .context("chat recall requires an admitted decision")?;
-        if self.fixed_reply()?.is_some() {
-            return Ok(crate::agent::context_recall::RecalledMemoryContext {
-                preamble: String::new(),
-                ids: Vec::new(),
-            });
-        }
-        Ok(crate::agent::context_recall::RecalledMemoryContext {
-            preamble: crate::agent::memory_loader::format_selected_context(None, decided.context.retrieved()?)?,
-            ids: Vec::new(),
-        })
+    /// Recall from the authenticated binding, even before a decision exists.
+    pub(super) async fn recalled_context(
+        &self,
+        memory: &dyn Memory,
+    ) -> crate::agent::context_recall::RecalledMemoryContext {
+        crate::agent::context_recall::scoped_recall(
+            memory,
+            &crate::agent::context_recall::RecallScope::from_envelope(
+                &self.envelope,
+                &self.generation.effective.memory,
+                "private",
+            ),
+            &self.routing_input,
+            crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+        )
+        .await
     }
 
     pub(super) fn is_approval_collection(&self) -> anyhow::Result<bool> {

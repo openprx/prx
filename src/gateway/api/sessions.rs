@@ -404,10 +404,13 @@ async fn run_console_runtime_turn(
     let system_prompt =
         build_runtime_system_prompt(&config_snapshot, &turn_runtime.model, &selected_skills, native_tools);
 
-    let mem_context = crate::agent::context_recall::RecalledMemoryContext {
-        preamble: crate::agent::memory_loader::format_selected_context(None, decision.context.retrieved()?)?,
-        ids: Vec::new(),
-    };
+    let mem_context = crate::agent::context_recall::scoped_recall(
+        state.mem.as_ref(),
+        &crate::agent::context_recall::RecallScope::from_envelope(&turn_envelope, &config_snapshot.memory, "private"),
+        visible_message,
+        crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+    )
+    .await;
     let enriched_message = if mem_context.preamble.is_empty() {
         visible_message.to_string()
     } else {

@@ -29,6 +29,80 @@ const MAX_DOCUMENT_CONTEXT_PREAMBLE_BYTES: usize = 12_288;
 pub(crate) struct RecalledMemoryContext {
     pub(crate) preamble: String,
     pub(crate) ids: Vec<String>,
+    pub(crate) semantic_range: std::ops::Range<usize>,
+}
+
+/// Read scope authored by the runtime, independent of decision admission.
+pub(crate) struct RecallScope {
+    principal: MemoryPrincipal,
+    semantic: MemoryWriteContext,
+    min_relevance_score: f64,
+    record_user_messages: bool,
+}
+
+impl RecallScope {
+    pub(crate) fn from_envelope(
+        envelope: &crate::runtime::envelope::RuntimeEnvelope,
+        config: &crate::config::MemoryConfig,
+        chat_type: &str,
+    ) -> Self {
+        let principal = envelope.memory_principal();
+        let mut semantic = envelope.memory_write_context(chat_type);
+        // Write projections deliberately omit read isolation. Re-author it
+        // from the authenticated principal before issuing a semantic read.
+        semantic.owner_id = principal.owner_id.clone();
+        semantic.require_owner_match = principal.require_owner_match;
+        Self {
+            principal,
+            semantic,
+            min_relevance_score: config.min_relevance_score,
+            record_user_messages: config.events.record_user_messages,
+        }
+    }
+}
+
+pub(crate) const RECALL_CONTEXT_BUDGET: usize = MAX_MEMORY_PREAMBLE_BYTES;
+
+/// Recall authenticated context without consulting a decision's retrieved set.
+/// The budget is in bytes and is clamped to the existing context ceiling.
+pub(crate) async fn scoped_recall(
+    memory: &dyn Memory,
+    scope: &RecallScope,
+    query: &str,
+    budget: usize,
+) -> RecalledMemoryContext {
+    // Historical user text must not be reintroduced when recording is off.
+    if !scope.record_user_messages || budget == 0 {
+        return RecalledMemoryContext {
+            preamble: String::new(),
+            ids: Vec::new(),
+            semantic_range: 0..0,
+        };
+    }
+    let bundle = build_agent_context_with_semantic_scope(
+        memory,
+        scope.principal.clone(),
+        query,
+        scope.min_relevance_score,
+        Some(&scope.semantic),
+    )
+    .await;
+    let semantic_start = bundle.current_session_context.len() + bundle.recent_shared_context.len();
+    let semantic_end = semantic_start + bundle.semantic_memory_context.len();
+    let mut preamble = bundle.preamble();
+    let budget = budget.min(RECALL_CONTEXT_BUDGET);
+    let mut ids = bundle.recalled_memory_ids;
+    if preamble.len() > budget {
+        preamble.truncate(preamble.floor_char_boundary(budget));
+        // A clipped bundle cannot reliably attribute every recalled id.
+        ids.clear();
+    }
+    let semantic_range = semantic_start.min(preamble.len())..semantic_end.min(preamble.len());
+    RecalledMemoryContext {
+        preamble,
+        ids,
+        semantic_range,
+    }
 }
 
 pub(crate) struct AgentContextBundle {
@@ -109,7 +183,12 @@ pub(crate) async fn build_context_with_scope(
         }
     }
 
-    RecalledMemoryContext { preamble: context, ids }
+    let semantic_range = 0..context.len();
+    RecalledMemoryContext {
+        preamble: context,
+        ids,
+        semantic_range,
+    }
 }
 
 /// Flatten a historical message into a single prompt line.
@@ -517,9 +596,12 @@ pub(crate) async fn build_context_with_shared_events_and_scope(
 ) -> RecalledMemoryContext {
     let bundle =
         build_agent_context_with_semantic_scope(mem, principal, user_msg, min_relevance_score, semantic_scope).await;
+    let semantic_start = bundle.current_session_context.len() + bundle.recent_shared_context.len();
+    let semantic_range = semantic_start..semantic_start + bundle.semantic_memory_context.len();
     RecalledMemoryContext {
         preamble: bundle.preamble(),
         ids: bundle.recalled_memory_ids,
+        semantic_range,
     }
 }
 

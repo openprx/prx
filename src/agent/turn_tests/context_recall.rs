@@ -904,3 +904,142 @@ fn quoted_turns_and_document_chunks_drop_fabricated_markers_too() {
 fn constants_bounds_are_compile_time_checked() {
     // Bounds are enforced by the const assertions above.
 }
+
+fn recall_test_scope(owner: &str, workspace: &str) -> RecallScope {
+    let mut envelope = crate::runtime::envelope::RuntimeEnvelope::channel(
+        workspace,
+        "mcp",
+        "shared-subject",
+        Some("shared-session".into()),
+    );
+    envelope.owner_id = Some(owner.to_owned());
+    envelope.owner_isolated = true;
+    RecallScope::from_envelope(
+        &envelope,
+        &crate::config::MemoryConfig {
+            min_relevance_score: 0.0,
+            ..Default::default()
+        },
+        "private",
+    )
+}
+
+async fn seed_recall_memory(mem: &SqliteMemory, scope: &RecallScope, key: &str, content: &str) {
+    mem.store_with_context(key, content, MemoryCategory::Conversation, None, Some(&scope.semantic))
+        .await
+        .unwrap();
+}
+
+async fn seed_recall_document(mem: &SqliteMemory, owner: &str, workspace: &str, content: &str) {
+    mem.ingest_document(DocumentIngestInput {
+        document_id: None,
+        workspace_id: workspace.into(),
+        owner_id: Some(owner.into()),
+        topic_id: None,
+        task_id: None,
+        source_message_event_id: None,
+        source_kind: "conversation_page".into(),
+        source_uri: None,
+        title: None,
+        content: content.into(),
+        mime_type: Some("text/plain".into()),
+        visibility: MemoryVisibility::Private,
+        metadata_json: None,
+        session_key: None,
+        agent_id: None,
+        persona_id: None,
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn scoped_recall_without_decision_context_returns_owner_bounded_entries() {
+    let dir = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(dir.path()).unwrap();
+    let scope = recall_test_scope("owner-a", "workspace-a");
+    seed_recall_memory(&mem, &scope, "project-note", "recallkeyword owner fact").await;
+    seed_recall_document(&mem, "owner-a", "workspace-a", "recallkeyword document-only fact").await;
+    let recalled = scoped_recall(&mem, &scope, "recallkeyword", RECALL_CONTEXT_BUDGET).await;
+    assert!(recalled.preamble.contains("owner fact"), "{}", recalled.preamble);
+    assert_eq!(recalled.ids.len(), 1);
+    assert!(recalled.preamble.contains("document-only fact"));
+    let semantic = recalled.preamble.get(recalled.semantic_range).unwrap();
+    assert!(semantic.contains("owner fact"));
+    assert!(!semantic.contains("document-only fact"));
+}
+
+#[tokio::test]
+async fn scoped_recall_excludes_foreign_owner_and_workspace() {
+    let dir = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(dir.path()).unwrap();
+    let scope = recall_test_scope("owner-a", "workspace-a");
+    seed_recall_memory(&mem, &scope, "own-note", "recallkeyword own fact").await;
+    seed_recall_memory(
+        &mem,
+        &recall_test_scope("owner-b", "workspace-a"),
+        "foreign-note",
+        "recallkeyword foreign owner",
+    )
+    .await;
+    seed_recall_document(&mem, "owner-a", "workspace-a", "recallkeyword own document").await;
+    seed_recall_document(&mem, "owner-b", "workspace-a", "recallkeyword foreign document").await;
+    seed_recall_document(&mem, "owner-a", "workspace-b", "recallkeyword foreign workspace").await;
+    let recalled = scoped_recall(&mem, &scope, "recallkeyword", RECALL_CONTEXT_BUDGET).await;
+    assert!(recalled.preamble.contains("own fact"));
+    assert!(recalled.preamble.contains("own document"), "{}", recalled.preamble);
+    assert!(!recalled.preamble.contains("foreign"), "{}", recalled.preamble);
+}
+
+#[tokio::test]
+async fn owner_isolated_origin_recall_is_private() {
+    let dir = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(dir.path()).unwrap();
+    let scope_a = recall_test_scope("issuer-a", "workspace-a");
+    let scope_b = recall_test_scope("issuer-b", "workspace-a");
+    seed_recall_memory(&mem, &scope_a, "issuer-a-note", "recallkeyword issuer-a private").await;
+    seed_recall_memory(&mem, &scope_b, "issuer-b-note", "recallkeyword issuer-b private").await;
+    let recalled = scoped_recall(&mem, &scope_b, "recallkeyword", RECALL_CONTEXT_BUDGET).await;
+    assert!(recalled.preamble.contains("issuer-b private"));
+    assert!(!recalled.preamble.contains("issuer-a private"));
+}
+
+#[tokio::test]
+async fn recall_respects_disabled_user_message_recording() {
+    let dir = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(dir.path()).unwrap();
+    let mut scope = recall_test_scope("owner-a", "workspace-a");
+    seed_recall_memory(&mem, &scope, "user-note", "recallkeyword historical user text").await;
+    assert_ne!(
+        scoped_recall(&mem, &scope, "recallkeyword", RECALL_CONTEXT_BUDGET)
+            .await
+            .preamble,
+        ""
+    );
+    scope.record_user_messages = false;
+    let recalled = scoped_recall(&mem, &scope, "recallkeyword", RECALL_CONTEXT_BUDGET).await;
+    assert_eq!(recalled.preamble, "");
+    assert_eq!(recalled.ids, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn recall_is_bounded_by_context_budget() {
+    let dir = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(dir.path()).unwrap();
+    let scope = recall_test_scope("owner-a", "workspace-a");
+    seed_recall_memory(
+        &mem,
+        &scope,
+        "large-note",
+        &format!("recallkeyword {}", "é".repeat(3000)),
+    )
+    .await;
+    let full = scoped_recall(&mem, &scope, "recallkeyword", RECALL_CONTEXT_BUDGET).await;
+    assert!(full.preamble.len() > 65);
+    let bounded = scoped_recall(&mem, &scope, "recallkeyword", 65).await;
+    assert_ne!(bounded.preamble, "");
+    assert!(bounded.preamble.len() <= 65);
+    assert_eq!(bounded.ids, Vec::<String>::new());
+    let empty = scoped_recall(&mem, &scope, "recallkeyword", 0).await;
+    assert_eq!(empty.preamble, "");
+}

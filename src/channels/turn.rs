@@ -785,13 +785,7 @@ pub(super) async fn run_channel_turn(
     // shares one run_id.
     let runtime_envelope = channel_source.envelope().clone();
     let route_decision = decision_turn.route.clone();
-    let memory_context = match decision_turn.memory_context() {
-        Ok(context) => context,
-        Err(error) => {
-            tracing::warn!(%error, "channel decision retrieval failed");
-            return;
-        }
-    };
+    let memory_context = decision_turn.memory_context();
     let chat_profile = match turn_memory.get_chat_profile(&msg.channel, &msg.reply_target).await {
         Ok(profile) => profile,
         Err(error) => {

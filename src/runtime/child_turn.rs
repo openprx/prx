@@ -18,10 +18,12 @@ pub(crate) struct ChildSegmentTurn {
     started_at: chrono::DateTime<chrono::Utc>,
     route: crate::llm::route_decision::RouteDecision,
     history_commit_len: Option<usize>,
+    recalled_context: String,
 }
 
 // Resources consumed by the synchronous post-decision terminal admission.
 struct ChildTerminalAdmission {
+    recalled_context: String,
     fabric: crate::memory::MemoryFabric,
     config: Arc<crate::config::Config>,
     usage_collector: Option<Arc<super::turn_terminal::TerminalUsageCollector>>,
@@ -67,6 +69,18 @@ impl ChildSegmentTurn {
             service.model_can_call_tools(proof.as_ref()),
             false,
         );
+        let recalled_context = crate::agent::context_recall::scoped_recall(
+            fabric.memory().as_ref(),
+            &crate::agent::context_recall::RecallScope::from_envelope(
+                &execution.envelope,
+                &config.memory,
+                proof.policy_chat_type(),
+            ),
+            proof.routing_input(),
+            crate::agent::context_recall::RECALL_CONTEXT_BUDGET,
+        )
+        .await
+        .preamble;
         let decision = service
             .decide_agent_segment(proof.as_ref(), previous_observation.as_deref(), cancellation)
             .await?;
@@ -76,6 +90,7 @@ impl ChildSegmentTurn {
             decision,
             execution,
             ChildTerminalAdmission {
+                recalled_context,
                 fabric,
                 config,
                 usage_collector,
@@ -99,6 +114,7 @@ impl ChildSegmentTurn {
         cancellation: &CancellationToken,
     ) -> anyhow::Result<Self> {
         let ChildTerminalAdmission {
+            recalled_context,
             fabric,
             config,
             usage_collector,
@@ -128,6 +144,7 @@ impl ChildSegmentTurn {
             started_at: chrono::Utc::now(),
             route,
             history_commit_len: None,
+            recalled_context,
         })
     }
 
@@ -191,11 +208,10 @@ impl ChildSegmentTurn {
             input.content == self.proof.routing_input(),
             "child segment history differs from its admitted input"
         );
-        let artifacts = self.decision.retrieved()?;
-        if artifacts.is_empty() {
+        if self.recalled_context.is_empty() {
             return Ok(());
         }
-        let mut enriched = crate::agent::memory_loader::format_selected_context(None, artifacts)?;
+        let mut enriched = self.recalled_context.clone();
         enriched.push_str(&input.content);
         *input = crate::agent::turn_contracts::inbound_user_message(&enriched);
         Ok(())

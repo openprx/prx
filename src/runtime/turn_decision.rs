@@ -661,10 +661,14 @@ pub(crate) struct TurnDecisionContext {
     main_compaction: crate::config::AgentCompactionConfig,
     hop_ids: Vec<DecisionId>,
     execution_refs: BTreeSet<CapabilityRef>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained decision-engine input during recall migration; prompt readers are independent"
+        )
+    )]
     selected_retrieved: Vec<ObservedArtifact>,
-    /// Extension-authored prompt text, deliberately excluded from observed
-    /// evidence, fingerprints and retrieval progress.
-    selected_custom_memory_context: Option<String>,
     #[cfg(feature = "llm-router")]
     router_transition: Option<Arc<routing::RouterTransition>>,
 }
@@ -1268,18 +1272,18 @@ impl TurnDecisionContext {
     /// The selected evidence belongs to the issued turn, not a fresh read.
     /// Decision-stage timeouts do not expire the subsequent provider turn;
     /// closing that turn prevents its evidence from re-entering execution.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retained decision-engine input during recall migration; prompt readers are independent"
+        )
+    )]
     pub(crate) fn retrieved(&self) -> Result<&[ObservedArtifact], DirectiveError> {
         if self.execution_closed.load(Ordering::Acquire) {
             return Err(DirectiveError::NotAdmitted);
         }
         Ok(&self.selected_retrieved)
-    }
-
-    pub(crate) fn custom_memory_context(&self) -> Result<Option<&str>, DirectiveError> {
-        if self.execution_closed.load(Ordering::Acquire) {
-            return Err(DirectiveError::NotAdmitted);
-        }
-        Ok(self.selected_custom_memory_context.as_deref())
     }
 
     pub(crate) fn disposition(&self) -> Result<TurnDisposition, DirectiveError> {
@@ -1322,7 +1326,6 @@ struct MemoryHopObservation {
     /// The read completed with status Ok, even when it returned nothing new.
     completed_ok: bool,
     selected_artifacts: Vec<ObservedArtifact>,
-    custom_context: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1883,7 +1886,7 @@ impl TurnDecisionService {
             | crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => candidate_id.clone(),
             _ => return Err(AgentRetrievalError::Selected(RetrievalIssueError)),
         };
-        let (artifacts, custom_context, status) = match self
+        let (artifacts, _custom_context, status) = match self
             .retrieve_selected_agent_evidence_with_context(proof, decision)
             .await
         {
@@ -1902,8 +1905,8 @@ impl TurnDecisionService {
         ));
         let mut all_artifacts = next.observed.artifacts().to_vec();
         let mut fresh_read = false;
-        // Prompt-facing selected evidence excludes stale or future-dated
-        // rows. The full observations remain in the decision state for audit.
+        // Fresh evidence remains decision input. Prompt recall has its own
+        // authenticated scope and never consumes loader presentation text.
         let selected_artifacts = artifacts
             .iter()
             .filter(|artifact| artifact.age_ms <= STALE_ARTIFACT_MS)
@@ -1928,7 +1931,6 @@ impl TurnDecisionService {
             fresh_read,
             completed_ok: status == ObservedStepStatus::Ok,
             selected_artifacts,
-            custom_context,
         })
     }
 
@@ -2385,7 +2387,6 @@ impl TurnDecisionService {
                 main_compaction: budget.main_compaction.clone(),
                 execution_refs: BTreeSet::new(),
                 selected_retrieved: Vec::new(),
-                selected_custom_memory_context: None,
                 #[cfg(feature = "llm-router")]
                 router_transition: router_transition.clone(),
             }))
@@ -2436,7 +2437,6 @@ impl TurnDecisionService {
                         hop_ids,
                         execution_refs,
                         selected_retrieved: Vec::new(),
-                        selected_custom_memory_context: None,
                         router_transition: None,
                     }),
                     telemetry,
@@ -2445,7 +2445,6 @@ impl TurnDecisionService {
             prior_hops.push(decision);
         }
         let mut selected_retrieved = Vec::new();
-        let mut selected_custom_memory_context = None;
         let max_hops = config.causal_tree.policy.max_decision_hops;
         for hop in state.lineage.hop()..=max_hops {
             if cancellation.is_cancelled() {
@@ -2601,7 +2600,6 @@ impl TurnDecisionService {
                     }
                     allow_terminal_answer = read_finishes_retrieval(&observed, proof.routing_input());
                     selected_retrieved = observed.selected_artifacts;
-                    selected_custom_memory_context = observed.custom_context;
                     let mut comparison = observed.state.clone();
                     comparison.derived = decision.state.derived.clone();
                     retrieval_progress = Some(comparison.evidence_fingerprint(&self.state_key) != prior_evidence);
@@ -2714,7 +2712,6 @@ impl TurnDecisionService {
                             hop_ids,
                             execution_refs,
                             selected_retrieved,
-                            selected_custom_memory_context,
                             #[cfg(feature = "llm-router")]
                             router_transition: router_transition.clone(),
                         }),
@@ -2757,7 +2754,6 @@ impl TurnDecisionService {
                             hop_ids,
                             execution_refs: BTreeSet::new(),
                             selected_retrieved,
-                            selected_custom_memory_context,
                             #[cfg(feature = "llm-router")]
                             router_transition: router_transition.clone(),
                         }),
@@ -2811,7 +2807,6 @@ impl TurnDecisionService {
                             hop_ids,
                             execution_refs,
                             selected_retrieved,
-                            selected_custom_memory_context,
                             #[cfg(feature = "llm-router")]
                             router_transition: router_transition.clone(),
                         }),
