@@ -75,6 +75,7 @@ pub mod renderer;
 pub mod tui;
 
 mod active_turn;
+mod approval_context;
 mod bootstrap;
 mod chat_events;
 mod compaction;

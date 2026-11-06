@@ -1,5 +1,5 @@
 #![cfg(test)]
-mod admission_matrix;
+pub(crate) mod admission_matrix;
 mod collection_arguments;
 mod exact_call_observation;
 use super::*;

@@ -7,13 +7,15 @@ impl TurnDecisionService {
     pub(crate) fn execution_approval_ledger(
         &self,
     ) -> Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger> {
-        (self.recordable && self.durable_key).then(|| {
-            crate::security::approval_ledger::strategy::ExecutionApprovalLedger {
-                memory: std::sync::Arc::clone(&self.memory),
-                state_key: std::sync::Arc::clone(&self.state_key),
-                workspace: self.generation.effective.workspace_dir.to_string_lossy().into_owned(),
-                catalog: std::sync::Arc::clone(&self.catalog),
-            }
+        if !(self.recordable && self.durable_key && self.generation.effective.causal_tree.enabled) {
+            return None;
+        }
+        let workspace = self.generation.effective.workspace_dir.to_str()?.to_owned();
+        Some(crate::security::approval_ledger::strategy::ExecutionApprovalLedger {
+            memory: std::sync::Arc::clone(&self.memory),
+            state_key: std::sync::Arc::clone(&self.state_key),
+            workspace,
+            catalog: std::sync::Arc::clone(&self.catalog),
         })
     }
 

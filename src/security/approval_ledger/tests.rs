@@ -842,6 +842,7 @@ async fn run_keyed_pending_uses_durable_source_identity() {
         .unwrap()
         .unwrap();
     let original = call_authority(&source, &serde_json::json!({"path":"project_a"}));
+    assert_eq!(&original, fixture.pending.authority());
     for field in 0..3 {
         let mut changed = source.clone();
         match field {
@@ -890,6 +891,15 @@ async fn expired_run_keyed_pending_cannot_be_reviewed_or_claimed() {
         .unwrap()
         .replace_event_payload_for_test(&event.event_id, &payload.to_string())
         .unwrap();
+    assert_eq!(
+        fixture
+            .port()
+            .inspect("prx_owner", "prx_session", fixture.pending.authority())
+            .await
+            .unwrap_err()
+            .to_string(),
+        "pending call approval expired"
+    );
     assert_eq!(
         fixture
             .port()

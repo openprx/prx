@@ -3775,7 +3775,7 @@ fn insert_optional(map: &mut serde_json::Map<String, serde_json::Value>, key: &s
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// T18 — local-operator origin marker (`_prx_scope_trusted`).
 ///

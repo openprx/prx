@@ -1986,11 +1986,10 @@ pub(crate) async fn run_with_runtime_envelope(
                             envelope = envelope.with_source_message_event_id(event_id);
                         }
                         adapter.tool_execution_context = proof.scheduled.as_ref().map_or_else(
-                            || crate::tools::ToolExecutionContext::new(envelope, "private"),
+                            || cli_tool_execution_context(envelope),
                             |source| source.execution.clone(),
                         );
                     }
-                    adapter.tool_execution_context.approval_ledger = decision_service.execution_approval_ledger();
                     if let Some(case) = &ctx.controlled_case {
                         case.apply(&mut adapter.tool_execution_context)?;
                     }
@@ -2493,9 +2492,8 @@ pub(crate) async fn run_with_runtime_envelope(
                     if let Some(event_id) = proof.source_event_id() {
                         envelope = envelope.with_source_message_event_id(event_id);
                     }
-                    runtime_adapter.tool_execution_context = crate::tools::ToolExecutionContext::new(envelope, "private");
+                    runtime_adapter.tool_execution_context = cli_tool_execution_context(envelope);
                 }
-                runtime_adapter.tool_execution_context.approval_ledger = decision_service.execution_approval_ledger();
                 runtime_adapter.provider_trace = Some(Arc::clone(retained_provider_trace));
                 let response = match crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
                     .scope(turn_spawn_ctx, async {
@@ -2802,4 +2800,8 @@ mod cli_admission_failure_tests {
         );
         crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(dir.path());
     }
+}
+
+fn cli_tool_execution_context(envelope: RuntimeEnvelope) -> crate::tools::ToolExecutionContext {
+    crate::tools::ToolExecutionContext::new(envelope, "private")
 }

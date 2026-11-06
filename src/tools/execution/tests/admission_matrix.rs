@@ -2,7 +2,7 @@ use super::*;
 use crate::security::approval_ledger::{run_call::ApprovalLedgerPort, strategy::ExecutionApprovalLedger};
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
 
-async fn ledger_context(path: &std::path::Path) -> ToolExecutionContext {
+pub(crate) async fn ledger_context(path: &std::path::Path) -> ToolExecutionContext {
     crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(path).unwrap());
     let key = crate::decision::DecisionKey::load_or_create(path).unwrap();
@@ -14,6 +14,7 @@ async fn ledger_context(path: &std::path::Path) -> ToolExecutionContext {
         "config_reload",
         "mcp_call",
         "sessions_spawn",
+        "project_tool",
     ]
     .into_iter()
     .map(|root_name| {
@@ -375,4 +376,176 @@ async fn general_call_claims_supply_gate_compatible_signed_grants() {
             ));
         }
     }
+}
+
+/// Exercise ordinary approval with both answers and observe the real durable inbox.
+pub(crate) async fn assert_existing_strategy(context: ToolExecutionContext, observer: ExecutionApprovalLedger) {
+    for allow in [true, false] {
+        let fixture = fixture();
+        let answer = if allow {
+            approved()
+        } else {
+            ToolApprovalDecision::Denied {
+                reason: "project refusal".into(),
+            }
+        };
+        let service = fixture.service("config_reload", vec![], ToolExecutionDecision::Ask, answer, true);
+        let outcome = service.execute(command(1), context.clone(), None).await;
+        assert_eq!(
+            outcome.status,
+            if allow {
+                ToolExecutionStatus::Succeeded
+            } else {
+                ToolExecutionStatus::ApprovalDenied
+            }
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), usize::from(allow));
+        assert_eq!(
+            fixture
+                .stages
+                .lock()
+                .iter()
+                .filter(|stage| **stage == "approval")
+                .count(),
+            1
+        );
+    }
+    let port = ApprovalLedgerPort {
+        memory: &observer.memory,
+        state_key: &observer.state_key,
+        workspace: &observer.workspace,
+        keyring: crate::acl::approval_grant::WitnessKeyring::global_for_tests(),
+    };
+    assert!(
+        port.list_pending_calls(context.envelope.owner_id.as_deref().unwrap(), 0, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn unmodelled_operation_uses_existing_strategy_without_pending() {
+    let path = tempfile::tempdir().unwrap();
+    let context = ledger_context(path.path()).await;
+    assert!(
+        crate::security::approval_operation::grant_op_for_call("project_tool", &serde_json::json!({"value":1}))
+            .is_none()
+    );
+    for allow in [true, false] {
+        let fixture = fixture();
+        let answer = if allow {
+            approved()
+        } else {
+            ToolApprovalDecision::Denied {
+                reason: "project refusal".into(),
+            }
+        };
+        let service = fixture.service("project_tool", vec![], ToolExecutionDecision::Ask, answer, true);
+        let outcome = service
+            .execute(
+                ToolExecutionCommand::new("project_tool", serde_json::json!({"value":1})),
+                context.clone(),
+                None,
+            )
+            .await;
+        assert_eq!(
+            outcome.status,
+            if allow {
+                ToolExecutionStatus::Succeeded
+            } else {
+                ToolExecutionStatus::ApprovalDenied
+            }
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), usize::from(allow));
+        assert!(fixture.stages.lock().contains(&"approval"));
+    }
+    let observer = context.approval_ledger.clone().unwrap();
+    let mut ordinary = context;
+    ordinary.approval_ledger = None;
+    assert_existing_strategy(ordinary, observer).await;
+}
+
+#[tokio::test]
+async fn pinned_mcp_alias_uses_catalog_operation_and_rejects_changed_live_target() {
+    use crate::config::schema::{McpConfig, McpServerConfig};
+    use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
+    let path = tempfile::tempdir().unwrap();
+    let mut context = ledger_context(path.path()).await;
+    let fixture = fixture();
+    let alias = "mcp__prx_server__nested__action";
+    let tool = RecordingTool {
+        root_name: "mcp_call",
+        aliases: vec![alias],
+        calls: Arc::clone(&fixture.calls),
+        arguments: Arc::clone(&fixture.arguments),
+        stages: Arc::clone(&fixture.stages),
+    };
+    let mut sources = CatalogSources::default();
+    sources.mcp.push(crate::tools::mcp::McpCapabilitySpec {
+        server: "prx_server__nested".into(),
+        tool: "action".into(),
+        state_digest: [7; 32],
+        spec: ToolSpec {
+            name: alias.into(),
+            description: "project action".into(),
+            parameters: tool.parameters_schema(),
+        },
+    });
+    context.approval_ledger.as_mut().unwrap().catalog = Arc::new(
+        CapabilityCatalog::build(&[Box::new(tool) as Box<dyn Tool>], &sources, &SurfacePolicy::default()).unwrap(),
+    );
+    let service = fixture.service("mcp_call", vec![alias], ToolExecutionDecision::Ask, approved(), true);
+    let command = || ToolExecutionCommand::new(alias, serde_json::json!({"value":1}));
+    assert_eq!(
+        service.execute(command(), context.clone(), None).await.status,
+        ToolExecutionStatus::AwaitingApproval
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    review(&context, true).await;
+    assert_eq!(
+        service.execute(command(), context, None).await.status,
+        ToolExecutionStatus::Succeeded
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    let args = fixture.arguments.lock().first().unwrap().clone();
+    let grant = ApprovalGrant::from_runtime_args(alias, &args).unwrap();
+    let operation = "mcp_call:call:prx_server__nested:action";
+    assert!(grant.permits_resource_operation(
+        alias,
+        operation,
+        ResourceRiskLevel::High,
+        chrono::Utc::now().timestamp()
+    ));
+    // The same public alias now resolves through a shorter configured server
+    // name to a different root operation. The real MCP gate must reject it
+    // before transport, without spending the valid original grant.
+    let mut live = McpConfig::default();
+    live.servers.insert(
+        "prx_server".into(),
+        McpServerConfig {
+            tool_name_prefix: "mcp".into(),
+            ..McpServerConfig::default()
+        },
+    );
+    let security = Arc::new(SecurityPolicy {
+        autonomy: AutonomyLevel::Supervised,
+        ..SecurityPolicy::default()
+    });
+    let mcp = crate::tools::mcp::McpTool::new(Arc::clone(&security), live, path.path().to_owned());
+    let refused = mcp.execute_named(alias, args).await.unwrap();
+    assert!(!refused.success);
+    assert!(
+        refused
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("requires runtime approval grant")
+    );
+    assert!(
+        SideEffectGate::new(&security)
+            .authorize_resource_operation(alias, operation, ResourceRiskLevel::High, Some(&grant))
+            .is_ok()
+    );
 }

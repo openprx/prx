@@ -1200,11 +1200,7 @@ impl EffectExecutor {
                                 &draft_id,
                             )
                         },
-                        |binding| {
-                            ToolExecutionContext::new(binding.envelope().clone(), "private")
-                                .with_approval_ledger(binding.execution_approval_ledger())
-                                .with_chat_id("terminal:user")
-                        },
+                        |binding| super::approval_context::tui(binding.envelope().clone()),
                     )
                     .with_schema_dialect(provider.tool_schema_dialect_for(&model));
                 let request_event_fabric = MemoryFabric::new(

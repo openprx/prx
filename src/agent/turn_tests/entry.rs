@@ -984,3 +984,14 @@ async fn a_refused_selection_leaves_no_bootstrap_side_effects() {
     );
     assert!(probe.requests().is_empty(), "nothing is sent");
 }
+
+#[tokio::test]
+async fn cli_agent_preserves_existing_approval_without_pending() {
+    use crate::tools::execution::tests::admission_matrix::{assert_existing_strategy, ledger_context};
+    let path = tempfile::tempdir().unwrap();
+    let mut recorded = ledger_context(path.path()).await;
+    let observer = recorded.approval_ledger.take().unwrap();
+    let context = cli_tool_execution_context(recorded.envelope);
+    assert!(context.approval_ledger.is_none());
+    assert_existing_strategy(context, observer).await;
+}

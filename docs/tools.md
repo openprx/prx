@@ -187,7 +187,10 @@ remain shared across owners.
 
 Recorded Console, gateway, h2 and background chat calls carrying a persisted
 approval context also use durable approval when no decision binding is present.
-Under Supervised autonomy, a side-effecting call waits for review before execution.
+With the causal plane enabled, a modelled side-effecting call under Supervised
+autonomy waits for review before execution. Unmodelled operations use the existing
+approval strategy. Foreground TUI, line-mode chat, and `prx agent` retain their
+interactive prompts, resolver and session allowlist.
 Approval binds the source, capability and complete arguments; changing arguments
 requires a new review. A claimed approval can execute at most once, including across restart.
 Channel approval runs first, and tool policy and execution gates still apply.
