@@ -399,7 +399,12 @@ impl TurnDecisionService {
 
     /// Report queue acknowledgement to owners that must reject an incomplete exit.
     pub(crate) async fn drain_writes(&self, deadline: Instant) -> bool {
-        // Catalog and causal writes remain authoritative; advisory telemetry is best effort.
+        // Close advisory telemetry first (as before R2b) so its owners release before the
+        // catalog/causal drains, but do not let a late telemetry drain fail the acknowledgement:
+        // catalog and causal writes remain authoritative; advisory telemetry is best effort.
+        if !self.drain_advisory(deadline).await {
+            tracing::warn!("decision engine telemetry did not drain before shutdown deadline");
+        }
         let mut drained = true;
         if let Some(writer) = self.store.writer() {
             #[cfg(test)]
@@ -426,9 +431,6 @@ impl TurnDecisionService {
             if !events_drained {
                 tracing::warn!("causal event queue did not drain before shutdown deadline");
             }
-        }
-        if !self.drain_advisory(deadline).await {
-            tracing::warn!("decision engine telemetry did not drain before shutdown deadline");
         }
         drained
     }
