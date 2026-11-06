@@ -37,6 +37,7 @@ struct QueuedEvent {
 
 enum QueueItem {
     Applied {
+        memory: Arc<dyn Memory>,
         event: Box<CausalEvent>,
         idempotency_key: String,
         original_generation: Option<(u64, Arc<str>)>,
@@ -49,7 +50,9 @@ enum QueueItem {
 /// and writable store. Call `drain` before stopping its runtime.
 pub(crate) struct DurableCausalEventSink {
     store_namespace: std::sync::OnceLock<Arc<str>>,
-    memory: Arc<dyn Memory>,
+    // The service owns the backend; only admitted work extends its lifetime.
+    // A shared store writer may retain this sink after the service exits.
+    memory: std::sync::Weak<dyn Memory>,
     workspace_id: String,
     generation_id: u64,
     revision: String,
@@ -72,7 +75,7 @@ impl DurableCausalEventSink {
         let workspace_id = generation.effective.workspace_dir.to_string_lossy().to_string();
         let config_generation_id = generation.id.0;
         let config_source_revision = generation.source_revision.fingerprint_sha256.clone();
-        let replay_memory = Arc::clone(&memory);
+        let replay_memory = Arc::downgrade(&memory);
         let replay_workspace = workspace_id.clone();
         let replay_revision = config_source_revision.clone();
         let worker_observer = Arc::clone(&observer);
@@ -82,7 +85,6 @@ impl DurableCausalEventSink {
             worker::Worker {
                 receiver,
                 control_receiver,
-                memory,
                 observer: worker_observer,
                 workspace: workspace_id,
                 generation: config_generation_id,
@@ -141,9 +143,14 @@ impl DurableCausalEventSink {
     pub(super) fn emit_applied(&self, application: VerifiedDirectiveApplication) {
         let (event, idempotency_key, original_generation) = application.into_parts();
         let lineage = event.lineage.clone();
+        let Some(memory) = self.memory.upgrade() else {
+            report_incomplete(self.observer.as_ref(), lineage, IncompleteReason::StoreDropped);
+            return;
+        };
         if self
             .control_queue
             .try_send(QueueItem::Applied {
+                memory,
                 event: Box::new(event),
                 idempotency_key,
                 original_generation,
@@ -163,6 +170,10 @@ impl DurableCausalEventSink {
         deadline: Instant,
     ) -> anyhow::Result<()> {
         let (event, idempotency_key, original_generation) = application.into_parts();
+        let memory = self
+            .memory
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("applied recovery backend released"))?;
         let (generation, revision) = original_generation
             .as_ref()
             .map_or((self.generation_id, self.revision.as_str()), |(id, revision)| {
@@ -171,7 +182,7 @@ impl DurableCausalEventSink {
         let mut input = to_message_input(&event, &self.workspace_id, generation, revision);
         input.event_id = Some(uuid::Uuid::new_v4().to_string());
         input.idempotency_key = Some(idempotency_key);
-        let stored = self.memory.append_message_event_until(input.clone(), deadline).await?;
+        let stored = memory.append_message_event_until(input.clone(), deadline).await?;
         anyhow::ensure!(
             applied_input_matches(&stored, &input),
             "rejoined applied event conflicts with authenticated terminal"
@@ -184,8 +195,7 @@ impl DurableCausalEventSink {
                 .ok_or_else(|| anyhow::anyhow!("applied recovery owner missing"))?,
             source: input.source.clone(),
         };
-        let readback = self
-            .memory
+        let readback = memory
             .read_ingress_event(
                 &scope,
                 &crate::memory::ingress_recovery::IngressEventLookup::EventId(stored.event_id.clone()),
@@ -204,6 +214,9 @@ impl DurableCausalEventSink {
     }
 
     pub(super) async fn repair_applied(&self, application: VerifiedDirectiveApplication, deadline: Instant) -> bool {
+        let Some(memory) = self.memory.upgrade() else {
+            return false;
+        };
         let (event, idempotency_key, original_generation) = application.into_parts();
         let (reply, received) = oneshot::channel();
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -211,6 +224,7 @@ impl DurableCausalEventSink {
             if self
                 .control_queue
                 .send(QueueItem::Applied {
+                    memory,
                     event: Box::new(event),
                     idempotency_key,
                     original_generation,
@@ -263,13 +277,18 @@ impl CausalEventSink for DurableCausalEventSink {
             .and_then(|namespace| routes::lookup(namespace, event.lineage.run_id.as_deref()));
         let memory = if let Some(memory) = routed {
             memory
-        } else if self.memory.requires_scoped_execution()
-            || (event.lineage.run_id.is_some() && event.lineage.source_event_id.is_some())
-        {
-            report_incomplete(self.observer.as_ref(), event.lineage, IncompleteReason::UnknownDecision);
-            return;
         } else {
-            routes::EventMemory::fallback(Arc::clone(&self.memory), self.generation_id, &self.revision)
+            let Some(memory) = self.memory.upgrade() else {
+                report_incomplete(self.observer.as_ref(), event.lineage, IncompleteReason::StoreDropped);
+                return;
+            };
+            if memory.requires_scoped_execution()
+                || (event.lineage.run_id.is_some() && event.lineage.source_event_id.is_some())
+            {
+                report_incomplete(self.observer.as_ref(), event.lineage, IncompleteReason::UnknownDecision);
+                return;
+            }
+            routes::EventMemory::fallback(memory, self.generation_id, &self.revision)
         };
         let deferred = self.deferral.for_event(&event.lineage);
         let queued = QueuedEvent {
@@ -374,8 +393,8 @@ mod tests {
         config.workspace_dir = workspace.path().to_path_buf();
         let generation = crate::config::new_shared(config).pin();
         let observer = Arc::new(RecordingSink::default());
-        let sink =
-            DurableCausalEventSink::new(&generation, Arc::new(NoneMemory), observer.clone()).expect("runtime sink");
+        let memory = Arc::new(NoneMemory);
+        let sink = DurableCausalEventSink::new(&generation, memory.clone(), observer.clone()).expect("runtime sink");
         let event = CausalEvent {
             kind: CausalEventKind::PredictionFailed,
             lineage: CausalLineage::default(),
@@ -399,6 +418,32 @@ mod tests {
                 .lock()
                 .iter()
                 .any(|entry| entry.fields.incomplete == Some(IncompleteReason::StoreFailed))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drained_shared_sink_releases_ingress_backend() {
+        let workspace = tempfile::tempdir().expect("test: workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        let generation = crate::config::new_shared(config).pin();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("test: memory"));
+        let released = Arc::downgrade(&memory);
+        let sink = DurableCausalEventSink::new(&generation, memory.clone(), Arc::new(RecordingSink::default()))
+            .expect("test: sink");
+        sink.emit(CausalEvent {
+            kind: CausalEventKind::PredictionFailed,
+            lineage: CausalLineage::default(),
+            fields: CausalEventFields::default(),
+        });
+        drop(memory);
+        // The current-thread worker has not run: accepted work must own memory.
+        assert!(released.upgrade().is_some(), "queued event must retain its backend");
+        assert!(sink.drain(Instant::now() + std::time::Duration::from_secs(2)).await);
+        // A shared decision-store thread can still retain this idle sink.
+        assert!(
+            released.upgrade().is_none(),
+            "drained sink must release the ingress backend"
         );
     }
 
@@ -436,7 +481,7 @@ mod tests {
             } else {
                 base.clone() as Arc<dyn Memory>
             };
-            let sink = DurableCausalEventSink::new(&generation, first_sink_memory, observer.clone())
+            let sink = DurableCausalEventSink::new(&generation, first_sink_memory.clone(), observer.clone())
                 .expect("test: first writer sink");
             let namespace: Arc<str> = Arc::from(uuid::Uuid::new_v4().to_string());
             sink.bind_store_namespace(namespace.clone())
@@ -783,7 +828,8 @@ mod tests {
                 .is_none()
         );
         let failed_observer = Arc::new(RecordingSink::default());
-        let failed = DurableCausalEventSink::new(&generation, Arc::new(NoneMemory), failed_observer.clone())
+        let unavailable_memory = Arc::new(NoneMemory);
+        let failed = DurableCausalEventSink::new(&generation, unavailable_memory.clone(), failed_observer.clone())
             .expect("failing sink");
         failed.emit_applied(VerifiedDirectiveApplication::fixture(event.clone(), key.clone()));
         assert!(failed.drain(Instant::now() + std::time::Duration::from_secs(5)).await);
