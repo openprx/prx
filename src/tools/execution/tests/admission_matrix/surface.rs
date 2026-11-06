@@ -46,6 +46,16 @@ async fn excluded_tool_called_by_model_is_refused() {
     assert_refused(&service, &fixture, context, "config_reload").await;
 }
 
+/// Production publishes only eligible entries, and the channel closure is the
+/// only source of ineligibility. This isolates that clause in `TurnSurface::build`.
+#[tokio::test]
+async fn channel_ineligible_entry_is_refused_on_channel_surface() {
+    let fixture = fixture();
+    let service = allow_service(&fixture);
+    let context = surface_context(&service, &crate::config::ToolTieringConfig::default(), true, false);
+    assert_refused(&service, &fixture, context, "config_reload").await;
+}
+
 #[tokio::test]
 async fn model_allowlist_excluded_tool_is_refused() {
     let fixture = fixture();
@@ -287,6 +297,76 @@ async fn assert_stale_between(build_state: usize, admit_state: usize) {
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     assert_eq!(&*fixture.stages.lock(), &["audit"]);
 }
+fn mutable_service(fixture: &Fixture, state: &Arc<AtomicUsize>) -> ToolExecutionService {
+    ToolExecutionService::new(
+        vec![Arc::new(MutableSurfaceTool {
+            state: Arc::clone(state),
+            calls: Arc::clone(&fixture.calls),
+        })],
+        Arc::new(FixedPolicy {
+            decision: ToolExecutionDecision::Allow,
+            stages: Arc::clone(&fixture.stages),
+        }),
+        Arc::new(FixedApproval {
+            decision: approved(),
+            stages: Arc::clone(&fixture.stages),
+        }),
+        Arc::new(RecordingPreparation {
+            allowed: true,
+            stages: Arc::clone(&fixture.stages),
+        }),
+        Arc::new(RecordingAudit {
+            records: Arc::clone(&fixture.records),
+            stages: Arc::clone(&fixture.stages),
+        }),
+    )
+}
+
+/// Two dispatches of one published turn. The backend owns its state and the
+/// service is never told, so the second dispatch must see the drift.
+#[tokio::test]
+async fn backend_state_change_between_dispatches_is_stale() {
+    let fixture = fixture();
+    let state = Arc::new(AtomicUsize::new(0));
+    let service = mutable_service(&fixture, &state);
+    let context = surface_context(&service, &crate::config::ToolTieringConfig::default(), false, true);
+    let call = || ToolExecutionCommand::new("project_tool", serde_json::json!({}));
+    assert_eq!(
+        service.execute(call(), context.clone(), None).await.status,
+        ToolExecutionStatus::Succeeded
+    );
+    state.store(2, Ordering::SeqCst);
+    assert_eq!(
+        service.execute(call(), context, None).await.status,
+        ToolExecutionStatus::StaleCapability
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+/// Control for the test above: with no backend change, the same surface is
+/// reused across two dispatches and both succeed.
+#[tokio::test]
+async fn unchanged_backend_admits_repeated_dispatches() {
+    let fixture = fixture();
+    let state = Arc::new(AtomicUsize::new(0));
+    let service = mutable_service(&fixture, &state);
+    let context = surface_context(&service, &crate::config::ToolTieringConfig::default(), false, true);
+    for _ in 0..2 {
+        assert_eq!(
+            service
+                .execute(
+                    ToolExecutionCommand::new("project_tool", serde_json::json!({})),
+                    context.clone(),
+                    None
+                )
+                .await
+                .status,
+            ToolExecutionStatus::Succeeded
+        );
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn registry_generation_change_mid_turn_is_stale() {
     assert_stale_after_change(2).await;

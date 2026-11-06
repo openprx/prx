@@ -1833,6 +1833,40 @@ impl ToolExecutionService {
             .collect()
     }
 
+    /// Live inventory paired with each entry's dispatch binding, in one pass
+    /// over the backends. The binding is read the same way `resolve` reads it,
+    /// but each backend's snapshot and binding map are captured only once.
+    #[must_use]
+    pub(crate) fn live_descriptors_with_bindings(&self) -> Vec<(ToolDescriptor, Option<[u8; 32]>)> {
+        let mut out = Vec::new();
+        for backend in self.backends.iter() {
+            let shared = backend.shared_catalog_snapshot();
+            let mut legacy_bindings = None;
+            for spec in backend.catalog_specs() {
+                let binding = if let Some(snapshot) = &shared {
+                    snapshot.entry(&spec.name).and_then(|entry| entry.binding_digest())
+                } else {
+                    legacy_bindings
+                        .get_or_insert_with(|| backend.catalog_binding_snapshot())
+                        .get(&spec.name)
+                        .copied()
+                };
+                let descriptor = tool_descriptor(
+                    backend.root_name(),
+                    spec,
+                    backend.tier(),
+                    backend.categories(),
+                    |name| backend.adapter_kind(name),
+                    backend.availability(),
+                    backend.process_worker_compatible(),
+                )
+                .with_execution_parameters(backend.execution_parameters_schema());
+                out.push((descriptor, binding));
+            }
+        }
+        out
+    }
+
     /// Full fresh inventory for causal parity without building user-facing
     /// descriptors. A malformed schema has the same Declared status as the
     /// descriptor path and therefore cannot satisfy a pinned configured entry.

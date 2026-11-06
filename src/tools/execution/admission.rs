@@ -1,14 +1,13 @@
 //! Decision-free publication and dispatch boundary for model turns.
 use super::{ToolDescriptor, ToolExecutionContext, ToolExecutionService, ToolExecutionStatus};
-use crate::causal_tree::branch::SchemaFingerprint;
 use crate::config::ToolTieringConfig;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnSurface {
     registry_generation: Option<[u8; 32]>,
-    published: BTreeMap<String, SchemaFingerprint>,
+    published: BTreeSet<String>,
     exclusions: BTreeSet<String>,
     model_allowlist: Option<BTreeSet<String>>,
     channel_eligible: BTreeSet<String>,
@@ -35,8 +34,8 @@ impl TurnSurface {
             .get(model)
             .map(|names| names.iter().cloned().collect());
         let mut surface = Self {
-            registry_generation: registry_generation(service),
-            published: BTreeMap::new(),
+            registry_generation: live_generation(service),
+            published: BTreeSet::new(),
             exclusions,
             model_allowlist,
             channel_eligible: BTreeSet::new(),
@@ -56,14 +55,7 @@ impl TurnSurface {
                 continue;
             }
             surface.channel_eligible.insert(name.clone());
-            surface.published.insert(
-                name.clone(),
-                crate::tools::capability::fingerprint::tool_spec_fingerprint(
-                    name,
-                    &descriptor.description,
-                    &descriptor.parameters,
-                ),
-            );
+            surface.published.insert(name.clone());
         }
         surface
     }
@@ -79,12 +71,12 @@ impl TurnSurface {
     pub(crate) fn for_publication(&self, specs: &[super::ToolSpec]) -> Self {
         let names: BTreeSet<_> = specs.iter().map(|spec| spec.name.as_str()).collect();
         let mut surface = self.clone();
-        surface.published.retain(|name, _| names.contains(name.as_str()));
+        surface.published.retain(|name| names.contains(name.as_str()));
         surface
     }
 
     pub(crate) fn contains(&self, name: &str) -> bool {
-        self.published.contains_key(name)
+        self.published.contains(name)
             && !self.exclusions.contains(name)
             && self.model_allowlist.as_ref().is_none_or(|names| names.contains(name))
             && self.channel_eligible.contains(name)
@@ -92,31 +84,34 @@ impl TurnSurface {
 }
 
 // Bind the complete live registry, including dynamic destination/epoch digests.
-// Sorting makes backend enumeration order irrelevant to the generation.
-// `None` means an entry could not be serialized; callers treat that as stale.
-fn registry_generation(service: &ToolExecutionService) -> Option<[u8; 32]> {
-    let mut entries = service
-        .current_descriptors()
-        .into_iter()
-        .map(|descriptor| {
-            let binding = service
-                .current_descriptor_with_binding(&descriptor.public_name, true)
-                .and_then(|(_, binding)| binding);
-            let value = serde_json::to_value((&descriptor, &binding)).ok()?;
-            let fingerprint = crate::tools::capability::fingerprint::tool_spec_fingerprint(
-                &descriptor.public_name,
-                &descriptor.backend_name,
-                &value,
-            );
-            Some(fingerprint.0)
-        })
-        .collect::<Option<Vec<[u8; 32]>>>()?;
-    entries.sort_unstable();
+// It is recomputed on every dispatch on purpose: MCP, skill and other backends
+// own their state and mutate it without a shared epoch, so a cached value could
+// not observe their changes. One pass over the inventory, streaming each entry
+// into a single hasher, keeps this O(N). Entries are sorted so backend order
+// does not matter. Each entry is length-framed because JSON entries are variable.
+fn registry_generation(service: &ToolExecutionService) -> Result<[u8; 32], serde_json::Error> {
+    let mut entries = service.live_descriptors_with_bindings();
+    entries.sort_by(|(a, _), (b, _)| {
+        a.public_name
+            .cmp(&b.public_name)
+            .then_with(|| a.backend_name.cmp(&b.backend_name))
+    });
     let mut digest = Sha256::new();
-    for entry in entries {
-        digest.update(entry);
+    let mut buffer = Vec::new();
+    for (descriptor, binding) in &entries {
+        buffer.clear();
+        serde_json::to_writer(&mut buffer, &(descriptor, binding))?;
+        digest.update((buffer.len() as u64).to_be_bytes());
+        digest.update(&buffer);
     }
-    Some(digest.finalize().into())
+    Ok(digest.finalize().into())
+}
+
+/// Fail closed: a generation that cannot be computed is treated as no generation.
+fn live_generation(service: &ToolExecutionService) -> Option<[u8; 32]> {
+    registry_generation(service)
+        .inspect_err(|error| tracing::warn!(%error, "tool registry generation unavailable"))
+        .ok()
 }
 
 pub(super) fn admit(
@@ -134,16 +129,12 @@ pub(super) fn admit(
         ));
     }
     let descriptor = service.current_descriptor(name);
+    // The registry generation below binds every descriptor field, so an
+    // unchanged generation already proves the published schema is current.
     let stale = descriptor.as_ref().is_none_or(|descriptor| {
         descriptor.availability.level < crate::capability::CapabilityAvailabilityLevel::Configured
-            || surface.published.get(name)
-                != Some(&crate::tools::capability::fingerprint::tool_spec_fingerprint(
-                    name,
-                    &descriptor.description,
-                    &descriptor.parameters,
-                ))
     });
-    if stale || surface.registry_generation.is_none() || surface.registry_generation != registry_generation(service) {
+    if stale || surface.registry_generation.is_none() || surface.registry_generation != live_generation(service) {
         return Err((
             ToolExecutionStatus::StaleCapability,
             format!("tool '{name}' changed after turn publication"),

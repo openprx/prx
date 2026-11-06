@@ -199,6 +199,13 @@ async fn hint_routed_turn_applies_the_pinned_model_allowlist() {
         api_key: None,
         credential_ref: None,
     }];
+    // The route destination must verify NativeTools, the same as a pinned turn.
+    config.providers.models.push(
+        serde_json::from_value(serde_json::json!({
+            "provider":"ollama", "model":"prx-local-model", "operations":["chat"], "native_tools":true,
+        }))
+        .expect("fixture route destination descriptor"),
+    );
     config
         .tool_tiering
         .model_allowlists
@@ -210,6 +217,10 @@ async fn hint_routed_turn_applies_the_pinned_model_allowlist() {
     let decision = admitted.decision();
     assert_eq!(decision.proof.model_name(), "hint:fast");
     assert_eq!(decision.proof.model_binding().pinned_model(), "prx-local-model");
+    assert!(
+        decision.service.model_can_call_tools(decision.proof),
+        "the route destination must verify NativeTools"
+    );
     let surface = decision.service.turn_tool_surface(decision.proof, &[]);
     assert!(surface.contains("project_tool"), "the allowed tool was not published");
     assert!(
