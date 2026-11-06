@@ -574,7 +574,15 @@ impl IngressRecorder {
                     );
                     Ok(())
                 }.await;
-                recovered.with_context(|| self.diagnostic(&capsule.run_id))?;
+                match recovered {
+                    // Matrix row "K = no": this capsule's key is unusable. Write
+                    // no marker, do not replay, leave it pending; the shared
+                    // warning is emitted by the memory layer, once.
+                    Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => {}
+                    other => {
+                        other.with_context(|| self.diagnostic(&capsule.run_id))?;
+                    }
+                }
             }
         }
     }
