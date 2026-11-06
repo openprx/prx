@@ -1051,14 +1051,6 @@ impl ChatTurnBinding {
         decided.service.agent_prompt_skills(self, &decided.context)
     }
 
-    pub(super) fn execution_approval_ledger(
-        &self,
-    ) -> Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger> {
-        self.decision
-            .get()
-            .and_then(|decided| decided.service.execution_approval_ledger())
-    }
-
     pub(super) fn decision_advice(&self) -> Option<crate::decision_engine::IntentAnalysis> {
         self.decision.get().and_then(|decided| decided.advice.clone())
     }

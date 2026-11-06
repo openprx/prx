@@ -896,7 +896,8 @@ async fn expired_run_keyed_pending_cannot_be_reviewed_or_claimed() {
             .port()
             .inspect("prx_owner", "prx_session", fixture.pending.authority())
             .await
-            .unwrap_err()
+            .err()
+            .unwrap()
             .to_string(),
         "pending call approval expired"
     );
