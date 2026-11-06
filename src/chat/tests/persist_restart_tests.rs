@@ -215,6 +215,65 @@ fn run_in_isolated_process(test: &str, child_flag: &str) -> bool {
     true
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn chat_drained_service_releases_ingress_lease_before_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let cleanup = CleanupScope::new(None, CancellationToken::new()).unwrap();
+    let (first, retained_sink, lease_token) = cleanup
+        .scope_admission(async {
+            let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+            let generation = crate::config::new_shared(config_at(dir.path())).pin();
+            let (source, binding, guard) = guarded_input(memory.clone(), &generation, "prx-drained-run").await?;
+            let lease = memory
+                .acquire_ingress_lifetime(
+                    &source.workspace_id,
+                    &uuid::Uuid::new_v4().to_string(),
+                    std::time::Instant::now() + Duration::from_secs(5),
+                )
+                .await?;
+            let token = lease.token().to_owned();
+            // Model the shared decision writer retaining an idle sink after
+            // the service exits, independently of its thread's scheduling.
+            let retained_sink = crate::runtime::causal_events::DurableCausalEventSink::new(
+                &generation,
+                memory.clone(),
+                Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+                    crate::observability::noop::NoopObserver,
+                ))),
+            )?;
+            let service = publish(memory.clone(), generation).await?;
+            let cancel = CancellationToken::new();
+            binding.decide(&service, &cancel).await?;
+            let fabric = MemoryFabric::new(memory, dir.path().to_string_lossy());
+            binding.close(&fabric, 2, chrono::Utc::now(), &cancel).await?;
+            guard.handoff();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            assert!(service.drain_writes(deadline).await, "first service writes must drain");
+            assert!(retained_sink.drain(deadline).await, "retained sink must drain");
+            Ok((source, retained_sink, token))
+        })
+        .await
+        .unwrap();
+    cleanup.run(async { Ok(()) }).await.unwrap();
+    let probe = SqliteMemory::new(dir.path()).unwrap();
+    let claim = probe
+        .claim_ingress_recovery(
+            &first.workspace_id,
+            &lease_token,
+            std::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(
+        claim.is_some(),
+        "drained service and retained idle sink must release the ingress lease"
+    );
+    drop(claim);
+    let next = restarted_chat(dir.path(), "prx-after-drain").await;
+    assert!(next.id > first.id);
+    drop(retained_sink);
+}
+
 #[tokio::test]
 async fn chat_recovers_a_real_seal_that_failed_verification_before_restart() {
     let dir = tempfile::tempdir().unwrap();
