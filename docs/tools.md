@@ -185,8 +185,9 @@ configure `[web_search] provider = "brave"` with a Brave credential. Public web
 search is available to owner-isolated callers; provider credentials and quota
 remain shared across owners.
 
-Recorded Console, gateway, h2 and background chat calls carrying a persisted
-approval context also use durable approval when no decision binding is present.
+Recorded Console, gateway, verified h2 ingress and explicit operator `/bg` calls
+(in both task and process mode) carrying a persisted approval context use durable
+approval when no decision binding is present. Ordinary child calls do not opt in.
 With the causal plane enabled, a modelled side-effecting call under Supervised
 autonomy waits for review before execution. Unmodelled operations use the existing
 approval strategy. Foreground TUI, line-mode chat, and `prx agent` retain their

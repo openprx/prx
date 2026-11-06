@@ -58,6 +58,16 @@ async fn restored_operator_process_decision_accounts_physical_send_without_os_sp
     run_operator_case(true).await
 }
 
+#[tokio::test]
+async fn task_mode_operator_child_gets_ledger_ordinary_child_none() -> anyhow::Result<()> {
+    run_operator_case(false).await
+}
+
+#[tokio::test]
+async fn operator_process_bg_child_gets_ledger() -> anyhow::Result<()> {
+    run_operator_case(true).await
+}
+
 async fn run_operator_case(process: bool) -> anyhow::Result<()> {
     let workspace = tempfile::tempdir()?;
     let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
@@ -244,7 +254,19 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
                     let service = authority.publication().task_service(Arc::clone(&authority), registry)?;
                     owner.retain_child_service(Arc::clone(&service))?;
                     let mut segments = authority.segments()?;
-                    let source = segments.record(task).await?;
+                    let mut source = segments.record(task).await?;
+                    assert!(source.1.approval_ledger.is_none());
+                    crate::tools::sessions_spawn::configure_operator_child_approval(&mut source.1, &service, None);
+                    assert!(
+                        source.1.approval_ledger.is_none(),
+                        "ordinary child path must not opt in"
+                    );
+                    crate::tools::sessions_spawn::configure_operator_child_approval(
+                        &mut source.1,
+                        &service,
+                        Some(&authority),
+                    );
+                    assert!(source.1.approval_ledger.is_some(), "operator task child must opt in");
                     _task_lifetime = Some(lifetime);
                     _process_lifetime = None;
                     (service, source)
@@ -259,6 +281,10 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
                     None,
                 )
                 .await?;
+                assert!(
+                    turn.adapter().tool_execution_context.approval_ledger.is_some(),
+                    "admitted operator child adapter must retain its builder ledger"
+                );
                 assert_eq!(
                     calls.load(Ordering::SeqCst),
                     1,
@@ -474,6 +500,7 @@ async fn process_segment(
     .publish()
     .await?;
     let mut segments = authority.segments()?;
-    let source = segments.record(task).await?;
+    let source = segments.record(task, &service).await?;
+    assert!(source.1.approval_ledger.is_some(), "operator process child must opt in");
     Ok((service, source, lifetime))
 }

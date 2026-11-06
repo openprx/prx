@@ -1922,6 +1922,37 @@ pub(crate) mod admission_failure_tests {
     }
 
     #[tokio::test]
+    async fn h2_approval_ledger_requires_h2_origin() {
+        let (_dir, fabric, binding, origin) = crate::runtime::h2_entry::recorded_terminal_approval_fixture().await;
+        assert!(binding.h2_approval_ledger().is_none(), "no decision or origin");
+        let service = service(&fabric, &binding).await;
+        assert!(service.execution_approval_ledger().is_some(), "durable fixture ledger");
+        binding
+            .decide(&service, &tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            binding.h2_approval_ledger().is_none(),
+            "decision without h2 origin must retain interactive approval"
+        );
+        binding.h2_origin.set(origin).unwrap();
+        assert!(
+            binding.h2_approval_ledger().is_some(),
+            "h2 origin plus decision opts in"
+        );
+        let (_other_dir, _other_fabric, other, other_origin) =
+            crate::runtime::h2_entry::recorded_terminal_approval_fixture().await;
+        other.h2_origin.set(other_origin).unwrap();
+        assert!(
+            other.h2_approval_ledger().is_none(),
+            "h2 origin without decision cannot opt in"
+        );
+        service
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await;
+    }
+
+    #[tokio::test]
     async fn advisory_decide_mode_projects_prediction_and_lazily_opens_store() {
         use crate::decision_engine::config::{DecisionEngineConfig, DecisionMode};
         for (enabled, mode) in [

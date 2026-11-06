@@ -42,6 +42,7 @@ impl OperatorProcessSegments {
     pub(crate) async fn record(
         &mut self,
         input: &str,
+        service: &crate::runtime::turn_decision::TurnDecisionService,
     ) -> anyhow::Result<(Arc<OwnedTurnSourceProof>, ToolExecutionContext)> {
         self.authority.verify()?;
         anyhow::ensure!(
@@ -106,7 +107,8 @@ impl OperatorProcessSegments {
         envelope.lease_epoch = scope.lease_epoch;
         envelope.config_generation_id = scope.config_generation_id;
         envelope.config_source_revision = scope.config_source_revision;
-        let execution = ToolExecutionContext::new(envelope, proof.policy_chat_type());
+        let execution = ToolExecutionContext::new(envelope, proof.policy_chat_type())
+            .with_approval_ledger(service.execution_approval_ledger());
         self.authority.verify_source(proof.as_ref())?;
         self.next = following;
         self.previous_input = next_previous;

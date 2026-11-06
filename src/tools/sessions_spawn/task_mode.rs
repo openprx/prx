@@ -13,6 +13,17 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+/// Only an explicitly issued operator task opts into durable child review.
+pub(crate) fn configure_operator_child_approval(
+    context: &mut crate::tools::ToolExecutionContext,
+    service: &crate::runtime::turn_decision::TurnDecisionService,
+    authority: Option<&Arc<crate::runtime::operator_spawn::task::OperatorTaskAuthority>>,
+) {
+    if authority.is_some() {
+        context.approval_ledger = service.execution_approval_ledger();
+    }
+}
+
 /// Convert a slice of `ChatMessage` to `HistoryEntry` values.
 /// Each entry is timestamped with the current wall-clock time (approximate).
 fn chat_messages_to_history(messages: &[ChatMessage]) -> Vec<HistoryEntry> {
@@ -300,10 +311,11 @@ pub(super) async fn run_sub_agent_task(
         let ordinary_runtime_owned = ordinary_runtime.clone();
         let parent_hooks_owned = parent_hooks.clone();
         let child_service_owned = child_service.clone().context("task segment service missing")?;
-        if operator_authority.is_some() {
-            // Explicit operator /bg calls opt into durable approval; ordinary children do not.
-            child_source_owned.1.approval_ledger = child_service_owned.execution_approval_ledger();
-        }
+        configure_operator_child_approval(
+            &mut child_source_owned.1,
+            &child_service_owned,
+            operator_authority.as_ref(),
+        );
         let child_config_owned = child_config.clone().context("task segment configuration missing")?;
         let child_fabric_owned = child_fabric.clone().context("task segment fabric missing")?;
         let child_usage_owned = child_usage.clone();

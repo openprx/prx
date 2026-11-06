@@ -32,6 +32,8 @@ mod provider;
 mod scope;
 mod spawn;
 mod task_mode;
+#[cfg(test)]
+pub(crate) use task_mode::configure_operator_child_approval;
 mod terminal_commit;
 #[cfg(test)]
 mod test_parent;

@@ -149,7 +149,7 @@ async fn bind_keeps_no_ledger_for_tui_line_mode_and_cli() {
 }
 
 #[tokio::test]
-async fn bind_keeps_ledger_for_console_gateway_h2_and_bg() {
+async fn bind_preserves_explicit_ledger_identity() {
     Box::pin(exact_file_without_intent(false, Some(true))).await;
 }
 

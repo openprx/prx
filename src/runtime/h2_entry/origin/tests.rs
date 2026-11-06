@@ -87,3 +87,35 @@ async fn gateway_profile_cannot_adopt_actual_terminal_source_even_with_same_stri
     .await;
     assert!(fixture.profile.bind_gateway(source.as_ref()).is_err());
 }
+
+/// Actual recorded Chat source and producer-bound origin for builder tests.
+pub(crate) async fn recorded_terminal_approval_fixture() -> (
+    tempfile::TempDir,
+    crate::memory::MemoryFabric,
+    Arc<crate::chat::decision_source::ChatTurnBinding>,
+    Arc<VerifiedEntryOrigin>,
+) {
+    let fixture = Fixture::new(EntryKind::Terminal);
+    crate::decision::DecisionKey::load_or_create(&fixture.config.workspace_dir).unwrap();
+    let generation = crate::config::new_shared(fixture.config).pin();
+    let memory: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(fixture.directory.path()).unwrap());
+    let fabric = crate::memory::MemoryFabric::new(memory.clone(), generation.effective.workspace_dir.to_string_lossy())
+        .with_event_recording(generation.effective.memory.event_recording_config());
+    let (binding, _) = crate::chat::decision_source::admission_failure_tests::recorded_approval_source(
+        &generation,
+        memory,
+        "prx input",
+        crate::agent::turn_contracts::ChatMode::Edit,
+        "prx_h2_approval",
+        1,
+    )
+    .await;
+    let mut producer = producer(fixture.profile);
+    let origin = producer
+        .submitted("prx_h2_input", "prx input")
+        .unwrap()
+        .bind(binding.as_ref())
+        .unwrap();
+    (fixture.directory, fabric, binding, origin)
+}
