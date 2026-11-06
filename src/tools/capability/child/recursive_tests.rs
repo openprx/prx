@@ -15,7 +15,7 @@ fn parent(workspace: &std::path::Path) -> (CapabilityConstraints, CapabilityRef,
     let other = reference("delegate", 3);
     (
         CapabilityConstraints {
-            decision_id: DecisionId::legacy(&[9; 32]),
+            parent_authority_id: DecisionId::legacy(&[9; 32]).into(),
             allowed: BTreeSet::from([spawn.clone(), read.clone(), other]),
             authority: AuthorityEnvelope {
                 owner: "prx_user".to_owned(),
@@ -91,7 +91,7 @@ fn descendant_manifest_keeps_model_pins_and_cannot_replenish_depth_or_tools() {
         ChildCapabilityManifest::for_recursive_spawn(&root, &[spawn.clone(), read], "ollama", "prx-local-model", 2)
             .unwrap();
     let parent = CapabilityConstraints {
-        decision_id: DecisionId::legacy(&[8; 32]),
+        parent_authority_id: DecisionId::legacy(&[8; 32]).into(),
         allowed: child.allowed,
         authority: child.authority,
         catalog_generation: root.catalog_generation,
@@ -117,7 +117,7 @@ fn descendant_manifest_keeps_model_pins_and_cannot_replenish_depth_or_tools() {
     );
     assert_eq!(grandchild.authority.max_cost_cents, 7);
     let leaf_parent = CapabilityConstraints {
-        decision_id: DecisionId::legacy(&[6; 32]),
+        parent_authority_id: DecisionId::legacy(&[6; 32]).into(),
         allowed: grandchild.allowed,
         authority: grandchild.authority,
         catalog_generation: parent.catalog_generation,
@@ -139,7 +139,7 @@ fn descendant_manifest_keeps_model_pins_and_cannot_replenish_depth_or_tools() {
     assert!(!pins.requested, "each new spawn requires its own opt-in");
     assert_eq!(pins.model, "prx-local-model");
     let exhausted = CapabilityConstraints {
-        decision_id: DecisionId::legacy(&[5; 32]),
+        parent_authority_id: DecisionId::legacy(&[5; 32]).into(),
         allowed: leaf.allowed,
         authority: leaf.authority,
         catalog_generation: parent.catalog_generation,

@@ -38,7 +38,7 @@ pub(crate) async fn persist(
         crate::decision::key::KeyDomain::StateFingerprint,
         &[
             b"worker-completion-journal-v1",
-            child.parent_decision_id.to_string().as_bytes(),
+            child.parent_authority_id.to_string().as_bytes(),
             &evidence.signing_bytes(&projection)?,
         ],
     );
@@ -126,7 +126,7 @@ pub(crate) async fn persist_ordinary(
         crate::decision::key::KeyDomain::StateFingerprint,
         &[
             b"ordinary-worker-completion-journal-v1",
-            child.parent_decision_id.to_string().as_bytes(),
+            child.parent_authority_id.to_string().as_bytes(),
             &evidence.signing_bytes(&projection)?,
         ],
     );

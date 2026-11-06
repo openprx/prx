@@ -1337,7 +1337,7 @@ fn derive_outgoing_child(
     let Some((parent, requested)) = delegation else {
         return Ok(None);
     };
-    if parent.decision_id != decision_id
+    if parent.parent_authority_id != decision_id.into()
         || parent.key.hmac(
             crate::decision::KeyDomain::StateFingerprint,
             &[b"outgoing-child-key-v1"],
@@ -2157,7 +2157,7 @@ mod tests {
         let other = reference("other");
         let root_id = DecisionId::parse("0192f0c4-0000-7000-8000-000000000001").unwrap();
         let root = CapabilityConstraints {
-            decision_id: root_id,
+            parent_authority_id: root_id.into(),
             allowed: BTreeSet::from([spawn.clone(), read.clone(), search.clone(), other]),
             authority: AuthorityEnvelope {
                 owner: trusted.owner_id.as_ref().unwrap().to_string(),
@@ -2173,7 +2173,7 @@ mod tests {
         let mut read_only_policy = SecurityPolicy::default();
         read_only_policy.autonomy = AutonomyLevel::ReadOnly;
         let overprivileged = CapabilityConstraints {
-            decision_id: root_id,
+            parent_authority_id: root_id.into(),
             allowed: root.allowed.clone(),
             authority: AuthorityEnvelope {
                 level: AutonomyLevel::Full,
@@ -2223,7 +2223,7 @@ mod tests {
 
         let nested_id = DecisionId::parse("0192f0c4-0000-7000-8000-000000000002").unwrap();
         let nested = CapabilityConstraints {
-            decision_id: nested_id,
+            parent_authority_id: nested_id.into(),
             allowed: first.allowed.clone(),
             authority: first.authority.clone(),
             catalog_generation: generation,
@@ -2245,7 +2245,7 @@ mod tests {
         second.verify(&nested).unwrap();
 
         let mismatched = CapabilityConstraints {
-            decision_id: nested_id,
+            parent_authority_id: nested_id.into(),
             allowed: BTreeSet::from([read.clone(), search.clone()]),
             authority: nested.authority.clone(),
             catalog_generation: generation,
@@ -2265,7 +2265,7 @@ mod tests {
         ));
         let wrong_key = fixtures::key();
         let wrong = CapabilityConstraints {
-            decision_id: nested_id,
+            parent_authority_id: nested_id.into(),
             allowed: nested.allowed.clone(),
             authority: nested.authority.clone(),
             catalog_generation: generation,
@@ -2340,7 +2340,7 @@ mod tests {
         assert!(matches!(
             super::super::directive::directive_from_selection(&decision, &context),
             Ok(super::super::directive::TurnExecutionDirective::Delegate { manifest })
-                if manifest.parent_decision_id == nested_id && !manifest.allowed.contains(&spawn)
+                if manifest.parent_authority_id == nested_id.into() && !manifest.allowed.contains(&spawn)
         ));
         // A separately derived child without spawn cannot emit Delegate.
         let no_spawn = derive_outgoing_child(
@@ -2356,7 +2356,7 @@ mod tests {
         .unwrap();
         assert!(!no_spawn.allowed.contains(&spawn));
         let no_spawn_parent = CapabilityConstraints {
-            decision_id: nested_id,
+            parent_authority_id: nested_id.into(),
             allowed: no_spawn.allowed.clone(),
             authority: no_spawn.authority.clone(),
             catalog_generation: generation,
@@ -2426,7 +2426,9 @@ mod tests {
         trusted.workspace_id = Arc::from("prx_workspace");
         trusted.catalog_generation = view.generation();
         let parent = CapabilityConstraints {
-            decision_id: DecisionId::parse("0192f0c4-0000-7000-8000-000000000001").unwrap(),
+            parent_authority_id: DecisionId::parse("0192f0c4-0000-7000-8000-000000000001")
+                .unwrap()
+                .into(),
             allowed: BTreeSet::from([reference]),
             authority: AuthorityEnvelope {
                 owner: trusted.owner_id.as_ref().unwrap().to_string(),

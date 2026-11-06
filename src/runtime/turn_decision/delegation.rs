@@ -145,7 +145,7 @@ impl TurnDecisionService {
             .checked_add(1)
             .context("child depth cannot reconstruct issued parent")?;
         let parent = CapabilityConstraints {
-            decision_id: context.decision_id(),
+            parent_authority_id: context.decision_id().into(),
             allowed: context
                 .engine
                 .outgoing_parent_allowed
@@ -373,7 +373,7 @@ impl TurnDecisionService {
             self.security.autonomy
         };
         let parent = CapabilityConstraints {
-            decision_id,
+            parent_authority_id: decision_id.into(),
             allowed,
             authority: inherited.map_or_else(
                 || AuthorityEnvelope {

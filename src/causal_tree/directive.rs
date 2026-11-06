@@ -222,7 +222,7 @@ pub(crate) fn directive_from_selection(
                         .outgoing_parent_allowed
                         .as_ref()
                         .ok_or(DirectiveError::InvalidChildScope)?;
-                    let decision_bound = manifest.parent_decision_id == decision.decision_id;
+                    let decision_bound = manifest.parent_authority_id == decision.decision_id.into();
                     let generation_bound = manifest.catalog_generation == trusted.catalog_generation;
                     let workspace_bound = manifest.authority.workspace == trusted.workspace_id.as_ref();
                     let owner_bound = trusted.owner_id.as_deref() == Some(manifest.authority.owner.as_str());

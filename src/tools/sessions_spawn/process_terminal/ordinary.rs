@@ -171,7 +171,7 @@ pub(super) async fn authenticate_launch(
     crate::runtime::child_source::ordinary_process::restore_input(fabric, worker, &scope, &provenance).await?;
     let lineage = CompletionLineage::from_worker(
         worker,
-        scope.gate_inputs().0.parent_decision_id.to_string(),
+        scope.gate_inputs().0.parent_authority_id.to_string(),
         provenance.session_key().to_owned(),
     )?;
     Ok((key, lineage))

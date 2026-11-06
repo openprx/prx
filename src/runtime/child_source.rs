@@ -405,7 +405,7 @@ fn verify_worker_input(
             crate::decision::key::KeyDomain::StateFingerprint,
             &[
                 b"worker-child-input-v1",
-                child.parent_decision_id.to_string().as_bytes(),
+                child.parent_authority_id.to_string().as_bytes(),
                 &serde_json::to_vec(&event)?
             ],
             &source.input_event_mac
@@ -513,7 +513,7 @@ impl ChildSegmentSequence {
             "task_input_event_id": event.event_id,
             "segment_index": self.next,
             "previous_segment_input_event_id": self.previous_input.as_ref().map(SegmentPredecessor::event_id),
-            "parent_decision_id": manifest.parent_decision_id.to_string(),
+            "parent_decision_id": manifest.parent_authority_id.to_string(),
         })
         .to_string();
         let mut receipt = record_child_input(
@@ -693,7 +693,10 @@ impl IssuedChildGrant {
         verify_worker_input(runtime.source_fabric.workspace_id(), worker, &scope, receipt.event())?;
         let source = worker.child_source.as_ref().context("worker child source missing")?;
         let (child, constraints) = scope.gate_inputs();
-        let expected_parent = parent.bind_process(child.parent_decision_id, &constraints.key)?;
+        let expected_parent = parent.bind_process(
+            crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
+            &constraints.key,
+        )?;
         anyhow::ensure!(
             source.parent_store_workspace == parent_record_binding.0.as_ref()
                 && source.parent_decision_digest == parent_record_binding.1
@@ -751,18 +754,19 @@ impl IssuedChildGrant {
         let parent_constraints = constraints.to_worker_constraints()?;
         let config_generation = self.generation().bind_process(&constraints.key)?;
         let catalog = self.catalog().bind_process(&constraints.key)?;
-        let provider_catalog = self
-            .provider_catalog()
-            .bind_process(&constraints.key, manifest.parent_decision_id)?;
-        let parent_source = self
-            .0
-            .parent
-            .bind_process(manifest.parent_decision_id, &constraints.key)?;
+        let provider_catalog = self.provider_catalog().bind_process(
+            &constraints.key,
+            crate::causal_tree::ids::DecisionId::parse(&manifest.parent_authority_id.to_string())?,
+        )?;
+        let parent_source = self.0.parent.bind_process(
+            crate::causal_tree::ids::DecisionId::parse(&manifest.parent_authority_id.to_string())?,
+            &constraints.key,
+        )?;
         let input_event_mac = constraints.key.hmac(
             crate::decision::key::KeyDomain::StateFingerprint,
             &[
                 b"worker-child-input-v1",
-                manifest.parent_decision_id.to_string().as_bytes(),
+                manifest.parent_authority_id.to_string().as_bytes(),
                 &serde_json::to_vec(event)?,
             ],
         );

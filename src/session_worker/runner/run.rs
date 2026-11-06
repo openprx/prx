@@ -310,7 +310,10 @@ fn verify_worker_parent_authority(
     };
     let record = store
         .reader()
-        .replay_record(&scope, &parent.decision_id)?
+        .replay_record(
+            &scope,
+            &crate::causal_tree::ids::DecisionId::parse(&parent.parent_authority_id.to_string())?,
+        )?
         .context("session-worker parent decision is unavailable")?;
     anyhow::ensure!(
         record.digest == source.parent_decision_digest
@@ -634,7 +637,7 @@ async fn run_owned_manifest(
         let provider_catalog = crate::providers::catalog::CatalogView::restore_process(
             &source.provider_catalog,
             &constraints.key,
-            constraints.decision_id,
+            crate::causal_tree::ids::DecisionId::parse(&constraints.parent_authority_id.to_string())?,
         )?;
         Some(crate::runtime::child_source::IssuedChildGrant::restore_process(
             Arc::clone(&authority.scope),
@@ -1455,7 +1458,7 @@ async fn run_owned_manifest(
             crate::decision::key::KeyDomain::StateFingerprint,
             &[
                 b"worker-completion-v1",
-                child.parent_decision_id.to_string().as_bytes(),
+                child.parent_authority_id.to_string().as_bytes(),
                 &evidence.signing_bytes(&worker_result)?,
             ],
         );
@@ -1495,7 +1498,7 @@ async fn run_owned_manifest(
             crate::decision::key::KeyDomain::StateFingerprint,
             &[
                 b"ordinary-worker-completion-v1",
-                child.parent_decision_id.to_string().as_bytes(),
+                child.parent_authority_id.to_string().as_bytes(),
                 &evidence.signing_bytes(&worker_result)?,
             ],
         );

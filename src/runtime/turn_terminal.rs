@@ -932,7 +932,10 @@ impl super::ingress_recovery::RecoveryScope {
             "terminal replay belongs to another ingress surface"
         );
         anyhow::ensure!(
-            replay.parent_decision_id() == self.parent_decision_id,
+            replay
+                .parent_decision_id()
+                .map(crate::tools::capability::child::ParentAuthorityId::from)
+                == self.parent_authority_id,
             "terminal replay belongs to another parent decision"
         );
         #[cfg(test)]

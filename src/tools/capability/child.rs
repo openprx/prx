@@ -10,6 +10,40 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
+/// Identity of the authority issuing a child, independent of decision admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParentAuthorityId(uuid::Uuid);
+
+impl ParentAuthorityId {
+    // R1 supplies the identity; run-rooted publication is connected in R2.
+    #[cfg_attr(not(test), expect(dead_code, reason = "run-rooted publication lands in R2"))]
+    pub(crate) fn for_run(run_id: &str, key: &DecisionKey) -> Self {
+        let digest = key.hmac(
+            KeyDomain::StateFingerprint,
+            &[b"child-parent-run-v1", run_id.as_bytes()],
+        );
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Self(uuid::Builder::from_custom_bytes(bytes).into_uuid())
+    }
+
+    fn parse(text: &str) -> Result<Self, uuid::Error> {
+        uuid::Uuid::parse_str(text).map(Self)
+    }
+}
+
+impl From<DecisionId> for ParentAuthorityId {
+    fn from(decision_id: DecisionId) -> Self {
+        Self(decision_id.as_uuid())
+    }
+}
+
+impl std::fmt::Display for ParentAuthorityId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.as_hyphenated().fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthorityEnvelope {
     pub owner: String,
@@ -22,7 +56,7 @@ pub(crate) struct AuthorityEnvelope {
 
 #[derive(Clone)]
 pub(crate) struct CapabilityConstraints {
-    pub decision_id: DecisionId,
+    pub parent_authority_id: ParentAuthorityId,
     pub allowed: BTreeSet<CapabilityRef>,
     pub authority: AuthorityEnvelope,
     pub catalog_generation: CatalogGeneration,
@@ -31,7 +65,7 @@ pub(crate) struct CapabilityConstraints {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChildCapabilityManifest {
-    pub parent_decision_id: DecisionId,
+    pub parent_authority_id: ParentAuthorityId,
     pub allowed: BTreeSet<CapabilityRef>,
     pub authority: AuthorityEnvelope,
     pub catalog_generation: CatalogGeneration,
@@ -198,7 +232,7 @@ impl ChildCapabilityManifest {
             }));
         }
         let mut manifest = Self {
-            parent_decision_id: parent.decision_id,
+            parent_authority_id: parent.parent_authority_id,
             allowed,
             authority,
             catalog_generation: parent.catalog_generation,
@@ -217,7 +251,7 @@ impl ChildCapabilityManifest {
         {
             return Err(ChildManifestError::InvalidTransport);
         }
-        if self.parent_decision_id != parent.decision_id {
+        if self.parent_authority_id != parent.parent_authority_id {
             return Err(ChildManifestError::StaleReference);
         }
         if self.catalog_generation != parent.catalog_generation {
@@ -246,67 +280,9 @@ impl ChildCapabilityManifest {
         Ok(())
     }
 
-    /// Decode transport data only against the authenticated parent context.
-    /// An outer worker HMAC does not replace this exact subset/seal check.
-    pub(crate) fn from_worker_manifest(
-        wire: &wire::WorkerChildCapabilityManifest,
-        parent: &CapabilityConstraints,
-    ) -> Result<Self, ChildManifestError> {
-        let invalid = || ChildManifestError::InvalidTransport;
-        let parent_decision_id = DecisionId::parse(&wire.parent_decision_id).map_err(|_| invalid())?;
-        if parent_decision_id.to_string() != wire.parent_decision_id
-            || wire.owner.is_empty()
-            || wire.workspace.is_empty()
-            || wire.allowed.len() >= parent.allowed.len()
-        {
-            return Err(invalid());
-        }
-        let allowed = decode_worker_refs(&wire.allowed, CatalogGeneration(wire.catalog_generation))?;
-        let manifest = Self {
-            parent_decision_id,
-            allowed,
-            authority: AuthorityEnvelope {
-                owner: wire.owner.clone(),
-                workspace: wire.workspace.clone(),
-                level: wire.level,
-                max_cost_cents: wire.max_cost_cents,
-                remaining_depth: wire.remaining_depth,
-                delegation: wire.delegation.clone().map(Arc::new),
-            },
-            catalog_generation: CatalogGeneration(wire.catalog_generation),
-            seal: wire.seal,
-        };
-        manifest.verify(parent)?;
-        Ok(manifest)
-    }
-
-    pub(crate) fn to_worker_manifest(&self) -> wire::WorkerChildCapabilityManifest {
-        use wire::{WorkerChildCapabilityManifest, WorkerChildCapabilityRef};
-        WorkerChildCapabilityManifest {
-            parent_decision_id: self.parent_decision_id.to_string(),
-            allowed: self
-                .allowed
-                .iter()
-                .map(|reference| WorkerChildCapabilityRef {
-                    id: reference.id.as_str().to_owned(),
-                    fingerprint: reference.fingerprint.0,
-                    generation: reference.generation.0,
-                })
-                .collect(),
-            owner: self.authority.owner.clone(),
-            workspace: self.authority.workspace.clone(),
-            level: self.authority.level,
-            max_cost_cents: self.authority.max_cost_cents,
-            remaining_depth: self.authority.remaining_depth,
-            delegation: self.authority.delegation.as_deref().cloned(),
-            catalog_generation: self.catalog_generation.0,
-            seal: self.seal,
-        }
-    }
-
     fn compute_seal(&self, key: &DecisionKey) -> [u8; 32] {
         let mut encoded = Vec::new();
-        append(&mut encoded, self.parent_decision_id.to_string().as_bytes());
+        append(&mut encoded, self.parent_authority_id.to_string().as_bytes());
         append(&mut encoded, &self.catalog_generation.0);
         append(&mut encoded, self.authority.owner.as_bytes());
         append(&mut encoded, self.authority.workspace.as_bytes());
@@ -395,7 +371,7 @@ mod tests {
             generation,
         };
         let parent = CapabilityConstraints {
-            decision_id: DecisionId::legacy(&[9; 32]),
+            parent_authority_id: DecisionId::legacy(&[9; 32]).into(),
             allowed: BTreeSet::from([first.clone(), second.clone()]),
             authority: AuthorityEnvelope {
                 owner: "prx_user".to_string(),
@@ -418,7 +394,7 @@ mod tests {
         assert_eq!(model_only.authority.owner, parent.authority.owner);
         assert_eq!(model_only.authority.max_cost_cents, parent.authority.max_cost_cents);
         let leaf = CapabilityConstraints {
-            decision_id: parent.decision_id,
+            parent_authority_id: parent.parent_authority_id,
             allowed: model_only.allowed.clone(),
             authority: model_only.authority,
             catalog_generation: parent.catalog_generation,
@@ -469,3 +445,6 @@ mod tests {
 
 #[cfg(test)]
 mod recursive_tests;
+
+#[cfg(test)]
+mod authority_tests;

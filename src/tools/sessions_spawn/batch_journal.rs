@@ -82,7 +82,7 @@ impl PreparedBatch {
             store_workspace: Some(grant.parent_record_binding().0.to_owned()),
             owner: scope.authority.owner.clone(),
             batch: batch.to_owned(),
-            parent_decision: scope.parent_decision_id.to_string(),
+            parent_decision: scope.parent_authority_id.to_string(),
             parent_digest: grant.parent_record_binding().1.to_owned(),
             ordinary_source: None,
             members: members

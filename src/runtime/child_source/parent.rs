@@ -359,7 +359,7 @@ impl ParentSource {
                     KeyDomain::StateFingerprint,
                     &[
                         b"worker-parent-source-v1",
-                        child.parent_decision_id.to_string().as_bytes(),
+                        child.parent_authority_id.to_string().as_bytes(),
                         snapshot.payload.as_bytes()
                     ],
                     &snapshot.seal,
@@ -440,7 +440,7 @@ impl ParentSource {
                 KeyDomain::StateFingerprint,
                 &[
                     b"worker-parent-source-v1",
-                    child.parent_decision_id.to_string().as_bytes(),
+                    child.parent_authority_id.to_string().as_bytes(),
                     snapshot.payload.as_bytes()
                 ],
                 &snapshot.seal
@@ -485,7 +485,10 @@ impl ParentSource {
         };
         let row = store
             .reader()
-            .replay_record(&owner_scope, &child.parent_decision_id)?
+            .replay_record(
+                &owner_scope,
+                &crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
+            )?
             .context("worker parent decision is unavailable")?;
         anyhow::ensure!(
             row.digest == source.parent_decision_digest

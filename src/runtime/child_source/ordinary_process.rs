@@ -75,7 +75,7 @@ pub(crate) async fn restore_input(
             crate::decision::key::KeyDomain::StateFingerprint,
             &[
                 b"worker-child-input-v1",
-                child.parent_decision_id.to_string().as_bytes(),
+                child.parent_authority_id.to_string().as_bytes(),
                 &serde_json::to_vec(&event)?
             ],
             &input.event_mac,
