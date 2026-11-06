@@ -6,7 +6,7 @@ mod router_history;
 
 use super::{DecisionSettlementRef, TurnTerminalCommit, TurnTerminalStatus, terminal_semantic_scope};
 use crate::causal_tree::ids::DecisionId;
-use crate::causal_tree::store::{DecisionScope, DecisionStoreReader, DecisionView};
+use crate::causal_tree::store::{DecisionReplayRecord, DecisionScope, DecisionStoreReader, DecisionView};
 use crate::decision::{DecisionKey, KeyDomain};
 use crate::memory::{Memory, MessageEvent, MessageEventScope};
 use anyhow::Context;
@@ -553,6 +553,51 @@ impl VerifiedTerminalReplay {
     }
 }
 
+/// Cutover switch for replay evidence authority. While false, the decision store
+/// remains the authority for replay rows. No config, env or test override exists.
+pub(crate) const REPLAY_EVIDENCE_AUTHORITY: bool = false;
+
+/// Journal-backed terminal replay failure. Every adapter failure keeps its source.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum JournalReplayError {
+    #[error("journal terminal replay: {0}")]
+    Replay(#[source] anyhow::Error),
+}
+
+/// Where the parent and hop decision rows come from. Both sources feed one
+/// verifier body, so every predicate exists once.
+enum ReplayRows<'a> {
+    Store(&'a DecisionStoreReader),
+    Journal {
+        workspace: &'a std::path::Path,
+        key: &'a Arc<DecisionKey>,
+    },
+}
+
+impl ReplayRows<'_> {
+    async fn decision(
+        &self,
+        store_workspace_id: &str,
+        owner_id: &str,
+        id: &DecisionId,
+        bounded: Option<(std::time::Instant, &Arc<crate::runtime::turn_cleanup::CleanupTracker>)>,
+    ) -> anyhow::Result<Option<DecisionReplayRecord>> {
+        match self {
+            Self::Store(reader) => {
+                let scope = DecisionScope::Owner {
+                    workspace_id: Arc::from(store_workspace_id),
+                    owner_id: Arc::from(owner_id),
+                };
+                read_replay_decision(reader, &scope, id, bounded).await
+            }
+            Self::Journal { workspace, key } => {
+                anyhow::ensure!(bounded.is_none(), "journal terminal replay carries no deadline");
+                read_journal_replay_record(workspace, key, store_workspace_id, owner_id, id).await
+            }
+        }
+    }
+}
+
 pub(crate) async fn verify_terminal_replay(
     memory: &dyn Memory,
     reader: &DecisionStoreReader,
@@ -565,7 +610,7 @@ pub(crate) async fn verify_terminal_replay(
 ) -> anyhow::Result<VerifiedTerminalReplay> {
     verify_terminal_replay_inner(
         memory,
-        reader,
+        ReplayRows::Store(reader),
         key,
         store_workspace_id,
         workspace_id,
@@ -575,6 +620,32 @@ pub(crate) async fn verify_terminal_replay(
         None,
     )
     .await
+}
+
+/// Journal-only terminal replay. It never opens or consults the decision store.
+pub(crate) async fn verify_terminal_replay_journal(
+    memory: &dyn Memory,
+    workspace: &std::path::Path,
+    key: &Arc<DecisionKey>,
+    store_workspace_id: &str,
+    workspace_id: &str,
+    owner_id: &str,
+    terminal_id: &str,
+    event: &MessageEvent,
+) -> Result<VerifiedTerminalReplay, JournalReplayError> {
+    verify_terminal_replay_inner(
+        memory,
+        ReplayRows::Journal { workspace, key },
+        key,
+        store_workspace_id,
+        workspace_id,
+        owner_id,
+        terminal_id,
+        event,
+        None,
+    )
+    .await
+    .map_err(JournalReplayError::Replay)
 }
 
 pub(crate) async fn verify_terminal_replay_until(
@@ -591,7 +662,7 @@ pub(crate) async fn verify_terminal_replay_until(
 ) -> anyhow::Result<VerifiedTerminalReplay> {
     verify_terminal_replay_inner(
         memory,
-        reader,
+        ReplayRows::Store(reader),
         key,
         store_workspace_id,
         workspace_id,
@@ -605,7 +676,7 @@ pub(crate) async fn verify_terminal_replay_until(
 
 async fn verify_terminal_replay_inner(
     memory: &dyn Memory,
-    reader: &DecisionStoreReader,
+    rows: ReplayRows<'_>,
     key: &DecisionKey,
     store_workspace_id: &str,
     workspace_id: &str,
@@ -740,11 +811,8 @@ async fn verify_terminal_replay_inner(
     );
     let parent_decision_id = if let Some(parent) = &binding.parent {
         let id = DecisionId::parse(&parent.decision_id)?;
-        let scope = DecisionScope::Owner {
-            workspace_id: Arc::from(store_workspace_id),
-            owner_id: Arc::from(owner_id),
-        };
-        let row = read_replay_decision(reader, &scope, &id, bounded)
+        let row = rows
+            .decision(store_workspace_id, owner_id, &id, bounded)
             .await?
             .context("parent replay decision missing")?;
         let parent_source = read_replay_event(
@@ -860,10 +928,6 @@ async fn verify_terminal_replay_inner(
         );
         None
     };
-    let scope = DecisionScope::Owner {
-        workspace_id: Arc::from(store_workspace_id),
-        owner_id: Arc::from(owner_id),
-    };
     if let Some(router) = &binding.router_read {
         router.validate_complete()?;
         router.validate_source(&source)?;
@@ -874,7 +938,8 @@ async fn verify_terminal_replay_inner(
     for hop in &binding.hops {
         let id =
             DecisionId::parse(&hop.decision_id).map_err(|_| anyhow::anyhow!("invalid terminal replay decision id"))?;
-        let row = read_replay_decision(reader, &scope, &id, bounded)
+        let row = rows
+            .decision(store_workspace_id, owner_id, &id, bounded)
             .await?
             .context("terminal replay decision row is missing")?;
         anyhow::ensure!(
@@ -1142,6 +1207,37 @@ async fn read_replay_decision(
         .await
     } else {
         Ok(reader.replay_record(scope, id)?)
+    }
+}
+
+/// Reads one decision row from `decision_evidence`, authenticated and decoded
+/// for replay. The read runs on the current cleanup owner when there is one.
+pub(crate) async fn read_journal_replay_record(
+    workspace: &std::path::Path,
+    key: &Arc<DecisionKey>,
+    store_workspace: &str,
+    owner: &str,
+    id: &DecisionId,
+) -> anyhow::Result<Option<DecisionReplayRecord>> {
+    let workspace = workspace.to_path_buf();
+    let key = Arc::clone(key);
+    let store_workspace = store_workspace.to_owned();
+    let owner = owner.to_owned();
+    let decision = id.to_string();
+    let read = move || -> anyhow::Result<Option<DecisionReplayRecord>> {
+        crate::runtime::child_source::authority_journal::read_decision_evidence(
+            &workspace,
+            &store_workspace,
+            &owner,
+            &decision,
+            &key,
+        )?
+        .map(|columns| DecisionReplayRecord::from_evidence_columns(&columns))
+        .transpose()
+    };
+    match crate::runtime::turn_cleanup::current_tracker() {
+        Some(tracker) => crate::runtime::ingress_recovery::owned_store_read(&tracker, read).await,
+        None => crate::runtime::blocking::spawn_blocking(read).await?,
     }
 }
 

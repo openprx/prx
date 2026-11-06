@@ -362,7 +362,6 @@ impl EvidenceValue {
         })
     }
 
-    #[cfg(test)]
     fn into_value(self) -> SqlValue {
         match self {
             Self::Null => SqlValue::Null,
@@ -458,7 +457,6 @@ pub(crate) fn write_decision_evidence(
 
 /// Authenticated read by SQL key. Seal first, then the payload identity guard
 /// (sealed workspace, owner and decision must equal the SQL key), then the schema.
-#[cfg(test)]
 pub(crate) fn read_decision_evidence(
     workspace: &Path,
     store_workspace: &str,

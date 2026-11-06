@@ -515,3 +515,245 @@ async fn child_outcome_missing_row_is_refused_for_v3() -> Result<()> {
     );
     Ok(())
 }
+
+/// Decision evidence columns with their schema names, checked against the replay order.
+fn named_evidence_columns(
+    columns: Vec<(String, rusqlite::types::Value)>,
+) -> Result<Vec<(&'static str, rusqlite::types::Value)>> {
+    let names = crate::causal_tree::store::replay_column_names();
+    anyhow::ensure!(columns.len() == names.len(), "test: evidence column count");
+    columns
+        .into_iter()
+        .zip(names)
+        .map(|((name, value), expected)| {
+            anyhow::ensure!(name == expected, "test: evidence column order");
+            Ok((expected, value))
+        })
+        .collect()
+}
+
+/// Rewrites the `candidates_json` column through `edit`, keeping its JSON array shape.
+fn edit_candidates(
+    columns: &mut [(&'static str, rusqlite::types::Value)],
+    edit: impl FnOnce(&mut Vec<crate::causal_tree::store::RecordedCandidate>) -> Result<()>,
+) -> Result<()> {
+    let Some((_, rusqlite::types::Value::Text(text))) = columns.iter().find(|(name, _)| *name == "candidates_json")
+    else {
+        anyhow::bail!("test: candidates_json is not text");
+    };
+    let mut candidates: Vec<crate::causal_tree::store::RecordedCandidate> = serde_json::from_str(text)?;
+    edit(&mut candidates)?;
+    set_column(
+        columns,
+        "candidates_json",
+        rusqlite::types::Value::Text(serde_json::to_string(&candidates)?),
+    )
+}
+
+/// The replay digest of one evidence row, recomputed from its typed columns.
+fn evidence_digest(columns: &[(&'static str, rusqlite::types::Value)]) -> Result<String> {
+    let owned: Vec<(String, rusqlite::types::Value)> = columns
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), value.clone()))
+        .collect();
+    Ok(crate::causal_tree::store::DecisionReplayRecord::from_evidence_columns(&owned)?.digest)
+}
+
+/// Replaces the single `decision_evidence` row of one decision, test-only.
+fn replace_evidence_row(
+    workspace: &std::path::Path,
+    key: &crate::decision::DecisionKey,
+    store_workspace: &str,
+    owner: &str,
+    decision: &str,
+    columns: &[(&'static str, rusqlite::types::Value)],
+) -> Result<()> {
+    let db = rusqlite::Connection::open(authority_journal::path(workspace))?;
+    let deleted = db.execute(
+        "DELETE FROM decision_evidence WHERE workspace = ?1 AND owner = ?2 AND decision = ?3",
+        (store_workspace, owner, decision),
+    )?;
+    anyhow::ensure!(deleted == 1, "test: exactly one decision evidence row must be replaced");
+    drop(db);
+    authority_journal::write_decision_evidence(workspace, key, &[columns.to_vec()])
+}
+
+/// Points the last signed hop at `digest` and reseals the marker with its assistant.
+fn reseal_last_hop(
+    key: &crate::decision::DecisionKey,
+    event: &mut crate::memory::MessageEvent,
+    digest: &str,
+    assistant: Option<&crate::memory::MessageEvent>,
+) -> Result<()> {
+    let mut payload: serde_json::Value =
+        serde_json::from_str(event.raw_payload_json.as_deref().context("test: payload")?)?;
+    let hops = payload
+        .get_mut("terminal_replay_v1")
+        .and_then(|binding| binding.get_mut("hops"))
+        .and_then(serde_json::Value::as_array_mut)
+        .context("test: replay hops")?;
+    hops.last_mut()
+        .and_then(serde_json::Value::as_object_mut)
+        .context("test: last replay hop")?
+        .insert("digest".to_owned(), serde_json::Value::String(digest.to_owned()));
+    crate::agent::terminal::reseal_payload_for_test(key, &mut payload, assistant)?;
+    event.raw_payload_json = Some(serde_json::to_string(&payload)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_replay_refuses_hop_digest_substitution() -> Result<()> {
+    use crate::agent::terminal::{verify_terminal_replay, verify_terminal_replay_journal};
+    use crate::causal_tree::store::{CausalDecisionStore, RecordedCandidate};
+
+    let tmp = tempfile::tempdir()?;
+    let (manifest, result) = completed_child_fixture(&tmp).await?;
+    let source = manifest.child_source.as_ref().context("test: child source")?;
+    let workspace = PathBuf::from(&source.parent_constraints.workspace);
+    let owner = manifest.owner_id.clone().context("test: owner")?;
+    let store_workspace = source.parent_store_workspace.clone();
+    let evidence = result
+        .completion_evidence
+        .as_ref()
+        .context("test: completion evidence")?;
+    let [segment] = evidence.segments.as_slice() else {
+        anyhow::bail!(
+            "test: expected one completed segment, found {}",
+            evidence.segments.len()
+        );
+    };
+    let terminal_id = segment.terminal_id.clone();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.as_path())?);
+    let fabric = MemoryFabric::new(
+        memory,
+        manifest.memory_workspace_id.clone().context("test: memory workspace")?,
+    );
+    let key = crate::decision::DecisionKey::load_existing(&workspace)?;
+    let mut terminal = fabric
+        .memory()
+        .find_message_event_by_idempotency_key(fabric.workspace_id(), &format!("turn:{terminal_id}:final"))
+        .await?
+        .context("test: segment terminal marker")?;
+
+    // Positive store replay of an ordinary terminal: no Router, no collection.
+    // Every store handle closes before the journal-only reads below.
+    let (decision_id, selected_id, assistant) = {
+        let store = CausalDecisionStore::open_unshared_read_only(&workspace);
+        let reader = store.reader();
+        let replay = verify_terminal_replay(
+            fabric.memory().as_ref(),
+            &reader,
+            &key,
+            &store_workspace,
+            fabric.workspace_id(),
+            &owner,
+            &terminal_id,
+            &terminal,
+        )
+        .await?;
+        let payload: serde_json::Value =
+            serde_json::from_str(terminal.raw_payload_json.as_deref().context("test: payload")?)?;
+        anyhow::ensure!(
+            !replay.collected_pending()
+                && !replay.collected_declined()
+                && replay.decision().directive_kind != "collect_approval_arguments"
+                && payload
+                    .get("terminal_replay_v1")
+                    .and_then(|binding| binding.get("router_read"))
+                    .is_none_or(serde_json::Value::is_null),
+            "test: fixture must be an ordinary terminal without Router or collection evidence"
+        );
+        (
+            replay.decision().decision_id.to_string(),
+            replay.decision().selected_candidate_id.clone(),
+            replay.assistant().cloned(),
+        )
+    };
+    let selected_id = selected_id.context("test: selected candidate")?;
+
+    // Baseline: append an unselected candidate (propensity 0.25) to the final row,
+    // then sign that row's digest into the last hop and reseal the marker.
+    let stored = authority_journal::read_decision_evidence(&workspace, &store_workspace, &owner, &decision_id, &key)?
+        .context("test: final decision evidence row")?;
+    let mut columns = named_evidence_columns(stored)?;
+    edit_candidates(&mut columns, |candidates| {
+        anyhow::ensure!(
+            candidates.iter().all(|candidate| candidate.id != "r9-unselected"),
+            "test: r9-unselected must be a new candidate"
+        );
+        let seed = candidates
+            .iter()
+            .find(|candidate| candidate.id == selected_id)
+            .cloned()
+            .context("test: selected candidate row")?;
+        candidates.push(RecordedCandidate {
+            id: "r9-unselected".to_owned(),
+            propensity: Some(0.25),
+            ..seed
+        });
+        Ok(())
+    })?;
+    replace_evidence_row(&workspace, &key, &store_workspace, &owner, &decision_id, &columns)?;
+    reseal_last_hop(&key, &mut terminal, &evidence_digest(&columns)?, assistant.as_ref())?;
+
+    // Remove every decision store file, so the journal-only reads cannot reach it.
+    let db = crate::causal_tree::store::db_path(&workspace);
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", db.display()));
+        if path.exists() {
+            std::fs::rename(&path, format!("{}.unavailable", path.display()))?;
+        }
+    }
+    anyhow::ensure!(!db.exists(), "test: decisions.db must be quarantined");
+
+    let baseline = verify_terminal_replay_journal(
+        fabric.memory().as_ref(),
+        &workspace,
+        &key,
+        &store_workspace,
+        fabric.workspace_id(),
+        &owner,
+        &terminal_id,
+        &terminal,
+    )
+    .await?;
+    anyhow::ensure!(
+        baseline.decision().selected_candidate_id.as_deref() == Some(selected_id.as_str()),
+        "test: the baseline must keep the selected candidate"
+    );
+
+    // Substitution: change only the unselected propensity (0.25 to 0.75). The
+    // signed hop digest still names the 0.25 row, so the replay must refuse.
+    let stored = authority_journal::read_decision_evidence(&workspace, &store_workspace, &owner, &decision_id, &key)?
+        .context("test: final decision evidence row")?;
+    let mut substituted = named_evidence_columns(stored)?;
+    edit_candidates(&mut substituted, |candidates| {
+        let unselected = candidates
+            .iter_mut()
+            .find(|candidate| candidate.id == "r9-unselected")
+            .context("test: unselected candidate")?;
+        unselected.propensity = Some(0.75);
+        Ok(())
+    })?;
+    replace_evidence_row(&workspace, &key, &store_workspace, &owner, &decision_id, &substituted)?;
+    let Err(error) = verify_terminal_replay_journal(
+        fabric.memory().as_ref(),
+        &workspace,
+        &key,
+        &store_workspace,
+        fabric.workspace_id(),
+        &owner,
+        &terminal_id,
+        &terminal,
+    )
+    .await
+    else {
+        anyhow::bail!("substituted hop digest was accepted");
+    };
+    anyhow::ensure!(
+        format!("{error:?}").contains("terminal replay decision chain changed"),
+        "test: substitution must fail the hop digest check: {error:?}"
+    );
+    anyhow::ensure!(!db.exists(), "test: the journal replay must not create decisions.db");
+    Ok(())
+}

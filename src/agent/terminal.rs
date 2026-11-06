@@ -10,7 +10,10 @@ mod replay;
 #[cfg(test)]
 pub(crate) use replay::reseal_payload_for_test;
 pub(crate) mod served_auxiliary;
-pub(crate) use replay::{VerifiedTerminalReplay, verify_terminal_replay, verify_terminal_replay_until};
+pub(crate) use replay::{
+    REPLAY_EVIDENCE_AUTHORITY, VerifiedTerminalReplay, verify_terminal_replay, verify_terminal_replay_journal,
+    verify_terminal_replay_until,
+};
 
 use crate::causal_tree::ids::DecisionId;
 use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
@@ -736,17 +739,32 @@ async fn finalize_turn_impl(
                 .find_message_event_by_idempotency_key(fabric.workspace_id(), &final_key)
                 .await?
             {
-                let verified_replay = verify_terminal_replay(
-                    fabric.memory().as_ref(),
-                    &recorded.reader,
-                    &recorded.key,
-                    &recorded.store_workspace_id,
-                    fabric.workspace_id(),
-                    commit.scope.owner_id.as_deref().context("terminal owner is missing")?,
-                    &commit.terminal_id,
-                    &existing,
-                )
-                .await?;
+                let owner_id = commit.scope.owner_id.as_deref().context("terminal owner is missing")?;
+                let verified_replay = if REPLAY_EVIDENCE_AUTHORITY {
+                    verify_terminal_replay_journal(
+                        fabric.memory().as_ref(),
+                        workspace_dir,
+                        &recorded.key,
+                        &recorded.store_workspace_id,
+                        fabric.workspace_id(),
+                        owner_id,
+                        &commit.terminal_id,
+                        &existing,
+                    )
+                    .await?
+                } else {
+                    verify_terminal_replay(
+                        fabric.memory().as_ref(),
+                        &recorded.reader,
+                        &recorded.key,
+                        &recorded.store_workspace_id,
+                        fabric.workspace_id(),
+                        owner_id,
+                        &commit.terminal_id,
+                        &existing,
+                    )
+                    .await?
+                };
                 let payload: serde_json::Value = serde_json::from_str(
                     existing
                         .raw_payload_json
@@ -1015,20 +1033,35 @@ async fn finalize_turn_impl(
         if commit.decision.is_recorded() {
             let decision = &commit.decision;
             let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
-            let verified_replay = verify_terminal_replay(
-                fabric.memory().as_ref(),
-                &recorded.reader,
-                &recorded.key,
-                &recorded.store_workspace_id,
-                fabric.workspace_id(),
-                terminal_event
-                    .owner_id
-                    .as_deref()
-                    .context("terminal owner is missing")?,
-                &commit.terminal_id,
-                &terminal_event,
-            )
-            .await?;
+            let owner_id = terminal_event
+                .owner_id
+                .as_deref()
+                .context("terminal owner is missing")?;
+            let verified_replay = if REPLAY_EVIDENCE_AUTHORITY {
+                verify_terminal_replay_journal(
+                    fabric.memory().as_ref(),
+                    workspace_dir,
+                    &recorded.key,
+                    &recorded.store_workspace_id,
+                    fabric.workspace_id(),
+                    owner_id,
+                    &commit.terminal_id,
+                    &terminal_event,
+                )
+                .await?
+            } else {
+                verify_terminal_replay(
+                    fabric.memory().as_ref(),
+                    &recorded.reader,
+                    &recorded.key,
+                    &recorded.store_workspace_id,
+                    fabric.workspace_id(),
+                    owner_id,
+                    &commit.terminal_id,
+                    &terminal_event,
+                )
+                .await?
+            };
             recorded
                 .child_outcome_hook
                 .persist(&verified_replay, &terminal_event, None, None)
