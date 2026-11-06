@@ -661,7 +661,7 @@ async fn recovery_with_unavailable_key_stays_unrecorded_without_retry() {
 }
 
 #[tokio::test]
-async fn crash_after_ingress_record_rejoins_after_restart_without_decision_service() {
+async fn crash_after_ingress_record_marks_interrupted_after_reopen_without_decision_service() {
     let dir = tempfile::tempdir().unwrap();
     let config = recovery_config(dir.path());
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
@@ -742,14 +742,49 @@ async fn recovery_off_when_user_message_recording_is_disabled() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = recovery_config(dir.path());
     config.memory.events.record_user_messages = false;
+    let config = Arc::new(config);
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
     let tracker = Arc::new(super::super::turn_cleanup::CleanupTracker::default());
     let ticket = tracker.register(tokio_util::sync::CancellationToken::new()).unwrap();
     assert!(
-        IngressRecorder::prepare(memory, &config, &ticket)
+        IngressRecorder::prepare(Arc::clone(&memory), &config, &ticket)
             .await
             .unwrap()
             .is_none()
     );
+    let fabric = crate::memory::MemoryFabric::new(memory.clone(), dir.path().to_string_lossy().into_owned())
+        .with_ingress_recovery(&config, &ticket)
+        .await
+        .unwrap();
+    let event = memory
+        .append_message_event(recovery_input(dir.path(), "prx_run"))
+        .await
+        .unwrap();
+    fabric.verify_ingress_input(&event).unwrap();
+    let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
+    let observer = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+        crate::observability::NoopObserver,
+    )));
+    // Supply durable authority so the recording opt-out is the deciding gate.
+    let key = DecisionKey::load_or_create(dir.path()).unwrap();
+    let recovery = RecoveryScope::prepare(
+        &generation,
+        memory,
+        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        observer,
+        None,
+        &tracker,
+        Some(key),
+    )
+    .await
+    .unwrap();
+    assert!(!recovery.ingress_recovery_enabled());
+    assert!(recovery.store.is_none());
+    assert!(recovery.durable_events.is_none());
+    assert!(!dir.path().join("self/causal_tree/decisions.db").exists());
     ticket.finish(true);
+    tracker
+        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
 }
