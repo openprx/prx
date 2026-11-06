@@ -590,7 +590,7 @@ impl RouterEngine {
         receipt: &crate::agent::terminal::TurnTerminalReceipt,
         source: &dyn crate::runtime::turn_source::TurnSourceProof,
         metadata: &crate::agent::embedded_source::VerifiedEmbeddedInputMetadata,
-        embedding: crate::runtime::turn_decision::RouterEmbedding,
+        embedding: crate::memory::router_history::RouterEmbedding,
     ) -> Result<crate::memory::RouterHistoryWriteEvidence> {
         self.bind_local_source(source)?;
         let policy = if self.history()?.local_embedder_if_present().is_some() {

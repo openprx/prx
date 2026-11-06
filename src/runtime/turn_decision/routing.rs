@@ -1,6 +1,7 @@
 //! One purpose-bound history hop inside the original Agent decision chain.
 //! No constructor here can be reached through backend predictions or wire data.
 mod embedding;
+use crate::memory::router_history::{RouterEmbedding, RouterReadScope};
 
 use super::accounting;
 use super::router_replay_facts::{RouterReadFacts, provider_binding};
@@ -19,7 +20,7 @@ use crate::causal_tree::branch::CausalActionKind;
 use crate::causal_tree::decision_select::Selection;
 use crate::causal_tree::directive::SelectedReadPurpose;
 use crate::causal_tree::state::RouterHistoryReadBinding;
-use crate::memory::{RouterHistoryDomain, RouterHistoryRead, RouterHistoryReadEvidence, RouterHistoryWriteEvidence};
+use crate::memory::{RouterHistoryRead, RouterHistoryReadEvidence, RouterHistoryWriteEvidence};
 use anyhow::ensure;
 use sha2::{Digest, Sha256};
 
@@ -34,18 +35,6 @@ impl RouterModelReadmission {
             "Router model admission belongs to another source"
         );
         Ok(self.selected)
-    }
-}
-
-pub(crate) struct RouterEmbedding {
-    source_event_id: String,
-    query_sha256: [u8; 32],
-    domain: RouterHistoryDomain,
-    vector: Vec<f32>,
-}
-impl RouterEmbedding {
-    pub(crate) fn into_parts(self) -> (String, [u8; 32], RouterHistoryDomain, Vec<f32>) {
-        (self.source_event_id, self.query_sha256, self.domain, self.vector)
     }
 }
 
@@ -505,13 +494,26 @@ impl TurnDecisionService {
                 ));
             }
             let grant = decision.issue_selected_router_read(&catalog, &directive_context, routing_input)?;
-            let evidence = RouterHistoryReadEvidence::from_selected(
-                grant,
-                proof,
-                original.input_metadata()?,
-                domain.clone(),
-                history_deadline,
-            )?;
+            ensure!(
+                grant.matches_source(
+                    proof.workspace_id(),
+                    proof.owner_id(),
+                    proof.session_key(),
+                    proof.run_id(),
+                    proof.source_event_id()
+                ),
+                "Router selection differs from source"
+            );
+            let (_, _, purpose, granted_deadline) = grant.into_parts();
+            ensure!(
+                purpose.domain_sha256.as_slice() == hex::decode(domain.key()?)?
+                    && purpose.query_sha256 == query_sha256
+                    && history_deadline <= granted_deadline,
+                "Router selection differs from routing audit"
+            );
+            let scope = RouterReadScope::from_source(proof, domain.clone(), history_deadline)?;
+            let evidence =
+                RouterHistoryReadEvidence::from_scope(scope, proof, original.input_metadata()?, history_deadline)?;
             let owner =
                 crate::runtime::turn_cleanup::current_tracker().context("Router history cleanup owner missing")?;
             ensure!(

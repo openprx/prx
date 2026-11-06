@@ -6,73 +6,15 @@ use super::{
 };
 use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, CausalActionKind};
 use crate::causal_tree::candidate_generator::CandidateSet;
-use crate::runtime::turn_source::OwnedTurnSourceProof;
 use crate::tools::ToolSpec;
 use crate::tools::capability::search::CatalogSearch;
-use crate::tools::capability::search_tool::{CapabilitySearchPort, MAX_QUERY_BYTES, MAX_SEARCH_HITS};
+use crate::tools::capability::search_tool::CapabilitySearchPort;
 pub(super) use append::DiscoveryAdmission;
 #[cfg(test)]
 pub(super) use append::MAX_DISCOVERED_TOOLS_PER_TURN;
-use std::sync::Weak;
 
-/// Offers in the order searches returned them (best rank first), so a bounded
-/// admission keeps the most relevant hits rather than the alphabetical first.
-#[derive(Default)]
-pub(in crate::runtime::turn_decision) struct DiscoveryOffers(Vec<(String, CapabilityRef)>);
-
-impl DiscoveryOffers {
-    pub(in crate::runtime::turn_decision) fn insert(&mut self, name: String, reference: CapabilityRef) {
-        if let Some(slot) = self.0.iter_mut().find(|(existing, _)| *existing == name) {
-            slot.1 = reference;
-        } else {
-            self.0.push((name, reference));
-        }
-    }
-
-    /// An offer by public name, else by exact capability ID.
-    fn find(&self, name_or_id: &str) -> Option<CapabilityRef> {
-        self.0
-            .iter()
-            .find(|(name, _)| name == name_or_id)
-            .or_else(|| self.0.iter().find(|(_, reference)| reference.id.as_str() == name_or_id))
-            .map(|(_, reference)| reference.clone())
-    }
-
-    fn names(&self) -> Vec<String> {
-        self.0.iter().map(|(name, _)| name.clone()).collect()
-    }
-
-    pub(in crate::runtime::turn_decision) fn clear(&mut self) {
-        self.0.clear();
-    }
-}
-
-#[derive(serde::Serialize)]
-pub(crate) struct CapabilitySearchHit {
-    capability: CapabilitySearchReference,
-    categories: Vec<&'static str>,
-    effect: &'static str,
-    risk: &'static str,
-    approval: &'static str,
-    channel_eligible: bool,
-    schema: ToolSpec,
-}
-
-/// Public offer metadata carries no execution authority.
-#[derive(serde::Serialize)]
-struct CapabilitySearchReference {
-    id: String,
-    fingerprint: String,
-    generation: String,
-}
-
-/// Weak references prevent retaining this tool from keeping a completed turn
-/// alive. The original proof is captured by runtime, never supplied in args.
-pub(crate) struct CapabilitySearchAuthority {
-    service: Weak<TurnDecisionService>,
-    context: Weak<TurnDecisionContext>,
-    proof: OwnedTurnSourceProof,
-}
+pub(super) use crate::tools::capability::search_tool::DiscoveryOffers;
+use crate::tools::capability::search_tool::{DiscoveryEntry, DiscoveryScope};
 
 impl TurnDecisionService {
     pub(crate) fn capability_search_port(
@@ -84,11 +26,71 @@ impl TurnDecisionService {
             self.agent_capability_search_spec(proof, context)?.is_some(),
             "turn does not expose capability search"
         );
-        Ok(CapabilitySearchPort::new(Arc::new(CapabilitySearchAuthority {
-            service: Arc::downgrade(self),
-            context: Arc::downgrade(context),
-            proof: OwnedTurnSourceProof::capture(proof),
-        })))
+        let families = self.discovery_families(proof, context)?;
+        let view = self
+            .catalog
+            .view(&CatalogScope::default())
+            .with_surface(&self.publication_policy);
+        let trusted = context.engine.state.trusted.parts();
+        let offered_direct = self.direct_discovery_ids(context);
+        let mut entries = BTreeMap::new();
+        for entry in view.iter_entries() {
+            let core = context.execution_refs.iter().any(|reference| {
+                reference.id == entry.id
+                    && reference.fingerprint == entry.fingerprint
+                    && reference.generation == entry.generation
+            });
+            let eligible = !matches!(
+                entry.public_name.as_str(),
+                "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate" | "sessions_spawn"
+            ) && (entry.supports_metadata_discovery()
+                || matches!(entry.exposure, Exposure::Direct) && (offered_direct.contains(&entry.id) || core))
+                && entry.availability.level >= CapabilityAvailabilityLevel::Configured
+                && !trusted.excludes_entry(view.model_admission_entry(entry))
+                && !(trusted.side_effect_mode == crate::causal_tree::state::SideEffectMode::ReadOnly
+                    && entry.effect > crate::causal_tree::branch::SideEffectClass::ReadOnly)
+                && (trusted.channel.is_none() || entry.channel_eligible)
+                && proof.child_scope().is_none_or(|scope| {
+                    scope.gate_inputs().0.allowed.iter().any(|reference| {
+                        reference.id == entry.id
+                            && reference.fingerprint == entry.fingerprint
+                            && reference.generation == entry.generation
+                    })
+                })
+                && crate::tools::execution::decide_tool_execution(
+                    &self.security,
+                    entry.policy_tool_name(),
+                    proof.policy_sender(),
+                    proof.policy_channel(),
+                    proof.policy_chat_type(),
+                ) != crate::tools::execution::ToolExecutionDecision::Deny;
+            if !eligible || (!core && !families.contains(&entry.family)) {
+                continue;
+            }
+            entries.insert(
+                entry.id.clone(),
+                DiscoveryEntry {
+                    reference: CapabilityRef {
+                        id: entry.id.clone(),
+                        fingerprint: entry.fingerprint,
+                        generation: entry.generation,
+                    },
+                    core,
+                    searchable: families.contains(&entry.family)
+                        && (entry.supports_metadata_discovery() || offered_direct.contains(&entry.id)),
+                },
+            );
+        }
+        self.discovery_families(proof, context)?;
+        let offers = context.discovery_offers.get_or_init(Default::default);
+        Ok(CapabilitySearchPort::new(Arc::new(DiscoveryScope::published(
+            Arc::clone(&self.catalog),
+            self.publication_policy.clone(),
+            entries,
+            Arc::downgrade(offers),
+            Arc::downgrade(&context.execution_closed),
+            Arc::downgrade(&self.execution),
+        ))))
     }
 
     /// Stable control definition, separate from the selected business refs and
@@ -246,130 +248,5 @@ impl TurnDecisionService {
             })
             .map(|entry| entry.id.clone())
             .collect()
-    }
-}
-
-impl CapabilitySearchAuthority {
-    pub(crate) fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<CapabilitySearchHit>> {
-        anyhow::ensure!(
-            !query.trim().is_empty() && query.len() <= MAX_QUERY_BYTES && (1..=MAX_SEARCH_HITS).contains(&limit),
-            "capability search query or limit is outside bounds"
-        );
-        let service = self.service.upgrade().context("capability search service expired")?;
-        let context = self.context.upgrade().context("capability search turn expired")?;
-        anyhow::ensure!(
-            service.agent_capability_search_spec(&self.proof, &context)?.is_some(),
-            "capability search is no longer exposed"
-        );
-        let mut families = service.discovery_families(&self.proof, &context)?;
-        let view = service
-            .catalog
-            .view(&CatalogScope::default())
-            .with_surface(&service.publication_policy);
-        // Looking up a schema that is already declared cannot expand the
-        // executable surface, even if its family has no undiscovered peers.
-        let exact_core = context.execution_refs.iter().find_map(|reference| {
-            view.entry_any(&reference.id).filter(|entry| {
-                entry.fingerprint == reference.fingerprint
-                    && entry.generation == reference.generation
-                    && (query.trim().eq_ignore_ascii_case(&entry.public_name) || query.trim() == entry.id.as_str())
-            })
-        });
-        if let Some(entry) = exact_core
-            && !families.contains(&entry.family)
-        {
-            families.push(entry.family);
-        }
-        let trusted = context.engine.state.trusted.parts();
-        let offered_direct = service.direct_discovery_ids(&context);
-        let mut results = Vec::new();
-        let mut issued = Vec::new();
-        let hits = CatalogSearch::find_filtered(&view, query, &families, limit, |entry| {
-            !matches!(
-                entry.public_name.as_str(),
-                "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate" | "sessions_spawn"
-            ) && (entry.supports_metadata_discovery()
-                || matches!(entry.exposure, Exposure::Direct)
-                    && (offered_direct.contains(&entry.id) || exact_core.is_some_and(|core| core.id == entry.id)))
-                && entry.availability.level >= CapabilityAvailabilityLevel::Configured
-                && !trusted.excludes_entry(view.model_admission_entry(entry))
-                && !(trusted.side_effect_mode == crate::causal_tree::state::SideEffectMode::ReadOnly
-                    && entry.effect > crate::causal_tree::branch::SideEffectClass::ReadOnly)
-                && (trusted.channel.is_none() || entry.channel_eligible)
-                && self.proof.child_scope().is_none_or(|scope| {
-                    scope.gate_inputs().0.allowed.iter().any(|reference| {
-                        reference.id == entry.id
-                            && reference.fingerprint == entry.fingerprint
-                            && reference.generation == entry.generation
-                    })
-                })
-                && crate::tools::execution::decide_tool_execution(
-                    &service.security,
-                    entry.policy_tool_name(),
-                    self.proof.policy_sender(),
-                    self.proof.policy_channel(),
-                    self.proof.policy_chat_type(),
-                ) != crate::tools::execution::ToolExecutionDecision::Deny
-        });
-        for hit in hits {
-            let entry = hit.entry;
-            let descriptor = service
-                .execution
-                .current_descriptor(&entry.public_name)
-                .context("discovered capability has no executable descriptor")?;
-            let schema = ToolSpec {
-                name: descriptor.public_name,
-                description: descriptor.description,
-                parameters: descriptor.parameters,
-            };
-            anyhow::ensure!(
-                crate::tools::capability::fingerprint::tool_spec_fingerprint(
-                    &schema.name,
-                    &schema.description,
-                    &schema.parameters,
-                ) == entry.fingerprint,
-                "discovered capability schema changed"
-            );
-            issued.push((
-                entry.public_name.clone(),
-                CapabilityRef {
-                    id: entry.id.clone(),
-                    fingerprint: entry.fingerprint,
-                    generation: entry.generation,
-                },
-            ));
-            results.push(CapabilitySearchHit {
-                capability: CapabilitySearchReference {
-                    id: entry.id.as_str().to_owned(),
-                    fingerprint: hex::encode(entry.fingerprint.0),
-                    generation: entry.generation.to_hex(),
-                },
-                categories: entry.categories.iter().map(|category| category.as_str()).collect(),
-                effect: entry.effect.as_str(),
-                risk: match entry.risk {
-                    crate::acl::approval_grant::RiskLevel::Low => "low",
-                    crate::acl::approval_grant::RiskLevel::Medium => "medium",
-                    crate::acl::approval_grant::RiskLevel::High => "high",
-                },
-                approval: entry.approval.code(),
-                channel_eligible: entry.channel_eligible,
-                schema,
-            });
-        }
-        // Recheck lifetime and parity after reading the descriptor snapshot.
-        service.discovery_families(&self.proof, &context)?;
-        if !issued.is_empty() {
-            let mut offers = context.discovery_offers.get_or_init(Default::default).lock();
-            // Serialize issuance with terminal clearing. Stored refs are offers,
-            // never entries in the executable capability set.
-            anyhow::ensure!(
-                !context.execution_closed.load(Ordering::Acquire),
-                "capability search turn expired"
-            );
-            for (name, reference) in issued {
-                offers.insert(name, reference);
-            }
-        }
-        Ok(results)
     }
 }

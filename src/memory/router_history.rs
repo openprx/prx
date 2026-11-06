@@ -53,6 +53,65 @@ impl RouterHistoryDomain {
     }
 }
 
+/// Authenticated source binding for a history read, independent of selection.
+#[cfg(feature = "llm-router")]
+pub(crate) struct RouterReadScope {
+    event_id: String,
+    run: String,
+    query_sha256: [u8; 32],
+    domain: RouterHistoryDomain,
+    deadline: Instant,
+}
+
+#[cfg(feature = "llm-router")]
+impl RouterReadScope {
+    pub(crate) fn from_source(
+        source: &dyn crate::runtime::turn_source::TurnSourceProof,
+        domain: RouterHistoryDomain,
+        deadline: Instant,
+    ) -> Result<Self> {
+        domain.validate()?;
+        ensure!(
+            domain.workspace == source.workspace_id()
+                && domain.owner == source.owner_id()
+                && domain.session == source.session_key(),
+            "Router scope differs from authenticated source"
+        );
+        let event_id = source
+            .source_event_id()
+            .ok_or_else(|| anyhow::anyhow!("Router source missing"))?;
+        ensure!(
+            !event_id.is_empty()
+                && event_id.len() <= 512
+                && !source.run_id().is_empty()
+                && source.run_id().len() <= 512
+                && source.routing_input().len() <= ROUTER_HISTORY_MAX_INPUT_BYTES,
+            "Router scope source exceeds bounds"
+        );
+        Ok(Self {
+            event_id: event_id.to_owned(),
+            run: source.run_id().to_owned(),
+            query_sha256: Sha256::digest(source.routing_input().as_bytes()).into(),
+            domain,
+            deadline,
+        })
+    }
+}
+
+#[cfg(feature = "llm-router")]
+pub(crate) struct RouterEmbedding {
+    pub(crate) source_event_id: String,
+    pub(crate) query_sha256: [u8; 32],
+    pub(crate) domain: RouterHistoryDomain,
+    pub(crate) vector: Vec<f32>,
+}
+#[cfg(feature = "llm-router")]
+impl RouterEmbedding {
+    pub(crate) fn into_parts(self) -> (String, [u8; 32], RouterHistoryDomain, Vec<f32>) {
+        (self.source_event_id, self.query_sha256, self.domain, self.vector)
+    }
+}
+
 /// Native embedded input expected by the actual selected read. Every other
 /// authority field must be absent as in the existing Router learning contract.
 /// The backend still compares these bytes against the live durable source.
@@ -65,44 +124,31 @@ pub(super) struct RouterHistorySource {
     pub raw_payload: Option<String>,
 }
 
-/// Issued only from an actual purpose-bound selection in the runtime's unique
-/// routing phase. Consumed by the storage call; not Clone or deserializable.
+/// Authenticated source-bound history evidence, consumed by storage.
+/// It does not carry decision or execution authority.
 pub struct RouterHistoryReadEvidence {
     pub(super) source: RouterHistorySource,
     pub(super) domain: RouterHistoryDomain,
-    pub(super) decision_id: String,
-    pub(super) capability_id: String,
     pub(super) query_sha256: [u8; 32],
     pub(super) deadline: Instant,
 }
 
 impl RouterHistoryReadEvidence {
     #[cfg(feature = "llm-router")]
-    pub(crate) fn from_selected(
-        grant: crate::causal_tree::decision_engine::SelectedRouterReadGrant,
+    pub(crate) fn from_scope(
+        scope: RouterReadScope,
         source: &dyn crate::runtime::turn_source::TurnSourceProof,
         witness: &crate::agent::embedded_source::VerifiedEmbeddedInputMetadata,
-        domain: RouterHistoryDomain,
         deadline: Instant,
     ) -> Result<Self> {
         ensure!(
-            grant.matches_source(
-                source.workspace_id(),
-                source.owner_id(),
-                source.session_key(),
-                source.run_id(),
-                source.source_event_id()
-            ),
-            "Router grant differs from original source"
-        );
-        let (decision, reference, purpose, granted_deadline) = grant.into_parts();
-        let domain_digest = hex::decode(domain.key()?)?;
-        ensure!(
-            domain_digest.as_slice() == purpose.domain_sha256
-                && domain.workspace == source.workspace_id()
-                && domain.owner == source.owner_id()
-                && domain.session == source.session_key(),
-            "Router grant differs from history domain"
+            scope.domain.workspace == source.workspace_id()
+                && scope.domain.owner == source.owner_id()
+                && scope.domain.session == source.session_key()
+                && scope.run == source.run_id()
+                && Some(scope.event_id.as_str()) == source.source_event_id()
+                && scope.query_sha256 == <[u8; 32]>::from(Sha256::digest(source.routing_input().as_bytes())),
+            "Router scope differs from original source"
         );
         let raw = witness.verified_raw_for(source)?;
         // Bounds are checked before cloning any caller-visible source bytes.
@@ -123,11 +169,9 @@ impl RouterHistoryReadEvidence {
                 input: source.routing_input().to_owned(),
                 raw_payload: raw.map(str::to_owned),
             },
-            domain,
-            decision_id: decision.to_string(),
-            capability_id: reference.id.as_str().to_owned(),
-            query_sha256: purpose.query_sha256,
-            deadline: granted_deadline,
+            domain: scope.domain,
+            query_sha256: scope.query_sha256,
+            deadline: scope.deadline,
         };
         evidence.validate(deadline)?;
         Ok(evidence)
@@ -137,7 +181,7 @@ impl RouterHistoryReadEvidence {
         self.domain.validate()?;
         ensure!(
             deadline <= self.deadline && crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
-            "Router history read exceeds its selected deadline"
+            "Router history read exceeds its scope deadline"
         );
         ensure!(
             !self.source.event_id.is_empty()
@@ -155,17 +199,10 @@ impl RouterHistoryReadEvidence {
                     .is_none_or(|raw| raw.len() <= ROUTER_HISTORY_MAX_METADATA_BYTES),
             "Router history source exceeds bounds"
         );
-        ensure!(
-            !self.decision_id.is_empty()
-                && self.decision_id.len() <= 128
-                && !self.capability_id.is_empty()
-                && self.capability_id.len() <= 512,
-            "Router history selection identity exceeds bounds"
-        );
         let actual: [u8; 32] = Sha256::digest(self.source.input.as_bytes()).into();
         ensure!(
             actual == self.query_sha256,
-            "Router history query differs from its selected input"
+            "Router history query differs from its authenticated input"
         );
         Ok(())
     }
@@ -231,10 +268,7 @@ pub struct RouterHistoryWriteEvidence {
 
 impl RouterHistoryWriteEvidence {
     #[cfg(feature = "llm-router")]
-    pub(crate) fn from_terminal(
-        terminal: RouterLearningEvidence,
-        embedding: crate::runtime::turn_decision::RouterEmbedding,
-    ) -> Result<Self> {
+    pub(crate) fn from_terminal(terminal: RouterLearningEvidence, embedding: RouterEmbedding) -> Result<Self> {
         let (source_event_id, query_sha256, domain, embedding) = embedding.into_parts();
         ensure!(
             source_event_id == terminal.source_event_id
@@ -349,3 +383,6 @@ fn hash_field(digest: &mut Sha256, value: &[u8]) {
 
 #[cfg(test)]
 mod codec_tests;
+
+#[cfg(test)]
+mod tests;

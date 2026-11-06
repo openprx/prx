@@ -18,7 +18,7 @@ pub mod postgres;
 pub mod principal;
 pub mod recovery_authority;
 pub mod retrieval;
-mod router_history;
+pub(crate) mod router_history;
 pub mod session_predicate;
 pub mod snapshot;
 pub mod sqlite;

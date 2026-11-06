@@ -38,10 +38,9 @@ mod child_recovery;
 mod delegation;
 mod discovery;
 use super::child_source::recursive_allowance;
+mod execution;
 mod recursive_budget;
 pub(super) mod segment_observation;
-pub(crate) use discovery::CapabilitySearchAuthority;
-mod execution;
 pub(crate) use execution::{OperatorChildPublication, OrdinaryChildPublication, OrdinaryProcessLaunch};
 mod owner_filesystem;
 mod pending_approval;
@@ -55,7 +54,7 @@ mod latency_snapshot;
 #[cfg(feature = "llm-router")]
 mod routing;
 #[cfg(feature = "llm-router")]
-pub(crate) use routing::{RouterEmbedding, RouterModelReadmission, commit_training_owned};
+pub(crate) use routing::{RouterModelReadmission, commit_training_owned};
 
 #[cfg(feature = "llm-router")]
 #[inline(never)]
@@ -646,10 +645,10 @@ pub(crate) struct TurnDecisionContext {
     recursive_allowance: std::sync::OnceLock<recursive_allowance::ContextAllowance>,
     main_parameters: std::sync::OnceLock<crate::providers::parameter_capture::Capture>,
     execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
-    execution_closed: AtomicBool,
+    execution_closed: Arc<AtomicBool>,
     approval_collection_started: AtomicBool,
     collected_approval_result: std::sync::OnceLock<Box<pending_approval::CollectedApprovalResult>>,
-    discovery_offers: std::sync::OnceLock<parking_lot::Mutex<discovery::DiscoveryOffers>>,
+    discovery_offers: std::sync::OnceLock<Arc<parking_lot::Mutex<discovery::DiscoveryOffers>>>,
     discovery_admissions: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<String, discovery::DiscoveryAdmission>>>,
     engine: EngineDecision,
     /// Completed dependent hops retained for the recorder. Nothing is
@@ -2347,7 +2346,7 @@ impl TurnDecisionService {
                 recursive_allowance: self.recursive_allowances.retain(proof),
                 main_parameters: Default::default(),
                 execution_trace: std::sync::OnceLock::new(),
-                execution_closed: AtomicBool::new(false),
+                execution_closed: Arc::new(AtomicBool::new(false)),
                 approval_collection_started: AtomicBool::new(false),
                 collected_approval_result: std::sync::OnceLock::new(),
                 discovery_offers: std::sync::OnceLock::new(),
@@ -2402,7 +2401,7 @@ impl TurnDecisionService {
                         recursive_allowance: self.recursive_allowances.retain(proof),
                         main_parameters: Default::default(),
                         execution_trace: std::sync::OnceLock::new(),
-                        execution_closed: AtomicBool::new(false),
+                        execution_closed: Arc::new(AtomicBool::new(false)),
                         approval_collection_started: AtomicBool::new(false),
                         collected_approval_result: std::sync::OnceLock::new(),
                         discovery_offers: std::sync::OnceLock::new(),
@@ -2682,7 +2681,7 @@ impl TurnDecisionService {
                             recursive_allowance: self.recursive_allowances.retain(proof),
                             main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
-                            execution_closed: AtomicBool::new(false),
+                            execution_closed: Arc::new(AtomicBool::new(false)),
                             approval_collection_started: AtomicBool::new(false),
                             collected_approval_result: std::sync::OnceLock::new(),
                             discovery_offers: std::sync::OnceLock::new(),
@@ -2725,7 +2724,7 @@ impl TurnDecisionService {
                             recursive_allowance: self.recursive_allowances.retain(proof),
                             main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
-                            execution_closed: AtomicBool::new(false),
+                            execution_closed: Arc::new(AtomicBool::new(false)),
                             approval_collection_started: AtomicBool::new(false),
                             collected_approval_result: std::sync::OnceLock::new(),
                             discovery_offers: std::sync::OnceLock::new(),
@@ -2779,7 +2778,7 @@ impl TurnDecisionService {
                             recursive_allowance: self.recursive_allowances.retain(proof),
                             main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
-                            execution_closed: AtomicBool::new(false),
+                            execution_closed: Arc::new(AtomicBool::new(false)),
                             approval_collection_started: AtomicBool::new(false),
                             collected_approval_result: std::sync::OnceLock::new(),
                             discovery_offers: std::sync::OnceLock::new(),
