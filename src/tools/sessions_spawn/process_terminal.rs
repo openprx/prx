@@ -432,7 +432,7 @@ pub(super) async fn verify(
         workspace: &grant.generation().effective.workspace_dir,
         store_workspace,
         owner: &child.authority.owner,
-        parent_decision: child.parent_decision_id,
+        parent_decision: crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
         parent_digest,
         input: input.event(),
         key: &constraints.key,
@@ -680,7 +680,7 @@ pub(super) async fn recover_usage(
         workspace: &grant.generation().effective.workspace_dir,
         store_workspace,
         owner: &child.authority.owner,
-        parent_decision: child.parent_decision_id,
+        parent_decision: crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
         parent_digest,
         input: input.event(),
         key: &constraints.key,
@@ -826,7 +826,8 @@ async fn read_bound_launch(
     };
     let provenance = launch.provenance();
     anyhow::ensure!(
-        provenance.parent_decision == child.parent_decision_id
+        crate::tools::capability::child::ParentAuthorityId::from(provenance.parent_decision)
+            == child.parent_authority_id
             && provenance.store_workspace == grant.parent_record_binding().0
             && provenance.parent_digest == grant.parent_record_binding().1
             && provenance.input.event_id == input.event().event_id,

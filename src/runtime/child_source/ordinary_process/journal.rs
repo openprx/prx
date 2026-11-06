@@ -51,7 +51,7 @@ impl OrdinarySegmentJournal {
             scope: authority.logical_scope(),
             process_id: authority.id.to_string(),
             task_run_id: authority.run_id.clone(),
-            parent_scope_id: child.parent_decision_id.to_string(),
+            parent_scope_id: child.parent_authority_id.to_string(),
             key: Arc::clone(&parent.key),
             recording: authority
                 .snapshots

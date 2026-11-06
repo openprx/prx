@@ -1613,7 +1613,7 @@ mod tests {
             .collect();
         let key = fixtures::key();
         let parent = CapabilityConstraints {
-            decision_id: DecisionId::legacy(&[9; 32]),
+            parent_authority_id: DecisionId::legacy(&[9; 32]).into(),
             allowed: refs.iter().cloned().collect(),
             authority: AuthorityEnvelope {
                 owner: "owner-1".into(),
@@ -1654,7 +1654,7 @@ mod tests {
         let report = HardGates::apply(&state, &view, std::slice::from_ref(&allowed), &inputs).unwrap();
         assert_eq!(report.outcomes.get(allowed.candidate_id()), Some(&blocked(1, "scope")));
         let read_only_parent = CapabilityConstraints {
-            decision_id: parent.decision_id,
+            parent_authority_id: parent.parent_authority_id,
             allowed: parent.allowed.clone(),
             authority: AuthorityEnvelope {
                 level: AutonomyLevel::ReadOnly,
@@ -1670,7 +1670,7 @@ mod tests {
         assert_eq!(report.outcomes.get(allowed.candidate_id()), Some(&blocked(1, "scope")));
 
         let cost_parent = CapabilityConstraints {
-            decision_id: parent.decision_id,
+            parent_authority_id: parent.parent_authority_id,
             allowed: parent.allowed.clone(),
             authority: AuthorityEnvelope {
                 max_cost_cents: 0,
@@ -1700,7 +1700,7 @@ mod tests {
         assert_eq!(report.outcomes.get(costly.candidate_id()), Some(&blocked(1, "scope")));
 
         let depth_parent = CapabilityConstraints {
-            decision_id: parent.decision_id,
+            parent_authority_id: parent.parent_authority_id,
             allowed: parent.allowed.clone(),
             authority: AuthorityEnvelope {
                 remaining_depth: 1,

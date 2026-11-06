@@ -154,7 +154,7 @@ impl OrdinaryProcessLaunch {
                         crate::decision::key::KeyDomain::StateFingerprint,
                         &[
                             b"worker-child-input-v1",
-                            child.parent_decision_id.to_string().as_bytes(),
+                            child.parent_authority_id.to_string().as_bytes(),
                             &serde_json::to_vec(receipt.event())?,
                         ],
                     ),
@@ -167,10 +167,14 @@ impl OrdinaryProcessLaunch {
             input,
             provider_selection: selection.clone(),
             parent_source: crate::runtime::child_source::parent::ParentSource::capture(&publication.0.source)
-                .bind_process(child.parent_decision_id, &parent.key)?,
-            provider_catalog: publication
-                .provider_catalog()
-                .bind_process(&parent.key, child.parent_decision_id)?,
+                .bind_process(
+                    crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
+                    &parent.key,
+                )?,
+            provider_catalog: publication.provider_catalog().bind_process(
+                &parent.key,
+                crate::causal_tree::ids::DecisionId::parse(&child.parent_authority_id.to_string())?,
+            )?,
             parent_constraints: parent.to_worker_constraints()?,
             capability_manifest: child.to_worker_manifest(),
             config_generation: publication.generation().bind_process(&parent.key)?,

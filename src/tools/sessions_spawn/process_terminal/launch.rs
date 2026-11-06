@@ -61,7 +61,7 @@ pub(super) async fn persist(
         owner_id: child.authority.owner.clone(),
         run_id: run.to_owned(),
         session_key: session.to_owned(),
-        parent_decision_id: child.parent_decision_id.to_string(),
+        parent_decision_id: child.parent_authority_id.to_string(),
         parent_decision_digest: grant.parent_record_binding().1.to_owned(),
         parent_task_run_id: (grant.parent().spawn_run_id() != grant.parent().run_id())
             .then(|| grant.parent().spawn_run_id().to_owned()),

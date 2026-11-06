@@ -482,7 +482,7 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
             "closed model-only child requests no inherited tools"
         );
         assert!(!parent_scope.allowed.is_empty());
-        assert_eq!(child_scope.parent_decision_id, context.decision_id());
+        assert_eq!(child_scope.parent_authority_id, context.decision_id().into());
         // Match the real CLI turn adapter's ambient lineage. This carries
         // the issued proof's actual parent IDs; it grants no capabilities.
         let turn_spawn_context = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
@@ -1176,7 +1176,7 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
             assert_eq!(prepared.authority.level, crate::security::AutonomyLevel::Supervised);
             assert_eq!(prepared.authority.owner, proof.owner_id());
             assert_eq!(prepared.authority.workspace, proof.workspace_id());
-            assert_eq!(prepared.parent_decision_id, context.decision_id());
+            assert_eq!(prepared.parent_authority_id, context.decision_id().into());
             assert_eq!(prepared.catalog_generation, context.catalog_generation());
             assert!(
                 prepared.allowed.is_empty(),

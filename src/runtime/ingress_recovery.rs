@@ -22,7 +22,7 @@ pub(crate) struct RecoveryScope {
     pub(super) surface: crate::causal_tree::state::TurnSurfaceKind,
     pub(super) state_key: Arc<DecisionKey>,
     pub(super) store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
-    pub(super) parent_decision_id: Option<crate::causal_tree::ids::DecisionId>,
+    pub(super) parent_authority_id: Option<crate::tools::capability::child::ParentAuthorityId>,
     pub(super) durable_events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
 }
 
@@ -41,7 +41,7 @@ impl RecoveryScope {
             surface,
             state_key,
             store: None,
-            parent_decision_id: None,
+            parent_authority_id: None,
             durable_events: None,
         }
     }
@@ -73,7 +73,7 @@ impl RecoveryScope {
             surface,
             state_key: workspace_key.unwrap_or_else(DecisionKey::ephemeral),
             store: None,
-            parent_decision_id: parent_grant.map(|grant| grant.scope().gate_inputs().0.parent_decision_id),
+            parent_authority_id: parent_grant.map(|grant| grant.scope().gate_inputs().0.parent_authority_id),
             durable_events: None,
         };
         if recordable {

@@ -60,8 +60,11 @@ pub(super) fn restore(
             && manifest.memory_event_recording.record_tool_events == recording.record_tool_events,
         "ordinary worker recording policy differs from authenticated configuration"
     );
-    let provider_catalog =
-        crate::providers::catalog::CatalogView::restore_process(&source.provider_catalog, &key, parent.decision_id)?;
+    let provider_catalog = crate::providers::catalog::CatalogView::restore_process(
+        &source.provider_catalog,
+        &key,
+        crate::causal_tree::ids::DecisionId::parse(&parent.parent_authority_id.to_string())?,
+    )?;
     let selection = &source.provider_selection;
     let resolved = crate::providers::selection::check_with(
         &generation.effective,

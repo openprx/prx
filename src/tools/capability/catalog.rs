@@ -2098,7 +2098,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let key = DecisionKey::load_or_create(workspace.path()).unwrap();
         let parent = CapabilityConstraints {
-            decision_id: crate::causal_tree::ids::DecisionId::legacy(&[7; 32]),
+            parent_authority_id: crate::causal_tree::ids::DecisionId::legacy(&[7; 32]).into(),
             allowed,
             authority: AuthorityEnvelope {
                 owner: "prx_user".into(),
