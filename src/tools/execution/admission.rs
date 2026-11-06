@@ -15,8 +15,23 @@ pub(crate) struct TurnSurface {
 impl TurnSurface {
     /// The caller supplies trusted ACL and channel eligibility from its pinned
     /// registry. Neither a decision context nor a model-provided name grants access.
+    #[cfg(test)]
     pub(crate) fn build(
         service: &ToolExecutionService,
+        config: &ToolTieringConfig,
+        model: &str,
+        channel: bool,
+        eligible: impl FnMut(&ToolDescriptor) -> bool,
+    ) -> Self {
+        Self::build_from(service, service.current_descriptors(), config, model, channel, eligible)
+    }
+
+    /// Applies the surface predicates over an explicit candidate list. The
+    /// caller supplies every name the publication source can emit, each already
+    /// resolved live through `service`; unresolved names must not be passed.
+    pub(crate) fn build_from(
+        service: &ToolExecutionService,
+        candidates: Vec<ToolDescriptor>,
         config: &ToolTieringConfig,
         model: &str,
         channel: bool,
@@ -43,7 +58,7 @@ impl TurnSurface {
             tracing::warn!("tool registry generation unavailable; publishing no tools for this turn");
             return surface;
         }
-        for descriptor in service.current_descriptors() {
+        for descriptor in candidates {
             let name = &descriptor.public_name;
             if surface.exclusions.contains(name)
                 || surface.exclusions.contains(&descriptor.backend_name)
@@ -110,6 +125,28 @@ fn live_generation(service: &ToolExecutionService) -> Option<[u8; 32]> {
         .ok()
 }
 
+fn outside_surface(name: &str) -> (ToolExecutionStatus, String) {
+    (
+        ToolExecutionStatus::Denied,
+        format!("tool '{name}' is outside the turn surface"),
+    )
+}
+
+/// Runs after `resolve` has bound a backend to `name`. `admit` lets a name
+/// through when it is unpublished and has no live descriptor, so that the
+/// registry's unknown-tool diagnostic is reported. A backend can register the
+/// name between those two steps, so the surface membership is checked again
+/// here, before any backend is reached.
+pub(super) fn recheck_resolved(
+    context: &ToolExecutionContext,
+    name: &str,
+) -> Result<(), (ToolExecutionStatus, String)> {
+    match &context.turn_surface {
+        Some(surface) if !surface.contains(name) => Err(outside_surface(name)),
+        _ => Ok(()),
+    }
+}
+
 pub(super) fn admit(
     service: &ToolExecutionService,
     context: &ToolExecutionContext,
@@ -119,10 +156,15 @@ pub(super) fn admit(
         return Ok(());
     };
     if !surface.contains(name) {
-        return Err((
-            ToolExecutionStatus::Denied,
-            format!("tool '{name}' is outside the turn surface"),
-        ));
+        // A name that is not in the live registry and was never published has
+        // no capability to protect. Let resolution report the registry's own
+        // unknown-tool diagnostic. A backend that registers the name between
+        // this check and resolution is caught by `recheck_resolved`, which
+        // runs after resolution and before any backend is reached.
+        if !surface.published.contains(name) && service.current_descriptor(name).is_none() {
+            return Ok(());
+        }
+        return Err(outside_surface(name));
     }
     let descriptor = service.current_descriptor(name);
     // The registry generation below binds every descriptor field, so an

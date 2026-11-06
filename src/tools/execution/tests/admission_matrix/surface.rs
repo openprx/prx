@@ -63,6 +63,59 @@ async fn channel_ineligible_entry_is_refused_on_channel_surface() {
     assert_refused(&service, &fixture, context, "config_reload").await;
 }
 
+/// A name that no backend registers is not a surface violation: resolution
+/// fails before any backend runs, so the registry's unknown-tool diagnostic
+/// is preserved and nothing dispatches.
+#[tokio::test]
+async fn unregistered_unpublished_name_keeps_unknown_tool_diagnostic() {
+    let fixture = fixture();
+    let service = allow_service(&fixture);
+    let context = surface_context(&service, &crate::config::ToolTieringConfig::default(), false, true);
+    let outcome = service
+        .execute(
+            ToolExecutionCommand::new("invented_probe", serde_json::json!({"value":1})),
+            context,
+            None,
+        )
+        .await;
+    assert_eq!(outcome.status, ToolExecutionStatus::UnknownTool);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unknown tool 'invented_probe'")),
+        "unexpected diagnostic: {:?}",
+        outcome.error
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+/// A registered tool that the surface never published stays Denied as
+/// outside the turn surface. The unknown-name fall-through must not widen this.
+#[tokio::test]
+async fn registered_unpublished_tool_is_denied_outside_surface() {
+    let fixture = fixture();
+    let service = allow_service(&fixture);
+    let context = surface_context(&service, &crate::config::ToolTieringConfig::default(), false, false);
+    let outcome = service
+        .execute(
+            ToolExecutionCommand::new("config_reload", serde_json::json!({"value":1})),
+            context,
+            None,
+        )
+        .await;
+    assert_eq!(outcome.status, ToolExecutionStatus::Denied);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("outside the turn surface")),
+        "unexpected diagnostic: {:?}",
+        outcome.error
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn model_allowlist_excluded_tool_is_refused() {
     let fixture = fixture();

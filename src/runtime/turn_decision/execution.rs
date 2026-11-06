@@ -31,8 +31,26 @@ impl TurnDecisionService {
         let view = self.catalog_view();
         // Key the operator allowlist on the pinned model, never on a route spelling.
         let pinned = proof.model_binding().pinned_model();
-        crate::tools::execution::admission::TurnSurface::build(
+        // Candidates are the backend inventory plus every pinned catalog name
+        // (per-skill `skill_read_<digest>` entries are published from the catalog
+        // and are absent from the backend list). Each name must resolve live;
+        // an unresolved name is not a candidate, so it stays unpublished.
+        let mut candidates = self.execution.current_descriptors();
+        let unlisted: Vec<_> = {
+            let listed: BTreeSet<&str> = candidates
+                .iter()
+                .map(|descriptor| descriptor.public_name.as_str())
+                .collect();
+            self.catalog
+                .public_names()
+                .filter(|name| !listed.contains(name))
+                .filter_map(|name| self.execution.current_descriptor(name))
+                .collect()
+        };
+        candidates.extend(unlisted);
+        crate::tools::execution::admission::TurnSurface::build_from(
             &self.execution,
+            candidates,
             &config,
             pinned,
             channel,
