@@ -1,13 +1,17 @@
 //! Lazy recovery authority, owned by the SQLite writer transaction.
 use super::{SqliteMemory, recovery_keys::KeyDirectory};
 use crate::memory::recovery_authority::{
-    RecoveryChain, RecoveryEvidence, RecoveryPublication, RecoveryReceipt, RecoveryRepository,
+    RecoveryChain, RecoveryEvidence, RecoveryFactsTooLarge, RecoveryPublication, RecoveryReceipt, RecoveryRepository,
 };
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::ValueRef};
 use serde::{Deserialize, Serialize};
 
-const MAX_FACTS: usize = 65_536;
+const MAX_SERIALIZED_FACTS: usize = 262_144;
+// Six identity/event-id strings of at most 1024 bytes expand by at most 6x.
+// 40 KiB covers those strings, two 32-byte JSON digests, and structural keys.
+// Each byte field expands by at most 4x; reserve equal pending/completion budgets.
+const MAX_FACTS: usize = (MAX_SERIALIZED_FACTS - 40 * 1024) / 8;
 const MAX_RECORD: usize = 1_048_576;
 
 pub(super) fn schema(conn: &Connection) -> anyhow::Result<()> {
@@ -17,7 +21,7 @@ pub(super) fn schema(conn: &Connection) -> anyhow::Result<()> {
         |r| r.get(0),
     )?;
     if !exists {
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "CREATE TABLE recovery_authority (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),
             version INTEGER NOT NULL CHECK(version=1), backend_namespace TEXT NOT NULL,
@@ -29,7 +33,7 @@ pub(super) fn schema(conn: &Connection) -> anyhow::Result<()> {
             terminal_event_id TEXT REFERENCES message_events(event_id) ON DELETE CASCADE,
             version INTEGER NOT NULL CHECK(version=1), key_id TEXT NOT NULL,
             state TEXT NOT NULL CHECK(state IN ('pending','settled')),
-            facts BLOB NOT NULL CHECK(length(facts)<=262144), mac BLOB NOT NULL CHECK(length(mac)=32),
+            facts BLOB NOT NULL CHECK(length(facts)<={MAX_SERIALIZED_FACTS}), mac BLOB NOT NULL CHECK(length(mac)=32),
             PRIMARY KEY(workspace_id,owner_id,source,run_id),
             CHECK((state='pending' AND input_event_id IS NOT NULL AND terminal_event_id IS NULL)
                   OR (state='settled' AND terminal_event_id IS NOT NULL)),
@@ -41,8 +45,8 @@ pub(super) fn schema(conn: &Connection) -> anyhow::Result<()> {
              OR OLD.workspace_id IS NOT NEW.workspace_id OR OLD.owner_id IS NOT NEW.owner_id
              OR OLD.source IS NOT NEW.source OR OLD.run_id IS NOT NEW.run_id
              OR OLD.input_event_id IS NOT NEW.input_event_id
-        BEGIN SELECT RAISE(ABORT,'immutable recovery receipt'); END;",
-        )?;
+        BEGIN SELECT RAISE(ABORT,'immutable recovery receipt'); END;"
+        ))?;
     }
     super::erasure_pool::install_table_triggers(conn, "recovery_attestations")?;
     Ok(())
@@ -102,13 +106,16 @@ fn event(conn: &Connection, chain: &RecoveryChain, id: &str) -> anyhow::Result<R
     })
 }
 
+fn framed(domain: &[u8], bytes: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(16 + domain.len() + bytes.len());
+    framed.extend_from_slice(&(domain.len() as u64).to_be_bytes());
+    framed.extend_from_slice(domain);
+    framed.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    framed.extend_from_slice(bytes);
+    framed
+}
 fn domain_mac(key: &ring::hmac::Key, domain: &[u8], bytes: &[u8]) -> Vec<u8> {
-    let mut context = ring::hmac::Context::with_key(key);
-    context.update(&(domain.len() as u64).to_be_bytes());
-    context.update(domain);
-    context.update(&(bytes.len() as u64).to_be_bytes());
-    context.update(bytes);
-    context.sign().as_ref().to_vec()
+    ring::hmac::sign(key, &framed(domain, bytes)).as_ref().to_vec()
 }
 fn bind(
     conn: &Connection,
@@ -169,19 +176,15 @@ fn verify(
     receipt: &RecoveryReceipt,
 ) -> anyhow::Result<BoundFacts> {
     anyhow::ensure!(
-        receipt.version == 1 && receipt.facts.len() <= 262_144,
+        receipt.version == 1 && receipt.facts.len() <= MAX_SERIALIZED_FACTS,
         "invalid recovery receipt"
     );
     let key = directory.load(&receipt.key_id)?;
     // ring verifies the domain-framed receipt in constant time.
     let domain = receipt_domain(&receipt.state)?;
     let bytes = receipt_bytes(receipt)?;
-    let mut framed = Vec::new();
-    framed.extend_from_slice(&(domain.len() as u64).to_be_bytes());
-    framed.extend_from_slice(domain);
-    framed.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-    framed.extend_from_slice(&bytes);
-    ring::hmac::verify(&key, &framed, &receipt.mac).map_err(|_| anyhow::anyhow!("invalid recovery authentication"))?;
+    ring::hmac::verify(&key, &framed(domain, &bytes), &receipt.mac)
+        .map_err(|_| anyhow::anyhow!("invalid recovery authentication"))?;
     let facts: BoundFacts = serde_json::from_slice(&receipt.facts)?;
     anyhow::ensure!(
         facts.chain == *chain
@@ -199,10 +202,8 @@ fn verify(
     );
     for bound in [&facts.input, &facts.terminal].into_iter().flatten() {
         let current = event(conn, chain, &bound.id)?;
-        anyhow::ensure!(
-            domain_mac(&key, b"prx.recovery.event.v1", &current.record) == bound.digest,
-            "recovery evidence changed"
-        );
+        ring::hmac::verify(&key, &framed(b"prx.recovery.event.v1", &current.record), &bound.digest)
+            .map_err(|_| anyhow::anyhow!("recovery evidence changed"))?;
     }
     Ok(facts)
 }
@@ -279,10 +280,10 @@ impl SqliteMemory {
                 .is_none_or(|(input, terminal)| input.event_id != terminal.event_id),
             "input cannot be terminal evidence"
         );
-        anyhow::ensure!(
-            publication.facts.len() <= MAX_FACTS && (settle == publication.terminal.is_some()),
-            "invalid recovery publication"
-        );
+        if publication.facts.len() > MAX_FACTS {
+            return Err(RecoveryFactsTooLarge { limit: MAX_FACTS }.into());
+        }
+        anyhow::ensure!(settle == publication.terminal.is_some(), "invalid recovery publication");
         anyhow::ensure!(settle || publication.input.is_some(), "pending reception needs input");
         let writer = self.pool.write();
         let sync = FullSync::new(&writer)?;
@@ -353,6 +354,12 @@ impl SqliteMemory {
             facts: serde_json::to_vec(&facts)?,
             mac: Vec::new(),
         };
+        if receipt.facts.len() > MAX_SERIALIZED_FACTS {
+            return Err(RecoveryFactsTooLarge {
+                limit: MAX_SERIALIZED_FACTS,
+            }
+            .into());
+        }
         sign(&mut receipt, &key)?;
         tx.execute("INSERT INTO recovery_attestations(workspace_id,owner_id,source,run_id,input_event_id,terminal_event_id,version,key_id,state,facts,mac) VALUES(?1,?2,?3,?4,?5,?6,1,?7,?8,?9,?10) ON CONFLICT(workspace_id,owner_id,source,run_id) DO UPDATE SET terminal_event_id=excluded.terminal_event_id,key_id=excluded.key_id,state=excluded.state,facts=excluded.facts,mac=excluded.mac", params![publication.chain.workspace_id,publication.chain.owner_id,publication.chain.source,publication.chain.run_id,facts.input.as_ref().map(|e| &e.id),facts.terminal.as_ref().map(|e| &e.id),receipt.key_id,receipt.state,receipt.facts,receipt.mac])?;
         tx.commit()?;

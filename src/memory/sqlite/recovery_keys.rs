@@ -22,9 +22,11 @@ impl KeyDirectory {
         let owner = rustix::process::geteuid().as_raw();
         let mut directory = File::from(open(
             "/",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?);
+        #[cfg(test)]
+        check_cloexec(&directory)?;
         for component in memory.components() {
             let name = match component {
                 Component::RootDir => continue,
@@ -34,9 +36,11 @@ impl KeyDirectory {
             directory = File::from(openat(
                 &directory,
                 name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )?);
+            #[cfg(test)]
+            check_cloexec(&directory)?;
             let metadata = directory.metadata()?;
             // Root-owned sticky temporary roots are safe ancestors, but never
             // acceptable as the repository/key directory itself.
@@ -61,9 +65,11 @@ impl KeyDirectory {
         let keys = File::from(openat(
             &directory,
             ".recovery_keys",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?);
+        #[cfg(test)]
+        check_cloexec(&keys)?;
         let metadata = keys.metadata()?;
         anyhow::ensure!(
             metadata.uid() == owner && metadata.permissions().mode() & 0o777 == 0o700,
@@ -96,7 +102,11 @@ impl KeyDirectory {
     }
 
     pub(super) fn create(&self) -> anyhow::Result<String> {
-        let bytes = rand::random::<[u8; 32]>();
+        use ring::rand::SecureRandom;
+        let mut bytes = [0u8; 32];
+        ring::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| anyhow::anyhow!("recovery key generation failed"))?;
         let id = Self::key_id(&bytes);
         self.install(&id, &bytes)?;
         Ok(id)
@@ -109,9 +119,11 @@ impl KeyDirectory {
         let mut file = File::from(openat(
             &self.0,
             Self::filename(id)?.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         )?);
+        #[cfg(test)]
+        check_cloexec(&file)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         self.0.sync_all()?;
@@ -129,9 +141,11 @@ impl KeyDirectory {
         let mut file = File::from(openat(
             &self.0,
             Self::filename(id)?.as_str(),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         )?);
+        #[cfg(test)]
+        check_cloexec(&file)?;
         let metadata = file.metadata()?;
         anyhow::ensure!(
             metadata.is_file()
@@ -153,4 +167,15 @@ impl KeyDirectory {
     pub(super) fn load(&self, _id: &str) -> anyhow::Result<ring::hmac::Key> {
         anyhow::bail!("secure recovery keys unavailable")
     }
+}
+
+// Check the actual descriptors while they are live, including transient walk,
+// install and load descriptors that are closed before returning to the caller.
+#[cfg(all(test, unix))]
+fn check_cloexec(file: &File) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        rustix::io::fcntl_getfd(file)?.contains(rustix::io::FdFlags::CLOEXEC),
+        "recovery descriptor must be close-on-exec"
+    );
+    Ok(())
 }

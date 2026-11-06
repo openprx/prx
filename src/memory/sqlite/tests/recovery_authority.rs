@@ -263,6 +263,13 @@ fn recovery_settlement_race_has_one_receipt() {
     memory.activate_recovery_authority().unwrap();
     let mut publication = pending(&memory).unwrap();
     let initial = memory.record_recovery_pending(&publication).unwrap();
+    let mut relabeled = initial.clone();
+    relabeled.state = "settled".into();
+    let keys = KeyDirectory::open(memory.db_path.parent().unwrap(), false).unwrap();
+    let error = verify(&memory.pool.write(), &keys, &publication.chain, &relabeled)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("invalid recovery authentication"));
     publication.terminal = Some(seed(&memory, "terminal", "assistant").unwrap());
     publication.facts = b"verified final/claim/usage/lineage; projection pending".to_vec();
     let barrier = Arc::new(Barrier::new(3));
@@ -315,4 +322,71 @@ fn recovery_settlement_race_has_one_receipt() {
     drop(writer);
     assert_eq!(*winner, memory.read_recovery_receipt(&chain()).unwrap().unwrap());
     assert!(!memory.db_path.parent().unwrap().join("cost.jsonl").exists());
+}
+
+#[test]
+fn recovery_key_fds_are_cloexec() {
+    let (_dir, memory) = store().unwrap();
+    // Test-only checks inspect F_GETFD immediately after every production open,
+    // including transient ancestor, install and load descriptors.
+    let id = memory.activate_recovery_authority().unwrap();
+    let keys = KeyDirectory::open(memory.db_path.parent().unwrap(), false).unwrap();
+    keys.load(&id).unwrap();
+    memory.rotate_recovery_authority().unwrap();
+}
+
+#[test]
+fn recovery_max_size_facts_still_settle() {
+    let (_dir, memory) = store().unwrap();
+    memory.activate_recovery_authority().unwrap();
+    // Exercise worst-case JSON escaping for all six bounded identity/event IDs.
+    let identity = "\u{1}".repeat(1024);
+    let scope = RecoveryChain {
+        workspace_id: identity.clone(),
+        owner_id: identity.clone(),
+        source: identity.clone(),
+        run_id: identity,
+    };
+    let input_id = "\u{2}".repeat(1024);
+    let terminal_id = "\u{3}".repeat(1024);
+    for (id, role) in [(&input_id, "user"), (&terminal_id, "assistant")] {
+        memory.pool.write().execute(
+            "INSERT INTO message_events(event_id,workspace_id,owner_id,source,run_id,role,event_type,content,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,'message.created','original bytes','0','0')",
+            params![id, scope.workspace_id, scope.owner_id, scope.source, scope.run_id, role],
+        ).unwrap();
+    }
+    let input = memory.recovery_event_evidence(&scope, &input_id).unwrap();
+    let mut publication = RecoveryPublication {
+        chain: scope,
+        input: Some(input),
+        terminal: None,
+        facts: vec![255; MAX_FACTS + 1],
+    };
+    let error = memory.record_recovery_pending(&publication).unwrap_err();
+    assert_eq!(error.downcast_ref::<RecoveryFactsTooLarge>().unwrap().limit, MAX_FACTS);
+    assert!(memory.read_recovery_receipt(&publication.chain).unwrap().is_none());
+    publication.facts.pop();
+    memory.record_recovery_pending(&publication).unwrap();
+    publication.terminal = Some(
+        memory
+            .recovery_event_evidence(&publication.chain, &terminal_id)
+            .unwrap(),
+    );
+    publication.facts.push(255);
+    let error = memory.settle_recovery(&publication).unwrap_err();
+    assert!(error.downcast_ref::<RecoveryFactsTooLarge>().is_some());
+    assert_eq!(
+        memory.read_recovery_receipt(&publication.chain).unwrap().unwrap().state,
+        "pending"
+    );
+    publication.facts.pop();
+    let settled = memory.settle_recovery(&publication).unwrap();
+    assert!(settled.facts.len() <= MAX_SERIALIZED_FACTS);
+    let facts: BoundFacts = serde_json::from_slice(&settled.facts).unwrap();
+    assert_eq!(facts.pending, vec![255; MAX_FACTS]);
+    assert_eq!(facts.completion, vec![255; MAX_FACTS]);
+    assert_eq!(
+        memory.read_recovery_receipt(&publication.chain).unwrap().unwrap(),
+        settled
+    );
 }

@@ -39,6 +39,13 @@ pub struct RecoveryReceipt {
     pub mac: Vec<u8>,
 }
 
+/// Facts exceed the backend's publication or serialized receipt budget.
+#[derive(Debug, thiserror::Error)]
+#[error("recovery facts exceed size limit of {limit} bytes")]
+pub struct RecoveryFactsTooLarge {
+    pub limit: usize,
+}
+
 /// Supported only by durable repositories; ordinary memory operations never
 /// initialize this capability. Rotation is an operator operation after drain.
 pub trait RecoveryRepository: Send + Sync {
