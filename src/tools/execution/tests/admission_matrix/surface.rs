@@ -46,13 +46,20 @@ async fn excluded_tool_called_by_model_is_refused() {
     assert_refused(&service, &fixture, context, "config_reload").await;
 }
 
-/// Production publishes only eligible entries, and the channel closure is the
-/// only source of ineligibility. This isolates that clause in `TurnSurface::build`.
+/// Eligibility is applied once, in `TurnSurface::build`. An ineligible entry is
+/// never published, so the surface does not contain it and dispatch is Denied.
 #[tokio::test]
 async fn channel_ineligible_entry_is_refused_on_channel_surface() {
     let fixture = fixture();
     let service = allow_service(&fixture);
     let context = surface_context(&service, &crate::config::ToolTieringConfig::default(), true, false);
+    assert!(
+        context
+            .turn_surface
+            .as_ref()
+            .is_some_and(|surface| !surface.contains("config_reload")),
+        "channel-ineligible entry was published"
+    );
     assert_refused(&service, &fixture, context, "config_reload").await;
 }
 
