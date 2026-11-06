@@ -1,5 +1,10 @@
 //! Version-directed authentication: derived slots always follow their capsule.
-use super::*;
+use super::IngressRecorder;
+use crate::decision::key::{DecisionKey, KeyDomain};
+use crate::memory::ingress_recovery::IngressCapsule;
+use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
+use anyhow::Context;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 #[error("legacy ingress authority unavailable; outcome remains unconfirmed")]

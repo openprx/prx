@@ -5,7 +5,7 @@ use crate::memory::ingress_recovery::{
     IngressRecoveryScan, IngressRecoveryScope, IngressRecoveryState, MAX_CAPSULE_BYTES, MAX_RECOVERY_EVENT_BYTES,
     MAX_RECOVERY_PAGE, input_within_bounds, remaining, serialized_within,
 };
-use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
+use crate::memory::recovery_authority::RecoveryMacDomain;
 use crate::memory::{Memory, MemoryVisibility, MessageEvent, MessageEventInput};
 use anyhow::Context;
 use sha2::{Digest, Sha256};
