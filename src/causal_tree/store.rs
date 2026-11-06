@@ -1603,6 +1603,98 @@ pub(crate) struct DecisionReplayRecord {
     pub(crate) digest: String,
 }
 
+/// Reads one named column of a replay evidence row, with its SQLite conversion.
+fn evidence_value<T: rusqlite::types::FromSql>(
+    columns: &[(String, rusqlite::types::Value)],
+    name: &str,
+) -> anyhow::Result<T> {
+    let (_, value) = columns
+        .iter()
+        .find(|(column, _)| column.as_str() == name)
+        .ok_or_else(|| anyhow::anyhow!("decision evidence column {name} is missing"))?;
+    <T as rusqlite::types::FromSql>::column_result(rusqlite::types::ValueRef::from(value))
+        .map_err(|error| anyhow::anyhow!("decision evidence column {name} is invalid: {error}"))
+}
+
+impl DecisionReplayRecord {
+    /// Decodes one authenticated `decision_evidence` row. The digest is recomputed
+    /// from the typed columns in replay order, and the decision is decoded with the
+    /// store's own `RawDecision` conversions. Outcomes are never derived.
+    pub(crate) fn from_evidence_columns(columns: &[(String, rusqlite::types::Value)]) -> anyhow::Result<Self> {
+        let names = replay_column_names();
+        anyhow::ensure!(
+            columns.len() == names.len()
+                && columns
+                    .iter()
+                    .zip(&names)
+                    .all(|((name, _), expected)| name.as_str() == *expected),
+            "decision evidence columns differ from the replay schema"
+        );
+        let mut digest = Sha256::new();
+        digest.update(b"prx.decision.terminal-replay-row.v1\0");
+        for (name, value) in columns {
+            replay_column_hash(&mut digest, name, rusqlite::types::ValueRef::from(value));
+        }
+        let state_fingerprint: String = evidence_value(columns, "state_fingerprint")?;
+        let catalog_generation: String = evidence_value(columns, "catalog_generation")?;
+        let raw = RawDecision {
+            id: evidence_value(columns, "decision_id")?,
+            prior_decision_id: evidence_value(columns, "prior_decision_id")?,
+            created_at_ms: evidence_value(columns, "created_at_ms")?,
+            has_owner: evidence_value::<Option<String>>(columns, "owner_id")?.is_some(),
+            session_key: evidence_value(columns, "session_key")?,
+            run_id: evidence_value(columns, "run_id")?,
+            task_id: evidence_value(columns, "task_id")?,
+            channel: evidence_value(columns, "channel")?,
+            enabled_snapshot: evidence_value(columns, "enabled_snapshot")?,
+            policy_version: evidence_value(columns, "policy_version")?,
+            scorer_version: evidence_value(columns, "scorer_version")?,
+            backend_kind: evidence_value(columns, "backend_kind")?,
+            backend_locality: evidence_value(columns, "backend_locality")?,
+            configured_model: evidence_value(columns, "configured_model")?,
+            candidates: evidence_value(columns, "candidates_json")?,
+            distributions: evidence_value(columns, "distributions_json")?,
+            shadow: evidence_value(columns, "builtin_shadow_json")?,
+            selected_candidate_id: evidence_value(columns, "selected_candidate_id")?,
+            directive_kind: evidence_value(columns, "directive_kind")?,
+            fallback_order: evidence_value(columns, "fallback_order_json")?,
+            abstention_reason: evidence_value(columns, "abstention_reason")?,
+            propensity: evidence_value(columns, "propensity")?,
+            explored: evidence_value(columns, "explored")?,
+            latency_ms: evidence_value(columns, "latency_ms")?,
+            attempts: evidence_value(columns, "attempts_json")?,
+            error_class: evidence_value(columns, "error_class")?,
+            cache_hit: evidence_value(columns, "cache_hit")?,
+            legacy_v1: evidence_value(columns, "legacy_v1")?,
+            backend_endpoint: evidence_value(columns, "backend_endpoint")?,
+        };
+        // The same collection gates as the store read: a bounded, valid projection.
+        if raw.directive_kind == "collect_approval_arguments" {
+            let gates_json: String = evidence_value(columns, "gates_json")?;
+            anyhow::ensure!(
+                gates_json.len() <= 1_048_576,
+                "decision evidence gates exceed the collection limit"
+            );
+            let gates: serde_json::Value = serde_json::from_str(&gates_json)?;
+            anyhow::ensure!(
+                super::approval_collection::valid_projection(&gates, &state_fingerprint, &catalog_generation),
+                "decision evidence collection projection is invalid"
+            );
+        }
+        let source_event_id: Option<String> = evidence_value(columns, "source_event_id")?;
+        let decision = raw
+            .decode(Vec::new())
+            .map_err(|error| anyhow::anyhow!("decision evidence replay decode failed: {error}"))?;
+        Ok(Self {
+            decision,
+            source_event_id,
+            catalog_generation,
+            state_fingerprint,
+            digest: hex::encode(digest.finalize()),
+        })
+    }
+}
+
 /// The largest number of idle read connections kept.
 const MAX_IDLE_READERS: usize = 4;
 
