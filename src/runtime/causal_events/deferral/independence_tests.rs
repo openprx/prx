@@ -69,6 +69,7 @@ async fn overlapping_admissions_release_independently_and_controls_bypass_live_d
     let (reply, received) = tokio::sync::oneshot::channel();
     sink.control_queue
         .send(QueueItem::Applied {
+            memory: memory.clone(),
             event: Box::new(event(CausalEventKind::DirectiveApplied, second_lineage)),
             idempotency_key: "prx-deferral-applied".into(),
             original_generation: None,

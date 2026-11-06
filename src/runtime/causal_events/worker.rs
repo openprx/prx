@@ -1,14 +1,12 @@
 //! Keep authority/control messages independent of admission-local telemetry waits.
 use super::{QueueItem, QueuedEvent, applied_input_matches, report_incomplete, to_message_input};
 use crate::decision::telemetry::{CausalEventSink, IncompleteReason};
-use crate::memory::Memory;
 use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::mpsc;
 
 pub(super) struct Worker {
     pub(super) receiver: mpsc::Receiver<QueuedEvent>,
     pub(super) control_receiver: mpsc::Receiver<QueueItem>,
-    pub(super) memory: Arc<dyn Memory>,
     pub(super) observer: Arc<dyn CausalEventSink>,
     pub(super) workspace: String,
     pub(super) generation: u64,
@@ -146,6 +144,7 @@ impl Worker {
                 let _ = reply.send(());
             }
             QueueItem::Applied {
+                memory,
                 event,
                 idempotency_key,
                 original_generation,
@@ -160,7 +159,7 @@ impl Worker {
                 let event_id = uuid::Uuid::new_v4().to_string();
                 input.event_id = Some(event_id.clone());
                 input.idempotency_key = Some(idempotency_key);
-                let persisted = match self.memory.append_message_event(input.clone()).await {
+                let persisted = match memory.append_message_event(input.clone()).await {
                     Ok(stored) if applied_input_matches(&stored, &input) => {
                         if stored.event_id == event_id {
                             self.observer.emit(*event);
