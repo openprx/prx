@@ -5,6 +5,7 @@
 //! table, and the seal is checked before the payload is interpreted.
 use crate::causal_tree::store::{DecisionRecord, replay_column_names};
 use crate::decision::key::{DecisionKey, KeyDomain};
+use crate::runtime::child_source::completion::ChildOutcomeError;
 use crate::session_worker::protocol::WorkerManifest;
 use anyhow::Context;
 use rusqlite::types::Value as SqlValue;
@@ -25,6 +26,9 @@ const BATCH_PARENT_DOMAIN: &[u8] = b"child-batch-parent-authority-v1";
 const DECISION_EVIDENCE_DOMAIN: &[u8] = b"child-decision-evidence-v1";
 /// Version of the `decision_evidence` payload.
 const DECISION_EVIDENCE_VERSION: u8 = 1;
+const CHILD_OUTCOME_DOMAIN: &[u8] = b"child-outcome-journal-v1";
+/// Version of the `child_outcome` payload.
+pub(crate) const CHILD_OUTCOME_VERSION: u8 = 1;
 
 const SELECT_AUTHORITY: &str = "SELECT entry FROM authority WHERE run=?1";
 const INSERT_AUTHORITY: &str = "INSERT OR IGNORE INTO authority(run, entry) VALUES (?1, ?2)";
@@ -36,6 +40,8 @@ const INSERT_DECISION_EVIDENCE: &str =
     "INSERT OR IGNORE INTO decision_evidence(workspace, owner, decision, entry) VALUES (?1, ?2, ?3, ?4)";
 const SELECT_DECISION_EVIDENCE: &str =
     "SELECT entry FROM decision_evidence WHERE workspace=?1 AND owner=?2 AND decision=?3";
+const INSERT_CHILD_OUTCOME: &str = "INSERT OR IGNORE INTO child_outcome(run, settlement, entry) VALUES (?1, ?2, ?3)";
+const SELECT_CHILD_OUTCOME: &str = "SELECT run, settlement, entry FROM child_outcome WHERE run=?1 AND settlement=?2";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,6 +119,24 @@ pub(crate) struct BatchParentRow {
     pub(crate) enabled_snapshot: bool,
     pub(crate) legacy_v1: bool,
     pub(crate) admits_issued_child: bool,
+}
+
+/// `child_outcome` payload, keyed by `(run, settlement)`. Every field is copied
+/// from the verified terminal replay and the persisted terminal marker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChildOutcomeRow {
+    pub(crate) version: u8,
+    pub(crate) run: String,
+    pub(crate) settlement: String,
+    pub(crate) terminal_id: String,
+    pub(crate) owner: String,
+    pub(crate) store_workspace: String,
+    pub(crate) parent_decision: Option<String>,
+    pub(crate) parent_digest: Option<String>,
+    pub(crate) child_decision: String,
+    pub(crate) child_digest: String,
+    pub(crate) outcome_hash: String,
 }
 
 pub(crate) fn path(workspace: &Path) -> PathBuf {
@@ -497,6 +521,106 @@ pub(crate) fn read_decision_evidence(
             .map(|column| (column.name, column.value.into_value()))
             .collect(),
     ))
+}
+
+/// Writes one `child_outcome` row in a FULL transaction, then reads it back and
+/// requires equality. An existing row is never overwritten.
+pub(crate) fn persist_child_outcome(
+    workspace: &Path,
+    key: &DecisionKey,
+    expected: &ChildOutcomeRow,
+) -> Result<(), ChildOutcomeError> {
+    write_child_outcome(workspace, key, expected).map_err(ChildOutcomeError::Journal)?;
+    if verify_child_outcome(workspace, key, expected, Some(JOURNAL_REQUIRED_VERSION))? {
+        Ok(())
+    } else {
+        Err(ChildOutcomeError::Journal(anyhow::anyhow!(
+            "child outcome readback is unconfirmed"
+        )))
+    }
+}
+
+fn write_child_outcome(workspace: &Path, key: &DecisionKey, expected: &ChildOutcomeRow) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        expected.version == CHILD_OUTCOME_VERSION
+            && expected.run == expected.settlement
+            && expected.settlement == expected.terminal_id,
+        "child outcome identity differs from its terminal"
+    );
+    let mut conn = open_writer(workspace)?;
+    let entry = seal_entry(key, CHILD_OUTCOME_DOMAIN, serde_json::to_string(expected)?)?;
+    let transaction = conn.transaction()?;
+    transaction.execute(INSERT_CHILD_OUTCOME, (&expected.run, &expected.settlement, &entry))?;
+    let (run, settlement, stored): (String, String, String) =
+        transaction.query_row(SELECT_CHILD_OUTCOME, (&expected.run, &expected.settlement), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    anyhow::ensure!(
+        run == expected.run && settlement == expected.settlement && stored == entry,
+        "child outcome journal conflict"
+    );
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Normal non-repair reader. It authenticates the row before decoding it and
+/// never writes, repairs or falls back to the store. A missing row or file is
+/// `Ok(false)` only without a journal version of 3 or later.
+pub(crate) fn verify_child_outcome(
+    workspace: &Path,
+    key: &DecisionKey,
+    expected: &ChildOutcomeRow,
+    journal_version: Option<u8>,
+) -> Result<bool, ChildOutcomeError> {
+    verify_child_outcome_row(workspace, key, expected, journal_version).map_err(ChildOutcomeError::Journal)
+}
+
+fn verify_child_outcome_row(
+    workspace: &Path,
+    key: &DecisionKey,
+    expected: &ChildOutcomeRow,
+    journal_version: Option<u8>,
+) -> anyhow::Result<bool> {
+    let required = journal_version.is_some_and(|version| version >= JOURNAL_REQUIRED_VERSION);
+    let Some((run, settlement, entry)) = read_child_outcome(workspace, &expected.run, &expected.settlement)? else {
+        anyhow::ensure!(!required, "child outcome row is missing");
+        return Ok(false);
+    };
+    let payload = open_entry(key, CHILD_OUTCOME_DOMAIN, "child outcome", &entry)?;
+    let row: ChildOutcomeRow = serde_json::from_str(&payload)?;
+    anyhow::ensure!(
+        run == row.run
+            && settlement == row.settlement
+            && row.run == row.settlement
+            && row.settlement == row.terminal_id,
+        "child outcome key differs from its sealed identity"
+    );
+    anyhow::ensure!(
+        row == *expected,
+        "child outcome differs from independent terminal evidence"
+    );
+    Ok(true)
+}
+
+/// Missing file or row is `None`. The SQL keys come back with the entry.
+fn read_child_outcome(
+    workspace: &Path,
+    run: &str,
+    settlement: &str,
+) -> anyhow::Result<Option<(String, String, String)>> {
+    let path = path(workspace);
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        result => {
+            result?;
+        }
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    Ok(conn
+        .query_row(SELECT_CHILD_OUTCOME, (run, settlement), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()?)
 }
 
 /// A version-3+ child with no authority row is refused, never downgraded to the

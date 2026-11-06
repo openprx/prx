@@ -1188,8 +1188,13 @@ async fn run_owned_manifest(
                             Ok(true) => {
                                 let closed = async {
                                     cleanup.run(async { Ok(()) }).await?;
-                                    let reply =
-                                        turn.close(&cancel).await?.context("worker close disposition changed")?;
+                                    let reply = child_segments
+                                        .as_ref()
+                                        .context("worker completion port missing")?
+                                        .completion
+                                        .close(turn, &cancel)
+                                        .await?
+                                        .context("worker close disposition changed")?;
                                     Ok((reply, crate::agent::turn_contracts::ToolLoopTrace::default()))
                                 }
                                 .await;
@@ -1239,13 +1244,14 @@ async fn run_owned_manifest(
                         };
                         segment_history.push(crate::agent::turn_contracts::inbound_user_message(&user_task));
                     }
-                    if let Some(turn) = child_turn.as_ref() {
+                    if let (Some(turn), Some(segments)) = (child_turn.as_ref(), child_segments.as_ref()) {
                         if let Err(error) = turn.enrich_input(&mut segment_history) {
                             let result = cleanup.run(async { Err::<(), _>(error) }).await;
                             let error = result
                                 .err()
                                 .unwrap_or_else(|| anyhow::anyhow!("worker enrichment failed"));
-                            if let Err(settlement) = turn.fail(&error, cancel.is_cancelled()).await {
+                            if let Err(settlement) = segments.completion.fail(turn, &error, cancel.is_cancelled()).await
+                            {
                                 return (segment_history, Err(settlement));
                             }
                             return (segment_history, Err(error));

@@ -20,6 +20,7 @@ use crate::cost::types::CostSettlement;
 use crate::decision::{DecisionKey, KeyDomain};
 use crate::llm::route_decision::{MeteredTokenUsageRecord, ProviderExecutionOutcome};
 use crate::memory::{Memory, MemoryFabric, MessageEvent, MessageEventScope};
+use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
 use crate::runtime::turn_decision::{SettlementIssueToken, TurnDecisionContext};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -132,6 +133,7 @@ struct RecordedDecisionSettlement {
     reader: DecisionStoreReader,
     store_workspace_id: Arc<str>,
     key: Arc<DecisionKey>,
+    child_outcome_hook: Arc<dyn ChildOutcomeHook>,
 }
 
 impl std::fmt::Debug for DecisionSettlementRef {
@@ -167,6 +169,11 @@ impl DecisionSettlementRef {
         memory: Arc<dyn Memory>,
         _token: SettlementIssueToken,
     ) -> Self {
+        let child_outcome_hook: Arc<dyn ChildOutcomeHook> = Arc::new(JournalChildOutcomeHook::new(
+            workspace_dir.clone(),
+            Arc::clone(&key),
+            Arc::clone(&store_workspace_id),
+        ));
         Self {
             parent_grant: None,
             operator_parent: None,
@@ -177,6 +184,7 @@ impl DecisionSettlementRef {
                 reader,
                 store_workspace_id,
                 key,
+                child_outcome_hook,
             }),
             workspace_dir,
             cost_config,
@@ -728,7 +736,7 @@ async fn finalize_turn_impl(
                 .find_message_event_by_idempotency_key(fabric.workspace_id(), &final_key)
                 .await?
             {
-                verify_terminal_replay(
+                let verified_replay = verify_terminal_replay(
                     fabric.memory().as_ref(),
                     &recorded.reader,
                     &recorded.key,
@@ -768,6 +776,10 @@ async fn finalize_turn_impl(
                             }),
                     "existing terminal marker conflicts with the pinned decision or scope"
                 );
+                recorded
+                    .child_outcome_hook
+                    .persist(&verified_replay, &existing, None, None)
+                    .await?;
             }
             // The workspace-scoped idempotency key is unique in the durable
             // message store. Its insert/readback transaction elects one decision
@@ -1003,7 +1015,7 @@ async fn finalize_turn_impl(
         if commit.decision.is_recorded() {
             let decision = &commit.decision;
             let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
-            verify_terminal_replay(
+            let verified_replay = verify_terminal_replay(
                 fabric.memory().as_ref(),
                 &recorded.reader,
                 &recorded.key,
@@ -1017,6 +1029,10 @@ async fn finalize_turn_impl(
                 &terminal_event,
             )
             .await?;
+            recorded
+                .child_outcome_hook
+                .persist(&verified_replay, &terminal_event, None, None)
+                .await?;
         }
         // After the durable marker and before the early return, so a retried
         // finalization joins and releases as well. Restart recovery

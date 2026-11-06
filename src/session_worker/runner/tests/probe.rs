@@ -6,6 +6,12 @@ use crate::session_worker::protocol::{WorkerManifest, WorkerResult};
 use crate::session_worker::runner::run::run_validated_manifest;
 use anyhow::Result;
 
+/// Runs a prepared manifest through the real process-worker entrypoint.
+pub(crate) async fn run_prepared_worker(manifest: WorkerManifest) -> Result<WorkerResult> {
+    let config_dir_arg = manifest.config_dir.to_string_lossy().to_string();
+    run_validated_manifest(manifest, None, Some(&config_dir_arg)).await
+}
+
 pub(super) fn retain_worker_probe_directory(mut tmp: tempfile::TempDir) -> tempfile::TempDir {
     tmp.disable_cleanup(true);
     let subscriber = tracing_subscriber::fmt()
@@ -24,15 +30,12 @@ pub(super) fn retain_worker_probe_directory(mut tmp: tempfile::TempDir) -> tempf
 /// against `provider_name`: a real parent config source, a shared-fabric
 /// SQLite memory and the worker workspace all live under `tmp`.
 async fn worker_probe_run(tmp: &tempfile::TempDir, provider_name: String) -> WorkerResult {
-    with_worker_probe_manifest(tmp, provider_name, false, |manifest| async move {
-        let config_dir_arg = manifest.config_dir.to_string_lossy().to_string();
-        run_validated_manifest(manifest, None, Some(&config_dir_arg)).await
-    })
-    .await
-    .expect("test: the worker runs to its result")
+    with_worker_probe_manifest(tmp, provider_name, false, run_prepared_worker)
+        .await
+        .expect("test: the worker runs to its result")
 }
 
-pub(super) async fn with_worker_probe_manifest<T, F, Fut>(
+pub(crate) async fn with_worker_probe_manifest<T, F, Fut>(
     tmp: &tempfile::TempDir,
     provider_name: String,
     generation_negative: bool,
