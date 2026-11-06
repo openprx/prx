@@ -701,7 +701,7 @@ fn terminal_scope(memory: Arc<dyn Memory>, workspace: &Path) -> RecoveryScope {
         surface: crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
         state_key: DecisionKey::load_or_create(workspace).unwrap(),
         store: None,
-        parent_decision_id: None,
+        parent_authority_id: None,
         durable_events: None,
     }
 }
