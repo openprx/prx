@@ -620,6 +620,14 @@ impl ToolExecutionContext {
         }
     }
 
+    pub(crate) fn with_approval_ledger(
+        mut self,
+        ledger: Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger>,
+    ) -> Self {
+        self.approval_ledger = ledger;
+        self
+    }
+
     /// Declare the schema rewrite the serving provider applied for this turn.
     #[must_use]
     pub const fn with_schema_dialect(mut self, schema_dialect: ToolSchemaDialect) -> Self {

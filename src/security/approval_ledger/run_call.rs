@@ -1,7 +1,7 @@
 //! Decision-free, authenticated exact-call approval over MemoryFabric.
 use super::keys::{ApprovalAuthority, RunCallAuthority};
 use super::pending::scope_from_source;
-use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring};
+use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, OpIdMatch, RiskLevel, Subject, WitnessKeyring};
 use crate::decision::{DecisionKey, KeyDomain};
 use crate::memory::{Memory, MemoryFabric, MessageEvent};
 use crate::tools::capability::execution_binding::{CallDigestSource, decision_call_digest};
@@ -34,6 +34,13 @@ impl RunCallAuthority {
     }
 }
 
+const fn exact_match() -> OpIdMatch {
+    OpIdMatch::Exact
+}
+const fn is_exact_match(mode: &OpIdMatch) -> bool {
+    matches!(mode, OpIdMatch::Exact)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PendingCall {
@@ -42,6 +49,8 @@ pub(crate) struct PendingCall {
     source_event_id: String,
     source_mac: [u8; 32],
     operation: String,
+    #[serde(default = "exact_match", skip_serializing_if = "is_exact_match")]
+    operation_match: OpIdMatch,
     risk: RiskLevel,
     expires_at: DateTime<Utc>,
 }
@@ -214,12 +223,40 @@ impl ApprovalLedgerPort<'_> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_pending(
         &self,
         envelope: &crate::runtime::envelope::RuntimeEnvelope,
         capability: &crate::causal_tree::branch::CapabilityRef,
         tool: &str,
         arguments: &serde_json::Value,
+    ) -> anyhow::Result<PendingCall> {
+        self.record_pending_target(envelope, capability, tool, arguments, None)
+            .await
+    }
+
+    pub(crate) async fn record_pending_entry(
+        &self,
+        envelope: &crate::runtime::envelope::RuntimeEnvelope,
+        entry: &crate::tools::capability::catalog::CapabilityEntry,
+        arguments: &serde_json::Value,
+    ) -> anyhow::Result<PendingCall> {
+        let capability = crate::causal_tree::branch::CapabilityRef {
+            id: entry.id.clone(),
+            fingerprint: entry.fingerprint,
+            generation: entry.generation,
+        };
+        self.record_pending_target(envelope, &capability, &entry.root, arguments, Some(entry))
+            .await
+    }
+
+    async fn record_pending_target(
+        &self,
+        envelope: &crate::runtime::envelope::RuntimeEnvelope,
+        capability: &crate::causal_tree::branch::CapabilityRef,
+        tool: &str,
+        arguments: &serde_json::Value,
+        entry: Option<&crate::tools::capability::catalog::CapabilityEntry>,
     ) -> anyhow::Result<PendingCall> {
         let owner = envelope
             .owner_id
@@ -252,9 +289,42 @@ impl ApprovalLedgerPort<'_> {
                 && source.run_id == envelope.run_id,
             "call approval source scope changed"
         );
-        let (operation, risk) = match crate::security::approval_operation::grant_op_for_call(tool, arguments) {
-            Some(crate::security::approval_operation::GrantOp::ResourceExact(op, risk)) => (op, risk),
-            _ => anyhow::bail!("call approval requires an exact resource operation"),
+        use crate::security::approval_operation::GrantOp;
+        let (operation, operation_match, risk) = if tool == "mcp_call" {
+            let operation = if let Some(entry) = entry.filter(|entry| entry.public_name != "mcp_call") {
+                anyhow::ensure!(
+                    entry.family == crate::causal_tree::branch::CapabilityTarget::Mcp && entry.op_ids.len() == 1,
+                    "MCP approval target is not pinned"
+                );
+                entry
+                    .op_ids
+                    .first()
+                    .context("MCP approval operation missing")?
+                    .as_str()
+                    .to_owned()
+            } else {
+                let server = arguments
+                    .get("server")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .context("MCP approval server missing")?;
+                let target = arguments
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .context("MCP approval tool missing")?;
+                crate::security::op_id::op_id("mcp_call", "call", &[server, target])
+            };
+            (operation, OpIdMatch::Exact, RiskLevel::High)
+        } else {
+            match crate::security::approval_operation::grant_op_for_call(tool, arguments) {
+                Some(GrantOp::ResourceExact(op, risk)) => (op, OpIdMatch::Exact, risk),
+                Some(GrantOp::ResourceGlob(pattern, risk)) => (pattern.clone(), OpIdMatch::GlobPattern(pattern), risk),
+                // The command gate verifies V2 exact op ids against the command text.
+                // A High ceiling authorizes only this exact command; policy still runs.
+                Some(GrantOp::Command(command)) => (command, OpIdMatch::Exact, RiskLevel::High),
+                None => anyhow::bail!("call approval operation unavailable"),
+            }
         };
         let authority = RunCallAuthority::for_call(
             capability,
@@ -292,7 +362,14 @@ impl ApprovalLedgerPort<'_> {
                     .clone()
                     .filter(|agent| !agent.is_empty())
                     .unwrap_or_else(|| "prx_agent".into()),
-                principal_id: owner.into(),
+                principal_id: crate::memory::principal::OwnerPrincipal::new(
+                    &source.workspace_id,
+                    source.channel.as_deref().unwrap_or("unknown"),
+                    source.sender.as_deref().unwrap_or("unknown"),
+                    &envelope.session_key,
+                    vec![crate::memory::principal::Role::Anonymous],
+                )
+                .principal_id,
             },
             source_event_id: source.event_id.clone(),
             source_mac: self.state_key.hmac(
@@ -300,6 +377,7 @@ impl ApprovalLedgerPort<'_> {
                 &[b"call.source", &serde_json::to_vec(&source)?],
             ),
             operation,
+            operation_match,
             risk,
             expires_at: Utc::now() + chrono::Duration::minutes(4),
         };
@@ -367,11 +445,12 @@ impl ApprovalLedgerPort<'_> {
     ) -> anyhow::Result<DateTime<Utc>> {
         let (pending, source) = self.load(owner, session, authority).await?;
         let grant = if approved {
-            let mut grant = ApprovalGrantV2::issue_one_shot(
+            let mut grant = ApprovalGrantV2::issue_one_shot_match(
                 self.keyring,
                 pending.record.subject.clone(),
                 IssuerAuthority::HumanReview,
                 &pending.record.operation,
+                pending.record.operation_match.clone(),
                 pending.record.risk,
             )?;
             grant.expires_at = grant.expires_at.min(pending.record.expires_at);
@@ -421,7 +500,7 @@ impl ApprovalLedgerPort<'_> {
                 && grant.max_uses == 1
                 && grant.uses_consumed == 0
                 && grant.capability.op_id == pending.operation
-                && grant.capability.op_id_match == crate::acl::approval_grant::OpIdMatch::Exact
+                && grant.capability.op_id_match == pending.operation_match
                 && grant.expires_at <= pending.expires_at,
             "call approval grant scope changed"
         );

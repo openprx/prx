@@ -1990,6 +1990,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             |source| source.execution.clone(),
                         );
                     }
+                    adapter.tool_execution_context.approval_ledger = decision_service.execution_approval_ledger();
                     if let Some(case) = &ctx.controlled_case {
                         case.apply(&mut adapter.tool_execution_context)?;
                     }
@@ -2494,6 +2495,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     }
                     runtime_adapter.tool_execution_context = crate::tools::ToolExecutionContext::new(envelope, "private");
                 }
+                runtime_adapter.tool_execution_context.approval_ledger = decision_service.execution_approval_ledger();
                 runtime_adapter.provider_trace = Some(Arc::clone(retained_provider_trace));
                 let response = match crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
                     .scope(turn_spawn_ctx, async {

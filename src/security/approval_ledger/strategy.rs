@@ -18,19 +18,13 @@ impl ApprovalStrategy for LedgerApprovalStrategy<'_> {
                 .catalog
                 .entry_for_public_name(&request.descriptor.public_name)
                 .ok_or_else(|| anyhow::anyhow!("approval capability unavailable"))?;
-            let capability = crate::causal_tree::branch::CapabilityRef {
-                id: entry.id.clone(),
-                fingerprint: entry.fingerprint,
-                generation: entry.generation,
-            };
+            anyhow::ensure!(
+                entry.root == request.descriptor.backend_name,
+                "approval backend changed"
+            );
             let pending = self
                 .port
-                .record_pending(
-                    &self.envelope,
-                    &capability,
-                    &request.descriptor.backend_name,
-                    &request.command.arguments,
-                )
+                .record_pending_entry(&self.envelope, entry, &request.command.arguments)
                 .await?;
             // Claim is atomic and precedes backend dispatch.
             let grant = self
@@ -43,7 +37,15 @@ impl ApprovalStrategy for LedgerApprovalStrategy<'_> {
                 .await?;
             Ok::<_, anyhow::Error>((
                 pending.authority().call_id(),
-                grant.map(serde_json::to_value).transpose()?,
+                grant
+                    .map(|grant| {
+                        serde_json::to_value(crate::security::policy::ApprovalGrant::from_verified_v2(
+                            &request.descriptor.public_name,
+                            "approval_ledger",
+                            grant,
+                        ))
+                    })
+                    .transpose()?,
             ))
         }
         .await;

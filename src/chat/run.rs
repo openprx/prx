@@ -4386,6 +4386,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                     provider_trace: binding.retained_provider_trace(),
                                     events: None, stream_provider: false, tool_execution_service: None,
                                     tool_execution_context: crate::tools::ToolExecutionContext::new(binding.envelope().clone(), "private")
+                                .with_approval_ledger(binding.execution_approval_ledger())
                                         .with_chat_id("terminal:user"),
                                     allowed_tool_names: None,
                                 }),

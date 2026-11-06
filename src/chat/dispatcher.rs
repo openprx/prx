@@ -1202,6 +1202,7 @@ impl EffectExecutor {
                         },
                         |binding| {
                             ToolExecutionContext::new(binding.envelope().clone(), "private")
+                                .with_approval_ledger(binding.execution_approval_ledger())
                                 .with_chat_id("terminal:user")
                         },
                     )

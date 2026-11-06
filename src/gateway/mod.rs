@@ -2794,6 +2794,7 @@ async fn run_gateway_chat_with_multimodal(
                                             "private"
                                         },
                                     )
+                                    .with_approval_ledger(service.execution_approval_ledger())
                                     .with_chat_id(&runtime_envelope.session_key),
                                     allowed_tool_names: None,
                                 }

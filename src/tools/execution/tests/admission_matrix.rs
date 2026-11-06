@@ -7,14 +7,25 @@ async fn ledger_context(path: &std::path::Path) -> ToolExecutionContext {
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(path).unwrap());
     let key = crate::decision::DecisionKey::load_or_create(path).unwrap();
     let fixture = fixture();
-    let tool = RecordingTool {
-        root_name: "config_reload",
-        aliases: vec![],
-        calls: fixture.calls,
-        arguments: fixture.arguments,
-        stages: fixture.stages,
-    };
-    let registry: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+    let registry: Vec<Box<dyn Tool>> = [
+        "file_write",
+        "shell",
+        "message_send",
+        "config_reload",
+        "mcp_call",
+        "sessions_spawn",
+    ]
+    .into_iter()
+    .map(|root_name| {
+        Box::new(RecordingTool {
+            root_name,
+            aliases: vec![],
+            calls: Arc::clone(&fixture.calls),
+            arguments: Arc::clone(&fixture.arguments),
+            stages: Arc::clone(&fixture.stages),
+        }) as Box<dyn Tool>
+    })
+    .collect();
     let catalog =
         Arc::new(CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default()).unwrap());
     let mut context = context();
@@ -239,4 +250,129 @@ async fn channel_force_ask_precedes_ledger_and_effective_full_skips_it() {
             .items
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn supervised_every_non_read_only_class_waits() {
+    let path = tempfile::tempdir().unwrap();
+    let context = ledger_context(path.path()).await;
+    assert!(context.execution_bindings.is_none());
+    let calls = [
+        (
+            "file_write",
+            serde_json::json!({"value":1,"path":"project.txt","content":"project content"}),
+        ),
+        ("shell", serde_json::json!({"value":1,"command":"touch project.txt"})),
+        (
+            "message_send",
+            serde_json::json!({"value":1,"channel":"prx_channel","target":"prx_target","message":"project message"}),
+        ),
+        ("config_reload", serde_json::json!({"value":1})),
+        (
+            "mcp_call",
+            serde_json::json!({"value":1,"server":"prx_server","tool":"prx_action","arguments":{}}),
+        ),
+        ("sessions_spawn", serde_json::json!({"value":1,"task":"project task"})),
+    ];
+    for (name, args) in calls {
+        let fixture = fixture();
+        let mut service = fixture.service(name, vec![], ToolExecutionDecision::Ask, approved(), true);
+        service.policy = Arc::new(SecurityEffectPolicy::new(Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        })));
+        let result = service
+            .execute(ToolExecutionCommand::new(name, args.clone()), context.clone(), None)
+            .await;
+        assert_eq!(
+            result.status,
+            ToolExecutionStatus::AwaitingApproval,
+            "{name}: {}",
+            result.model_content
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn general_call_claims_supply_gate_compatible_signed_grants() {
+    let path = tempfile::tempdir().unwrap();
+    let context = ledger_context(path.path()).await;
+    for (name, args, operation) in [
+        (
+            "shell",
+            serde_json::json!({"value":1,"command":"touch project.txt"}),
+            "touch project.txt",
+        ),
+        (
+            "file_write",
+            serde_json::json!({"value":1,"path":"project.txt"}),
+            "file_write:write:project",
+        ),
+        (
+            "message_send",
+            serde_json::json!({"value":1,"message":"project"}),
+            "message_send:send:project",
+        ),
+        (
+            "mcp_call",
+            serde_json::json!({"value":1,"server":"prx_server","tool":"prx_action"}),
+            "mcp_call:call:prx_server:prx_action",
+        ),
+    ] {
+        let fixture = fixture();
+        let service = fixture.service(name, vec![], ToolExecutionDecision::Ask, approved(), true);
+        assert_eq!(
+            service
+                .execute(ToolExecutionCommand::new(name, args.clone()), context.clone(), None)
+                .await
+                .status,
+            ToolExecutionStatus::AwaitingApproval
+        );
+        review(&context, true).await;
+        assert_eq!(
+            service
+                .execute(ToolExecutionCommand::new(name, args), context.clone(), None)
+                .await
+                .status,
+            ToolExecutionStatus::Succeeded
+        );
+        let arguments = fixture.arguments.lock();
+        let normalized = arguments.first().unwrap();
+        let grant = crate::security::policy::ApprovalGrant::from_runtime_args(name, normalized).unwrap();
+        let v2 = grant.v2.as_ref().unwrap();
+        assert!(v2.decision_binding.is_none());
+        assert_eq!(v2.max_uses, 1);
+        assert!(!grant.permits_resource_operation(
+            "prx_other_tool",
+            operation,
+            crate::security::policy::ResourceRiskLevel::Medium,
+            chrono::Utc::now().timestamp()
+        ));
+        if name == "shell" {
+            assert!(grant.permits_command(
+                name,
+                operation,
+                crate::security::policy::CommandRiskLevel::Medium,
+                chrono::Utc::now().timestamp()
+            ));
+            assert!(!grant.permits_command(
+                name,
+                "touch another.txt",
+                crate::security::policy::CommandRiskLevel::Medium,
+                chrono::Utc::now().timestamp()
+            ));
+        } else {
+            assert!(grant.permits_resource_operation(
+                name,
+                operation,
+                if name == "mcp_call" {
+                    crate::security::policy::ResourceRiskLevel::High
+                } else {
+                    crate::security::policy::ResourceRiskLevel::Medium
+                },
+                chrono::Utc::now().timestamp()
+            ));
+        }
+    }
 }

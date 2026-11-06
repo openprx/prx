@@ -506,6 +506,7 @@ async fn run_console_runtime_turn(
                 stream_provider: false,
                 tool_execution_service: None,
                 tool_execution_context: crate::tools::ToolExecutionContext::new(turn_envelope.clone(), "private")
+                    .with_approval_ledger(decision.service.execution_approval_ledger())
                     .with_chat_id(&turn_envelope.session_key),
                 allowed_tool_names: None,
             }),
