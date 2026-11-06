@@ -39,6 +39,7 @@ pub(crate) struct RecallScope {
     semantic: MemoryWriteContext,
     min_relevance_score: f64,
     record_user_messages: bool,
+    current_input_key: Option<String>,
 }
 
 impl RecallScope {
@@ -58,6 +59,7 @@ impl RecallScope {
             semantic,
             min_relevance_score: config.min_relevance_score,
             record_user_messages: config.events.record_user_messages,
+            current_input_key: envelope.run_id.as_deref().map(|run| format!("user_msg:{run}")),
         }
     }
 }
@@ -89,6 +91,7 @@ pub(crate) async fn scoped_recall(
         scope.min_relevance_score,
         Some(&scope.semantic),
         Some(scope.record_user_messages),
+        scope.current_input_key.as_deref(),
     )
     .await;
     let semantic_start = bundle.current_session_context.len() + bundle.recent_shared_context.len();
@@ -148,7 +151,7 @@ pub(crate) async fn build_context_with_scope(
     min_relevance_score: f64,
     scope_ctx: Option<&MemoryWriteContext>,
 ) -> RecalledMemoryContext {
-    build_semantic_context(mem, user_msg, min_relevance_score, scope_ctx, false).await
+    build_semantic_context(mem, user_msg, min_relevance_score, scope_ctx, false, None).await
 }
 
 fn fresh_timestamp(timestamp: &str) -> bool {
@@ -170,52 +173,93 @@ async fn build_semantic_context(
     min_relevance_score: f64,
     scope_ctx: Option<&MemoryWriteContext>,
     fresh_only: bool,
+    excluded_key: Option<&str>,
 ) -> RecalledMemoryContext {
     let mut summaries = Vec::new();
     let mut context = String::new();
     let mut ids = Vec::new();
 
-    // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall_with_context(user_msg, 5, None, scope_ctx).await {
-        let relevant: Vec<_> = entries
-            .iter()
-            .filter(|e| e.score.map_or(true, |score| score >= min_relevance_score))
-            .filter(|e| !fresh_only || fresh_timestamp(&e.timestamp))
-            .collect();
-
-        if !relevant.is_empty() {
-            context.push_str("[Memory context]\n");
-            for entry in &relevant {
-                if memory::is_assistant_autosave_key(&entry.key) {
-                    continue;
-                }
-
-                // Quoted material: strip the marker syntax before it is spliced
-                // into the live user turn, then cap the entry so a single huge
-                // memory cannot dominate the preamble.
-                let quoted = crate::multimodal::neutralize_media_markers(&entry.content);
-                let content = if quoted.len() > MAX_MEMORY_ENTRY_BYTES {
-                    let end = quoted.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
-                    format!("{}...", quoted.get(..end).unwrap_or_default())
-                } else {
-                    quoted.into_owned()
-                };
-
-                let line = format!("- {}: {}\n", entry.key, content);
-
-                // Cap total preamble size
-                if context.len() + line.len() > MAX_MEMORY_PREAMBLE_BYTES {
-                    break;
-                }
-                ids.push(entry.id.clone());
-                summaries.push(crate::causal_tree::projection::bounded_artifact_summary(&entry.content).0);
-                context.push_str(&line);
+    // The current turn is already in the live input; its semantic promotion
+    // must not count as historical recall or trigger a presentation callback.
+    let scored_entries = mem
+        .recall_with_context(user_msg, 5, None, scope_ctx)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.score.map_or(true, |score| score >= min_relevance_score))
+        .filter(|entry| !fresh_only || fresh_timestamp(&entry.timestamp))
+        .filter(|entry| excluded_key != Some(entry.key.as_str()))
+        .map(|entry| (entry.id, entry.key, entry.content))
+        .collect::<Vec<_>>();
+    let entries = if fresh_only && scored_entries.is_empty() {
+        // When scored recall has no matches, scoped prompt reads also use the
+        // repository's bounded keyword contract, independent of decision selection.
+        // Its hits have no semantic score: raw BM25 ranks are not comparable
+        // with the configured cosine/hybrid relevance threshold.
+        let Some(scope) = scope_ctx else {
+            return RecalledMemoryContext {
+                preamble: context,
+                ids,
+                semantic_range: 0..0,
+                summaries,
+            };
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            mem.retrieve_decision_memory(user_msg, 5, scope, None, deadline),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .filter(|hits| {
+            hits.len() <= 5
+                && hits.iter().all(|hit| {
+                    hit.id.len() <= 128
+                        && hit.key.len() <= 1024
+                        && hit.content.len() <= 4096
+                        && hit.created_at.len() <= 64
+                })
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|hit| fresh_timestamp(&hit.created_at))
+        .filter(|hit| excluded_key != Some(hit.key.as_str()))
+        .map(|hit| {
+            let content = crate::causal_tree::projection::bounded_artifact_summary(&hit.content).0;
+            (hit.id, hit.key, content)
+        })
+        .collect::<Vec<_>>()
+    } else {
+        scored_entries
+    };
+    if !entries.is_empty() {
+        context.push_str("[Memory context]\n");
+        for (id, key, content) in entries {
+            if memory::is_assistant_autosave_key(&key) {
+                continue;
             }
-            if context != "[Memory context]\n" {
-                context.push('\n');
+
+            // Neutralize quoted media before truncating or composing a prompt.
+            let quoted = crate::multimodal::neutralize_media_markers(&content);
+            let content = if quoted.len() > MAX_MEMORY_ENTRY_BYTES {
+                let end = quoted.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
+                format!("{}...", quoted.get(..end).unwrap_or_default())
             } else {
-                context.clear();
+                quoted.into_owned()
+            };
+            let line = format!("- {key}: {content}\n");
+            if context.len() + line.len() > MAX_MEMORY_PREAMBLE_BYTES {
+                break;
             }
+            ids.push(id);
+            summaries.push(crate::causal_tree::projection::bounded_artifact_summary(&content).0);
+            context.push_str(&line);
+        }
+        if context != "[Memory context]\n" {
+            context.push('\n');
+        } else {
+            context.clear();
         }
     }
 
@@ -550,7 +594,16 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
     min_relevance_score: f64,
     semantic_scope: Option<&MemoryWriteContext>,
 ) -> AgentContextBundle {
-    build_agent_context(mem, principal, user_msg, min_relevance_score, semantic_scope, None).await
+    build_agent_context(
+        mem,
+        principal,
+        user_msg,
+        min_relevance_score,
+        semantic_scope,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn build_agent_context(
@@ -560,9 +613,10 @@ async fn build_agent_context(
     min_relevance_score: f64,
     semantic_scope: Option<&MemoryWriteContext>,
     record_user_messages: Option<bool>,
+    excluded_key: Option<&str>,
 ) -> AgentContextBundle {
     let semantic = if record_user_messages.is_some() {
-        build_semantic_context(mem, user_msg, min_relevance_score, semantic_scope, true).await
+        build_semantic_context(mem, user_msg, min_relevance_score, semantic_scope, true, excluded_key).await
     } else {
         build_context_with_scope(mem, user_msg, min_relevance_score, semantic_scope).await
     };

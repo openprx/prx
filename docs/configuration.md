@@ -1215,7 +1215,12 @@ isolation for external origins. The composed recalled context is capped at
 recall is suppressed; semantic facts, documents and assistant history remain
 available. Scoped recall excludes stale and future-dated rows and projects image
 markers before bounding the retrieval query to 1024 bytes, including in traces.
-Decision-selected retrieval remains available to the decision engine.
+When scored semantic recall has no matches, scoped prompt recall also uses the
+repository’s bounded keyword read (up to five fresh, redacted summaries).
+The current turn’s semantic promotion is excluded from recall. Keyword
+hits have no semantic score; `memory.min_relevance_score` continues to filter
+scored semantic recall. Decision-selected retrieval remains available to the
+decision engine.
 
 ### Embeddings and vector recall
 

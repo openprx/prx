@@ -1112,3 +1112,44 @@ async fn scoped_recall_excludes_stale_and_future_history() {
     assert!(!recalled.preamble.contains("future history"));
     assert!(!fresh_timestamp("invalid"));
 }
+
+#[tokio::test]
+async fn scoped_recall_keyword_fallback_excludes_current_turn_and_foreign_owner() {
+    let dir = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(dir.path()).unwrap();
+    let mut scope = recall_test_scope("owner-a", "workspace-a");
+    scope.min_relevance_score = crate::config::MemoryConfig::default().min_relevance_score;
+    scope.current_input_key = Some("user_msg:prx_current_run".into());
+    seed_recall_memory(
+        &mem,
+        &scope,
+        scope.current_input_key.as_deref().unwrap(),
+        "fallbackkeyword current turn",
+    )
+    .await;
+    seed_recall_memory(
+        &mem,
+        &recall_test_scope("owner-b", "workspace-a"),
+        "foreign-note",
+        "fallbackkeyword foreign owner",
+    )
+    .await;
+    let empty = scoped_recall(&mem, &scope, "fallbackkeyword", RECALL_CONTEXT_BUDGET).await;
+    assert_eq!(empty.ids, Vec::<String>::new());
+    seed_recall_memory(&mem, &scope, "prior-note", "fallbackkeyword prior fact").await;
+    let scored = mem
+        .recall_with_context("fallbackkeyword", 5, None, Some(&scope.semantic))
+        .await
+        .unwrap();
+    assert!(!scored.is_empty());
+    assert!(
+        scored
+            .iter()
+            .all(|entry| entry.score.is_some_and(|score| score < scope.min_relevance_score))
+    );
+    let recalled = scoped_recall(&mem, &scope, "fallbackkeyword", RECALL_CONTEXT_BUDGET).await;
+    assert_eq!(recalled.ids.len(), 1);
+    assert!(recalled.preamble.contains("prior fact"));
+    assert!(!recalled.preamble.contains("current turn"));
+    assert!(!recalled.preamble.contains("foreign owner"));
+}
