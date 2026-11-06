@@ -93,6 +93,7 @@ impl RecoveryScope {
                 Some(crate::causal_tree::store::StoreMode::ReadWrite),
                 move |result| {
                     ticket.retain_prepared_store(result.as_ref().ok().cloned(), Some(prepared_events));
+                    // A failed store open also fails cleanup so the owner cannot report a clean drain.
                     ticket.finish(result.is_ok());
                 },
             )

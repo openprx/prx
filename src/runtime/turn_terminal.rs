@@ -3,7 +3,6 @@ use super::turn_decision::VerifiedDirectiveApplication;
 use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
 use crate::causal_tree::state::TurnSurfaceKind;
 use crate::causal_tree::store::{DecisionScope, Enqueue};
-use crate::decision::telemetry::{CausalEvent, CausalEventFields, CausalEventKind, CausalLineage};
 use crate::runtime::turn_decision::TurnDecisionService;
 use anyhow::Context;
 use std::sync::Arc;
@@ -1035,39 +1034,7 @@ impl super::ingress_recovery::RecoveryScope {
                 !replay.fixed_close() || facts.is_completed_local_close(),
                 "replay is not a completed local close"
             );
-            let source = replay.source();
-            let original_generation = (
-                source
-                    .config_generation_id
-                    .context("original source generation is missing")?,
-                Arc::from(
-                    source
-                        .config_source_revision
-                        .as_deref()
-                        .context("original source revision is missing")?,
-                ),
-            );
-            let application = VerifiedDirectiveApplication {
-                event: CausalEvent {
-                    kind: CausalEventKind::DirectiveApplied,
-                    lineage: CausalLineage {
-                        workspace_id: Arc::from(workspace_id.as_ref()),
-                        owner_id: Some(Arc::from(owner_id)),
-                        session_key: source.session_key.as_deref().map(Arc::from),
-                        run_id: source.run_id.as_deref().map(Arc::from),
-                        source_event_id: Some(Arc::from(source.event_id.as_str())),
-                        causation_event_id: Some(Arc::from(event.event_id.as_str())),
-                        decision_id: Some(Arc::from(decision.decision_id.to_string())),
-                        ..CausalLineage::default()
-                    },
-                    fields: CausalEventFields {
-                        item_count: Some(1),
-                        ..CausalEventFields::default()
-                    },
-                },
-                idempotency_key: format!("causal:{}:directive-applied", decision.decision_id),
-                original_generation: Some(original_generation),
-            };
+            let application = VerifiedDirectiveApplication::from_replay(&replay, &event)?;
             let sink = self
                 .durable_events
                 .as_ref()

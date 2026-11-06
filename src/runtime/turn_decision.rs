@@ -711,15 +711,56 @@ pub(crate) async fn close_directive_turn<P: CloseTurnPorts>(
     ports.finalize_closed_turn(context, &reply).await
 }
 
-/// Only the owning service issues an applied-event admission after checking
-/// the source proof, durable decision chain and committed terminal receipt.
+/// Applied-event admission issued by the owning service after terminal commit
+/// or reconstructed from an authenticated historical terminal replay.
 pub(super) struct VerifiedDirectiveApplication {
-    pub(super) event: CausalEvent,
-    pub(super) idempotency_key: String,
-    pub(super) original_generation: Option<(u64, Arc<str>)>,
+    event: CausalEvent,
+    idempotency_key: String,
+    original_generation: Option<(u64, Arc<str>)>,
 }
 
 impl VerifiedDirectiveApplication {
+    /// Reconstruct admission from authenticated source and decision evidence.
+    pub(super) fn from_replay(
+        replay: &crate::agent::terminal::VerifiedTerminalReplay,
+        terminal: &crate::memory::MessageEvent,
+    ) -> anyhow::Result<Self> {
+        let source = replay.source();
+        let decision = replay.decision();
+        let original_generation = (
+            source
+                .config_generation_id
+                .context("original source generation is missing")?,
+            Arc::from(
+                source
+                    .config_source_revision
+                    .as_deref()
+                    .context("original source revision is missing")?,
+            ),
+        );
+        Ok(Self {
+            event: CausalEvent {
+                kind: CausalEventKind::DirectiveApplied,
+                lineage: CausalLineage {
+                    workspace_id: Arc::from(source.workspace_id.as_str()),
+                    owner_id: source.owner_id.as_deref().map(Arc::from),
+                    session_key: source.session_key.as_deref().map(Arc::from),
+                    run_id: source.run_id.as_deref().map(Arc::from),
+                    source_event_id: Some(Arc::from(source.event_id.as_str())),
+                    causation_event_id: Some(Arc::from(terminal.event_id.as_str())),
+                    decision_id: Some(Arc::from(decision.decision_id.to_string())),
+                    ..CausalLineage::default()
+                },
+                fields: CausalEventFields {
+                    item_count: Some(1),
+                    ..CausalEventFields::default()
+                },
+            },
+            idempotency_key: format!("causal:{}:directive-applied", decision.decision_id),
+            original_generation: Some(original_generation),
+        })
+    }
+
     #[cfg(test)]
     pub(super) const fn fixture(event: CausalEvent, idempotency_key: String) -> Self {
         Self {
