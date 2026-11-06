@@ -20,7 +20,7 @@ use crate::tools::ToolSpec;
 
 impl TurnDecisionService {
     /// Build the safety ceiling once, independently of decision selection.
-    pub(crate) fn agent_turn_surface(
+    pub(crate) fn turn_tool_surface(
         &self,
         proof: &dyn TurnSourceProof,
         model: &str,
