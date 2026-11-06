@@ -497,6 +497,7 @@ impl PreparedReplay {
 /// Authentication of the old source and durable terminal does not mint a new
 /// generation's source proof. Consumers may use this only to repair telemetry.
 pub(crate) struct VerifiedTerminalReplay {
+    terminal_event_id: String,
     collected_pending: bool,
     collected_declined: bool,
     parent_digest: Option<String>,
@@ -511,6 +512,10 @@ pub(crate) struct VerifiedTerminalReplay {
 }
 
 impl VerifiedTerminalReplay {
+    /// Event id of the durable terminal this replay authenticated.
+    pub(crate) fn terminal_event_id(&self) -> &str {
+        &self.terminal_event_id
+    }
     pub(crate) const fn collected_pending(&self) -> bool {
         self.collected_pending
     }
@@ -1069,6 +1074,7 @@ async fn verify_terminal_replay_inner(
         );
     }
     Ok(VerifiedTerminalReplay {
+        terminal_event_id: event.event_id.clone(),
         collected_pending: binding.collected_pending.is_some(),
         collected_declined: binding.collected_declined.is_some(),
         parent_digest: binding.parent.map(|parent| parent.digest),

@@ -722,7 +722,6 @@ impl VerifiedDirectiveApplication {
     /// Reconstruct admission from authenticated source and decision evidence.
     pub(super) fn from_replay(
         replay: &crate::agent::terminal::VerifiedTerminalReplay,
-        terminal: &crate::memory::MessageEvent,
     ) -> anyhow::Result<Self> {
         let source = replay.source();
         let decision = replay.decision();
@@ -746,7 +745,7 @@ impl VerifiedDirectiveApplication {
                     session_key: source.session_key.as_deref().map(Arc::from),
                     run_id: source.run_id.as_deref().map(Arc::from),
                     source_event_id: Some(Arc::from(source.event_id.as_str())),
-                    causation_event_id: Some(Arc::from(terminal.event_id.as_str())),
+                    causation_event_id: Some(Arc::from(replay.terminal_event_id())),
                     decision_id: Some(Arc::from(decision.decision_id.to_string())),
                     ..CausalLineage::default()
                 },
