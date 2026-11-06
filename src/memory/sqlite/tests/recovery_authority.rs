@@ -3,15 +3,11 @@ use crate::memory::Memory;
 use std::sync::{Arc, Barrier};
 use tempfile::TempDir;
 
-fn store() -> (TempDir, SqliteMemory) {
-    let directory = TempDir::new().unwrap_or_else(|error| panic!("create fixture directory: {error}"));
-    let path = directory
-        .path()
-        .canonicalize()
-        .unwrap_or_else(|error| panic!("canonicalize fixture directory: {error}"))
-        .join("memory/brain.db");
-    let memory = SqliteMemory::new_with_path(path).unwrap_or_else(|error| panic!("open fixture repository: {error}"));
-    (directory, memory)
+fn store() -> anyhow::Result<(TempDir, SqliteMemory)> {
+    let directory = TempDir::new()?;
+    let path = directory.path().canonicalize()?.join("memory/brain.db");
+    let memory = SqliteMemory::new_with_path(path)?;
+    Ok((directory, memory))
 }
 fn chain() -> RecoveryChain {
     RecoveryChain {
@@ -21,32 +17,30 @@ fn chain() -> RecoveryChain {
         run_id: "prx_run".into(),
     }
 }
-fn seed(memory: &SqliteMemory, id: &str, role: &str) -> RecoveryEvidence {
-    memory.pool.write().execute("INSERT INTO message_events(event_id,workspace_id,owner_id,source,run_id,role,event_type,content,created_at,updated_at) VALUES(?1,'prx_workspace','prx_owner','cli','prx_run',?2,'message.created','original bytes','0','0')", params![id,role]).unwrap_or_else(|error| panic!("insert fixture event: {error}"));
-    memory
-        .recovery_event_evidence(&chain(), id)
-        .unwrap_or_else(|error| panic!("read fixture evidence: {error}"))
+fn seed(memory: &SqliteMemory, id: &str, role: &str) -> anyhow::Result<RecoveryEvidence> {
+    memory.pool.write().execute("INSERT INTO message_events(event_id,workspace_id,owner_id,source,run_id,role,event_type,content,created_at,updated_at) VALUES(?1,'prx_workspace','prx_owner','cli','prx_run',?2,'message.created','original bytes','0','0')", params![id,role])?;
+    memory.recovery_event_evidence(&chain(), id)
 }
-fn pending(memory: &SqliteMemory) -> RecoveryPublication {
-    RecoveryPublication {
+fn pending(memory: &SqliteMemory) -> anyhow::Result<RecoveryPublication> {
+    Ok(RecoveryPublication {
         chain: chain(),
-        input: Some(seed(memory, "input", "user")),
+        input: Some(seed(memory, "input", "user")?),
         terminal: None,
         facts: b"verified capsule, generation, lifetime, transport".to_vec(),
-    }
+    })
 }
-fn key_path(memory: &SqliteMemory, id: &str) -> std::path::PathBuf {
-    memory
+fn key_path(memory: &SqliteMemory, id: &str) -> anyhow::Result<std::path::PathBuf> {
+    Ok(memory
         .db_path
         .parent()
-        .unwrap_or_else(|| panic!("fixture repository has no memory directory"))
+        .ok_or_else(|| anyhow::anyhow!("fixture repository has no memory directory"))?
         .join(".recovery_keys")
-        .join(format!("{id}.key"))
+        .join(format!("{id}.key")))
 }
 
 #[test]
 fn recovery_key_create_race_is_durable() {
-    let (_dir, memory) = store();
+    let (_dir, memory) = store().unwrap();
     assert!(memory.recovery_repository().is_some());
     assert!(!memory.db_path.parent().unwrap().join(".recovery_keys").exists());
     let barrier = Arc::new(Barrier::new(3));
@@ -63,24 +57,28 @@ fn recovery_key_create_race_is_durable() {
     let ids = handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>();
     assert_eq!(ids.first(), ids.get(1));
     let id = ids.first().unwrap();
-    let before = std::fs::read(key_path(&memory, id)).unwrap();
+    let before = std::fs::read(key_path(&memory, id).unwrap()).unwrap();
     assert_eq!(before.len(), 32);
     let keys = KeyDirectory::open(memory.db_path.parent().unwrap(), false).unwrap();
     // A second exclusive create must refuse without touching existing bytes.
     let bytes: [u8; 32] = before.clone().try_into().unwrap();
     assert!(keys.install(id, &bytes).is_err());
-    assert_eq!(before, std::fs::read(key_path(&memory, id)).unwrap());
+    assert_eq!(before, std::fs::read(key_path(&memory, id).unwrap()).unwrap());
     let reopened = SqliteMemory::new_with_path(memory.db_path.clone()).unwrap();
     assert_eq!(*id, reopened.activate_recovery_authority().unwrap());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            std::fs::metadata(key_path(&memory, id)).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(key_path(&memory, id).unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
         assert_eq!(
-            std::fs::metadata(key_path(&memory, id).parent().unwrap())
+            std::fs::metadata(key_path(&memory, id).unwrap().parent().unwrap())
                 .unwrap()
                 .permissions()
                 .mode()
@@ -92,9 +90,9 @@ fn recovery_key_create_race_is_durable() {
 
 #[test]
 fn recovery_key_rejects_unsafe_paths() {
-    let (_dir, memory) = store();
+    let (_dir, memory) = store().unwrap();
     let id = memory.activate_recovery_authority().unwrap();
-    let path = key_path(&memory, &id);
+    let path = key_path(&memory, &id).unwrap();
     std::fs::write(&path, b"malformed").unwrap();
     assert!(memory.activate_recovery_authority().is_err());
     #[cfg(unix)]
@@ -118,7 +116,7 @@ fn recovery_key_rejects_unsafe_paths() {
         let alias = keys.with_file_name("memory_alias");
         symlink(memory.db_path.parent().unwrap(), &alias).unwrap();
         assert!(KeyDirectory::open(&alias, false).is_err());
-        let (_other, other) = store();
+        let (_other, other) = store().unwrap();
         let parent = other.db_path.parent().unwrap();
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(other.activate_recovery_authority().is_err());
@@ -128,11 +126,11 @@ fn recovery_key_rejects_unsafe_paths() {
 
 #[test]
 fn recovery_key_loss_never_replaces_authority() {
-    let (_dir, memory) = store();
+    let (_dir, memory) = store().unwrap();
     let id = memory.activate_recovery_authority().unwrap();
-    let publication = pending(&memory);
+    let publication = pending(&memory).unwrap();
     memory.record_recovery_pending(&publication).unwrap();
-    let path = key_path(&memory, &id);
+    let path = key_path(&memory, &id).unwrap();
     std::fs::remove_file(&path).unwrap();
     assert!(memory.activate_recovery_authority().is_err());
     assert!(memory.rotate_recovery_authority().is_err());
@@ -158,9 +156,9 @@ fn recovery_key_loss_never_replaces_authority() {
 
 #[test]
 fn recovery_rotation_preserves_old_receipts() {
-    let (_dir, memory) = store();
+    let (_dir, memory) = store().unwrap();
     let old = memory.activate_recovery_authority().unwrap();
-    let mut publication = pending(&memory);
+    let mut publication = pending(&memory).unwrap();
     let pending_receipt = memory.record_recovery_pending(&publication).unwrap();
     let new = memory.rotate_recovery_authority().unwrap();
     assert_ne!(old, new);
@@ -168,7 +166,7 @@ fn recovery_rotation_preserves_old_receipts() {
         memory.read_recovery_receipt(&chain()).unwrap().unwrap(),
         pending_receipt
     );
-    publication.terminal = Some(seed(&memory, "terminal", "assistant"));
+    publication.terminal = Some(seed(&memory, "terminal", "assistant").unwrap());
     publication.facts = b"verified final status and usage".to_vec();
     let settled = memory.settle_recovery(&publication).unwrap();
     assert_eq!(settled.key_id, new);
@@ -180,13 +178,13 @@ fn recovery_rotation_preserves_old_receipts() {
         .execute("UPDATE message_events SET content='changed' WHERE event_id='input'", [])
         .unwrap();
     assert!(memory.read_recovery_receipt(&chain()).is_err());
-    assert!(key_path(&memory, &old).exists());
-    assert!(key_path(&memory, &new).exists());
+    assert!(key_path(&memory, &old).unwrap().exists());
+    assert!(key_path(&memory, &new).unwrap().exists());
 }
 
 #[test]
 fn recovery_schema_upgrade_is_atomic() {
-    let (_dir, memory) = store();
+    let (_dir, memory) = store().unwrap();
     {
         let writer = memory.pool.write();
         let tx = writer.unchecked_transaction().unwrap();
@@ -223,7 +221,7 @@ fn recovery_schema_upgrade_is_atomic() {
         .execute_batch("DROP VIEW recovery_attestations")
         .unwrap();
     memory.activate_recovery_authority().unwrap();
-    let publication = pending(&memory);
+    let publication = pending(&memory).unwrap();
     let receipt = memory.record_recovery_pending(&publication).unwrap();
     assert_eq!(receipt, memory.record_recovery_pending(&publication).unwrap());
     let mut changed = publication.clone();
@@ -250,11 +248,11 @@ fn recovery_schema_upgrade_is_atomic() {
 
 #[test]
 fn recovery_settlement_race_has_one_receipt() {
-    let (_dir, memory) = store();
+    let (_dir, memory) = store().unwrap();
     memory.activate_recovery_authority().unwrap();
-    let mut publication = pending(&memory);
+    let mut publication = pending(&memory).unwrap();
     let initial = memory.record_recovery_pending(&publication).unwrap();
-    publication.terminal = Some(seed(&memory, "terminal", "assistant"));
+    publication.terminal = Some(seed(&memory, "terminal", "assistant").unwrap());
     publication.facts = b"verified final/claim/usage/lineage; projection pending".to_vec();
     let barrier = Arc::new(Barrier::new(3));
     // Distinct repositories/pools exercise SQLite's cross-connection writer arbitration.
