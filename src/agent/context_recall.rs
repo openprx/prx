@@ -170,6 +170,25 @@ fn fresh_timestamp(timestamp: &str) -> bool {
         .is_some_and(|age| age <= crate::decision::builtin::weights::STALE_ARTIFACT_MS)
 }
 
+/// Live-input echo rule shared by every recall path. A hit is an echo of the
+/// current turn when its trimmed content equals the trimmed live input, or is
+/// a Lucid `key: content` echo: the content ends with `": " + live input` and
+/// the part before `": "` contains no whitespace (a key, not prose).
+pub(crate) fn is_live_input_echo(content: &str, live: &str) -> bool {
+    let content = content.trim();
+    let live = live.trim();
+    if content == live {
+        return true;
+    }
+    if live.is_empty() {
+        return false;
+    }
+    content
+        .strip_suffix(live)
+        .and_then(|rest| rest.strip_suffix(": "))
+        .is_some_and(|key| !key.chars().any(char::is_whitespace))
+}
+
 pub(crate) fn recall_query(input: &str) -> String {
     let mut query = crate::multimodal::project_image_markers_for_routing(input).into_owned();
     query.truncate(query.floor_char_boundary(1024));
@@ -200,7 +219,7 @@ async fn build_semantic_context(
         .filter(|entry| !fresh_only || fresh_timestamp(&entry.timestamp))
         .filter(|entry| excluded_key != Some(entry.key.as_str()))
         .filter(|entry| excluded_event.is_none() || entry.source_event_id.as_deref() != excluded_event)
-        .filter(|entry| !entry.content.trim().ends_with(user_msg.trim()))
+        .filter(|entry| !is_live_input_echo(&entry.content, user_msg))
         .map(|entry| (entry.id, entry.key, entry.content))
         .collect::<Vec<_>>();
     let entries = if fresh_only && scored_entries.is_empty() {
@@ -261,7 +280,7 @@ async fn build_semantic_context(
         .filter(|hit| fresh_timestamp(&hit.created_at))
         .filter(|hit| excluded_key != Some(hit.key.as_str()))
         .filter(|hit| excluded_event.is_none() || hit.source_event_id.as_deref() != excluded_event)
-        .filter(|hit| !hit.content.trim().ends_with(user_msg.trim()))
+        .filter(|hit| !is_live_input_echo(&hit.content, user_msg))
         .map(|hit| {
             let content = crate::causal_tree::projection::bounded_artifact_summary(&hit.content).0;
             (hit.id, hit.key, content)

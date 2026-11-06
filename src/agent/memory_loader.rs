@@ -252,7 +252,7 @@ impl Memory for SelectedMemoryView<'_> {
         hits.retain(|hit| {
             self.excluded_key != Some(hit.key.as_str())
                 && (self.excluded_event.is_none() || hit.source_event_id.as_deref() != self.excluded_event)
-                && !hit.content.trim().ends_with(self.current_input.trim())
+                && !crate::agent::context_recall::is_live_input_echo(&hit.content, self.current_input)
                 && !hit.content.trim().is_empty()
                 && chrono::DateTime::parse_from_rfc3339(&hit.created_at)
                     .ok()

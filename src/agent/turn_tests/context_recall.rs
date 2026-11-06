@@ -1367,3 +1367,18 @@ async fn scoped_recall_excludes_provenance_less_live_input_echo() {
     assert!(recalled.preamble.contains("unrelated prior fact"));
     assert!(!recalled.preamble.contains("live input"));
 }
+
+#[test]
+fn live_input_echo_rule_is_exact() {
+    // Exact echo of the live input is dropped.
+    assert!(is_live_input_echo("prxquery live input", " prxquery live input "));
+    // Lucid `key: content` echo is dropped when the key has no whitespace.
+    assert!(is_live_input_echo("lucid_3: status updates", "status updates"));
+    // Prose that merely ends with the live input is kept.
+    assert!(!is_live_input_echo(
+        "User asked for concise status updates",
+        "status updates"
+    ));
+    // A labelled echo whose label contains whitespace is prose, so it is kept.
+    assert!(!is_live_input_echo("user msg: status updates", "status updates"));
+}
