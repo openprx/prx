@@ -6,7 +6,7 @@ use anyhow::Context as _;
 impl IssuedChildGrant {
     pub(in crate::runtime) fn recursive_child_allowance(
         &self,
-    ) -> Option<Arc<crate::runtime::turn_decision::recursive_allowance::RecursiveAllowance>> {
+    ) -> Option<Arc<crate::runtime::child_source::recursive_allowance::RecursiveAllowance>> {
         self.0.recursive_child_claimed.clone()
     }
 
