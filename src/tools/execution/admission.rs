@@ -10,7 +10,6 @@ pub(crate) struct TurnSurface {
     published: BTreeSet<String>,
     exclusions: BTreeSet<String>,
     model_allowlist: Option<BTreeSet<String>>,
-    channel_eligible: BTreeSet<String>,
 }
 
 impl TurnSurface {
@@ -38,7 +37,6 @@ impl TurnSurface {
             published: BTreeSet::new(),
             exclusions,
             model_allowlist,
-            channel_eligible: BTreeSet::new(),
         };
         if surface.registry_generation.is_none() {
             // Fail closed: without a generation no later call can be proven current.
@@ -54,7 +52,6 @@ impl TurnSurface {
             {
                 continue;
             }
-            surface.channel_eligible.insert(name.clone());
             surface.published.insert(name.clone());
         }
         surface
@@ -79,7 +76,6 @@ impl TurnSurface {
         self.published.contains(name)
             && !self.exclusions.contains(name)
             && self.model_allowlist.as_ref().is_none_or(|names| names.contains(name))
-            && self.channel_eligible.contains(name)
     }
 }
 
