@@ -1351,17 +1351,34 @@ fn test_chat_plain_resume_command_switches_saved_session_no_tui_chrome() {
     );
     let alpha_id = first_saved_session_id(&list_sessions_in(&guard));
 
-    let output = run_chat_script_in(
+    // Interactive PTY: /resume is deferred while the beta turn is pending, and
+    // /cost is not. A single stdin burst can therefore print cost for the empty
+    // beta session before the resume marker. Wait for the marker first.
+    let mut sg = spawn_chat_in(
         &guard,
         &["--plain"],
         &[("PRX_TUI", "1"), ("OPENPRX_MOCK_RESPONSE", "BETA_REPLY")],
-        &format!("beta question\n/resume {alpha_id}\n/cost\n/exit\n"),
     );
+    let session = sg.session();
+    let mut output = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
 
+    session.send("beta question\r").expect("send beta question");
+    output.push_str(&read_until_with_dsr(session, "BETA_REPLY", TURN_TIMEOUT));
+
+    session.send(format!("/resume {alpha_id}\r")).expect("send /resume");
+    output.push_str(&read_until_with_dsr(
+        session,
+        "Resumed saved chat session",
+        TURN_TIMEOUT,
+    ));
     assert!(
         output.contains("Resumed saved chat session"),
         "resume confirmation missing; output:\n{output}"
     );
+
+    session.send("/cost\r").expect("send /cost");
+    output.push_str(&read_until_with_dsr(session, "Turns:", TURN_TIMEOUT));
     assert!(
         output.contains("Turns:        2"),
         "cost after /resume should reflect alpha session's exact two persisted turns; output:\n{output}"
@@ -1373,6 +1390,9 @@ fn test_chat_plain_resume_command_switches_saved_session_no_tui_chrome() {
             && !output.contains("diff workspace diff"),
         "--plain /resume must not render TUI chrome; output:\n{output}"
     );
+
+    session.send("/exit\r").expect("send /exit");
+    let _ = wait_for_exit(session, EXIT_TIMEOUT);
 }
 
 #[test]
