@@ -1238,3 +1238,6 @@ mod authority;
 
 #[cfg(test)]
 mod authority_tests;
+
+#[cfg(test)]
+pub(crate) mod tombstone_fixture;

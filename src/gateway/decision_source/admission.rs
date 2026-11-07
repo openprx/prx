@@ -404,6 +404,179 @@ mod tests {
         );
     }
 
+    const ERASED_KEY: &str = "prx-gateway-stable-key";
+
+    /// One gateway issuer over one workspace, with the decision plane on or off.
+    struct GatewayIssuer {
+        generation: Arc<crate::config::ConfigGeneration>,
+        fabric: MemoryFabric,
+        envelope: RuntimeEnvelope,
+        tracker: Arc<crate::runtime::turn_cleanup::CleanupTracker>,
+    }
+
+    impl GatewayIssuer {
+        fn new(workspace: &std::path::Path, plane: bool, memory: Arc<dyn Memory>) -> Self {
+            let mut config = crate::config::Config::default();
+            config.workspace_dir = workspace.to_path_buf();
+            config.config_path = workspace.join("config.toml");
+            config.causal_tree.enabled = plane;
+            let generation = crate::config::new_shared(config).pin();
+            let fabric = MemoryFabric::new(memory, workspace.to_string_lossy());
+            let envelope = RuntimeEnvelope::gateway(
+                fabric.workspace_id(),
+                "prx_session",
+                "webhook",
+                "prx_user",
+                "prx_service",
+                MemoryVisibility::Session,
+            )
+            .with_run_id("prx_run")
+            .with_config_generation(&generation);
+            Self {
+                generation,
+                fabric,
+                envelope,
+                tracker: Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default()),
+            }
+        }
+
+        async fn admit(
+            &self,
+            content: &str,
+        ) -> anyhow::Result<(
+            GatewaySourceReceipt,
+            Option<crate::memory::MessageEvent>,
+            GatewayAdmissionGuard,
+        )> {
+            GatewayPendingInput {
+                generation: Arc::clone(&self.generation),
+                fabric: self.fabric.clone(),
+                envelope: self.envelope.clone(),
+                ticket: self
+                    .tracker
+                    .register(tokio_util::sync::CancellationToken::new())
+                    .expect("test: cleanup owner"),
+                acknowledgement: None,
+            }
+            .record(content.to_string(), Some(ERASED_KEY.to_string()))
+            .await
+        }
+
+        /// Every ticket this issuer registered was released; true when none failed.
+        async fn drained(&self) -> anyhow::Result<()> {
+            self.tracker
+                .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await
+        }
+    }
+
+    /// Accept a stable-key gateway input with the plane on, then erase its
+    /// message through the production erasure store: the tombstone remains.
+    async fn gateway_erased_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
+        let dir = fixture::home_dir();
+        let workspace = dir.path().to_path_buf();
+        let base: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&workspace).unwrap());
+        let view = base.with_erasure_origin(fixture::erasure_origin()).unwrap();
+        let issuer = GatewayIssuer::new(&workspace, true, view);
+        let (_receipt, event, guard) = issuer.admit("prx input").await.expect("test: first admission");
+        assert!(event.is_some_and(|event| event.id > 0), "first input was not recorded");
+        let (ticket, _acknowledgement) = guard.into_terminal_parts().expect("test: hand off the admission");
+        ticket.finish(true);
+        issuer.drained().await.expect("test: first admission cleanup");
+        fixture::erase(&base);
+        assert_eq!(fixture::row_count(&workspace, "recovery_tombstones"), 1, "tombstone");
+        assert_eq!(fixture::row_count(&workspace, "message_events"), 0, "row survived");
+        drop((issuer, base));
+        (dir, workspace)
+    }
+
+    fn fresh_memory(workspace: &std::path::Path) -> Arc<dyn Memory> {
+        Arc::new(SqliteMemory::new(workspace).unwrap())
+    }
+
+    /// (i) Plane off, keys present: the erased stable key is still spent.
+    #[tokio::test]
+    async fn gateway_plane_off_erased_key_retry_is_refused_as_already_accepted() {
+        use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
+        let (_dir, workspace) = gateway_erased_workspace().await;
+        let keys = fixture::key_snapshot(&workspace);
+        assert!(keys.as_ref().is_some_and(|keys| !keys.is_empty()), "no recovery keys");
+        let issuer = GatewayIssuer::new(&workspace, false, fresh_memory(&workspace));
+        for content in ["prx input", "prx different input"] {
+            let retry = issuer.admit(content).await;
+            assert!(
+                retry.as_ref().err().is_some_and(fixture::is_already_accepted),
+                "erased gateway key was readmitted: {:?}",
+                retry.as_ref().err()
+            );
+        }
+        assert_eq!(
+            fixture::row_count(&workspace, "message_events"),
+            0,
+            "a refusal wrote a row"
+        );
+        assert_eq!(fixture::key_snapshot(&workspace), keys, "the fence touched the keys");
+        issuer.drained().await.expect("test: refused tickets are released");
+    }
+
+    /// (ii) Plane off, the tombstone's key file removed: typed refusal from the
+    /// issuer's own error branch, never an unrecorded receipt.
+    #[tokio::test]
+    async fn gateway_plane_off_erased_key_without_key_file_is_a_typed_refusal() {
+        use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
+        let (_dir, workspace) = gateway_erased_workspace().await;
+        fixture::stash_keys(&workspace);
+        let issuer = GatewayIssuer::new(&workspace, false, fresh_memory(&workspace));
+        let retry = issuer.admit("prx different input").await;
+        assert!(
+            retry.as_ref().err().is_some_and(fixture::is_fence_unavailable),
+            "a missing key file was not a typed refusal: {:?}",
+            retry.as_ref().err()
+        );
+        assert_eq!(
+            fixture::row_count(&workspace, "message_events"),
+            0,
+            "a refusal wrote a row"
+        );
+        assert_eq!(
+            fixture::key_snapshot(&workspace).map(|keys| keys.len()),
+            Some(0),
+            "the refusal recreated a key"
+        );
+        // The ticket is released (finished as failed), never left pending.
+        let drained = issuer.drained().await;
+        assert!(
+            drained
+                .as_ref()
+                .err()
+                .is_none_or(|error| !error.to_string().contains("timed out")),
+            "the refused admission left its ticket pending: {drained:?}"
+        );
+    }
+
+    /// (iii) A database that never activated recovery is admitted and gains no state.
+    #[tokio::test]
+    async fn gateway_plane_off_never_activated_store_creates_no_recovery_state() {
+        use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let issuer = GatewayIssuer::new(&workspace, false, fresh_memory(&workspace));
+        let (_receipt, event, guard) = issuer.admit("prx input").await.expect("test: admission");
+        assert!(event.is_some_and(|event| event.id > 0), "input was not recorded");
+        let (ticket, _acknowledgement) = guard.into_terminal_parts().expect("test: hand off the admission");
+        ticket.finish(true);
+        issuer.drained().await.expect("test: cleanup");
+        assert!(
+            !fixture::table_exists(&workspace, "recovery_tombstones"),
+            "the fence created the tombstone table"
+        );
+        assert!(
+            !fixture::keys_dir(&workspace).exists(),
+            "the fence created .recovery_keys"
+        );
+    }
+
     struct CommitThenSuspend {
         inner: Arc<dyn Memory>,
         suspend: std::sync::atomic::AtomicBool,

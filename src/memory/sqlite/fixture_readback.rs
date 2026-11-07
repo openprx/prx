@@ -95,3 +95,28 @@ impl RouterReadback {
         )
     }
 }
+
+fn read_only(workspace: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(
+        workspace.join("memory/brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("test: brain.db")
+}
+
+pub(crate) fn table_exists(workspace: &std::path::Path, table: &str) -> bool {
+    read_only(workspace)
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("test: schema query")
+        > 0
+}
+
+pub(crate) fn row_count(workspace: &std::path::Path, table: &str) -> i64 {
+    read_only(workspace)
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))
+        .expect("test: row count")
+}
