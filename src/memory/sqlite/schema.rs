@@ -1121,6 +1121,7 @@ impl SqliteMemory {
         )?;
 
         super::erasure_pool::init_schema(conn)?;
+        super::agent_registry::init_schema(conn)?;
         Self::run_memory_schema_migrations(conn)?;
 
         Ok(())
@@ -1460,6 +1461,11 @@ impl SqliteMemory {
                 17,
                 "ramflux_transactional_erasure",
                 "ramflux_erase_index(account,conversation,message,table_name,record_rowid) + ramflux_erase_origin + ramflux_erase_record + ramflux_tombstones(account,conversation,message,sealed) + ramflux_blobs(id,account,conversation,kind,object_key,bytes)",
+            ),
+            (
+                18,
+                "multi_agent_registry",
+                "agent_incarnations(workspace_id,owner_id,agent_key,incarnation,state,config_revision) + agent_scopes(scope_id,workspace_id,owner_id,session_key,agent_key,incarnation,generation) + agent_erase_fences(scope_id,erase_id,state,next_generation) + agent_erase_receipts(workspace_id,owner_id,erase_id,scope_id,incarnation,generation,state,remaining,completed_at) + agent_erase_keys(workspace_id,owner_id,idempotency_key,request_method,canonical_path,scope_id,request_hash,erase_id,created_at,expires_at) + agent_erase_manifest(erase_id,store,record_key,fts_rowid) + agent_purge_progress(workspace_id,owner_id,agent_key,incarnation,purge_id,state,after_scope_id,current_erase_id) + STRICT + active-incarnation partial unique + erased-receipt immutability triggers",
             ),
         ]
     }

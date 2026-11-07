@@ -24,6 +24,7 @@ use crate::memory::traits::{
     SharedContextQuery,
 };
 
+mod agent_registry;
 mod erasure;
 mod event_batch;
 mod message_events;
