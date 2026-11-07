@@ -112,6 +112,16 @@ impl UploadGuard {
         std::sync::Arc::clone(&self.abandoned)
     }
 
+    /// Settle the outcome of creating `path`. A failed create (including
+    /// `AlreadyExists`) means this request did not create the file, so the path
+    /// is unregistered and the guard can never unlink a file it does not own.
+    fn settle(&mut self, path: &StdPath, created: std::io::Result<std::fs::File>) -> std::io::Result<std::fs::File> {
+        if created.is_err() {
+            self.paths.retain(|registered| registered != path);
+        }
+        created
+    }
+
     /// The request was admitted: the files now belong to the turn.
     fn release(mut self) {
         self.released = true;
@@ -863,8 +873,8 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<P
                     let worker_path = stored_path.clone();
                     let created = tokio::task::spawn_blocking(move || create_upload_file(&worker_path, &abandoned))
                         .await
-                        .map_err(|error| persist_failed(std::io::Error::other(error)))?
-                        .map_err(persist_failed)?;
+                        .map_err(|error| persist_failed(std::io::Error::other(error)))?;
+                    let created = uploads.settle(&stored_path, created).map_err(persist_failed)?;
                     let mut file = fs::File::from_std(created);
                     file.write_all(&bytes).await.map_err(persist_failed)?;
                     file.flush().await.map_err(persist_failed)?;

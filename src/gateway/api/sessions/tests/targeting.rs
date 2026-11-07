@@ -1096,6 +1096,26 @@ fn upload_path_is_owned_before_creation_and_cancellation_leaves_no_file() {
     assert!(kept.exists(), "a released upload stays");
 }
 
+#[test]
+fn upload_already_exists_preserves_the_existing_file() {
+    let temp = tempfile::tempdir().expect("test: tempdir");
+    let sentinel = temp.path().join("sentinel.bin");
+    std::fs::write(&sentinel, b"PRE-EXISTING").expect("test: sentinel");
+
+    let mut guard = UploadGuard::default();
+    let abandoned = guard.begin(sentinel.clone());
+    let outcome = guard.settle(&sentinel, create_upload_file(&sentinel, &abandoned));
+    let error = outcome.expect_err("test: create_new must refuse an existing file");
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(guard.paths.is_empty(), "a path this request did not create is unregistered");
+
+    drop(guard);
+    assert_eq!(
+        std::fs::read(&sentinel).expect("test: sentinel must still exist"),
+        b"PRE-EXISTING"
+    );
+}
+
 #[tokio::test]
 async fn multipart_parse_error_after_a_file_leaves_no_upload() {
     // A completed file followed by a truncated `agent` field: the parser
