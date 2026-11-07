@@ -911,3 +911,115 @@ async fn targeted_turn_approval_call_ends_denied_without_pending_state() {
     assert_eq!(main.ran("file_read"), 0, "the resolver denied the call");
     assert!(!main.follow_up.contains(APPROVAL_DENIED));
 }
+
+// ── Upload ownership ────────────────────────────────────────────────────────
+
+const BOUNDARY: &str = "prx-test-boundary";
+
+fn multipart_request(body: String) -> Request {
+    let mut request = Request::builder()
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(Body::from(body))
+        .expect("test: request");
+    request
+        .extensions_mut()
+        .insert(super::super::super::ApiPrincipal::of_token("prx-test-token"));
+    request
+}
+
+fn text_part(name: &str, value: &str) -> String {
+    format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+}
+
+fn file_part(file_name: &str, content: &str) -> String {
+    format!(
+        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{file_name}\"\r\n\
+         Content-Type: text/plain\r\n\r\n{content}\r\n"
+    )
+}
+
+async fn post_multipart(fixture: &Fixture, session: &str, body: String) -> StatusCode {
+    post_session_message(
+        State(fixture.state.clone()),
+        Path(session.to_owned()),
+        multipart_request(body),
+    )
+    .await
+    .into_response()
+    .status()
+}
+
+fn stored_uploads(fixture: &Fixture) -> Vec<(String, String)> {
+    let root = fixture.state.config.pin().effective.workspace_dir.join("uploads");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(String, String)> = entries
+        .map(|entry| {
+            let path = entry.expect("test: entry").path();
+            (
+                path.file_name().expect("test: name").to_string_lossy().into_owned(),
+                std::fs::read_to_string(&path).expect("test: read upload"),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn refused_target_cleanup_removes_only_its_own_upload() {
+    // The switch is off, so the named request is refused after its file is
+    // stored. A Main request sent the same file name in the same instant (its
+    // session does not exist, so its file stays behind). The refusal must
+    // remove only the file the refused request created.
+    let fixture = fixture(|config| config.gateway.targeted_agents = false).await;
+    let main_body = format!(
+        "{}{}--{BOUNDARY}--\r\n",
+        text_part("message", "main request"),
+        file_part("same.txt", "MAIN-CONTENT")
+    );
+    assert_eq!(
+        post_multipart(&fixture, "no-such-session", main_body).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(stored_uploads(&fixture).len(), 1, "the Main upload is stored");
+
+    let named_body = format!(
+        "{}{}{}--{BOUNDARY}--\r\n",
+        text_part("message", "named request"),
+        text_part("agent", "helper"),
+        file_part("same.txt", "NAMED-CONTENT")
+    );
+    assert_eq!(
+        post_multipart(&fixture, SESSION, named_body).await,
+        StatusCode::CONFLICT
+    );
+    let left = stored_uploads(&fixture);
+    assert_eq!(left.len(), 1, "only the refused request's file was removed: {left:?}");
+    assert_eq!(
+        left.first().map(|(_, content)| content.as_str()),
+        Some("MAIN-CONTENT"),
+        "the Main request's file is untouched"
+    );
+    assert_untouched(&fixture).await;
+}
+
+#[tokio::test]
+async fn multipart_parse_error_after_a_file_leaves_no_upload() {
+    // A completed file followed by a truncated `agent` field: the parser
+    // fails after the file is on disk, and nothing may remain.
+    let fixture = fixture(|config| config.gateway.targeted_agents = true).await;
+    let body = format!(
+        "{}{}--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"agent\"\r\n\r\nhelp",
+        text_part("message", "hi"),
+        file_part("kept.txt", "CONTENT")
+    );
+    let status = post_multipart(&fixture, SESSION, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(stored_uploads(&fixture), Vec::new(), "no upload is left behind");
+    assert_untouched(&fixture).await;
+}

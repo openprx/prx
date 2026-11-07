@@ -87,12 +87,42 @@ where
     serde_json::Value::deserialize(deserializer).map(Some)
 }
 
+/// The files one multipart request created. They are removed when the guard
+/// drops (a parse error, a refused target, a cancelled request) unless
+/// [`UploadGuard::release`] handed them over. Only paths this request created
+/// are ever removed.
+#[derive(Default)]
+struct UploadGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl UploadGuard {
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    /// The request was admitted: the files now belong to the turn.
+    fn release(mut self) {
+        self.paths.clear();
+    }
+}
+
+impl Drop for UploadGuard {
+    fn drop(&mut self) {
+        for path in self.paths.drain(..) {
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::warn!(error = %error, "Failed to remove an upload of an unadmitted request");
+            }
+        }
+    }
+}
+
 /// A parsed message request. `uploads` are the files already stored for a
-/// multipart request; they are removed again when the target is refused.
+/// multipart request; they are removed again unless the request is admitted.
 struct ParsedMessage {
     message: String,
     agent: AgentField,
-    uploads: Vec<PathBuf>,
+    uploads: UploadGuard,
 }
 
 #[derive(Deserialize)]
@@ -692,7 +722,7 @@ async fn parse_json_message(state: &AppState, request: Request) -> Result<Parsed
     Ok(ParsedMessage {
         message,
         agent: payload.agent.map_or(AgentField::Omitted, AgentField::from_json),
-        uploads: Vec::new(),
+        uploads: UploadGuard::default(),
     })
 }
 
@@ -711,7 +741,7 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<P
     let mut message = String::new();
     let mut agent = AgentField::Omitted;
     let mut attachments = Vec::new();
-    let mut uploads = Vec::new();
+    let mut uploads = UploadGuard::default();
     let mut file_count = 0usize;
 
     while let Some(field) = multipart
@@ -767,14 +797,36 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<P
                     uploads_root_prepared = true;
                 }
 
-                let stored_name = format!("{}_{}_{}", Utc::now().timestamp_millis(), file_count, safe_name);
+                // A per-request unique name, created exclusively: concurrent
+                // requests never share a path, and cleanup never reaches a file
+                // this request did not create.
+                let stored_name = format!(
+                    "{}_{}_{}_{}",
+                    Utc::now().timestamp_millis(),
+                    uuid::Uuid::new_v4().simple(),
+                    file_count,
+                    safe_name
+                );
                 let stored_path = uploads_root.join(stored_name);
 
-                fs::write(&stored_path, &bytes).await.map_err(|error| {
+                let persist_failed = |error: std::io::Error| {
                     tracing::error!("Failed to persist uploaded file: {error}");
                     json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist uploaded file")
-                })?;
-                uploads.push(stored_path.clone());
+                };
+                {
+                    use tokio::io::AsyncWriteExt;
+                    let mut file = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&stored_path)
+                        .await
+                        .map_err(persist_failed)?;
+                    // The file exists from here on, so the guard owns it even
+                    // if the write below fails.
+                    uploads.track(stored_path.clone());
+                    file.write_all(&bytes).await.map_err(persist_failed)?;
+                    file.flush().await.map_err(persist_failed)?;
+                }
 
                 if is_image_upload(&content_type, &safe_name) {
                     attachments.push(format!("[IMAGE:{}]", stored_path.display()));
@@ -1355,16 +1407,11 @@ pub async fn post_session_message(
 
     let selected = match select_turn_target(&state, turn_runtime, agent) {
         Ok(selected) => selected,
-        Err(refusal) => {
-            // A refused target leaves nothing behind, uploads included.
-            for path in &uploads {
-                if let Err(error) = fs::remove_file(path).await {
-                    tracing::warn!(error = %error, "Failed to remove an upload of a refused targeted request");
-                }
-            }
-            return refusal;
-        }
+        // A refused target leaves nothing behind: dropping the guard removes
+        // the files this request created, and only those.
+        Err(refusal) => return refusal,
     };
+    uploads.release();
 
     submit_console_message(
         state,
