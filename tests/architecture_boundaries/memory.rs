@@ -30,6 +30,8 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/agent/turn_tests/compaction.rs::configurable_compaction_records_run_and_summary_memory::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     // Test-only: tamper the durable v3 capsule authentication to simulate an unverifiable capsule (AUTH-02-1a).
     "src/chat/tests/persist_recovery_tests.rs::chat_inbound_on_an_agent_store_survives_an_unverifiable_capsule::rusqlite::Connection::open(dir.path().join(\"memory\").join(\"brain.db\")).expect(\"agent store database\");",
+    // Test-only: inspect the real tables to prove erasure leaves a tombstone and no transport digest (AUTH-02-1b).
+    "src/runtime/ingress_recovery/authority_tests.rs::db::rusqlite::Connection::open(workspace.join(\"memory\").join(\"brain.db\")).expect(\"brain.db\")",
     "src/chat/tests/legacy_chat_compaction_audit_tests.rs::legacy_chat_compaction_downgrades_fidelity_when_event_provenance_is_unavailable::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/chat/tests/legacy_chat_compaction_audit_tests.rs::legacy_chat_compaction_persists_run_and_summary_memory::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/cron/store.rs::add_job_persists_owner_topic_lineage_and_event::let memory_conn = Connection::open(config.workspace_dir.join(\"memory\").join(\"brain.db\")).unwrap();",
@@ -156,6 +158,10 @@ const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     // derived from message_events, erased with their referenced input/final.
     "src/memory/sqlite/recovery_authority.rs::recovery_authority",
     "src/memory/sqlite/recovery_authority.rs::recovery_attestations",
+    // AUTH-02-1b: keyed transport digest per attestation (erased with it by cascade).
+    "src/memory/sqlite/recovery_authority.rs::recovery_transport_index",
+    // AUTH-02-1b: keyed digest of an erased stable input key; no content, no foreign key.
+    "src/memory/sqlite/recovery_authority.rs::recovery_tombstones",
     // Dedicated Article 73 compliance ledger: it stores immutable event hashes,
     // is owned by IncidentStore, and is intentionally separate from message/memory events.
     "src/compliance/incident.rs::serious_incident_audit_events",
@@ -262,7 +268,10 @@ fn persisted_event_tables_are_explicitly_allowlisted() {
                 table.trim_matches(|character: char| matches!(character, '`' | '\'' | '"' | '(' | ')' | ',' | ';'));
             if table.contains("event")
                 || table.contains("ledger")
-                || matches!(table, "recovery_authority" | "recovery_attestations")
+                || matches!(
+                    table,
+                    "recovery_authority" | "recovery_attestations" | "recovery_transport_index" | "recovery_tombstones"
+                )
             {
                 actual.push(format!("{relative}::{table}"));
             }

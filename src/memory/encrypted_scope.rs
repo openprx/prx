@@ -768,6 +768,7 @@ impl Memory for EncryptedScope {
         capsule: crate::memory::ingress_recovery::IngressCapsule,
         lifetime: std::sync::Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
         deadline: std::time::Instant,
+        attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
     ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
         let mut input = input;
         self.seal_event_content(&mut input)?;
@@ -785,7 +786,7 @@ impl Memory for EncryptedScope {
         }
         let outcome = self
             .inner
-            .append_ingress_input(input, capsule, lifetime, deadline)
+            .append_ingress_input(input, capsule, lifetime, deadline, attestation)
             .await?;
         Ok(match outcome {
             crate::memory::ingress_recovery::IngressAppendOutcome::Inserted(event) => {
@@ -793,6 +794,9 @@ impl Memory for EncryptedScope {
             }
             crate::memory::ingress_recovery::IngressAppendOutcome::AlreadyAccepted(event) => {
                 crate::memory::ingress_recovery::IngressAppendOutcome::AlreadyAccepted(self.reveal(event))
+            }
+            crate::memory::ingress_recovery::IngressAppendOutcome::Tombstoned => {
+                crate::memory::ingress_recovery::IngressAppendOutcome::Tombstoned
             }
         })
     }
