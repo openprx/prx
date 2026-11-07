@@ -362,6 +362,12 @@ max_history = 200
 # again. Must be greater than 0. Default: 86400 (24 hours).
 # channel_webhook_dedup_ttl_secs = 86400
 
+# Rollout switch for targeted agent turns (`agent` on
+# POST /api/sessions/{id}/message). While false, any otherwise-valid named
+# target answers 409 `agent_disabled` and never runs as the main agent.
+# Default: false.
+# targeted_agents = false
+
 [runtime]
 # Extra host environment variable names available to the generic shell tool.
 # Default: []; exact uppercase ASCII names only, no wildcards or values.
@@ -634,6 +640,12 @@ provider = "anthropic"
 model = "claude-sonnet-4-6"
 agentic = true
 allowed_tools = ["web_search", "file_read"]
+# Targeted turns (`agent` on POST /api/sessions/{id}/message, needs
+# [gateway] targeted_agents = true): `enabled = false` answers 409
+# `agent_disabled`; `autonomy` is capped at the main agent's level.
+# Names must match ^[a-z][a-z0-9_-]{0,63}$ and cannot be `main`.
+# enabled = true
+# autonomy = "supervised"
 
 # Model fallbacks
 [reliability.model_fallbacks]

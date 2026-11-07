@@ -118,6 +118,8 @@ mod tests {
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
+            enabled: true,
+            autonomy: None,
         }
     }
 

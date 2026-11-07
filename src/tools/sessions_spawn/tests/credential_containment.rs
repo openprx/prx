@@ -21,6 +21,8 @@ fn containment_agent(provider: &str, api_key: Option<&str>) -> DelegateAgentConf
         identity_dir: None,
         memory_scope: None,
         spawn_enabled: None,
+        enabled: true,
+        autonomy: None,
     }
 }
 

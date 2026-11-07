@@ -134,6 +134,8 @@ async fn genuine_depth_denial_retains_parent_cleanup_ack_evidence() -> anyhow::R
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             };
             config.agents.insert("deep-agent".to_owned(), depth_config);
             super::native_decision_fixture::configure(&mut config, &endpoint).unwrap();

@@ -17,6 +17,8 @@ fn kimi_agent(api_key: Option<&str>) -> DelegateAgentConfig {
         identity_dir: None,
         memory_scope: None,
         spawn_enabled: None,
+        enabled: true,
+        autonomy: None,
     }
 }
 

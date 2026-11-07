@@ -536,6 +536,10 @@ pub struct ToolExecutionContext {
     pub(crate) ordinary_child_publication: Option<crate::runtime::turn_decision::OrdinaryChildPublication>,
     pub(crate) child_grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
     pub(crate) decision_resume: Option<super::capability::execution_binding::DecisionResumePort>,
+    /// A call that needs approval ends denied before any ledger route or
+    /// durable pending decision exists. Set for targeted agent turns, which
+    /// have no resumable approval until MA-04.
+    pub(crate) pending_approval_denied: bool,
     pub(crate) decision_approval: Option<super::capability::execution_binding::DecisionApprovalPort>,
     pub(crate) execution_trace: Option<super::capability::execution_trace::ExecutionTrace>,
     /// None is retained for non-model service callers. A constrained model
@@ -613,6 +617,7 @@ impl ToolExecutionContext {
             child_grant: None,
             decision_approval: None,
             decision_resume: None,
+            pending_approval_denied: false,
             execution_bindings: None,
             execution_trace: None,
             envelope,
@@ -621,6 +626,13 @@ impl ToolExecutionContext {
             semantic_turn_id,
             schema_dialect: ToolSchemaDialect::Raw,
         }
+    }
+
+    /// Deny every call that would otherwise wait for approval.
+    #[must_use]
+    pub(crate) const fn with_pending_approval_denied(mut self) -> Self {
+        self.pending_approval_denied = true;
+        self
     }
 
     pub(crate) fn with_approval_ledger(
@@ -2808,6 +2820,25 @@ impl ToolExecutionService {
         };
         if channel_policy_ask && channel_gate.as_ref().is_some_and(|gate| gate.effective_full) {
             runtime_approval_granted = true;
+        }
+        if decision == ToolExecutionDecision::Ask
+            && context.pending_approval_denied
+            && context.decision_resume.is_none()
+        {
+            let reason = "approval is not available for this agent".to_string();
+            return self.finish(
+                &command,
+                &context,
+                input_sha256,
+                Some(descriptor),
+                Some(decision),
+                ToolExecutionStatus::ApprovalDenied,
+                format!("Denied: {reason}"),
+                None,
+                Some(reason),
+                None,
+                started,
+            );
         }
         if decision == ToolExecutionDecision::Ask
             && !prx_operator_ask

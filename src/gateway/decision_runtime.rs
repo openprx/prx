@@ -9,6 +9,8 @@ pub(super) struct GatewayDecisionSlot {
     service: tokio::sync::OnceCell<Arc<TurnDecisionService>>,
     security: Arc<crate::security::SecurityPolicy>,
     plugin_generation: u64,
+    /// Set only for a targeted agent turn.
+    targeted: Option<crate::runtime::turn_publication::TargetedSurface>,
 }
 
 impl GatewayDecisionSlot {
@@ -19,6 +21,25 @@ impl GatewayDecisionSlot {
             service: tokio::sync::OnceCell::new(),
             security,
             plugin_generation,
+            targeted: None,
+        }
+    }
+
+    /// A slot for one targeted agent turn: the same cleanup owner and
+    /// generation as `self`, its own capped security policy and tool surface,
+    /// and its own decision service (never the host's published one).
+    pub(super) fn targeted(
+        &self,
+        security: Arc<crate::security::SecurityPolicy>,
+        surface: crate::runtime::turn_publication::TargetedSurface,
+    ) -> Self {
+        Self {
+            controlled: self.controlled.clone(),
+            cleanup: Arc::clone(&self.cleanup),
+            service: tokio::sync::OnceCell::new(),
+            security,
+            plugin_generation: self.plugin_generation,
+            targeted: Some(surface),
         }
     }
 
@@ -50,7 +71,11 @@ impl GatewayDecisionSlot {
                     memory: Arc::clone(&state.mem),
                     plugin_generation: self.plugin_generation,
                 }
-                .publish(crate::causal_tree::state::TurnSurfaceKind::Server)
+                .publish_scoped(
+                    crate::causal_tree::state::TurnSurfaceKind::Server,
+                    None,
+                    self.targeted.clone(),
+                )
                 .await?;
                 self.cleanup.retain_service(Arc::clone(&service));
                 Ok(service)

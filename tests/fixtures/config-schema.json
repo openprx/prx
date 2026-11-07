@@ -298,6 +298,7 @@
         "port": 16830,
         "rate_limit_max_keys": 10000,
         "require_pairing": true,
+        "targeted_agents": false,
         "trust_forwarded_headers": false,
         "webhook_rate_limit_per_minute": 60
       }
@@ -2133,12 +2134,28 @@
           ],
           "default": null
         },
+        "autonomy": {
+          "description": "Autonomy ceiling for targeted turns. Unset inherits the main agent's\nlevel; the effective level is `min(agent, main)`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutonomyLevel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "credential_ref": {
           "description": "A credential reference (`cred-<name>`, `prx providers credential\nset`) issued for this agent's provider, used instead of an inline\n`api_key`. The reference is resolved from the encrypted auth-profile\nstore only when its owner is this provider; setting both is refused.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "enabled": {
+          "description": "Whether this agent can be targeted by `POST /api/sessions/{id}/message`\n(default: true). A disabled agent answers 409 `agent_disabled`.",
+          "type": "boolean",
+          "default": true
         },
         "identity_dir": {
           "description": "Optional identity files directory relative to workspace root.",
@@ -2719,6 +2736,11 @@
           "description": "Require pairing before accepting requests (default: true)",
           "type": "boolean",
           "default": true
+        },
+        "targeted_agents": {
+          "description": "Rollout switch for targeted agent turns (`agent` on\n`POST /api/sessions/{id}/message`). While false, any otherwise-valid\nnamed target answers 409 `agent_disabled` and never runs as Main.",
+          "type": "boolean",
+          "default": false
         },
         "trust_forwarded_headers": {
           "description": "Trust headers that a reverse proxy in front of the gateway asserts: the\nclient IP (`X-Forwarded-For`, `X-Real-IP`) for rate limiting, and the\ncaller identity of MCP tool calls (`X-Client-Cert-Subject`,\n`X-Forwarded-Client-Cert`, `X-Spiffe-Id`, `X-Spiffe-Svid`,\n`X-Client-Cert-Pem`). Disabled by default. Enable only when every request\nreaches the gateway through a proxy that removes or overwrites all of\nthese headers; otherwise any client can claim any identity.",

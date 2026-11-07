@@ -204,6 +204,8 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
+            enabled: true,
+            autonomy: None,
         },
     );
     config.providers.models.push(toml::from_str(

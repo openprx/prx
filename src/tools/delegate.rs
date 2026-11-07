@@ -1973,6 +1973,8 @@ mod tests {
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             },
         );
         agents.insert(
@@ -1990,6 +1992,8 @@ mod tests {
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             },
         );
         agents
@@ -2143,6 +2147,8 @@ mod tests {
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
+            enabled: true,
+            autonomy: None,
             model: "model-test".to_string(),
             system_prompt: Some("You are agentic.".to_string()),
             api_key: Some("delegate-test-credential".to_string()),
@@ -2274,6 +2280,8 @@ mod tests {
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             },
         );
         let tool = DelegateTool::new(agents, test_security());
@@ -2381,6 +2389,8 @@ mod tests {
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             },
         );
         let mut config = crate::config::Config::default();
@@ -3709,6 +3719,8 @@ mod tests {
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             },
         );
         agents
@@ -3866,6 +3878,8 @@ mod credential_containment_tests {
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
+            enabled: true,
+            autonomy: None,
         }
     }
 

@@ -1,3 +1,4 @@
+pub mod agent_name;
 pub mod credential_slots;
 pub(crate) mod deprecations;
 pub mod files;

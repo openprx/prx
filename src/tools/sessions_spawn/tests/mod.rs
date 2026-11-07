@@ -543,6 +543,8 @@ fn make_agent_config(identity_dir: Option<String>) -> DelegateAgentConfig {
         identity_dir,
         memory_scope: None,
         spawn_enabled: None,
+        enabled: true,
+        autonomy: None,
     }
 }
 

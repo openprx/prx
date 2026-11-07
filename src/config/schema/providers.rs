@@ -42,6 +42,18 @@ pub struct DelegateAgentConfig {
     /// Whether this agent is allowed to be targeted by sessions_spawn (default: true).
     #[serde(default)]
     pub spawn_enabled: Option<bool>,
+    /// Whether this agent can be targeted by `POST /api/sessions/{id}/message`
+    /// (default: true). A disabled agent answers 409 `agent_disabled`.
+    #[serde(default = "default_agent_enabled")]
+    pub enabled: bool,
+    /// Autonomy ceiling for targeted turns. Unset inherits the main agent's
+    /// level; the effective level is `min(agent, main)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomy: Option<super::AutonomyLevel>,
+}
+
+pub(super) const fn default_agent_enabled() -> bool {
+    true
 }
 
 pub(super) const fn default_max_depth() -> u32 {

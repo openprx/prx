@@ -231,6 +231,8 @@ fn configured_providers_are_every_provider_the_operator_named() {
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
+            enabled: true,
+            autonomy: None,
         },
     )]);
 
