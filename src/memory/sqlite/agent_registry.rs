@@ -43,22 +43,42 @@ fn bytes(col: &str) -> String {
     format!("length(CAST({col} AS BLOB))")
 }
 
-/// Canonical lowercase 36-character UUID.
-fn uuid(col: &str) -> String {
-    let hex = |n: usize| "[0-9a-f]".repeat(n);
-    format!("{col} GLOB '{}-{}-{}-{}-{}'", hex(8), hex(4), hex(4), hex(4), hex(12))
+/// No embedded NUL byte. GLOB and `length()` stop at the first NUL, so every
+/// text validator must also carry this conjunct.
+fn no_nul(col: &str) -> String {
+    format!("instr(CAST({col} AS BLOB), x'00') = 0")
 }
 
-/// Lowercase SHA-256 hex.
+/// Canonical lowercase 36-byte UUID.
+fn uuid(col: &str) -> String {
+    let hex = |n: usize| "[0-9a-f]".repeat(n);
+    format!(
+        "{} = 36 AND {} AND {col} GLOB '{}-{}-{}-{}-{}'",
+        bytes(col),
+        no_nul(col),
+        hex(8),
+        hex(4),
+        hex(4),
+        hex(4),
+        hex(12)
+    )
+}
+
+/// Lowercase SHA-256 hex, exactly 64 bytes.
 fn hex64(col: &str) -> String {
-    format!("length({col}) = 64 AND {col} NOT GLOB '*[^0-9a-f]*'")
+    format!(
+        "{} = 64 AND {} AND {col} NOT GLOB '*[^0-9a-f]*'",
+        bytes(col),
+        no_nul(col)
+    )
 }
 
 /// `m` for Main, or `n:` plus the AgentName grammar; `n:main` is reserved.
 fn agent_key(col: &str) -> String {
     format!(
-        "({col} = 'm' OR ({col} GLOB 'n:[a-z]*' AND substr({col}, 3) NOT GLOB '*[^a-z0-9_-]*' \
+        "{} AND ({col} = 'm' OR ({col} GLOB 'n:[a-z]*' AND substr({col}, 3) NOT GLOB '*[^a-z0-9_-]*' \
          AND {} <= 66)) AND {col} <> 'n:main'",
+        no_nul(col),
         bytes(col)
     )
 }
@@ -69,8 +89,8 @@ fn nullable(col: &str, check: &str) -> String {
 
 fn schema_sql() -> String {
     let stores = MANIFEST_STORES.join("','");
-    let w = |c: &str| format!("{} <= 4096", bytes(c));
-    let o = |c: &str| format!("{} <= 512", bytes(c));
+    let w = |c: &str| format!("{} <= 4096 AND {}", bytes(c), no_nul(c));
+    let o = |c: &str| format!("{} <= 512 AND {}", bytes(c), no_nul(c));
     format!(
         "CREATE TABLE IF NOT EXISTS agent_incarnations (
             workspace_id TEXT NOT NULL CHECK({w_ws}),
@@ -124,12 +144,33 @@ fn schema_sql() -> String {
             completed_at INTEGER,
             PRIMARY KEY (workspace_id, owner_id, erase_id),
             CHECK((state = 'pending' AND remaining IS NULL AND completed_at IS NULL)
-               OR (state = 'erased' AND remaining = 0 AND completed_at IS NOT NULL)),
+               OR (state = 'erased' AND remaining IS NOT NULL AND remaining = 0
+                   AND completed_at IS NOT NULL)),
             FOREIGN KEY (scope_id, workspace_id, owner_id, incarnation, generation)
                 REFERENCES agent_scopes (scope_id, workspace_id, owner_id, incarnation, generation)
         ) STRICT;
         CREATE TRIGGER IF NOT EXISTS agent_erase_receipts_immutable_update
             BEFORE UPDATE ON agent_erase_receipts WHEN OLD.state = 'erased'
+            BEGIN SELECT RAISE(ABORT, 'erased receipt is immutable'); END;
+        -- A REPLACE can hit the primary key or the UNIQUE erase_id; both keys
+        -- are checked so neither can displace an erased receipt.
+        CREATE TRIGGER IF NOT EXISTS agent_erase_receipts_immutable_insert
+            BEFORE INSERT ON agent_erase_receipts
+            WHEN EXISTS (SELECT 1 FROM agent_erase_receipts r
+                         WHERE r.state = 'erased'
+                           AND (r.erase_id = NEW.erase_id
+                                OR (r.workspace_id = NEW.workspace_id
+                                    AND r.owner_id = NEW.owner_id
+                                    AND r.erase_id = NEW.erase_id)))
+            BEGIN SELECT RAISE(ABORT, 'erased receipt is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS agent_erase_receipts_immutable_update_onto
+            BEFORE UPDATE ON agent_erase_receipts
+            WHEN EXISTS (SELECT 1 FROM agent_erase_receipts r
+                         WHERE r.state = 'erased' AND r.rowid <> OLD.rowid
+                           AND (r.erase_id = NEW.erase_id
+                                OR (r.workspace_id = NEW.workspace_id
+                                    AND r.owner_id = NEW.owner_id
+                                    AND r.erase_id = NEW.erase_id)))
             BEGIN SELECT RAISE(ABORT, 'erased receipt is immutable'); END;
         CREATE TRIGGER IF NOT EXISTS agent_erase_receipts_immutable_delete
             BEFORE DELETE ON agent_erase_receipts WHEN OLD.state = 'erased'
@@ -139,9 +180,9 @@ fn schema_sql() -> String {
             workspace_id TEXT NOT NULL CHECK({w_ws}),
             owner_id TEXT NOT NULL CHECK({o_owner}),
             idempotency_key TEXT NOT NULL
-                CHECK({b_idem} BETWEEN 16 AND 128 AND idempotency_key NOT GLOB '*[^ -~]*'),
-            request_method TEXT NOT NULL,
-            canonical_path TEXT NOT NULL,
+                CHECK({b_idem} BETWEEN 16 AND 128 AND {n_idem} AND idempotency_key NOT GLOB '*[^ -~]*'),
+            request_method TEXT NOT NULL CHECK({n_method}),
+            canonical_path TEXT NOT NULL CHECK({n_path}),
             scope_id TEXT NOT NULL CHECK({u_scope}),
             request_hash TEXT NOT NULL CHECK({h_hash}),
             erase_id TEXT NOT NULL CHECK({u_erase}),
@@ -158,7 +199,7 @@ fn schema_sql() -> String {
         CREATE TABLE IF NOT EXISTS agent_erase_manifest (
             erase_id TEXT NOT NULL CHECK({u_erase}),
             store TEXT NOT NULL CHECK(store IN ('{stores}')),
-            record_key TEXT NOT NULL CHECK({b_record} <= 1024),
+            record_key TEXT NOT NULL CHECK({b_record} <= 1024 AND {n_record}),
             fts_rowid INTEGER CHECK(fts_rowid IS NULL OR fts_rowid > 0),
             PRIMARY KEY (erase_id, store, record_key)
         ) STRICT;
@@ -190,6 +231,10 @@ fn schema_sql() -> String {
         h_hash = hex64("request_hash"),
         b_idem = bytes("idempotency_key"),
         b_record = bytes("record_key"),
+        n_idem = no_nul("idempotency_key"),
+        n_record = no_nul("record_key"),
+        n_method = no_nul("request_method"),
+        n_path = no_nul("canonical_path"),
     )
 }
 

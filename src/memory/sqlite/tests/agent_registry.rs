@@ -313,3 +313,190 @@ fn registry_rejects_unknown_enum() {
         assert!(error.contains("erased receipt is immutable"), "{sql}: {error}");
     }
 }
+
+#[test]
+fn registry_null_arm_erased_receipt_rejected() {
+    let dir = TempDir::new().unwrap();
+    let (_memory, conn) = open(&dir);
+    seed(&conn);
+    let error = receipt(&conn, ERASE, "erased", None, Some(5)).unwrap_err();
+    assert!(
+        matches!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        ),
+        "insert with NULL remaining: {error}"
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM agent_erase_receipts"), 0);
+    receipt(&conn, ERASE, "pending", None, None).unwrap();
+    let error = conn
+        .execute(
+            "UPDATE agent_erase_receipts SET state = 'erased', remaining = NULL, completed_at = 5",
+            [],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        ),
+        "update to NULL remaining: {error}"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM agent_erase_receipts WHERE state = 'pending'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn registry_rejects_embedded_nul() {
+    let dir = TempDir::new().unwrap();
+    let (_memory, conn) = open(&dir);
+    seed(&conn);
+    receipt(&conn, ERASE, "pending", None, None).unwrap();
+    let u4 = "00000000-0000-4000-8000-000000000004";
+    let nul_uuid = format!("{u4}\0x");
+    let nul_hash = format!("{REV}\0x");
+    let cases: Vec<(&str, rusqlite::Result<usize>)> = vec![
+        ("agent_key n:main", incarnation(&conn, "n:main\0x", u4, "active")),
+        ("agent_key n:b", incarnation(&conn, "n:b\0x", u4, "active")),
+        ("agent_key m", incarnation(&conn, "m\0x", u4, "active")),
+        ("incarnation uuid", incarnation(&conn, "n:b", &nul_uuid, "active")),
+        (
+            "incarnation uuid 36 bytes",
+            incarnation(&conn, "n:b", "00000000-0000-4000-8000-0000000000\0\0", "active"),
+        ),
+        (
+            "config revision",
+            conn.execute(
+                "INSERT INTO agent_incarnations VALUES (?1, ?2, 'n:b', ?3, 'active', ?4)",
+                params![W, O, u4, nul_hash],
+            ),
+        ),
+        (
+            "workspace",
+            conn.execute(
+                "INSERT INTO agent_incarnations VALUES (?1, ?2, 'n:b', ?3, 'active', ?4)",
+                params![format!("{W}\0x"), O, u4, REV],
+            ),
+        ),
+        (
+            "owner",
+            conn.execute(
+                "INSERT INTO agent_incarnations VALUES (?1, ?2, 'n:b', ?3, 'active', ?4)",
+                params![W, format!("{O}\0x"), u4, REV],
+            ),
+        ),
+        ("scope uuid", scope(&conn, &nul_uuid, None, "n:alpha", U1)),
+        ("scope session", scope(&conn, u4, Some("s\0x"), "n:alpha", U1)),
+        (
+            "fence erase id",
+            conn.execute(
+                "INSERT INTO agent_erase_fences VALUES (?1, ?2, 'draining', 1)",
+                params![SCOPE, nul_uuid],
+            ),
+        ),
+        ("receipt erase id", receipt(&conn, &nul_uuid, "pending", None, None)),
+        (
+            "key idempotency",
+            conn.execute(
+                "INSERT INTO agent_erase_keys VALUES (?1, ?2, ?3, 'DELETE', '/p', ?4, ?5, ?6, 1, NULL)",
+                params![W, O, "idempotency-key\0-0001", SCOPE, REV, ERASE],
+            ),
+        ),
+        (
+            "key request hash",
+            conn.execute(
+                "INSERT INTO agent_erase_keys VALUES (?1, ?2, ?3, 'DELETE', '/p', ?4, ?5, ?6, 1, NULL)",
+                params![W, O, KEY, SCOPE, nul_hash, ERASE],
+            ),
+        ),
+        (
+            "key method",
+            conn.execute(
+                "INSERT INTO agent_erase_keys VALUES (?1, ?2, ?3, ?7, '/p', ?4, ?5, ?6, 1, NULL)",
+                params![W, O, KEY, SCOPE, REV, ERASE, "DE\0LETE"],
+            ),
+        ),
+        (
+            "manifest record key",
+            conn.execute(
+                "INSERT INTO agent_erase_manifest VALUES (?1, 'memories', ?2, NULL)",
+                params![ERASE, "a\0b"],
+            ),
+        ),
+        (
+            "purge cursor",
+            conn.execute(
+                "INSERT INTO agent_purge_progress VALUES (?1, ?2, 'n:alpha', ?3, ?4, 'draining', ?5, NULL)",
+                params![W, O, U1, U2, nul_uuid],
+            ),
+        ),
+        (
+            "purge key",
+            conn.execute(
+                "INSERT INTO agent_purge_progress VALUES (?1, ?2, ?3, ?4, ?5, 'draining', NULL, NULL)",
+                params![W, O, "n:alpha\0x", U1, U2],
+            ),
+        ),
+    ];
+    for (name, result) in cases {
+        let error = result.expect_err(name);
+        assert!(
+            matches!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::ConstraintViolation)
+            ),
+            "{name}: expected a constraint error, got {error}"
+        );
+    }
+}
+
+#[test]
+fn registry_replace_never_touches_erased_receipt() {
+    let dir = TempDir::new().unwrap();
+    let (_memory, conn) = open(&dir);
+    seed(&conn);
+    let other = "00000000-0000-4000-8000-0000000000b2";
+    receipt(&conn, ERASE, "erased", Some(0), Some(7)).unwrap();
+    receipt(&conn, other, "pending", None, None).unwrap();
+    let snapshot = |conn: &Connection| -> String {
+        conn.query_row(
+            "SELECT group_concat(erase_id || state || ifnull(remaining, 'n') || ifnull(completed_at, 'n'), '|') \
+             FROM (SELECT * FROM agent_erase_receipts ORDER BY erase_id)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let before = snapshot(&conn);
+
+    let error = conn
+        .execute(
+            "INSERT OR REPLACE INTO agent_erase_receipts VALUES (?1, ?2, ?3, ?4, ?5, 1, 'pending', NULL, NULL)",
+            params![W, O, ERASE, SCOPE, U1],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("erased receipt is immutable"),
+        "insert or replace: {error}"
+    );
+    assert_eq!(snapshot(&conn), before);
+
+    let error = conn
+        .execute(
+            "UPDATE OR REPLACE agent_erase_receipts SET erase_id = ?1 WHERE erase_id = ?2",
+            params![ERASE, other],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("erased receipt is immutable"),
+        "update or replace: {error}"
+    );
+    assert_eq!(snapshot(&conn), before);
+}
