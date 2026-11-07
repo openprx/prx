@@ -1280,6 +1280,14 @@ async fn durability_readback_body(
     ));
     let catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
+    // Pre-open the shared store with a writer hold; the service joins it.
+    let hold = Arc::new(parking_lot::Mutex::new(()));
+    let held_store = crate::causal_tree::store::CausalDecisionStore::open_shared_held(
+        &workspace,
+        crate::causal_tree::store::Retention::days(1, 1),
+        Arc::new(SilentEvents),
+        Arc::clone(&hold),
+    )?;
     let mut service = build_turn_decision_service(
         TurnSurfaceKind::AgentLoop,
         TurnServiceBuild {
@@ -1332,11 +1340,32 @@ async fn durability_readback_body(
         context.record_admitted.load(Ordering::Acquire),
         "parent chain was not queued"
     );
-    // The verifier captures its deadline on entry. The clock advances while
-    // its readback is pending: `join!` polls the verifier first, so the
-    // advance lands after the readback has started and before its reply.
-    let stall = async { clock.advance(advance) };
-    let (verified, ()) = tokio::join!(service.validate_delegation_storage(Arc::clone(&context)), stall);
+    drop(held_store);
+    // Hold the writer so the readback reply cannot arrive early, poll the
+    // verifier until it is pending (its deadline is captured by then), advance
+    // logical time, and only then release the writer.
+    let (ready, ready_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _held = hold.lock();
+        let _ = ready.send(());
+        let _ = release_rx.recv_timeout(Duration::from_secs(60));
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(60))
+        .context("writer hold was not acquired")?;
+    let verify = service.validate_delegation_storage(Arc::clone(&context));
+    tokio::pin!(verify);
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(verify.as_mut(), cx))).await;
+    anyhow::ensure!(first.is_pending(), "readback finished before the writer was released");
+    clock.advance(advance);
+    release
+        .send(())
+        .map_err(|_| anyhow::anyhow!("writer hold already released"))?;
+    let verified = verify.await;
+    holder
+        .join()
+        .map_err(|_| anyhow::anyhow!("writer hold thread panicked"))?;
     service.shutdown(Instant::now() + Duration::from_secs(2)).await;
     Ok(verified.map_err(|error| format!("{error:#}")))
 }
