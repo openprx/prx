@@ -111,6 +111,26 @@ async fn launch_v3_refuses_missing_parent_row() -> Result<()> {
 }
 
 /// Raw journal rows and the store file, to prove a refused startup wrote nothing.
+/// Replaces one sealed `launch_parent` row so a test can reseal it for another run.
+fn reseal_launch_parent(
+    workspace: &std::path::Path,
+    key: &crate::decision::DecisionKey,
+    key_run: &str,
+    launch: &authority_journal::LaunchParentRow,
+) -> Result<()> {
+    // Mirrors the journal's sealing: HMAC over the domain and the payload.
+    let payload = serde_json::to_string(launch)?;
+    let seal = key.hmac(
+        crate::decision::key::KeyDomain::StateFingerprint,
+        &[b"child-launch-parent-authority-v1", payload.as_bytes()],
+    );
+    let entry = serde_json::to_string(&serde_json::json!({ "payload": payload, "seal": seal }))?;
+    let conn = rusqlite::Connection::open(authority_journal::path(workspace))?;
+    let updated = conn.execute("UPDATE launch_parent SET entry=?1 WHERE run=?2", (entry, key_run))?;
+    anyhow::ensure!(updated == 1, "test: the launch parent row existed before resealing");
+    Ok(())
+}
+
 fn startup_footprint(
     workspace: &std::path::Path,
 ) -> Result<(Vec<String>, Vec<String>, Option<(u64, std::time::SystemTime)>)> {
@@ -217,7 +237,7 @@ async fn launch_v3_refuses_launch_parent_sealed_for_another_run() -> Result<()> 
         for (label, forged) in [("identity", other_run), ("lineage", other_lineage)] {
             assert_ne!(forged, original, "test: the {label} mutation changes the row");
             // The forged row is validly sealed, so only the comparison can refuse it.
-            authority_journal::reseal_launch_parent_for_test(workspace, &key, &worker.run_id, &forged)?;
+            reseal_launch_parent(workspace, &key, &worker.run_id, &forged)?;
             let before = startup_footprint(workspace)?;
             let error = verify_worker_parent_authority(&worker, workspace)
                 .err()
