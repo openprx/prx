@@ -52,9 +52,11 @@ pub(crate) trait ApprovalRuntime: Send + Sync {
 /// A view of the pinned authority; constructing it grants no execution rights.
 pub(crate) struct ApprovalLedger<'a> {
     pub(crate) memory: &'a Arc<dyn Memory>,
-    pub(crate) state_key: &'a DecisionKey,
+    pub(crate) state_key: &'a Arc<DecisionKey>,
     pub(crate) store: &'a CausalDecisionStore,
     pub(crate) workspace: String,
+    /// Filesystem root of the authority journal that backs decision evidence.
+    pub(crate) workspace_dir: &'a std::path::Path,
     pub(crate) catalog_generation: [u8; 32],
     pub(crate) policy_version: &'a str,
     pub(crate) enabled: bool,

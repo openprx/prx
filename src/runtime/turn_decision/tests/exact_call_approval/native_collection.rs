@@ -14,10 +14,16 @@ async fn supervised_http_collects_exact_arguments_without_bypassing_ssrf() {
 
 /// The decision store is a lagging projection. With its writer held behind a
 /// lock that never releases during the turn, the collection must still record
-/// its durable approval, because the chain digests come from the journal.
+/// its durable approval, and the inbox, inspection, review and resume must all
+/// work, because the chain digests come from the journal.
 #[tokio::test]
 async fn approval_collection_reads_journal_not_store_queue() {
     native_collection_with(false, true).await;
+}
+
+#[tokio::test]
+async fn approval_inspection_review_resume_read_journal() {
+    native_collection_with(true, true).await;
 }
 
 async fn native_collection(http: bool) {
@@ -153,7 +159,7 @@ async fn native_collection_with(http: bool, stalled_store: bool) {
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
     assert!(!workspace.path().join("prx-approved.txt").exists());
     let (owner, session, id) = (proof.owner_id(), proof.session_key(), context.decision_id());
-    if let Some(conn) = store_lock {
+    if store_lock.is_some() {
         let pending_key = format!("decision-approval:{id}:pending");
         assert!(
             memory
@@ -163,8 +169,6 @@ async fn native_collection_with(http: bool, stalled_store: bool) {
                 .is_some(),
             "the approval was recorded while the decision store could not commit"
         );
-        conn.execute_batch("ROLLBACK").expect("test: release the store writer");
-        return;
     }
     let pending = service
         .load_pending_decision_approval(owner, session, id)
@@ -281,5 +285,8 @@ async fn native_collection_with(http: bool, stalled_store: bool) {
             .is_err()
     );
     assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    if let Some(conn) = store_lock {
+        conn.execute_batch("ROLLBACK").expect("test: release the store writer");
+    }
     assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
 }

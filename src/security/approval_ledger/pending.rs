@@ -3,13 +3,11 @@ use super::ApprovalLedger;
 use super::keys::{ApprovalAuthority, DecisionAuthority};
 use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject};
 use crate::causal_tree::ids::DecisionId;
-use crate::causal_tree::store::DecisionScope;
 use crate::decision::KeyDomain;
 use crate::memory::{MemoryFabric, MessageEvent, MessageEventScope};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EncryptedCall {
@@ -446,18 +444,20 @@ impl ApprovalLedger<'_> {
             record.decision_digests.last().map(|hop| hop.0.as_str()) == Some(record.binding.decision_id.as_str()),
             "pending approval final hop changed"
         );
-        let decision_scope = DecisionScope::Owner {
-            workspace_id: store_workspace,
-            owner_id: Arc::from(owner),
-        };
         let mut prior = None;
         for (id, digest) in &record.decision_digests {
             let id = DecisionId::parse(id)?;
-            let row = self
-                .store
-                .reader()
-                .replay_record(&decision_scope, &id)?
-                .context("pending approval decision missing")?;
+            // The authority journal is the only evidence. The decision store is
+            // a lagging projection, and an absent row never selects it.
+            let row = crate::agent::terminal::read_journal_replay_record(
+                self.workspace_dir,
+                self.state_key,
+                &store_workspace,
+                owner,
+                &id,
+            )
+            .await?
+            .context("pending approval journal evidence missing; request the approval again")?;
             anyhow::ensure!(
                 row.digest == *digest
                     && row.decision.prior_decision_id == prior

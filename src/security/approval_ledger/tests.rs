@@ -136,6 +136,7 @@ impl ApprovalRuntime for LedgerTestPort {
 }
 
 struct LifecycleFixture {
+    dir: std::path::PathBuf,
     memory: Arc<dyn Memory>,
     key: Arc<DecisionKey>,
     store: Arc<CausalDecisionStore>,
@@ -147,6 +148,11 @@ struct LifecycleFixture {
 
 impl LifecycleFixture {
     async fn new(path: &std::path::Path) -> Self {
+        Self::with_journal(path, true).await
+    }
+    /// `journal: false` models an approval issued before the authority journal
+    /// existed: only the decision store holds its chain.
+    async fn with_journal(path: &std::path::Path, journal: bool) -> Self {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(path).unwrap());
         let key = DecisionKey::load_or_create(path).unwrap();
         let store = CausalDecisionStore::open_shared(
@@ -188,6 +194,14 @@ impl LifecycleFixture {
         row.lineage.session_key = Some(Arc::from("prx_session"));
         row.lineage.run_id = Some(Arc::from("prx_run"));
         let writer = store.writer().unwrap();
+        let evidence = crate::runtime::child_source::authority_journal::decision_evidence_rows(
+            std::slice::from_ref(&row),
+            &workspace,
+        )
+        .unwrap();
+        if journal {
+            crate::runtime::child_source::authority_journal::write_decision_evidence(path, &key, &evidence).unwrap();
+        }
         writer.record_decision(row);
         assert!(
             writer
@@ -217,6 +231,7 @@ impl LifecycleFixture {
         )
         .unwrap();
         let fixture = Self {
+            dir: path.to_owned(),
             memory,
             key,
             store,
@@ -270,6 +285,7 @@ impl LifecycleFixture {
             state_key: &self.key,
             store: &self.store,
             workspace: self.subject.workspace_id.clone(),
+            workspace_dir: &self.dir,
             catalog_generation: self.binding.catalog_generation,
             policy_version: "prx_policy",
             enabled: true,
@@ -914,4 +930,81 @@ async fn expired_run_keyed_pending_cannot_be_reviewed_or_claimed() {
         fixture.claim().await.unwrap_err().to_string(),
         "pending call approval expired"
     );
+}
+
+fn journal_connection(dir: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(crate::runtime::child_source::authority_journal::path(dir)).unwrap()
+}
+
+fn decision_id(fixture: &LifecycleFixture) -> DecisionId {
+    DecisionId::parse(&fixture.binding.decision_id).unwrap()
+}
+
+async fn load(fixture: &LifecycleFixture) -> anyhow::Result<()> {
+    fixture
+        .ledger()
+        .load_pending_decision_approval("prx_owner", "prx_session", decision_id(fixture))
+        .await
+        .map(|_| ())
+}
+
+#[tokio::test]
+async fn pending_approval_loads_from_the_journal_with_a_dropped_store_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = LifecycleFixture::new(dir.path()).await;
+    load(&fixture).await.expect("journal-backed approval loads");
+    let conn = rusqlite::Connection::open(crate::causal_tree::store::db_path(dir.path())).unwrap();
+    conn.execute_batch("DELETE FROM outcomes; DELETE FROM decisions;")
+        .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM decisions", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    load(&fixture)
+        .await
+        .expect("a dropped store projection does not gate the approval");
+}
+
+#[tokio::test]
+async fn pending_approval_with_a_missing_journal_row_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = LifecycleFixture::new(dir.path()).await;
+    let removed = journal_connection(dir.path())
+        .execute("DELETE FROM decision_evidence", [])
+        .unwrap();
+    assert_eq!(removed, 1);
+    let error = load(&fixture).await.expect_err("store row must not substitute");
+    assert!(error.to_string().contains("journal evidence missing"), "{error:#}");
+}
+
+#[tokio::test]
+async fn pending_approval_with_a_tampered_journal_row_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = LifecycleFixture::new(dir.path()).await;
+    let conn = journal_connection(dir.path());
+    let entry: String = conn
+        .query_row("SELECT entry FROM decision_evidence", [], |row| row.get(0))
+        .unwrap();
+    let mut bytes = entry.into_bytes();
+    let middle = bytes.len() / 2;
+    let byte = bytes.get_mut(middle).expect("test: entry has a middle byte");
+    *byte = if *byte == b'A' { b'B' } else { b'A' };
+    let tampered = String::from_utf8(bytes).unwrap();
+    let changed = conn
+        .execute("UPDATE decision_evidence SET entry = ?1", [&tampered])
+        .unwrap();
+    assert_eq!(changed, 1);
+    let error = load(&fixture).await.expect_err("tampered evidence is refused");
+    assert!(!error.to_string().contains("journal evidence missing"), "{error:#}");
+}
+
+#[tokio::test]
+async fn legacy_pending_approval_without_journal_rows_must_be_requested_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = LifecycleFixture::with_journal(dir.path(), false).await;
+    let error = load(&fixture)
+        .await
+        .expect_err("a store-only chain is not evidence; absence never selects the store");
+    assert!(error.to_string().contains("request the approval again"), "{error:#}");
 }
