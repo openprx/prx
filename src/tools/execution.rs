@@ -535,6 +535,10 @@ pub struct ToolExecutionContext {
     pub(crate) capability_search: Option<super::capability::search_tool::CapabilitySearchPort>,
     pub(crate) ordinary_child_publication: Option<crate::runtime::turn_decision::OrdinaryChildPublication>,
     pub(crate) child_grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
+    /// Incoming child authority of this turn, independent of `child_grant`.
+    pub(crate) child_scope: Option<Arc<super::capability::child::VerifiedChildScope>>,
+    /// Pinned child provenance; dispatch refuses either half without the other.
+    pub(crate) child_pin: Option<Arc<super::capability::child::ChildDispatchPin>>,
     pub(crate) decision_resume: Option<super::capability::execution_binding::DecisionResumePort>,
     /// A call that needs approval ends denied before any ledger route or
     /// durable pending decision exists. Set for targeted agent turns, which
@@ -615,6 +619,8 @@ impl ToolExecutionContext {
             capability_search: None,
             ordinary_child_publication: None,
             child_grant: None,
+            child_scope: None,
+            child_pin: None,
             decision_approval: None,
             decision_resume: None,
             pending_approval_denied: false,
@@ -3198,6 +3204,31 @@ impl ToolExecutionService {
 
         // Approval, preparation, reservation and claim may have awaited while the
         // live registry changed. Recheck before the backend future is polled.
+        if let Err((status, error)) = admission::admit_child(self, &context, &command.name, true) {
+            let abandonment = self
+                .abandon_idempotent_execution(idempotency_lease.as_ref(), &context)
+                .await;
+            let (status, error) = match abandonment {
+                Ok(()) => (status, error),
+                Err(error) => (ToolExecutionStatus::Indeterminate, error),
+            };
+            if let Some(observation) = exact_call {
+                observation.complete(status);
+            }
+            return self.finish(
+                &command,
+                &context,
+                input_sha256,
+                Some(descriptor),
+                Some(decision),
+                status,
+                format!("Error: {error}"),
+                None,
+                Some(error),
+                Some(preparation),
+                started,
+            );
+        }
         if let Some(bindings) = &context.execution_bindings {
             let verified = bindings
                 .get(&command.name)

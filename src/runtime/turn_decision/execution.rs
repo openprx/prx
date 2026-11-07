@@ -635,6 +635,20 @@ impl TurnDecisionService {
         }
         self.verify_console_filesystem_context(proof, context)?;
         let mut execution_context = execution_context.clone();
+        // Incoming child authority comes only from the authenticated source and is
+        // overwritten unconditionally, so a caller cannot carry or strip it.
+        let child_origin = proof.child_scope().is_some()
+            || proof.ordinary_task_authority_id().is_some()
+            || proof.ordinary_process_authority_id().is_some();
+        execution_context.child_scope = proof.child_scope().cloned();
+        execution_context.child_pin = child_origin.then(|| {
+            Arc::new(crate::tools::capability::child::ChildDispatchPin {
+                catalog: Arc::clone(&self.catalog),
+                key: Arc::clone(&self.state_key),
+                owner: proof.owner_id().to_owned(),
+                workspace: proof.workspace_id().to_owned(),
+            })
+        });
         // Approval routing belongs to the ingress builder, including an explicit None.
         execution_context.owner_filesystem = context.owner_filesystem.clone();
         execution_context.set_h2_origin(proof.h2_entry_origin().cloned());

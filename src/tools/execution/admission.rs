@@ -134,11 +134,66 @@ pub(super) fn recheck_resolved(
     }
 }
 
+/// Mandatory incoming-child admission, independent of bindings and surface.
+/// Child provenance without a verified scope, or a scope without its pin, is
+/// stale. Authority is never inferred from absence. `last` is the pre-invocation
+/// recheck, where a vanished descriptor is also stale instead of deferred to the
+/// registry's unknown-tool diagnostic.
+pub(super) fn admit_child(
+    service: &ToolExecutionService,
+    context: &ToolExecutionContext,
+    name: &str,
+    last: bool,
+) -> Result<(), (ToolExecutionStatus, String)> {
+    let stale = || {
+        (
+            ToolExecutionStatus::StaleCapability,
+            format!("tool '{name}' lacks current child authority"),
+        )
+    };
+    let (scope, pin) = match (&context.child_scope, &context.child_pin) {
+        (None, None) => return Ok(()),
+        (Some(scope), Some(pin)) => (scope, pin),
+        _ => return Err(stale()),
+    };
+    if context.envelope.workspace_id != pin.workspace || context.envelope.resolved_owner_id() != pin.owner {
+        return Err(stale());
+    }
+    scope
+        .validate_runtime(&pin.key, &pin.owner, &pin.workspace, *pin.catalog.generation())
+        .map_err(|_| stale())?;
+    let Some(descriptor) = service.current_descriptor(name) else {
+        return if last { Err(stale()) } else { Ok(()) };
+    };
+    let entry = pin
+        .catalog
+        .entry_for_public_name(&descriptor.public_name)
+        .filter(|entry| {
+            entry.root == descriptor.backend_name
+                && crate::tools::capability::fingerprint::tool_spec_fingerprint(
+                    &descriptor.public_name,
+                    &descriptor.description,
+                    &descriptor.parameters,
+                ) == entry.fingerprint
+        })
+        .ok_or_else(stale)?;
+    let reference = crate::causal_tree::branch::CapabilityRef {
+        id: entry.id.clone(),
+        fingerprint: entry.fingerprint,
+        generation: entry.generation,
+    };
+    if !scope.gate_inputs().0.allowed.contains(&reference) {
+        return Err(stale());
+    }
+    pin.catalog.check_child_parity(service, scope).map_err(|_| stale())
+}
+
 pub(super) fn admit(
     service: &ToolExecutionService,
     context: &ToolExecutionContext,
     name: &str,
 ) -> Result<(), (ToolExecutionStatus, String)> {
+    admit_child(service, context, name, false)?;
     let Some(surface) = &context.turn_surface else {
         return Ok(());
     };
