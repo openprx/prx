@@ -1909,8 +1909,11 @@ pub trait Memory: Send + Sync {
         capsule: super::ingress_recovery::IngressCapsule,
         lifetime: std::sync::Arc<dyn super::ingress_recovery::IngressLifetime>,
         deadline: std::time::Instant,
+        attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
     ) -> anyhow::Result<super::ingress_recovery::IngressAppendOutcome> {
         let _ = (input, capsule, lifetime, deadline);
+        // An attestation is refused with its typed error, never silently dropped.
+        super::ingress_recovery::refuse_attestation(attestation.as_ref())?;
         Err(crate::memory::fabric::fail_fast(self.name(), "append_ingress_input"))
     }
 

@@ -411,9 +411,10 @@ impl Memory for ObservedSqlite {
         capsule: crate::memory::ingress_recovery::IngressCapsule,
         lifetime: std::sync::Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
         deadline: std::time::Instant,
+        attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
     ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
         self.inner
-            .append_ingress_input(input, capsule, lifetime, deadline)
+            .append_ingress_input(input, capsule, lifetime, deadline, attestation)
             .await
     }
 

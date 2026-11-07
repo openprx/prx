@@ -51,6 +51,18 @@ pub struct RecoveryReceipt {
     pub mac: Vec<u8>,
 }
 
+impl RecoveryReceipt {
+    /// The opaque pending facts the receipt was published with. Call only on a
+    /// receipt returned by `read_recovery_receipt`, which has authenticated it.
+    pub fn pending_facts(&self) -> anyhow::Result<Vec<u8>> {
+        #[derive(Deserialize)]
+        struct Bound {
+            pending: Vec<u8>,
+        }
+        Ok(serde_json::from_slice::<Bound>(&self.facts)?.pending)
+    }
+}
+
 /// Facts exceed the backend's publication or serialized receipt budget.
 #[derive(Debug, thiserror::Error)]
 #[error("recovery facts exceed size limit of {limit} bytes")]
@@ -72,6 +84,8 @@ pub enum RecoveryMacDomain {
     StateV3,
     QuarantineKeyV3,
     QuarantineV3,
+    TransportV3,
+    InputKeyV3,
 }
 
 impl RecoveryMacDomain {
@@ -82,6 +96,8 @@ impl RecoveryMacDomain {
             Self::StateV3 => b"prx-recovery-state-v3",
             Self::QuarantineKeyV3 => b"prx-recovery-quarantine-key-v3",
             Self::QuarantineV3 => b"prx-recovery-quarantine-v3",
+            Self::TransportV3 => b"prx-recovery-transport-v3",
+            Self::InputKeyV3 => b"prx-recovery-input-key-v3",
         }
     }
 }

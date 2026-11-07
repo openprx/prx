@@ -338,8 +338,13 @@ impl Memory for LegacyLedger {
         capsule: crate::memory::ingress_recovery::IngressCapsule,
         lifetime: Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
         deadline: std::time::Instant,
+        attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
     ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
-        self.0.append_ingress_input(input, capsule, lifetime, deadline).await
+        // Like PostgreSQL: no repository, so an attestation is refused, not dropped.
+        crate::memory::ingress_recovery::refuse_attestation(attestation.as_ref())?;
+        self.0
+            .append_ingress_input(input, capsule, lifetime, deadline, attestation)
+            .await
     }
     async fn list_ingress_recovery_candidates(
         &self,
@@ -412,4 +417,212 @@ fn backend_memory(backend: &str, workspace: &std::path::Path) -> anyhow::Result<
         _ => Arc::new(local),
     };
     Ok(memory)
+}
+
+/// Production entry: fabric -> `with_ingress_recovery` -> `append`. The spy counts
+/// what an entry point would go on to dispatch, which is only an admitted input.
+async fn admit(
+    memory: &Arc<dyn Memory>,
+    workspace: &std::path::Path,
+    content: &str,
+    dispatched: &std::sync::atomic::AtomicUsize,
+) -> (anyhow::Result<MessageEvent>, bool) {
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.to_owned();
+    config.causal_tree.enabled = true;
+    let config = Arc::new(config);
+    let owner = Arc::new(super::super::turn_cleanup::CleanupTracker::default());
+    let ticket = owner
+        .register(tokio_util::sync::CancellationToken::new())
+        .expect("ticket");
+    let fabric = crate::memory::fabric::MemoryFabric::new(Arc::clone(memory), workspace.to_string_lossy())
+        .with_event_recording(config.memory.event_recording_config())
+        .with_ingress_recovery(&config, &ticket)
+        .await
+        .expect("fabric");
+    let scope = crate::memory::fabric::MessageEventScope::new(
+        crate::memory::MessageEventSource::Agent,
+        MemoryVisibility::Session,
+    )
+    .with_channel("agent_api")
+    .with_owner_id("prx_user")
+    .with_session_key("prx_session")
+    .with_run_id(uuid::Uuid::new_v4().to_string());
+    let result = fabric
+        .record_inbound_user_message(scope, content, Some("prx_stable_key".to_owned()), None)
+        .await;
+    if result.is_ok() {
+        dispatched.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let duplicate = fabric.ingress_already_accepted();
+    ticket.finish(true);
+    (result, duplicate)
+}
+
+fn db(workspace: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(workspace.join("memory").join("brain.db")).expect("brain.db")
+}
+
+fn table_count(writer: &rusqlite::Connection, table: &str) -> i64 {
+    writer
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .expect("count")
+}
+
+fn assert_absent_everywhere(writer: &rusqlite::Connection, needles: &[Vec<u8>]) {
+    let names: Vec<String> = writer
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
+        .expect("tables")
+        .query_map([], |r| r.get(0))
+        .expect("names")
+        .collect::<rusqlite::Result<_>>()
+        .expect("names");
+    for table in names {
+        let quoted = table.replace('"', "\"\"");
+        let mut query = writer.prepare(&format!("SELECT * FROM \"{quoted}\"")).expect("scan");
+        let columns = query.column_count();
+        let mut rows = query.query([]).expect("rows");
+        while let Some(row) = rows.next().expect("row") {
+            for index in 0..columns {
+                if let rusqlite::types::ValueRef::Text(bytes) | rusqlite::types::ValueRef::Blob(bytes) =
+                    row.get_ref(index).expect("cell")
+                {
+                    for needle in needles {
+                        assert!(
+                            !bytes.windows(needle.len()).any(|window| window == needle.as_slice()),
+                            "a transport digest survived in {table}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovery_duplicate_never_reexecutes_tools() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = directory()?;
+    let workspace = dir.path().canonicalize()?;
+    let sqlite = SqliteMemory::new(&workspace)?;
+    let origin = crate::memory::erasure::ErasureOrigin::new("prx_account", "prx_conversation", "prx_message");
+    let view = sqlite.with_erasure_origin(origin.clone())?;
+    let dispatched = AtomicUsize::new(0);
+    let conn = db(&workspace);
+
+    let (first, duplicate) = admit(&view, &workspace, "original content", &dispatched).await;
+    first?;
+    anyhow::ensure!(!duplicate && dispatched.load(Ordering::SeqCst) == 1, "first admission");
+
+    // A matching retry (fresh run id, same stable content) is an AlreadyAccepted.
+    let (retry, duplicate) = admit(&view, &workspace, "original content", &dispatched).await;
+    anyhow::ensure!(
+        retry.as_ref().err().is_some_and(|e| e.is::<AlreadyAccepted>()) && duplicate,
+        "matching retry must be AlreadyAccepted"
+    );
+    // A conflicting retry is a typed IngressConflict.
+    let (conflict, duplicate) = admit(&view, &workspace, "different content", &dispatched).await;
+    anyhow::ensure!(
+        conflict.as_ref().err().is_some_and(|e| e.is::<IngressConflict>()) && duplicate,
+        "conflicting retry must be IngressConflict"
+    );
+    anyhow::ensure!(dispatched.load(Ordering::SeqCst) == 1, "a retry dispatched");
+    anyhow::ensure!(table_count(&conn, "recovery_transport_index") == 1, "index row missing");
+
+    let (transport, key_id): (Vec<u8>, String) = conn.query_row(
+        "SELECT transport_digest,key_id FROM recovery_transport_index",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    anyhow::ensure!(
+        table_count(&conn, "recovery_tombstones") == 0,
+        "tombstone before erasure"
+    );
+
+    // Production erasure of the message that carried the input.
+    let store = sqlite.erasure_store()?;
+    store.begin_delete(&origin)?;
+    store.erase_rows(&origin)?;
+    anyhow::ensure!(table_count(&conn, "message_events") == 0, "input survived erasure");
+    anyhow::ensure!(
+        table_count(&conn, "recovery_transport_index") == 0,
+        "index row survived"
+    );
+    anyhow::ensure!(table_count(&conn, "recovery_attestations") == 0, "attestation survived");
+    anyhow::ensure!(table_count(&conn, "recovery_tombstones") == 1, "tombstone missing");
+    let (tombstone_key,): (String,) =
+        conn.query_row("SELECT key_id FROM recovery_tombstones", [], |r| Ok((r.get(0)?,)))?;
+    anyhow::ensure!(tombstone_key == key_id, "tombstone key id");
+    assert_absent_everywhere(&conn, &[transport.clone(), hex::encode(&transport).into_bytes()]);
+
+    // Even different content is the spent key: AlreadyAccepted, nothing executes.
+    for content in ["original content", "entirely different content"] {
+        let (after, duplicate) = admit(&view, &workspace, content, &dispatched).await;
+        anyhow::ensure!(
+            after.as_ref().err().is_some_and(|e| e.is::<AlreadyAccepted>()) && duplicate,
+            "tombstoned retry must be AlreadyAccepted"
+        );
+    }
+    anyhow::ensure!(table_count(&conn, "message_events") == 0, "a tombstoned retry inserted");
+
+    // The tombstone was written under a key that is no longer active.
+    let rotated = sqlite.rotate_recovery_authority()?;
+    anyhow::ensure!(rotated != key_id, "rotation kept the key");
+    let (after, duplicate) = admit(&view, &workspace, "rotated content", &dispatched).await;
+    anyhow::ensure!(
+        after.as_ref().err().is_some_and(|e| e.is::<AlreadyAccepted>()) && duplicate,
+        "rotated-out tombstone must still match"
+    );
+    anyhow::ensure!(dispatched.load(Ordering::SeqCst) == 1, "a retry dispatched");
+
+    // A PostgreSQL-class backend refuses an attestation instead of dropping it.
+    let ledger = LegacyLedger(SqliteMemory::new(&workspace)?);
+    let lifetime = ledger
+        .acquire_ingress_lifetime(
+            &workspace.to_string_lossy(),
+            &uuid::Uuid::new_v4().to_string(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .await?;
+    let capsule = IngressCapsule {
+        version: 3,
+        key_id: Some(rotated.clone()),
+        backend_namespace: lifetime.namespace().to_owned(),
+        scope: IngressRecoveryScope {
+            workspace_id: workspace.to_string_lossy().into_owned(),
+            owner_id: "prx_user".into(),
+            source: crate::memory::MessageEventSource::Agent,
+        },
+        lifetime: lifetime.token().to_owned(),
+        input_event_id: "prx_event".into(),
+        input_key: "prx_stable_key".into(),
+        run_id: "prx_run".into(),
+        input_digest: "0".repeat(64),
+        authentication: "0".repeat(64),
+    };
+    let tag = RecoveryTag {
+        key_id: rotated,
+        tag: [0; 32],
+    };
+    let refused = ledger
+        .append_ingress_input(
+            input(&workspace, "prx_run")?,
+            capsule,
+            lifetime,
+            Instant::now() + Duration::from_secs(30),
+            Some(crate::memory::ingress_recovery::IngressAttestation {
+                facts: Vec::new(),
+                transport: tag.clone(),
+                input_key: tag,
+            }),
+        )
+        .await
+        .err()
+        .context("attestation was accepted")?;
+    anyhow::ensure!(
+        refused.downcast_ref::<crate::memory::ingress_recovery::IngressAttestationError>()
+            == Some(&crate::memory::ingress_recovery::IngressAttestationError::Unsupported),
+        "untyped refusal: {refused:#}"
+    );
+    Ok(())
 }

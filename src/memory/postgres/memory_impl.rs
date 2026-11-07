@@ -1522,8 +1522,11 @@ impl Memory for PostgresMemory {
         capsule: crate::memory::ingress_recovery::IngressCapsule,
         lifetime: Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
         deadline: Instant,
+        attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
     ) -> Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
         use crate::memory::ingress_recovery::{AtomicIngressMutation, IngressAppendOutcome};
+        // No recovery repository here: an attestation is refused, never dropped.
+        crate::memory::ingress_recovery::refuse_attestation(attestation.as_ref())?;
         let (event, inserted) = self
             .ingress_append_atomic(
                 input,
@@ -1531,6 +1534,7 @@ impl Memory for PostgresMemory {
                     capsule,
                     lifetime,
                     deadline,
+                    attestation,
                 },
             )
             .await?;
