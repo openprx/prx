@@ -551,3 +551,242 @@ async fn pinned_mcp_alias_uses_catalog_operation_and_rejects_changed_live_target
             .is_ok()
     );
 }
+
+mod child_fixture {
+    use super::*;
+    use crate::causal_tree::branch::CapabilityRef;
+    use crate::decision::DecisionKey;
+    use crate::tools::capability::child::{
+        AuthorityEnvelope, CapabilityConstraints, ChildCapabilityManifest, ChildDispatchPin, VerifiedChildScope,
+    };
+
+    /// A tool whose published description follows a shared counter, so a test
+    /// can drift one registered capability after the catalog was pinned.
+    struct DriftTool {
+        state: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Tool for DriftTool {
+        fn name(&self) -> &str {
+            "file_write"
+        }
+        fn description(&self) -> &str {
+            "drift tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{"value":{}},"required":["value"]})
+        }
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "file_write".into(),
+                description: format!("drift {}", self.state.load(Ordering::SeqCst)),
+                parameters: self.parameters_schema(),
+            }]
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "executed".into(),
+                error: None,
+            })
+        }
+    }
+
+    pub(super) struct ChildCase {
+        pub(super) fixture: Fixture,
+        pub(super) service: ToolExecutionService,
+        pub(super) drift: Arc<AtomicUsize>,
+        pub(super) key: Arc<DecisionKey>,
+        pub(super) catalog: Arc<CapabilityCatalog>,
+        pub(super) scope: Arc<VerifiedChildScope>,
+    }
+
+    impl ChildCase {
+        /// `members` names the registered tools the sealed manifest allows.
+        pub(super) fn new(members: &[&str]) -> Self {
+            let fixture = fixture();
+            let drift = Arc::new(AtomicUsize::new(0));
+            let tools = |state: &Arc<AtomicUsize>| -> Vec<Box<dyn Tool>> {
+                vec![
+                    Box::new(RecordingTool {
+                        root_name: "config_reload",
+                        aliases: vec![],
+                        calls: Arc::clone(&fixture.calls),
+                        arguments: Arc::clone(&fixture.arguments),
+                        stages: Arc::clone(&fixture.stages),
+                    }),
+                    Box::new(DriftTool {
+                        state: Arc::clone(state),
+                        calls: Arc::clone(&fixture.calls),
+                    }),
+                    // Held by the parent only, so every manifest is a strict subset.
+                    Box::new(RecordingTool {
+                        root_name: "message_send",
+                        aliases: vec![],
+                        calls: Arc::clone(&fixture.calls),
+                        arguments: Arc::clone(&fixture.arguments),
+                        stages: Arc::clone(&fixture.stages),
+                    }),
+                ]
+            };
+            let catalog = Arc::new(
+                CapabilityCatalog::build(&tools(&drift), &CatalogSources::default(), &SurfacePolicy::default())
+                    .unwrap(),
+            );
+            let service = ToolExecutionService::new(
+                tools(&drift).into_iter().map(Arc::from).collect(),
+                Arc::new(FixedPolicy {
+                    decision: ToolExecutionDecision::Allow,
+                    stages: Arc::clone(&fixture.stages),
+                }),
+                Arc::new(FixedApproval {
+                    decision: approved(),
+                    stages: Arc::clone(&fixture.stages),
+                }),
+                Arc::new(RecordingPreparation {
+                    stages: Arc::clone(&fixture.stages),
+                    allowed: true,
+                }),
+                Arc::new(RecordingAudit {
+                    records: Arc::clone(&fixture.records),
+                    stages: Arc::clone(&fixture.stages),
+                }),
+            );
+            let reference = |name: &str| {
+                let entry = catalog.entry_for_public_name(name).unwrap();
+                CapabilityRef {
+                    id: entry.id.clone(),
+                    fingerprint: entry.fingerprint,
+                    generation: entry.generation,
+                }
+            };
+            let key = DecisionKey::ephemeral();
+            let parent = CapabilityConstraints {
+                parent_authority_id: crate::causal_tree::ids::DecisionId::legacy(&[7; 32]).into(),
+                allowed: ["config_reload", "file_write", "message_send"]
+                    .into_iter()
+                    .map(reference)
+                    .collect(),
+                authority: AuthorityEnvelope {
+                    owner: "owner-a".into(),
+                    workspace: "workspace-a".into(),
+                    level: AutonomyLevel::Full,
+                    max_cost_cents: 100,
+                    remaining_depth: 2,
+                    delegation: None,
+                },
+                catalog_generation: *catalog.generation(),
+                key: Arc::clone(&key),
+            };
+            let requested: Vec<_> = members.iter().map(|name| reference(name)).collect();
+            let manifest = ChildCapabilityManifest::derive_strict_subset(&parent, &requested).unwrap();
+            let scope = Arc::new(VerifiedChildScope::new(manifest, &parent).unwrap());
+            Self {
+                fixture,
+                service,
+                drift,
+                key,
+                catalog,
+                scope,
+            }
+        }
+
+        pub(super) fn context(&self, scope: bool, pin: bool) -> ToolExecutionContext {
+            let mut context = context();
+            context.envelope.workspace_id = "workspace-a".into();
+            context.child_scope = scope.then(|| Arc::clone(&self.scope));
+            context.child_pin = pin.then(|| {
+                Arc::new(ChildDispatchPin {
+                    catalog: Arc::clone(&self.catalog),
+                    key: Arc::clone(&self.key),
+                    owner: "owner-a".into(),
+                    workspace: "workspace-a".into(),
+                })
+            });
+            context
+        }
+
+        /// Dispatches without bindings, a surface or a decision context.
+        pub(super) async fn call(&self, name: &str, context: ToolExecutionContext) -> ToolExecutionStatus {
+            self.service
+                .execute(
+                    ToolExecutionCommand::new(name, serde_json::json!({"value":1})),
+                    context,
+                    None,
+                )
+                .await
+                .status
+        }
+    }
+}
+
+#[tokio::test]
+async fn child_call_outside_manifest_is_refused_without_decision_context() {
+    let case = child_fixture::ChildCase::new(&["config_reload"]);
+    assert_eq!(
+        case.call("config_reload", case.context(true, true)).await,
+        ToolExecutionStatus::Succeeded
+    );
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
+    // Registered, catalog-valid and parity-valid, but not a manifest member.
+    assert_eq!(
+        case.call("file_write", case.context(true, true)).await,
+        ToolExecutionStatus::StaleCapability
+    );
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn child_call_with_parity_drift_is_refused_without_decision_context() {
+    let case = child_fixture::ChildCase::new(&["config_reload", "file_write"]);
+    assert_eq!(
+        case.call("config_reload", case.context(true, true)).await,
+        ToolExecutionStatus::Succeeded
+    );
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
+    // A different allowed capability drifts: the member itself is unchanged.
+    case.drift.store(1, Ordering::SeqCst);
+    assert_eq!(
+        case.call("config_reload", case.context(true, true)).await,
+        ToolExecutionStatus::StaleCapability
+    );
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn child_provenance_without_scope_is_stale() {
+    let case = child_fixture::ChildCase::new(&["config_reload"]);
+    // Provenance without scope, and scope without provenance, both refuse.
+    for (scope, pin) in [(false, true), (true, false)] {
+        assert_eq!(
+            case.call("config_reload", case.context(scope, pin)).await,
+            ToolExecutionStatus::StaleCapability
+        );
+    }
+    // A foreign owner or a foreign runtime key never validates the scope.
+    let mut foreign_owner = case.context(true, true);
+    foreign_owner.envelope.owner_id = Some("owner-b".into());
+    assert_eq!(
+        case.call("config_reload", foreign_owner).await,
+        ToolExecutionStatus::StaleCapability
+    );
+    let mut foreign_key = case.context(true, true);
+    foreign_key.child_pin = Some(Arc::new(crate::tools::capability::child::ChildDispatchPin {
+        catalog: Arc::clone(&case.catalog),
+        key: crate::decision::DecisionKey::ephemeral(),
+        owner: "owner-a".into(),
+        workspace: "workspace-a".into(),
+    }));
+    assert_eq!(
+        case.call("config_reload", foreign_key).await,
+        ToolExecutionStatus::StaleCapability
+    );
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        case.call("config_reload", case.context(true, true)).await,
+        ToolExecutionStatus::Succeeded
+    );
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
+}
