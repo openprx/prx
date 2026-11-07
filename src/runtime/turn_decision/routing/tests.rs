@@ -495,7 +495,9 @@ async fn sqlite_router_1024_eligible_rows_read_but_1025_close_before_dispatch() 
         // changes; no malformed row may explain the capacity rejection.
         for index in 1..count {
             tx.execute(
-                "INSERT INTO router_history_v1 SELECT domain,workspace,owner,session,policy,embedding_model,
+                "INSERT INTO router_history_v1(domain,workspace,owner,session,policy,embedding_model,
+                dimensions,embedding_version,source_event,source_sequence,terminal,terminal_sequence,provider,model,
+                success,embedding,fingerprint) SELECT domain,workspace,owner,session,policy,embedding_model,
                 dimensions,embedding_version,source_event,source_sequence,?1,terminal_sequence,provider,model,
                 success,embedding,fingerprint FROM router_history_v1 LIMIT 1",
                 [format!("prx-fixture-terminal-{index}")],
