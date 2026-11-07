@@ -1073,10 +1073,6 @@ async fn child_recovery_journal_cursor_wraps() -> Result<()> {
         empty.is_empty(),
         "test: late rows must stay above this pass's high water"
     );
-    anyhow::ensure!(
-        position.is_none(),
-        "test: an empty page must reset the exhausted cursor"
-    );
 
     // The next pass restarts at the first row and walks, page by page, to the late rows.
     let mut third = Vec::new();
@@ -1136,6 +1132,12 @@ async fn child_recovery_journal_cursor_wraps() -> Result<()> {
     anyhow::ensure!(
         repaired == 1,
         "test: the late child must be repaired exactly once, got {repaired}"
+    );
+    // Structural check, kept after the repair proof: the terminating empty page
+    // of the walk must leave the cursor reset.
+    anyhow::ensure!(
+        position.is_none(),
+        "test: an empty page must reset the exhausted cursor"
     );
     anyhow::ensure!(
         authority_journal::verify_child_outcome(
