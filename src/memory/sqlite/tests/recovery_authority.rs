@@ -46,6 +46,7 @@ fn key_path(memory: &SqliteMemory, id: &str) -> anyhow::Result<std::path::PathBu
 }
 
 #[test]
+#[serial_test::serial(recovery_authority)]
 fn recovery_key_create_race_is_durable() {
     let (_dir, memory) = store().unwrap();
     assert!(memory.recovery_repository().is_some());
@@ -96,6 +97,7 @@ fn recovery_key_create_race_is_durable() {
 }
 
 #[test]
+#[serial_test::serial(recovery_authority)]
 fn recovery_key_rejects_unsafe_paths() {
     let (_dir, memory) = store().unwrap();
     let id = memory.activate_recovery_authority().unwrap();
@@ -136,6 +138,7 @@ fn recovery_key_rejects_unsafe_paths() {
 }
 
 #[test]
+#[serial_test::serial(recovery_authority)]
 fn recovery_key_loss_never_replaces_authority() {
     let (_dir, memory) = store().unwrap();
     let id = memory.activate_recovery_authority().unwrap();
@@ -166,6 +169,7 @@ fn recovery_key_loss_never_replaces_authority() {
 }
 
 #[test]
+#[serial_test::serial(recovery_authority)]
 fn recovery_rotation_preserves_old_receipts() {
     let (_dir, memory) = store().unwrap();
     let old = memory.activate_recovery_authority().unwrap();
@@ -194,6 +198,7 @@ fn recovery_rotation_preserves_old_receipts() {
 }
 
 #[test]
+#[serial_test::serial(recovery_authority)]
 fn recovery_schema_upgrade_is_atomic() {
     let (_dir, memory) = store().unwrap();
     {
@@ -258,6 +263,7 @@ fn recovery_schema_upgrade_is_atomic() {
 }
 
 #[test]
+#[serial_test::serial(recovery_authority)]
 fn recovery_settlement_race_has_one_receipt() {
     let (_dir, memory) = store().unwrap();
     memory.activate_recovery_authority().unwrap();
@@ -325,6 +331,7 @@ fn recovery_settlement_race_has_one_receipt() {
 }
 
 #[test]
+#[serial_test::serial(recovery_authority)]
 fn recovery_key_fds_are_cloexec() {
     let (_dir, memory) = store().unwrap();
     // Test-only checks inspect F_GETFD immediately after every production open,
@@ -336,6 +343,7 @@ fn recovery_key_fds_are_cloexec() {
 }
 
 #[test]
+#[serial_test::serial(recovery_authority)]
 fn recovery_max_size_facts_still_settle() {
     let (_dir, memory) = store().unwrap();
     memory.activate_recovery_authority().unwrap();
@@ -392,8 +400,12 @@ fn recovery_max_size_facts_still_settle() {
 }
 
 #[tokio::test]
+#[serial_test::serial(recovery_authority)]
 async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()> {
     use crate::runtime::ingress_recovery::IngressRecorder;
+    // Process-wide callsite interest and set_default capture; sibling tests in
+    // this file also emit the shared unavailable-key warning.
+    let _logs = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
     let (dir, memory) = store()?;
     let id = memory.activate_recovery_authority()?;
     let key_file = memory
@@ -427,6 +439,7 @@ async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()
     // The first forwarded activation establishes the failure; preparations must
     // share this same result, including its one warning, without reading again.
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         anyhow::ensure!(
             memory
                 .recovery_repository()
@@ -539,6 +552,7 @@ async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()
         .with_writer(move || sink.clone())
         .finish();
     let _logging = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
     let second_recorder = prepare(second_memory.clone()).await?;
     let second = second_recorder
         .append(cell_input("prx-cell-2", "prx-cell-input-2")?)
@@ -558,6 +572,7 @@ async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()
 }
 
 #[test]
+#[serial_test::serial(recovery_authority)]
 fn recovery_activation_failure_is_attempted_once_under_contention() -> anyhow::Result<()> {
     let (dir, memory) = store()?;
     let id = memory.activate_recovery_authority()?;
@@ -600,6 +615,7 @@ fn recovery_activation_failure_is_attempted_once_under_contention() -> anyhow::R
 }
 
 #[test]
+#[serial_test::serial(recovery_authority)]
 fn recovery_key_gates_do_not_grow_with_distinct_ids() -> anyhow::Result<()> {
     let (dir, memory) = store()?;
     let before = memory.recovery_key_gates.len();
