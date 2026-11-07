@@ -395,3 +395,519 @@ async fn target_allowlist_semantics() {
     assert_eq!(error_code(&value), Some("agent_tools_invalid"));
     assert_untouched(&fixture).await;
 }
+
+// ── Enforcement through the real targeted console turn ──────────────────────
+//
+// These tests run `run_console_runtime_turn` with a target built by the real
+// `resolve_target` and `prepare_target` (capped policy, per-target decision
+// slot and published tool surface). Only the model transport is scripted: the
+// target's provider instance is replaced by a provider that emits fixed tool
+// calls, and its binding is rebuilt around that instance.
+
+type ToolBox = Box<dyn crate::tools::Tool>;
+
+/// Emits the scripted calls in its first reply and answers in text after that.
+struct ScriptedCalls {
+    calls: Vec<(&'static str, serde_json::Value)>,
+    requests: parking_lot::Mutex<Vec<Vec<ChatMessage>>>,
+}
+
+#[async_trait]
+impl Provider for ScriptedCalls {
+    fn capabilities(&self) -> crate::providers::ProviderCapabilities {
+        crate::providers::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok("summary".to_owned())
+    }
+
+    async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
+        let first = {
+            let mut requests = self.requests.lock();
+            requests.push(request.messages.to_vec());
+            requests.len() == 1
+        };
+        let tool_calls: Vec<crate::providers::ToolCall> = if first {
+            self.calls
+                .iter()
+                .enumerate()
+                .map(|(index, (name, arguments))| crate::providers::ToolCall {
+                    id: format!("call-targeted-{index}"),
+                    name: (*name).to_owned(),
+                    arguments: arguments.to_string(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(ChatResponse {
+            text: tool_calls.is_empty().then(|| "done".to_owned()),
+            tool_calls,
+            reasoning_content: None,
+        })
+    }
+}
+
+/// A registered tool that counts backend executions. It borrows the published
+/// metadata of `file_read` (or of `file_write` under that name), so it is
+/// catalogued like a real filesystem tool.
+struct CountingTool {
+    name: &'static str,
+    inner: ToolBox,
+    executions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl crate::tools::Tool for CountingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+    fn tier(&self) -> crate::tools::traits::ToolTier {
+        self.inner.tier()
+    }
+    fn categories(&self) -> &'static [crate::tools::traits::ToolCategory] {
+        self.inner.categories()
+    }
+    fn supports_owner_filesystem(&self) -> bool {
+        self.inner.supports_owner_filesystem()
+    }
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        self.executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: "probe-output".to_owned(),
+            error: None,
+        })
+    }
+}
+
+const NOT_EXPOSED: &str = "was not exposed for this turn and was not executed";
+const APPROVAL_DENIED: &str = "approval is not available for this agent";
+const APPROVAL_EVENT_TYPES: [&str; 8] = [
+    "approval.call.pending",
+    "approval.call.reviewed",
+    "approval.decision.pending",
+    "approval.decision.reviewed",
+    "approval.decision.issued",
+    "approval.decision.resolved",
+    "approval.decision.resume_requested",
+    "approval.collection.declined",
+];
+
+impl Driven {
+    fn ran(&self, tool: &str) -> usize {
+        self.executions.get(tool).copied().expect("test: counted tool")
+    }
+}
+
+struct Driven {
+    awaiting_approval: bool,
+    successful_attempts: u64,
+    denied_attempts: u64,
+    awaiting_approval_attempts: u64,
+    /// The text of every message of the request that followed the tool round.
+    follow_up: String,
+    executions: std::collections::BTreeMap<&'static str, usize>,
+    /// Durable approval rows by event type, read from the memory store.
+    rows: std::collections::BTreeMap<&'static str, usize>,
+    pending_decisions: usize,
+    pending_calls: Option<usize>,
+    /// How often the channel approval resolver was consulted.
+    approval_asked: usize,
+}
+
+/// Records every consultation and denies.
+struct DenyingResolver {
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl crate::agent::turn_contracts::ApprovalResolver for DenyingResolver {
+    async fn resolve(
+        &self,
+        _request: &crate::approval::ApprovalRequest,
+        _channel: &str,
+    ) -> crate::agent::turn_contracts::ApprovalDecision {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::agent::turn_contracts::ApprovalDecision::Deny
+    }
+}
+
+/// Run one console turn. `agent_config` is `Some` for a targeted turn on agent
+/// `worker`, `None` for a Main turn. Every name in `registry` is a registered
+/// counting tool. With `ask_gate`, the run is installed with a channel approval
+/// policy that makes every call ask first (the runtime route a read tool takes
+/// to "needs approval" in a Run-disposition console turn).
+async fn drive(
+    main_level: AutonomyLevel,
+    agent_config: Option<DelegateAgentConfig>,
+    registry: &[&'static str],
+    calls: Vec<(&'static str, serde_json::Value)>,
+    input: &'static str,
+    ask_gate: bool,
+) -> Driven {
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start("filesystem")
+        .await
+        .expect("test: decision fixture");
+    let endpoint = driver.endpoint().to_owned();
+    let registry = registry.to_vec();
+    let targeted_request = agent_config.is_some();
+    driver
+        .run(true, async move {
+            let tmp = tempfile::tempdir().expect("test: tempdir");
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("test: cleanup scope");
+            let driven = cleanup
+                .run(Box::pin(async {
+                    let workspace = tmp.path().join("workspace");
+                    let private = tmp.path().join("private");
+                    std::fs::create_dir_all(&workspace).expect("test: workspace");
+                    std::fs::create_dir_all(&private).expect("test: private root");
+                    let mut config = Config::default();
+                    console_provider_fixture_config(&mut config, &workspace, CONSOLE_WINDOW_MODEL, &endpoint);
+                    config.config_path = private.join("config.toml");
+                    config.autonomy.level = main_level;
+                    config.gateway.targeted_agents = true;
+                    config.tool_tiering.always_include = registry.iter().map(|name| (*name).to_owned()).collect();
+                    if let Some(mut worker) = agent_config {
+                        worker.model = CONSOLE_WINDOW_MODEL.to_owned();
+                        config.agents.insert("worker".to_owned(), worker);
+                    }
+                    let scripted = Arc::new(ScriptedCalls {
+                        calls,
+                        requests: parking_lot::Mutex::new(Vec::new()),
+                    });
+                    let mut state = test_app_state_with_config(config, Arc::new(CapturingProvider::default()));
+                    state.mem = Arc::new(
+                        crate::memory::SqliteMemory::new(&state.config.pin().effective.workspace_dir)
+                            .expect("test: sqlite memory"),
+                    );
+                    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+                        &state.config.pin().effective.autonomy,
+                        &workspace,
+                    ));
+                    let counters: std::collections::BTreeMap<&'static str, Arc<std::sync::atomic::AtomicUsize>> =
+                        registry
+                            .iter()
+                            .map(|name| (*name, Arc::new(std::sync::atomic::AtomicUsize::new(0))))
+                            .collect();
+                    state.tools_registry = Arc::new(
+                        registry
+                            .iter()
+                            .map(|name| {
+                                let inner: ToolBox = if *name == "file_write" {
+                                    Box::new(crate::tools::file_write::FileWriteTool::new(Arc::clone(&security)))
+                                } else {
+                                    Box::new(crate::tools::file_read::FileReadTool::new(Arc::clone(&security), false))
+                                };
+                                Box::new(CountingTool {
+                                    name,
+                                    inner,
+                                    executions: Arc::clone(counters.get(name).expect("test: counter")),
+                                }) as ToolBox
+                            })
+                            .collect(),
+                    );
+
+                    // The parent runtime, exactly as the console fixtures build it.
+                    let mut parent = state.pin_turn_runtime();
+                    let effective = Arc::clone(&parent.config_generation.effective);
+                    let catalog = crate::providers::selection::catalog_for(&effective);
+                    let resolve = |provider: &str| {
+                        crate::providers::selection::check_with(
+                            &effective,
+                            &catalog,
+                            provider,
+                            CONSOLE_WINDOW_MODEL,
+                            crate::providers::selection::credential_for(&effective, provider),
+                            &crate::providers::catalog::Requirement::chat(),
+                            crate::providers::catalog::UnknownPolicy::Invocation,
+                        )
+                        .expect("test: model resolves")
+                    };
+                    {
+                        let parent = Arc::get_mut(&mut parent).expect("test: unshared runtime");
+                        parent.provider = scripted.clone();
+                        parent.model = CONSOLE_WINDOW_MODEL.to_owned();
+                        parent.provider_binding =
+                            Some(Arc::new(crate::gateway::decision_source::GatewayProviderBinding::new(
+                                scripted.clone(),
+                                resolve("ollama"),
+                            )));
+                        parent.decision_slot = Arc::new(crate::gateway::decision_runtime::GatewayDecisionSlot::new(
+                            Arc::new(crate::security::SecurityPolicy::from_config(
+                                &effective.autonomy,
+                                &workspace,
+                            )),
+                            0,
+                        ));
+                    }
+
+                    // The real target resolution and runtime derivation; only the
+                    // provider instance is swapped for the scripted transport.
+                    let plan = if targeted_request {
+                        resolve_target(&effective, &named("worker")).expect("test: resolves")
+                    } else {
+                        None
+                    };
+                    let (runtime, targeted) = match plan {
+                        Some(plan) => {
+                            let (mut runtime, turn) = prepare_target(&parent, &plan).expect("test: target runtime");
+                            {
+                                let derived = Arc::get_mut(&mut runtime).expect("test: unshared target runtime");
+                                derived.provider = scripted.clone();
+                                derived.provider_binding =
+                                    Some(Arc::new(crate::gateway::decision_source::GatewayProviderBinding::new(
+                                        scripted.clone(),
+                                        resolve("ollama"),
+                                    )));
+                            }
+                            (runtime, Some(turn))
+                        }
+                        None => (parent, None),
+                    };
+
+                    let principal = super::super::super::ApiPrincipal::of_token("prx-test-token");
+                    let envelope = console_runtime_envelope_for_workspace(
+                        workspace.to_string_lossy().to_string(),
+                        "console-targeted-session",
+                        "console",
+                        "prx_user",
+                    )
+                    .with_run_id(uuid::Uuid::new_v4().to_string())
+                    .with_config_generation(&runtime.config_generation)
+                    .with_owner_id(principal.owner_id.clone())
+                    .with_owner_isolation();
+                    let event_id = append_console_turn(&state, &envelope, "user", input, true, false)
+                        .await
+                        .expect("test: record the input");
+                    let proof = crate::gateway::decision_source::GatewaySourceReceipt::console_proof(
+                        state.mem.as_ref(),
+                        &runtime,
+                        &principal,
+                        &envelope,
+                        input,
+                        &event_id,
+                    )
+                    .await
+                    .expect("test: admitted source");
+                    let resolver = Arc::new(DenyingResolver {
+                        asked: std::sync::atomic::AtomicUsize::new(0),
+                    });
+                    if ask_gate {
+                        let run_id = envelope.run_id.clone().expect("test: run id");
+                        crate::agent::channel_approval::install(&run_id, resolver.clone(), true, false);
+                    }
+                    let service = runtime
+                        .decision_slot
+                        .publish(&runtime, &state)
+                        .await
+                        .expect("test: publish")
+                        .clone();
+                    let cancellation = tokio_util::sync::CancellationToken::new();
+                    let context = service
+                        .decide_agent_initial(
+                            &proof,
+                            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                            &cancellation,
+                        )
+                        .await
+                        .expect("test: decision");
+                    assert!(
+                        matches!(
+                            context.disposition(),
+                            Ok(crate::runtime::turn_decision::TurnDisposition::Run)
+                        ),
+                        "the turn must reach the tool loop, not collection or a direct reply"
+                    );
+                    let decision = ConsoleDecisionTurn {
+                        service: Arc::clone(&service),
+                        context,
+                        proof: &proof,
+                        cancellation,
+                        provider_trace: None,
+                    };
+                    let turn = run_console_runtime_turn(
+                        Arc::clone(&runtime),
+                        &state,
+                        input,
+                        Vec::new(),
+                        &decision,
+                        targeted.as_ref(),
+                    )
+                    .await
+                    .expect("test: console turn completes");
+
+                    let owner = principal.owner_id.clone();
+                    let workspace_id = proof.envelope().workspace_id.clone();
+                    let mut rows = std::collections::BTreeMap::new();
+                    for event_type in APPROVAL_EVENT_TYPES {
+                        let found = state
+                            .mem
+                            .list_owned_message_events_by_type(&workspace_id, &owner, event_type, 0, 50)
+                            .await
+                            .expect("test: read approval rows");
+                        rows.insert(event_type, found.len());
+                    }
+                    let pending_decisions = service
+                        .list_pending_decision_approvals(&owner, 0, 10)
+                        .await
+                        .expect("test: pending decision approvals")
+                        .items
+                        .len();
+                    let pending_calls = match service.call_approval_strategy(proof.envelope().clone()) {
+                        Ok(adapter) => Some(
+                            adapter
+                                .port
+                                .list_pending_calls(&owner, 0, 10)
+                                .await
+                                .expect("test: pending call approvals")
+                                .items
+                                .len(),
+                        ),
+                        Err(_) => None,
+                    };
+                    service
+                        .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+                        .await;
+                    if let Some(run_id) = envelope.run_id.as_deref() {
+                        crate::agent::channel_approval::clear(run_id);
+                    }
+
+                    let requests = scripted.requests.lock().clone();
+                    let follow_up = requests
+                        .get(1)
+                        .map(|messages| {
+                            messages
+                                .iter()
+                                .map(|message| message.content.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    let snapshot = turn.trace.execution_trace.clone().expect("test: execution trace");
+                    Ok::<_, anyhow::Error>(Driven {
+                        awaiting_approval: turn.awaiting_approval,
+                        successful_attempts: snapshot.successful_attempts,
+                        denied_attempts: snapshot.denied_attempts,
+                        awaiting_approval_attempts: snapshot.awaiting_approval_attempts,
+                        follow_up,
+                        executions: counters
+                            .iter()
+                            .map(|(name, count)| (*name, count.load(std::sync::atomic::Ordering::SeqCst)))
+                            .collect(),
+                        rows,
+                        pending_decisions,
+                        pending_calls,
+                        approval_asked: resolver.asked.load(std::sync::atomic::Ordering::SeqCst),
+                    })
+                }))
+                .await;
+            driven.expect("test: scripted turn and cleanup")
+        })
+        .await
+}
+
+#[tokio::test]
+async fn targeted_turn_cannot_dispatch_excluded_or_unlisted_tool() {
+    // `cron` is excluded even under a wildcard; `file_grep` is registered but
+    // not on the agent's explicit allowlist; `file_read` is listed. The model
+    // calls all three in one reply.
+    let probe = serde_json::json!({"path": "probe.txt"});
+    let calls = vec![
+        ("cron", probe.clone()),
+        ("file_grep", probe.clone()),
+        ("file_read", probe),
+    ];
+    let input = "file_read probe.txt: show the probe file";
+    for allowlist in [&["file_read", "cron"][..], &["*"][..]] {
+        let driven = drive(
+            AutonomyLevel::Full,
+            Some(agent(true, allowlist)),
+            &["cron", "file_grep", "file_read"],
+            calls.clone(),
+            input,
+            false,
+        )
+        .await;
+        assert_eq!(driven.ran("cron"), 0, "cron never runs ({allowlist:?})");
+        assert_eq!(driven.ran("file_grep"), 0, "unlisted never runs ({allowlist:?})");
+        assert_eq!(
+            driven.denied_attempts, 2,
+            "both refused calls end denied ({allowlist:?})"
+        );
+        assert_eq!(
+            driven.follow_up.matches(NOT_EXPOSED).count(),
+            2,
+            "{allowlist:?}: {}",
+            driven.follow_up
+        );
+        assert_eq!(
+            driven.ran("file_read"),
+            1,
+            "the listed tool still works ({allowlist:?})"
+        );
+        assert_eq!(driven.successful_attempts, 1, "{allowlist:?}");
+        assert!(driven.follow_up.contains("probe-output"), "{allowlist:?}");
+        assert!(!driven.awaiting_approval);
+    }
+}
+
+#[tokio::test]
+async fn targeted_turn_approval_call_ends_denied_without_pending_state() {
+    // The turn runs `file_read` under a run policy that makes every call ask
+    // first. The agent asks for Full, but is capped at Main's level.
+    let mut worker = agent(true, &["file_read"]);
+    worker.autonomy = Some(AutonomyLevel::Full);
+    let calls = vec![("file_read", serde_json::json!({"path": "probe.txt"}))];
+    let input = "file_read probe.txt: show the probe file";
+
+    let targeted = drive(
+        AutonomyLevel::Supervised,
+        Some(worker),
+        &["file_read"],
+        calls.clone(),
+        input,
+        true,
+    )
+    .await;
+    assert_eq!(targeted.ran("file_read"), 0, "the backend never runs");
+    assert!(
+        targeted.follow_up.contains(&format!("Denied: {APPROVAL_DENIED}")),
+        "the call ended ApprovalDenied: {}",
+        targeted.follow_up
+    );
+    assert_eq!(targeted.approval_asked, 0, "no approval route was entered");
+    assert_eq!(targeted.denied_attempts, 1);
+    assert_eq!(targeted.awaiting_approval_attempts, 0);
+    assert_eq!(targeted.successful_attempts, 0);
+    assert!(!targeted.awaiting_approval, "the turn is not waiting for anyone");
+    assert_eq!(targeted.pending_decisions, 0, "no pending decision");
+    assert_eq!(targeted.pending_calls.unwrap_or(0), 0, "no pending call");
+    for (event_type, count) in &targeted.rows {
+        assert_eq!(*count, 0, "no {event_type} row was written");
+    }
+
+    // Control: the same call on a Main turn reaches the ordinary approval path.
+    let main = drive(AutonomyLevel::Supervised, None, &["file_read"], calls, input, true).await;
+    assert_eq!(main.approval_asked, 1, "Main consults the approval resolver");
+    assert_eq!(main.ran("file_read"), 0, "the resolver denied the call");
+    assert!(!main.follow_up.contains(APPROVAL_DENIED));
+}
