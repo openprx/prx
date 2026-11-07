@@ -355,61 +355,143 @@ async fn disabled_terminal_validates_source_without_decision_store_writes() {
     fixture.assert_no_outcome().await;
 }
 
+/// Where the persisted issued-state fingerprint is tampered.
+#[derive(Clone, Copy)]
+enum FingerprintTamper {
+    /// The decision-store row. Capture no longer reads it, so it cannot reject.
+    StoreRow,
+    /// The journal `decision_evidence` row, resealed so only the fingerprint differs.
+    JournalEvidence,
+}
+
+fn tampered_fingerprint(stored: &str, double_encoded: bool) -> String {
+    let changed = if double_encoded {
+        hex::encode(stored.as_bytes())
+    } else {
+        let mut changed = stored.to_owned();
+        changed.replace_range(..1, if stored.starts_with('0') { "1" } else { "0" });
+        changed
+    };
+    assert_ne!(changed, stored);
+    changed
+}
+
+/// Replaces the sealed journal evidence of one decision with `fingerprint`.
+fn reseal_journal_fingerprint(fixture: &LinkedFixture, owner: &str, decision: &str, double_encoded: bool) {
+    let workspace_id = fixture.service.store.workspace_id().expect("owned store namespace");
+    let key = &fixture.service.state_key;
+    let columns = crate::runtime::child_source::authority_journal::read_decision_evidence(
+        fixture.workspace.path(),
+        &workspace_id,
+        owner,
+        decision,
+        key,
+    )
+    .expect("authenticated journal evidence")
+    .expect("journal evidence row of the issued hop");
+    let mut named = Vec::with_capacity(columns.len());
+    for (name, value) in columns {
+        let name = crate::causal_tree::store::replay_column_names()
+            .into_iter()
+            .find(|candidate| *candidate == name)
+            .expect("known replay column");
+        named.push((name, value));
+    }
+    let slot = named
+        .iter_mut()
+        .find(|(name, _)| *name == "state_fingerprint")
+        .expect("state_fingerprint column");
+    let rusqlite::types::Value::Text(stored) = &slot.1 else {
+        panic!("state_fingerprint evidence is not text");
+    };
+    assert_eq!(stored.len(), 64);
+    slot.1 = rusqlite::types::Value::Text(tampered_fingerprint(stored, double_encoded));
+    let journal = rusqlite::Connection::open(crate::runtime::child_source::authority_journal::path(
+        fixture.workspace.path(),
+    ))
+    .expect("authority journal");
+    assert_eq!(
+        journal
+            .execute(
+                "DELETE FROM decision_evidence WHERE workspace = ?1 AND owner = ?2 AND decision = ?3",
+                (workspace_id.as_ref(), owner, decision),
+            )
+            .expect("remove exactly the actual evidence row"),
+        1
+    );
+    drop(journal);
+    crate::runtime::child_source::authority_journal::write_decision_evidence(fixture.workspace.path(), key, &[named])
+        .expect("reseal the tampered evidence row");
+}
+
 #[tokio::test]
 async fn linked_finalizer_rejects_changed_or_double_encoded_persisted_fingerprint_before_writes() {
-    for double_encoded in [false, true] {
-        let fixture = LinkedFixture::new().await;
-        let workspace_id = fixture.service.store.workspace_id().expect("owned store namespace");
-        let hop = fixture.context.audit_hops().next().expect("actual issued hop");
-        let decision_id = hop.decision_id.to_string();
-        let expected = hop.state.material_fingerprint(&fixture.service.state_key);
-        let connection = rusqlite::Connection::open(fixture.workspace.path().join("self/causal_tree/decisions.db"))
-            .expect("actual decision store");
-        let stored: String = connection
-            .query_row(
-                "SELECT state_fingerprint FROM decisions WHERE workspace_id=?1 AND decision_id=?2",
-                rusqlite::params![workspace_id.as_ref(), &decision_id],
-                |row| row.get(0),
-            )
-            .expect("durable issued fingerprint");
-        assert_eq!(stored, expected);
-        assert_eq!(stored.len(), 64);
-        assert!(stored.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        let changed = if double_encoded {
-            hex::encode(stored.as_bytes())
-        } else {
-            let mut changed = stored.clone();
-            changed.replace_range(..1, if stored.starts_with('0') { "1" } else { "0" });
-            changed
-        };
-        assert_ne!(changed, stored);
-        assert_eq!(
-            connection
-                .execute(
-                    "UPDATE decisions SET state_fingerprint=?1 WHERE workspace_id=?2 AND decision_id=?3",
-                    rusqlite::params![changed, workspace_id.as_ref(), decision_id],
+    for tamper in [FingerprintTamper::JournalEvidence, FingerprintTamper::StoreRow] {
+        for double_encoded in [false, true] {
+            let fixture = LinkedFixture::new().await;
+            let workspace_id = fixture.service.store.workspace_id().expect("owned store namespace");
+            let hop = fixture.context.audit_hops().next().expect("actual issued hop");
+            let decision_id = hop.decision_id.to_string();
+            let owner = fixture.proof.owner_id().to_owned();
+            let expected = hop.state.material_fingerprint(&fixture.service.state_key);
+            let connection = rusqlite::Connection::open(fixture.workspace.path().join("self/causal_tree/decisions.db"))
+                .expect("actual decision store");
+            let stored: String = connection
+                .query_row(
+                    "SELECT state_fingerprint FROM decisions WHERE workspace_id=?1 AND decision_id=?2",
+                    rusqlite::params![workspace_id.as_ref(), &decision_id],
+                    |row| row.get(0),
                 )
-                .expect("change exactly the actual owned row"),
-            1
-        );
-        drop(connection);
-        let fabric = fixture.fabric(Arc::clone(&fixture.memory));
-        let error = crate::agent::terminal::finalize_turn(
-            &fabric,
-            fixture.commit.clone(),
-            &fixture.config.cost,
-            fixture.workspace.path(),
-        )
-        .await
-        .expect_err("altered persisted fingerprint must reject terminal capture");
-        assert_eq!(
-            error.to_string(),
-            "persisted decision replay binding differs from the issued context"
-        );
-        assert_eq!(fixture.marker_presence(&fabric).await, [false; 4]);
-        fixture.assert_no_outcome().await;
-        assert!(!fixture.workspace.path().join("state/costs.jsonl").exists());
-        fixture.service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+                .expect("durable issued fingerprint");
+            assert_eq!(stored, expected);
+            assert_eq!(stored.len(), 64);
+            assert!(stored.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            match tamper {
+                FingerprintTamper::StoreRow => {
+                    let changed = tampered_fingerprint(&stored, double_encoded);
+                    assert_eq!(
+                        connection
+                            .execute(
+                                "UPDATE decisions SET state_fingerprint=?1 WHERE workspace_id=?2 AND decision_id=?3",
+                                rusqlite::params![changed, workspace_id.as_ref(), decision_id],
+                            )
+                            .expect("change exactly the actual owned row"),
+                        1
+                    );
+                }
+                FingerprintTamper::JournalEvidence => {
+                    reseal_journal_fingerprint(&fixture, &owner, &decision_id, double_encoded);
+                }
+            }
+            drop(connection);
+            let fabric = fixture.fabric(Arc::clone(&fixture.memory));
+            let result = crate::agent::terminal::finalize_turn(
+                &fabric,
+                fixture.commit.clone(),
+                &fixture.config.cost,
+                fixture.workspace.path(),
+            )
+            .await;
+            match tamper {
+                FingerprintTamper::JournalEvidence => {
+                    let error = result.expect_err("altered journal fingerprint must reject terminal capture");
+                    assert_eq!(
+                        error.to_string(),
+                        "persisted decision replay binding differs from the issued context"
+                    );
+                    assert_eq!(fixture.marker_presence(&fabric).await, [false; 4]);
+                    fixture.assert_no_outcome().await;
+                    assert!(!fixture.workspace.path().join("state/costs.jsonl").exists());
+                }
+                FingerprintTamper::StoreRow => {
+                    // Journal authority never reads the store row, so its tamper
+                    // is inert: capture still binds to the sealed journal evidence.
+                    result.expect("store row is not terminal evidence under journal authority");
+                    assert!(fixture.marker_presence(&fabric).await[3], "final marker committed");
+                }
+            }
+            fixture.service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+        }
     }
 }
 
