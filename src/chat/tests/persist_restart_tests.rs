@@ -145,6 +145,8 @@ enum Fault {
     None,
     FloatDrift,
     MissingSource,
+    /// A pre-journal marker: sealed without `journal_version`, so replay selects the store.
+    LegacySelection,
 }
 
 async fn completed_chat(workspace: &Path, fault: Fault) -> MessageEvent {
@@ -188,7 +190,18 @@ async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &
                 let mut payload: serde_json::Value =
                     serde_json::from_str(receipt.terminal_event.raw_payload_json.as_deref().unwrap()).unwrap();
                 let cost = 0.002_917_600_000_000_000_2_f64;
-                if matches!(fault, Fault::MissingSource) {
+                if matches!(fault, Fault::LegacySelection) {
+                    assert!(
+                        payload
+                            .pointer_mut("/terminal_replay_v1")
+                            .unwrap()
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("journal_version")
+                            .is_some(),
+                        "test: capture must have sealed a journal-required marker"
+                    );
+                } else if matches!(fault, Fault::MissingSource) {
                     *payload.pointer_mut("/terminal_replay_v1/source/event_id").unwrap() = "prx-missing-source".into();
                 } else {
                     payload
@@ -207,11 +220,20 @@ async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &
                 memory
                     .replace_event_payload_for_test(&receipt.terminal_event.event_id, &payload.to_string())
                     .unwrap();
-                let error = service
+                let rejoin = service
                     .recovery_scope()
                     .rejoin_terminal("prx-first-run", source.owner_id.as_deref().unwrap())
-                    .await
-                    .unwrap_err();
+                    .await;
+                if matches!(fault, Fault::LegacySelection) {
+                    // The legacy store arm still verifies while its store is intact.
+                    rejoin.expect("legacy-selected marker rejoins against its own store");
+                    guard.handoff();
+                    service
+                        .shutdown(std::time::Instant::now() + Duration::from_secs(5))
+                        .await;
+                    return Ok(source);
+                }
+                let error = rejoin.unwrap_err();
                 let expected = if matches!(fault, Fault::FloatDrift) {
                     "terminal replay authentication failed"
                 } else {
@@ -405,6 +427,15 @@ async fn chat_recovers_a_real_seal_that_failed_verification_before_restart() {
     assert_eq!(marker(dir.path(), &first).await.event_id, evidence.event_id);
 }
 
+/// Which evidence authority the first run's terminal marker selects.
+#[derive(Clone, Copy)]
+enum StoreReset {
+    /// Journal-required marker: the sealed journal is authoritative, so the reset store is not consulted.
+    JournalAuthority,
+    /// Pre-journal marker: the decision store is authoritative, so the reset is unverifiable.
+    LegacyStore,
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn empty_decision_store_beside_populated_memory_recovers_with_named_diagnostics() {
     // Other chat tests configure process-wide tracing. Isolate the subscriber
@@ -414,9 +445,31 @@ async fn empty_decision_store_beside_populated_memory_recovers_with_named_diagno
     if run_in_isolated_process(TEST, CHILD_FLAG) {
         return;
     }
+    // The in-process arm is the legacy one: it must keep its named quarantine diagnostics.
+    // The journal arm runs in its own isolated child process below.
+    reset_store_and_restart(StoreReset::LegacyStore).await;
+}
 
+#[tokio::test(flavor = "current_thread")]
+async fn empty_decision_store_beside_journal_authority_terminal_recovers_without_quarantine() {
+    const CHILD_FLAG: &str = "PRX_TEST_INGRESS_JOURNAL_DIAGNOSTICS_CHILD";
+    const TEST: &str = "chat::tests::persist_restart_tests::empty_decision_store_beside_journal_authority_terminal_recovers_without_quarantine";
+    if run_in_isolated_process(TEST, CHILD_FLAG) {
+        return;
+    }
+    reset_store_and_restart(StoreReset::JournalAuthority).await;
+}
+
+async fn reset_store_and_restart(arm: StoreReset) {
     let dir = tempfile::tempdir().unwrap();
-    let first = completed_chat(dir.path(), Fault::None).await;
+    let first = completed_chat(
+        dir.path(),
+        match arm {
+            StoreReset::JournalAuthority => Fault::None,
+            StoreReset::LegacyStore => Fault::LegacySelection,
+        },
+    )
+    .await;
     let decision_dir = dir.path().join("self/causal_tree");
     let saved = dir.path().join("previous-decisions");
     std::fs::create_dir(&saved).unwrap();
@@ -434,17 +487,39 @@ async fn empty_decision_store_beside_populated_memory_recovers_with_named_diagno
         .finish();
     let _logging = tracing::subscriber::set_default(subscriber);
     restarted_chat(dir.path(), "prx-after-reset").await;
-    let evidence = marker(dir.path(), &first).await;
-    assert!(evidence.content.contains("binding does not match the committed marker"));
     let text = String::from_utf8(log.lock().clone()).unwrap();
-    for expected in [
-        "brain.db",
-        "decisions.db",
-        "prx-first-run",
-        "quarantined",
-        "startup recovery will continue",
-    ] {
-        assert!(text.contains(expected), "missing {expected}: {text}");
+    match arm {
+        StoreReset::LegacyStore => {
+            let evidence = marker(dir.path(), &first).await;
+            assert!(evidence.content.contains("binding does not match the committed marker"));
+            for expected in [
+                "brain.db",
+                "decisions.db",
+                "prx-first-run",
+                "quarantined",
+                "startup recovery will continue",
+            ] {
+                assert!(text.contains(expected), "missing {expected}: {text}");
+            }
+        }
+        StoreReset::JournalAuthority => {
+            // The sealed journal still verifies the terminal, so nothing is
+            // unverifiable: no quarantine marker and no quarantine diagnostic.
+            let absent = SqliteMemory::new(dir.path())
+                .unwrap()
+                .find_owned_message_event_by_idempotency_key(
+                    &first.workspace_id,
+                    first.owner_id.as_deref().unwrap(),
+                    &format!("ingress:{}:quarantine", first.event_id),
+                )
+                .await
+                .unwrap();
+            assert!(absent.is_none(), "journal-authority terminal must not be quarantined");
+            assert!(
+                !text.contains("quarantined"),
+                "unexpected quarantine diagnostic: {text}"
+            );
+        }
     }
 }
 
