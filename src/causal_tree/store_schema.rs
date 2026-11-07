@@ -19,7 +19,7 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 /// The schema version this build writes.
-pub(crate) const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 6;
 
 /// Version 1: decisions, outcomes and the store's own metadata.
 const V1: &str = "
@@ -132,8 +132,16 @@ CREATE TABLE child_outcomes (
 CREATE INDEX child_outcomes_parent ON child_outcomes(parent_decision_id, child_decision_id, settlement_id);
 ";
 
+/// Version 6 (MA-01b1b): the logical agent-scope reference of each row. It
+/// names a scope in the memory database, so it carries no SQL foreign key.
+const V6: &str = "
+ALTER TABLE decisions ADD COLUMN ma_scope_id TEXT;
+ALTER TABLE outcomes ADD COLUMN ma_scope_id TEXT;
+ALTER TABLE child_outcomes ADD COLUMN ma_scope_id TEXT;
+";
+
 /// The migrations, in order: entry `n` moves the schema from `n` to `n + 1`.
-const MIGRATIONS: [&str; 5] = [V1, V2, V3, V4, V5];
+const MIGRATIONS: [&str; 6] = [V1, V2, V3, V4, V5, V6];
 
 /// What the schema check found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +238,27 @@ mod tests {
             )
             .expect("test: ids");
         assert_eq!(ids, 1);
+    }
+
+    /// MA-01b1b: a version-5 store gains a plain scope column on each row table.
+    #[test]
+    fn a_version_five_store_gains_the_scope_columns() {
+        let mut conn = Connection::open_in_memory().expect("test: open");
+        for step in &MIGRATIONS[..5] {
+            conn.execute_batch(step).expect("test: step");
+        }
+        conn.pragma_update(None, "user_version", 5).expect("test: version 5");
+        assert_eq!(migrate(&mut conn).expect("test: migrate"), SchemaState::Current);
+        for table in ["decisions", "outcomes", "child_outcomes"] {
+            let columns: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info(?1) WHERE name = 'ma_scope_id'",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("test: columns");
+            assert_eq!(columns, 1, "{table}");
+        }
     }
 
     /// D-102 H-2: a version-1 store gains the endpoint column, its rows keep

@@ -190,6 +190,23 @@ async fn observe_evicts_fifo_at_telemetry_cap() {
 }
 
 #[test]
+fn engine_outcomes_gains_a_scope_column_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("engine.db");
+    drop(SqliteTelemetryWriter::open(&path).unwrap());
+    drop(SqliteTelemetryWriter::open(&path).unwrap());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let columns: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('engine_outcomes') WHERE name = 'ma_scope_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(columns, 1);
+}
+
+#[test]
 fn observe_without_runtime_returns_typed_error_before_opening_store() {
     let result = ObserveQueue::start(1, 1, CancellationToken::new(), || panic!("must not open"));
     assert!(matches!(result, Err(observe::ObserveStartError::Runtime(_))));

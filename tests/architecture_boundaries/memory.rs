@@ -124,6 +124,7 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
 /// backend (everything but the tests directory). Both lists are compared with
 /// the directory, so a new file must be placed in one of them on purpose.
 const SQLITE_BACKEND_FILES: &[&str] = &[
+    "agent_migration.rs",
     "agent_registry.rs",
     "approval_grants.rs",
     "documents.rs",
@@ -293,6 +294,10 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
     // missing from this list fails the check below, so neither can go blind.
     let sqlite_sources = [
         ("mod.rs", include_str!("../../src/memory/sqlite/mod.rs")),
+        (
+            "agent_migration.rs",
+            include_str!("../../src/memory/sqlite/agent_migration.rs"),
+        ),
         (
             "agent_registry.rs",
             include_str!("../../src/memory/sqlite/agent_registry.rs"),

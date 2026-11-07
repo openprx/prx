@@ -45,6 +45,7 @@ pub(super) fn init_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         kind TEXT NOT NULL, object_key TEXT NOT NULL, bytes BLOB NOT NULL,
         UNIQUE(account,conversation,kind,object_key));",
     )?;
+    super::agent_registry::add_scope_column(conn, "ramflux_blobs")?;
     Ok(())
 }
 

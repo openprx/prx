@@ -413,9 +413,13 @@ const SCHEMA: &str = "PRAGMA journal_mode = WAL;
 /// Every name here is a literal from this file — never a value from a row, a
 /// request or a configuration file — which is why formatting them into the
 /// statement cannot be a SQL injection.
-const ADDED_COLUMNS: [(&str, &str, &str); 2] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 5] = [
     ("chat_sessions", "revision", "INTEGER NOT NULL DEFAULT 0"),
     ("chat_assignments", "revision", "INTEGER NOT NULL DEFAULT 0"),
+    // Logical reference to an agent scope in the memory database; no SQL foreign key across databases.
+    ("chat_sessions", "ma_scope_id", "TEXT"),
+    ("chat_assignments", "ma_scope_id", "TEXT"),
+    ("chat_results", "ma_scope_id", "TEXT"),
 ];
 
 /// Bring a database written by an older PRX up to the current column set.
@@ -945,6 +949,31 @@ mod tests {
             b"already here",
             "pre-creation must never truncate a database that is already there"
         );
+    }
+
+    /// MA-01b1b: every mailbox table carries a plain (no foreign key) scope column.
+    #[test]
+    fn the_mailbox_tables_carry_a_scope_column() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        let store = SqliteMailboxStore::open(dir.path().join("mailbox.db")).expect("test: open");
+        let conn = store.conn.lock();
+        for table in ["chat_sessions", "chat_assignments", "chat_results"] {
+            let columns: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info(?1) WHERE name = 'ma_scope_id' AND \"notnull\" = 0",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("test: columns");
+            let keys: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_foreign_key_list(?1) WHERE \"from\" = 'ma_scope_id'",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("test: keys");
+            assert_eq!((columns, keys), (1, 0), "{table}");
+        }
     }
 
     /// The module header promises that "accepted" and "durable" are the same

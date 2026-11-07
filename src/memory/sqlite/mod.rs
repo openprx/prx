@@ -1,3 +1,4 @@
+mod agent_migration;
 mod agent_registry;
 mod approval_grants;
 mod documents;
