@@ -504,6 +504,29 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
         let receipt = sequence.record(&fabric, "Read file_read project metadata").await?;
         let child_proof = Arc::new(binding.source_proof(&grant, &receipt, &child_provider)?);
         let execution_context = receipt.execution_context(&child_proof)?;
+        // Adapter-produced context: no bindings, surface or decision context.
+        assert!(execution_context.execution_bindings.is_none() && execution_context.turn_surface.is_none());
+        assert!(execution_context.child_scope.is_some() && execution_context.child_pin.is_some());
+        let mut unscoped = execution_context.clone();
+        unscoped.child_scope = None;
+        // Stale is decided before resolution, approval or any backend entry.
+        for (context, name) in [
+            (execution_context.clone(), HIDDEN_CHILD_CAPABILITY),
+            (unscoped, "file_read"),
+        ] {
+            let outcome = child_service
+                .execution
+                .execute(
+                    crate::tools::ToolExecutionCommand::new(name, serde_json::json!({})),
+                    context,
+                    None,
+                )
+                .await;
+            assert_eq!(outcome.status, ToolExecutionStatus::StaleCapability, "{name}");
+        }
+        // Neither the outside capability nor the in-manifest one reached a backend.
+        assert_eq!(hidden_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(physical_calls.load(Ordering::SeqCst), 0);
         let first = ChildSegmentTurn::admit(
             Arc::clone(&child_service),
             (Arc::clone(&child_proof), execution_context.clone()),

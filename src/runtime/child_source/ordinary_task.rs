@@ -232,7 +232,8 @@ impl OrdinaryTaskSegments {
         envelope.run_id = Some(run);
         envelope.task_id = Some(self.authority.proof.run_id().to_owned());
         envelope.source_message_event_id = proof.source_event_id().map(str::to_owned);
-        let execution = ToolExecutionContext::new(envelope, proof.policy_chat_type());
+        let execution =
+            ToolExecutionContext::new(envelope, proof.policy_chat_type()).with_incoming_child(proof.as_ref())?;
         self.next = following;
         self.previous_input = next_previous;
         Ok((proof, execution))

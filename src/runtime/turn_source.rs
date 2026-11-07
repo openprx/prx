@@ -163,6 +163,10 @@ pub(crate) trait TurnSourceProof: sealed::Sealed + Send + Sync {
     fn child_scope(&self) -> Option<&std::sync::Arc<crate::tools::capability::child::VerifiedChildScope>> {
         None
     }
+    /// Pinned catalog and runtime key for the incoming child scope.
+    fn child_pin(&self) -> Option<&std::sync::Arc<crate::tools::capability::child::ChildDispatchPin>> {
+        None
+    }
     /// Exact source-owned read identity, required from every sealed ingress.
     /// Child issuers must not substitute an inherited parent session here.
     fn source_memory_principal(&self) -> crate::memory::MemoryPrincipal;
@@ -269,6 +273,7 @@ pub(crate) struct OwnedTurnSourceProof {
     intercepts_writes: bool,
     has_conversation_history: bool,
     child_scope: Option<std::sync::Arc<crate::tools::capability::child::VerifiedChildScope>>,
+    child_pin: Option<std::sync::Arc<crate::tools::capability::child::ChildDispatchPin>>,
     workspace_id: String,
     owner_id: String,
     session_key: String,
@@ -364,6 +369,12 @@ impl OwnedTurnSourceProof {
             intercepts_writes: false,
             has_conversation_history: false,
             child_scope: Some(snapshots.scope.clone()),
+            child_pin: Some(crate::tools::capability::child::ChildDispatchPin::for_scope(
+                &snapshots.scope,
+                std::sync::Arc::clone(&snapshots.catalog),
+                parent.owner_id(),
+                parent.workspace_id(),
+            )),
             workspace_id: parent.workspace_id().to_owned(),
             owner_id: parent.owner_id().to_owned(),
             session_key: authority.session_key().to_owned(),
@@ -413,6 +424,7 @@ impl OwnedTurnSourceProof {
             intercepts_writes: false,
             has_conversation_history: false,
             child_scope: None,
+            child_pin: None,
             workspace_id: parent.workspace_id().to_owned(),
             owner_id: parent.owner_id().to_owned(),
             session_key: authority.session_key().to_owned(),
@@ -489,6 +501,12 @@ impl OwnedTurnSourceProof {
             intercepts_writes: false,
             has_conversation_history: false,
             child_scope: Some(grant.scope().clone()),
+            child_pin: Some(crate::tools::capability::child::ChildDispatchPin::for_scope(
+                grant.scope(),
+                std::sync::Arc::clone(grant.catalog()),
+                parent.owner_id(),
+                &event.workspace_id,
+            )),
             workspace_id: event.workspace_id.clone(),
             owner_id: parent.owner_id().to_owned(),
             session_key: event.session_key.clone().context("child session missing")?,
@@ -598,6 +616,10 @@ impl OwnedTurnSourceProof {
                 .ordinary_child_publication
                 .as_ref()
                 .map(|publication| publication.scope().clone()),
+            child_pin: actor
+                .ordinary_child_publication
+                .as_ref()
+                .map(|publication| publication.dispatch_pin(&owner_id, &actor.envelope.workspace_id)),
             workspace_id: actor.envelope.workspace_id.clone(),
             owner_id,
             session_key: scope.session_key.clone().context("ordinary child session missing")?,
@@ -812,6 +834,7 @@ impl OwnedTurnSourceProof {
             intercepts_writes: proof.intercepts_writes(),
             has_conversation_history: proof.has_conversation_history(),
             child_scope: proof.child_scope().cloned(),
+            child_pin: proof.child_pin().cloned(),
             workspace_id: proof.workspace_id().to_owned(),
             owner_id: proof.owner_id().to_owned(),
             session_key: proof.session_key().to_owned(),
@@ -872,6 +895,9 @@ impl TurnSourceProof for OwnedTurnSourceProof {
     }
     fn child_scope(&self) -> Option<&std::sync::Arc<crate::tools::capability::child::VerifiedChildScope>> {
         self.child_scope.as_ref()
+    }
+    fn child_pin(&self) -> Option<&std::sync::Arc<crate::tools::capability::child::ChildDispatchPin>> {
+        self.child_pin.as_ref()
     }
     fn workspace_id(&self) -> &str {
         &self.workspace_id

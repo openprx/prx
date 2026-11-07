@@ -169,6 +169,19 @@ impl OrdinaryChildPublication {
         self.0.source.intercepts_writes()
     }
 
+    pub(crate) fn dispatch_pin(
+        &self,
+        owner: &str,
+        workspace: &str,
+    ) -> Arc<crate::tools::capability::child::ChildDispatchPin> {
+        crate::tools::capability::child::ChildDispatchPin::for_scope(
+            &self.0.scope,
+            Arc::clone(&self.0.service.catalog),
+            owner,
+            workspace,
+        )
+    }
+
     fn capture(
         service: &Arc<TurnDecisionService>,
         context: &Arc<TurnDecisionContext>,
