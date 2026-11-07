@@ -87,34 +87,76 @@ where
     serde_json::Value::deserialize(deserializer).map(Some)
 }
 
-/// The files one multipart request created. They are removed when the guard
-/// drops (a parse error, a refused target, a cancelled request) unless
-/// [`UploadGuard::release`] handed them over. Only paths this request created
-/// are ever removed.
+/// The files one multipart request creates. They are removed when the guard
+/// drops (a parse error, a refused target, a failed admission, a cancelled
+/// request) unless [`UploadGuard::release`] handed them over.
+///
+/// Ownership precedes creation: a path is registered with [`UploadGuard::begin`]
+/// before the file exists. Every path carries a per-request uuid, so it can only
+/// ever name a file this request creates. Creation runs in a blocking worker that
+/// outlives a cancelled future, so the guard also publishes an `abandoned` flag
+/// that the worker checks right after creating the file: whichever of the
+/// worker's create and the guard's drop comes last removes the file.
 #[derive(Default)]
 struct UploadGuard {
     paths: Vec<PathBuf>,
+    abandoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    released: bool,
 }
 
 impl UploadGuard {
-    fn track(&mut self, path: PathBuf) {
+    /// Register `path` for cleanup before it is created, and return the flag
+    /// the creating worker must hand to [`create_upload_file`].
+    fn begin(&mut self, path: PathBuf) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.paths.push(path);
+        std::sync::Arc::clone(&self.abandoned)
     }
 
     /// The request was admitted: the files now belong to the turn.
     fn release(mut self) {
+        self.released = true;
         self.paths.clear();
     }
 }
 
 impl Drop for UploadGuard {
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        // Publish the abandonment before removing, so a worker that creates its
+        // file after the removal below sees the flag and removes it itself.
+        self.abandoned.store(true, std::sync::atomic::Ordering::SeqCst);
         for path in self.paths.drain(..) {
-            if let Err(error) = std::fs::remove_file(&path) {
-                tracing::warn!(error = %error, "Failed to remove an upload of an unadmitted request");
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                // Never created, or already removed by its worker.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "Failed to remove an upload of an unadmitted request");
+                }
             }
         }
     }
+}
+
+/// Exclusively create an upload file. If the owning guard was abandoned
+/// meanwhile (the request was cancelled while this worker was running), the
+/// file is removed again instead of being orphaned.
+fn create_upload_file(path: &StdPath, abandoned: &std::sync::atomic::AtomicBool) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    if abandoned.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %error, "Failed to remove an upload of an abandoned request");
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "upload request was abandoned",
+        ));
+    }
+    Ok(file)
 }
 
 /// A parsed message request. `uploads` are the files already stored for a
@@ -815,15 +857,15 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<P
                 };
                 {
                     use tokio::io::AsyncWriteExt;
-                    let mut file = fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&stored_path)
+                    // Ownership first: the guard knows the path before the
+                    // blocking worker can create it.
+                    let abandoned = uploads.begin(stored_path.clone());
+                    let worker_path = stored_path.clone();
+                    let created = tokio::task::spawn_blocking(move || create_upload_file(&worker_path, &abandoned))
                         .await
+                        .map_err(|error| persist_failed(std::io::Error::other(error)))?
                         .map_err(persist_failed)?;
-                    // The file exists from here on, so the guard owns it even
-                    // if the write below fails.
-                    uploads.track(stored_path.clone());
+                    let mut file = fs::File::from_std(created);
                     file.write_all(&bytes).await.map_err(persist_failed)?;
                     file.flush().await.map_err(persist_failed)?;
                 }
@@ -1411,8 +1453,8 @@ pub async fn post_session_message(
         // the files this request created, and only those.
         Err(refusal) => return refusal,
     };
-    uploads.release();
-
+    // The guard stays alive through admission: a missing session, a failed
+    // history read, closed admission or cancellation removes the files.
     submit_console_message(
         state,
         session_id,
@@ -1421,6 +1463,7 @@ pub async fn post_session_message(
         message,
         async_mode,
         ConsoleTurnMode::Message,
+        uploads,
     )
     .await
 }
@@ -1739,10 +1782,12 @@ pub(super) async fn post_decision_resume(
         message,
         async_mode,
         ConsoleTurnMode::Resume,
+        UploadGuard::default(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // the pinned request, plus the upload guard that rides through admission
 async fn submit_console_message(
     state: AppState,
     session_id: String,
@@ -1751,6 +1796,7 @@ async fn submit_console_message(
     message: String,
     async_mode: bool,
     mode: ConsoleTurnMode,
+    uploads: UploadGuard,
 ) -> Response {
     let SelectedTurn {
         runtime: turn_runtime,
@@ -1871,6 +1917,8 @@ async fn submit_console_message(
         run_console_message_job(turn_runtime, state, message, turns, source, target),
         Some(cleanup_receiver),
     );
+    // The job owns the turn now; hand the uploaded files over with it.
+    uploads.release();
 
     if async_mode {
         return (StatusCode::ACCEPTED, Json(job.accepted_body())).into_response();

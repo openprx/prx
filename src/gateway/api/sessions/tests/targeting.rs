@@ -918,6 +918,8 @@ const BOUNDARY: &str = "prx-test-boundary";
 
 fn multipart_request(body: String) -> Request {
     let mut request = Request::builder()
+        // Async mode answers 202 once the input is admitted, without waiting for the turn.
+        .uri("/?mode=async")
         .header(
             header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={BOUNDARY}"),
@@ -941,15 +943,19 @@ fn file_part(file_name: &str, content: &str) -> String {
     )
 }
 
-async fn post_multipart(fixture: &Fixture, session: &str, body: String) -> StatusCode {
-    post_session_message(
+async fn post_multipart(fixture: &Fixture, session: &str, body: String) -> (StatusCode, String) {
+    let response = post_session_message(
         State(fixture.state.clone()),
         Path(session.to_owned()),
         multipart_request(body),
     )
     .await
-    .into_response()
-    .status()
+    .into_response();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("test: body");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn stored_uploads(fixture: &Fixture) -> Vec<(String, String)> {
@@ -970,23 +976,52 @@ fn stored_uploads(fixture: &Fixture) -> Vec<(String, String)> {
     files
 }
 
+const ADMITTED_SESSION: &str = "prx-admitted-session";
+
+/// Wire the fixture like a running gateway, so a Main request on
+/// `ADMITTED_SESSION` is actually admitted (input recorded, job submitted).
+async fn make_admissible(fixture: &mut Fixture) -> anyhow::Result<()> {
+    let workspace = fixture.state.config.pin().effective.workspace_dir.clone();
+    let envelope = console_runtime_envelope_for_workspace(
+        workspace.to_string_lossy().as_ref(),
+        ADMITTED_SESSION,
+        "console",
+        "prx_user",
+    );
+    let (runtime, _, _, anchor) = console_test_source(&mut fixture.state, envelope, "Admission fixture anchor").await;
+    drop(anchor);
+    let current = Arc::try_unwrap(runtime).map_err(|_| anyhow::anyhow!("fixture runtime unexpectedly shared"))?;
+    fixture.state.turn_runtime = Some(Arc::new(crate::gateway::GatewayTurnRuntimeOwner::new(
+        current,
+        Arc::clone(&fixture.state.config),
+        Arc::clone(&fixture.state.mem),
+        None,
+        None,
+        None,
+        None,
+        Arc::clone(&fixture.state.hooks),
+        #[cfg(feature = "wasm-plugins")]
+        None,
+    )));
+    Ok(())
+}
+
 #[tokio::test]
-async fn refused_target_cleanup_removes_only_its_own_upload() {
+async fn refused_target_cleanup_removes_only_its_own_upload() -> anyhow::Result<()> {
     // The switch is off, so the named request is refused after its file is
-    // stored. A Main request sent the same file name in the same instant (its
-    // session does not exist, so its file stays behind). The refusal must
-    // remove only the file the refused request created.
-    let fixture = fixture(|config| config.gateway.targeted_agents = false).await;
+    // stored. An ADMITTED Main request sent the same file name (its session
+    // exists, so its file now belongs to the turn). The refusal must remove
+    // only the file the refused request created.
+    let mut fixture = fixture(|config| config.gateway.targeted_agents = false).await;
+    make_admissible(&mut fixture).await?;
     let main_body = format!(
         "{}{}--{BOUNDARY}--\r\n",
         text_part("message", "main request"),
         file_part("same.txt", "MAIN-CONTENT")
     );
-    assert_eq!(
-        post_multipart(&fixture, "no-such-session", main_body).await,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(stored_uploads(&fixture).len(), 1, "the Main upload is stored");
+    let (status, reply) = post_multipart(&fixture, ADMITTED_SESSION, main_body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
+    assert_eq!(stored_uploads(&fixture).len(), 1, "the admitted Main upload is stored");
 
     let named_body = format!(
         "{}{}{}--{BOUNDARY}--\r\n",
@@ -994,18 +1029,71 @@ async fn refused_target_cleanup_removes_only_its_own_upload() {
         text_part("agent", "helper"),
         file_part("same.txt", "NAMED-CONTENT")
     );
-    assert_eq!(
-        post_multipart(&fixture, SESSION, named_body).await,
-        StatusCode::CONFLICT
-    );
+    let (status, reply) = post_multipart(&fixture, SESSION, named_body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{reply}");
     let left = stored_uploads(&fixture);
     assert_eq!(left.len(), 1, "only the refused request's file was removed: {left:?}");
     assert_eq!(
         left.first().map(|(_, content)| content.as_str()),
         Some("MAIN-CONTENT"),
-        "the Main request's file is untouched"
+        "the admitted Main request's file is untouched"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_main_admission_removes_its_upload() {
+    // A Main request whose session does not exist fails admission after its
+    // file is stored; the file must not outlive the request.
+    let fixture = fixture(|config| config.gateway.targeted_agents = false).await;
+    let body = format!(
+        "{}{}--{BOUNDARY}--\r\n",
+        text_part("message", "main request"),
+        file_part("gone.txt", "MAIN-CONTENT")
+    );
+    let (status, reply) = post_multipart(&fixture, "no-such-session", body).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{reply}");
+    assert_eq!(stored_uploads(&fixture), Vec::new(), "no upload is left behind");
     assert_untouched(&fixture).await;
+}
+
+#[test]
+fn upload_path_is_owned_before_creation_and_cancellation_leaves_no_file() {
+    use std::sync::atomic::Ordering;
+    let temp = tempfile::tempdir().expect("test: tempdir");
+
+    // Ordering invariant: the guard knows the path while the file does not
+    // exist yet.
+    let early = temp.path().join("early.bin");
+    let mut guard = UploadGuard::default();
+    let abandoned = guard.begin(early.clone());
+    assert!(guard.paths.contains(&early), "the path is registered");
+    assert!(!early.exists(), "before the file exists");
+
+    // Cancellation between registration and creation: the guard drops first,
+    // the blocking worker runs afterwards and must not leave a file.
+    drop(guard);
+    assert!(abandoned.load(Ordering::SeqCst), "the abandonment is published");
+    assert!(create_upload_file(&early, &abandoned).is_err());
+    assert!(!early.exists(), "a worker running after the drop removes its own file");
+
+    // Cancellation after creation: the guard removes the file it registered.
+    let late = temp.path().join("late.bin");
+    let mut guard = UploadGuard::default();
+    let abandoned = guard.begin(late.clone());
+    let file = create_upload_file(&late, &abandoned).expect("test: created");
+    assert!(late.exists());
+    drop(guard);
+    drop(file);
+    assert!(!late.exists(), "the guard removes a created file");
+
+    // A released guard hands the file over.
+    let kept = temp.path().join("kept.bin");
+    let mut guard = UploadGuard::default();
+    let abandoned = guard.begin(kept.clone());
+    drop(create_upload_file(&kept, &abandoned).expect("test: created"));
+    guard.release();
+    assert!(kept.exists(), "a released upload stays");
 }
 
 #[tokio::test]
@@ -1018,8 +1106,8 @@ async fn multipart_parse_error_after_a_file_leaves_no_upload() {
         text_part("message", "hi"),
         file_part("kept.txt", "CONTENT")
     );
-    let status = post_multipart(&fixture, SESSION, body).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, reply) = post_multipart(&fixture, SESSION, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
     assert_eq!(stored_uploads(&fixture), Vec::new(), "no upload is left behind");
     assert_untouched(&fixture).await;
 }
