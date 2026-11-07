@@ -173,6 +173,8 @@ impl VerifiedLaunch {
             parent_digest: &self.fields.parent_decision_digest,
             input: &self.input,
             key: &self.key,
+            journal_version: (self.fields.version >= authority_journal::LAUNCH_PARENT_VERSION)
+                .then_some(authority_journal::JOURNAL_REQUIRED_VERSION),
         }
     }
 }

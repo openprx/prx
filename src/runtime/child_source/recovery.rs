@@ -7,7 +7,7 @@ use crate::agent::terminal::{
 };
 use crate::causal_tree::store::ChildRecoveryLineage;
 use crate::decision::DecisionKey;
-use crate::memory::ingress_recovery::{IngressEventLookup, IngressRecoveryScope, remaining};
+use crate::memory::ingress_recovery::{IngressRecoveryScope, remaining};
 use crate::memory::{Memory, MessageEvent};
 use crate::runtime::turn_cleanup::CleanupTracker;
 use anyhow::Context;
@@ -15,9 +15,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Replays the discovered child's terminal from journal evidence alone. A
-/// missing terminal is `None`; discovery lineage must match the authenticated
-/// terminal and the enumerated decision row.
+/// Replays the discovered child's already-read terminal marker from journal
+/// evidence alone. Discovery lineage must match the authenticated terminal and
+/// the enumerated decision row.
 pub(crate) async fn verify_candidate(
     memory: &dyn Memory,
     workspace: &Path,
@@ -25,20 +25,11 @@ pub(crate) async fn verify_candidate(
     store_workspace: &str,
     scope: &IngressRecoveryScope,
     lineage: &ChildRecoveryLineage,
+    event: &MessageEvent,
     owner: &Arc<CleanupTracker>,
     deadline: Instant,
-) -> anyhow::Result<Option<(MessageEvent, VerifiedTerminalReplay)>> {
+) -> anyhow::Result<VerifiedTerminalReplay> {
     remaining(deadline)?;
-    let Some(event) = memory
-        .read_ingress_event(
-            scope,
-            &IngressEventLookup::OwnedIdempotencyKey(format!("turn:{}:final", lineage.run_id)),
-            deadline,
-        )
-        .await?
-    else {
-        return Ok(None);
-    };
     let replay = verify_terminal_replay_journal_until(
         memory,
         workspace,
@@ -47,7 +38,7 @@ pub(crate) async fn verify_candidate(
         &scope.workspace_id,
         &scope.owner_id,
         &lineage.run_id,
-        &event,
+        event,
         deadline,
         owner,
     )
@@ -74,7 +65,7 @@ pub(crate) async fn verify_candidate(
             && row.decision.session_key.as_deref() == Some(lineage.session_key.as_str()),
         "child discovery decision lineage changed"
     );
-    Ok(Some((event, replay)))
+    Ok(replay)
 }
 
 /// Settles the verified child in the journal. `true` means this call wrote the

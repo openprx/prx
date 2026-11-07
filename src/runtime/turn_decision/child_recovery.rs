@@ -2,7 +2,7 @@
 use super::{
     Arc, BTreeMap, Context, DecisionScope, Enqueue, Instant, OutcomeCorrelator, TerminalFacts, TurnDecisionService,
 };
-use crate::agent::terminal::REPLAY_EVIDENCE_AUTHORITY;
+use crate::agent::terminal::replay_requires_journal;
 use crate::causal_tree::store::{ChildRecoveryCursor, ChildRecoveryLineage};
 use crate::memory::MessageEvent;
 use crate::memory::ingress_recovery::{IngressEventLookup, IngressLifetime, IngressRecoveryScope, remaining};
@@ -19,6 +19,8 @@ pub(super) struct ChildRecoveryState {
 /// Separate bounded scan positions: journal evidence and legacy store rows.
 #[derive(Default)]
 struct RecoveryPositions {
+    /// Which cursor the next call scans; flipped before every scan.
+    next_legacy: bool,
     legacy: Option<ChildRecoveryCursor>,
     journal: Option<EvidenceCursor>,
 }
@@ -130,7 +132,10 @@ impl TurnDecisionService {
             workspace_id: Arc::clone(&store_workspace),
             owner_id: Arc::from(scope.owner_id.as_str()),
         };
-        let page: Vec<(Advance, Option<ChildRecoveryLineage>)> = if REPLAY_EVIDENCE_AUTHORITY {
+        // Flipped before the scan, so a failing scan on one cursor never repeats it.
+        let scan_legacy = position.next_legacy;
+        position.next_legacy = !scan_legacy;
+        let page: Vec<(Advance, Option<ChildRecoveryLineage>)> = if !scan_legacy {
             let (workspace, key) = (
                 self.generation.effective.workspace_dir.clone(),
                 Arc::clone(&self.state_key),
@@ -184,7 +189,9 @@ impl TurnDecisionService {
             }
         };
         if page.is_empty() {
-            position.legacy = None;
+            if scan_legacy {
+                position.legacy = None;
+            }
             report.wrapped = true;
             return Ok(report);
         }
@@ -202,7 +209,7 @@ impl TurnDecisionService {
                 continue;
             };
             let verified = self.verify_child_candidate(scope, &lineage, owner, deadline).await;
-            let (event, replay) = match verified {
+            let (event, replay, journal) = match verified {
                 Ok(Some(value)) => value,
                 Ok(None) => {
                     report.no_final += 1;
@@ -231,7 +238,7 @@ impl TurnDecisionService {
                 return Err(error);
             }
             match self
-                .repair_verified_child(&event, &replay, &store_scope, lifetime, owner, deadline)
+                .repair_verified_child(&event, &replay, journal, &store_scope, lifetime, owner, deadline)
                 .await?
             {
                 Some(true) => report.repaired += 1,
@@ -249,25 +256,8 @@ impl TurnDecisionService {
         lineage: &ChildRecoveryLineage,
         owner: &Arc<CleanupTracker>,
         deadline: Instant,
-    ) -> anyhow::Result<Option<(MessageEvent, crate::agent::terminal::VerifiedTerminalReplay)>> {
+    ) -> anyhow::Result<Option<(MessageEvent, crate::agent::terminal::VerifiedTerminalReplay, bool)>> {
         remaining(deadline)?;
-        if REPLAY_EVIDENCE_AUTHORITY {
-            let store_workspace = self
-                .store
-                .workspace_id()
-                .context("child recovery store scope missing")?;
-            return recovery::verify_candidate(
-                self.memory.as_ref(),
-                &self.generation.effective.workspace_dir,
-                &self.state_key,
-                &store_workspace,
-                scope,
-                lineage,
-                owner,
-                deadline,
-            )
-            .await;
-        }
         let Some(event) = self
             .memory
             .read_ingress_event(
@@ -283,6 +273,21 @@ impl TurnDecisionService {
             .store
             .workspace_id()
             .context("child recovery store scope missing")?;
+        if replay_requires_journal(&self.state_key, &event, None)? {
+            let replay = recovery::verify_candidate(
+                self.memory.as_ref(),
+                &self.generation.effective.workspace_dir,
+                &self.state_key,
+                &store_workspace,
+                scope,
+                lineage,
+                &event,
+                owner,
+                deadline,
+            )
+            .await?;
+            return Ok(Some((event, replay, true)));
+        }
         let replay = crate::agent::terminal::verify_terminal_replay_until(
             self.memory.as_ref(),
             &self.store.reader(),
@@ -296,6 +301,10 @@ impl TurnDecisionService {
             owner,
         )
         .await?;
+        anyhow::ensure!(
+            replay.source().source != crate::memory::MessageEventSource::SessionWorker,
+            "worker segment requires launch provenance for legacy selection"
+        );
         anyhow::ensure!(
             replay.source().event_id == lineage.source_event_id
                 && replay.source().run_id.as_deref() == Some(lineage.run_id.as_str())
@@ -321,13 +330,14 @@ impl TurnDecisionService {
                 && row.decision.session_key.as_deref() == Some(lineage.session_key.as_str()),
             "child discovery decision lineage changed"
         );
-        Ok(Some((event, replay)))
+        Ok(Some((event, replay, false)))
     }
 
     async fn repair_verified_child(
         &self,
         event: &MessageEvent,
         replay: &crate::agent::terminal::VerifiedTerminalReplay,
+        journal: bool,
         scope: &DecisionScope,
         lifetime: &Arc<dyn IngressLifetime>,
         owner: &Arc<CleanupTracker>,
@@ -342,7 +352,7 @@ impl TurnDecisionService {
         if remaining(deadline).is_err() || lifetime.validate(deadline).await.is_err() {
             return Ok(None);
         }
-        if REPLAY_EVIDENCE_AUTHORITY {
+        if journal {
             // Journal-required children are settled from independent evidence
             // only. No projection write, drain or store readback takes part.
             let written = recovery::settle(

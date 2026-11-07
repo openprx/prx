@@ -393,6 +393,38 @@ async fn batch_child_completion_settles_after_restart_through_completion_port() 
         before.len() == 1 && before[0].0 == child.expected.run && before[0].1 == child.expected.settlement,
         "test: completion must leave exactly one settled child outcome row: {before:?}"
     );
+    // r10 delta: the first observation after the WorkerResult runs with no decision store.
+    let store_db = quarantine_decision_store(&child.workspace)?;
+    let source = manifest.child_source.as_ref().context("test: child source")?;
+    let owner = manifest.owner_id.clone().context("test: owner")?;
+    let evidence = result
+        .completion_evidence
+        .as_ref()
+        .context("test: completion evidence")?;
+    let [segment] = evidence.segments.as_slice() else {
+        anyhow::bail!("test: expected one completed segment");
+    };
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(child.workspace.as_path())?);
+    let fabric = MemoryFabric::new(
+        memory,
+        manifest.memory_workspace_id.clone().context("test: memory workspace")?,
+    );
+    let terminal = fabric
+        .memory()
+        .find_message_event_by_idempotency_key(fabric.workspace_id(), &format!("turn:{}:final", segment.terminal_id))
+        .await?
+        .context("test: segment terminal marker")?;
+    crate::agent::terminal::verify_terminal_replay_journal(
+        fabric.memory().as_ref(),
+        &child.workspace,
+        &child.key,
+        &source.parent_store_workspace,
+        fabric.workspace_id(),
+        &owner,
+        &segment.terminal_id,
+        &terminal,
+    )
+    .await?;
     anyhow::ensure!(
         authority_journal::verify_child_outcome(
             &child.workspace,
@@ -405,6 +437,10 @@ async fn batch_child_completion_settles_after_restart_through_completion_port() 
     anyhow::ensure!(
         child_outcome_rows(&child.workspace)? == before,
         "test: the normal reader changed the child outcome journal"
+    );
+    anyhow::ensure!(
+        !store_db.exists(),
+        "test: the journal-only observation must not recreate the decision store"
     );
     Ok(())
 }
@@ -972,6 +1008,50 @@ fn owner_evidence(db: &rusqlite::Connection, store_workspace: &str, owner: &str)
     Ok(rows)
 }
 
+/// Reads a discovered child's terminal marker once, as discovery does, and replays it from journal evidence.
+async fn replay_candidate(
+    memory: &dyn Memory,
+    workspace: &std::path::Path,
+    key: &Arc<crate::decision::DecisionKey>,
+    store_workspace: &str,
+    scope: &crate::memory::ingress_recovery::IngressRecoveryScope,
+    lineage: &crate::causal_tree::store::ChildRecoveryLineage,
+    tracker: &Arc<crate::runtime::turn_cleanup::CleanupTracker>,
+    deadline: std::time::Instant,
+) -> Result<
+    Option<(
+        crate::memory::MessageEvent,
+        crate::agent::terminal::VerifiedTerminalReplay,
+    )>,
+> {
+    let Some(event) = memory
+        .read_ingress_event(
+            scope,
+            &crate::memory::ingress_recovery::IngressEventLookup::OwnedIdempotencyKey(format!(
+                "turn:{}:final",
+                lineage.run_id
+            )),
+            deadline,
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let replay = crate::runtime::child_source::recovery::verify_candidate(
+        memory,
+        workspace,
+        key,
+        store_workspace,
+        scope,
+        lineage,
+        &event,
+        tracker,
+        deadline,
+    )
+    .await?;
+    Ok(Some((event, replay)))
+}
+
 #[tokio::test]
 async fn child_recovery_journal_cursor_wraps() -> Result<()> {
     use crate::causal_tree::ids::DecisionId;
@@ -1109,7 +1189,7 @@ async fn child_recovery_journal_cursor_wraps() -> Result<()> {
         let Some(lineage) = candidate.lineage.as_ref() else {
             continue;
         };
-        let Some((event, replay)) = recovery::verify_candidate(
+        let Some((event, replay)) = replay_candidate(
             fabric.memory().as_ref(),
             &workspace,
             &key,
@@ -1161,7 +1241,7 @@ async fn child_recovery_journal_cursor_wraps() -> Result<()> {
             .filter_map(|candidate| candidate.lineage.as_ref())
             .find(|lineage| lineage.run_id == expected.run)
             .context("test: the child's own evidence row")?;
-        recovery::verify_candidate(
+        replay_candidate(
             fabric.memory().as_ref(),
             &workspace,
             &key,
@@ -1178,6 +1258,97 @@ async fn child_recovery_journal_cursor_wraps() -> Result<()> {
         !recovery::settle(&workspace, &key, &store_arc, &replay, &event, &tracker, deadline).await?
             && child_outcome_rows(&workspace)? == rows,
         "test: a settled child must not be rewritten"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_worker_child_replays_with_parent_evidence() -> Result<()> {
+    use crate::agent::terminal::{replay_requires_journal, reseal_payload_for_test, verify_terminal_replay_journal};
+    use crate::causal_tree::store::{CausalDecisionStore, DecisionReplayRecord};
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().to_path_buf();
+    let terminal_id = crate::tools::delegate::tests::retained_delegation_fixture(&workspace).await?;
+    let store_workspace = CausalDecisionStore::open_unshared_read_only(&workspace)
+        .workspace_id()
+        .context("test: store namespace")?
+        .to_string();
+    let store_db = quarantine_decision_store(&workspace)?;
+
+    // Reopen memory, fabric and key; only the journals remain.
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.as_path())?);
+    let fabric = MemoryFabric::new(memory, workspace.to_string_lossy().into_owned());
+    let key = crate::decision::DecisionKey::load_existing(&workspace)?;
+    let marker = fabric
+        .memory()
+        .find_message_event_by_idempotency_key(fabric.workspace_id(), &format!("turn:{terminal_id}:final"))
+        .await?
+        .context("test: delegate terminal marker")?;
+    let owner = marker.owner_id.clone().context("test: terminal owner")?;
+
+    anyhow::ensure!(
+        replay_requires_journal(&key, &marker, None)?,
+        "non-worker v3 terminal did not select journal authority"
+    );
+    let replay = verify_terminal_replay_journal(
+        fabric.memory().as_ref(),
+        &workspace,
+        &key,
+        &store_workspace,
+        fabric.workspace_id(),
+        &owner,
+        &terminal_id,
+        &marker,
+    )
+    .await?;
+    let parent = replay
+        .parent_decision_id()
+        .context("test: delegated child has a parent")?;
+    let parent_columns =
+        authority_journal::read_decision_evidence(&workspace, &store_workspace, &owner, &parent.to_string(), &key)?
+            .context("test: parent decision_evidence row")?;
+    anyhow::ensure!(
+        replay.parent_digest()
+            == Some(
+                DecisionReplayRecord::from_evidence_columns(&parent_columns)?
+                    .digest
+                    .as_str()
+            ),
+        "test: the replayed parent digest differs from its decision_evidence row"
+    );
+    anyhow::ensure!(
+        authority_journal::read_launch_parent(&workspace, &terminal_id, &key)?.is_none(),
+        "test: a non-worker child has no launch parent row"
+    );
+    anyhow::ensure!(!store_db.exists(), "test: the decision store must stay absent");
+
+    // Controls: without the signed field the marker is legacy, and a flipped MAC is refused.
+    let mut payload: serde_json::Value =
+        serde_json::from_str(marker.raw_payload_json.as_deref().context("test: payload")?)?;
+    payload
+        .get_mut("terminal_replay_v1")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("test: replay binding")?
+        .remove("journal_version");
+    reseal_payload_for_test(&key, &mut payload, replay.assistant())?;
+    let mut legacy = marker.clone();
+    legacy.raw_payload_json = Some(serde_json::to_string(&payload)?);
+    anyhow::ensure!(
+        !replay_requires_journal(&key, &legacy, None)?,
+        "test: a marker without the journal field must select the store"
+    );
+    let mut forged = marker.clone();
+    let mut payload: serde_json::Value =
+        serde_json::from_str(marker.raw_payload_json.as_deref().context("test: payload")?)?;
+    let mac = payload.get_mut("terminal_replay_mac_v1").context("test: replay MAC")?;
+    let flipped = mac.as_str().context("test: MAC text")?.replacen(['0', '1'], "f", 1);
+    anyhow::ensure!(Some(flipped.as_str()) != mac.as_str(), "test: the MAC must change");
+    *mac = serde_json::Value::String(flipped);
+    forged.raw_payload_json = Some(serde_json::to_string(&payload)?);
+    anyhow::ensure!(
+        replay_requires_journal(&key, &forged, None).is_err(),
+        "test: a flipped MAC byte must be refused"
     );
     Ok(())
 }

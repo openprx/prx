@@ -3,9 +3,9 @@ pub(in crate::tools::sessions_spawn) mod launch;
 mod segments;
 use super::{
     CausalDecisionStore, ConfirmedProcessRepair, Context, Digest, MemoryFabric, MessageEvent, MessageEventSource,
-    MessageEventSubject, REPLAY_EVIDENCE_AUTHORITY, RecoveredProcessOutcome, RecoveredProcessRun, RecoveredWorkerUsage,
-    Sha256, TurnTerminalStatus, WorkerResult, authority_journal, read_terminal, verify_terminal_replay,
-    verify_terminal_replay_journal,
+    MessageEventSubject, RecoveredProcessOutcome, RecoveredProcessRun, RecoveredWorkerUsage, Sha256,
+    TurnTerminalStatus, WorkerResult, authority_journal, read_terminal, replay_requires_journal,
+    verify_terminal_replay, verify_terminal_replay_journal,
 };
 use crate::agent::terminal::authenticated_replay_store_workspace;
 use crate::runtime::child_source::completion::ChildOutcomeHook;
@@ -477,9 +477,10 @@ async fn verify_segment_replay(
     {
         let workspace = std::path::Path::new(fabric.workspace_id());
         let decision_key = crate::decision::DecisionKey::load_existing(workspace)?;
-        let store = (!REPLAY_EVIDENCE_AUTHORITY).then(|| CausalDecisionStore::open_unshared_read_only(workspace));
+        let journal = replay_requires_journal(&decision_key, event, None)?;
+        let store = (!journal).then(|| CausalDecisionStore::open_unshared_read_only(workspace));
         let reader = store.as_ref().map(|store| store.reader());
-        let store_workspace: std::sync::Arc<str> = if REPLAY_EVIDENCE_AUTHORITY {
+        let store_workspace: std::sync::Arc<str> = if journal {
             std::sync::Arc::from(authenticated_replay_store_workspace(&decision_key, event)?)
         } else {
             store
@@ -488,7 +489,7 @@ async fn verify_segment_replay(
                 .context("operator decision store namespace missing")?
         };
         let memory = fabric.memory();
-        let replay = if REPLAY_EVIDENCE_AUTHORITY {
+        let replay = if journal {
             verify_terminal_replay_journal(
                 memory.as_ref(),
                 workspace,
@@ -531,7 +532,7 @@ async fn verify_segment_replay(
             std::sync::Arc::clone(&store_workspace),
         );
         hook.persist(&replay, event, None, None).await?;
-        if REPLAY_EVIDENCE_AUTHORITY {
+        if journal {
             anyhow::ensure!(
                 authority_journal::verify_child_outcome(
                     workspace,

@@ -1924,7 +1924,7 @@ mod task_boundary_tests {
 
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::memory::{MemoryPrincipal, SqliteMemory};
     use crate::providers::{ChatRequest, ChatResponse, ToolCall};
@@ -2925,6 +2925,83 @@ mod tests {
                 .await
             })
             .await
+    }
+
+    /// Runs the one native-tool delegation of
+    /// `agentic_mode_accepts_and_executes_one_explicit_dynamic_alias` against a
+    /// caller-owned workspace, so it survives for close, quarantine and reopen.
+    /// Returns the in-process child's segment terminal id.
+    pub(crate) async fn retained_delegation_fixture(workspace: &std::path::Path) -> anyhow::Result<String> {
+        use anyhow::Context as _;
+        let retained = tempfile::tempdir()?;
+        let driver = crate::agent::agent::native_decision_fixture::Driver::start_delegation("native_tool")
+            .await?
+            .retain_evidence_at(retained.path().to_path_buf());
+        let endpoint = driver.endpoint().to_owned();
+        let owned = workspace.to_path_buf();
+        let (result, _) = driver
+            .run_factory(true, move || async move {
+                let cleanup =
+                    crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())?;
+                let mut observed = None;
+                cleanup
+                    .run(boxed_delegate_observation(|| async {
+                        observed = Some(
+                            CONFIGURED_DELEGATE_ENDPOINT
+                                .scope(
+                                    endpoint,
+                                    boxed_delegate_observation(|| {
+                                        run_admitted_delegate_fixture(
+                                            owned,
+                                            vec!["dynamic_alias".to_owned()],
+                                            vec![Arc::new(DynamicAliasTool)],
+                                            "dynamic_alias",
+                                            json!({}),
+                                            None,
+                                            false,
+                                            None,
+                                        )
+                                    }),
+                                )
+                                .await,
+                        );
+                        Ok(())
+                    }))
+                    .await
+                    .map_err(|error| anyhow::anyhow!("delegate fixture writers did not drain: {error:?}"))?;
+                observed.context("delegate fixture did not run")
+            })
+            .await?;
+        anyhow::ensure!(result.success, "delegate fixture child failed: {:?}", result.error);
+        let workspace_id = workspace.to_string_lossy();
+        let memory = SqliteMemory::new(workspace)?;
+        let mut owners: Vec<String> = crate::memory::sqlite::fixture_readback::terminal_rows(workspace)?
+            .into_iter()
+            .filter_map(|row| row.owner_id)
+            .collect();
+        owners.sort();
+        owners.dedup();
+        let mut terminals = Vec::new();
+        for owner in &owners {
+            for event in memory
+                .list_owned_message_events_by_type(&workspace_id, owner, "turn.finalized", 0, 100)
+                .await?
+            {
+                if event.source == crate::memory::MessageEventSource::Delegate
+                    && let Some(id) = event
+                        .idempotency_key
+                        .as_deref()
+                        .and_then(|key| key.strip_prefix("turn:"))
+                        .and_then(|key| key.strip_suffix(":final"))
+                {
+                    terminals.push(id.to_owned());
+                }
+            }
+        }
+        match terminals.as_slice() {
+            [terminal] => Ok(terminal.clone()),
+            other => anyhow::bail!("expected one delegate terminal, found {}", other.len()),
+        }
     }
 
     async fn observe_owned_delegate_workspace<T, F, Fut>(work: F) -> T
