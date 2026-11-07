@@ -570,6 +570,7 @@ async fn run(env: &Env, autonomy: AutonomyLevel, case: Case) {
                 tool_name: "skills_manage",
                 arguments: &spec.arguments,
                 cleanup_confirmed: &cleanup_confirmed,
+                store_stalled: false,
             }))
             .await;
         }
@@ -1224,6 +1225,7 @@ async fn production_unnamed_reviewed_import_collects_with_competing_retrieval_to
             tool_name: "skills_manage",
             arguments: &arguments,
             cleanup_confirmed: &cleanup,
+            store_stalled: false,
         }))
         .await;
         assert!(cleanup.load(Ordering::SeqCst));

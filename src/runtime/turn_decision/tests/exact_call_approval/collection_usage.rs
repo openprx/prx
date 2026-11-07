@@ -19,6 +19,8 @@ pub(super) struct Fixture<'a> {
     pub tool_name: &'a str,
     pub arguments: &'a serde_json::Value,
     pub cleanup_confirmed: &'a AtomicBool,
+    /// The decision store cannot commit during this run, so only journal-backed checks may follow the receipt.
+    pub store_stalled: bool,
 }
 
 struct ReportedApprovalProvider<'a> {
@@ -246,6 +248,9 @@ async fn exercise_owned(f: &Fixture<'_>) {
         serde_json::from_str(usage_event.raw_payload_json.as_deref().unwrap()).unwrap();
     assert_eq!(&persisted, usage);
     assert_eq!(persisted.settlement_id.as_deref(), Some(receipt.terminal_id.as_str()));
+    if f.store_stalled {
+        return;
+    }
     let replay = crate::agent::terminal::verify_terminal_replay(
         f.memory.as_ref(),
         &f.service.store.reader(),

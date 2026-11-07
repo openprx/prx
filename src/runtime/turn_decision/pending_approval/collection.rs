@@ -221,20 +221,16 @@ impl ApprovalCollectionLease {
             &operation,
             risk,
         )?;
-        let decision_scope = crate::causal_tree::store::DecisionScope::Owner {
-            workspace_id: self.service.store.workspace_id().context("approval store missing")?,
-            owner_id: Arc::from(self.source.owner_id()),
-        };
-        let mut decision_digests = Vec::with_capacity(self.context.hop_ids().len());
-        for id in self.context.hop_ids() {
-            let row = self
-                .service
-                .store
-                .reader()
-                .replay_record(&decision_scope, id)?
-                .context("approval decision is not durable")?;
-            decision_digests.push((id.to_string(), row.digest));
-        }
+        let store_workspace = self.service.store.workspace_id().context("approval store missing")?;
+        let decision_digests = self
+            .service
+            .journal_decision_digests(
+                &store_workspace,
+                self.source.owner_id(),
+                self.context.hop_ids(),
+                "approval decision is not durable",
+            )
+            .await?;
         let channel = source.channel.as_deref().context("approval channel missing")?;
         let sender = source.sender.as_deref().context("approval sender missing")?;
         let principal = crate::memory::principal::OwnerPrincipal::new(

@@ -6,7 +6,6 @@ mod sealed_call;
 use super::{TurnDecisionContext, TurnDecisionService, TurnExecutionDirective};
 use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject, WitnessKeyring};
 use crate::causal_tree::ids::DecisionId;
-use crate::causal_tree::store::DecisionScope;
 use crate::decision::KeyDomain;
 use crate::memory::MessageEvent;
 use crate::runtime::turn_source::TurnSourceProof;
@@ -146,19 +145,14 @@ impl TurnDecisionService {
             "pending approval source differs from admitted input"
         );
         let store_workspace = self.store.workspace_id().context("approval decision store missing")?;
-        let decision_scope = DecisionScope::Owner {
-            workspace_id: Arc::clone(&store_workspace),
-            owner_id: Arc::from(proof.owner_id()),
-        };
-        let mut decision_digests = Vec::with_capacity(context.hop_ids().len());
-        for id in context.hop_ids() {
-            let row = self
-                .store
-                .reader()
-                .replay_record(&decision_scope, id)?
-                .context("pending approval decision is not durable")?;
-            decision_digests.push((id.to_string(), row.digest));
-        }
+        let decision_digests = self
+            .journal_decision_digests(
+                &store_workspace,
+                proof.owner_id(),
+                context.hop_ids(),
+                "pending approval decision is not durable",
+            )
+            .await?;
         let principal = crate::memory::principal::OwnerPrincipal::new(
             proof.workspace_id(),
             proof.policy_channel(),
@@ -501,19 +495,15 @@ impl TurnDecisionService {
             );
             return Ok(None);
         }
-        let decision_scope = DecisionScope::Owner {
-            workspace_id: self.store.workspace_id().context("approval store missing")?,
-            owner_id: Arc::from(owner),
-        };
-        let mut decision_digests = Vec::with_capacity(context.hop_ids().len());
-        for id in context.hop_ids() {
-            let row = self
-                .store
-                .reader()
-                .replay_record(&decision_scope, id)?
-                .context("approval decision is not durable")?;
-            decision_digests.push((id.to_string(), row.digest));
-        }
+        let store_workspace = self.store.workspace_id().context("approval store missing")?;
+        let decision_digests = self
+            .journal_decision_digests(
+                &store_workspace,
+                owner,
+                context.hop_ids(),
+                "approval decision is not durable",
+            )
+            .await?;
         let channel = scope.channel.as_deref().context("approval channel missing")?;
         let sender = scope.sender.as_deref().context("approval sender missing")?;
         let principal = crate::memory::principal::OwnerPrincipal::new(
@@ -1195,6 +1185,35 @@ impl AdmittedDecisionResume {
                 .collect(),
             causation: Arc::from(self.receipt.event_id.as_str()),
         })
+    }
+}
+
+impl TurnDecisionService {
+    /// Chain digests of recorded decisions, read from the authority journal.
+    /// The async decision store is a projection and may lag the journal, so it
+    /// is never consulted. A missing journal row is a refusal.
+    pub(super) async fn journal_decision_digests(
+        &self,
+        store_workspace: &str,
+        owner: &str,
+        ids: &[DecisionId],
+        missing: &'static str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let workspace = &self.generation.effective.workspace_dir;
+        let mut digests = Vec::with_capacity(ids.len());
+        for id in ids {
+            let row = crate::agent::terminal::read_journal_replay_record(
+                workspace,
+                &self.state_key,
+                store_workspace,
+                owner,
+                id,
+            )
+            .await?
+            .context(missing)?;
+            digests.push((id.to_string(), row.digest));
+        }
+        Ok(digests)
     }
 }
 

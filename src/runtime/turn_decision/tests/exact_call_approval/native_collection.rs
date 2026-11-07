@@ -12,7 +12,19 @@ async fn supervised_http_collects_exact_arguments_without_bypassing_ssrf() {
     native_collection(true).await;
 }
 
+/// The decision store is a lagging projection. With its writer held behind a
+/// lock that never releases during the turn, the collection must still record
+/// its durable approval, because the chain digests come from the journal.
+#[tokio::test]
+async fn approval_collection_reads_journal_not_store_queue() {
+    native_collection_with(false, true).await;
+}
+
 async fn native_collection(http: bool) {
+    native_collection_with(http, false).await;
+}
+
+async fn native_collection_with(http: bool, stalled_store: bool) {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().unwrap();
     let tool_name = if http { "http_request" } else { "shell" };
@@ -94,6 +106,13 @@ async fn native_collection(http: bool) {
     .await
     .unwrap();
 
+    let store_lock = stalled_store.then(|| {
+        let conn = rusqlite::Connection::open(crate::causal_tree::store::db_path(workspace.path()))
+            .expect("test: open decision store");
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .expect("test: hold the store writer");
+        conn
+    });
     let cancel = CancellationToken::new();
     let arguments = if http {
         serde_json::json!({"url":"http://127.0.0.1:1/blocked", "method":"POST", "body":"reviewed", "headers":{"X-PRX-Test":"reviewed"}})
@@ -127,12 +146,26 @@ async fn native_collection(http: bool) {
         tool_name,
         arguments: &arguments,
         cleanup_confirmed: &cleanup,
+        store_stalled: stalled_store,
     }))
     .await;
     assert!(cleanup.load(Ordering::SeqCst));
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
     assert!(!workspace.path().join("prx-approved.txt").exists());
     let (owner, session, id) = (proof.owner_id(), proof.session_key(), context.decision_id());
+    if let Some(conn) = store_lock {
+        let pending_key = format!("decision-approval:{id}:pending");
+        assert!(
+            memory
+                .find_message_event_by_idempotency_key(proof.workspace_id(), &pending_key)
+                .await
+                .unwrap()
+                .is_some(),
+            "the approval was recorded while the decision store could not commit"
+        );
+        conn.execute_batch("ROLLBACK").expect("test: release the store writer");
+        return;
+    }
     let pending = service
         .load_pending_decision_approval(owner, session, id)
         .await
