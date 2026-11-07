@@ -1205,4 +1205,164 @@ async fn supervised_without_exact_approval_cannot_issue_parent_delegate_grant() 
     parent_effect_policy_case(crate::security::AutonomyLevel::Supervised).await
 }
 
+/// Runs a real Full-policy parent decision under a logical clock with a 50 ms
+/// latency budget, then verifies its durable chain while `advance` of logical
+/// time elapses during the readback (after the verifier captured its deadline).
+async fn durability_readback_case(advance: Duration) -> anyhow::Result<Result<(), String>> {
+    let clock = crate::causal_tree::logical_clock::ManualClock::new();
+    crate::causal_tree::logical_clock::scope(Arc::clone(&clock), durability_readback_body(clock, advance)).await
+}
+
+async fn durability_readback_body(
+    clock: Arc<crate::causal_tree::logical_clock::ManualClock>,
+    advance: Duration,
+) -> anyhow::Result<Result<(), String>> {
+    let scratch = tempfile::tempdir()?;
+    let owned_runs = Arc::new(tokio::sync::RwLock::new(Vec::<SubAgentRun>::new()));
+    let workspace = scratch.path().join("logical");
+    let config_dir = scratch.path().join("config");
+    let workers = scratch.path().join("workers");
+    for path in [&workspace, &config_dir, &workers] {
+        std::fs::create_dir_all(path)?;
+    }
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.clone();
+    config.config_path = config_dir.join("config.toml");
+    config.default_provider = Some("ollama".into());
+    config.default_model = Some("prx-local-model".into());
+    config.memory.backend = "sqlite".into();
+    config.causal_tree.enabled = true;
+    config.causal_tree.policy.extra_latency_budget_ms = 50;
+    config.causal_tree.policy.extra_latency_budget_ms_explicit = true;
+    config.autonomy.level = crate::security::AutonomyLevel::Full;
+    config.sessions_spawn.default_mode = "process".into();
+    config.sessions_spawn.process_memory_strategy = "isolated_private".into();
+    config.sessions_spawn.worker_workspace_root = Some(workers.to_string_lossy().into_owned());
+    config.sessions_spawn.cleanup_on_complete = false;
+    config.providers.models.push(toml::from_str(
+        "provider='ollama'\nmodel='prx-local-model'\noperations=['chat']\nnative_tools=true\n",
+    )?);
+    std::fs::write(&config.config_path, toml::to_string(&config)?)?;
+    let generation = crate::config::new_shared(config.clone()).pin();
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &workspace));
+    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(&workspace)?);
+    let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy())
+        .with_event_recording(config.memory.event_recording_config());
+    let spawn = SessionsSpawnTool::new_with_registry(
+        Arc::new(NoAnnouncements),
+        "ollama",
+        "prx-local-model",
+        0.0,
+        Arc::clone(&security),
+        workspace.clone(),
+        config.multimodal.clone(),
+        Default::default(),
+        None,
+        crate::providers::ProviderRuntimeOptions::default(),
+        config.sessions_spawn.clone(),
+        Arc::clone(&owned_runs),
+    )
+    .with_test_parent_provider(Arc::new(NoTransport))
+    .with_hint_config(&config)
+    .with_model_catalog(crate::providers::selection::catalog_for(&config))
+    .with_shared_memory(Arc::clone(&memory))
+    .with_source_fabric(fabric)
+    .with_event_recording(config.memory.event_recording_config());
+    let tools_handle = spawn.tools_handle();
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(spawn)]);
+    anyhow::ensure!(tools_handle.set(&registry), "tools handle already bound");
+    let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
+        Arc::clone(&registry),
+        Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+        Arc::new(DenyApprovalStrategy),
+        Arc::new(AdapterOwnedPreparation),
+        Arc::new(TracingToolExecutionAudit),
+    ));
+    let catalog = ProviderCatalogView::from_config(&config);
+    let transports = CountingTransports(AtomicUsize::new(0));
+    let mut service = build_turn_decision_service(
+        TurnSurfaceKind::AgentLoop,
+        TurnServiceBuild {
+            parent_grant: None,
+            generation: Arc::clone(&generation),
+            registry,
+            execution,
+            catalog_sources: sources(&generation, &config),
+            surface_policy: SurfacePolicy {
+                direct_names: BTreeSet::from(["sessions_spawn".into()]),
+                ..SurfacePolicy::default()
+            },
+            provider_catalog: &catalog,
+            transports: &transports,
+            events: Arc::new(SilentEvents),
+            memory: Arc::clone(&memory),
+            security,
+        },
+    )
+    .await?;
+    let owning = Arc::get_mut(&mut service).context("unshared parent service")?;
+    owning.factory = DecisionBackendFactory::from_slots(
+        vec![Box::new(ParentDelegateBackend {
+            identity: BackendIdentity {
+                kind: BackendKind::Mock,
+                provider: None,
+                configured_model: Arc::from("prx-local-model"),
+            },
+        })],
+        Arc::clone(&owning.state_key),
+        OutboundSecrets::default(),
+        SlotLimits::default(),
+    );
+    let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
+        &generation,
+        Arc::clone(&memory),
+        "sessions_spawn: Describe the project.",
+        "prx_durability_readback",
+    )
+    .await;
+    let cancellation = CancellationToken::new();
+    let context = service
+        .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
+        .await?;
+    anyhow::ensure!(
+        matches!(context.directive(), TurnExecutionDirective::Delegate { .. }),
+        "fixture must select a delegation"
+    );
+    anyhow::ensure!(
+        context.record_admitted.load(Ordering::Acquire),
+        "parent chain was not queued"
+    );
+    // The verifier captures its deadline on entry. The clock advances while
+    // its readback is pending: `join!` polls the verifier first, so the
+    // advance lands after the readback has started and before its reply.
+    let stall = async { clock.advance(advance) };
+    let (verified, ()) = tokio::join!(service.validate_delegation_storage(Arc::clone(&context)), stall);
+    service.shutdown(Instant::now() + Duration::from_secs(2)).await;
+    Ok(verified.map_err(|error| format!("{error:#}")))
+}
+
+#[tokio::test]
+async fn delegation_durability_survives_latency_budget_stall() -> anyhow::Result<()> {
+    // 200 ms of logical time exceeds the 50 ms decision budget but not the 5 s bound.
+    let verified = durability_readback_case(Duration::from_millis(200)).await?;
+    anyhow::ensure!(
+        verified.is_ok(),
+        "valid delegation failed durability verification under a stall: {verified:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn delegation_durability_still_times_out() -> anyhow::Result<()> {
+    // 6 s of logical time exceeds the 5 s durability bound: the readback must fail closed.
+    match durability_readback_case(Duration::from_secs(6)).await? {
+        Ok(()) => anyhow::bail!("delegation passed durability verification past its own deadline"),
+        Err(message) => anyhow::ensure!(
+            message.contains("decision recovery read deadline elapsed"),
+            "unexpected durability failure: {message}"
+        ),
+    }
+    Ok(())
+}
+
 mod g8_segment;

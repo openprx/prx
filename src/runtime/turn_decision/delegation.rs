@@ -1,10 +1,15 @@
 //! Construct outgoing authority from exact mentions or admitted discoveries.
 use super::{
     Arc, BTreeSet, CapabilityAvailabilityLevel, CapabilityRef, CatalogView, CausalState, ChildExecutionPolicy, Context,
-    DecisionId, DiscoveredRefs, Exposure, Instant, Ordering, TurnDecisionContext, TurnDecisionService,
-    TurnExecutionDirective, TurnSourceProof, TurnSurfaceKind,
+    DecisionId, DiscoveredRefs, Exposure, Ordering, TurnDecisionContext, TurnDecisionService, TurnExecutionDirective,
+    TurnSourceProof, TurnSurfaceKind,
 };
 use crate::tools::capability::child::{AuthorityEnvelope, CapabilityConstraints};
+use std::time::Duration;
+
+/// Durability verification is a correctness gate with its own bound. It must
+/// not share the decision latency budget (`extra_latency_budget_ms`).
+const DELEGATION_DURABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) struct OutgoingDelegation {
     pub parent: CapabilityConstraints,
@@ -56,9 +61,11 @@ impl TurnDecisionService {
     /// Children may read the parent immediately, including in another process.
     /// Queue admission alone cannot authorize that launch.
     pub(super) async fn validate_delegation_storage(&self, context: Arc<TurnDecisionContext>) -> anyhow::Result<()> {
-        let deadline = context.engine.deadline;
+        let deadline = crate::causal_tree::logical_clock::now()
+            .checked_add(DELEGATION_DURABILITY_TIMEOUT)
+            .context("delegation durability deadline cannot be represented")?;
         anyhow::ensure!(
-            Instant::now() < deadline,
+            crate::causal_tree::logical_clock::now() < deadline,
             "delegation persistence exceeded the decision deadline"
         );
         // Preserve the issued-context authority checks before reading storage.
@@ -96,7 +103,7 @@ impl TurnDecisionService {
             );
         }
         anyhow::ensure!(
-            Instant::now() < deadline,
+            crate::causal_tree::logical_clock::now() < deadline,
             "delegation readback exceeded the decision deadline"
         );
         Ok(())
