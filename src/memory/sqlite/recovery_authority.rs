@@ -7,7 +7,19 @@ use crate::memory::recovery_authority::{
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::ValueRef};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+
+/// Number of stripes in the fixed per-key gate set.
+pub(in crate::memory::sqlite) const RECOVERY_KEY_GATES: usize = 16;
+
+/// Stripe for a key id. Equal ids always share a stripe, so per-id serialization
+/// holds; distinct ids may share one, which only adds harmless waiting.
+fn recovery_key_gate_index(id: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    // The remainder is below RECOVERY_KEY_GATES, so the cast cannot truncate.
+    (hasher.finish() % RECOVERY_KEY_GATES as u64) as usize
+}
 
 const MAX_SERIALIZED_FACTS: usize = 262_144;
 // Six identity/event-id strings of at most 1024 bytes expand by at most 6x.
@@ -248,8 +260,11 @@ impl SqliteMemory {
     /// Check, load and failure publication for one key id are serialized, so a
     /// queued caller never reloads a key after its failure was recorded.
     fn capsule_key(&self, id: &str) -> anyhow::Result<ring::hmac::Key> {
-        let gate = Arc::clone(self.recovery_key_gates.lock().entry(id.to_owned()).or_default());
-        let _serial = gate.lock();
+        // The index is always below the fixed length; a miss cannot occur.
+        let _serial = self
+            .recovery_key_gates
+            .get(recovery_key_gate_index(id))
+            .map(|gate| gate.lock());
         if self.recovery_unusable.lock().contains(id) {
             return Err(anyhow::Error::new(RecoveryKeyUnavailable(format!(
                 "recovery key {id} unusable"

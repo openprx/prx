@@ -139,20 +139,13 @@ impl ChannelSourceReceipt {
             let mut admission = None;
             let operation = async {
                 let event = fabric
-                    .record_inbound_user_message(
+                    .record_inbound_user_message_best_effort(
                         envelope.message_scope(),
                         crate::agent::turn_contracts::inbound_user_message(&message.content).content,
                         Some(input_key.clone()),
-                        None,
+                        "channel",
                     )
-                    .await
-                    .map_or_else(
-                        |error| {
-                            tracing::warn!(error = %error, "channel input persistence is unconfirmed");
-                            None
-                        },
-                        Some,
-                    );
+                    .await?;
                 if let Some(event) = event.as_ref().filter(|event| event.id > 0) {
                     anyhow::ensure!(
                         event.idempotency_key.as_deref() == Some(input_key.as_str()),

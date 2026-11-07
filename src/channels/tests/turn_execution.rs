@@ -1185,3 +1185,60 @@ fn progress_lines_read_as_progress_and_never_as_a_deadline() {
         "⏳ working… (step 3, 9s)"
     );
 }
+
+/// Recording is on and the decision plane is off, so no recovery recorder
+/// exists. The same channel message id yields the same stable input key; its
+/// retry must be refused by the production admission, which is the gate in
+/// front of every dispatch (`channel_turn` returns on this refusal).
+#[tokio::test]
+async fn channel_retry_of_accepted_input_key_is_refused_with_plane_off() {
+    let dir = TempDir::new().expect("test: tempdir");
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let ctx = evidence_runtime_ctx(
+        &dir,
+        Arc::new(DummyProvider) as Arc<dyn Provider>,
+        Vec::new(),
+        Arc::clone(&channel_impl) as Arc<dyn Channel>,
+    );
+    let mut config = Config::default();
+    config.workspace_dir = dir.path().to_path_buf();
+    config.config_path = dir.path().join("config.toml");
+    config.causal_tree.enabled = false;
+    assert!(config.memory.event_recording_config().enabled);
+    let generation = crate::config::new_shared(config).pin();
+    let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+    let message = evidence_message("msg-retry-1", "admit me once");
+    let ticket = cleanup
+        .register(CancellationToken::new())
+        .expect("test: first cleanup owner");
+    let (event, _source, guard) = decision_source::ChannelSourceReceipt::record_guarded(
+        Arc::clone(&ctx),
+        Arc::clone(&generation),
+        message.clone(),
+        "prx-channel-run-1".to_string(),
+        ticket,
+    )
+    .await
+    .expect("test: first admission");
+    assert!(event.is_some_and(|event| event.id > 0), "first input was not recorded");
+    guard.finish_without_decision();
+
+    let ticket = cleanup
+        .register(CancellationToken::new())
+        .expect("test: retry cleanup owner");
+    let retry = decision_source::ChannelSourceReceipt::record_guarded(
+        ctx,
+        generation,
+        message,
+        "prx-channel-run-2".to_string(),
+        ticket,
+    )
+    .await;
+    assert!(
+        retry
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.is::<crate::runtime::ingress_recovery::AlreadyAccepted>()),
+        "retry of an accepted channel input was admitted"
+    );
+}

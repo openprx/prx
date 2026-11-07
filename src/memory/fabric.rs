@@ -355,6 +355,33 @@ impl MemoryFabric {
         .await
     }
 
+    /// Best-effort form of [`Self::record_inbound_user_message`] for issuers that
+    /// may proceed unrecorded when the decision plane is off. Persistence trouble
+    /// degrades to `Ok(None)`, but an input key that is already accepted is never
+    /// swallowed: it is always returned as `AlreadyAccepted`, so no issuer can
+    /// admit the same stable input twice. This is the single place that rule lives.
+    pub(crate) async fn record_inbound_user_message_best_effort(
+        &self,
+        scope: MessageEventScope,
+        content: impl Into<String>,
+        idempotency_key: Option<String>,
+        what: &'static str,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        match self
+            .record_inbound_user_message(scope, content, idempotency_key, None)
+            .await
+        {
+            Ok(event) => Ok(Some(event)),
+            Err(error) if error.is::<crate::runtime::ingress_recovery::AlreadyAccepted>() => Err(error),
+            Err(_) if self.ingress_already_accepted() => Err(crate::runtime::ingress_recovery::AlreadyAccepted.into()),
+            Err(_) => {
+                // The error text may embed private input; keep it out of the log.
+                tracing::warn!(input = what, "input persistence is unconfirmed");
+                Ok(None)
+            }
+        }
+    }
+
     pub async fn record_assistant_message(
         &self,
         scope: MessageEventScope,
@@ -771,7 +798,9 @@ impl MemoryFabric {
                 // Without a recorder the stable input key still fences admission:
                 // the append names a fresh event id, so a row that already holds
                 // the workspace/input key comes back with a different id. That
-                // comparison is made inside the same insert transaction.
+                // comparison runs after the backend commit, on the receipt the
+                // backend returns atomically (insert and duplicate selection are
+                // one transaction).
                 let mut input = input;
                 let event_id = uuid::Uuid::new_v4().to_string();
                 input.event_id = Some(event_id.clone());

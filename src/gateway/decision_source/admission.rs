@@ -52,22 +52,13 @@ impl GatewayPendingInput {
             let operation = async {
                 let recorded = guard
                     .fabric
-                    .record_inbound_user_message(
+                    .record_inbound_user_message_best_effort(
                         self.envelope.message_scope(),
                         input.clone(),
                         Some(idempotency_key.clone()),
-                        None,
+                        "gateway",
                     )
-                    .await
-                    .map_or_else(
-                        |_| {
-                            // Preserve disabled-mode best effort without exposing
-                            // private input embedded in a backend's error text.
-                            tracing::warn!("gateway input persistence is unconfirmed");
-                            None
-                        },
-                        Some,
-                    );
+                    .await?;
                 if let Some(event) = recorded.as_ref().filter(|event| event.id > 0) {
                     anyhow::ensure!(
                         event.idempotency_key.as_deref() == Some(idempotency_key.as_str()),
@@ -366,6 +357,53 @@ mod tests {
             }
         }
     }
+    /// Recording is on and the decision plane is off, so no recovery recorder
+    /// exists. A second admission of the same stable key must be refused and
+    /// must issue no receipt, which is what any dispatch needs.
+    #[tokio::test]
+    async fn gateway_retry_of_accepted_input_key_is_refused_with_plane_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = dir.path().to_path_buf();
+        config.config_path = dir.path().join("config.toml");
+        config.causal_tree.enabled = false;
+        let generation = crate::config::new_shared(config).pin();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+        let fabric = MemoryFabric::new(memory, dir.path().to_string_lossy());
+        let envelope = RuntimeEnvelope::gateway(
+            fabric.workspace_id(),
+            "prx_session",
+            "webhook",
+            "prx_user",
+            "prx_service",
+            MemoryVisibility::Session,
+        )
+        .with_run_id("prx_run")
+        .with_config_generation(&generation);
+        let tracker = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+        let admit = || {
+            GatewayPendingInput {
+                generation: Arc::clone(&generation),
+                fabric: fabric.clone(),
+                envelope: envelope.clone(),
+                ticket: tracker.register(tokio_util::sync::CancellationToken::new()).unwrap(),
+                acknowledgement: None,
+            }
+            .record("prx input".to_string(), Some("prx-gateway-stable-key".to_string()))
+        };
+        let (_receipt, event, guard) = admit().await.expect("test: first admission");
+        assert!(event.is_some_and(|event| event.id > 0), "first input was not recorded");
+        drop(guard);
+        let retry = admit().await;
+        assert!(
+            retry
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<crate::runtime::ingress_recovery::AlreadyAccepted>()),
+            "retry of an accepted gateway input was admitted"
+        );
+    }
+
     struct CommitThenSuspend {
         inner: Arc<dyn Memory>,
         suspend: std::sync::atomic::AtomicBool,

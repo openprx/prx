@@ -183,8 +183,9 @@ pub struct SqliteMemory {
     recovery_unusable: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Serializes check, load and failure publication for this handle's activation.
     recovery_activation: Arc<parking_lot::Mutex<()>>,
-    /// One gate per capsule key id, serializing its check, load and failure publication.
-    recovery_key_gates: Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<parking_lot::Mutex<()>>>>>,
+    /// Fixed striped gates serializing check, load and failure publication per
+    /// capsule key id. The set never grows, whatever ids stored capsules name.
+    recovery_key_gates: Arc<[parking_lot::Mutex<()>; recovery_authority::RECOVERY_KEY_GATES]>,
     ingress_owners: Arc<super::ingress_recovery::IngressOwnerCache>,
     db_path: PathBuf,
     acl_enabled: bool,
