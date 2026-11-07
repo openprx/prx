@@ -1224,6 +1224,7 @@ impl TurnDecisionService {
             state_key: &self.state_key,
             store: &self.store,
             workspace: self.generation.effective.workspace_dir.to_string_lossy().into_owned(),
+            workspace_dir: &self.generation.effective.workspace_dir,
             catalog_generation: self.catalog.generation().0,
             policy_version: &self.policy_version,
             enabled: self.recordable && self.durable_key && self.generation.effective.causal_tree.enabled,
