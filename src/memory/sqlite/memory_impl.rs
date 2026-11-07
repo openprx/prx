@@ -644,8 +644,10 @@ impl Memory for SqliteMemory {
         capsule: crate::memory::ingress_recovery::IngressCapsule,
         lifetime: Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
         deadline: std::time::Instant,
+        attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
     ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
-        self.append_ingress_input_impl(input, capsule, lifetime, deadline).await
+        self.append_ingress_input_impl(input, capsule, lifetime, deadline, attestation)
+            .await
     }
 
     async fn list_ingress_recovery_candidates(

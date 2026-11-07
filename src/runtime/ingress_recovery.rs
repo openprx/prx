@@ -1,11 +1,12 @@
 //! Recovery consumes authenticated durable reception, never execution authority.
 use crate::decision::key::{DecisionKey, KeyDomain};
+use crate::memory::ingress_recovery::PendingFacts;
 use crate::memory::ingress_recovery::{
-    IngressAppendOutcome, IngressCapsule, IngressEventLookup, IngressLifetime, IngressRecoveryCommit,
-    IngressRecoveryScan, IngressRecoveryScope, IngressRecoveryState, MAX_CAPSULE_BYTES, MAX_RECOVERY_EVENT_BYTES,
-    MAX_RECOVERY_PAGE, input_within_bounds, remaining, serialized_within,
+    IngressAppendOutcome, IngressAttestation, IngressCapsule, IngressEventLookup, IngressLifetime,
+    IngressRecoveryCommit, IngressRecoveryScan, IngressRecoveryScope, IngressRecoveryState, MAX_CAPSULE_BYTES,
+    MAX_RECOVERY_EVENT_BYTES, MAX_RECOVERY_PAGE, input_within_bounds, remaining, serialized_within,
 };
-use crate::memory::recovery_authority::RecoveryMacDomain;
+use crate::memory::recovery_authority::{RecoveryChain, RecoveryMacDomain, RecoveryRepository, RecoveryTag};
 use crate::memory::{Memory, MemoryVisibility, MessageEvent, MessageEventInput};
 use anyhow::Context;
 use sha2::{Digest, Sha256};
@@ -194,6 +195,11 @@ impl RecoveryScope {
 #[error("input already accepted; execution was not repeated and its outcome remains unconfirmed")]
 pub(crate) struct AlreadyAccepted;
 
+/// A retry reused a stable input key with different content. Nothing executes.
+#[derive(Debug, thiserror::Error)]
+#[error("ingress stable key conflicts with a different input")]
+pub(crate) struct IngressConflict;
+
 /// Store/run metadata for diagnostics only; recovery classification is unchanged.
 #[derive(Debug)]
 pub(crate) struct IngressRecoveryDiagnostic {
@@ -360,6 +366,12 @@ impl IngressRecorder {
         remaining(self.deadline)?;
         input_within_bounds(&input, MAX_RECOVERY_EVENT_BYTES - MAX_CAPSULE_BYTES)?;
         let attempted_digest = transport_digest(&input)?;
+        // The keyed v3 preimage is the same transport tuple, serialized once.
+        let attempted_transport = if self.memory.recovery_repository().is_some() {
+            Some(serde_json::to_vec(&transport_view(&input))?)
+        } else {
+            None
+        };
         let scope = IngressRecoveryScope {
             workspace_id: input.workspace_id.clone(),
             owner_id: input.owner_id.clone().context("durable ingress owner missing")?,
@@ -392,6 +404,16 @@ impl IngressRecorder {
         };
         capsule.authentication = self.sign(&capsule)?;
         capsule.validate_bounds()?;
+        let attestation = match (
+            capsule.key_id.as_deref(),
+            self.memory.recovery_repository(),
+            &attempted_transport,
+        ) {
+            (Some(key_id), Some(repository), Some(transport)) => Some(pending_attestation(
+                repository, key_id, &capsule, &input, surface, transport,
+            )?),
+            _ => None,
+        };
         #[derive(serde::Serialize)]
         struct Payload<'a> {
             prx_ingress_capsule: &'a IngressCapsule,
@@ -403,7 +425,13 @@ impl IngressRecorder {
         })?);
         match self
             .memory
-            .append_ingress_input(input, capsule.clone(), self.lifetime.clone(), self.deadline)
+            .append_ingress_input(
+                input,
+                capsule.clone(),
+                self.lifetime.clone(),
+                self.deadline,
+                attestation,
+            )
             .await?
         {
             IngressAppendOutcome::Inserted(event) => {
@@ -417,12 +445,71 @@ impl IngressRecorder {
                 // OLD capsule first; compare stable transport content separately.
                 let old = capsule_from_event(&event)?;
                 let previous = self.verify(&old, &event)?;
-                anyhow::ensure!(
-                    transport_digest(&previous)? == attempted_digest,
-                    "ingress stable key conflicts with a different input"
-                );
+                self.check_retry(&old, &previous, &attempted_digest, attempted_transport.as_deref())
+                    .await?;
                 Err(AlreadyAccepted.into())
             }
+            IngressAppendOutcome::Tombstoned => {
+                // The record was erased. Whatever the content, the stable key is
+                // spent; no capsule exists to read and nothing executes.
+                self.duplicate.store(true, std::sync::atomic::Ordering::Release);
+                Err(AlreadyAccepted.into())
+            }
+        }
+    }
+
+    /// Compare a retry's stable transport content with the accepted input. A v3
+    /// capsule is compared through its authenticated attestation and the
+    /// repository's keyed transport tag; an earlier capsule keeps the digest
+    /// compare. Neither outcome executes anything.
+    async fn check_retry(
+        &self,
+        old: &IngressCapsule,
+        previous: &MessageEventInput,
+        attempted_digest: &str,
+        attempted_transport: Option<&[u8]>,
+    ) -> anyhow::Result<()> {
+        if old.version == 3 {
+            let chain = RecoveryChain {
+                workspace_id: old.scope.workspace_id.clone(),
+                owner_id: old.scope.owner_id.clone(),
+                source: old.scope.source.as_str().to_owned(),
+                run_id: old.run_id.clone(),
+            };
+            let memory = Arc::clone(&self.memory);
+            let receipt = owned_store_operation(&self.owner, move || {
+                memory
+                    .recovery_repository()
+                    .context("recovery repository unavailable")?
+                    .read_recovery_receipt(&chain)
+            })
+            .await?;
+            if let Some(receipt) = receipt {
+                let facts = PendingFacts::parse(&receipt.pending_facts()?)?;
+                facts.check_capsule(old)?;
+                let tag = RecoveryTag {
+                    key_id: facts.key_id.clone(),
+                    tag: hex::decode(&facts.transport_digest)?
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("invalid attested transport tag length"))?,
+                };
+                let repository = self
+                    .memory
+                    .recovery_repository()
+                    .context("recovery repository unavailable")?;
+                let attempted = attempted_transport.context("transport content unavailable")?;
+                return match repository.verify_recovery_mac(&tag, RecoveryMacDomain::TransportV3, attempted) {
+                    Ok(()) => Ok(()),
+                    // An unusable key is not a conflict: surface it unchanged.
+                    Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => Err(error),
+                    Err(_) => Err(IngressConflict.into()),
+                };
+            }
+        }
+        if transport_digest(previous)? == attempted_digest {
+            Ok(())
+        } else {
+            Err(IngressConflict.into())
         }
     }
     async fn recover(
@@ -836,9 +923,57 @@ fn digest(input: &MessageEventInput) -> anyhow::Result<String> {
     digest_value(input)
 }
 fn transport_digest(input: &MessageEventInput) -> anyhow::Result<String> {
+    digest_value(&transport_view(input))
+}
+
+/// The v3 attestation for a new input: the keyed transport and stable-key tags
+/// and the closed facts that bind them to the exact capsule.
+fn pending_attestation(
+    repository: &dyn RecoveryRepository,
+    key_id: &str,
+    capsule: &IngressCapsule,
+    input: &MessageEventInput,
+    surface: crate::causal_tree::state::TurnSurfaceKind,
+    transport_bytes: &[u8],
+) -> anyhow::Result<IngressAttestation> {
+    use base64::Engine as _;
+    let transport = repository.recovery_mac(Some(key_id), RecoveryMacDomain::TransportV3, transport_bytes)?;
+    let input_key = repository.recovery_mac(
+        Some(key_id),
+        RecoveryMacDomain::InputKeyV3,
+        capsule.input_key.as_bytes(),
+    )?;
+    let facts = PendingFacts {
+        v: 1,
+        namespace: capsule.backend_namespace.clone(),
+        workspace_id: capsule.scope.workspace_id.clone(),
+        owner_id: capsule.scope.owner_id.clone(),
+        source: capsule.scope.source.as_str().to_owned(),
+        channel: input.channel.clone(),
+        session_key: input.session_key.clone(),
+        surface: surface.as_str().to_owned(),
+        generation: input.config_generation_id.unwrap_or(0),
+        lifetime: capsule.lifetime.clone(),
+        input_event_id: capsule.input_event_id.clone(),
+        input_key: capsule.input_key.clone(),
+        capsule_version: capsule.version,
+        capsule: base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(capsule)?),
+        input_digest: capsule.input_digest.clone(),
+        transport_digest: hex::encode(transport.tag),
+        input_key_digest: hex::encode(input_key.tag),
+        key_id: key_id.to_owned(),
+    };
+    Ok(IngressAttestation {
+        facts: serde_json::to_vec(&facts)?,
+        transport,
+        input_key,
+    })
+}
+
+fn transport_view(input: &MessageEventInput) -> impl serde::Serialize {
     // Local retry run and config generation may change; creator/lease and
     // transport attribution never do. Hash borrowed fields without cloning.
-    digest_value(&(
+    (
         &input.workspace_id,
         &input.owner_id,
         &input.source,
@@ -868,7 +1003,7 @@ fn transport_digest(input: &MessageEventInput) -> anyhow::Result<String> {
             &input.visibility,
             &input.idempotency_key,
         ),
-    ))
+    )
 }
 fn capsule_from_event(event: &MessageEvent) -> anyhow::Result<IngressCapsule> {
     let raw = event
