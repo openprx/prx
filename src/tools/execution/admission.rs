@@ -13,19 +13,6 @@ pub(crate) struct TurnSurface {
 }
 
 impl TurnSurface {
-    /// The caller supplies trusted ACL and channel eligibility from its pinned
-    /// registry. Neither a decision context nor a model-provided name grants access.
-    #[cfg(test)]
-    pub(crate) fn build(
-        service: &ToolExecutionService,
-        config: &ToolTieringConfig,
-        model: &str,
-        channel: bool,
-        eligible: impl FnMut(&ToolDescriptor) -> bool,
-    ) -> Self {
-        Self::build_from(service, service.current_descriptors(), config, model, channel, eligible)
-    }
-
     /// Applies the surface predicates over an explicit candidate list. The
     /// caller supplies every name the publication source can emit, each already
     /// resolved live through `service`; unresolved names must not be passed.
