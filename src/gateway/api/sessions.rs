@@ -1459,11 +1459,13 @@ pub async fn post_session_message(
         state,
         session_id,
         api_principal,
-        selected,
-        message,
-        async_mode,
-        ConsoleTurnMode::Message,
-        uploads,
+        ConsoleSubmission {
+            selected,
+            message,
+            async_mode,
+            mode: ConsoleTurnMode::Message,
+            uploads,
+        },
     )
     .await
 }
@@ -1775,29 +1777,43 @@ pub(super) async fn post_decision_resume(
         state,
         session_id,
         principal,
-        SelectedTurn {
-            runtime,
-            targeted: None,
+        ConsoleSubmission {
+            selected: SelectedTurn {
+                runtime,
+                targeted: None,
+            },
+            message,
+            async_mode,
+            mode: ConsoleTurnMode::Resume,
+            uploads: UploadGuard::default(),
         },
-        message,
-        async_mode,
-        ConsoleTurnMode::Resume,
-        UploadGuard::default(),
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)] // the pinned request, plus the upload guard that rides through admission
-async fn submit_console_message(
-    state: AppState,
-    session_id: String,
-    api_principal: super::ApiPrincipal,
+/// What one console submission carries into admission. `uploads` rides along
+/// so the files are removed unless the input or job is accepted.
+struct ConsoleSubmission {
     selected: SelectedTurn,
     message: String,
     async_mode: bool,
     mode: ConsoleTurnMode,
     uploads: UploadGuard,
+}
+
+async fn submit_console_message(
+    state: AppState,
+    session_id: String,
+    api_principal: super::ApiPrincipal,
+    submission: ConsoleSubmission,
 ) -> Response {
+    let ConsoleSubmission {
+        selected,
+        message,
+        async_mode,
+        mode,
+        uploads,
+    } = submission;
     let SelectedTurn {
         runtime: turn_runtime,
         targeted: target,
