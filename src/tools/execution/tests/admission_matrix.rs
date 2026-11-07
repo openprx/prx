@@ -956,11 +956,17 @@ async fn spawn_without_parent_authority_is_refused() {
         );
     }
     assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 0);
-    // A receipt-free direct operator caller carries no child authority and
-    // keeps its existing admission: each launcher reaches the backend once.
+    // The runtime-owned local terminal operator context (the constructor the chat
+    // dispatcher uses) carries no child scope, pin or grant and keeps its existing
+    // admission: each launcher reaches the backend exactly once.
+    let policy = crate::security::SecurityPolicy::default();
+    let operator = crate::chat::dispatcher::chat_tool_execution_context(&policy, None, None, "operator-control");
+    assert!(operator.is_local_operator());
+    assert!(operator.child_scope.is_none() && operator.child_pin.is_none() && operator.child_grant.is_none());
+    assert!(operator.execution_bindings.is_none() && operator.turn_surface.is_none());
     for (index, name) in ["delegate", "sessions_spawn"].into_iter().enumerate() {
         assert_eq!(
-            case.call(name, case.context(false, false)).await,
+            case.call(name, operator.clone()).await,
             ToolExecutionStatus::Succeeded,
             "{name}"
         );

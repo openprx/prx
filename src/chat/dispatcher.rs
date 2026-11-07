@@ -2016,7 +2016,7 @@ fn trim_redux_driver_context_budget_after_rollover(
     trimmed
 }
 
-fn chat_tool_execution_context(
+pub(crate) fn chat_tool_execution_context(
     policy: &crate::security::SecurityPolicy,
     turn_spawn_ctx: Option<&crate::tools::sessions_spawn::SpawnExecutionContext>,
     task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
