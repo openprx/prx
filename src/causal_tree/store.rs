@@ -2048,6 +2048,28 @@ impl CausalDecisionStore {
         shared::open(workspace_dir, retention, events, mode)
     }
 
+    /// Test-only: open (or join) the shared writable store with a writer hold.
+    /// While a test owns `hold`'s lock the writer thread blocks before it
+    /// handles its next command, so a queued request stays unanswered.
+    #[cfg(test)]
+    pub(crate) fn open_shared_held(
+        workspace_dir: &Path,
+        retention: Retention,
+        events: Arc<dyn CausalEventSink>,
+        hold: Arc<parking_lot::Mutex<()>>,
+    ) -> Result<Arc<Self>, StoreError> {
+        shared::open_with(
+            workspace_dir,
+            retention,
+            events,
+            StoreMode::ReadWrite,
+            WriterSetup {
+                hold: Some(hold),
+                ..WriterSetup::default()
+            },
+        )
+    }
+
     fn open(
         workspace_dir: &Path,
         retention: Retention,

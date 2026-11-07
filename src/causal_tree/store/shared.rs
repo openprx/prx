@@ -38,6 +38,16 @@ pub(super) fn open(
     events: Arc<dyn CausalEventSink>,
     mode: StoreMode,
 ) -> Result<Arc<CausalDecisionStore>, StoreError> {
+    open_with(workspace, retention, events, mode, WriterSetup::default())
+}
+
+pub(super) fn open_with(
+    workspace: &Path,
+    retention: Retention,
+    events: Arc<dyn CausalEventSink>,
+    mode: StoreMode,
+    setup: WriterSetup,
+) -> Result<Arc<CausalDecisionStore>, StoreError> {
     let slot = slot(db_path(workspace));
     let _opening = slot.opening.lock();
     let existing = slot.current.lock().upgrade();
@@ -46,7 +56,7 @@ pub(super) fn open(
             return Ok(existing);
         }
     }
-    let mut store = CausalDecisionStore::open(workspace, retention, events, mode, WriterSetup::default())?;
+    let mut store = CausalDecisionStore::open(workspace, retention, events, mode, setup)?;
     store.shared_slot = Some(Arc::clone(&slot));
     let store = Arc::new(store);
     *slot.current.lock() = Arc::downgrade(&store);
