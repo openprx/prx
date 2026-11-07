@@ -103,6 +103,8 @@ fn event(conn: &Connection, chain: &RecoveryChain, id: &str) -> anyhow::Result<R
         let mut record = Vec::new();
         for index in 0..row.as_ref().column_count() {
             let value = row.get_ref(index)?;
+            // An unstamped scope column is absent from digests bound before the column existed.
+            if matches!(value, ValueRef::Null) && row.as_ref().column_name(index)? == "ma_scope_id" { continue; }
             let (tag, bytes) = match value {
                 ValueRef::Null => (0, Vec::new()),
                 ValueRef::Integer(value) => (1, value.to_be_bytes().to_vec()),
