@@ -889,37 +889,79 @@ impl super::ingress_recovery::RecoveryScope {
             event.workspace_id == workspace_id && event.owner_id.as_deref() == Some(owner_id),
             "terminal replay scope does not match its owner"
         );
-        let store = self
-            .store
-            .as_ref()
-            .context("historical terminal evidence store is unavailable")?;
-        let store_workspace_id = store.workspace_id().context("store workspace scope is missing")?;
-        let replay = if let Some((_, deadline, owner)) = bounded {
-            crate::agent::terminal::verify_terminal_replay_until(
-                self.memory.as_ref(),
-                &store.reader(),
-                &self.state_key,
-                &store_workspace_id,
-                &workspace_id,
-                owner_id,
-                terminal_id,
-                &event,
-                deadline,
-                owner,
-            )
-            .await?
+        let store = if crate::agent::terminal::REPLAY_EVIDENCE_AUTHORITY {
+            None
         } else {
-            crate::agent::terminal::verify_terminal_replay(
-                self.memory.as_ref(),
-                &store.reader(),
-                &self.state_key,
-                &store_workspace_id,
-                &workspace_id,
-                owner_id,
-                terminal_id,
-                &event,
+            Some(
+                self.store
+                    .as_ref()
+                    .context("historical terminal evidence store is unavailable")?,
             )
-            .await?
+        };
+        let store_workspace_id: Arc<str> = match store {
+            Some(store) => store.workspace_id().context("store workspace scope is missing")?,
+            None => Arc::from(crate::agent::terminal::authenticated_replay_store_workspace(
+                &self.state_key,
+                &event,
+            )?),
+        };
+        let replay = match (store, bounded) {
+            (Some(store), Some((_, deadline, owner))) => {
+                crate::agent::terminal::verify_terminal_replay_until(
+                    self.memory.as_ref(),
+                    &store.reader(),
+                    &self.state_key,
+                    &store_workspace_id,
+                    &workspace_id,
+                    owner_id,
+                    terminal_id,
+                    &event,
+                    deadline,
+                    owner,
+                )
+                .await?
+            }
+            (Some(store), None) => {
+                crate::agent::terminal::verify_terminal_replay(
+                    self.memory.as_ref(),
+                    &store.reader(),
+                    &self.state_key,
+                    &store_workspace_id,
+                    &workspace_id,
+                    owner_id,
+                    terminal_id,
+                    &event,
+                )
+                .await?
+            }
+            (None, Some((_, deadline, owner))) => {
+                crate::agent::terminal::verify_terminal_replay_journal_until(
+                    self.memory.as_ref(),
+                    &self.workspace,
+                    &self.state_key,
+                    &store_workspace_id,
+                    &workspace_id,
+                    owner_id,
+                    terminal_id,
+                    &event,
+                    deadline,
+                    owner,
+                )
+                .await?
+            }
+            (None, None) => {
+                crate::agent::terminal::verify_terminal_replay_journal(
+                    self.memory.as_ref(),
+                    &self.workspace,
+                    &self.state_key,
+                    &store_workspace_id,
+                    &workspace_id,
+                    owner_id,
+                    terminal_id,
+                    &event,
+                )
+                .await?
+            }
         };
         #[cfg(test)]
         stage.next(super::turn_cleanup::diagnostic::StageName::RejoinReplayScope);
@@ -943,7 +985,9 @@ impl super::ingress_recovery::RecoveryScope {
         let decision = replay.decision();
         let facts = TerminalFacts::from_persisted_marker(&event, decision, owner_id, &workspace_id)?
             .with_verified_resume(&replay);
-        let writer = store.writer().context("terminal rejoin writer is missing")?;
+        let writer = store
+            .map(|store| store.writer().context("terminal rejoin writer is missing"))
+            .transpose()?;
         #[cfg(test)]
         stage.next(super::turn_cleanup::diagnostic::StageName::RejoinCorrelator);
         let expected = OutcomeCorrelator::persisted_record(decision, &facts)?;
@@ -960,36 +1004,43 @@ impl super::ingress_recovery::RecoveryScope {
         )
         .persist(&replay, &event, child_owner, child_deadline)
         .await?;
-        let queued = writer.record_outcome(expected.clone());
-        anyhow::ensure!(queued == Enqueue::Queued, "rejoined outcome could not be queued");
-        #[cfg(test)]
-        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinDrain);
-        anyhow::ensure!(
-            writer
-                .drain(bounded.map_or_else(|| Instant::now() + Duration::from_secs(5), |(_, deadline, _)| deadline))
-                .await,
-            "rejoined outcome persistence timed out"
-        );
-        #[cfg(test)]
-        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinConfirmAndRepairs);
         let scope = DecisionScope::Owner {
             workspace_id: store_workspace_id,
             owner_id: Arc::from(owner_id),
         };
-        anyhow::ensure!(
-            if let Some((_, deadline, owner)) = bounded {
-                let reader = store.reader();
-                let scope = scope.clone();
-                let expected = expected.clone();
-                super::ingress_recovery::owned_store_read(owner, move || {
-                    Ok(reader.outcome_matches_until(&scope, &expected, deadline)?)
-                })
-                .await?
-            } else {
-                store.reader().outcome_matches(&scope, &expected)?
-            },
-            "rejoined outcome is absent or conflicts with the authenticated terminal"
-        );
+        // Journal mode: the hook's FULL commit and readback above settled the
+        // child. The projection below is store-only and is not authority.
+        let projection = store.zip(writer.as_ref());
+        if let Some((store, writer)) = projection {
+            anyhow::ensure!(
+                writer.record_outcome(expected.clone()) == Enqueue::Queued,
+                "rejoined outcome could not be queued"
+            );
+            #[cfg(test)]
+            stage.next(super::turn_cleanup::diagnostic::StageName::RejoinDrain);
+            anyhow::ensure!(
+                writer
+                    .drain(bounded.map_or_else(|| Instant::now() + Duration::from_secs(5), |(_, deadline, _)| deadline))
+                    .await,
+                "rejoined outcome persistence timed out"
+            );
+            #[cfg(test)]
+            stage.next(super::turn_cleanup::diagnostic::StageName::RejoinConfirmAndRepairs);
+            anyhow::ensure!(
+                if let Some((_, deadline, owner)) = bounded {
+                    let reader = store.reader();
+                    let scope = scope.clone();
+                    let expected = expected.clone();
+                    super::ingress_recovery::owned_store_read(owner, move || {
+                        Ok(reader.outcome_matches_until(&scope, &expected, deadline)?)
+                    })
+                    .await?
+                } else {
+                    store.reader().outcome_matches(&scope, &expected)?
+                },
+                "rejoined outcome is absent or conflicts with the authenticated terminal"
+            );
+        }
         let (terminal_status, awaiting_approval, verified) = facts.recovered_signals(&decision.directive_kind);
         crate::skills::lifecycle::spawn_settle_task_terminal(
             self.workspace.clone(),
@@ -1006,7 +1057,7 @@ impl super::ingress_recovery::RecoveryScope {
                 ..terminal_status.skill_observation(awaiting_approval, verified)
             },
         );
-        if replay.parent_decision_id().is_some() {
+        if let (Some((store, writer)), true) = (projection, replay.parent_decision_id().is_some()) {
             let link = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &expected)
                 .context("child outcome lineage is inconsistent")?;
             anyhow::ensure!(
@@ -1080,6 +1131,6 @@ impl super::ingress_recovery::RecoveryScope {
         }
         #[cfg(test)]
         stage.finish();
-        Ok(queued)
+        Ok(Enqueue::Queued)
     }
 }

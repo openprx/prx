@@ -12,7 +12,8 @@ pub(crate) use replay::reseal_payload_for_test;
 pub(crate) mod served_auxiliary;
 pub(crate) use replay::{
     REPLAY_EVIDENCE_AUTHORITY, VerifiedTerminalReplay, authenticated_replay_store_workspace,
-    read_journal_replay_record, verify_terminal_replay, verify_terminal_replay_journal, verify_terminal_replay_until,
+    read_journal_replay_record, read_journal_replay_record_on, verify_terminal_replay, verify_terminal_replay_journal,
+    verify_terminal_replay_journal_until, verify_terminal_replay_until,
 };
 
 use crate::causal_tree::ids::DecisionId;

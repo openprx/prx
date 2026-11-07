@@ -961,3 +961,221 @@ async fn launch_v3_succeeds_with_matching_parent_row() -> Result<()> {
     })
     .await
 }
+
+/// Real evidence rows of one owner, as raw `(decision, entry)` pairs.
+fn owner_evidence(db: &rusqlite::Connection, store_workspace: &str, owner: &str) -> Result<Vec<(String, String)>> {
+    let mut statement =
+        db.prepare("SELECT decision, entry FROM decision_evidence WHERE workspace = ?1 AND owner = ?2 ORDER BY rowid")?;
+    let rows = statement
+        .query_map((store_workspace, owner), |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+    Ok(rows)
+}
+
+#[tokio::test]
+async fn child_recovery_journal_cursor_wraps() -> Result<()> {
+    use crate::causal_tree::ids::DecisionId;
+    use crate::memory::ingress_recovery::IngressRecoveryScope;
+    use crate::runtime::child_source::recovery;
+    use crate::runtime::turn_cleanup::CleanupTracker;
+    use rusqlite::types::Value;
+
+    let tmp = tempfile::tempdir()?;
+    let (manifest, result) = completed_child_fixture(&tmp).await?;
+    let ReopenedChild {
+        workspace,
+        key,
+        expected,
+        ..
+    } = reopened_child_evidence(&manifest, &result).await?;
+    let store_workspace = manifest
+        .child_source
+        .as_ref()
+        .context("test: child source")?
+        .parent_store_workspace
+        .clone();
+    let owner = manifest.owner_id.clone().context("test: owner")?;
+
+    // Set the real chain aside (bytes kept), drop the settled row, drop the store.
+    let db = rusqlite::Connection::open(authority_journal::path(&workspace))?;
+    let real = owner_evidence(&db, &store_workspace, &owner)?;
+    anyhow::ensure!(!real.is_empty(), "test: the child must have evidence rows");
+    let template = {
+        let columns =
+            authority_journal::read_decision_evidence(&workspace, &store_workspace, &owner, &real[0].0, &key)?
+                .context("test: template evidence row")?;
+        named_evidence_columns(columns)?
+    };
+    db.execute(
+        "DELETE FROM decision_evidence WHERE workspace = ?1 AND owner = ?2",
+        (&store_workspace, &owner),
+    )?;
+    anyhow::ensure!(
+        db.execute(
+            "DELETE FROM child_outcome WHERE run = ?1 AND settlement = ?2",
+            (&expected.run, &expected.settlement),
+        )? == 1,
+        "test: exactly one child outcome row must be deleted"
+    );
+    quarantine_decision_store(&workspace)?;
+
+    // 65 initial rows: one invalid entry in the middle, the rest valid with no terminal.
+    for index in 0..65 {
+        if index == 30 {
+            db.execute(
+                "INSERT INTO decision_evidence(workspace, owner, decision, entry) VALUES (?1, ?2, 'invalid', 'not-an-entry')",
+                (&store_workspace, &owner),
+            )?;
+            continue;
+        }
+        let mut columns = template.clone();
+        set_column(
+            &mut columns,
+            "decision_id",
+            Value::Text(DecisionId::new_runtime().to_string()),
+        )?;
+        set_column(&mut columns, "run_id", Value::Text(format!("filler-{index}")))?;
+        authority_journal::write_decision_evidence(&workspace, &key, &[columns])?;
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut position = None;
+    let next_page = |position: &mut Option<authority_journal::EvidenceCursor>| {
+        authority_journal::next_evidence_page(position, &workspace, &key, &store_workspace, &owner, 64, deadline)
+    };
+    let first = next_page(&mut position)?;
+    anyhow::ensure!(first.len() == 64, "test: the first page must hold exactly 64 rows");
+    anyhow::ensure!(
+        first.iter().filter(|candidate| candidate.lineage.is_none()).count() == 1,
+        "test: the invalid entry must be reported without lineage"
+    );
+    for candidate in &first {
+        position = Some(candidate.cursor);
+    }
+
+    // Late rows land above the captured high water: the real chain, byte for byte.
+    for (decision, entry) in &real {
+        db.execute(
+            "INSERT INTO decision_evidence(workspace, owner, decision, entry) VALUES (?1, ?2, ?3, ?4)",
+            (&store_workspace, &owner, decision, entry),
+        )?;
+    }
+    let second = next_page(&mut position)?;
+    anyhow::ensure!(
+        second.len() == 1,
+        "test: only the last initial row remains in this pass"
+    );
+    for candidate in &second {
+        position = Some(candidate.cursor);
+    }
+    let empty = next_page(&mut position)?;
+    anyhow::ensure!(
+        empty.is_empty(),
+        "test: late rows must stay above this pass's high water"
+    );
+    anyhow::ensure!(
+        position.is_none(),
+        "test: an empty page must reset the exhausted cursor"
+    );
+
+    // The next pass restarts at the first row and walks, page by page, to the late rows.
+    let mut third = Vec::new();
+    loop {
+        let page = next_page(&mut position)?;
+        anyhow::ensure!(page.len() <= 64, "test: every page is bounded");
+        if page.is_empty() {
+            break;
+        }
+        for candidate in page {
+            position = Some(candidate.cursor);
+            third.push(candidate);
+        }
+    }
+    anyhow::ensure!(
+        third.len() == 65 + real.len(),
+        "test: the next pass must reach the late rows, saw {}",
+        third.len()
+    );
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.as_path())?);
+    let fabric = MemoryFabric::new(
+        memory,
+        manifest.memory_workspace_id.clone().context("test: memory workspace")?,
+    );
+    let scope = IngressRecoveryScope {
+        workspace_id: fabric.workspace_id().to_owned(),
+        owner_id: owner.clone(),
+        source: crate::memory::MessageEventSource::SessionWorker,
+    };
+    let tracker = Arc::new(CleanupTracker::default());
+    let store_arc: Arc<str> = Arc::from(store_workspace.as_str());
+    let mut repaired = 0;
+    for candidate in &third {
+        let Some(lineage) = candidate.lineage.as_ref() else {
+            continue;
+        };
+        let Some((event, replay)) = recovery::verify_candidate(
+            fabric.memory().as_ref(),
+            &workspace,
+            &key,
+            &store_workspace,
+            &scope,
+            lineage,
+            &tracker,
+            deadline,
+        )
+        .await?
+        else {
+            continue;
+        };
+        if replay.parent_decision_id().is_some()
+            && recovery::settle(&workspace, &key, &store_arc, &replay, &event, &tracker, deadline).await?
+        {
+            repaired += 1;
+        }
+    }
+    anyhow::ensure!(
+        repaired == 1,
+        "test: the late child must be repaired exactly once, got {repaired}"
+    );
+    anyhow::ensure!(
+        authority_journal::verify_child_outcome(
+            &workspace,
+            &key,
+            &expected,
+            Some(authority_journal::JOURNAL_REQUIRED_VERSION),
+        )?,
+        "test: the repaired child outcome must verify"
+    );
+    let rows = child_outcome_rows(&workspace)?;
+    anyhow::ensure!(
+        rows.len() == 1 && rows[0].0 == expected.run && rows[0].1 == expected.settlement,
+        "test: repair must leave exactly one row at the expected key: {rows:?}"
+    );
+
+    // A second pass finds the row settled and writes nothing.
+    let (event, replay) = {
+        let lineage = third
+            .iter()
+            .filter_map(|candidate| candidate.lineage.as_ref())
+            .find(|lineage| lineage.run_id == expected.run)
+            .context("test: the child's own evidence row")?;
+        recovery::verify_candidate(
+            fabric.memory().as_ref(),
+            &workspace,
+            &key,
+            &store_workspace,
+            &scope,
+            lineage,
+            &tracker,
+            deadline,
+        )
+        .await?
+        .context("test: the child terminal must replay again")?
+    };
+    anyhow::ensure!(
+        !recovery::settle(&workspace, &key, &store_arc, &replay, &event, &tracker, deadline).await?
+            && child_outcome_rows(&workspace)? == rows,
+        "test: a settled child must not be rewritten"
+    );
+    Ok(())
+}

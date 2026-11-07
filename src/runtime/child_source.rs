@@ -2,6 +2,7 @@
 pub(crate) mod authority_journal;
 pub(crate) mod completion;
 mod parent_authority;
+pub(crate) mod recovery;
 pub(crate) mod recursive_allowance;
 pub(crate) use parent_authority::ParentAuthority;
 pub(crate) mod operator_process;
