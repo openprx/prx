@@ -50,12 +50,177 @@ pub enum IngressAppendOutcome {
 
 /// Pending-attestation inputs the repository publishes in the append transaction.
 /// The tags are repository-keyed; `facts` is the closed [`PendingFacts`] JSON.
-#[derive(Debug, Clone)]
+/// `verified` is set only by [`verify_transport`], at the first layer that holds
+/// the plaintext accepted input.
+#[derive(Debug)]
 pub struct IngressAttestation {
     pub facts: Vec<u8>,
     pub transport: super::recovery_authority::RecoveryTag,
     pub input_key: super::recovery_authority::RecoveryTag,
+    verified: Option<VerifiedTransport>,
 }
+
+/// Proof that the transport tag was verified against the accepted input. Only
+/// [`verify_transport`] can build it: private fields, no `Default`, no `Deserialize`,
+/// not `Clone`.
+#[derive(Debug)]
+struct VerifiedTransport {
+    input_event_id: String,
+}
+
+impl IngressAttestation {
+    #[must_use]
+    pub const fn new(
+        facts: Vec<u8>,
+        transport: super::recovery_authority::RecoveryTag,
+        input_key: super::recovery_authority::RecoveryTag,
+    ) -> Self {
+        Self {
+            facts,
+            transport,
+            input_key,
+            verified: None,
+        }
+    }
+
+    /// The input event the transport tag was verified for, if it was verified.
+    pub(crate) fn verified_input_event_id(&self) -> Option<&str> {
+        self.verified.as_ref().map(|verified| verified.input_event_id.as_str())
+    }
+
+    /// Whether the first trusted layer already verified this attestation.
+    #[must_use]
+    pub const fn is_verified(&self) -> bool {
+        self.verified.is_some()
+    }
+}
+
+impl Clone for IngressAttestation {
+    /// A clone never inherits the verification token.
+    fn clone(&self) -> Self {
+        Self {
+            facts: self.facts.clone(),
+            transport: self.transport.clone(),
+            input_key: self.input_key.clone(),
+            verified: None,
+        }
+    }
+}
+
+/// The transport preimage: the stable transport content of an input, with its
+/// payload replaced by the pre-envelope `original_payload`. Local retry run and
+/// config generation may change; creator/lease and transport attribution never do.
+#[must_use]
+pub fn transport_preimage(input: &MessageEventInput, original_payload: Option<&str>) -> Vec<u8> {
+    let view = (
+        &input.workspace_id,
+        &input.owner_id,
+        &input.source,
+        &input.channel,
+        &input.session_key,
+        (
+            &input.parent_session_key,
+            &input.parent_run_id,
+            &input.agent_id,
+            &input.persona_id,
+            &input.sender,
+            &input.recipient,
+        ),
+        (
+            &input.role,
+            &input.event_type,
+            &input.subject,
+            &input.goal_id,
+            &input.causation_event_id,
+            &input.correlation_id,
+        ),
+        (
+            &input.attempt_id,
+            &input.lease_epoch,
+            &input.content,
+            original_payload,
+            &input.visibility,
+            &input.idempotency_key,
+        ),
+    );
+    // Serializing borrowed strings and options cannot fail.
+    serde_json::to_vec(&view).unwrap_or_default()
+}
+
+/// Verify the transport tag against the accepted plaintext input, and bind the
+/// result to the input event. Run it once, at the first layer that holds the
+/// plaintext (before any sealing). A MAC failure is a mismatch; an unusable key
+/// propagates unchanged.
+pub fn verify_transport(
+    repo: &dyn super::recovery_authority::RecoveryRepository,
+    input: &MessageEventInput,
+    capsule: &IngressCapsule,
+    attestation: &mut IngressAttestation,
+) -> anyhow::Result<()> {
+    let mismatch = || anyhow::Error::from(IngressAttestationError::Mismatch("transport_digest"));
+    let raw = input.raw_payload_json.as_deref().ok_or_else(mismatch)?;
+    anyhow::ensure!(raw.len() <= MAX_RECOVERY_EVENT_BYTES, "oversized ingress payload");
+    let envelope: serde_json::Value = serde_json::from_str(raw).map_err(|_| mismatch())?;
+    let stored = envelope.get("prx_ingress_capsule").ok_or_else(mismatch)?;
+    let decoded = IngressCapsule::decode(&serde_json::to_string(stored)?).map_err(|_| mismatch())?;
+    if serde_json::to_vec(&decoded)? != serde_json::to_vec(capsule)? {
+        return Err(mismatch());
+    }
+    let original = match envelope.get("original_payload_json") {
+        Some(serde_json::Value::String(text)) => Some(text.as_str()),
+        Some(serde_json::Value::Null) | None => None,
+        Some(_) => return Err(mismatch()),
+    };
+    if input.event_id.as_deref() != Some(capsule.input_event_id.as_str()) {
+        return Err(mismatch());
+    }
+    let facts = PendingFacts::parse(&attestation.facts)?;
+    facts.check_capsule(capsule)?;
+    let tag_matches = facts.key_id == attestation.transport.key_id
+        && same_bytes(
+            facts.transport_digest.as_bytes(),
+            hex::encode(attestation.transport.tag).as_bytes(),
+        );
+    if !tag_matches {
+        return Err(mismatch());
+    }
+    match repo.verify_recovery_mac(
+        &attestation.transport,
+        super::recovery_authority::RecoveryMacDomain::TransportV3,
+        &transport_preimage(input, original),
+    ) {
+        Ok(()) => {}
+        Err(error) if super::recovery_authority::is_key_unavailable(&error) => return Err(error),
+        Err(_) => return Err(mismatch()),
+    }
+    attestation.verified = Some(VerifiedTransport {
+        input_event_id: capsule.input_event_id.clone(),
+    });
+    Ok(())
+}
+
+/// The stable input key was accepted before and its record was erased; this
+/// input is refused without a row.
+#[derive(Debug, thiserror::Error)]
+#[error("stable input key was accepted before and its record was erased")]
+pub struct StableKeyTombstoned;
+
+/// The tombstone fence could not load a key a tombstone in this scope needs.
+/// It carries no key id, digest or load error, and is deliberately not a
+/// `RecoveryKeyUnavailable`: no path may turn it into "unavailable, continue".
+#[derive(Debug)]
+pub struct StableKeyFenceUnavailable {
+    pub workspace: String,
+    pub source: String,
+}
+
+impl std::fmt::Display for StableKeyFenceUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stable input key fence unavailable: a recovery key needed by this scope is missing")
+    }
+}
+
+impl std::error::Error for StableKeyFenceUnavailable {}
 
 /// Why an attestation was refused. Each variant is a distinct, typed refusal.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -68,6 +233,8 @@ pub enum IngressAttestationError {
     Malformed,
     #[error("ingress attestation fact `{0}` does not match the input")]
     Mismatch(&'static str),
+    #[error("an accepted v3 ingress input has no attestation")]
+    Missing,
 }
 
 /// Refuse an attestation on a backend that has no recovery repository. The
@@ -118,6 +285,7 @@ pub struct PendingFacts {
     pub channel: Option<String>,
     pub session_key: Option<String>,
     pub surface: String,
+    /// The accepted input's config_generation_id, with None normalized to the sentinel 0. Bound for audit only: 0 does not distinguish "no generation" from generation 0, so consumers must not infer from this field whether the input carried a generation. The transport tag excludes the generation, so a retry under a new generation is not a conflict.
     pub generation: u64,
     pub lifetime: String,
     pub input_event_id: String,

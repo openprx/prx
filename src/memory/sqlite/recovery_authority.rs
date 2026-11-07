@@ -1,13 +1,11 @@
 //! Lazy recovery authority, owned by the SQLite writer transaction.
 use super::{SqliteMemory, recovery_keys::KeyDirectory};
-use crate::memory::ingress_recovery::{
-    IngressAttestation, IngressAttestationError, IngressCapsule, IngressRecoveryScope, PendingFacts,
-};
+use crate::memory::ingress_recovery::{IngressAttestation, IngressAttestationError, IngressCapsule, PendingFacts};
 use crate::memory::recovery_authority::{
     RecoveryChain, RecoveryEvidence, RecoveryFactsTooLarge, RecoveryKeyUnavailable, RecoveryMacDomain,
     RecoveryPublication, RecoveryReceipt, RecoveryRepository, RecoveryTag,
 };
-use crate::memory::traits::MessageEvent;
+use crate::memory::traits::{MessageEvent, MessageEventInput};
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::ValueRef};
 use serde::{Deserialize, Serialize};
@@ -424,38 +422,83 @@ fn same_hex(left: &str, right: &[u8]) -> bool {
     crate::memory::ingress_recovery::same_bytes(left.as_bytes(), hex::encode(right).as_bytes())
 }
 
-/// Whether this stable input key was accepted and later erased. The digest is
-/// checked under every key id stored for the scope, so a rotated-out key still
-/// matches; each comparison is `ring::hmac::verify`.
-pub(super) fn tombstoned(
+/// Outcome of the stable-key tombstone fence.
+pub(super) enum Fence {
+    Clear,
+    Tombstoned,
+}
+
+/// Whether a stable user input key was accepted and later erased. Backend-wide:
+/// it runs inside every append transaction for a user `message.created` input
+/// with a stable key, whether or not a recorder or the decision plane exists.
+/// It reads and refuses only: it never activates the authority, never creates
+/// `.recovery_keys`, a key or a table, and returns `Clear` with no key opened
+/// when the database holds no tombstone table or no tombstone for the scope.
+/// An owner scopes the match to `(workspace, owner, source)`; no owner matches
+/// by workspace alone, as the UNIQUE live dedup does. The digest is checked under
+/// every key id stored for the matching rows, each by `ring::hmac::verify`.
+/// A key a matching row needs but cannot load is a typed refusal.
+pub(super) fn stable_key_fence(
     conn: &Connection,
-    directory: &KeyDirectory,
-    scope: &IngressRecoveryScope,
-    input_key: &str,
-) -> anyhow::Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT key_id,input_key_digest FROM recovery_tombstones WHERE workspace_id=?1 AND owner_id=?2 AND source=?3",
+    key_root: Option<&std::path::Path>,
+    input: &MessageEventInput,
+) -> anyhow::Result<Fence> {
+    let Some(input_key) = input
+        .idempotency_key
+        .as_deref()
+        .filter(|_| input.role == "user" && input.event_type == "message.created")
+    else {
+        return Ok(Fence::Clear);
+    };
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='recovery_tombstones' AND type='table')",
+        [],
+        |r| r.get(0),
     )?;
-    let rows = stmt
-        .query_map(
-            params![scope.workspace_id, scope.owner_id, scope.source.as_str()],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !present {
+        return Ok(Fence::Clear);
+    }
+    let read = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?));
+    let rows = match &input.owner_id {
+        Some(owner) => conn
+            .prepare(
+                "SELECT key_id,input_key_digest FROM recovery_tombstones WHERE workspace_id=?1 AND owner_id=?2 AND source=?3",
+            )?
+            .query_map(params![input.workspace_id, owner, input.source.as_str()], read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        None => conn
+            .prepare("SELECT key_id,input_key_digest FROM recovery_tombstones WHERE workspace_id=?1")?
+            .query_map(params![input.workspace_id], read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    };
+    if rows.is_empty() {
+        return Ok(Fence::Clear);
+    }
+    // The load error is dropped on purpose: it must never match
+    // `is_key_unavailable` or leak a path.
+    let unavailable = || {
+        anyhow::Error::new(crate::memory::ingress_recovery::StableKeyFenceUnavailable {
+            workspace: input.workspace_id.clone(),
+            source: input.source.as_str().to_owned(),
+        })
+    };
+    let directory = key_root
+        .ok_or_else(unavailable)
+        .and_then(|root| KeyDirectory::open(root, false).map_err(|_| unavailable()))?;
     let signed = framed(RecoveryMacDomain::InputKeyV3.bytes(), input_key.as_bytes());
     let mut keys: std::collections::HashMap<String, ring::hmac::Key> = std::collections::HashMap::new();
     for (key_id, digest) in rows {
         if !keys.contains_key(&key_id) {
-            keys.insert(key_id.clone(), directory.load(&key_id)?);
+            keys.insert(key_id.clone(), directory.load(&key_id).map_err(|_| unavailable())?);
         }
         if keys
             .get(&key_id)
             .is_some_and(|key| ring::hmac::verify(key, &signed, &digest).is_ok())
         {
-            return Ok(true);
+            return Ok(Fence::Tombstoned);
         }
     }
-    Ok(false)
+    Ok(Fence::Clear)
 }
 
 fn same_fact(ok: bool, name: &'static str) -> anyhow::Result<()> {
@@ -485,10 +528,14 @@ pub(super) fn attest_ingress(
             .is_some_and(|surface| surface.as_str() == facts.surface),
         "surface",
     )?;
+    // Sentinel: None ⇒ 0; see PendingFacts::generation.
     same_fact(facts.generation == row.config_generation_id.unwrap_or(0), "generation")?;
+    // The transport tag was verified against the accepted plaintext input by the
+    // first layer that held it, and is bound here to the inserted event.
     same_fact(
-        attestation.transport.key_id == facts.key_id && same_hex(&facts.transport_digest, &attestation.transport.tag),
-        "transport_digest",
+        attestation.verified_input_event_id() == Some(row.event_id.as_str())
+            && attestation.verified_input_event_id() == Some(facts.input_event_id.as_str()),
+        "transport_binding",
     )?;
     let key = directory.load(&facts.key_id)?;
     same_fact(

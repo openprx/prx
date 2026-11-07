@@ -368,7 +368,10 @@ impl IngressRecorder {
         let attempted_digest = transport_digest(&input)?;
         // The keyed v3 preimage is the same transport tuple, serialized once.
         let attempted_transport = if self.memory.recovery_repository().is_some() {
-            Some(serde_json::to_vec(&transport_view(&input))?)
+            Some(crate::memory::ingress_recovery::transport_preimage(
+                &input,
+                input.raw_payload_json.as_deref(),
+            ))
         } else {
             None
         };
@@ -484,27 +487,28 @@ impl IngressRecorder {
                     .read_recovery_receipt(&chain)
             })
             .await?;
-            if let Some(receipt) = receipt {
-                let facts = PendingFacts::parse(&receipt.pending_facts()?)?;
-                facts.check_capsule(old)?;
-                let tag = RecoveryTag {
-                    key_id: facts.key_id.clone(),
-                    tag: hex::decode(&facts.transport_digest)?
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("invalid attested transport tag length"))?,
-                };
-                let repository = self
-                    .memory
-                    .recovery_repository()
-                    .context("recovery repository unavailable")?;
-                let attempted = attempted_transport.context("transport content unavailable")?;
-                return match repository.verify_recovery_mac(&tag, RecoveryMacDomain::TransportV3, attempted) {
-                    Ok(()) => Ok(()),
-                    // An unusable key is not a conflict: surface it unchanged.
-                    Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => Err(error),
-                    Err(_) => Err(IngressConflict.into()),
-                };
-            }
+            // A v3 capsule always has an attestation. Absence never selects the
+            // older digest compare: it refuses.
+            let receipt = receipt.ok_or(crate::memory::ingress_recovery::IngressAttestationError::Missing)?;
+            let facts = PendingFacts::parse(&receipt.pending_facts()?)?;
+            facts.check_capsule(old)?;
+            let tag = RecoveryTag {
+                key_id: facts.key_id.clone(),
+                tag: hex::decode(&facts.transport_digest)?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid attested transport tag length"))?,
+            };
+            let repository = self
+                .memory
+                .recovery_repository()
+                .context("recovery repository unavailable")?;
+            let attempted = attempted_transport.context("transport content unavailable")?;
+            return match repository.verify_recovery_mac(&tag, RecoveryMacDomain::TransportV3, attempted) {
+                Ok(()) => Ok(()),
+                // An unusable key is not a conflict: surface it unchanged.
+                Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => Err(error),
+                Err(_) => Err(IngressConflict.into()),
+            };
         }
         if transport_digest(previous)? == attempted_digest {
             Ok(())
@@ -952,6 +956,7 @@ fn pending_attestation(
         channel: input.channel.clone(),
         session_key: input.session_key.clone(),
         surface: surface.as_str().to_owned(),
+        // Sentinel: None ⇒ 0; see PendingFacts::generation.
         generation: input.config_generation_id.unwrap_or(0),
         lifetime: capsule.lifetime.clone(),
         input_event_id: capsule.input_event_id.clone(),
@@ -963,11 +968,11 @@ fn pending_attestation(
         input_key_digest: hex::encode(input_key.tag),
         key_id: key_id.to_owned(),
     };
-    Ok(IngressAttestation {
-        facts: serde_json::to_vec(&facts)?,
+    Ok(IngressAttestation::new(
+        serde_json::to_vec(&facts)?,
         transport,
         input_key,
-    })
+    ))
 }
 
 fn transport_view(input: &MessageEventInput) -> impl serde::Serialize {

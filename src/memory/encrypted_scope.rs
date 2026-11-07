@@ -771,6 +771,16 @@ impl Memory for EncryptedScope {
         attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
     ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
         let mut input = input;
+        let mut attestation = attestation;
+        if let Some(attestation) = attestation.as_mut().filter(|attestation| !attestation.is_verified()) {
+            // This is the first layer holding the plaintext input: verify the
+            // transport tag before sealing, so SQLite never recomputes over ciphertext.
+            let repository = self
+                .inner
+                .recovery_repository()
+                .ok_or(crate::memory::ingress_recovery::IngressAttestationError::Unsupported)?;
+            crate::memory::ingress_recovery::verify_transport(repository, &input, &capsule, attestation)?;
+        }
         self.seal_event_content(&mut input)?;
         if let Some(payload) = input.raw_payload_json.take() {
             let mut wrapper: serde_json::Value = serde_json::from_str(&payload)?;
