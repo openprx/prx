@@ -188,7 +188,52 @@ pub(super) fn admit_child(
     if !scope.gate_inputs().0.allowed.contains(&reference) {
         return Err(stale());
     }
-    pin.catalog.check_child_parity(service, scope).map_err(|_| stale())
+    pin.catalog.check_child_parity(service, scope).map_err(|_| stale())?;
+    // Both launchers need live depth and a verified outgoing authority; the
+    // launcher bodies repeat their own checks, but none may be reached without them.
+    if matches!(name, "delegate" | "sessions_spawn") {
+        let depth = scope.gate_inputs().0.authority.remaining_depth;
+        if depth == 0 || (context.child_grant.is_none() && context.ordinary_child_publication.is_none()) {
+            return Err((
+                ToolExecutionStatus::Denied,
+                format!("tool '{name}' has no spawn depth or parent authority for this child"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Combines the parent policy decision with the child manifest autonomy by
+/// Deny > Ask > Allow. A child can only tighten the parent decision.
+pub(super) fn child_autonomy(
+    context: &ToolExecutionContext,
+    descriptor: &ToolDescriptor,
+    decision: super::ToolExecutionDecision,
+) -> super::ToolExecutionDecision {
+    use super::ToolExecutionDecision::{Allow, Ask, Deny};
+    use crate::security::policy::AutonomyLevel;
+    let Some(scope) = &context.child_scope else {
+        return decision;
+    };
+    let name = if descriptor.adapter == super::ToolAdapterKind::Skill {
+        &descriptor.backend_name
+    } else {
+        &descriptor.public_name
+    };
+    let child = if crate::security::policy::is_read_only_tool(name) {
+        Allow
+    } else {
+        match scope.gate_inputs().0.authority.level {
+            AutonomyLevel::Full => Allow,
+            AutonomyLevel::Supervised => Ask,
+            AutonomyLevel::ReadOnly => Deny,
+        }
+    };
+    match (decision, child) {
+        (Deny, _) | (_, Deny) => Deny,
+        (Ask, _) | (_, Ask) => Ask,
+        _ => Allow,
+    }
 }
 
 pub(super) fn admit(

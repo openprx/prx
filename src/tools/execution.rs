@@ -2760,7 +2760,7 @@ impl ToolExecutionService {
             }
         };
 
-        let decision = self.policy.decide(&descriptor, &context);
+        let decision = admission::child_autonomy(&context, &descriptor, self.policy.decide(&descriptor, &context));
         // A call the tool itself only accepts with a signed one-shot grant
         // needs a human approval at every autonomy level, also where policy
         // would allow it. Deny stays Deny.

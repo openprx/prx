@@ -611,6 +611,11 @@ mod child_fixture {
         }
 
         pub(super) fn owned_by(members: &[&str], owner: &str) -> Self {
+            Self::build(members, owner, AutonomyLevel::Full, 2)
+        }
+
+        /// `depth` is the parent's remaining depth; the child holds one less.
+        pub(super) fn build(members: &[&str], owner: &str, level: AutonomyLevel, depth: u8) -> Self {
             let fixture = fixture();
             let drift = Arc::new(AtomicUsize::new(0));
             let tools = |state: &Arc<AtomicUsize>| -> Vec<Box<dyn Tool>> {
@@ -634,6 +639,20 @@ mod child_fixture {
                         arguments: Arc::clone(&fixture.arguments),
                         stages: Arc::clone(&fixture.stages),
                     }),
+                    Box::new(RecordingTool {
+                        root_name: "delegate",
+                        aliases: vec![],
+                        calls: Arc::clone(&fixture.calls),
+                        arguments: Arc::clone(&fixture.arguments),
+                        stages: Arc::clone(&fixture.stages),
+                    }),
+                    Box::new(RecordingTool {
+                        root_name: "sessions_spawn",
+                        aliases: vec![],
+                        calls: Arc::clone(&fixture.calls),
+                        arguments: Arc::clone(&fixture.arguments),
+                        stages: Arc::clone(&fixture.stages),
+                    }),
                 ]
             };
             let catalog = Arc::new(
@@ -647,7 +666,9 @@ mod child_fixture {
                     stages: Arc::clone(&fixture.stages),
                 }),
                 Arc::new(FixedApproval {
-                    decision: approved(),
+                    decision: ToolApprovalDecision::Denied {
+                        reason: "no approver".into(),
+                    },
                     stages: Arc::clone(&fixture.stages),
                 }),
                 Arc::new(RecordingPreparation {
@@ -670,16 +691,22 @@ mod child_fixture {
             let key = DecisionKey::ephemeral();
             let parent = CapabilityConstraints {
                 parent_authority_id: crate::causal_tree::ids::DecisionId::legacy(&[7; 32]).into(),
-                allowed: ["config_reload", "file_write", "message_send"]
-                    .into_iter()
-                    .map(reference)
-                    .collect(),
+                allowed: [
+                    "config_reload",
+                    "file_write",
+                    "message_send",
+                    "delegate",
+                    "sessions_spawn",
+                ]
+                .into_iter()
+                .map(reference)
+                .collect(),
                 authority: AuthorityEnvelope {
                     owner: owner.into(),
                     workspace: "workspace-a".into(),
-                    level: AutonomyLevel::Full,
+                    level,
                     max_cost_cents: 100,
-                    remaining_depth: 2,
+                    remaining_depth: depth,
                     delegation: None,
                 },
                 catalog_generation: *catalog.generation(),
@@ -844,4 +871,70 @@ async fn child_owner_is_never_derived_from_channel_or_sender() {
         ToolExecutionStatus::StaleCapability
     );
     assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn readonly_child_denies_every_non_read_only_class() {
+    let case = child_fixture::ChildCase::build(
+        &["config_reload", "file_write", "delegate", "sessions_spawn"],
+        "owner-a",
+        AutonomyLevel::ReadOnly,
+        2,
+    );
+    for name in ["config_reload", "file_write", "delegate", "sessions_spawn"] {
+        assert!(!crate::security::policy::is_read_only_tool(name), "{name}");
+        assert_eq!(
+            case.call(name, case.context(true, true)).await,
+            ToolExecutionStatus::Denied,
+            "{name}"
+        );
+    }
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 0);
+    assert!(!case.fixture.stages.lock().contains(&"approval"));
+}
+
+#[tokio::test]
+async fn supervised_child_under_full_parent_asks() {
+    let case = child_fixture::ChildCase::build(
+        &["config_reload", "file_write"],
+        "owner-a",
+        AutonomyLevel::Supervised,
+        2,
+    );
+    // The service policy allows every call, as a Full parent does.
+    assert_eq!(
+        case.call("config_reload", case.context(true, true)).await,
+        ToolExecutionStatus::ApprovalDenied
+    );
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        case.fixture
+            .stages
+            .lock()
+            .iter()
+            .filter(|stage| **stage == "approval")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn spawn_without_parent_authority_is_refused() {
+    // Live depth but no outgoing grant or ordinary publication, then depth zero.
+    for depth in [2, 1] {
+        let case = child_fixture::ChildCase::build(
+            &["config_reload", "delegate", "sessions_spawn"],
+            "owner-a",
+            AutonomyLevel::Full,
+            depth,
+        );
+        for name in ["delegate", "sessions_spawn"] {
+            assert_eq!(
+                case.call(name, case.context(true, true)).await,
+                ToolExecutionStatus::Denied,
+                "{name} at parent depth {depth}"
+            );
+        }
+        assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 0);
+    }
 }
