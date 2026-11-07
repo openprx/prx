@@ -73,6 +73,8 @@ struct ReplayBinding {
     parent: Option<ReplayParent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operator: Option<operator::ReplayOperator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    journal_version: Option<u8>,
     workspace_id: String,
     store_workspace_id: String,
     owner_id: String,
@@ -239,10 +241,22 @@ impl PreparedReplay {
         }
         let mut hops = Vec::with_capacity(link.context.hop_ids().len());
         for (position, hop) in link.context.audit_hops().enumerate() {
-            let row = recorded
-                .reader
-                .replay_record(&scope, &hop.decision_id)?
-                .context("decision replay row is missing")?;
+            let row = if REPLAY_EVIDENCE_AUTHORITY {
+                read_journal_replay_record(
+                    &link.workspace_dir,
+                    &recorded.key,
+                    &recorded.store_workspace_id,
+                    owner,
+                    &hop.decision_id,
+                )
+                .await?
+                .context("decision replay row is missing")?
+            } else {
+                recorded
+                    .reader
+                    .replay_record(&scope, &hop.decision_id)?
+                    .context("decision replay row is missing")?
+            };
             anyhow::ensure!(
                 row.decision.enabled_snapshot
                     && !row.decision.legacy_v1
@@ -319,10 +333,22 @@ impl PreparedReplay {
         let parent = if let Some(grant) = &link.parent_grant {
             let parent_id = grant.scope().gate_inputs().0.parent_authority_id.decision_grant_id();
             let (store_workspace, expected_digest) = grant.parent_record_binding();
-            let row = recorded
-                .reader
-                .replay_record(&scope, &parent_id)?
-                .context("parent decision replay row is missing")?;
+            let row = if REPLAY_EVIDENCE_AUTHORITY {
+                read_journal_replay_record(
+                    &link.workspace_dir,
+                    &recorded.key,
+                    &recorded.store_workspace_id,
+                    owner,
+                    &parent_id,
+                )
+                .await?
+                .context("parent decision replay row is missing")?
+            } else {
+                recorded
+                    .reader
+                    .replay_record(&scope, &parent_id)?
+                    .context("parent decision replay row is missing")?
+            };
             let proof = grant.parent();
             anyhow::ensure!(
                 store_workspace == recorded.store_workspace_id.as_ref()
@@ -424,6 +450,7 @@ impl PreparedReplay {
             served_auxiliary: None,
             parent,
             operator,
+            journal_version: REPLAY_EVIDENCE_AUTHORITY.then_some(3),
             workspace_id: trusted.workspace_id.to_string(),
             store_workspace_id: recorded.store_workspace_id.to_string(),
             owner_id: owner.to_owned(),
@@ -674,33 +701,8 @@ pub(crate) async fn verify_terminal_replay_until(
     .await
 }
 
-async fn verify_terminal_replay_inner(
-    memory: &dyn Memory,
-    rows: ReplayRows<'_>,
-    key: &DecisionKey,
-    store_workspace_id: &str,
-    workspace_id: &str,
-    owner_id: &str,
-    terminal_id: &str,
-    event: &MessageEvent,
-    bounded: Option<(std::time::Instant, &Arc<crate::runtime::turn_cleanup::CleanupTracker>)>,
-) -> anyhow::Result<VerifiedTerminalReplay> {
-    anyhow::ensure!(
-        event.id > 0
-            && !event.event_id.is_empty()
-            && event.workspace_id == workspace_id
-            && event.owner_id.as_deref() == Some(owner_id)
-            && event.role == "event"
-            && event.event_type == "turn.finalized"
-            && crate::runtime::turn_source::ingress_event_surface(
-                &event.source,
-                event.channel.as_deref(),
-                &event.visibility
-            )
-            .is_some()
-            && event.idempotency_key.as_deref() == Some(format!("turn:{terminal_id}:final").as_str()),
-        "terminal replay scope does not match its owner"
-    );
+/// MAC-authenticates a terminal marker and strictly decodes its replay binding.
+fn authenticate_replay_binding(key: &DecisionKey, event: &MessageEvent) -> anyhow::Result<(Value, ReplayBinding)> {
     let mut payload: Value = serde_json::from_str(
         event
             .raw_payload_json
@@ -728,6 +730,43 @@ async fn verify_terminal_replay_inner(
             .context("terminal replay binding is missing")?
             .clone(),
     )?;
+    Ok((payload, binding))
+}
+
+/// The durable store UUID bound by the authenticated terminal marker.
+pub(crate) fn authenticated_replay_store_workspace(key: &DecisionKey, event: &MessageEvent) -> anyhow::Result<String> {
+    let (_, binding) = authenticate_replay_binding(key, event)?;
+    Ok(binding.store_workspace_id)
+}
+
+async fn verify_terminal_replay_inner(
+    memory: &dyn Memory,
+    rows: ReplayRows<'_>,
+    key: &DecisionKey,
+    store_workspace_id: &str,
+    workspace_id: &str,
+    owner_id: &str,
+    terminal_id: &str,
+    event: &MessageEvent,
+    bounded: Option<(std::time::Instant, &Arc<crate::runtime::turn_cleanup::CleanupTracker>)>,
+) -> anyhow::Result<VerifiedTerminalReplay> {
+    anyhow::ensure!(
+        event.id > 0
+            && !event.event_id.is_empty()
+            && event.workspace_id == workspace_id
+            && event.owner_id.as_deref() == Some(owner_id)
+            && event.role == "event"
+            && event.event_type == "turn.finalized"
+            && crate::runtime::turn_source::ingress_event_surface(
+                &event.source,
+                event.channel.as_deref(),
+                &event.visibility
+            )
+            .is_some()
+            && event.idempotency_key.as_deref() == Some(format!("turn:{terminal_id}:final").as_str()),
+        "terminal replay scope does not match its owner"
+    );
+    let (payload, binding) = authenticate_replay_binding(key, event)?;
     anyhow::ensure!(
         binding.version == 1
             && binding.workspace_id == workspace_id

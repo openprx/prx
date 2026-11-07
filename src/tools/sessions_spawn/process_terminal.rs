@@ -2,9 +2,12 @@
 mod launch;
 pub(super) mod operator;
 pub(super) mod ordinary;
-use crate::agent::terminal::{TurnTerminalStatus, verify_terminal_replay};
+use crate::agent::terminal::{
+    REPLAY_EVIDENCE_AUTHORITY, TurnTerminalStatus, verify_terminal_replay, verify_terminal_replay_journal,
+};
 use crate::causal_tree::store::CausalDecisionStore;
 use crate::memory::{MemoryFabric, MessageEvent, MessageEventSource, MessageEventSubject};
+use crate::runtime::child_source::authority_journal;
 use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
 use crate::runtime::child_source::{ChildInputReceipt, IssuedChildGrant};
 use crate::session_worker::protocol::WorkerResult;
@@ -544,18 +547,21 @@ async fn verify_bound(
         );
     }
     let mut usage_records = Vec::new();
-    let store = CausalDecisionStore::open_unshared_read_only(provenance.workspace);
-    let actual_store = repair_store.unwrap_or(&store);
-    anyhow::ensure!(
-        actual_store.workspace_id().as_deref() == Some(provenance.store_workspace),
-        "worker completion decision store differs from original namespace"
-    );
-    let reader = actual_store.reader();
-    let memory = fabric.memory();
-    let scope = crate::causal_tree::store::DecisionScope::Owner {
-        workspace_id: std::sync::Arc::from(provenance.store_workspace),
-        owner_id: std::sync::Arc::from(provenance.owner),
+    let store =
+        (!REPLAY_EVIDENCE_AUTHORITY).then(|| CausalDecisionStore::open_unshared_read_only(provenance.workspace));
+    let reader = if REPLAY_EVIDENCE_AUTHORITY {
+        None
+    } else {
+        let actual_store = repair_store
+            .or(store.as_deref())
+            .context("worker completion decision store missing")?;
+        anyhow::ensure!(
+            actual_store.workspace_id().as_deref() == Some(provenance.store_workspace),
+            "worker completion decision store differs from original namespace"
+        );
+        Some(actual_store.reader())
     };
+    let memory = fabric.memory();
     for reference in &evidence.segments {
         let event = read_terminal(
             fabric,
@@ -573,17 +579,31 @@ async fn verify_bound(
                 && event.config_source_revision == source.config_source_revision,
             "worker segment terminal lineage differs from task"
         );
-        let replay = verify_terminal_replay(
-            memory.as_ref(),
-            &reader,
-            provenance.key,
-            provenance.store_workspace,
-            fabric.workspace_id(),
-            provenance.owner,
-            &reference.terminal_id,
-            &event,
-        )
-        .await?;
+        let replay = if REPLAY_EVIDENCE_AUTHORITY {
+            verify_terminal_replay_journal(
+                memory.as_ref(),
+                provenance.workspace,
+                provenance.key,
+                provenance.store_workspace,
+                fabric.workspace_id(),
+                provenance.owner,
+                &reference.terminal_id,
+                &event,
+            )
+            .await?
+        } else {
+            verify_terminal_replay(
+                memory.as_ref(),
+                reader.as_ref().context("worker completion decision reader missing")?,
+                provenance.key,
+                provenance.store_workspace,
+                fabric.workspace_id(),
+                provenance.owner,
+                &reference.terminal_id,
+                &event,
+            )
+            .await?
+        };
         anyhow::ensure!(
             replay.parent_decision_id() == Some(provenance.parent_decision.decision_grant_id())
                 && replay.parent_digest() == Some(provenance.parent_digest)
@@ -600,47 +620,63 @@ async fn verify_bound(
         )?
         .with_verified_resume(&replay);
         let outcome = crate::causal_tree::outcome::OutcomeCorrelator::persisted_record(replay.decision(), &facts)?;
-        JournalChildOutcomeHook::new(
+        let hook = JournalChildOutcomeHook::new(
             provenance.workspace.to_path_buf(),
             std::sync::Arc::clone(provenance.key),
             std::sync::Arc::from(provenance.store_workspace),
-        )
-        .persist(&replay, &event, None, None)
-        .await?;
-        let link = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &outcome)
-            .context("worker segment outcome lineage is inconsistent")?;
-        if !reader.child_outcome_matches(&scope, &link)? {
-            let writer = repair_store
-                .and_then(CausalDecisionStore::writer)
-                .context("worker parent outcome repair requires an existing owned writer")?;
+        );
+        hook.persist(&replay, &event, None, None).await?;
+        if REPLAY_EVIDENCE_AUTHORITY {
             anyhow::ensure!(
-                writer.record_outcome(outcome.clone()) == crate::causal_tree::store::Enqueue::Queued,
-                "recovered worker outcome could not be queued"
+                authority_journal::verify_child_outcome(
+                    provenance.workspace,
+                    provenance.key,
+                    &hook.expected_row(&replay, &event)?,
+                    Some(authority_journal::JOURNAL_REQUIRED_VERSION),
+                )?,
+                "worker segment child outcome is missing or conflicts"
             );
+        } else {
+            let reader = reader.as_ref().context("worker completion decision reader missing")?;
+            let scope = crate::causal_tree::store::DecisionScope::Owner {
+                workspace_id: std::sync::Arc::from(provenance.store_workspace),
+                owner_id: std::sync::Arc::from(provenance.owner),
+            };
+            let link = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &outcome)
+                .context("worker segment outcome lineage is inconsistent")?;
+            if !reader.child_outcome_matches(&scope, &link)? {
+                let writer = repair_store
+                    .and_then(CausalDecisionStore::writer)
+                    .context("worker parent outcome repair requires an existing owned writer")?;
+                anyhow::ensure!(
+                    writer.record_outcome(outcome.clone()) == crate::causal_tree::store::Enqueue::Queued,
+                    "recovered worker outcome could not be queued"
+                );
+                anyhow::ensure!(
+                    writer
+                        .drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                        .await
+                        && reader.outcome_matches(&scope, &outcome)?,
+                    "recovered worker outcome is missing or conflicts"
+                );
+                let repair = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &outcome)
+                    .context("recovered worker outcome lineage changed")?;
+                anyhow::ensure!(
+                    writer.record_child_outcome(repair) == crate::causal_tree::store::Enqueue::Queued,
+                    "recovered worker parent link could not be queued"
+                );
+                anyhow::ensure!(
+                    writer
+                        .drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                        .await,
+                    "recovered worker parent link persistence is unconfirmed"
+                );
+            }
             anyhow::ensure!(
-                writer
-                    .drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
-                    .await
-                    && reader.outcome_matches(&scope, &outcome)?,
-                "recovered worker outcome is missing or conflicts"
-            );
-            let repair = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &outcome)
-                .context("recovered worker outcome lineage changed")?;
-            anyhow::ensure!(
-                writer.record_child_outcome(repair) == crate::causal_tree::store::Enqueue::Queued,
-                "recovered worker parent link could not be queued"
-            );
-            anyhow::ensure!(
-                writer
-                    .drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
-                    .await,
-                "recovered worker parent link persistence is unconfirmed"
+                reader.child_outcome_matches(&scope, &link)?,
+                "worker segment parent outcome link is missing or inconsistent"
             );
         }
-        anyhow::ensure!(
-            reader.child_outcome_matches(&scope, &link)?,
-            "worker segment parent outcome link is missing or inconsistent"
-        );
         let payload: serde_json::Value = serde_json::from_str(
             event
                 .raw_payload_json
@@ -707,12 +743,16 @@ async fn recover_usage_bound(
     );
     let task = source.run_id.as_deref().context("worker recovery task missing")?;
     let memory = fabric.memory();
-    let store = CausalDecisionStore::open_unshared_read_only(provenance.workspace);
-    anyhow::ensure!(
-        store.workspace_id().as_deref() == Some(provenance.store_workspace),
-        "worker usage recovery decision store differs from original namespace"
-    );
-    let reader = store.reader();
+    let reader = if REPLAY_EVIDENCE_AUTHORITY {
+        None
+    } else {
+        let store = CausalDecisionStore::open_unshared_read_only(provenance.workspace);
+        anyhow::ensure!(
+            store.workspace_id().as_deref() == Some(provenance.store_workspace),
+            "worker usage recovery decision store differs from original namespace"
+        );
+        Some(store.reader())
+    };
     let mut recovered = RecoveredWorkerUsage {
         records: Vec::new(),
         unfinished_segments: 0,
@@ -751,17 +791,33 @@ async fn recover_usage_bound(
             )
             .await?
         {
-            let replay = verify_terminal_replay(
-                memory.as_ref(),
-                &reader,
-                provenance.key,
-                provenance.store_workspace,
-                fabric.workspace_id(),
-                provenance.owner,
-                &run,
-                &event,
-            )
-            .await?;
+            let replay = if REPLAY_EVIDENCE_AUTHORITY {
+                verify_terminal_replay_journal(
+                    memory.as_ref(),
+                    provenance.workspace,
+                    provenance.key,
+                    provenance.store_workspace,
+                    fabric.workspace_id(),
+                    provenance.owner,
+                    &run,
+                    &event,
+                )
+                .await?
+            } else {
+                verify_terminal_replay(
+                    memory.as_ref(),
+                    reader
+                        .as_ref()
+                        .context("worker usage recovery decision reader missing")?,
+                    provenance.key,
+                    provenance.store_workspace,
+                    fabric.workspace_id(),
+                    provenance.owner,
+                    &run,
+                    &event,
+                )
+                .await?
+            };
             anyhow::ensure!(
                 replay.parent_decision_id() == Some(provenance.parent_decision.decision_grant_id())
                     && replay.parent_digest() == Some(provenance.parent_digest)
@@ -886,7 +942,11 @@ async fn recover_from_launch(
     )?;
     // All transport, inventory, logical terminal and segment replay checks are
     // shared with normal completion. Journal presence alone grants nothing.
-    let repair_store = CausalDecisionStore::existing_shared_writer(provenance.workspace);
+    let repair_store = if REPLAY_EVIDENCE_AUTHORITY {
+        None
+    } else {
+        CausalDecisionStore::existing_shared_writer(provenance.workspace)
+    };
     verify_bound(
         fabric,
         &provenance,

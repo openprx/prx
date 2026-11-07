@@ -11,8 +11,8 @@ mod replay;
 pub(crate) use replay::reseal_payload_for_test;
 pub(crate) mod served_auxiliary;
 pub(crate) use replay::{
-    REPLAY_EVIDENCE_AUTHORITY, VerifiedTerminalReplay, verify_terminal_replay, verify_terminal_replay_journal,
-    verify_terminal_replay_until,
+    REPLAY_EVIDENCE_AUTHORITY, VerifiedTerminalReplay, authenticated_replay_store_workspace,
+    read_journal_replay_record, verify_terminal_replay, verify_terminal_replay_journal, verify_terminal_replay_until,
 };
 
 use crate::causal_tree::ids::DecisionId;
@@ -289,10 +289,12 @@ impl DecisionSettlementRef {
             .recorded
             .as_ref()
             .context("disabled decision has no durable settlement")?;
-        anyhow::ensure!(
-            recorded.writer.drain(Instant::now() + Duration::from_secs(5)).await,
-            "decision chain did not reach durable storage before terminal claim"
-        );
+        if !REPLAY_EVIDENCE_AUTHORITY {
+            anyhow::ensure!(
+                recorded.writer.drain(Instant::now() + Duration::from_secs(5)).await,
+                "decision chain did not reach durable storage before terminal claim"
+            );
+        }
         let trusted = self
             .context
             .audit_hops()
@@ -301,15 +303,29 @@ impl DecisionSettlementRef {
             .state
             .trusted
             .parts();
+        let owner_id = trusted.owner_id.clone().context("decision has no owner")?;
         let scope = DecisionScope::Owner {
             workspace_id: Arc::clone(&recorded.store_workspace_id),
-            owner_id: trusted.owner_id.clone().context("decision has no owner")?,
+            owner_id: Arc::clone(&owner_id),
         };
         for (position, id) in self.context.hop_ids().iter().enumerate() {
-            let view = recorded
-                .reader
-                .get(&scope, id)?
-                .context("queued decision hop was not durably stored")?;
+            let view = if REPLAY_EVIDENCE_AUTHORITY {
+                read_journal_replay_record(
+                    &self.workspace_dir,
+                    &recorded.key,
+                    &recorded.store_workspace_id,
+                    &owner_id,
+                    id,
+                )
+                .await?
+                .context("queued decision hop was not durably stored")?
+                .decision
+            } else {
+                recorded
+                    .reader
+                    .get(&scope, id)?
+                    .context("queued decision hop was not durably stored")?
+            };
             anyhow::ensure!(
                 view.enabled_snapshot
                     && !view.legacy_v1
