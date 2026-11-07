@@ -822,18 +822,3 @@ fn verify_launch_parent(worker: &WorkerManifest, workspace: &Path, key: &Decisio
     );
     Ok(())
 }
-
-/// Replaces one sealed `launch_parent` row so tests can reseal it for another run.
-#[cfg(test)]
-pub(crate) fn reseal_launch_parent_for_test(
-    workspace: &Path,
-    key: &DecisionKey,
-    key_run: &str,
-    launch: &LaunchParentRow,
-) -> anyhow::Result<()> {
-    let conn = open_writer(workspace)?;
-    let entry = seal_entry(key, LAUNCH_PARENT_DOMAIN, serde_json::to_string(launch)?)?;
-    let updated = conn.execute("UPDATE launch_parent SET entry=?1 WHERE run=?2", (entry, key_run))?;
-    anyhow::ensure!(updated == 1, "test: the launch parent row existed before resealing");
-    Ok(())
-}
