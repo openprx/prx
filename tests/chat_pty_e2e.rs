@@ -1361,7 +1361,6 @@ fn test_chat_plain_resume_command_switches_saved_session_no_tui_chrome() {
     );
     let session = sg.session();
     let mut output = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
-    drain_with_dsr(session, Duration::from_millis(200));
 
     session.send("beta question\r").expect("send beta question");
     output.push_str(&read_until_with_dsr(session, "BETA_REPLY", TURN_TIMEOUT));
@@ -1378,7 +1377,7 @@ fn test_chat_plain_resume_command_switches_saved_session_no_tui_chrome() {
     );
 
     session.send("/cost\r").expect("send /cost");
-    output.push_str(&read_until_with_dsr(session, "Turns:", TURN_TIMEOUT));
+    output.push_str(&read_until_with_dsr(session, "Turns:        2", TURN_TIMEOUT));
     assert!(
         output.contains("Turns:        2"),
         "cost after /resume should reflect alpha session's exact two persisted turns; output:\n{output}"
@@ -1392,7 +1391,11 @@ fn test_chat_plain_resume_command_switches_saved_session_no_tui_chrome() {
     );
 
     session.send("/exit\r").expect("send /exit");
-    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat did not exit");
+    assert!(
+        matches!(session.reaped, Some(expectrl::WaitStatus::Exited(_, 0))),
+        "chat did not exit successfully"
+    );
 }
 
 #[test]
