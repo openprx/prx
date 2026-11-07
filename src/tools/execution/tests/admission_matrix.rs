@@ -599,6 +599,7 @@ mod child_fixture {
         pub(super) service: ToolExecutionService,
         pub(super) drift: Arc<AtomicUsize>,
         pub(super) key: Arc<DecisionKey>,
+        pub(super) owner: String,
         pub(super) catalog: Arc<CapabilityCatalog>,
         pub(super) scope: Arc<VerifiedChildScope>,
     }
@@ -606,6 +607,10 @@ mod child_fixture {
     impl ChildCase {
         /// `members` names the registered tools the sealed manifest allows.
         pub(super) fn new(members: &[&str]) -> Self {
+            Self::owned_by(members, "owner-a")
+        }
+
+        pub(super) fn owned_by(members: &[&str], owner: &str) -> Self {
             let fixture = fixture();
             let drift = Arc::new(AtomicUsize::new(0));
             let tools = |state: &Arc<AtomicUsize>| -> Vec<Box<dyn Tool>> {
@@ -670,7 +675,7 @@ mod child_fixture {
                     .map(reference)
                     .collect(),
                 authority: AuthorityEnvelope {
-                    owner: "owner-a".into(),
+                    owner: owner.into(),
                     workspace: "workspace-a".into(),
                     level: AutonomyLevel::Full,
                     max_cost_cents: 100,
@@ -688,6 +693,7 @@ mod child_fixture {
                 service,
                 drift,
                 key,
+                owner: owner.into(),
                 catalog,
                 scope,
             }
@@ -701,7 +707,7 @@ mod child_fixture {
                 Arc::new(ChildDispatchPin {
                     catalog: Arc::clone(&self.catalog),
                     key: Arc::clone(&self.key),
-                    owner: "owner-a".into(),
+                    owner: self.owner.clone(),
                     workspace: "workspace-a".into(),
                 })
             });
@@ -783,10 +789,59 @@ async fn child_provenance_without_scope_is_stale() {
         case.call("config_reload", foreign_key).await,
         ToolExecutionStatus::StaleCapability
     );
+    // A foreign workspace and a catalog of another generation also refuse.
+    let mut foreign_workspace = case.context(true, true);
+    foreign_workspace.envelope.workspace_id = "workspace-b".into();
+    assert_eq!(
+        case.call("config_reload", foreign_workspace).await,
+        ToolExecutionStatus::StaleCapability
+    );
+    let other_catalog = Arc::new(
+        CapabilityCatalog::build(
+            &[Box::new(RecordingTool {
+                root_name: "config_reload",
+                aliases: vec![],
+                calls: Arc::clone(&case.fixture.calls),
+                arguments: Arc::clone(&case.fixture.arguments),
+                stages: Arc::clone(&case.fixture.stages),
+            }) as Box<dyn Tool>],
+            &CatalogSources::default(),
+            &SurfacePolicy::default(),
+        )
+        .unwrap(),
+    );
+    assert_ne!(other_catalog.generation(), case.catalog.generation());
+    let mut stale_generation = case.context(true, true);
+    stale_generation.child_pin = Some(Arc::new(crate::tools::capability::child::ChildDispatchPin {
+        catalog: other_catalog,
+        key: Arc::clone(&case.key),
+        owner: "owner-a".into(),
+        workspace: "workspace-a".into(),
+    }));
+    assert_eq!(
+        case.call("config_reload", stale_generation).await,
+        ToolExecutionStatus::StaleCapability
+    );
     assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         case.call("config_reload", case.context(true, true)).await,
         ToolExecutionStatus::Succeeded
     );
     assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn child_owner_is_never_derived_from_channel_or_sender() {
+    let mut cleared = context();
+    cleared.envelope.owner_id = None;
+    let derived = cleared.envelope.resolved_owner_id();
+    assert_ne!(derived, "owner-a");
+    let case = child_fixture::ChildCase::owned_by(&["config_reload"], &derived);
+    let mut context = case.context(true, true);
+    context.envelope.owner_id = None;
+    assert_eq!(
+        case.call("config_reload", context).await,
+        ToolExecutionStatus::StaleCapability
+    );
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 0);
 }

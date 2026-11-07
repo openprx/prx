@@ -117,6 +117,24 @@ pub(crate) struct ChildDispatchPin {
     pub(crate) workspace: String,
 }
 
+impl ChildDispatchPin {
+    /// Pins a verified scope to the catalog it was issued against. The runtime
+    /// key is the scope's own sealed parent key, never a caller-supplied value.
+    pub(crate) fn for_scope(
+        scope: &VerifiedChildScope,
+        catalog: Arc<super::catalog::CapabilityCatalog>,
+        owner: &str,
+        workspace: &str,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            catalog,
+            key: Arc::clone(&scope.gate_inputs().1.key),
+            owner: owner.to_owned(),
+            workspace: workspace.to_owned(),
+        })
+    }
+}
+
 impl std::fmt::Debug for ChildDispatchPin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChildDispatchPin").finish_non_exhaustive()

@@ -634,6 +634,21 @@ impl ToolExecutionContext {
         }
     }
 
+    /// Carries the authenticated incoming child authority from a child source
+    /// proof. Child provenance without a verified scope and pin is refused here.
+    pub(crate) fn with_incoming_child(
+        mut self,
+        proof: &dyn crate::runtime::turn_source::TurnSourceProof,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            proof.child_scope().is_some() && proof.child_pin().is_some(),
+            "child provenance requires a verified scope and pinned catalog"
+        );
+        self.child_scope = proof.child_scope().cloned();
+        self.child_pin = proof.child_pin().cloned();
+        Ok(self)
+    }
+
     /// Deny every call that would otherwise wait for approval.
     #[must_use]
     pub(crate) const fn with_pending_approval_denied(mut self) -> Self {

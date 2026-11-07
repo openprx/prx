@@ -156,7 +156,10 @@ pub(super) fn admit_child(
         (Some(scope), Some(pin)) => (scope, pin),
         _ => return Err(stale()),
     };
-    if context.envelope.workspace_id != pin.workspace || context.envelope.resolved_owner_id() != pin.owner {
+    // The owner must be the envelope's own, never a principal derived from channel or sender.
+    if context.envelope.workspace_id != pin.workspace
+        || context.envelope.owner_id.as_deref() != Some(pin.owner.as_str())
+    {
         return Err(stale());
     }
     scope

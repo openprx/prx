@@ -111,7 +111,7 @@ impl OrdinaryProcessSegments {
                 envelope.lease_epoch = scope.lease_epoch;
                 envelope.config_generation_id = scope.config_generation_id;
                 envelope.config_source_revision = scope.config_source_revision;
-                ToolExecutionContext::new(envelope, proof.policy_chat_type())
+                ToolExecutionContext::new(envelope, proof.policy_chat_type()).with_incoming_child(proof.as_ref())?
             }
         };
         self.authority.verify_source(proof.as_ref())?;

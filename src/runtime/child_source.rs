@@ -245,10 +245,7 @@ impl ChildInputReceipt {
         envelope.authority_guard = self.authority_guard.clone();
         envelope.config_generation_id = Some(proof.config_generation_id());
         envelope.config_source_revision = Some(proof.config_source_revision().to_owned());
-        Ok(crate::tools::ToolExecutionContext::new(
-            envelope,
-            proof.policy_chat_type(),
-        ))
+        crate::tools::ToolExecutionContext::new(envelope, proof.policy_chat_type()).with_incoming_child(proof)
     }
 }
 
@@ -1556,7 +1553,8 @@ impl ChildProviderBinding {
         envelope.authority_guard = bound.authority_guard;
         envelope.config_generation_id = Some(proof.config_generation_id());
         envelope.config_source_revision = Some(proof.config_source_revision().to_owned());
-        let execution = crate::tools::ToolExecutionContext::new(envelope, proof.policy_chat_type());
+        let execution = crate::tools::ToolExecutionContext::new(envelope, proof.policy_chat_type())
+            .with_incoming_child(proof.as_ref())?;
         Ok((proof, execution))
     }
 
