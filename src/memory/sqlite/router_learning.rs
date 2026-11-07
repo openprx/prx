@@ -11,6 +11,20 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Lazy tables: created, and given their scope column, in the first writer's transaction.
+pub(super) fn schema(tx: &rusqlite::Connection) -> anyhow::Result<()> {
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS router_learning_state (
+        domain TEXT PRIMARY KEY, version INTEGER NOT NULL, snapshot TEXT NOT NULL CHECK(length(CAST(snapshot AS BLOB)) <= 262144));
+        CREATE TABLE IF NOT EXISTS router_learning_receipts (
+        workspace TEXT NOT NULL, owner TEXT NOT NULL, terminal TEXT NOT NULL,
+        domain TEXT NOT NULL, fingerprint TEXT NOT NULL,
+        PRIMARY KEY(workspace,owner,terminal));")?;
+    for table in ["router_learning_state", "router_learning_receipts"] {
+        super::agent_registry::add_scope_column(tx, table)?;
+    }
+    Ok(())
+}
+
 impl SqliteMemory {
     pub(super) async fn router_learning_transaction(
         &self,
@@ -71,12 +85,7 @@ impl SqliteMemory {
                 |row| row.get(0))?;
             anyhow::ensure!(valid, "Router learning source or terminal authority mismatch");
             // New tables only: no historical/global rows are scanned or imported.
-            tx.execute_batch("CREATE TABLE IF NOT EXISTS router_learning_state (
-                domain TEXT PRIMARY KEY, version INTEGER NOT NULL, snapshot TEXT NOT NULL CHECK(length(CAST(snapshot AS BLOB)) <= 262144));
-                CREATE TABLE IF NOT EXISTS router_learning_receipts (
-                workspace TEXT NOT NULL, owner TEXT NOT NULL, terminal TEXT NOT NULL,
-                domain TEXT NOT NULL, fingerprint TEXT NOT NULL,
-                PRIMARY KEY(workspace,owner,terminal));")?;
+            schema(&tx)?;
             let replay: Option<(String,String)> = tx.query_row(
                 "SELECT CASE WHEN length(domain)=64 THEN domain ELSE '' END,CASE WHEN length(fingerprint)=64 THEN fingerprint ELSE '' END FROM router_learning_receipts WHERE workspace=?1 AND owner=?2 AND terminal=?3",
                 params![event.workspace_id,event.owner_id,evidence.terminal_id()], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;

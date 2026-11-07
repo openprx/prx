@@ -131,6 +131,15 @@ impl SqliteTelemetryWriter {
         }
         let connection = rusqlite::Connection::open(path)?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS engine_outcomes (sequence INTEGER PRIMARY KEY, decision_id TEXT, tools TEXT NOT NULL, succeeded INTEGER NOT NULL)")?;
+        let scoped: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('engine_outcomes') WHERE name = 'ma_scope_id')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !scoped {
+            // Logical reference to a memory-database agent scope: no SQL foreign key.
+            connection.execute_batch("ALTER TABLE engine_outcomes ADD COLUMN ma_scope_id TEXT")?;
+        }
         Ok(Self { connection })
     }
     pub fn outcomes(&self) -> anyhow::Result<Vec<TurnOutcome>> {

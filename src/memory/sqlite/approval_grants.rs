@@ -154,6 +154,9 @@ pub fn init_approval_grant_schema(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_approval_grant_revocations_revoked_at
             ON approval_grant_revocations(revoked_at);",
     )?;
+    for table in ["approval_grants", "approval_grant_events", "approval_grant_revocations"] {
+        super::agent_registry::add_scope_column(conn, table)?;
+    }
     Ok(())
 }
 

@@ -1122,6 +1122,11 @@ impl SqliteMemory {
 
         super::erasure_pool::init_schema(conn)?;
         super::agent_registry::init_schema(conn)?;
+        super::agent_registry::add_schema_scope_columns(conn)?;
+        let unattributed = super::agent_migration::migrate_legacy_console(conn)?;
+        if unattributed > 0 {
+            tracing::warn!(unattributed, "legacy console rows left without an agent scope");
+        }
         Self::run_memory_schema_migrations(conn)?;
 
         Ok(())
@@ -1466,6 +1471,11 @@ impl SqliteMemory {
                 18,
                 "multi_agent_registry",
                 "agent_incarnations(workspace_id,owner_id,agent_key,incarnation,state,config_revision) + agent_scopes(scope_id,workspace_id,owner_id,session_key,agent_key,incarnation,generation) + agent_erase_fences(scope_id,erase_id,state,next_generation) + agent_erase_receipts(workspace_id,owner_id,erase_id,scope_id,incarnation,generation,state,remaining,completed_at) + agent_erase_keys(workspace_id,owner_id,idempotency_key,request_method,canonical_path,scope_id,request_hash,erase_id,created_at,expires_at) + agent_erase_manifest(erase_id,store,record_key,fts_rowid) + agent_purge_progress(workspace_id,owner_id,agent_key,incarnation,purge_id,state,after_scope_id,current_erase_id) + STRICT + active-incarnation partial unique + erased-receipt immutability triggers",
+            ),
+            (
+                19,
+                "agent_scope_columns",
+                "ma_scope_id TEXT REFERENCES agent_scopes(scope_id) on conversation_turns + message_events + memories + documents + document_chunks + embedding_cache + memory_events + memory_drafts + memory_trash + memory_links + retrieval_traces + compaction_runs + topics + topic_participants + topic_aliases + chat_profiles + access_audit_log + approval_grants + approval_grant_events + approval_grant_revocations + ramflux_blobs + legacy console history migrated to Main",
             ),
         ]
     }

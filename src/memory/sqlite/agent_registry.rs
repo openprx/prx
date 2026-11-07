@@ -245,3 +245,50 @@ pub(super) fn init_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     conn.execute_batch(&schema_sql())?;
     Ok(())
 }
+
+/// Tables created by `schema.rs` that carry the scope reference (MA-01b1b).
+/// Tables owned by other schema paths add the column from their own function.
+const SCHEMA_SCOPED_TABLES: [&str; 17] = [
+    "conversation_turns",
+    "message_events",
+    "memories",
+    "documents",
+    "document_chunks",
+    "embedding_cache",
+    "memory_events",
+    "memory_drafts",
+    "memory_trash",
+    "memory_links",
+    "retrieval_traces",
+    "compaction_runs",
+    "topics",
+    "topic_participants",
+    "topic_aliases",
+    "chat_profiles",
+    "access_audit_log",
+];
+
+/// Add the nullable `ma_scope_id` reference to `table` unless it is present.
+/// `table` is always a literal of a schema module, never request data. No
+/// version value, version check or CHECK constraint changes.
+pub(super) fn add_scope_column(conn: &rusqlite::Connection, table: &str) -> anyhow::Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'ma_scope_id')",
+        [table],
+        |row| row.get(0),
+    )?;
+    if !present {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN ma_scope_id TEXT REFERENCES agent_scopes(scope_id)"
+        ))?;
+    }
+    Ok(())
+}
+
+/// Add the scope column to every `schema.rs` table.
+pub(super) fn add_schema_scope_columns(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    for table in SCHEMA_SCOPED_TABLES {
+        add_scope_column(conn, table)?;
+    }
+    Ok(())
+}

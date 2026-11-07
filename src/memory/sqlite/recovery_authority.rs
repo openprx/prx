@@ -68,6 +68,7 @@ pub(super) fn schema(conn: &Connection) -> anyhow::Result<()> {
         BEGIN SELECT RAISE(ABORT,'immutable recovery receipt'); END;"
         ))?;
     }
+    super::agent_registry::add_scope_column(conn, "recovery_attestations")?;
     super::erasure_pool::install_table_triggers(conn, "recovery_attestations")?;
     Ok(())
 }

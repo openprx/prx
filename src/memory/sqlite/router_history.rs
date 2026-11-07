@@ -18,7 +18,7 @@ fn check(deadline: Instant) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn schema(tx: &Transaction<'_>) -> anyhow::Result<()> {
+pub(super) fn schema(tx: &Transaction<'_>) -> anyhow::Result<()> {
     // The row is also the permanent receipt ledger. Capacity never evicts it.
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS router_history_v1 (
@@ -35,6 +35,7 @@ fn schema(tx: &Transaction<'_>) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS router_history_domain_sequence_v1
         ON router_history_v1(domain,source_sequence,terminal_sequence);",
     )?;
+    super::agent_registry::add_scope_column(tx, "router_history_v1")?;
     Ok(())
 }
 

@@ -120,6 +120,7 @@ pub(super) fn schema(connection: &Connection) -> anyhow::Result<String> {
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     anyhow::ensure!(version == 1, "unsupported SQLite ingress recovery schema");
+    super::agent_registry::add_scope_column(connection, "ingress_recovery")?;
     anyhow::ensure!(
         uuid::Uuid::parse_str(&namespace)?.to_string() == namespace,
         "invalid SQLite ingress backend namespace"
