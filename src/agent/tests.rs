@@ -586,6 +586,8 @@ async fn default_causal_embedded_turn_runs_delegate_child_and_confirms_cleanup()
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
+            enabled: true,
+            autonomy: None,
         },
     )]);
     config.agents = agents.clone();

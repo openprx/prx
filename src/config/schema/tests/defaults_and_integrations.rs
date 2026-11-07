@@ -641,6 +641,7 @@ async fn checklist_gateway_serde_roundtrip() {
         idempotency_ttl_secs: 600,
         idempotency_max_keys: 4096,
         channel_webhook_dedup_ttl_secs: 7200,
+        targeted_agents: false,
     };
     let toml_str = toml::to_string(&g).unwrap();
     let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();

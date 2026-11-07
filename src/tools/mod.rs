@@ -1198,6 +1198,8 @@ mod tests {
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             },
         )]);
         let tools = all_tools(
@@ -1317,6 +1319,8 @@ mod tests {
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             },
         );
 
@@ -1398,6 +1402,8 @@ mod tests {
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             },
         )]);
         root.agents = agents.clone();

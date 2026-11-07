@@ -59,6 +59,14 @@ pub(crate) struct TurnDecisionPublication {
     pub(crate) plugin_generation: u64,
 }
 
+/// The tool surface a targeted agent turn is published with: an optional
+/// allowlist plus names removed from every allowlist, wildcard included.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TargetedSurface {
+    pub(crate) allowed_tools: Option<std::collections::BTreeSet<String>>,
+    pub(crate) excluded_names: std::collections::BTreeSet<String>,
+}
+
 impl TurnDecisionPublication {
     pub(crate) async fn publish(
         self,
@@ -71,6 +79,17 @@ impl TurnDecisionPublication {
         self,
         surface: crate::causal_tree::state::TurnSurfaceKind,
         loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
+    ) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
+        self.publish_scoped(surface, loader, None).await
+    }
+
+    /// Publish with the surface of one targeted agent applied on top of the
+    /// host surface policy. `None` is the ordinary host publication.
+    pub(crate) async fn publish_scoped(
+        self,
+        surface: crate::causal_tree::state::TurnSurfaceKind,
+        loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
+        targeted: Option<TargetedSurface>,
     ) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
         let registry = &self.registry;
         let config_generation = &self.generation;
@@ -127,7 +146,11 @@ impl TurnDecisionPublication {
             &hooks.diagnostics(),
             self.plugin_generation,
         );
-        let surface_policy = surface_policy(surface, &config.tool_tiering);
+        let mut surface_policy = surface_policy(surface, &config.tool_tiering);
+        if let Some(targeted) = targeted {
+            surface_policy.allowed_tools = targeted.allowed_tools;
+            surface_policy.excluded_names.extend(targeted.excluded_names);
+        }
         let execution = Arc::new(
             tools::ToolExecutionService::from_shared_boxed_registry(
                 Arc::clone(registry),

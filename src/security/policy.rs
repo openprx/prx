@@ -307,7 +307,7 @@ fn contains_active_shell_substitution(command: &str) -> bool {
 }
 
 /// How much autonomy the agent has
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AutonomyLevel {
     /// Read-only: can observe but not act

@@ -221,6 +221,8 @@ async fn int_das_01_delegate_inherits_parent_security_policy() {
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
+            enabled: true,
+            autonomy: None,
         },
     );
 
@@ -413,6 +415,8 @@ async fn int_das_02_delegate_respects_max_depth() {
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
+            enabled: true,
+            autonomy: None,
         },
     );
 
@@ -681,6 +685,8 @@ async fn admitted_delegate_under_depth_reports_unsupported_provider() -> anyhow:
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
+            enabled: true,
+            autonomy: None,
         },
     );
     let delegate = DelegateTool::with_depth(agents.clone(), security, 1);

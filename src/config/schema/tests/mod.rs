@@ -53,6 +53,8 @@ fn agentic_delegate_config(allowed_tools: Vec<String>) -> DelegateAgentConfig {
         identity_dir: None,
         memory_scope: None,
         spawn_enabled: None,
+        enabled: true,
+        autonomy: None,
     }
 }
 

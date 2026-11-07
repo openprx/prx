@@ -419,6 +419,8 @@ async fn config_split_and_reload_roundtrip_matches_original() {
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: Some(true),
+            enabled: true,
+            autonomy: None,
         },
     );
 
@@ -505,6 +507,8 @@ async fn config_save_encrypts_nested_credentials() {
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
+            enabled: true,
+            autonomy: None,
         },
     );
 

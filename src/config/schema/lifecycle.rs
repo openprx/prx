@@ -7,6 +7,11 @@ use super::{
     stored_tree_encrypts_secrets, validate_credential_references,
 };
 
+/// Agent names already reported as not targetable, so a configuration that is
+/// validated again (every reload) warns once per process.
+static REPORTED_UNTARGETABLE_AGENTS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
 impl Config {
     /// Return the upgrade notice when this configuration inherited local vector
     /// recall from the flipped default instead of asking for it.
@@ -837,6 +842,18 @@ impl Config {
         }
 
         for (name, agent) in &self.agents {
+            // A name outside the agent-name grammar, or the reserved `main`,
+            // keeps loading for delegate/spawn so an upgrade never stops PRX
+            // from starting over it; it is never targetable as a named agent.
+            if !crate::config::agent_name::is_targetable(name)
+                && REPORTED_UNTARGETABLE_AGENTS.lock().insert(name.clone())
+            {
+                tracing::warn!(
+                    agent = %name,
+                    "agents.{name} is not a targetable agent name (^[a-z][a-z0-9_-]{{0,63}}$, not 'main'); \
+                     it still works for delegate/spawn but cannot be targeted by the sessions API"
+                );
+            }
             // Checked for every agent, agentic or not: an unrecognised value is
             // a typo, and without this the typo only surfaces the first time
             // that agent is spawned — deep inside `sessions_spawn`, after the

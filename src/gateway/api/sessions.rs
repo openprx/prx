@@ -27,6 +27,9 @@ const MAX_UPLOAD_FILES: usize = 10;
 const MAX_UPLOAD_FILE_SIZE_BYTES: usize = 20 * 1024 * 1024;
 const UPLOADS_DIR_NAME: &str = "uploads";
 
+mod target;
+use target::{AgentField, SelectedTurn, TargetedTurn, TurnTarget, prepare_target, resolve_target};
+
 #[derive(Serialize)]
 pub(super) struct SessionSummary {
     session_id: String,
@@ -71,6 +74,25 @@ pub(super) struct ApprovalInboxQuery {
 #[derive(Deserialize)]
 pub(super) struct SendMessageRequest {
     message: String,
+    /// Present-or-absent is kept apart from `null`: an omitted field is Main,
+    /// an explicit `null` is refused.
+    #[serde(default, deserialize_with = "present_value")]
+    agent: Option<serde_json::Value>,
+}
+
+fn present_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+/// A parsed message request. `uploads` are the files already stored for a
+/// multipart request; they are removed again when the target is refused.
+struct ParsedMessage {
+    message: String,
+    agent: AgentField,
+    uploads: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -375,6 +397,7 @@ async fn run_console_runtime_turn(
     visible_message: &str,
     previous_turns: Vec<crate::memory::ConversationTurn>,
     decision: &ConsoleDecisionTurn<'_>,
+    target: Option<&TargetedTurn>,
 ) -> anyhow::Result<ConsoleTurnResult> {
     decision.proof.verify_runtime_input(&turn_runtime, visible_message)?;
     let turn_envelope = decision.proof.envelope().clone();
@@ -384,7 +407,12 @@ async fn run_console_runtime_turn(
     // makes a reloaded autonomy / security.audit take effect for console-driven
     // turns without a restart; all non-security fields used for the prompt come from
     // the same snapshot, so the turn stays internally consistent.
-    let config_snapshot = (*turn_runtime.config_generation.effective).clone();
+    let mut config_snapshot = (*turn_runtime.config_generation.effective).clone();
+    if let Some(target) = target {
+        // Autonomy = min(sub-agent, main); the same cap the target's decision
+        // slot publishes its tool policy with.
+        config_snapshot.autonomy.level = target.autonomy;
+    }
     let provider_label = turn_runtime
         .provider_binding
         .as_ref()
@@ -398,11 +426,15 @@ async fn run_console_runtime_turn(
             crate::providers::traits::ProviderRequestMode::NonStreaming,
         )
         .native_tool_calling;
-    let selected_skills = decision
-        .service
-        .agent_prompt_skills(decision.proof, &decision.context)?;
-    let system_prompt =
-        build_runtime_system_prompt(&config_snapshot, &turn_runtime.model, &selected_skills, native_tools);
+    let system_prompt = if let Some(target) = target {
+        // The target's own identity; never the main persona.
+        target.system_prompt.clone()
+    } else {
+        let selected_skills = decision
+            .service
+            .agent_prompt_skills(decision.proof, &decision.context)?;
+        build_runtime_system_prompt(&config_snapshot, &turn_runtime.model, &selected_skills, native_tools)
+    };
 
     let mem_context = crate::agent::context_recall::scoped_recall(
         state.mem.as_ref(),
@@ -508,9 +540,17 @@ async fn run_console_runtime_turn(
                 events: None,
                 stream_provider: false,
                 tool_execution_service: None,
-                tool_execution_context: crate::tools::ToolExecutionContext::new(turn_envelope.clone(), "private")
-                    .with_approval_ledger(decision.service.execution_approval_ledger())
-                    .with_chat_id(&turn_envelope.session_key),
+                tool_execution_context: {
+                    let context = crate::tools::ToolExecutionContext::new(turn_envelope.clone(), "private");
+                    if target.is_some() {
+                        // Until MA-04 a targeted call that needs approval ends
+                        // denied: no durable ledger route, no pending decision.
+                        context.with_pending_approval_denied()
+                    } else {
+                        context.with_approval_ledger(decision.service.execution_approval_ledger())
+                    }
+                    .with_chat_id(&turn_envelope.session_key)
+                },
                 allowed_tool_names: None,
             }),
             memory: crate::agent::turn_request::ToolLoopMemory::new(
@@ -639,7 +679,7 @@ fn media_content_type_for_path(path: &StdPath) -> &'static str {
 }
 
 #[allow(clippy::result_large_err)] // the axum `Response` is the error contract of these parsers
-async fn parse_json_message(state: &AppState, request: Request) -> Result<String, Response> {
+async fn parse_json_message(state: &AppState, request: Request) -> Result<ParsedMessage, Response> {
     let Json(payload) = Json::<SendMessageRequest>::from_request(request, state)
         .await
         .map_err(|_| json_error(StatusCode::BAD_REQUEST, "Invalid JSON payload"))?;
@@ -649,11 +689,15 @@ async fn parse_json_message(state: &AppState, request: Request) -> Result<String
         return Err(json_error(StatusCode::BAD_REQUEST, "message must not be empty"));
     }
 
-    Ok(message)
+    Ok(ParsedMessage {
+        message,
+        agent: payload.agent.map_or(AgentField::Omitted, AgentField::from_json),
+        uploads: Vec::new(),
+    })
 }
 
 #[allow(clippy::result_large_err)]
-async fn parse_multipart_message(state: &AppState, request: Request) -> Result<String, Response> {
+async fn parse_multipart_message(state: &AppState, request: Request) -> Result<ParsedMessage, Response> {
     let mut multipart = Multipart::from_request(request, state)
         .await
         .map_err(|_| json_error(StatusCode::BAD_REQUEST, "Invalid multipart payload"))?;
@@ -665,7 +709,9 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
     let mut uploads_root_prepared = false;
 
     let mut message = String::new();
+    let mut agent = AgentField::Omitted;
     let mut attachments = Vec::new();
+    let mut uploads = Vec::new();
     let mut file_count = 0usize;
 
     while let Some(field) = multipart
@@ -682,6 +728,12 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
                         "Failed to decode message text from multipart payload",
                     )
                 })?;
+            }
+            "agent" => {
+                let text = field.text().await.map_err(|_| {
+                    json_error(StatusCode::BAD_REQUEST, "Failed to decode agent from multipart payload")
+                })?;
+                agent = AgentField::Text(text);
             }
             "files" => {
                 file_count += 1;
@@ -722,6 +774,7 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
                     tracing::error!("Failed to persist uploaded file: {error}");
                     json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist uploaded file")
                 })?;
+                uploads.push(stored_path.clone());
 
                 if is_image_upload(&content_type, &safe_name) {
                     attachments.push(format!("[IMAGE:{}]", stored_path.display()));
@@ -748,11 +801,15 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
         return Err(json_error(StatusCode::BAD_REQUEST, "message must not be empty"));
     }
 
-    Ok(combined)
+    Ok(ParsedMessage {
+        message: combined,
+        agent,
+        uploads,
+    })
 }
 
 #[allow(clippy::result_large_err)]
-async fn parse_message_from_request(state: &AppState, request: Request) -> Result<String, Response> {
+async fn parse_message_from_request(state: &AppState, request: Request) -> Result<ParsedMessage, Response> {
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -1286,21 +1343,72 @@ pub async fn post_session_message(
     let turn_runtime = state.pin_turn_runtime();
     let headers = request.headers().clone();
     let async_mode = jobs::wants_async(request.uri().query(), &headers);
-    let message = match parse_message_from_request(&state, request).await {
-        Ok(message) => message,
+    let parsed = match parse_message_from_request(&state, request).await {
+        Ok(parsed) => parsed,
         Err(error_response) => return error_response,
+    };
+    let ParsedMessage {
+        message,
+        agent,
+        uploads,
+    } = parsed;
+
+    let selected = match select_turn_target(&state, turn_runtime, agent) {
+        Ok(selected) => selected,
+        Err(refusal) => {
+            // A refused target leaves nothing behind, uploads included.
+            for path in &uploads {
+                if let Err(error) = fs::remove_file(path).await {
+                    tracing::warn!(error = %error, "Failed to remove an upload of a refused targeted request");
+                }
+            }
+            return refusal;
+        }
     };
 
     submit_console_message(
         state,
         session_id,
         api_principal,
-        turn_runtime,
+        selected,
         message,
         async_mode,
         ConsoleTurnMode::Message,
     )
     .await
+}
+
+/// Resolve the request's `agent` against the pinned runtime generation,
+/// before admission, input recording or provider access.
+#[allow(clippy::result_large_err)] // the axum `Response` is the error contract of these helpers
+fn select_turn_target(
+    state: &AppState,
+    turn_runtime: std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
+    agent: AgentField,
+) -> Result<SelectedTurn, Response> {
+    let target = TurnTarget::from_field(agent).map_err(IntoResponse::into_response)?;
+    if matches!(target, TurnTarget::Main) {
+        return Ok(SelectedTurn {
+            runtime: turn_runtime,
+            targeted: None,
+        });
+    }
+    // A caller who may not post messages learns nothing about which agents exist.
+    super::authorize_resource_mutation(state, "gateway_api:sessions:message", ResourceRiskLevel::Low)
+        .map_err(IntoResponse::into_response)?;
+    let Some(plan) =
+        resolve_target(&turn_runtime.config_generation.effective, &target).map_err(IntoResponse::into_response)?
+    else {
+        return Ok(SelectedTurn {
+            runtime: turn_runtime,
+            targeted: None,
+        });
+    };
+    let (runtime, turn) = prepare_target(&turn_runtime, &plan).map_err(IntoResponse::into_response)?;
+    Ok(SelectedTurn {
+        runtime,
+        targeted: Some(turn),
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1577,7 +1685,10 @@ pub(super) async fn post_decision_resume(
         state,
         session_id,
         principal,
-        runtime,
+        SelectedTurn {
+            runtime,
+            targeted: None,
+        },
         message,
         async_mode,
         ConsoleTurnMode::Resume,
@@ -1589,11 +1700,15 @@ async fn submit_console_message(
     state: AppState,
     session_id: String,
     api_principal: super::ApiPrincipal,
-    turn_runtime: std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
+    selected: SelectedTurn,
     message: String,
     async_mode: bool,
     mode: ConsoleTurnMode,
 ) -> Response {
+    let SelectedTurn {
+        runtime: turn_runtime,
+        targeted: target,
+    } = selected;
     let Some(session) = (match state.mem.get_conversation_session(&session_id).await {
         Ok(session) => session,
         Err(error) => {
@@ -1706,7 +1821,7 @@ async fn submit_console_message(
     let job = jobs::submit_with_cleanup(
         jobs::KIND_SESSION_MESSAGE,
         format!("gateway:session_message:{session_id}"),
-        run_console_message_job(turn_runtime, state, message, turns, source),
+        run_console_message_job(turn_runtime, state, message, turns, source, target),
         Some(cleanup_receiver),
     );
 
@@ -1727,6 +1842,7 @@ fn run_console_message_job(
     message: String,
     turns: Vec<crate::memory::ConversationTurn>,
     source: ConsoleTurnSource,
+    target: Option<TargetedTurn>,
 ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<jobs::JobOutput, String>> + Send>> {
     // Keep the owned Console work out of the generic job submitter's stack.
     // Construction does not poll it; the same input guard retains its sender.
@@ -1736,6 +1852,7 @@ fn run_console_message_job(
         message,
         turns,
         source,
+        target,
     ))
 }
 
@@ -1745,6 +1862,7 @@ async fn run_console_message_job_work(
     message: String,
     turns: Vec<crate::memory::ConversationTurn>,
     source: ConsoleTurnSource,
+    target: Option<TargetedTurn>,
 ) -> Result<jobs::JobOutput, String> {
     let (mode, source_proof, input_guard) = match source {
         #[cfg(test)]
@@ -1920,6 +2038,11 @@ async fn run_console_message_job_work(
             }
             crate::runtime::turn_decision::TurnDisposition::Run => {}
             crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments => {
+                if target.is_some() {
+                    // Approval collection is a durable pending decision; a
+                    // targeted turn has none until MA-04.
+                    return Err("Targeted agents cannot collect approvals".to_owned());
+                }
                 if mode != ConsoleTurnMode::Message || decision.provider_trace.is_none() {
                     return Err("Console collection requires the owning main-turn trace".to_owned());
                 }
@@ -1942,6 +2065,7 @@ async fn run_console_message_job_work(
             &message,
             turns,
             &decision,
+            target.as_ref(),
         )
         .await
         {
@@ -2221,6 +2345,7 @@ pub async fn get_session_media(
 #[cfg(test)]
 mod tests {
     mod collection;
+    mod targeting;
     use super::*;
     use crate::config::Config;
     use crate::gateway::{GatewayRateLimiter, IdempotencyStore};
@@ -2650,6 +2775,7 @@ mod tests {
                                 "different unadmitted input",
                                 Vec::new(),
                                 &decision,
+                                None,
                             )
                             .await
                             .is_err()
@@ -2658,10 +2784,16 @@ mod tests {
                             provider_impl.requests.lock().is_empty(),
                             "source mismatch must fail before provider transport"
                         );
-                        let turn =
-                            run_console_runtime_turn(runtime, &state, "current question", previous_turns, &decision)
-                                .await
-                                .unwrap();
+                        let turn = run_console_runtime_turn(
+                            runtime,
+                            &state,
+                            "current question",
+                            previous_turns,
+                            &decision,
+                            None,
+                        )
+                        .await
+                        .unwrap();
 
                         service
                             .shutdown(std::time::Instant::now() + Duration::from_secs(2))
@@ -2752,7 +2884,7 @@ mod tests {
                     cancellation,
                     provider_trace: None,
                 };
-                let turn = run_console_runtime_turn(runtime, &state, input, Vec::new(), &decision).await?;
+                let turn = run_console_runtime_turn(runtime, &state, input, Vec::new(), &decision, None).await?;
                 service
                     .shutdown(std::time::Instant::now() + Duration::from_secs(2))
                     .await;
@@ -3023,6 +3155,7 @@ mod tests {
                     INPUT,
                     Vec::new(),
                     &decision,
+                    None,
                 )
                 .await
                 .expect("test: console turn completes");
@@ -3096,6 +3229,7 @@ mod tests {
                     "hello".to_string(),
                     Vec::new(),
                     ConsoleTurnSource::Message(proof),
+                    None,
                 )
                 .await
                 {
@@ -3244,6 +3378,7 @@ mod tests {
                     "what is my key?".to_string(),
                     Vec::new(),
                     ConsoleTurnSource::Message(proof),
+                    None,
                 )
                 .await
                 .expect("test: the console turn completes");
@@ -3317,6 +3452,7 @@ mod tests {
                     "what is my key?".to_string(),
                     Vec::new(),
                     ConsoleTurnSource::Message(proof),
+                    None,
                 )
                 .await;
                 assert!(

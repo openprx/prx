@@ -592,6 +592,8 @@ fn agent_and_route_keys_are_bound_to_their_entries_provider() {
             identity_dir: None,
             memory_scope: None,
             spawn_enabled: None,
+            enabled: true,
+            autonomy: None,
         },
     );
     for hint in ["fast", "dup", "dup"] {

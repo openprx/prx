@@ -3419,6 +3419,8 @@ mod tests {
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             },
         );
         let mut items = Vec::new();
@@ -4003,6 +4005,8 @@ mod tests {
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             },
         );
         config.agents.insert(
@@ -4020,6 +4024,8 @@ mod tests {
                 identity_dir: None,
                 memory_scope: None,
                 spawn_enabled: None,
+                enabled: true,
+                autonomy: None,
             },
         );
 

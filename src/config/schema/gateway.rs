@@ -66,6 +66,12 @@ pub struct GatewayConfig {
     /// platform's retry schedule lets a late retry start the turn a second time.
     #[serde(default = "default_channel_webhook_dedup_ttl_secs")]
     pub channel_webhook_dedup_ttl_secs: u64,
+
+    /// Rollout switch for targeted agent turns (`agent` on
+    /// `POST /api/sessions/{id}/message`). While false, any otherwise-valid
+    /// named target answers 409 `agent_disabled` and never runs as Main.
+    #[serde(default)]
+    pub targeted_agents: bool,
 }
 
 pub(super) const fn default_gateway_port() -> u16 {
@@ -124,6 +130,7 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             channel_webhook_dedup_ttl_secs: default_channel_webhook_dedup_ttl_secs(),
+            targeted_agents: false,
         }
     }
 }
