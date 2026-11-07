@@ -27,6 +27,7 @@ impl SqliteMemory {
             }
         };
         let pool = self.pool.clone();
+        let key_root = self.db_path.parent().map(std::path::Path::to_path_buf);
         let result =
             crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<anyhow::Result<MessageEvent>>> {
                 // The blocking owner retains admission through the real
@@ -39,6 +40,18 @@ impl SqliteMemory {
                     if let Err(error) = input.validate() {
                         results.push(Err(error));
                         continue;
+                    }
+                    // The same backend-wide fence as the scalar append, per qualifying row.
+                    match super::recovery_authority::stable_key_fence(&tx, key_root.as_deref(), &input) {
+                        Ok(super::recovery_authority::Fence::Clear) => {}
+                        Ok(super::recovery_authority::Fence::Tombstoned) => {
+                            results.push(Err(crate::memory::ingress_recovery::StableKeyTombstoned.into()));
+                            continue;
+                        }
+                        Err(error) => {
+                            results.push(Err(error));
+                            continue;
+                        }
                     }
                     tx.execute_batch("SAVEPOINT message_event_batch_item;")?;
                     match Self::append_event_row(&tx, input, false) {

@@ -109,12 +109,13 @@ impl SqliteMemory {
     ) -> anyhow::Result<(MessageEvent, bool)> {
         self.append_attested_event(input, mutation, repair_deadline)
             .await?
-            .context("only an attested ingress input can hit a tombstone")
+            .context("only an ingress input can hit a tombstone without an error")
     }
 
-    /// The single append transaction; `None` means the stable key is tombstoned.
-    /// An attested ingress input also runs its
-    /// tombstone lookup, pending attestation and transport index row inside it,
+    /// The single append transaction; `None` means the stable key of an ingress
+    /// input is tombstoned (any other tombstoned input is `StableKeyTombstoned`).
+    /// Every stable-key user input runs the tombstone fence inside it. An attested
+    /// ingress input also writes its pending attestation and transport index row,
     /// under FULL synchronization, so a crash leaves all of them or none.
     pub(super) async fn append_attested_event(
         &self,
@@ -160,11 +161,16 @@ impl SqliteMemory {
             if let Some(operation) = &mutation {
                 ingress_recovery::before_append(&tx, operation, &input)?;
             }
-            if let (Some((capsule, _)), Some(keys)) = (attested, &keys)
-                && recovery_authority::tombstoned(&tx, keys, &capsule.scope, &capsule.input_key)?
-            {
+            // Every stable-key user input is fenced, with or without a recorder.
+            if matches!(
+                recovery_authority::stable_key_fence(&tx, key_root.as_deref(), &input)?,
+                recovery_authority::Fence::Tombstoned
+            ) {
                 // Dropping the transaction rolls back; nothing was inserted.
-                return Ok(None);
+                return match mutation {
+                    Some(AtomicIngressMutation::Input { .. }) => Ok(None),
+                    _ => Err(crate::memory::ingress_recovery::StableKeyTombstoned.into()),
+                };
             }
             let (event, inserted) = Self::append_event_row(&tx, input, deadline.is_some())?;
             if let Some(operation) = &mutation {
@@ -720,6 +726,11 @@ impl SqliteMemory {
         attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
     ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
         use crate::memory::ingress_recovery::IngressAppendOutcome;
+        let mut attestation = attestation;
+        if let Some(attestation) = attestation.as_mut().filter(|attestation| !attestation.is_verified()) {
+            // Bare SQLite (or Lucid) is the first layer holding the plaintext input.
+            crate::memory::ingress_recovery::verify_transport(self, &input, &capsule, attestation)?;
+        }
         Ok(
             match self
                 .append_attested_event(

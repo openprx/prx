@@ -792,7 +792,7 @@ fn main_attribution_rebinds_pending_and_settled_console_receipts() -> anyhow::Re
 
 mod attestation {
     use super::*;
-    use crate::memory::ingress_recovery::{IngressAppendOutcome, IngressLifetime};
+    use crate::memory::ingress_recovery::{IngressAppendOutcome, IngressLifetime, IngressRecoveryScope};
     use crate::memory::recovery_authority::RecoveryMacDomain;
     use crate::memory::{MessageEventInput, MessageEventSource};
 
@@ -859,7 +859,11 @@ mod attestation {
         }))
         .unwrap();
         let transport = memory
-            .recovery_mac(Some(&key_id), RecoveryMacDomain::TransportV3, b"transport")
+            .recovery_mac(
+                Some(&key_id),
+                RecoveryMacDomain::TransportV3,
+                &crate::memory::ingress_recovery::transport_preimage(&input, None),
+            )
             .unwrap();
         let key_tag = memory
             .recovery_mac(Some(&key_id), RecoveryMacDomain::InputKeyV3, input_key.as_bytes())
@@ -885,11 +889,7 @@ mod attestation {
             input_key_digest: hex::encode(key_tag.tag),
             key_id,
         };
-        let attestation = IngressAttestation {
-            facts: serde_json::to_vec(&facts).unwrap(),
-            transport,
-            input_key: key_tag,
-        };
+        let attestation = IngressAttestation::new(serde_json::to_vec(&facts).unwrap(), transport, key_tag);
         Fixture {
             input,
             capsule,
@@ -918,9 +918,120 @@ mod attestation {
     fn mutated(f: &Fixture, edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) -> IngressAttestation {
         let mut value = serde_json::to_value(&f.facts).unwrap();
         edit(value.as_object_mut().unwrap());
-        IngressAttestation {
-            facts: serde_json::to_vec(&value).unwrap(),
-            ..f.attestation.clone()
+        let mut attestation = f.attestation.clone();
+        attestation.facts = serde_json::to_vec(&value).unwrap();
+        attestation
+    }
+
+    async fn append_input(
+        memory: &dyn crate::memory::Memory,
+        f: &Fixture,
+        input: MessageEventInput,
+        attestation: IngressAttestation,
+    ) -> anyhow::Result<IngressAppendOutcome> {
+        memory
+            .append_ingress_input(
+                input,
+                f.capsule.clone(),
+                f.lifetime.clone(),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                Some(attestation),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn recovery_transport_substitution_is_refused() {
+        for backend in ["sqlite", "encrypted"] {
+            let (dir, memory) = store().unwrap();
+            let f = fixture(&memory).await;
+            let target: Arc<dyn crate::memory::Memory> = if backend == "encrypted" {
+                let workspace = std::path::PathBuf::from(&f.capsule.scope.workspace_id);
+                let crypto = Arc::new(crate::security::ramflux_aead::AccountCrypto::new(
+                    &workspace, &workspace, true,
+                ));
+                crypto.unlock("prx_account").unwrap();
+                Arc::new(crate::memory::encrypted_scope::EncryptedScope::new(
+                    Arc::new(memory.clone()),
+                    crypto,
+                    "prx_account",
+                    "prx_scope",
+                ))
+            } else {
+                Arc::new(memory.clone())
+            };
+            let mismatch = Some(&IngressAttestationError::Mismatch("transport_digest"));
+            let assert_nothing_written = || {
+                for table in ["message_events", "recovery_attestations", "recovery_transport_index"] {
+                    assert_eq!(count(&memory, table), 0, "{backend}: {table} kept a refused write");
+                }
+            };
+
+            // (i) A coherent tag and facts over an unrelated transport.
+            let unrelated = memory
+                .recovery_mac(
+                    f.capsule.key_id.as_deref(),
+                    RecoveryMacDomain::TransportV3,
+                    b"transport",
+                )
+                .unwrap();
+            let mut substituted = mutated(&f, |m| {
+                m.insert(
+                    "transport_digest".into(),
+                    serde_json::Value::String(hex::encode(unrelated.tag)),
+                );
+            });
+            substituted.transport = unrelated;
+            let error = append_input(target.as_ref(), &f, f.input.clone(), substituted)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.downcast_ref::<IngressAttestationError>(),
+                mismatch,
+                "{backend}: {error:#}"
+            );
+            assert_nothing_written();
+
+            // (ii) The real attestation, replayed with different content.
+            let mut other = f.input.clone();
+            other.content = "substituted content".to_owned();
+            let error = append_input(target.as_ref(), &f, other, f.attestation.clone())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.downcast_ref::<IngressAttestationError>(),
+                mismatch,
+                "{backend}: {error:#}"
+            );
+            assert_nothing_written();
+
+            // (iii) The genuine pair commits, and the stored tag verifies against A.
+            assert!(matches!(
+                append_input(target.as_ref(), &f, f.input.clone(), f.attestation.clone())
+                    .await
+                    .unwrap(),
+                IngressAppendOutcome::Inserted(_)
+            ));
+            memory
+                .verify_recovery_mac(
+                    &f.attestation.transport,
+                    RecoveryMacDomain::TransportV3,
+                    &crate::memory::ingress_recovery::transport_preimage(&f.input, None),
+                )
+                .unwrap();
+            let stored: String = memory
+                .pool
+                .write()
+                .query_row("SELECT content FROM message_events", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                stored != "attested",
+                backend == "encrypted",
+                "{backend}: stored content"
+            );
+            drop(dir);
         }
     }
 
@@ -1034,7 +1145,11 @@ mod attestation {
         assert_eq!(receipt.state, "pending");
         assert_eq!(receipt.pending_facts().unwrap(), f.attestation.facts);
         reopened
-            .verify_recovery_mac(&f.attestation.transport, RecoveryMacDomain::TransportV3, b"transport")
+            .verify_recovery_mac(
+                &f.attestation.transport,
+                RecoveryMacDomain::TransportV3,
+                &crate::memory::ingress_recovery::transport_preimage(&f.input, None),
+            )
             .unwrap();
         assert!(
             reopened

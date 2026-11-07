@@ -373,6 +373,8 @@ impl MemoryFabric {
         {
             Ok(event) => Ok(Some(event)),
             Err(error) if error.is::<crate::runtime::ingress_recovery::AlreadyAccepted>() => Err(error),
+            // A tombstone fence that cannot load its key is a refusal, never "unrecorded, continue".
+            Err(error) if error.is::<crate::memory::ingress_recovery::StableKeyFenceUnavailable>() => Err(error),
             Err(_) if self.ingress_already_accepted() => Err(crate::runtime::ingress_recovery::AlreadyAccepted.into()),
             Err(_) => {
                 // The error text may embed private input; keep it out of the log.
@@ -804,7 +806,14 @@ impl MemoryFabric {
                 let mut input = input;
                 let event_id = uuid::Uuid::new_v4().to_string();
                 input.event_id = Some(event_id.clone());
-                let event = self.memory.append_message_event(input).await?;
+                let event = match self.memory.append_message_event(input).await {
+                    Ok(event) => event,
+                    Err(error) if error.is::<crate::memory::ingress_recovery::StableKeyTombstoned>() => {
+                        self.input_accepted.store(true, std::sync::atomic::Ordering::Release);
+                        return Err(crate::runtime::ingress_recovery::AlreadyAccepted.into());
+                    }
+                    Err(error) => return Err(error),
+                };
                 if event.event_id != event_id {
                     self.input_accepted.store(true, std::sync::atomic::Ordering::Release);
                     return Err(crate::runtime::ingress_recovery::AlreadyAccepted.into());
