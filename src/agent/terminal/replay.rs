@@ -582,7 +582,20 @@ impl VerifiedTerminalReplay {
 
 /// Cutover switch for replay evidence authority. While false, the decision store
 /// remains the authority for replay rows. No config, env or test override exists.
-pub(crate) const REPLAY_EVIDENCE_AUTHORITY: bool = false;
+pub(crate) const REPLAY_EVIDENCE_AUTHORITY: bool = true;
+
+/// Selects journal authority for one terminal. The marker is authenticated before
+/// anything is decoded, and no row input exists, so row absence never selects the
+/// store. `worker_journal_version` is the signed launch version when the caller has one.
+pub(crate) fn replay_requires_journal(
+    key: &DecisionKey,
+    event: &MessageEvent,
+    worker_journal_version: Option<u8>,
+) -> anyhow::Result<bool> {
+    let (_, binding) = authenticate_replay_binding(key, event)?;
+    let required = Some(crate::runtime::child_source::authority_journal::JOURNAL_REQUIRED_VERSION);
+    Ok(REPLAY_EVIDENCE_AUTHORITY && (binding.journal_version >= required || worker_journal_version >= required))
+}
 
 /// Journal-backed terminal replay failure. Every adapter failure keeps its source.
 #[derive(Debug, thiserror::Error)]

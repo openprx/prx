@@ -12,8 +12,8 @@ pub(crate) use replay::reseal_payload_for_test;
 pub(crate) mod served_auxiliary;
 pub(crate) use replay::{
     REPLAY_EVIDENCE_AUTHORITY, VerifiedTerminalReplay, authenticated_replay_store_workspace,
-    read_journal_replay_record, read_journal_replay_record_on, verify_terminal_replay, verify_terminal_replay_journal,
-    verify_terminal_replay_journal_until, verify_terminal_replay_until,
+    read_journal_replay_record, read_journal_replay_record_on, replay_requires_journal, verify_terminal_replay,
+    verify_terminal_replay_journal, verify_terminal_replay_journal_until, verify_terminal_replay_until,
 };
 
 use crate::causal_tree::ids::DecisionId;
@@ -757,7 +757,8 @@ async fn finalize_turn_impl(
                 .await?
             {
                 let owner_id = commit.scope.owner_id.as_deref().context("terminal owner is missing")?;
-                let verified_replay = if REPLAY_EVIDENCE_AUTHORITY {
+                let journal = replay_requires_journal(&recorded.key, &existing, None)?;
+                let verified_replay = if journal {
                     verify_terminal_replay_journal(
                         fabric.memory().as_ref(),
                         workspace_dir,
@@ -782,6 +783,10 @@ async fn finalize_turn_impl(
                     )
                     .await?
                 };
+                anyhow::ensure!(
+                    journal || verified_replay.source().source != crate::memory::MessageEventSource::SessionWorker,
+                    "worker segment requires launch provenance for legacy selection"
+                );
                 let payload: serde_json::Value = serde_json::from_str(
                     existing
                         .raw_payload_json
@@ -1047,6 +1052,7 @@ async fn finalize_turn_impl(
             )
             .await?;
 
+        let mut journal_selected = None;
         if commit.decision.is_recorded() {
             let decision = &commit.decision;
             let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
@@ -1054,7 +1060,8 @@ async fn finalize_turn_impl(
                 .owner_id
                 .as_deref()
                 .context("terminal owner is missing")?;
-            let verified_replay = if REPLAY_EVIDENCE_AUTHORITY {
+            let journal = replay_requires_journal(&recorded.key, &terminal_event, None)?;
+            let verified_replay = if journal {
                 verify_terminal_replay_journal(
                     fabric.memory().as_ref(),
                     workspace_dir,
@@ -1079,6 +1086,11 @@ async fn finalize_turn_impl(
                 )
                 .await?
             };
+            anyhow::ensure!(
+                journal || verified_replay.source().source != crate::memory::MessageEventSource::SessionWorker,
+                "worker segment requires launch provenance for legacy selection"
+            );
+            journal_selected = Some(journal);
             recorded
                 .child_outcome_hook
                 .persist(&verified_replay, &terminal_event, None, None)
@@ -1123,10 +1135,14 @@ async fn finalize_turn_impl(
             let decision = &commit.decision;
             let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
             let facts = TerminalFacts::from_receipt(&decision.context, &receipt)?;
-            anyhow::ensure!(
-                OutcomeCorrelator::settle(&recorded.writer, &decision.context, &facts)? == Enqueue::Queued,
-                "decision outcome could not be queued after terminal commit"
-            );
+            let queued = OutcomeCorrelator::settle(&recorded.writer, &decision.context, &facts)? == Enqueue::Queued;
+            if journal_selected == Some(true) {
+                if !queued {
+                    tracing::warn!("decision outcome projection could not be queued after terminal commit");
+                }
+            } else {
+                anyhow::ensure!(queued, "decision outcome could not be queued after terminal commit");
+            }
         }
         Ok(receipt)
     })

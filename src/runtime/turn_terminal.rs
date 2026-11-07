@@ -889,7 +889,8 @@ impl super::ingress_recovery::RecoveryScope {
             event.workspace_id == workspace_id && event.owner_id.as_deref() == Some(owner_id),
             "terminal replay scope does not match its owner"
         );
-        let store = if crate::agent::terminal::REPLAY_EVIDENCE_AUTHORITY {
+        let journal = crate::agent::terminal::replay_requires_journal(&self.state_key, &event, None)?;
+        let store = if journal {
             None
         } else {
             Some(
@@ -963,6 +964,10 @@ impl super::ingress_recovery::RecoveryScope {
                 .await?
             }
         };
+        anyhow::ensure!(
+            journal || replay.source().source != crate::memory::MessageEventSource::SessionWorker,
+            "worker segment requires launch provenance for legacy selection"
+        );
         #[cfg(test)]
         stage.next(super::turn_cleanup::diagnostic::StageName::RejoinReplayScope);
         anyhow::ensure!(
@@ -1127,6 +1132,30 @@ impl super::ingress_recovery::RecoveryScope {
                 if let Some(assistant) = replay.assistant() {
                     self.memory.project_console_message(assistant).await?;
                 }
+            }
+        }
+        if journal {
+            // Non-gating store projection: the journal rows above are the authority,
+            // so every failure here is logged and never refuses the rejoin.
+            match self.store.as_ref().and_then(|store| store.writer()) {
+                Some(writer) => {
+                    if writer.record_outcome(expected.clone()) != Enqueue::Queued {
+                        tracing::warn!("rejoined outcome projection could not be queued");
+                    }
+                    if replay.parent_decision_id().is_some() {
+                        let queued = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &expected)
+                            .is_some_and(|link| writer.record_child_outcome(link) == Enqueue::Queued);
+                        if !queued {
+                            tracing::warn!("child outcome link projection could not be queued");
+                        }
+                    }
+                    let deadline =
+                        bounded.map_or_else(|| Instant::now() + Duration::from_secs(5), |(_, deadline, _)| deadline);
+                    if !writer.drain(deadline).await {
+                        tracing::warn!("rejoined outcome projection drain timed out");
+                    }
+                }
+                None => tracing::warn!("rejoined outcome projection has no store writer"),
             }
         }
         #[cfg(test)]

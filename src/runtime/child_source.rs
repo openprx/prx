@@ -830,7 +830,7 @@ impl IssuedChildGrant {
             parent_constraints,
             config_generation,
             catalog,
-            journal_version: Some(authority_journal::JOURNAL_REQUIRED_VERSION),
+            journal_version: self.journal_version(),
         });
         let issuer = self.parent_issuer_evidence()?;
         let launch_parent = authority_journal::LaunchParentRow {
@@ -924,6 +924,11 @@ impl IssuedChildGrant {
             .as_ref()
             .context("restored incoming grant cannot select a new child model")?;
         Ok((&source.provider, &source.model, &source.credential))
+    }
+
+    /// Grants are issued by the live parent, so their terminals are journal-required.
+    pub(crate) const fn journal_version(&self) -> Option<u8> {
+        Some(authority_journal::JOURNAL_REQUIRED_VERSION)
     }
 
     pub(crate) fn parent_record_binding(&self) -> (&str, &str) {

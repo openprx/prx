@@ -3,7 +3,7 @@ mod launch;
 pub(super) mod operator;
 pub(super) mod ordinary;
 use crate::agent::terminal::{
-    REPLAY_EVIDENCE_AUTHORITY, TurnTerminalStatus, verify_terminal_replay, verify_terminal_replay_journal,
+    TurnTerminalStatus, replay_requires_journal, verify_terminal_replay, verify_terminal_replay_journal,
 };
 use crate::causal_tree::store::CausalDecisionStore;
 use crate::memory::{MemoryFabric, MessageEvent, MessageEventSource, MessageEventSubject};
@@ -421,6 +421,31 @@ struct RecoveryProvenance<'a> {
     parent_digest: &'a str,
     input: &'a MessageEvent,
     key: &'a std::sync::Arc<crate::decision::DecisionKey>,
+    /// Signed launch version mapped to the journal version, or the grant's own.
+    journal_version: Option<u8>,
+}
+
+/// Opens the legacy store reader on the first segment that authenticates as
+/// legacy. `repair_store` keeps precedence; journal segments never reach this.
+fn legacy_reader(
+    repair_store: Option<&CausalDecisionStore>,
+    provenance: &RecoveryProvenance<'_>,
+    reader: &mut Option<crate::causal_tree::store::DecisionStoreReader>,
+) -> anyhow::Result<()> {
+    if reader.is_none() {
+        let opened = repair_store
+            .is_none()
+            .then(|| CausalDecisionStore::open_unshared_read_only(provenance.workspace));
+        let actual_store = repair_store
+            .or(opened.as_deref())
+            .context("worker completion decision store missing")?;
+        anyhow::ensure!(
+            actual_store.workspace_id().as_deref() == Some(provenance.store_workspace),
+            "worker completion decision store differs from original namespace"
+        );
+        *reader = Some(actual_store.reader());
+    }
+    Ok(())
 }
 
 pub(super) async fn verify(
@@ -440,6 +465,7 @@ pub(super) async fn verify(
         parent_digest,
         input: input.event(),
         key: &constraints.key,
+        journal_version: grant.journal_version(),
     };
     verify_bound(fabric, &provenance, result, b"worker-completion-v1", None).await
 }
@@ -547,20 +573,7 @@ async fn verify_bound(
         );
     }
     let mut usage_records = Vec::new();
-    let store =
-        (!REPLAY_EVIDENCE_AUTHORITY).then(|| CausalDecisionStore::open_unshared_read_only(provenance.workspace));
-    let reader = if REPLAY_EVIDENCE_AUTHORITY {
-        None
-    } else {
-        let actual_store = repair_store
-            .or(store.as_deref())
-            .context("worker completion decision store missing")?;
-        anyhow::ensure!(
-            actual_store.workspace_id().as_deref() == Some(provenance.store_workspace),
-            "worker completion decision store differs from original namespace"
-        );
-        Some(actual_store.reader())
-    };
+    let mut reader = None;
     let memory = fabric.memory();
     for reference in &evidence.segments {
         let event = read_terminal(
@@ -579,7 +592,8 @@ async fn verify_bound(
                 && event.config_source_revision == source.config_source_revision,
             "worker segment terminal lineage differs from task"
         );
-        let replay = if REPLAY_EVIDENCE_AUTHORITY {
+        let journal = replay_requires_journal(provenance.key, &event, provenance.journal_version)?;
+        let replay = if journal {
             verify_terminal_replay_journal(
                 memory.as_ref(),
                 provenance.workspace,
@@ -592,6 +606,7 @@ async fn verify_bound(
             )
             .await?
         } else {
+            legacy_reader(repair_store, provenance, &mut reader)?;
             verify_terminal_replay(
                 memory.as_ref(),
                 reader.as_ref().context("worker completion decision reader missing")?,
@@ -626,7 +641,7 @@ async fn verify_bound(
             std::sync::Arc::from(provenance.store_workspace),
         );
         hook.persist(&replay, &event, None, None).await?;
-        if REPLAY_EVIDENCE_AUTHORITY {
+        if journal {
             anyhow::ensure!(
                 authority_journal::verify_child_outcome(
                     provenance.workspace,
@@ -728,6 +743,7 @@ pub(super) async fn recover_usage(
         parent_digest,
         input: input.event(),
         key: &constraints.key,
+        journal_version: grant.journal_version(),
     };
     recover_usage_bound(fabric, &provenance).await
 }
@@ -743,16 +759,7 @@ async fn recover_usage_bound(
     );
     let task = source.run_id.as_deref().context("worker recovery task missing")?;
     let memory = fabric.memory();
-    let reader = if REPLAY_EVIDENCE_AUTHORITY {
-        None
-    } else {
-        let store = CausalDecisionStore::open_unshared_read_only(provenance.workspace);
-        anyhow::ensure!(
-            store.workspace_id().as_deref() == Some(provenance.store_workspace),
-            "worker usage recovery decision store differs from original namespace"
-        );
-        Some(store.reader())
-    };
+    let mut reader = None;
     let mut recovered = RecoveredWorkerUsage {
         records: Vec::new(),
         unfinished_segments: 0,
@@ -791,7 +798,7 @@ async fn recover_usage_bound(
             )
             .await?
         {
-            let replay = if REPLAY_EVIDENCE_AUTHORITY {
+            let replay = if replay_requires_journal(provenance.key, &event, provenance.journal_version)? {
                 verify_terminal_replay_journal(
                     memory.as_ref(),
                     provenance.workspace,
@@ -804,6 +811,7 @@ async fn recover_usage_bound(
                 )
                 .await?
             } else {
+                legacy_reader(None, provenance, &mut reader)?;
                 verify_terminal_replay(
                     memory.as_ref(),
                     reader
@@ -942,10 +950,10 @@ async fn recover_from_launch(
     )?;
     // All transport, inventory, logical terminal and segment replay checks are
     // shared with normal completion. Journal presence alone grants nothing.
-    let repair_store = if REPLAY_EVIDENCE_AUTHORITY {
-        None
-    } else {
+    let repair_store = if provenance.journal_version < Some(authority_journal::JOURNAL_REQUIRED_VERSION) {
         CausalDecisionStore::existing_shared_writer(provenance.workspace)
+    } else {
+        None
     };
     verify_bound(
         fabric,
