@@ -97,6 +97,42 @@ impl std::fmt::Debug for VerifiedChildScope {
     }
 }
 
+// Equality is identity of the verified manifest and its shared parent, not an
+// authorization check.
+impl PartialEq for VerifiedChildScope {
+    fn eq(&self, other: &Self) -> bool {
+        self.manifest == other.manifest && Arc::ptr_eq(&self.parent, &other.parent)
+    }
+}
+impl Eq for VerifiedChildScope {}
+
+/// Pinned runtime identity of an authenticated child-origin turn. It is set only
+/// by the execution adapter from the turn source and is independent of any
+/// outgoing grant. Its presence marks child provenance; a scope must accompany it.
+#[derive(Clone)]
+pub(crate) struct ChildDispatchPin {
+    pub(crate) catalog: Arc<super::catalog::CapabilityCatalog>,
+    pub(crate) key: Arc<DecisionKey>,
+    pub(crate) owner: String,
+    pub(crate) workspace: String,
+}
+
+impl std::fmt::Debug for ChildDispatchPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildDispatchPin").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ChildDispatchPin {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.catalog, &other.catalog)
+            && Arc::ptr_eq(&self.key, &other.key)
+            && self.owner == other.owner
+            && self.workspace == other.workspace
+    }
+}
+impl Eq for ChildDispatchPin {}
+
 impl VerifiedChildScope {
     pub(crate) fn new(
         manifest: ChildCapabilityManifest,
