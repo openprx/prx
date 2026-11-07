@@ -499,4 +499,28 @@ fn registry_replace_never_touches_erased_receipt() {
         "update or replace: {error}"
     );
     assert_eq!(snapshot(&conn), before);
+
+    // The receipt table has no hidden rowid for a REPLACE to collide on.
+    assert!(
+        conn.prepare("SELECT rowid FROM agent_erase_receipts").is_err(),
+        "rowid column must not exist"
+    );
+    let error = conn
+        .execute(
+            "INSERT OR REPLACE INTO agent_erase_receipts (rowid, workspace_id, owner_id, erase_id, scope_id, incarnation, generation, state) \
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, 1, 'pending')",
+            params![W, O, "00000000-0000-4000-8000-0000000000b9", SCOPE, U1],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("rowid"), "insert with rowid: {error}");
+    let error = conn
+        .execute(
+            "UPDATE OR REPLACE agent_erase_receipts SET rowid = 1 WHERE erase_id = ?1",
+            [other],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("rowid"), "update rowid: {error}");
+    assert_eq!(snapshot(&conn), before);
 }

@@ -148,12 +148,12 @@ fn schema_sql() -> String {
                    AND completed_at IS NOT NULL)),
             FOREIGN KEY (scope_id, workspace_id, owner_id, incarnation, generation)
                 REFERENCES agent_scopes (scope_id, workspace_id, owner_id, incarnation, generation)
-        ) STRICT;
+        ) STRICT, WITHOUT ROWID;
         CREATE TRIGGER IF NOT EXISTS agent_erase_receipts_immutable_update
             BEFORE UPDATE ON agent_erase_receipts WHEN OLD.state = 'erased'
             BEGIN SELECT RAISE(ABORT, 'erased receipt is immutable'); END;
         -- A REPLACE can hit the primary key or the UNIQUE erase_id; both keys
-        -- are checked so neither can displace an erased receipt.
+        -- are checked. The table is WITHOUT ROWID so no hidden rowid key exists.
         CREATE TRIGGER IF NOT EXISTS agent_erase_receipts_immutable_insert
             BEFORE INSERT ON agent_erase_receipts
             WHEN EXISTS (SELECT 1 FROM agent_erase_receipts r
@@ -166,7 +166,10 @@ fn schema_sql() -> String {
         CREATE TRIGGER IF NOT EXISTS agent_erase_receipts_immutable_update_onto
             BEFORE UPDATE ON agent_erase_receipts
             WHEN EXISTS (SELECT 1 FROM agent_erase_receipts r
-                         WHERE r.state = 'erased' AND r.rowid <> OLD.rowid
+                         WHERE r.state = 'erased'
+                           AND NOT (r.workspace_id = OLD.workspace_id
+                                    AND r.owner_id = OLD.owner_id
+                                    AND r.erase_id = OLD.erase_id)
                            AND (r.erase_id = NEW.erase_id
                                 OR (r.workspace_id = NEW.workspace_id
                                     AND r.owner_id = NEW.owner_id
