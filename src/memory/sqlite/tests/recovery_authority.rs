@@ -623,3 +623,54 @@ fn recovery_key_gates_do_not_grow_with_distinct_ids() -> anyhow::Result<()> {
     drop(dir);
     Ok(())
 }
+
+#[test]
+fn message_event_digest_is_stable_across_the_ma_scope_alter() -> anyhow::Result<()> {
+    let (_dir, memory) = store()?;
+    let evidence = seed(&memory, "stable", "user")?;
+    // Rebuild the pre-ALTER row shape: the same table without `ma_scope_id`.
+    let legacy = Connection::open_in_memory()?;
+    legacy.execute(
+        "ATTACH DATABASE ?1 AS live",
+        [memory.db_path.to_string_lossy().as_ref()],
+    )?;
+    let columns: Vec<String> = {
+        let conn = memory.pool.write();
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('message_events') WHERE name <> 'ma_scope_id' ORDER BY cid")?;
+        stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?
+    };
+    legacy.execute_batch(&format!(
+        "CREATE TABLE message_events AS SELECT {} FROM live.message_events",
+        columns.join(", ")
+    ))?;
+    let before = event(&legacy, &chain(), "stable")?;
+    assert_eq!(
+        before, evidence,
+        "an unstamped scope column must not change the digest input"
+    );
+    // A stamped row must still differ, so the scope cannot be rebound silently.
+    let rev = "a".repeat(64);
+    let (inc, scope) = (
+        "00000000-0000-4000-8000-0000000000a0",
+        "00000000-0000-4000-8000-0000000000b1",
+    );
+    {
+        let conn = memory.pool.write();
+        conn.execute(
+            "INSERT INTO agent_incarnations VALUES ('prx_workspace','prx_owner','m',?1,'active',?2)",
+            params![inc, rev],
+        )?;
+        conn.execute(
+            "INSERT INTO agent_scopes VALUES (?1,'prx_workspace','prx_owner','sk','m',?2,1)",
+            params![scope, inc],
+        )?;
+        conn.execute(
+            "UPDATE message_events SET ma_scope_id=?1 WHERE event_id='stable'",
+            [scope],
+        )?;
+    }
+    let after = memory.recovery_event_evidence(&chain(), "stable")?;
+    assert_ne!(after, evidence, "a stamped scope must change the digest input");
+    Ok(())
+}

@@ -174,6 +174,9 @@ const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     "src/memory/sqlite/schema.rs::memory_events",
     "src/memory/sqlite/schema.rs::message_events",
     "src/memory/sqlite/schema.rs::message_events",
+    // Test-only: the pre-ALTER `message_events` shape (no `ma_scope_id`), rebuilt in an in-memory
+    // database to prove the recovery event digest is unchanged by the MA-01b1b scope column.
+    "src/memory/sqlite/tests/recovery_authority.rs::message_events",
     "src/memory/sqlite/tests/schema_and_documents.rs::message_events",
     // The `memory_events` tables in `tests/visibility_events.rs` are pre-v16
     // fixtures (`legacy_memory_events_gets_owner_id_column_on_init` and its
