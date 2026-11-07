@@ -1107,7 +1107,10 @@ fn upload_already_exists_preserves_the_existing_file() {
     let outcome = guard.settle(&sentinel, create_upload_file(&sentinel, &abandoned));
     let error = outcome.expect_err("test: create_new must refuse an existing file");
     assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-    assert!(guard.paths.is_empty(), "a path this request did not create is unregistered");
+    assert!(
+        guard.paths.is_empty(),
+        "a path this request did not create is unregistered"
+    );
 
     drop(guard);
     assert_eq!(
