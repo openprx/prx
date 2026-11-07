@@ -35,6 +35,20 @@ impl ParentSourceSnapshot {
         self.payload == other.payload && self.seal == other.seal
     }
 
+    /// Joins the sealed `launch_parent` lineage to this manifest-authenticated
+    /// parent source: parent run, session, source event, task and configuration.
+    pub(crate) fn matches_launch_parent(&self, launch: &super::authority_journal::LaunchParentRow) -> bool {
+        let Ok(fields) = serde_json::from_str::<SourceFields>(&self.payload) else {
+            return false;
+        };
+        launch.parent_run_id.as_deref() == Some(fields.run_id.as_str())
+            && launch.session_key.as_deref() == Some(fields.session_key.as_str())
+            && launch.source_event_id == fields.source_event_id
+            && launch.parent_task_run_id == fields.task_run_id
+            && launch.config_generation_id == fields.config_generation_id
+            && launch.config_source_revision == fields.config_source_revision
+    }
+
     /// A preliminary row/manifest join. restore_process independently checks
     /// this snapshot's signature and the durable source event before use.
     pub(crate) fn matches_worker_parent_run(

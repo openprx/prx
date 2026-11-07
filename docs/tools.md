@@ -389,13 +389,19 @@ inside the worker signature. Parent constraints carry a separate decision-key
 signature. The worker loads existing authority without creating keys or repairing
 permissions, and verifies the strict subset and inner seals. New delegated
 launches persist an immutable, signed authority binding in the logical workspace's
-`self/child_authority/journal.db` before handing off the worker manifest. Parent
-verification and source restoration use that binding without reading the decision
-store. Only a missing journal file or launch row falls back to the original
-owner-scoped parent decision and record digest; corrupt or mismatched journal
-entries are refused. Segment admission still runs the existing decision gate,
-and completion retains its admitted terminal settlement reference. Batch and
-parent-side process-terminal recovery retain their existing decision-store paths.
+`self/child_authority/journal.db` before handing off the worker manifest, in one
+transaction with a signed `launch_parent` record that seals the parent identity,
+lineage and eligibility. Parent verification and source restoration use these
+records without reading the decision store. Journals are mandatory for version 3
+and later launches: such a worker refuses to start when its `authority` or
+`launch_parent` record is missing, corrupt, or differs from the signed manifest.
+The legacy owner-scoped parent decision and record digest path is selected only
+by the launch version (an authenticated launch that predates version 3), never by
+the absence of a journal file or row. Segment admission still runs the existing
+decision gate, and completion retains its admitted terminal settlement
+reference. Batch and process-terminal recovery replay the journal's batch,
+launch and terminal evidence rather than the decision store; the decision store
+projections that remain are non-gating and are never read for authority.
 Reverting this change restores the legacy reader; journal entries can remain in
 place. A separate
 keyed binding covers the parent's effective configuration, logical workspace,

@@ -789,5 +789,51 @@ pub(crate) fn verify(worker: &WorkerManifest, workspace: &Path, key: &DecisionKe
         payload == binding(worker)?,
         "session-worker parent decision differs from issued authority"
     );
+    if required {
+        verify_launch_parent(worker, workspace, key)?;
+    }
     Ok(true)
+}
+
+/// A journal-required child must also carry its authenticated `launch_parent`
+/// row. Identity, lineage and eligibility are compared with the signed manifest;
+/// a missing, corrupt or mismatched row is an error, never a fallback.
+fn verify_launch_parent(worker: &WorkerManifest, workspace: &Path, key: &DecisionKey) -> anyhow::Result<()> {
+    let source = worker.child_source.as_ref().context("worker child source missing")?;
+    let parent_decision = &worker
+        .capability_manifest
+        .as_ref()
+        .context("worker capability manifest missing")?
+        .parent_decision_id;
+    let launch = read_launch_parent(workspace, &worker.run_id, key)?
+        .context("worker launch parent authority row is missing for a journal-required child")?;
+    anyhow::ensure!(
+        launch.version == LAUNCH_PARENT_VERSION
+            && launch.run == worker.run_id
+            && worker.owner_id.as_deref() == Some(launch.owner.as_str())
+            && launch.parent_decision == *parent_decision
+            && launch.parent_digest == source.parent_decision_digest
+            && launch.store_workspace == source.parent_store_workspace
+            && source.parent_source.matches_launch_parent(&launch)
+            && launch.enabled_snapshot
+            && !launch.legacy_v1
+            && launch.admits_issued_child,
+        "worker launch parent authority differs from the signed manifest"
+    );
+    Ok(())
+}
+
+/// Replaces one sealed `launch_parent` row so tests can reseal it for another run.
+#[cfg(test)]
+pub(crate) fn reseal_launch_parent_for_test(
+    workspace: &Path,
+    key: &DecisionKey,
+    key_run: &str,
+    launch: &LaunchParentRow,
+) -> anyhow::Result<()> {
+    let conn = open_writer(workspace)?;
+    let entry = seal_entry(key, LAUNCH_PARENT_DOMAIN, serde_json::to_string(launch)?)?;
+    let updated = conn.execute("UPDATE launch_parent SET entry=?1 WHERE run=?2", (entry, key_run))?;
+    anyhow::ensure!(updated == 1, "test: the launch parent row existed before resealing");
+    Ok(())
 }
