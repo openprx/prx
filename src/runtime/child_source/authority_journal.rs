@@ -3,7 +3,8 @@
 //! Three sealed tables live in `self/child_authority/journal.db`. Each row is
 //! `(key, entry)`, where `entry` is `{payload, seal}`. The seal domain differs per
 //! table, and the seal is checked before the payload is interpreted.
-use crate::causal_tree::store::{DecisionRecord, replay_column_names};
+use crate::causal_tree::ids::DecisionId;
+use crate::causal_tree::store::{ChildRecoveryLineage, DecisionRecord, replay_column_names};
 use crate::decision::key::{DecisionKey, KeyDomain};
 use crate::runtime::child_source::completion::ChildOutcomeError;
 use crate::session_worker::protocol::WorkerManifest;
@@ -12,6 +13,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Worker children sealed at this version or later must have an authority row.
 pub(crate) const JOURNAL_REQUIRED_VERSION: u8 = 3;
@@ -215,6 +217,7 @@ fn open_writer(workspace: &Path) -> anyhow::Result<Connection> {
              workspace TEXT NOT NULL, owner TEXT NOT NULL, decision TEXT NOT NULL, entry TEXT NOT NULL,
              PRIMARY KEY(workspace, owner, decision)
          );
+         CREATE INDEX IF NOT EXISTS decision_evidence_owner ON decision_evidence(workspace, owner);
          CREATE TABLE IF NOT EXISTS child_outcome (run TEXT NOT NULL, settlement TEXT NOT NULL, entry TEXT NOT NULL,
              PRIMARY KEY(run, settlement)
          );",
@@ -480,7 +483,18 @@ pub(crate) fn read_decision_evidence(
     else {
         return Ok(None);
     };
-    let payload = open_entry(key, DECISION_EVIDENCE_DOMAIN, "decision evidence", &entry)?;
+    decode_evidence_entry(key, &entry, store_workspace, owner, decision).map(Some)
+}
+
+/// Authenticates and decodes one sealed evidence entry against its SQL key.
+fn decode_evidence_entry(
+    key: &DecisionKey,
+    entry: &str,
+    store_workspace: &str,
+    owner: &str,
+    decision: &str,
+) -> anyhow::Result<Vec<(String, SqlValue)>> {
+    let payload = open_entry(key, DECISION_EVIDENCE_DOMAIN, "decision evidence", entry)?;
     let payload: DecisionEvidencePayload = serde_json::from_str(&payload)?;
     anyhow::ensure!(
         payload.version == DECISION_EVIDENCE_VERSION,
@@ -512,13 +526,143 @@ pub(crate) fn read_decision_evidence(
                 .all(|(column, expected)| column.name == *expected),
         "decision evidence columns differ from the replay schema"
     );
-    Ok(Some(
-        payload
-            .columns
-            .into_iter()
-            .map(|column| (column.name, column.value.into_value()))
-            .collect(),
-    ))
+    Ok(payload
+        .columns
+        .into_iter()
+        .map(|column| (column.name, column.value.into_value()))
+        .collect())
+}
+
+/// Rowid anchor of one discovery pass over an owner's evidence rows. Rows are
+/// append-only, so a number is enough to advance past an invalid entry.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EvidenceCursor {
+    after_rowid: i64,
+    high_water: i64,
+}
+
+/// One enumerated row. Discovery is never authority: lineage comes from the
+/// authenticated sealed columns and replay still verifies the whole chain.
+pub(crate) struct EvidenceCandidate {
+    pub(crate) cursor: EvidenceCursor,
+    pub(crate) lineage: Option<ChildRecoveryLineage>,
+}
+
+const MAX_EVIDENCE_ENTRY_BYTES: i64 = 1 << 20;
+const MAX_LINEAGE_FIELD_BYTES: usize = 4096;
+const SELECT_EVIDENCE_PAGE: &str = "SELECT rowid, \
+    CASE WHEN typeof(decision) = 'text' AND typeof(entry) = 'text' \
+        AND length(CAST(decision AS BLOB)) BETWEEN 1 AND 4096 \
+        AND length(CAST(entry AS BLOB)) <= ?6 THEN decision END, \
+    CASE WHEN typeof(decision) = 'text' AND typeof(entry) = 'text' \
+        AND length(CAST(decision AS BLOB)) BETWEEN 1 AND 4096 \
+        AND length(CAST(entry AS BLOB)) <= ?6 THEN entry END \
+    FROM decision_evidence WHERE workspace = ?1 AND owner = ?2 AND rowid > ?3 AND rowid <= ?4 \
+    ORDER BY rowid LIMIT ?5";
+
+fn evidence_lineage(columns: &[(String, SqlValue)]) -> Option<ChildRecoveryLineage> {
+    let text = |name: &str| {
+        columns
+            .iter()
+            .find(|(column, _)| column == name)
+            .and_then(|(_, value)| match value {
+                SqlValue::Text(text) if (1..=MAX_LINEAGE_FIELD_BYTES).contains(&text.len()) => Some(text.clone()),
+                _ => None,
+            })
+    };
+    Some(ChildRecoveryLineage {
+        decision_id: DecisionId::parse(&text("decision_id")?).ok()?,
+        source_event_id: text("source_event_id")?,
+        run_id: text("run_id")?,
+        session_key: text("session_key")?,
+    })
+}
+
+/// Next page, in ascending rowid order, of one owner's evidence rows up to the
+/// high water captured when the pass started. An empty page resets the position
+/// so the next pass sees late inserts; it never implies exhaustive success.
+pub(crate) fn next_evidence_page(
+    position: &mut Option<EvidenceCursor>,
+    workspace: &Path,
+    key: &DecisionKey,
+    store_workspace: &str,
+    owner: &str,
+    limit: usize,
+    deadline: Instant,
+) -> anyhow::Result<Vec<EvidenceCandidate>> {
+    anyhow::ensure!(
+        (1..=64).contains(&limit)
+            && (1..=MAX_LINEAGE_FIELD_BYTES).contains(&owner.len())
+            && (1..=MAX_LINEAGE_FIELD_BYTES).contains(&store_workspace.len()),
+        "evidence discovery bounds are invalid"
+    );
+    let page = scan_evidence(*position, workspace, key, store_workspace, owner, limit, deadline)?;
+    if page.is_empty() {
+        *position = None;
+    }
+    Ok(page)
+}
+
+fn scan_evidence(
+    position: Option<EvidenceCursor>,
+    workspace: &Path,
+    key: &DecisionKey,
+    store_workspace: &str,
+    owner: &str,
+    limit: usize,
+    deadline: Instant,
+) -> anyhow::Result<Vec<EvidenceCandidate>> {
+    let path = path(workspace);
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        result => {
+            result?;
+        }
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    let high_water = match position {
+        Some(cursor) => cursor.high_water,
+        None => conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM decision_evidence", [], |row| {
+            row.get(0)
+        })?,
+    };
+    let after = position.map_or(0, |cursor| cursor.after_rowid);
+    let mut statement = conn.prepare(SELECT_EVIDENCE_PAGE)?;
+    let mut rows = statement.query((
+        store_workspace,
+        owner,
+        after,
+        high_water,
+        i64::try_from(limit)?,
+        MAX_EVIDENCE_ENTRY_BYTES,
+    ))?;
+    let mut page = Vec::with_capacity(limit);
+    while let Some(row) = rows.next()? {
+        anyhow::ensure!(Instant::now() < deadline, "evidence discovery deadline elapsed");
+        let rowid: i64 = row.get(0)?;
+        let decision: Option<String> = row.get(1)?;
+        let entry: Option<String> = row.get(2)?;
+        let lineage = match (decision, entry) {
+            (Some(decision), Some(entry)) => {
+                match decode_evidence_entry(key, &entry, store_workspace, owner, &decision) {
+                    Ok(columns) => evidence_lineage(&columns),
+                    Err(error) => {
+                        tracing::warn!(rowid, "skipping an invalid decision evidence entry: {error}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        page.push(EvidenceCandidate {
+            cursor: EvidenceCursor {
+                after_rowid: rowid,
+                high_water,
+            },
+            lineage,
+        });
+    }
+    Ok(page)
 }
 
 /// Writes one `child_outcome` row in a FULL transaction, then reads it back and

@@ -618,8 +618,19 @@ impl ReplayRows<'_> {
                 read_replay_decision(reader, &scope, id, bounded).await
             }
             Self::Journal { workspace, key } => {
-                anyhow::ensure!(bounded.is_none(), "journal terminal replay carries no deadline");
-                read_journal_replay_record(workspace, key, store_workspace_id, owner_id, id).await
+                let tracker = match bounded {
+                    Some((_, owner)) => Some(Arc::clone(owner)),
+                    None => crate::runtime::turn_cleanup::current_tracker(),
+                };
+                let row =
+                    read_journal_replay_record_on(tracker, workspace, key, store_workspace_id, owner_id, id).await?;
+                if let Some((deadline, _)) = bounded {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "journal terminal replay deadline elapsed"
+                    );
+                }
+                Ok(row)
             }
         }
     }
@@ -670,6 +681,35 @@ pub(crate) async fn verify_terminal_replay_journal(
         terminal_id,
         event,
         None,
+    )
+    .await
+    .map_err(JournalReplayError::Replay)
+}
+
+/// Bounded journal-only terminal replay for recovery. Parent and hop rows are
+/// read on the given cleanup owner and the deadline is rechecked after each read.
+pub(crate) async fn verify_terminal_replay_journal_until(
+    memory: &dyn Memory,
+    workspace: &std::path::Path,
+    key: &Arc<DecisionKey>,
+    store_workspace_id: &str,
+    workspace_id: &str,
+    owner_id: &str,
+    terminal_id: &str,
+    event: &MessageEvent,
+    deadline: std::time::Instant,
+    owner: &Arc<crate::runtime::turn_cleanup::CleanupTracker>,
+) -> Result<VerifiedTerminalReplay, JournalReplayError> {
+    verify_terminal_replay_inner(
+        memory,
+        ReplayRows::Journal { workspace, key },
+        key,
+        store_workspace_id,
+        workspace_id,
+        owner_id,
+        terminal_id,
+        event,
+        Some((deadline, owner)),
     )
     .await
     .map_err(JournalReplayError::Replay)
@@ -1258,6 +1298,25 @@ pub(crate) async fn read_journal_replay_record(
     owner: &str,
     id: &DecisionId,
 ) -> anyhow::Result<Option<DecisionReplayRecord>> {
+    read_journal_replay_record_on(
+        crate::runtime::turn_cleanup::current_tracker(),
+        workspace,
+        key,
+        store_workspace,
+        owner,
+        id,
+    )
+    .await
+}
+
+pub(crate) async fn read_journal_replay_record_on(
+    tracker: Option<Arc<crate::runtime::turn_cleanup::CleanupTracker>>,
+    workspace: &std::path::Path,
+    key: &Arc<DecisionKey>,
+    store_workspace: &str,
+    owner: &str,
+    id: &DecisionId,
+) -> anyhow::Result<Option<DecisionReplayRecord>> {
     let workspace = workspace.to_path_buf();
     let key = Arc::clone(key);
     let store_workspace = store_workspace.to_owned();
@@ -1274,7 +1333,7 @@ pub(crate) async fn read_journal_replay_record(
         .map(|columns| DecisionReplayRecord::from_evidence_columns(&columns))
         .transpose()
     };
-    match crate::runtime::turn_cleanup::current_tracker() {
+    match tracker {
         Some(tracker) => crate::runtime::ingress_recovery::owned_store_read(&tracker, read).await,
         None => crate::runtime::blocking::spawn_blocking(read).await?,
     }

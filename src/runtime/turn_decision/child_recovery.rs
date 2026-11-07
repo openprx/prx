@@ -2,10 +2,13 @@
 use super::{
     Arc, BTreeMap, Context, DecisionScope, Enqueue, Instant, OutcomeCorrelator, TerminalFacts, TurnDecisionService,
 };
+use crate::agent::terminal::REPLAY_EVIDENCE_AUTHORITY;
 use crate::causal_tree::store::{ChildRecoveryCursor, ChildRecoveryLineage};
 use crate::memory::MessageEvent;
 use crate::memory::ingress_recovery::{IngressEventLookup, IngressLifetime, IngressRecoveryScope, remaining};
+use crate::runtime::child_source::authority_journal::{self, EvidenceCursor};
 use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
+use crate::runtime::child_source::recovery;
 use crate::runtime::turn_cleanup::CleanupTracker;
 
 #[derive(Default)]
@@ -13,9 +16,31 @@ pub(super) struct ChildRecoveryState {
     owners: parking_lot::Mutex<BTreeMap<String, OwnerCursor>>,
 }
 
+/// Separate bounded scan positions: journal evidence and legacy store rows.
+#[derive(Default)]
+struct RecoveryPositions {
+    legacy: Option<ChildRecoveryCursor>,
+    journal: Option<EvidenceCursor>,
+}
+
+/// A scanned row advances exactly one of the two positions.
+enum Advance {
+    Legacy(ChildRecoveryCursor),
+    Journal(EvidenceCursor),
+}
+
+impl Advance {
+    const fn apply(self, positions: &mut RecoveryPositions) {
+        match self {
+            Self::Legacy(cursor) => positions.legacy = Some(cursor),
+            Self::Journal(cursor) => positions.journal = Some(cursor),
+        }
+    }
+}
+
 struct OwnerCursor {
     owner: std::sync::Weak<CleanupTracker>,
-    cursor: Arc<tokio::sync::Mutex<Option<ChildRecoveryCursor>>>,
+    cursor: Arc<tokio::sync::Mutex<RecoveryPositions>>,
 }
 
 /// Counts are evidence statuses, not an exhaustive reconciliation assertion.
@@ -82,7 +107,7 @@ impl TurnDecisionService {
                     report.deferred = true;
                     return Ok(report);
                 }
-                let cursor = Arc::new(tokio::sync::Mutex::new(None));
+                let cursor = Arc::new(tokio::sync::Mutex::new(RecoveryPositions::default()));
                 owners.insert(
                     scope.owner_id.clone(),
                     OwnerCursor {
@@ -105,36 +130,74 @@ impl TurnDecisionService {
             workspace_id: Arc::clone(&store_workspace),
             owner_id: Arc::from(scope.owner_id.as_str()),
         };
-        let reader = self.store.reader();
-        let scan_scope = store_scope.clone();
-        let after = *position;
-        let page = super::super::ingress_recovery::owned_store_read(owner, move || {
-            Ok(reader.child_recovery_candidates_until(&scan_scope, after, 64, deadline)?)
-        })
-        .await;
-        let page = match page {
-            Ok(page) => page,
-            Err(_) => {
-                report.scan_unavailable = true;
-                report.deadline_reached = remaining(deadline).is_err();
-                return Ok(report);
+        let page: Vec<(Advance, Option<ChildRecoveryLineage>)> = if REPLAY_EVIDENCE_AUTHORITY {
+            let (workspace, key) = (
+                self.generation.effective.workspace_dir.clone(),
+                Arc::clone(&self.state_key),
+            );
+            let (store_ws, owner_id) = (Arc::clone(&store_workspace), scope.owner_id.clone());
+            let mut journal = position.journal;
+            let scanned = super::super::ingress_recovery::owned_store_read(owner, move || {
+                let page = authority_journal::next_evidence_page(
+                    &mut journal,
+                    &workspace,
+                    &key,
+                    &store_ws,
+                    &owner_id,
+                    64,
+                    deadline,
+                )?;
+                Ok((journal, page))
+            })
+            .await;
+            match scanned {
+                Ok((journal, page)) => {
+                    position.journal = journal;
+                    page.into_iter()
+                        .map(|item| (Advance::Journal(item.cursor), item.lineage))
+                        .collect()
+                }
+                Err(_) => {
+                    report.scan_unavailable = true;
+                    report.deadline_reached = remaining(deadline).is_err();
+                    return Ok(report);
+                }
+            }
+        } else {
+            let reader = self.store.reader();
+            let scan_scope = store_scope.clone();
+            let after = position.legacy;
+            let page = super::super::ingress_recovery::owned_store_read(owner, move || {
+                Ok(reader.child_recovery_candidates_until(&scan_scope, after, 64, deadline)?)
+            })
+            .await;
+            match page {
+                Ok(page) => page
+                    .into_iter()
+                    .map(|item| (Advance::Legacy(item.cursor), item.lineage))
+                    .collect(),
+                Err(_) => {
+                    report.scan_unavailable = true;
+                    report.deadline_reached = remaining(deadline).is_err();
+                    return Ok(report);
+                }
             }
         };
         if page.is_empty() {
-            *position = None;
+            position.legacy = None;
             report.wrapped = true;
             return Ok(report);
         }
-        for candidate in page {
+        for (advance, lineage) in page {
             if remaining(deadline).is_err() {
                 report.deadline_reached = true;
                 break;
             }
             // Unconfirmed history cannot pin enumeration forever. This is a
             // live scan position only: wrap/restart revisits unresolved rows.
-            *position = Some(candidate.cursor);
+            advance.apply(&mut position);
             report.scanned += 1;
-            let Some(lineage) = candidate.lineage else {
+            let Some(lineage) = lineage else {
                 report.unconfirmed += 1;
                 continue;
             };
@@ -188,6 +251,23 @@ impl TurnDecisionService {
         deadline: Instant,
     ) -> anyhow::Result<Option<(MessageEvent, crate::agent::terminal::VerifiedTerminalReplay)>> {
         remaining(deadline)?;
+        if REPLAY_EVIDENCE_AUTHORITY {
+            let store_workspace = self
+                .store
+                .workspace_id()
+                .context("child recovery store scope missing")?;
+            return recovery::verify_candidate(
+                self.memory.as_ref(),
+                &self.generation.effective.workspace_dir,
+                &self.state_key,
+                &store_workspace,
+                scope,
+                lineage,
+                owner,
+                deadline,
+            )
+            .await;
+        }
         let Some(event) = self
             .memory
             .read_ingress_event(
@@ -261,6 +341,24 @@ impl TurnDecisionService {
             .context("child recovery store scope missing")?;
         if remaining(deadline).is_err() || lifetime.validate(deadline).await.is_err() {
             return Ok(None);
+        }
+        if REPLAY_EVIDENCE_AUTHORITY {
+            // Journal-required children are settled from independent evidence
+            // only. No projection write, drain or store readback takes part.
+            let written = recovery::settle(
+                &self.generation.effective.workspace_dir,
+                &self.state_key,
+                &store_workspace,
+                replay,
+                event,
+                owner,
+                deadline,
+            )
+            .await?;
+            if remaining(deadline).is_err() || lifetime.validate(deadline).await.is_err() {
+                return Ok(None);
+            }
+            return Ok(Some(written));
         }
         JournalChildOutcomeHook::new(
             self.generation.effective.workspace_dir.clone(),
