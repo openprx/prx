@@ -302,6 +302,7 @@ async fn exact_file_collection_with_legacy_events(
                 service: &service, context: &bad_context, proof: bad_proof.as_ref(), envelope: &bad_envelope,
                 config: &config, memory: &memory, registry: &registry, tool_name, arguments: &arguments,
                 cleanup_confirmed: &owned_cleanup_confirmed,
+                store_stalled: false,
             }, mode)).await;
             assert_eq!(dispatches.load(Ordering::SeqCst), 0);
             assert_unmodified();
@@ -310,6 +311,7 @@ async fn exact_file_collection_with_legacy_events(
             service: &service, context: &context, proof: proof.as_ref(), envelope: &envelope,
             config: &config, memory: &memory, registry: &registry, tool_name, arguments: &arguments,
             cleanup_confirmed: &owned_cleanup_confirmed,
+            store_stalled: false,
         })).await;
         assert!(service.begin_approval_collection(proof.as_ref(), &context).is_err(), "lease cannot be reissued");
         assert_eq!(dispatches.load(Ordering::SeqCst), 0);
@@ -911,6 +913,7 @@ async fn fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once() {
             tool_name,
             arguments: &arguments,
             cleanup_confirmed: &owned_cleanup_confirmed,
+            store_stalled: false,
         }))
         .await;
         assert_eq!(executions(), 0, "collection never dispatches");
