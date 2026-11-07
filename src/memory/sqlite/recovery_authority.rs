@@ -231,6 +231,144 @@ fn verify(
     Ok(facts)
 }
 
+/// Receipts that bind legacy events being attributed to Main, split by whether
+/// they authenticate against the events' current (pre-stamp) bytes.
+#[derive(Default)]
+pub(super) struct MainBinding {
+    pub(super) verified: Vec<RecoveryChain>,
+    /// Event ids bound by a receipt that did not verify; they must stay unstamped.
+    pub(super) blocked: Vec<String>,
+}
+
+/// Historical keys are load-only: this never creates a key directory or a key.
+fn memory_directory(conn: &Connection) -> anyhow::Result<KeyDirectory> {
+    let path = conn
+        .path()
+        .filter(|path| !path.is_empty())
+        .context("an in-memory store has no recovery keys")?;
+    KeyDirectory::open(
+        std::path::Path::new(path)
+            .parent()
+            .context("missing memory directory")?,
+        false,
+    )
+}
+
+/// Verify, before any mutation, every receipt binding one of `events`.
+pub(super) fn verify_main_binding(conn: &Connection, events: &[String]) -> anyhow::Result<MainBinding> {
+    let mut out = MainBinding::default();
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='recovery_attestations' AND type='table')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present || events.is_empty() {
+        return Ok(out);
+    }
+    let ids = serde_json::to_string(events)?;
+    let rows = conn
+        .prepare(
+            "SELECT workspace_id,owner_id,source,run_id,input_event_id,terminal_event_id,version,key_id,state,facts,mac
+             FROM recovery_attestations
+             WHERE input_event_id IN (SELECT value FROM json_each(?1))
+                OR terminal_event_id IN (SELECT value FROM json_each(?1))",
+        )?
+        .query_map([ids], |r| {
+            let chain = RecoveryChain {
+                workspace_id: r.get(0)?,
+                owner_id: r.get(1)?,
+                source: r.get(2)?,
+                run_id: r.get(3)?,
+            };
+            let receipt = RecoveryReceipt {
+                version: r.get(6)?,
+                backend_namespace: String::new(),
+                key_id: r.get(7)?,
+                state: r.get(8)?,
+                facts: r.get(9)?,
+                mac: r.get(10)?,
+            };
+            Ok((
+                chain,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                receipt,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let authority = active(conn);
+    let directory = memory_directory(conn);
+    for (chain, input, terminal, mut receipt) in rows {
+        let outcome = match (&authority, &directory) {
+            (Ok((namespace, _)), Ok(directory)) => {
+                receipt.backend_namespace.clone_from(namespace);
+                directory
+                    .load(&receipt.key_id)
+                    .map_err(|error| ("recovery_key_unusable", error))
+                    .and_then(|_| {
+                        verify(conn, directory, &chain, &receipt)
+                            .map(|_| ())
+                            .map_err(|error| ("recovery_receipt_unverifiable", error))
+                    })
+            }
+            _ => Err((
+                "recovery_key_unusable",
+                anyhow::anyhow!("recovery authority unavailable"),
+            )),
+        };
+        match outcome {
+            Ok(()) => out.verified.push(chain),
+            Err((reason, error)) => {
+                tracing::warn!(reason, run_id = %chain.run_id, %error, "recovery receipt left on its unmigrated events");
+                out.blocked.extend(input.into_iter().chain(terminal));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Rebind verified receipts to the already-stamped event rows with the
+/// receipt's own historical key. The immutability trigger is dropped and
+/// restored verbatim inside the caller's transaction; every rebound receipt is
+/// re-verified before returning, and any failure aborts the caller's savepoint.
+pub(super) fn rebind_main_binding(conn: &Connection, chains: &[RecoveryChain]) -> anyhow::Result<()> {
+    if chains.is_empty() {
+        return Ok(());
+    }
+    let directory = memory_directory(conn)?;
+    let trigger: String = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='recovery_settled_immutable'",
+        [],
+        |r| r.get(0),
+    )?;
+    conn.execute_batch("DROP TRIGGER recovery_settled_immutable")?;
+    for chain in chains {
+        let receipt = stored(conn, chain)?.context("missing recovery receipt")?;
+        let key = directory.load(&receipt.key_id)?;
+        let mut facts: BoundFacts = serde_json::from_slice(&receipt.facts)?;
+        for bound in [&mut facts.input, &mut facts.terminal].into_iter().flatten() {
+            bound.digest = domain_mac(&key, b"prx.recovery.event.v1", &event(conn, chain, &bound.id)?.record);
+        }
+        let mut next = RecoveryReceipt {
+            facts: serde_json::to_vec(&facts)?,
+            mac: Vec::new(),
+            ..receipt
+        };
+        anyhow::ensure!(
+            next.facts.len() <= MAX_SERIALIZED_FACTS,
+            "rebound recovery facts too large"
+        );
+        sign(&mut next, &key)?;
+        conn.execute(
+            "UPDATE recovery_attestations SET facts=?1,mac=?2 WHERE workspace_id=?3 AND owner_id=?4 AND source=?5 AND run_id=?6",
+            params![next.facts, next.mac, chain.workspace_id, chain.owner_id, chain.source, chain.run_id],
+        )?;
+        verify(conn, &directory, chain, &next)?;
+    }
+    conn.execute_batch(&trigger)?;
+    Ok(())
+}
+
 // Recovery commits require SQLite FULL synchronization, independent of the
 // ordinary memory writer's NORMAL policy. Restore the connection on all paths.
 struct FullSync<'a>(&'a Connection, i64);

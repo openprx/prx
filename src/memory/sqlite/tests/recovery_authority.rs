@@ -674,3 +674,109 @@ fn message_event_digest_is_stable_across_the_ma_scope_alter() -> anyhow::Result<
     assert_ne!(after, evidence, "a stamped scope must change the digest input");
     Ok(())
 }
+
+fn console_chain(run: &str) -> RecoveryChain {
+    RecoveryChain {
+        workspace_id: "prx_workspace".into(),
+        owner_id: "prx_owner".into(),
+        source: "console".into(),
+        run_id: run.into(),
+    }
+}
+fn console_seed(memory: &SqliteMemory, id: &str, run: &str, role: &str) -> anyhow::Result<RecoveryEvidence> {
+    memory.pool.write().execute("INSERT INTO message_events(event_id,workspace_id,owner_id,source,run_id,session_key,role,event_type,content,created_at,updated_at) VALUES(?1,'prx_workspace','prx_owner','console',?2,'sk',?3,'message.created','console bytes','0','0')", params![id,run,role])?;
+    memory.recovery_event_evidence(&console_chain(run), id)
+}
+fn scope_of(memory: &SqliteMemory, id: &str) -> Option<String> {
+    memory
+        .pool
+        .write()
+        .query_row("SELECT ma_scope_id FROM message_events WHERE event_id=?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+fn set_scope(memory: &SqliteMemory, id: &str, scope: Option<&str>) {
+    memory
+        .pool
+        .write()
+        .execute(
+            "UPDATE message_events SET ma_scope_id=?2 WHERE event_id=?1",
+            params![id, scope],
+        )
+        .unwrap();
+}
+
+#[test]
+fn main_attribution_rebinds_pending_and_settled_console_receipts() -> anyhow::Result<()> {
+    let (_dir, memory) = store()?;
+    memory.activate_recovery_authority()?;
+    let path = memory.db_path.clone();
+    let publish = |run: &str, input: &str, terminal: Option<&str>| -> anyhow::Result<RecoveryReceipt> {
+        let mut publication = RecoveryPublication {
+            chain: console_chain(run),
+            input: Some(console_seed(&memory, input, run, "user")?),
+            terminal: None,
+            facts: b"pending console facts".to_vec(),
+        };
+        let pending = memory.record_recovery_pending(&publication)?;
+        let receipt = if let Some(terminal) = terminal {
+            publication.terminal = Some(console_seed(&memory, terminal, run, "assistant")?);
+            publication.facts = b"settled console facts".to_vec();
+            memory.settle_recovery(&publication)?
+        } else {
+            pending
+        };
+        Ok(receipt)
+    };
+    let pending_before = publish("run-pending", "p-in", None)?;
+    let settled_before = publish("run-settled", "s-in", Some("s-out"))?;
+    publish("run-tampered", "t-in", None)?;
+    // Legacy history changed after attestation: this receipt must not be rebound.
+    memory
+        .pool
+        .write()
+        .execute("UPDATE message_events SET content='changed' WHERE event_id='t-in'", [])?;
+    drop(memory);
+
+    // Normal reopen runs the Main attribution migration.
+    let memory = SqliteMemory::new_with_path(path)?;
+    let scope = scope_of(&memory, "p-in").expect("verified console event is attributed to Main");
+    for id in ["s-in", "s-out"] {
+        assert_eq!(scope_of(&memory, id).as_deref(), Some(scope.as_str()));
+    }
+    assert_eq!(
+        scope_of(&memory, "t-in"),
+        None,
+        "an unverifiable receipt keeps its event unmigrated"
+    );
+    let pending = memory
+        .read_recovery_receipt(&console_chain("run-pending"))?
+        .expect("pending receipt");
+    let settled = memory
+        .read_recovery_receipt(&console_chain("run-settled"))?
+        .expect("settled receipt");
+    assert_eq!((pending.state.as_str(), settled.state.as_str()), ("pending", "settled"));
+    assert_ne!(pending.mac, pending_before.mac);
+    assert_ne!(settled.mac, settled_before.mac);
+    assert!(memory.read_recovery_receipt(&console_chain("run-tampered")).is_err());
+
+    // A later change of the scope, including clearing it, is detected.
+    let other = "00000000-0000-4000-8000-0000000000c3";
+    let incarnation: String = memory.pool.write().query_row(
+        "SELECT incarnation FROM agent_scopes WHERE scope_id=?1",
+        [&scope],
+        |r| r.get(0),
+    )?;
+    memory.pool.write().execute(
+        "INSERT INTO agent_scopes VALUES (?1,'prx_workspace','prx_owner','sk2','m',?2,1)",
+        params![other, incarnation],
+    )?;
+    for changed in [None, Some(other)] {
+        set_scope(&memory, "p-in", changed);
+        assert!(memory.read_recovery_receipt(&console_chain("run-pending")).is_err());
+        set_scope(&memory, "p-in", Some(&scope));
+        assert!(memory.read_recovery_receipt(&console_chain("run-pending")).is_ok());
+    }
+    Ok(())
+}

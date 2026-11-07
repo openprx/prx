@@ -118,20 +118,41 @@ pub(super) fn migrate_legacy_console(conn: &Connection) -> anyhow::Result<u64> {
         let Some(scope) = unfenced_scope(conn, &workspace, &owner, &session, &incarnation)? else {
             continue;
         };
-        conn.execute(
-            &format!(
-                "UPDATE message_events AS e SET ma_scope_id = ?1
-                 WHERE {EVENT_PENDING} AND e.workspace_id = ?2 AND e.owner_id = ?3 AND e.session_key = ?4"
-            ),
-            params![scope, workspace, owner, session],
-        )?;
-        conn.execute(
-            &format!(
-                "UPDATE conversation_turns AS c SET ma_scope_id = ?1
-                 WHERE {TURN_PENDING} AND {TURN_WORKSPACE} = ?2 AND c.owner_id = ?3 AND c.session_key = ?4"
-            ),
-            params![scope, workspace, owner, session],
-        )?;
+        let events = conn
+            .prepare(&format!(
+                "SELECT e.event_id FROM message_events e
+                 WHERE {EVENT_PENDING} AND e.workspace_id = ?1 AND e.owner_id = ?2 AND e.session_key = ?3"
+            ))?
+            .query_map(params![workspace, owner, session], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Receipts are verified against the original bytes before any mutation.
+        let binding = super::recovery_authority::verify_main_binding(conn, &events)?;
+        let blocked = serde_json::to_string(&binding.blocked)?;
+        conn.execute_batch("SAVEPOINT ma_main_attribution")?;
+        let stamped = (|| -> anyhow::Result<()> {
+            conn.execute(
+                &format!(
+                    "UPDATE message_events AS e SET ma_scope_id = ?1
+                     WHERE {EVENT_PENDING} AND e.workspace_id = ?2 AND e.owner_id = ?3 AND e.session_key = ?4
+                       AND e.event_id NOT IN (SELECT value FROM json_each(?5))"
+                ),
+                params![scope, workspace, owner, session, blocked],
+            )?;
+            conn.execute(
+                &format!(
+                    "UPDATE conversation_turns AS c SET ma_scope_id = ?1
+                     WHERE {TURN_PENDING} AND {TURN_WORKSPACE} = ?2 AND c.owner_id = ?3 AND c.session_key = ?4"
+                ),
+                params![scope, workspace, owner, session],
+            )?;
+            super::recovery_authority::rebind_main_binding(conn, &binding.verified)
+        })();
+        if let Err(error) = stamped {
+            // Never keep a stamp whose receipt could not be rebound and re-verified.
+            conn.execute_batch("ROLLBACK TO ma_main_attribution")?;
+            tracing::warn!(reason = "recovery_rebind_failed", %error, "legacy console rows left unmigrated");
+        }
+        conn.execute_batch("RELEASE ma_main_attribution")?;
     }
     let left: i64 = conn.query_row(
         &format!(
