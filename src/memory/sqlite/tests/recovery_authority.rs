@@ -510,6 +510,15 @@ async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()
     // the old file. The active authority stays usable.
     let retired = first_memory.activate_recovery_authority()?;
     first_memory.rotate_recovery_authority()?;
+    // This cell is a database written before AUTH-02-1b: a capsule with no
+    // attestation (an attestation would keep its key referenced, and activation
+    // refuses a missing referenced key by design).
+    first_memory.pool.write().execute_batch(
+        "DROP TRIGGER recovery_transport_tombstone;
+         DROP TABLE recovery_transport_index;
+         DROP TABLE recovery_tombstones;
+         DELETE FROM recovery_attestations;",
+    )?;
     std::fs::remove_file(
         db_path
             .parent()
@@ -779,4 +788,259 @@ fn main_attribution_rebinds_pending_and_settled_console_receipts() -> anyhow::Re
         assert!(memory.read_recovery_receipt(&console_chain("run-pending")).is_ok());
     }
     Ok(())
+}
+
+mod attestation {
+    use super::*;
+    use crate::memory::ingress_recovery::{IngressAppendOutcome, IngressLifetime};
+    use crate::memory::recovery_authority::RecoveryMacDomain;
+    use crate::memory::{MessageEventInput, MessageEventSource};
+
+    struct Fixture {
+        input: MessageEventInput,
+        capsule: IngressCapsule,
+        lifetime: Arc<dyn IngressLifetime>,
+        facts: PendingFacts,
+        attestation: IngressAttestation,
+    }
+
+    fn count(memory: &SqliteMemory, table: &str) -> i64 {
+        memory
+            .pool
+            .write()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    async fn fixture(memory: &SqliteMemory) -> Fixture {
+        let key_id = memory.activate_recovery_authority().unwrap();
+        let workspace = memory
+            .db_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let lifetime = memory
+            .acquire_ingress_lifetime(&workspace, &uuid::Uuid::new_v4().to_string(), deadline)
+            .await
+            .unwrap();
+        let input_key = "prx_input_key";
+        let digest = memory
+            .recovery_mac(Some(&key_id), RecoveryMacDomain::InputDigestV3, b"input")
+            .unwrap();
+        let capsule = IngressCapsule {
+            version: 3,
+            key_id: Some(key_id.clone()),
+            backend_namespace: lifetime.namespace().to_owned(),
+            scope: IngressRecoveryScope {
+                workspace_id: workspace.clone(),
+                owner_id: "prx_owner".into(),
+                source: MessageEventSource::Agent,
+            },
+            lifetime: lifetime.token().to_owned(),
+            input_event_id: "prx_input_event".into(),
+            input_key: input_key.into(),
+            run_id: "prx_run".into(),
+            input_digest: hex::encode(digest.tag),
+            authentication: "0".repeat(64),
+        };
+        let input: MessageEventInput = serde_json::from_value(serde_json::json!({
+            "event_id": capsule.input_event_id, "workspace_id": workspace, "owner_id": "prx_owner",
+            "source": "agent", "channel": "agent_api", "session_key": "prx_session",
+            "run_id": "prx_run", "idempotency_key": input_key, "role": "user",
+            "event_type": "message.created", "content": "attested", "visibility": "session",
+            "config_generation_id": 7,
+            "raw_payload_json": serde_json::json!({
+                "prx_ingress_capsule": capsule, "original_payload_json": null
+            }).to_string()
+        }))
+        .unwrap();
+        let transport = memory
+            .recovery_mac(Some(&key_id), RecoveryMacDomain::TransportV3, b"transport")
+            .unwrap();
+        let key_tag = memory
+            .recovery_mac(Some(&key_id), RecoveryMacDomain::InputKeyV3, input_key.as_bytes())
+            .unwrap();
+        use base64::Engine as _;
+        let facts = PendingFacts {
+            v: 1,
+            namespace: capsule.backend_namespace.clone(),
+            workspace_id: workspace.clone(),
+            owner_id: "prx_owner".into(),
+            source: "agent".into(),
+            channel: Some("agent_api".into()),
+            session_key: Some("prx_session".into()),
+            surface: "agent_loop".into(),
+            generation: 7,
+            lifetime: capsule.lifetime.clone(),
+            input_event_id: capsule.input_event_id.clone(),
+            input_key: input_key.into(),
+            capsule_version: 3,
+            capsule: base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&capsule).unwrap()),
+            input_digest: capsule.input_digest.clone(),
+            transport_digest: hex::encode(transport.tag),
+            input_key_digest: hex::encode(key_tag.tag),
+            key_id,
+        };
+        let attestation = IngressAttestation {
+            facts: serde_json::to_vec(&facts).unwrap(),
+            transport,
+            input_key: key_tag,
+        };
+        Fixture {
+            input,
+            capsule,
+            lifetime,
+            facts,
+            attestation,
+        }
+    }
+
+    async fn append(
+        memory: &SqliteMemory,
+        f: &Fixture,
+        attestation: IngressAttestation,
+    ) -> anyhow::Result<IngressAppendOutcome> {
+        memory
+            .append_ingress_input(
+                f.input.clone(),
+                f.capsule.clone(),
+                f.lifetime.clone(),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                Some(attestation),
+            )
+            .await
+    }
+
+    fn mutated(f: &Fixture, edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) -> IngressAttestation {
+        let mut value = serde_json::to_value(&f.facts).unwrap();
+        edit(value.as_object_mut().unwrap());
+        IngressAttestation {
+            facts: serde_json::to_vec(&value).unwrap(),
+            ..f.attestation.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_wrong_owner_or_workspace_is_refused() {
+        let (dir, memory) = store().unwrap();
+        let f = fixture(&memory).await;
+        let other = uuid::Uuid::new_v4().to_string();
+        let text = |v: &str| serde_json::Value::String(v.to_owned());
+        let mut cells: Vec<(&'static str, IngressAttestation)> = Vec::new();
+        let mut set = |name: &'static str, value: serde_json::Value| {
+            cells.push((
+                name,
+                mutated(&f, |m| {
+                    m.insert(name.into(), value);
+                }),
+            ));
+        };
+        set("v", 2.into());
+        set("namespace", text(&other));
+        set("workspace_id", text("prx_other_workspace"));
+        set("owner_id", text("prx_other_owner"));
+        set("source", text("cli"));
+        set("channel", text("terminal"));
+        set("session_key", text("prx_other_session"));
+        set("surface", text("cron"));
+        set("generation", 8.into());
+        set("lifetime", text(&other));
+        set("input_event_id", text("prx_other_event"));
+        set("input_key", text("prx_other_key"));
+        // Legacy format: the capsule version, and the key id that version implies.
+        set("capsule_version", 2.into());
+        set("capsule", text("AAAA"));
+        set("input_digest", text(&"1".repeat(64)));
+        set("transport_digest", text(&"2".repeat(64)));
+        set("input_key_digest", text(&"3".repeat(64)));
+        set("key_id", text(&other));
+        for (name, attestation) in cells {
+            let error = append(&memory, &f, attestation).await.err().unwrap();
+            assert_eq!(
+                error.downcast_ref::<IngressAttestationError>(),
+                Some(&IngressAttestationError::Mismatch(name)),
+                "cell {name}: {error:#}"
+            );
+        }
+        // A forged tag next to honest facts: the stable-key tag must verify.
+        let mut forged = f.attestation.clone();
+        forged.input_key.tag = [9; 32];
+        let facts = mutated(&f, |m| {
+            m.insert(
+                "input_key_digest".into(),
+                serde_json::Value::String(hex::encode([9u8; 32])),
+            );
+        });
+        forged.facts = facts.facts;
+        assert_eq!(
+            append(&memory, &f, forged)
+                .await
+                .err()
+                .unwrap()
+                .downcast_ref::<IngressAttestationError>(),
+            Some(&IngressAttestationError::Mismatch("input_key_digest"))
+        );
+        let unknown = mutated(&f, |m| {
+            m.insert("extra".into(), 1.into());
+        });
+        assert_eq!(
+            append(&memory, &f, unknown)
+                .await
+                .err()
+                .unwrap()
+                .downcast_ref::<IngressAttestationError>(),
+            Some(&IngressAttestationError::UnknownKey)
+        );
+        let missing = mutated(&f, |m| {
+            m.remove("surface");
+        });
+        assert_eq!(
+            append(&memory, &f, missing)
+                .await
+                .err()
+                .unwrap()
+                .downcast_ref::<IngressAttestationError>(),
+            Some(&IngressAttestationError::Malformed)
+        );
+        // Every refusal rolled the whole transaction back.
+        for table in [
+            "message_events",
+            "recovery_attestations",
+            "recovery_transport_index",
+            "ingress_recovery",
+        ] {
+            assert_eq!(count(&memory, table), 0, "{table} kept a refused write");
+        }
+        // The honest attestation commits all of it together, and survives a reopen.
+        assert!(matches!(
+            append(&memory, &f, f.attestation.clone()).await.unwrap(),
+            IngressAppendOutcome::Inserted(_)
+        ));
+        let reopened = SqliteMemory::new_with_path(memory.db_path.clone()).unwrap();
+        for table in ["message_events", "recovery_attestations", "recovery_transport_index"] {
+            assert_eq!(count(&reopened, table), 1, "{table}");
+        }
+        let chain = RecoveryChain {
+            workspace_id: f.capsule.scope.workspace_id.clone(),
+            owner_id: "prx_owner".into(),
+            source: "agent".into(),
+            run_id: "prx_run".into(),
+        };
+        let receipt = reopened.read_recovery_receipt(&chain).unwrap().unwrap();
+        assert_eq!(receipt.state, "pending");
+        assert_eq!(receipt.pending_facts().unwrap(), f.attestation.facts);
+        reopened
+            .verify_recovery_mac(&f.attestation.transport, RecoveryMacDomain::TransportV3, b"transport")
+            .unwrap();
+        assert!(
+            reopened
+                .verify_recovery_mac(&f.attestation.transport, RecoveryMacDomain::TransportV3, b"other")
+                .is_err()
+        );
+        drop(dir);
+    }
 }

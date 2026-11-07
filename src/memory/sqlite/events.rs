@@ -10,7 +10,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::ingress_recovery;
+use super::recovery_authority::{self, FullSync};
+use super::recovery_keys::KeyDirectory;
 use super::{SQLITE_DIALECT, SqliteMemory};
+use crate::memory::ingress_recovery::AtomicIngressMutation;
+use anyhow::Context;
 
 impl SqliteMemory {
     pub(super) async fn list_conversation_turns_ordered(
@@ -103,14 +107,30 @@ impl SqliteMemory {
         mutation: Option<crate::memory::ingress_recovery::AtomicIngressMutation>,
         repair_deadline: Option<std::time::Instant>,
     ) -> anyhow::Result<(MessageEvent, bool)> {
+        self.append_attested_event(input, mutation, repair_deadline)
+            .await?
+            .context("only an attested ingress input can hit a tombstone")
+    }
+
+    /// The single append transaction; `None` means the stable key is tombstoned.
+    /// An attested ingress input also runs its
+    /// tombstone lookup, pending attestation and transport index row inside it,
+    /// under FULL synchronization, so a crash leaves all of them or none.
+    pub(super) async fn append_attested_event(
+        &self,
+        input: MessageEventInput,
+        mutation: Option<crate::memory::ingress_recovery::AtomicIngressMutation>,
+        repair_deadline: Option<std::time::Instant>,
+    ) -> anyhow::Result<Option<(MessageEvent, bool)>> {
         input.validate()?;
         let pool = self.pool.clone();
         let deadline = mutation.as_ref().map(ingress_recovery::deadline).or(repair_deadline);
         let repair_owner = repair_deadline
             .map(|_| self.repair_owner(&input.workspace_id))
             .transpose()?;
+        let key_root = self.db_path.parent().map(std::path::Path::to_path_buf);
 
-        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<(MessageEvent, bool)> {
+        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<(MessageEvent, bool)>> {
             // The mutation owns the genuine lease inside this blocking closure,
             // including when its async waiter is cancelled.
             let conn = match deadline {
@@ -120,6 +140,19 @@ impl SqliteMemory {
             let _budget = deadline
                 .map(|deadline| ingress_recovery::ConnectionDeadline::new(&conn, deadline))
                 .transpose()?;
+            let attested = match &mutation {
+                Some(AtomicIngressMutation::Input {
+                    capsule,
+                    attestation: Some(attestation),
+                    ..
+                }) => Some((capsule, attestation)),
+                _ => None,
+            };
+            // Synchronization cannot change inside a transaction: set it first.
+            let _sync = attested.map(|_| FullSync::new(&conn)).transpose()?;
+            let keys = attested
+                .map(|_| KeyDirectory::open(key_root.as_deref().context("missing memory directory")?, false))
+                .transpose()?;
             let tx = conn.unchecked_transaction()?;
             if let (Some(owner), Some(deadline)) = (&repair_owner, repair_deadline) {
                 ingress_recovery::validate_owner(&tx, owner, &input.workspace_id, deadline)?;
@@ -127,9 +160,18 @@ impl SqliteMemory {
             if let Some(operation) = &mutation {
                 ingress_recovery::before_append(&tx, operation, &input)?;
             }
+            if let (Some((capsule, _)), Some(keys)) = (attested, &keys)
+                && recovery_authority::tombstoned(&tx, keys, &capsule.scope, &capsule.input_key)?
+            {
+                // Dropping the transaction rolls back; nothing was inserted.
+                return Ok(None);
+            }
             let (event, inserted) = Self::append_event_row(&tx, input, deadline.is_some())?;
             if let Some(operation) = &mutation {
                 ingress_recovery::after_append(&tx, operation, &event, inserted)?;
+            }
+            if let (true, Some((capsule, attestation)), Some(keys)) = (inserted, attested, &keys) {
+                recovery_authority::attest_ingress(&tx, keys, capsule, attestation, &event)?;
             }
             if let (Some(owner), Some(deadline)) = (&repair_owner, repair_deadline) {
                 ingress_recovery::validate_owner(&tx, owner, &event.workspace_id, deadline)?;
@@ -141,7 +183,7 @@ impl SqliteMemory {
             if let Some(deadline) = deadline {
                 crate::memory::ingress_recovery::remaining(deadline)?;
             }
-            Ok((event, inserted))
+            Ok(Some((event, inserted)))
         })
         .await?
     }
@@ -675,23 +717,28 @@ impl SqliteMemory {
         capsule: crate::memory::ingress_recovery::IngressCapsule,
         lifetime: Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
         deadline: std::time::Instant,
+        attestation: Option<crate::memory::ingress_recovery::IngressAttestation>,
     ) -> anyhow::Result<crate::memory::ingress_recovery::IngressAppendOutcome> {
-        let (event, inserted) = self
-            .append_event_with_recovery(
-                input,
-                Some(crate::memory::ingress_recovery::AtomicIngressMutation::Input {
-                    capsule,
-                    lifetime,
-                    deadline,
-                }),
-                None,
-            )
-            .await?;
-        Ok(if inserted {
-            crate::memory::ingress_recovery::IngressAppendOutcome::Inserted(event)
-        } else {
-            crate::memory::ingress_recovery::IngressAppendOutcome::AlreadyAccepted(event)
-        })
+        use crate::memory::ingress_recovery::IngressAppendOutcome;
+        Ok(
+            match self
+                .append_attested_event(
+                    input,
+                    Some(AtomicIngressMutation::Input {
+                        capsule,
+                        lifetime,
+                        deadline,
+                        attestation,
+                    }),
+                    None,
+                )
+                .await?
+            {
+                Some((event, true)) => IngressAppendOutcome::Inserted(event),
+                Some((event, false)) => IngressAppendOutcome::AlreadyAccepted(event),
+                None => IngressAppendOutcome::Tombstoned,
+            },
+        )
     }
 
     pub(super) async fn find_message_event_by_idempotency_key_impl(

@@ -43,6 +43,146 @@ pub enum IngressAppendOutcome {
     Inserted(MessageEvent),
     /// Immutable prior receipt. The runtime must reconcile/report it, not execute.
     AlreadyAccepted(MessageEvent),
+    /// The stable input key was accepted before and its record was erased. Nothing
+    /// was inserted, and no content-derived digest of the erased input survives.
+    Tombstoned,
+}
+
+/// Pending-attestation inputs the repository publishes in the append transaction.
+/// The tags are repository-keyed; `facts` is the closed [`PendingFacts`] JSON.
+#[derive(Debug, Clone)]
+pub struct IngressAttestation {
+    pub facts: Vec<u8>,
+    pub transport: super::recovery_authority::RecoveryTag,
+    pub input_key: super::recovery_authority::RecoveryTag,
+}
+
+/// Why an attestation was refused. Each variant is a distinct, typed refusal.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IngressAttestationError {
+    #[error("this backend cannot publish an ingress attestation")]
+    Unsupported,
+    #[error("ingress attestation facts carry an unknown key")]
+    UnknownKey,
+    #[error("ingress attestation facts are malformed")]
+    Malformed,
+    #[error("ingress attestation fact `{0}` does not match the input")]
+    Mismatch(&'static str),
+}
+
+/// Refuse an attestation on a backend that has no recovery repository. The
+/// attestation is never silently dropped.
+pub fn refuse_attestation(attestation: Option<&IngressAttestation>) -> anyhow::Result<()> {
+    match attestation {
+        Some(_) => Err(IngressAttestationError::Unsupported.into()),
+        None => Ok(()),
+    }
+}
+
+/// Constant-time equality of two byte strings, via `ring::hmac`.
+pub(crate) fn same_bytes(left: &[u8], right: &[u8]) -> bool {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[0; 32]);
+    ring::hmac::verify(&key, left, ring::hmac::sign(&key, right).as_ref()).is_ok()
+}
+
+const FACT_KEYS: [&str; 18] = [
+    "v",
+    "namespace",
+    "workspace_id",
+    "owner_id",
+    "source",
+    "channel",
+    "session_key",
+    "surface",
+    "generation",
+    "lifetime",
+    "input_event_id",
+    "input_key",
+    "capsule_version",
+    "capsule",
+    "input_digest",
+    "transport_digest",
+    "input_key_digest",
+    "key_id",
+];
+
+/// Closed v1 schema of the pending attestation facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingFacts {
+    pub v: u32,
+    pub namespace: String,
+    pub workspace_id: String,
+    pub owner_id: String,
+    pub source: String,
+    pub channel: Option<String>,
+    pub session_key: Option<String>,
+    pub surface: String,
+    pub generation: u64,
+    pub lifetime: String,
+    pub input_event_id: String,
+    pub input_key: String,
+    pub capsule_version: u32,
+    /// Base64 of the exact serialized capsule bytes.
+    pub capsule: String,
+    pub input_digest: String,
+    pub transport_digest: String,
+    pub input_key_digest: String,
+    pub key_id: String,
+}
+
+impl PendingFacts {
+    /// Parse the closed schema: an unknown or missing key refuses.
+    pub fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| IngressAttestationError::Malformed)?;
+        let object = value.as_object().ok_or(IngressAttestationError::Malformed)?;
+        if object.keys().any(|key| !FACT_KEYS.contains(&key.as_str())) {
+            return Err(IngressAttestationError::UnknownKey.into());
+        }
+        if FACT_KEYS.iter().any(|key| !object.contains_key(*key)) {
+            return Err(IngressAttestationError::Malformed.into());
+        }
+        let facts: Self = serde_json::from_value(value).map_err(|_| IngressAttestationError::Malformed)?;
+        if facts.v != 1 {
+            return Err(IngressAttestationError::Mismatch("v").into());
+        }
+        Ok(facts)
+    }
+
+    /// Check every fact that the capsule alone determines.
+    pub fn check_capsule(&self, capsule: &IngressCapsule) -> anyhow::Result<()> {
+        use base64::Engine as _;
+        fn same(ok: bool, name: &'static str) -> anyhow::Result<()> {
+            if ok {
+                Ok(())
+            } else {
+                Err(IngressAttestationError::Mismatch(name).into())
+            }
+        }
+        same(self.namespace == capsule.backend_namespace, "namespace")?;
+        same(self.workspace_id == capsule.scope.workspace_id, "workspace_id")?;
+        same(self.owner_id == capsule.scope.owner_id, "owner_id")?;
+        same(self.source == capsule.scope.source.as_str(), "source")?;
+        same(self.lifetime == capsule.lifetime, "lifetime")?;
+        same(self.input_event_id == capsule.input_event_id, "input_event_id")?;
+        same(self.input_key == capsule.input_key, "input_key")?;
+        same(
+            self.capsule_version == capsule.version && capsule.version == 3,
+            "capsule_version",
+        )?;
+        let exact = serde_json::to_vec(capsule)?;
+        same(
+            base64::engine::general_purpose::STANDARD
+                .decode(&self.capsule)
+                .is_ok_and(|bytes| bytes == exact),
+            "capsule",
+        )?;
+        same(
+            same_bytes(self.input_digest.as_bytes(), capsule.input_digest.as_bytes()),
+            "input_digest",
+        )?;
+        same(capsule.key_id.as_deref() == Some(self.key_id.as_str()), "key_id")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +223,7 @@ pub(crate) enum AtomicIngressMutation {
         capsule: IngressCapsule,
         lifetime: Arc<dyn IngressLifetime>,
         deadline: std::time::Instant,
+        attestation: Option<IngressAttestation>,
     },
     Recovery(IngressRecoveryCommit),
 }
