@@ -118,26 +118,11 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         buffer.extend_from_slice(&chunk[..read]);
                     }
                     let request_body = String::from_utf8_lossy(&buffer[head_end..]).to_string();
-                    let marker = [
-                        "PRX-ROUTE-PARENT",
-                        "PRX-AGENT-PARENT",
-                        "PRX-ROUTE-CHILD",
-                        "PRX-AGENT-CHILD",
-                        "PRX-DENIED-PARENT",
-                        "PRX-DENIED-CHILD",
-                        "PRX-NESTED-PARENT",
-                        "PRX-NESTED-CHILD",
-                        "PRX-NESTED-LEAF",
-                        "PRX-FANOUT-PARENT",
-                        "PRX-FANOUT-CHILD",
-                        "PRX-FANOUT-LEAF",
-                        "PRX-FANOUT-DENIED-A",
-                        "PRX-FANOUT-DENIED-B",
-                        "PRX-FANOUT-SECOND",
-                    ]
-                    .into_iter()
-                    .find(|candidate| request_body.contains(candidate))
-                    .expect("fixture request marker");
+                    let own_input = request_own_input(&request_body);
+                    let marker = FIXTURE_MARKERS
+                        .into_iter()
+                        .find(|candidate| own_input.contains(candidate))
+                        .unwrap_or_else(|| panic!("fixture request marker in own input: {own_input:?}"));
                     if !matches!(
                         marker,
                         "PRX-ROUTE-PARENT"
@@ -1029,6 +1014,71 @@ fn assert_completion_journal(workspace: &Path, manifest: &WorkerManifest) {
     assert_eq!(evidence_run_id, Some(manifest.run_id.as_str()));
 }
 
+/// Markers in classification priority order.
+const FIXTURE_MARKERS: [&str; 15] = [
+    "PRX-ROUTE-PARENT",
+    "PRX-AGENT-PARENT",
+    "PRX-ROUTE-CHILD",
+    "PRX-AGENT-CHILD",
+    "PRX-DENIED-PARENT",
+    "PRX-DENIED-CHILD",
+    "PRX-NESTED-PARENT",
+    "PRX-NESTED-CHILD",
+    "PRX-NESTED-LEAF",
+    "PRX-FANOUT-PARENT",
+    "PRX-FANOUT-CHILD",
+    "PRX-FANOUT-LEAF",
+    "PRX-FANOUT-DENIED-A",
+    "PRX-FANOUT-DENIED-B",
+    "PRX-FANOUT-SECOND",
+];
+
+/// Recall preamble headers the runtime prepends to a turn's input
+/// (`src/agent/context_recall.rs`). They quote other sessions' events, so a
+/// marker inside them belongs to another request.
+const RECALL_PREAMBLE_HEADERS: [&str; 4] = [
+    "[Recent shared workspace events]\n",
+    "[Current session context]\n",
+    "[Memory context]\n",
+    "[Document evidence]\n",
+];
+
+/// Drops leading recall preamble blocks (header through the blank line that
+/// ends the block), leaving the request's own input.
+fn strip_recall_preambles(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    while let Some(header) = RECALL_PREAMBLE_HEADERS.iter().find(|header| rest.starts_with(**header)) {
+        rest = match rest[header.len()..].split_once("\n\n") {
+            Some((_, tail)) => tail.trim_start(),
+            None => "",
+        };
+    }
+    rest
+}
+
+/// The text a fixture request is classified on: its user messages (or the
+/// assessment's `current_request`), minus recall preambles. Never the whole
+/// body, which also carries recalled events quoting other sessions' markers,
+/// and never assistant/tool messages, which echo other tasks' text.
+fn request_own_input(request_body: &str) -> String {
+    let request: serde_json::Value = serde_json::from_str(request_body).expect("provider request JSON");
+    request["messages"]
+        .as_array()
+        .expect("request messages")
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str())
+        .map(|content| {
+            let current = serde_json::from_str::<serde_json::Value>(content)
+                .ok()
+                .and_then(|value| value["current_request"].as_str().map(str::to_string))
+                .unwrap_or_else(|| content.to_string());
+            strip_recall_preambles(&current).to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn is_assessment_request(request: &ProviderRequest) -> bool {
     request
         .body
@@ -1042,9 +1092,20 @@ fn assert_parent_join(requests: &[ProviderRequest], marker: &str, expected_total
     let post_join = requests
         .iter()
         .filter(|request| request.marker == marker && !is_assessment_request(request))
-        .nth(2)
-        .expect("parent post-join request");
+        .find(|request| last_tool_summary(request).is_some_and(|summary| summary.get("total").is_some()))
+        .expect("parent post-join request carrying a join summary");
     assert_join_summary(post_join, expected_total);
+}
+
+fn last_tool_summary(request: &ProviderRequest) -> Option<serde_json::Value> {
+    let body: serde_json::Value = serde_json::from_str(&request.body).ok()?;
+    body["messages"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
 }
 
 fn assert_join_summary(post_join: &ProviderRequest, expected_total: usize) {
