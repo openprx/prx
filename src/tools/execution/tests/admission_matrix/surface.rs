@@ -12,8 +12,9 @@ fn surface_context(
     eligible: bool,
 ) -> ToolExecutionContext {
     let mut context = context();
-    context.turn_surface = Some(Arc::new(TurnSurface::build(
+    context.turn_surface = Some(Arc::new(TurnSurface::build_from(
         service,
+        service.current_descriptors(),
         config,
         "prx_model",
         channel,
@@ -46,7 +47,7 @@ async fn excluded_tool_called_by_model_is_refused() {
     assert_refused(&service, &fixture, context, "config_reload").await;
 }
 
-/// Eligibility is applied once, in `TurnSurface::build`. An ineligible entry is
+/// Eligibility is applied once, in `TurnSurface::build_from`. An ineligible entry is
 /// never published, so the surface does not contain it and dispatch is Denied.
 #[tokio::test]
 async fn channel_ineligible_entry_is_refused_on_channel_surface() {
@@ -455,4 +456,39 @@ async fn binding_drift_after_publication_is_stale() {
 #[tokio::test]
 async fn disappeared_tool_after_publication_is_stale() {
     assert_stale_between(0, 5).await;
+}
+
+/// `admit` lets an unpublished, unregistered name through; a backend can
+/// register it before `resolve`. The post-resolve recheck must then deny it.
+#[test]
+fn recheck_resolved_denies_registered_name_outside_surface() {
+    let fixture = fixture();
+    let service = allow_service(&fixture);
+    let context = surface_context(&service, &crate::config::ToolTieringConfig::default(), true, false);
+    assert!(
+        context
+            .turn_surface
+            .as_ref()
+            .is_some_and(|surface| !surface.contains("config_reload")),
+        "fixture must leave config_reload unpublished"
+    );
+    assert!(service.current_descriptor("config_reload").is_some());
+    let (status, message) = crate::tools::execution::admission::recheck_resolved(&context, "config_reload")
+        .expect_err("a resolved name outside the surface must be denied");
+    assert_eq!(status, ToolExecutionStatus::Denied);
+    assert!(message.contains("outside the turn surface"), "{message}");
+}
+
+#[test]
+fn recheck_resolved_passes_published_name() {
+    let fixture = fixture();
+    let service = allow_service(&fixture);
+    let context = surface_context(&service, &crate::config::ToolTieringConfig::default(), false, true);
+    assert!(
+        context
+            .turn_surface
+            .as_ref()
+            .is_some_and(|surface| surface.contains("config_reload"))
+    );
+    assert!(crate::tools::execution::admission::recheck_resolved(&context, "config_reload").is_ok());
 }
