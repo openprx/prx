@@ -770,6 +770,186 @@ async fn scheduled_retry_of_accepted_input_key_is_refused_with_plane_off() {
     assert_eq!(chat_request_count(&probe), dispatched, "retry reached the provider");
 }
 
+const SCHEDULED_PROMPT: &str = "prx scheduled retry";
+
+/// The scheduled attempt as the entry point sees it: probe-backed config, a stored
+/// creator job, and the plane switch. The workspace lives under `$HOME`.
+struct ScheduledIssuer {
+    job: crate::cron::CronJob,
+    envelope: RuntimeEnvelope,
+    scope: crate::tools::execution::ScheduledToolScope,
+    config: crate::config::Config,
+}
+
+impl ScheduledIssuer {
+    async fn new(root: &std::path::Path, probe: &crate::providers::credential_probe::CredentialProbe) -> Self {
+        let mut config = cli_agent_probe_config(root, probe);
+        config.causal_tree.enabled = false;
+        assert!(config.memory.event_recording_config().enabled);
+        std::fs::create_dir_all(&config.workspace_dir).expect("test: workspace");
+        let (job, envelope, scope) = stored_creator_job_fixture(&config, SCHEDULED_PROMPT).await;
+        Self {
+            job,
+            envelope,
+            scope,
+            config,
+        }
+    }
+
+    /// The stable input key the scheduled entry derives for its first turn.
+    fn input_key(&self) -> String {
+        let run = self.envelope.run_id.as_deref().expect("test: scheduled run id");
+        format!("agent:{run}:1:user")
+    }
+
+    /// Accept the scheduled input with the plane on, through a view that carries an
+    /// erasure origin, then erase it with the production erasure store.
+    async fn accept_and_erase(&self) {
+        use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
+        let workspace = &self.config.workspace_dir;
+        let base: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace).expect("test: sqlite"));
+        let view = base.with_erasure_origin(fixture::erasure_origin()).expect("test: view");
+        let mut on = self.config.clone();
+        on.causal_tree.enabled = true;
+        let on = Arc::new(on);
+        let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+        let ticket = owner.register(CancellationToken::new()).expect("test: cleanup owner");
+        let fabric = crate::memory::MemoryFabric::new(view, workspace.to_string_lossy())
+            .with_event_recording(on.memory.event_recording_config())
+            .with_ingress_recovery(&on, &ticket)
+            .await
+            .expect("test: recorder");
+        let event = fabric
+            .record_inbound_user_message_best_effort(
+                self.envelope.message_scope(),
+                SCHEDULED_PROMPT,
+                Some(self.input_key()),
+                "scheduled",
+            )
+            .await
+            .expect("test: first scheduled admission");
+        assert!(event.is_some_and(|event| event.id > 0), "first input was not recorded");
+        ticket.finish(true);
+        owner
+            .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .expect("test: first admission cleanup");
+        fixture::erase(&base);
+        assert_eq!(fixture::row_count(workspace, "recovery_tombstones"), 1, "tombstone");
+        assert_eq!(fixture::row_count(workspace, "message_events"), 0, "row survived");
+    }
+
+    /// One production scheduled turn of the same attempt identity, plane off.
+    async fn run(&self) -> anyhow::Result<String> {
+        crate::agent::scheduled_source::ScheduledAgentOrigin::from_cron(&self.job, None)
+            .scope(run_with_runtime_envelope(
+                self.config.clone(),
+                Some(SCHEDULED_PROMPT.to_string()),
+                None,
+                None,
+                0.0,
+                CancellationToken::new(),
+                Some(self.envelope.clone()),
+                Some(self.scope.clone()),
+            ))
+            .await
+    }
+}
+
+/// (i) Plane off, keys present: the erased scheduled key is refused before the provider.
+#[tokio::test]
+async fn scheduled_plane_off_erased_key_retry_is_refused_as_already_accepted() {
+    use crate::providers::credential_probe::CredentialProbe;
+    use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
+
+    let root = fixture::home_dir();
+    let probe = CredentialProbe::start().await;
+    let issuer = ScheduledIssuer::new(root.path(), &probe).await;
+    issuer.accept_and_erase().await;
+    let workspace = &issuer.config.workspace_dir;
+    let keys = fixture::key_snapshot(workspace);
+    assert!(keys.as_ref().is_some_and(|keys| !keys.is_empty()), "no recovery keys");
+
+    let retry = issuer.run().await;
+    assert!(
+        refused_as_already_accepted(&retry),
+        "an erased scheduled key was readmitted: {retry:?}"
+    );
+    assert_eq!(chat_request_count(&probe), 0, "the retry reached the provider");
+    assert_eq!(
+        fixture::row_count(workspace, "message_events"),
+        0,
+        "a refusal wrote a row"
+    );
+    assert_eq!(fixture::key_snapshot(workspace), keys, "the fence touched the keys");
+}
+
+/// (ii) Plane off, the tombstone's key file removed: typed refusal from the
+/// scheduled issuer's own error branch, never an unrecorded receipt.
+#[tokio::test]
+async fn scheduled_plane_off_erased_key_without_key_file_is_a_typed_refusal() {
+    use crate::providers::credential_probe::CredentialProbe;
+    use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
+
+    let root = fixture::home_dir();
+    let probe = CredentialProbe::start().await;
+    let issuer = ScheduledIssuer::new(root.path(), &probe).await;
+    issuer.accept_and_erase().await;
+    let workspace = &issuer.config.workspace_dir;
+    fixture::stash_keys(workspace);
+
+    // `run` returns only after the scheduled cleanup scope drained, so the
+    // refused turn's ticket is released.
+    let retry = issuer.run().await;
+    assert!(
+        retry.as_ref().err().is_some_and(fixture::is_fence_unavailable),
+        "a missing key file was not a typed refusal: {retry:?}"
+    );
+    assert_eq!(chat_request_count(&probe), 0, "the retry reached the provider");
+    assert_eq!(
+        fixture::row_count(workspace, "message_events"),
+        0,
+        "a refusal wrote a row"
+    );
+    assert_eq!(
+        fixture::key_snapshot(workspace).map(|keys| keys.len()),
+        Some(0),
+        "the refusal recreated a key"
+    );
+}
+
+/// (iii) A database that never activated recovery is admitted and gains no state.
+#[tokio::test]
+async fn scheduled_plane_off_never_activated_store_creates_no_recovery_state() {
+    use crate::providers::credential_probe::CredentialProbe;
+    use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
+
+    let root = TempDir::new().expect("test: tempdir");
+    let probe = CredentialProbe::start().await;
+    let issuer = ScheduledIssuer::new(root.path(), &probe).await;
+    let first = issuer.run().await;
+    assert!(
+        first
+            .as_ref()
+            .err()
+            .is_none_or(|error| { !fixture::is_already_accepted(error) && !fixture::is_fence_unavailable(error) }),
+        "a never-activated store was refused: {first:?}"
+    );
+    let workspace = &issuer.config.workspace_dir;
+    assert!(
+        fixture::row_count(workspace, "message_events") >= 1,
+        "input was not recorded"
+    );
+    assert!(
+        !fixture::table_exists(workspace, "recovery_tombstones"),
+        "the fence created the tombstone table"
+    );
+    assert!(
+        !fixture::keys_dir(workspace).exists(),
+        "the fence created .recovery_keys"
+    );
+}
+
 /// A scheduled turn retains its creator's read-only tool authority even when
 /// the bootstrap CLI policy would otherwise permit the same write.
 #[tokio::test]
