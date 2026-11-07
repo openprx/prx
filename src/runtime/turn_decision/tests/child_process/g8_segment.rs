@@ -351,6 +351,8 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
     );
     assert!(issued.allowed.iter().any(|reference| reference.id == schedule.id));
     let grant = Arc::new(grant.for_process_worker()?);
+    // Grant-dependent launcher cells run against this real issued grant.
+    crate::tools::execution::tests::admission_matrix::launcher_authority_cells(Arc::clone(&grant)).await;
     let (worker_issued, _) = grant.scope().gate_inputs();
     assert_eq!(worker_issued.allowed.len(), 1);
     assert!(worker_issued.allowed.iter().any(|reference| reference.id == read.id));

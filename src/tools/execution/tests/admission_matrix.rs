@@ -633,6 +633,27 @@ mod child_fixture {
                     }),
                     // Held by the parent only, so every manifest is a strict subset.
                     Box::new(RecordingTool {
+                        root_name: "http_request",
+                        aliases: vec![],
+                        calls: Arc::clone(&fixture.calls),
+                        arguments: Arc::clone(&fixture.arguments),
+                        stages: Arc::clone(&fixture.stages),
+                    }),
+                    Box::new(RecordingTool {
+                        root_name: "shell",
+                        aliases: vec![],
+                        calls: Arc::clone(&fixture.calls),
+                        arguments: Arc::clone(&fixture.arguments),
+                        stages: Arc::clone(&fixture.stages),
+                    }),
+                    Box::new(RecordingTool {
+                        root_name: "nodes",
+                        aliases: vec![],
+                        calls: Arc::clone(&fixture.calls),
+                        arguments: Arc::clone(&fixture.arguments),
+                        stages: Arc::clone(&fixture.stages),
+                    }),
+                    Box::new(RecordingTool {
                         root_name: "message_send",
                         aliases: vec![],
                         calls: Arc::clone(&fixture.calls),
@@ -695,6 +716,9 @@ mod child_fixture {
                     "config_reload",
                     "file_write",
                     "message_send",
+                    "http_request",
+                    "shell",
+                    "nodes",
                     "delegate",
                     "sessions_spawn",
                 ]
@@ -875,13 +899,10 @@ async fn child_owner_is_never_derived_from_channel_or_sender() {
 
 #[tokio::test]
 async fn readonly_child_denies_every_non_read_only_class() {
-    let case = child_fixture::ChildCase::build(
-        &["config_reload", "file_write", "delegate", "sessions_spawn"],
-        "owner-a",
-        AutonomyLevel::ReadOnly,
-        2,
-    );
-    for name in ["config_reload", "file_write", "delegate", "sessions_spawn"] {
+    // LocalWrite, ProcessExec, ExternalSend, CredentialOrConfig and Destructive.
+    let names = ["file_write", "shell", "message_send", "config_reload", "nodes"];
+    let case = child_fixture::ChildCase::build(&names, "owner-a", AutonomyLevel::ReadOnly, 2);
+    for name in names {
         assert!(!crate::security::policy::is_read_only_tool(name), "{name}");
         assert_eq!(
             case.call(name, case.context(true, true)).await,
@@ -920,21 +941,73 @@ async fn supervised_child_under_full_parent_asks() {
 
 #[tokio::test]
 async fn spawn_without_parent_authority_is_refused() {
-    // Live depth but no outgoing grant or ordinary publication, then depth zero.
-    for depth in [2, 1] {
-        let case = child_fixture::ChildCase::build(
-            &["config_reload", "delegate", "sessions_spawn"],
-            "owner-a",
-            AutonomyLevel::Full,
-            depth,
+    let case = child_fixture::ChildCase::build(
+        &["config_reload", "delegate", "sessions_spawn"],
+        "owner-a",
+        AutonomyLevel::Full,
+        2,
+    );
+    // Live depth but no outgoing grant or ordinary publication.
+    for name in ["delegate", "sessions_spawn"] {
+        assert_eq!(
+            case.call(name, case.context(true, true)).await,
+            ToolExecutionStatus::Denied,
+            "{name}"
         );
-        for name in ["delegate", "sessions_spawn"] {
-            assert_eq!(
-                case.call(name, case.context(true, true)).await,
-                ToolExecutionStatus::Denied,
-                "{name} at parent depth {depth}"
-            );
-        }
-        assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 0);
     }
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 0);
+    // A receipt-free direct operator caller carries no child authority and
+    // keeps its existing admission: each launcher reaches the backend once.
+    for (index, name) in ["delegate", "sessions_spawn"].into_iter().enumerate() {
+        assert_eq!(
+            case.call(name, case.context(false, false)).await,
+            ToolExecutionStatus::Succeeded,
+            "{name}"
+        );
+        assert_eq!(case.fixture.calls.load(Ordering::SeqCst), index + 1);
+    }
+}
+
+/// Launcher cells that need a real issued outgoing grant. The caller supplies one
+/// from a fixture that builds a decision-enabled parent; the grant is only checked
+/// for presence at dispatch. No decision context, binding or surface is involved.
+pub(crate) async fn launcher_authority_cells(grant: Arc<crate::runtime::child_source::IssuedChildGrant>) {
+    let members = ["config_reload", "delegate", "sessions_spawn"];
+    let launchers = ["delegate", "sessions_spawn"];
+    let with_grant = |case: &child_fixture::ChildCase| {
+        let mut context = case.context(true, true);
+        context.child_grant = Some(Arc::clone(&grant));
+        context
+    };
+    // Depth zero with valid outgoing authority: only depth can refuse.
+    let exhausted = child_fixture::ChildCase::build(&members, "owner-a", AutonomyLevel::Full, 1);
+    for name in launchers {
+        assert_eq!(
+            exhausted.call(name, with_grant(&exhausted)).await,
+            ToolExecutionStatus::Denied,
+            "{name} at depth zero"
+        );
+    }
+    assert_eq!(exhausted.fixture.calls.load(Ordering::SeqCst), 0);
+    // Live depth with valid authority: exactly one backend entry per launcher.
+    let live = child_fixture::ChildCase::build(&members, "owner-a", AutonomyLevel::Full, 2);
+    for (index, name) in launchers.into_iter().enumerate() {
+        assert_eq!(
+            live.call(name, with_grant(&live)).await,
+            ToolExecutionStatus::Succeeded,
+            "{name} with live depth"
+        );
+        assert_eq!(live.fixture.calls.load(Ordering::SeqCst), index + 1);
+    }
+    // The same admitted launchers under a ReadOnly child: policy Deny, no approval, no backend.
+    let readonly = child_fixture::ChildCase::build(&members, "owner-a", AutonomyLevel::ReadOnly, 2);
+    for name in launchers {
+        assert_eq!(
+            readonly.call(name, with_grant(&readonly)).await,
+            ToolExecutionStatus::Denied,
+            "{name} under a ReadOnly child"
+        );
+    }
+    assert_eq!(readonly.fixture.calls.load(Ordering::SeqCst), 0);
+    assert!(!readonly.fixture.stages.lock().contains(&"approval"));
 }
