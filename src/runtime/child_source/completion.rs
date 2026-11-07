@@ -50,7 +50,7 @@ impl JournalChildOutcomeHook {
 
     /// Builds the expected row from the verified replay and the persisted marker.
     /// No `child_outcome` lookup takes part in this derivation.
-    fn expected_row(
+    pub(crate) fn expected_row(
         &self,
         replay: &VerifiedTerminalReplay,
         terminal: &MessageEvent,

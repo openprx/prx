@@ -760,3 +760,204 @@ async fn terminal_replay_refuses_hop_digest_substitution() -> Result<()> {
     );
     Ok(())
 }
+
+/// Moves the decision store database and its sidecars aside, so only journals remain.
+fn quarantine_decision_store(workspace: &std::path::Path) -> Result<PathBuf> {
+    let db = crate::causal_tree::store::db_path(workspace);
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", db.display()));
+        if path.exists() {
+            std::fs::rename(&path, format!("{}.unavailable", path.display()))?;
+        }
+    }
+    anyhow::ensure!(!db.exists(), "test: the decision store database must be quarantined");
+    Ok(db)
+}
+
+/// Raw journal entries for one fixed query, read without repair.
+fn journal_entries(workspace: &std::path::Path, query: &'static str) -> Result<Vec<String>> {
+    let db = rusqlite::Connection::open_with_flags(
+        authority_journal::path(workspace),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut statement = db.prepare(query)?;
+    let rows = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(rows)
+}
+
+const EVIDENCE_ENTRIES: &str = "SELECT entry FROM decision_evidence ORDER BY workspace, owner, decision";
+
+#[tokio::test]
+async fn process_terminal_repair_uses_child_journal() -> Result<()> {
+    use crate::agent::terminal::verify_terminal_replay_journal;
+    use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
+
+    let tmp = tempfile::tempdir()?;
+    let (manifest, result) = completed_child_fixture(&tmp).await?;
+    let ReopenedChild {
+        workspace,
+        key,
+        expected,
+        launch_version,
+    } = reopened_child_evidence(&manifest, &result).await?;
+    anyhow::ensure!(launch_version == 3, "test: the launch authority must be version 3");
+    let source = manifest.child_source.as_ref().context("test: child source")?;
+    let store_workspace = source.parent_store_workspace.clone();
+    let owner = manifest.owner_id.clone().context("test: owner")?;
+    let evidence = result
+        .completion_evidence
+        .as_ref()
+        .context("test: completion evidence")?;
+    let [segment] = evidence.segments.as_slice() else {
+        anyhow::bail!("test: expected one completed segment");
+    };
+    let evidence_before = journal_entries(&workspace, EVIDENCE_ENTRIES)?;
+
+    // Delete only the settled child outcome row, then drop the decision store.
+    let db = rusqlite::Connection::open(authority_journal::path(&workspace))?;
+    let deleted = db.execute(
+        "DELETE FROM child_outcome WHERE run = ?1 AND settlement = ?2",
+        (&expected.run, &expected.settlement),
+    )?;
+    anyhow::ensure!(deleted == 1, "test: exactly one child outcome row must be deleted");
+    drop(db);
+    let store_db = quarantine_decision_store(&workspace)?;
+
+    // Reopen memory, fabric, key and the segment marker without any store.
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.as_path())?);
+    let fabric = MemoryFabric::new(
+        memory,
+        manifest.memory_workspace_id.clone().context("test: memory workspace")?,
+    );
+    let terminal = fabric
+        .memory()
+        .find_message_event_by_idempotency_key(fabric.workspace_id(), &format!("turn:{}:final", segment.terminal_id))
+        .await?
+        .context("test: segment terminal marker")?;
+    let error = authority_journal::verify_child_outcome(&workspace, &key, &expected, Some(launch_version))
+        .expect_err("a version-3 child without its outcome row must be refused");
+    assert!(error.to_string().contains("child outcome row is missing"), "{error:#}");
+    anyhow::ensure!(
+        child_outcome_rows(&workspace)?.is_empty(),
+        "test: the refused read must not insert a row"
+    );
+
+    let memory = fabric.memory();
+    let replay_from_journal = || {
+        verify_terminal_replay_journal(
+            memory.as_ref(),
+            &workspace,
+            &key,
+            &store_workspace,
+            fabric.workspace_id(),
+            &owner,
+            &segment.terminal_id,
+            &terminal,
+        )
+    };
+    let replay = replay_from_journal().await?;
+    anyhow::ensure!(
+        replay.parent_decision_id().map(|id| id.to_string()) == expected.parent_decision
+            && replay.parent_digest().map(str::to_owned) == expected.parent_digest
+            && replay.decision().decision_id.to_string() == expected.child_decision
+            && replay.decision_digest() == expected.child_digest
+            && replay.source().run_id.as_deref() == Some(expected.run.as_str()),
+        "test: the journal replay must match the saved expected row"
+    );
+    let hook = JournalChildOutcomeHook::new(workspace.clone(), Arc::clone(&key), Arc::from(store_workspace.as_str()));
+    hook.persist(&replay, &terminal, None, None).await?;
+    assert!(
+        matches!(
+            authority_journal::verify_child_outcome(&workspace, &key, &expected, Some(launch_version)),
+            Ok(true)
+        ),
+        "journal repair did not restore the authenticated child outcome"
+    );
+    let repaired = child_outcome_rows(&workspace)?;
+    anyhow::ensure!(
+        repaired.len() == 1 && repaired[0].0 == expected.run && repaired[0].1 == expected.settlement,
+        "test: repair must leave exactly one row at the expected key: {repaired:?}"
+    );
+    anyhow::ensure!(
+        journal_entries(&workspace, EVIDENCE_ENTRIES)? == evidence_before && !store_db.exists(),
+        "test: repair must not touch decision evidence or recreate the store"
+    );
+
+    // Idempotent: the same adapter and hook leave identical bytes.
+    let replay = replay_from_journal().await?;
+    hook.persist(&replay, &terminal, None, None).await?;
+    anyhow::ensure!(
+        child_outcome_rows(&workspace)? == repaired,
+        "test: a repeated repair must be byte-identical"
+    );
+
+    // Corruption: flip one seal byte. Replay still works, the hook refuses to overwrite.
+    let db = rusqlite::Connection::open(authority_journal::path(&workspace))?;
+    let mut entry: SealedEntry = serde_json::from_str(&repaired[0].2)?;
+    entry.seal[0] ^= 1;
+    let tampered = serde_json::to_string(&entry)?;
+    db.execute(
+        "UPDATE child_outcome SET entry = ?1 WHERE run = ?2 AND settlement = ?3",
+        (&tampered, &expected.run, &expected.settlement),
+    )?;
+    drop(db);
+    let replay = replay_from_journal().await?;
+    anyhow::ensure!(
+        hook.persist(&replay, &terminal, None, None).await.is_err(),
+        "test: the hook must refuse to overwrite a corrupt child outcome row"
+    );
+    anyhow::ensure!(
+        child_outcome_rows(&workspace)? == vec![(expected.run.clone(), expected.settlement.clone(), tampered)],
+        "test: the corrupt entry must stay unchanged"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn launch_v3_succeeds_with_matching_parent_row() -> Result<()> {
+    const AUTHORITY_ENTRIES: &str = "SELECT entry FROM authority ORDER BY run";
+    const LAUNCH_ENTRIES: &str = "SELECT entry FROM launch_parent ORDER BY run";
+    let tmp = tempfile::tempdir()?;
+    with_prepared_worker_manifest(&tmp, "ollama".into(), None, |manifest| async move {
+        let source = manifest.child_source.as_ref().context("test: child source")?;
+        anyhow::ensure!(source.journal_version == Some(3), "test: the child must be version 3");
+        let workspace = PathBuf::from(&source.parent_constraints.workspace);
+        let owner = manifest.owner_id.clone().context("test: owner")?;
+        let parent = manifest
+            .capability_manifest
+            .as_ref()
+            .context("test: capability manifest")?
+            .parent_decision_id
+            .clone();
+        let key = crate::decision::DecisionKey::load_existing(&workspace)?;
+        let authority_before = journal_entries(&workspace, AUTHORITY_ENTRIES)?;
+        let launch_before = journal_entries(&workspace, LAUNCH_ENTRIES)?;
+        let launch = authority_journal::read_launch_parent(&workspace, &manifest.run_id, &key)?
+            .context("test: launch parent authority row")?;
+        anyhow::ensure!(
+            launch.version == 3
+                && launch.run == manifest.run_id
+                && launch.owner == owner
+                && launch.parent_decision == parent
+                && launch.parent_digest == source.parent_decision_digest
+                && launch.store_workspace == source.parent_store_workspace
+                && launch.enabled_snapshot
+                && !launch.legacy_v1
+                && launch.admits_issued_child,
+            "test: launch parent authority differs from the signed manifest"
+        );
+        anyhow::ensure!(
+            authority_journal::verify(&manifest, &workspace, &key)?,
+            "test: a version-3 child with its matching parent row must verify"
+        );
+        anyhow::ensure!(
+            journal_entries(&workspace, AUTHORITY_ENTRIES)? == authority_before
+                && journal_entries(&workspace, LAUNCH_ENTRIES)? == launch_before,
+            "test: verification must leave the journal rows unchanged"
+        );
+        Ok(())
+    })
+    .await
+}

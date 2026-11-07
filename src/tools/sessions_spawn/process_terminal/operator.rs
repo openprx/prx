@@ -3,9 +3,11 @@ pub(in crate::tools::sessions_spawn) mod launch;
 mod segments;
 use super::{
     CausalDecisionStore, ConfirmedProcessRepair, Context, Digest, MemoryFabric, MessageEvent, MessageEventSource,
-    MessageEventSubject, RecoveredProcessOutcome, RecoveredProcessRun, RecoveredWorkerUsage, Sha256,
-    TurnTerminalStatus, WorkerResult, read_terminal, verify_terminal_replay,
+    MessageEventSubject, REPLAY_EVIDENCE_AUTHORITY, RecoveredProcessOutcome, RecoveredProcessRun, RecoveredWorkerUsage,
+    Sha256, TurnTerminalStatus, WorkerResult, authority_journal, read_terminal, verify_terminal_replay,
+    verify_terminal_replay_journal,
 };
+use crate::agent::terminal::authenticated_replay_store_workspace;
 use crate::runtime::child_source::completion::ChildOutcomeHook;
 use crate::session_worker::protocol::WorkerManifest;
 
@@ -475,23 +477,42 @@ async fn verify_segment_replay(
     {
         let workspace = std::path::Path::new(fabric.workspace_id());
         let decision_key = crate::decision::DecisionKey::load_existing(workspace)?;
-        let store = CausalDecisionStore::open_unshared_read_only(workspace);
-        let store_workspace = store
-            .workspace_id()
-            .context("operator decision store namespace missing")?;
-        let reader = store.reader();
+        let store = (!REPLAY_EVIDENCE_AUTHORITY).then(|| CausalDecisionStore::open_unshared_read_only(workspace));
+        let reader = store.as_ref().map(|store| store.reader());
+        let store_workspace: std::sync::Arc<str> = if REPLAY_EVIDENCE_AUTHORITY {
+            std::sync::Arc::from(authenticated_replay_store_workspace(&decision_key, event)?)
+        } else {
+            store
+                .as_ref()
+                .and_then(|store| store.workspace_id())
+                .context("operator decision store namespace missing")?
+        };
         let memory = fabric.memory();
-        let replay = verify_terminal_replay(
-            memory.as_ref(),
-            &reader,
-            &decision_key,
-            &store_workspace,
-            fabric.workspace_id(),
-            owner,
-            run,
-            event,
-        )
-        .await?;
+        let replay = if REPLAY_EVIDENCE_AUTHORITY {
+            verify_terminal_replay_journal(
+                memory.as_ref(),
+                workspace,
+                &decision_key,
+                &store_workspace,
+                fabric.workspace_id(),
+                owner,
+                run,
+                event,
+            )
+            .await?
+        } else {
+            verify_terminal_replay(
+                memory.as_ref(),
+                reader.as_ref().context("operator decision reader missing")?,
+                &decision_key,
+                &store_workspace,
+                fabric.workspace_id(),
+                owner,
+                run,
+                event,
+            )
+            .await?
+        };
         anyhow::ensure!(
             replay.parent_decision_id().is_none(),
             "operator segment asserts model delegation"
@@ -504,21 +525,35 @@ async fn verify_segment_replay(
         )?
         .with_verified_resume(&replay);
         let outcome = crate::causal_tree::outcome::OutcomeCorrelator::persisted_record(replay.decision(), &facts)?;
-        crate::runtime::child_source::completion::JournalChildOutcomeHook::new(
+        let hook = crate::runtime::child_source::completion::JournalChildOutcomeHook::new(
             workspace.to_path_buf(),
             std::sync::Arc::clone(&decision_key),
             std::sync::Arc::clone(&store_workspace),
-        )
-        .persist(&replay, event, None, None)
-        .await?;
-        let scope = crate::causal_tree::store::DecisionScope::Owner {
-            workspace_id: store_workspace,
-            owner_id: std::sync::Arc::from(owner),
-        };
-        anyhow::ensure!(
-            reader.outcome_matches(&scope, &outcome)?,
-            "operator segment outcome is missing or conflicts"
         );
+        hook.persist(&replay, event, None, None).await?;
+        if REPLAY_EVIDENCE_AUTHORITY {
+            anyhow::ensure!(
+                authority_journal::verify_child_outcome(
+                    workspace,
+                    &decision_key,
+                    &hook.expected_row(&replay, event)?,
+                    Some(authority_journal::JOURNAL_REQUIRED_VERSION),
+                )?,
+                "operator segment outcome is missing or conflicts"
+            );
+        } else {
+            let scope = crate::causal_tree::store::DecisionScope::Owner {
+                workspace_id: store_workspace,
+                owner_id: std::sync::Arc::from(owner),
+            };
+            anyhow::ensure!(
+                reader
+                    .as_ref()
+                    .context("operator decision reader missing")?
+                    .outcome_matches(&scope, &outcome)?,
+                "operator segment outcome is missing or conflicts"
+            );
+        }
     }
     Ok(())
 }
