@@ -233,7 +233,7 @@ fn prx_causal_status_parses_and_reports_order() {
     assert_eq!(order.last().and_then(|slot| slot["kind"].as_str()), Some("builtin"));
     assert_eq!(status["store"]["mode"], "read_write");
     // Keep this CLI literal aligned with store_schema::SCHEMA_VERSION.
-    assert_eq!(status["store"]["schema_version"], 5);
+    assert_eq!(status["store"]["schema_version"], 6);
 
     let backends = stdout_json(&causal(&dir, &["backends", "--json"]));
     assert_eq!(backends["order"][0]["kind"], "compatible_http");

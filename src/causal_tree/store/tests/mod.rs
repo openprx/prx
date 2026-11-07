@@ -413,6 +413,10 @@ async fn old_read_only_stores_project_absent_columns_without_migration() {
                  CREATE INDEX decisions_scope_time ON decisions(workspace_id, owner_id, created_at_ms);",
         )
         .expect("remove v5 child settlements and restore the v1 scope index");
+        conn.execute_batch(
+            "ALTER TABLE decisions DROP COLUMN ma_scope_id; ALTER TABLE outcomes DROP COLUMN ma_scope_id",
+        )
+        .expect("remove v6 scope columns");
         conn.execute_batch("ALTER TABLE decisions DROP COLUMN prior_decision_id")
             .expect("remove v3 column");
         if version == 1 {
