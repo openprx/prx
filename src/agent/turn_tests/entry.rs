@@ -636,23 +636,18 @@ for line in sys.stdin:
     assert!(!marker.exists(), "the MCP server saw an unapproved write call");
 }
 
-/// A scheduled turn retains its creator's read-only tool authority even when
-/// the bootstrap CLI policy would otherwise permit the same write.
-#[tokio::test]
-async fn scheduled_agent_creator_read_only_denies_wire_file_write() {
-    use crate::providers::credential_probe::CredentialProbe;
-
-    let tmp = TempDir::new().expect("test: tempdir");
-    let probe = CredentialProbe::start_with_tool_reply(
-        "<tool_call>\n{\"name\":\"file_write\",\"arguments\":{\"path\":\"scheduled-denied.txt\",\"content\":\"should-not-exist\"}}\n</tool_call>",
-    )
-    .await;
-    let mut config = cli_agent_probe_config(tmp.path(), &probe);
-    config.autonomy.level = crate::security::AutonomyLevel::Full;
-    config.tool_tiering.always_include.push("file_write".to_string());
+/// Store a creator job through the real tool service (it owns the trusted
+/// creator projection) and rebuild the scheduler's read-only scope for it.
+async fn stored_creator_job_fixture(
+    config: &crate::config::Config,
+    prompt: &str,
+) -> (
+    crate::cron::CronJob,
+    RuntimeEnvelope,
+    crate::tools::execution::ScheduledToolScope,
+) {
     // Persist the job through the real tool service: it owns the trusted
     // creator projection. The model arguments contain no scope or origin.
-    const PROMPT: &str = "write scheduled-denied.txt";
     let creator_envelope = RuntimeEnvelope::chat_terminal(
         config.workspace_dir.to_string_lossy(),
         "prx_creator_chat",
@@ -675,23 +670,21 @@ async fn scheduled_agent_creator_read_only_denies_wire_file_write() {
             "action": "add",
             "schedule": {"kind": "at", "at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()},
             "job_type": "agent",
-            "prompt": PROMPT,
+            "prompt": prompt,
         }),
     )
     .await;
     assert!(created.success, "real creator job must be stored: {created:?}");
-    let jobs = crate::cron::list_jobs(&config).expect("stored creator jobs");
+    let jobs = crate::cron::list_jobs(config).expect("stored creator jobs");
     assert_eq!(jobs.len(), 1);
-    let job = crate::cron::get_job(&config, &jobs.first().expect("one stored creator job").id)
+    let job = crate::cron::get_job(config, &jobs.first().expect("one stored creator job").id)
         .expect("reload actual stored creator origin");
-    assert_eq!(job.prompt.as_deref(), Some(PROMPT));
+    assert_eq!(job.prompt.as_deref(), Some(prompt));
     assert!(matches!(
         &job.origin,
         crate::tools::execution::JobOrigin::Principal { channel, sender, chat_type, .. }
             if channel == "telegram" && sender == "creator" && chat_type == "private"
     ));
-    // Same no-lease immediate invocation identity as the production scheduler.
-    let origin = crate::agent::scheduled_source::ScheduledAgentOrigin::from_cron(&job, None);
     let mut envelope = RuntimeEnvelope::cron(
         config.workspace_dir.to_string_lossy(),
         job.id.clone(),
@@ -719,6 +712,82 @@ async fn scheduled_agent_creator_read_only_denies_wire_file_write() {
         context,
         policy: Arc::new(creator_policy),
     };
+    (job, envelope, scope)
+}
+
+fn chat_request_count(probe: &crate::providers::credential_probe::CredentialProbe) -> usize {
+    probe
+        .requests()
+        .iter()
+        .filter(|request| request.path.contains("chat/completions"))
+        .count()
+}
+
+fn refused_as_already_accepted(result: &anyhow::Result<String>) -> bool {
+    result.as_ref().err().is_some_and(|error| {
+        error
+            .chain()
+            .any(|cause| cause.is::<crate::runtime::ingress_recovery::AlreadyAccepted>())
+    })
+}
+
+/// Recording is on and the decision plane is off, so no recovery recorder
+/// exists. A retry of the same attempt identity reuses the stable scheduled
+/// input key and must be refused before it reaches the provider.
+#[tokio::test]
+async fn scheduled_retry_of_accepted_input_key_is_refused_with_plane_off() {
+    use crate::providers::credential_probe::CredentialProbe;
+
+    let tmp = TempDir::new().expect("test: tempdir");
+    let probe = CredentialProbe::start().await;
+    let mut config = cli_agent_probe_config(tmp.path(), &probe);
+    config.causal_tree.enabled = false;
+    assert!(config.memory.event_recording_config().enabled);
+    let (job, envelope, scope) = stored_creator_job_fixture(&config, "prx scheduled retry").await;
+    let run = |envelope: RuntimeEnvelope, scope: crate::tools::execution::ScheduledToolScope| {
+        crate::agent::scheduled_source::ScheduledAgentOrigin::from_cron(&job, None).scope(run_with_runtime_envelope(
+            config.clone(),
+            Some("prx scheduled retry".to_string()),
+            None,
+            None,
+            0.0,
+            CancellationToken::new(),
+            Some(envelope),
+            Some(scope),
+        ))
+    };
+    let first = run(envelope.clone(), scope.clone()).await;
+    assert!(
+        !refused_as_already_accepted(&first),
+        "first admission was refused: {first:?}"
+    );
+    let dispatched = chat_request_count(&probe);
+    let retry = run(envelope, scope).await;
+    assert!(
+        refused_as_already_accepted(&retry),
+        "retry of an accepted scheduled input was admitted: {retry:?}"
+    );
+    assert_eq!(chat_request_count(&probe), dispatched, "retry reached the provider");
+}
+
+/// A scheduled turn retains its creator's read-only tool authority even when
+/// the bootstrap CLI policy would otherwise permit the same write.
+#[tokio::test]
+async fn scheduled_agent_creator_read_only_denies_wire_file_write() {
+    use crate::providers::credential_probe::CredentialProbe;
+
+    let tmp = TempDir::new().expect("test: tempdir");
+    let probe = CredentialProbe::start_with_tool_reply(
+        "<tool_call>\n{\"name\":\"file_write\",\"arguments\":{\"path\":\"scheduled-denied.txt\",\"content\":\"should-not-exist\"}}\n</tool_call>",
+    )
+    .await;
+    let mut config = cli_agent_probe_config(tmp.path(), &probe);
+    config.autonomy.level = crate::security::AutonomyLevel::Full;
+    config.tool_tiering.always_include.push("file_write".to_string());
+    const PROMPT: &str = "write scheduled-denied.txt";
+    let (job, envelope, scope) = stored_creator_job_fixture(&config, PROMPT).await;
+    // Same no-lease immediate invocation identity as the production scheduler.
+    let origin = crate::agent::scheduled_source::ScheduledAgentOrigin::from_cron(&job, None);
 
     let reply = origin
         .scope(run_with_runtime_envelope(

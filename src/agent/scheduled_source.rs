@@ -406,15 +406,8 @@ impl ScheduledPendingInput {
                 self.choice.model_name()
             ));
             self.fabric
-                .record_inbound_user_message(scope, self.input.clone(), Some(self.key.clone()), None)
-                .await
-                .map_or_else(
-                    |_| {
-                        tracing::warn!("scheduled input persistence is unconfirmed");
-                        None
-                    },
-                    Some,
-                )
+                .record_inbound_user_message_best_effort(scope, self.input.clone(), Some(self.key.clone()), "scheduled")
+                .await?
         };
         if let Some(event) = event.as_ref().filter(|event| event.id > 0) {
             anyhow::ensure!(

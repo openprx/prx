@@ -598,3 +598,28 @@ fn recovery_activation_failure_is_attempted_once_under_contention() -> anyhow::R
     drop(dir);
     Ok(())
 }
+
+#[test]
+fn recovery_key_gates_do_not_grow_with_distinct_ids() -> anyhow::Result<()> {
+    let (dir, memory) = store()?;
+    let before = memory.recovery_key_gates.len();
+    anyhow::ensure!(
+        before == super::RECOVERY_KEY_GATES,
+        "gate set is not the fixed stripe count"
+    );
+    let mut used = std::collections::HashSet::new();
+    for n in 0..5000 {
+        let id = format!("capsule-key-{n}");
+        let stripe = super::recovery_key_gate_index(&id);
+        anyhow::ensure!(stripe < before, "stripe index escaped the fixed gate set");
+        anyhow::ensure!(
+            stripe == super::recovery_key_gate_index(&id),
+            "one id must always map to one gate"
+        );
+        used.insert(stripe);
+    }
+    anyhow::ensure!(used.len() > 1, "distinct ids never spread across stripes");
+    anyhow::ensure!(memory.recovery_key_gates.len() == before, "gate set grew");
+    drop(dir);
+    Ok(())
+}

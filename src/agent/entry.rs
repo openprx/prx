@@ -322,15 +322,13 @@ impl CliPendingInput {
             let operation = crate::runtime::experiment_stage::retain(experiment_stage, async {
                 let event = self
                     .fabric
-                    .record_inbound_user_message(self.scope.clone(), self.input.clone(), Some(self.key.clone()), None)
-                    .await
-                    .map_or_else(
-                        |_| {
-                            tracing::warn!("CLI input persistence is unconfirmed");
-                            None
-                        },
-                        Some,
-                    );
+                    .record_inbound_user_message_best_effort(
+                        self.scope.clone(),
+                        self.input.clone(),
+                        Some(self.key.clone()),
+                        "CLI",
+                    )
+                    .await?;
                 let proof = self.issue(event.as_ref()).await?;
                 Ok::<_, anyhow::Error>((event, proof))
             });
