@@ -663,8 +663,8 @@ async fn child_page_recall_is_bound_to_the_child_task() {
             "{run} history should be paged out"
         );
     }
-    // Legacy page written before pages carried a task label. No current
-    // writer produces it, so it is seeded directly to prove children fail closed.
+    // Task-less page: a legacy page, or one written by a main turn whose
+    // envelope has neither task nor run id. Seeded directly to prove children fail closed.
     mem.ingest_document(DocumentIngestInput {
         document_id: Some("context-page:delegate:shared:unlabelled".to_string()),
         workspace_id: workspace.clone(),
