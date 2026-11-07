@@ -199,6 +199,23 @@ async fn native_collection_with(http: bool, stalled_store: bool) {
             .await
             .is_err()
     );
+    let view = service
+        .inspect_pending_decision_approval(owner, session, id)
+        .await
+        .expect("test: inspection works without the store projection");
+    assert_eq!(view.decision_id, id.to_string());
+    assert_eq!(view.tool.as_deref(), Some(tool_name));
+    assert_eq!(view.arguments.as_ref(), Some(&arguments));
+    let page = service
+        .list_pending_decision_approvals(owner, 0, 100)
+        .await
+        .expect("test: the inbox works without the store projection");
+    assert!(
+        page.items
+            .iter()
+            .any(|item| item.session_id == session && item.view.decision_id == id.to_string()),
+        "the inbox lists this decision and session"
+    );
     service
         .review_pending_decision_approval(owner, session, id, true)
         .await
