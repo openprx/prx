@@ -67,6 +67,8 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     // with a single parameterized UPDATE on the seeded test database; every
     // read in that test still goes through the production MCP seam.
     "src/gateway/compat/tests/memory_tools.rs::mcp_memory_search_still_returns_public_rows::let conn = Connection::open(workspace.path().join(\"memory\").join(\"brain.db\"))",
+    // MA-01b1b-2 fixture: reads and seeds agent_incarnations rows of the owners under test.
+    "src/gateway/tests/agent_registry.rs::db::rusqlite::Connection::open(dir.join(\"workspace/memory/brain.db\")).expect(\"test: open registry database\")",
     "src/gateway/compat.rs::upsert_agent_identity_binding::let conn = Connection::open(db_path)?;",
     "src/main.rs::open_approval_ledger::Connection::open(&db_path).with_context(|| format!(\"Failed to open approval ledger: {}\", db_path.display()))?;",
     "src/memory/hygiene.rs::close_stale_topics::let conn = Connection::open(db_path)?;",
