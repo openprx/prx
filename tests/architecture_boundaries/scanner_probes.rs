@@ -71,7 +71,7 @@ use super::tool_tests::{
     direct_tool_invocations_outside_the_execution_service_are_allowlisted,
     every_gateway_tool_execution_documents_its_alternative_gate,
     every_non_tool_execute_call_site_shows_its_type_evidence, non_tool_closure_providers_match_their_definitions,
-    non_tool_execute_call_sites_match_their_declared_occurrences,
+    non_tool_execute_call_sites_match_their_declared_occurrences, resume_sites_go_through_model_turn_context,
 };
 use std::fs;
 /// Tree scanners that deliberately inventory test code as well, with the
@@ -729,6 +729,7 @@ source_mutation_probes! {
     provider_label_sinks_redact_url_userinfo => terminal_provider_label_guard_rejects_bypass_missing_calls_and_literal_decoys,
     embedded_user_input_cannot_bypass_reserved_marker_neutralization => mutation_proof_embedded_input_guard,
     every_non_tool_execute_call_site_shows_its_type_evidence => mutation_proof_execution_binding_guard,
+    resume_sites_go_through_model_turn_context => mutation_proof_resume_sites_guard,
     forwarded_compaction_values_are_produced_from_the_effective_window => mutation_proof_compaction_producer_guard,
     both_gateway_launch_paths_register_their_tools_from_one_body => mutation_proof_gateway_registration_guard,
     ordinary_worker_credential_comparison_rejects_unscoped_neighbors_and_duplicates => mutation_proof_credential_comparison_guard,
@@ -760,6 +761,16 @@ fn mutation_proof_execution_binding_guard() {
         "service.bind_agent_execution(source, &decision, &context, &selected.specs)?",
         "service.bind_unreviewed_execution(source, &decision, &context, &selected.specs)?",
     );
+}
+fn mutation_proof_resume_sites_guard() {
+    for path in ["src/gateway/api/sessions.rs", "src/chat/decision_source.rs"] {
+        assert_reviewed_source_mutation(
+            resume_sites_go_through_model_turn_context,
+            path,
+            "crate::tools::surface_owner::model_turn_context",
+            "crate::tools::ToolExecutionContext::new",
+        );
+    }
 }
 fn mutation_proof_compaction_producer_guard() {
     for expression in [
