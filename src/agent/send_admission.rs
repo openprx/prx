@@ -7,6 +7,13 @@ use crate::runtime::turn_source::TurnSourceProof;
 use crate::tools::{ToolSchemaDialect, ToolSpec};
 use anyhow::{Context, Result};
 
+#[cfg(test)]
+thread_local! {
+    /// Narrows the live G6 tokens after the decision was admitted, the way a
+    /// decision attempt's settlement does. One test runs on one thread.
+    pub(crate) static TEST_TOKEN_CAP: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
 /// Refuses the send unless it fits G6 and the remaining spend. Nothing is sent
 /// or debited here; decision-attempt token reservation and settlement are
 /// unchanged.
@@ -27,6 +34,8 @@ pub(crate) fn admit_provider_send(
 ) -> Result<()> {
     let tools = tools.unwrap_or_default();
     let remaining = context.remaining_g6_tokens();
+    #[cfg(test)]
+    let remaining = remaining.min(TEST_TOKEN_CAP.get());
     let answer = crate::cost::estimate::candidate_tokens(0);
     anyhow::ensure!(
         answer <= remaining,

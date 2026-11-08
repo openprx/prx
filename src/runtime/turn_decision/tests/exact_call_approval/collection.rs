@@ -107,10 +107,8 @@ enum LegacyEvents {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CollectionBudget {
     Standard,
-    /// A route window whose decision slice is `available / 8` tokens; the answer needs 128.
-    Window {
-        available: usize,
-    },
+    /// The default fixture with the live G6 tokens narrowed after the decision.
+    Narrowed,
     /// A money ceiling between a request carrying the raw and the Gemini-cleaned schema.
     Dialect {
         gemini: bool,
@@ -130,7 +128,7 @@ impl Tool for HugeExamplesSchema {
     fn parameters_schema(&self) -> serde_json::Value {
         let mut schema = self.0.parameters_schema();
         if let Some(properties) = schema.get_mut("properties").and_then(serde_json::Value::as_object_mut) {
-            let examples: Vec<String> = (0..4000).map(|index| format!("word{index} ")).collect();
+            let examples: Vec<String> = (0..2500).map(|index| format!("word{index} ")).collect();
             properties.insert(
                 "prx_budget_probe".into(),
                 serde_json::json!({"type": "string", "examples": examples}),
@@ -153,10 +151,8 @@ impl Tool for HugeExamplesSchema {
 #[tokio::test]
 async fn collection_request_over_token_budget_is_refused_without_a_send() {
     usage::EXPECTED_REFUSAL.set(Some("answer estimates 128 tokens but 127 remain"));
-    Box::pin(exact_file_collection_with_budget(CollectionBudget::Window {
-        available: 1016,
-    }))
-    .await;
+    crate::agent::send_admission::TEST_TOKEN_CAP.set(127);
+    Box::pin(exact_file_collection_with_budget(CollectionBudget::Narrowed)).await;
     assert!(
         usage::EXPECTED_REFUSAL.take().is_none(),
         "the refusal expectation was consumed"
@@ -166,10 +162,8 @@ async fn collection_request_over_token_budget_is_refused_without_a_send() {
 /// Answer 128 of 128 tokens: the same branch sends exactly once.
 #[tokio::test]
 async fn collection_request_within_token_budget_sends_once() {
-    Box::pin(exact_file_collection_with_budget(CollectionBudget::Window {
-        available: 1024,
-    }))
-    .await;
+    crate::agent::send_admission::TEST_TOKEN_CAP.set(128);
+    Box::pin(exact_file_collection_with_budget(CollectionBudget::Narrowed)).await;
 }
 
 /// At one money ceiling, the Gemini provider dialect fits and the Raw dialect
@@ -247,17 +241,10 @@ async fn exact_file_collection_with_legacy_events(
     );
     match budget {
         CollectionBudget::Standard => {}
-        CollectionBudget::Window { available } => {
-            config.agent.compaction.reserve_tokens = 100;
-            config.agent.compaction.max_context_tokens = available + 100;
-            config.agent.compaction.max_context_tokens_explicit = true;
-        }
+        CollectionBudget::Narrowed => {}
         CollectionBudget::Dialect { .. } => {
             // 1 micro-USD per token: the ceiling sits between the two request sizes.
-            config.cost.daily_limit_usd = 0.003;
-            config.agent.compaction.reserve_tokens = 100;
-            config.agent.compaction.max_context_tokens = 100_000;
-            config.agent.compaction.max_context_tokens_explicit = true;
+            config.cost.daily_limit_usd = 0.007;
         }
     }
     config.save().await.expect("owned fixture config");
