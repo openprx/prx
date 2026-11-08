@@ -169,8 +169,6 @@ impl DurableCausalEventSink {
         application: VerifiedDirectiveApplication,
         deadline: Instant,
     ) -> anyhow::Result<()> {
-        #[cfg(test)]
-        super::ingress_recovery::repair_spies::note_directive_repair();
         let (event, idempotency_key, original_generation) = application.into_parts();
         let memory = self
             .memory
@@ -216,8 +214,6 @@ impl DurableCausalEventSink {
     }
 
     pub(super) async fn repair_applied(&self, application: VerifiedDirectiveApplication, deadline: Instant) -> bool {
-        #[cfg(test)]
-        super::ingress_recovery::repair_spies::note_directive_repair();
         let Some(memory) = self.memory.upgrade() else {
             return false;
         };

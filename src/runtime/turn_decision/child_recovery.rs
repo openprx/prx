@@ -53,7 +53,7 @@ pub(crate) fn child_recovery_gate(
     durable_key: bool,
 ) -> Option<ChildRecoveryReport> {
     #[cfg(test)]
-    crate::runtime::ingress_recovery::repair_spies::note_child_recovery();
+    recovery.spies().note_child_recovery();
     if recovery.authority.legacy.is_none() || !plane || !recordable || !durable_key {
         return Some(ChildRecoveryReport::default());
     }

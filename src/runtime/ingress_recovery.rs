@@ -20,42 +20,39 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ActivatedRepository;
 
+/// Per-scope repair counters. Instance-scoped so parallel tests cannot share counts.
 #[cfg(test)]
-pub(crate) mod repair_spies {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+#[derive(Default)]
+pub(crate) struct RepairSpies {
+    rejoin: std::sync::atomic::AtomicUsize,
+    child_recovery: std::sync::atomic::AtomicUsize,
+    directive_repair: std::sync::atomic::AtomicUsize,
+}
 
-    static REJOIN: AtomicUsize = AtomicUsize::new(0);
-    static CHILD_RECOVERY: AtomicUsize = AtomicUsize::new(0);
-    static DIRECTIVE_REPAIR: AtomicUsize = AtomicUsize::new(0);
-
-    pub(crate) fn reset() {
-        REJOIN.store(0, Ordering::SeqCst);
-        CHILD_RECOVERY.store(0, Ordering::SeqCst);
-        DIRECTIVE_REPAIR.store(0, Ordering::SeqCst);
+#[cfg(test)]
+impl RepairSpies {
+    pub(crate) fn note_rejoin(&self) {
+        self.rejoin.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub(crate) fn note_rejoin() {
-        REJOIN.fetch_add(1, Ordering::SeqCst);
+    pub(crate) fn note_child_recovery(&self) {
+        self.child_recovery.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub(crate) fn note_child_recovery() {
-        CHILD_RECOVERY.fetch_add(1, Ordering::SeqCst);
+    pub(crate) fn note_directive_repair(&self) {
+        self.directive_repair.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub(crate) fn note_directive_repair() {
-        DIRECTIVE_REPAIR.fetch_add(1, Ordering::SeqCst);
+    pub(crate) fn rejoin(&self) -> usize {
+        self.rejoin.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(crate) fn rejoin() -> usize {
-        REJOIN.load(Ordering::SeqCst)
+    pub(crate) fn child_recovery(&self) -> usize {
+        self.child_recovery.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(crate) fn child_recovery() -> usize {
-        CHILD_RECOVERY.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn directive_repair() -> usize {
-        DIRECTIVE_REPAIR.load(Ordering::SeqCst)
+    pub(crate) fn directive_repair(&self) -> usize {
+        self.directive_repair.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -100,6 +97,8 @@ pub(crate) struct RecoveryScope {
     pub(super) surface: crate::causal_tree::state::TurnSurfaceKind,
     pub(super) authority: Arc<RecoveryAuthority>,
     pub(super) parent_authority_id: Option<crate::tools::capability::child::ParentAuthorityId>,
+    #[cfg(test)]
+    pub(crate) spies: Arc<RepairSpies>,
 }
 
 impl RecoveryScope {
@@ -118,11 +117,18 @@ impl RecoveryScope {
                 legacy: None,
             }),
             parent_authority_id: None,
+            #[cfg(test)]
+            spies: Arc::new(RepairSpies::default()),
         }
     }
 
     pub(super) fn legacy_store(&self) -> Option<&Arc<crate::causal_tree::store::CausalDecisionStore>> {
         self.authority.legacy.as_ref().map(|legacy| &legacy.store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spies(&self) -> &RepairSpies {
+        &self.spies
     }
 
     pub(super) fn legacy_events(&self) -> Option<&Arc<super::causal_events::DurableCausalEventSink>> {
@@ -206,6 +212,8 @@ impl RecoveryScope {
                 legacy,
             }),
             parent_authority_id: parent_grant.map(|grant| grant.scope().gate_inputs().0.parent_authority_id),
+            #[cfg(test)]
+            spies: Arc::new(RepairSpies::default()),
         });
         owner.retain_recovery(Arc::clone(&scope))?;
         recovery_ready(Arc::clone(&scope)).await?;

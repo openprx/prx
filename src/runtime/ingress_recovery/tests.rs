@@ -705,6 +705,7 @@ fn terminal_scope(memory: Arc<dyn Memory>, workspace: &Path) -> RecoveryScope {
             legacy: None,
         }),
         parent_authority_id: None,
+        spies: Arc::new(RepairSpies::default()),
     }
 }
 
@@ -792,7 +793,6 @@ async fn recovery_off_when_user_message_recording_is_disabled() {
         .unwrap();
 }
 
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #[path = "auth_02_2a_tests.rs"]
 mod auth_02_2a_tests;
 

@@ -840,7 +840,7 @@ impl super::ingress_recovery::RecoveryScope {
         )>,
     ) -> anyhow::Result<Enqueue> {
         #[cfg(test)]
-        super::ingress_recovery::repair_spies::note_rejoin();
+        self.spies().note_rejoin();
         #[cfg(test)]
         let mut stage = super::turn_cleanup::diagnostic::Stage::current(
             super::turn_cleanup::diagnostic::StageName::RejoinPreconditions,
@@ -1105,7 +1105,7 @@ impl super::ingress_recovery::RecoveryScope {
             );
             let application = VerifiedDirectiveApplication::from_replay(&replay)?;
             #[cfg(test)]
-            super::ingress_recovery::repair_spies::note_directive_repair();
+            self.spies().note_directive_repair();
             let sink = legacy.events.as_ref().context("applied replay sink is unavailable")?;
             if let Some((_, deadline, _)) = bounded {
                 sink.repair_applied_until(application, deadline).await?;

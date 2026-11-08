@@ -1594,6 +1594,29 @@ mod tests {
         service
     }
 
+    /// Production-faithful signed terminal without writing `outcomes`, so a later
+    /// plane-on rejoin can assert the repair insert.
+    pub(crate) async fn seed_replayable_completed_terminal(
+        workspace: &Path,
+        memory: Arc<dyn Memory>,
+    ) -> (String, String) {
+        let mut draft = completed_commit("prx_legacy");
+        let cost = CostConfig::default();
+        let service = bind_terminal_fixture(workspace, Arc::clone(&memory), &mut draft, &cost).await;
+        let terminal_id = draft.terminal_id.clone();
+        let owner_id = draft.scope.owner_id.clone().expect("test: seeded terminal owner");
+        let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy());
+        finalize_turn_stop_after_marker(&fabric, draft, &cost, workspace)
+            .await
+            .expect("test: seed signed terminal");
+        assert!(
+            service.drain_writes(Instant::now() + Duration::from_secs(5)).await,
+            "test: fixture drain"
+        );
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+        (terminal_id, owner_id)
+    }
+
     fn terminal_fixture_principal(workspace: &Path, scope: &MessageEventScope) -> MemoryPrincipal {
         MemoryPrincipal {
             require_owner_match: true,
@@ -3053,3 +3076,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::seed_replayable_completed_terminal;

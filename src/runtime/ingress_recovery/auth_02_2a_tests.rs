@@ -8,7 +8,7 @@ use crate::memory::ingress_recovery::{IngressAttestationError, IngressCapsule, I
 use crate::memory::recovery_authority::{RecoveryChain, RecoveryPublication};
 use crate::runtime::ingress_recovery::tombstone_fixture;
 use crate::runtime::ingress_recovery::{
-    IngressRecorder, LegacyUnconfirmed, RecoveryScope, SettledTerminalFacts, backend_memory, repair_spies,
+    IngressRecorder, LegacyUnconfirmed, RecoveryScope, SettledTerminalFacts, backend_memory,
 };
 use crate::runtime::turn_cleanup::CleanupTracker;
 use crate::skills::lifecycle::{TerminalKind, take_settled_skill_observations};
@@ -85,6 +85,7 @@ fn cell_memory(backend: &str, workspace: &Path, k: bool) -> Arc<dyn Memory> {
     backend_memory(backend, workspace).expect("test: unavailable handle")
 }
 
+#[derive(Clone, Copy)]
 struct MatrixCell {
     backend: &'static str,
     plane: bool,
@@ -98,6 +99,50 @@ fn cell_config(workspace: &Path, plane: bool, recording: bool) -> crate::config:
     config.causal_tree.enabled = plane;
     config.memory.events.record_user_messages = recording;
     config
+}
+
+fn assert_exact_error(error: &anyhow::Error, expected: &str) {
+    assert!(
+        error.chain().any(|cause| cause.to_string() == expected),
+        "expected exact error {expected}, got {error:#}"
+    );
+}
+
+async fn assert_plane_on_legacy_rejoin(cell: &MatrixCell, recovery: &RecoveryScope, owner_id: &str, seeded: bool) {
+    match (cell.backend, cell.plane, cell.recording, cell.k, cell.l) {
+        ("sqlite", true, true, true, true) => {
+            assert!(seeded, "sqlite plane-on recording+k+l seeds a replayable terminal");
+            let store = recovery.legacy_store().expect("test: plane-on store");
+            let before = store.reader().counts().expect("test: outcomes before").outcomes;
+            recovery
+                .rejoin_terminal("prx_legacy", owner_id)
+                .await
+                .expect("test: seeded plane-on rejoin");
+            let after = store.reader().counts().expect("test: outcomes after").outcomes;
+            let directive = recovery.spies().directive_repair();
+            assert!(
+                after > before || directive > 0,
+                "sqlite plane-on rejoin must write an outcomes row or repair the chain (before={before} after={after} directive={directive})"
+            );
+        }
+        ("sqlite", true, true, false, true) => {
+            let error = recovery
+                .rejoin_terminal("prx_legacy", owner_id)
+                .await
+                .expect_err("test: sqlite k-false rejoin");
+            assert_exact_error(&error, "terminal rejoin requires recording plus recovery authority");
+        }
+        ("postgres_class", true, true, false, true) => {
+            let error = recovery
+                .rejoin_terminal("prx_legacy", owner_id)
+                .await
+                .expect_err("test: postgres_class dummy rejoin");
+            assert_exact_error(&error, "terminal replay payload is missing");
+        }
+        (backend, plane, recording, k, l) => {
+            panic!("test: unhandled plane-on repair cell {backend} plane={plane} rec={recording} k={k} l={l}")
+        }
+    }
 }
 
 fn observer() -> Arc<dyn crate::decision::telemetry::CausalEventSink> {
@@ -197,11 +242,20 @@ async fn run_matrix_cell(cell: MatrixCell) {
     } = cell;
     let (_dir, workspace) = home_workspace();
     let memory = cell_memory(backend, &workspace, k);
-    if l {
-        let mut input = recovery_input(&workspace, "prx_legacy");
-        input.idempotency_key = Some("turn:prx_legacy:final".into());
-        memory.append_message_event(input).await.expect("test: legacy final");
-    }
+    let seed_replay = backend == "sqlite" && plane && recording && k && l;
+    let rejoin_owner = if seed_replay {
+        let (terminal_id, owner) =
+            crate::agent::terminal::seed_replayable_completed_terminal(&workspace, Arc::clone(&memory)).await;
+        assert_eq!(terminal_id, "prx_legacy");
+        owner
+    } else {
+        if l {
+            let mut input = recovery_input(&workspace, "prx_legacy");
+            input.idempotency_key = Some("turn:prx_legacy:final".into());
+            memory.append_message_event(input).await.expect("test: legacy final");
+        }
+        "prx_user".into()
+    };
     let before = decision_tree(&workspace);
     let config = Arc::new(cell_config(&workspace, plane, recording));
     let recorder_owner = Arc::new(CleanupTracker::default());
@@ -280,29 +334,7 @@ async fn run_matrix_cell(cell: MatrixCell) {
         assert_no_decision_files(&workspace);
     }
     if l && open_legacy {
-        let outcomes_before = table_rows(&workspace, "decision_outcomes");
-        match recovery.rejoin_terminal("prx_legacy", "prx_user").await {
-            Ok(_) => {
-                assert!(
-                    table_rows(&workspace, "decision_outcomes") != outcomes_before
-                        || repair_spies::directive_repair() > 0
-                        || recovery.legacy_store().is_some(),
-                    "{backend} plane-on rejoin must repair or keep the writer"
-                );
-            }
-            Err(error) => {
-                let text = format!("{error:#}");
-                assert!(
-                    text.contains("decision replay row is missing")
-                        || text.contains("terminal replay payload is missing")
-                        || text.contains("terminal replay binding is missing")
-                        || text.contains("terminal replay claim is missing")
-                        || text.contains("terminal replay claim binding is missing")
-                        || text.contains("terminal rejoin requires recording plus recovery authority"),
-                    "{backend} plane-on rejoin specific error: {text}"
-                );
-            }
-        }
+        assert_plane_on_legacy_rejoin(&cell, &recovery, &rejoin_owner, seed_replay).await;
         assert_eq!(table_rows(&workspace, "recovery_attestations"), 0);
         assert_eq!(table_rows(&workspace, "recovery_transport_index"), 0);
     }
@@ -447,7 +479,6 @@ fn settled_facts(terminal_id: &str, claim: &str, final_id: &str, key_id: &str) -
 }
 
 pub(super) async fn recovery_off_never_writes_outcome_or_child_link() {
-    repair_spies::reset();
     let _ = take_settled_skill_observations();
     let (_dir, workspace) = home_workspace();
     let memory: Arc<dyn Memory> = backend_memory("sqlite", &workspace).expect("test: sqlite");
@@ -523,10 +554,14 @@ pub(super) async fn recovery_off_never_writes_outcome_or_child_link() {
         }),
         "skill settle must run from skill_observation (Completed, false, true): {settled_obs:?}"
     );
-    assert!(repair_spies::rejoin() >= 1, "rejoin spy");
-    assert_eq!(repair_spies::directive_repair(), 0, "plane-off skips directive repair");
+    assert!(recovery.spies().rejoin() >= 1, "rejoin spy");
     assert_eq!(
-        repair_spies::child_recovery(),
+        recovery.spies().directive_repair(),
+        0,
+        "plane-off skips directive repair"
+    );
+    assert_eq!(
+        recovery.spies().child_recovery(),
         0,
         "off-writes does not invoke child recovery"
     );
@@ -559,7 +594,7 @@ pub(super) async fn recovery_off_never_writes_outcome_or_child_link() {
         crate::runtime::turn_decision::child_recovery_gate(&plane_on_without_key, true, true, true).is_some(),
         "plane-on without key skips child recovery"
     );
-    assert!(repair_spies::child_recovery() >= 1, "child recovery spy");
+    assert!(plane_on_without_key.spies().child_recovery() >= 1, "child recovery spy");
 }
 
 pub(super) async fn recovery_legacy_chain_writes_no_attestation() {
@@ -594,20 +629,11 @@ pub(super) async fn recovery_legacy_chain_writes_no_attestation() {
     .await
     .expect("test: plane-on prepare");
     assert!(recovery.authority.legacy.is_some());
-    match recovery.rejoin_terminal("prx_legacy", "prx_user").await {
-        Ok(_) => {}
-        Err(error) => {
-            let text = format!("{error:#}");
-            assert!(
-                text.contains("decision replay row is missing")
-                    || text.contains("terminal replay payload is missing")
-                    || text.contains("terminal replay binding is missing")
-                    || text.contains("terminal replay claim is missing")
-                    || text.contains("terminal replay claim binding is missing"),
-                "legacy-chain plane-on rejoin specific error: {text}"
-            );
-        }
-    }
+    let error = recovery
+        .rejoin_terminal("prx_legacy", "prx_user")
+        .await
+        .expect_err("test: dummy legacy-chain rejoin");
+    assert_exact_error(&error, "terminal replay payload is missing");
     assert_eq!(table_rows(&workspace, "recovery_attestations"), 0);
     assert_eq!(table_rows(&workspace, "recovery_transport_index"), 0);
 
