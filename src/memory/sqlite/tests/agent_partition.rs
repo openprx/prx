@@ -297,8 +297,18 @@ async fn agent_partition_filters_transcripts_and_events() {
     let offset = 0_i64;
     let after = 0_i64;
     let session = SESSION_A.to_owned();
+    let agent: Option<String> = Some("system".to_owned());
+    let persona: Option<String> = None;
+    let sender: Option<String> = Some("s".to_owned());
+    let system_allowed = true;
     let none_turn_plan = explain(&conn, &turn_sql(""), &[&session, &limit, &offset, &owner, &legacy]);
-    let none_event_plan = explain(&conn, &event_sql(""), &[&after, &W, &session]);
+    // Production events bind ?1..=?8; unused slots still occupy the numbered range
+    // so SQLite's highest-index rule matches `agent_partition_clause(..., 9)`.
+    let none_event_plan = explain(
+        &conn,
+        &event_sql(""),
+        &[&after, &W, &agent, &persona, &session, &sender, &system_allowed, &limit],
+    );
     for (label, partition) in [("named", Some(named("x", UX))), ("main", Some(main_partition()))] {
         let reader = principal(SESSION_A, partition);
         let (turn_clause, turn_values) = agent_partition_clause(&reader, 6);
@@ -316,7 +326,8 @@ async fn agent_partition_filters_transcripts_and_events() {
             "{label} turns SCAN agent_scopes: {turn_plan:?}"
         );
         let (event_clause, event_values) = agent_partition_clause(&reader, 9);
-        let mut event_binds: Vec<&dyn rusqlite::types::ToSql> = vec![&after, &W, &session];
+        let mut event_binds: Vec<&dyn rusqlite::types::ToSql> =
+            vec![&after, &W, &agent, &persona, &session, &sender, &system_allowed, &limit];
         for value in &event_values {
             event_binds.push(value);
         }
