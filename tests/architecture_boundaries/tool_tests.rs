@@ -600,6 +600,29 @@ pub(super) fn every_non_tool_execute_call_site_shows_its_type_evidence() {
     }
 }
 
+/// Console and chat resume must go through `model_turn_context`. Reverting
+/// either site to a bare `ToolExecutionContext::new` (Internal) fails this cell.
+#[test]
+pub(super) fn resume_sites_go_through_model_turn_context() {
+    for (relative, function) in [
+        ("src/gateway/api/sessions.rs", "run_console_resume"),
+        ("src/chat/decision_source.rs", "execute_resume_and_finalize"),
+    ] {
+        let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
+            &repository_root().join(relative),
+        )));
+        let body = compact_rust_tokens(&function_body(&production, function));
+        assert!(
+            body.contains("crate::tools::surface_owner::model_turn_context("),
+            "{function} must stamp ModelTurn+surface via model_turn_context"
+        );
+        assert!(
+            !body.contains("ToolExecutionContext::new("),
+            "{function} must not construct a bare Internal context"
+        );
+    }
+}
+
 /// Every closure provider still hands out the type the table claims.
 #[test]
 pub(super) fn non_tool_closure_providers_match_their_definitions() {

@@ -88,31 +88,79 @@ fn decision_free_surface(
     (service, surface)
 }
 
-/// An execution model outside the ingress binding is refused by the binding
-/// itself, with no decision service or `AdmittedTurn`.
-#[test]
-fn execution_model_differs_from_bound_model_is_refused() {
+/// An execution model outside the ingress binding is refused by `run_turn`
+/// before the provider is reached. Card: assertions unchanged (decision-bound
+/// cell is fine; L2 restores the original `run_turn` + provider-not-reached).
+#[tokio::test]
+async fn execution_model_differs_from_bound_model_is_refused() {
     let workspace = tempfile::tempdir().expect("test workspace");
-    let mut config = workspace_config(workspace.path());
-    config.causal_tree.enabled = false;
-    config.providers.models.push(
-        serde_json::from_value(serde_json::json!({
-            "provider":"ollama", "model":"prx-local-model", "operations":["chat"], "native_tools":true,
-        }))
-        .expect("fixture model descriptor"),
-    );
-    let generation = crate::config::new_shared(config).pin();
-    let proof = crate::agent::entry::test_cli_agent_turn_proof(&generation, "ollama", "prx-local-model");
+    let dispatches = Arc::new(Mutex::new(Vec::new()));
+    let registry = project_tool_registry(&dispatches, &["project_tool"]);
+    let admitted = AdmittedTurn::with_config(workspace_config(workspace.path()), "reply", Arc::clone(&registry)).await;
+    let decision = admitted.decision();
     assert!(
-        crate::runtime::turn_model::validate_execution(&proof, "ollama", "prx-local-model").is_ok(),
+        decision
+            .service
+            .validate_agent_execution_model(decision.proof, "ollama", "prx-local-model")
+            .is_ok(),
         "the ingress binding must admit itself"
     );
     for (provider_name, model) in [("ollama", "prx-other-model"), ("openai", "prx-local-model")] {
         assert!(
-            crate::runtime::turn_model::validate_execution(&proof, provider_name, model).is_err(),
+            decision
+                .service
+                .validate_agent_execution_model(decision.proof, provider_name, model)
+                .is_err(),
             "{provider_name}/{model} is outside the ingress binding"
         );
+        let provider = NativeScriptedProvider::new(vec![ChatResponse {
+            text: Some("done".into()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        }]);
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("reply")];
+        let result = run_turn(
+            &mut history,
+            TurnRequest {
+                advice: None,
+                channel_name: "cli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: TurnSchedule {
+                    read_only_tool_concurrency_window: 1,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admitted.decision(),
+            },
+            TurnServices {
+                provider: &provider,
+                provider_name,
+                model,
+                temperature: 0.0,
+                tools_registry: Arc::clone(&registry),
+                observer: &crate::observability::NoopObserver,
+                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admitted.adapter()),
+                memory: admitted.memory_runtime(),
+            },
+            TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await;
+        assert!(result.is_err(), "run_turn accepted {provider_name}/{model}");
+        assert!(provider.requests().is_empty(), "a refused model reached the provider");
     }
+    assert!(dispatches.lock().unwrap().is_empty());
 }
 
 /// A model without verified native tools gets an empty surface from the
