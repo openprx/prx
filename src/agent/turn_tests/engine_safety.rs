@@ -904,7 +904,11 @@ async fn called_tool_schema_bytes_reach_the_turn_budget_at_dispatch() {
             execution_order: Arc::clone(&dispatches),
         }) as Box<dyn Tool>,
     ]);
-    let admitted = AdmittedTurn::with_config(workspace_config(workspace.path()), "reply", Arc::clone(&registry)).await;
+    // A wide window gives the decision slice more than the 300 narrowed tokens,
+    // so only the live cap decides the two calls. TEST_TOKEN_CAP can only lower it.
+    let mut config = workspace_config(workspace.path());
+    config.agent.compaction.max_context_tokens = 100_000;
+    let admitted = AdmittedTurn::with_config(config, "reply", Arc::clone(&registry)).await;
     let call = |name: &str| ChatResponse {
         text: None,
         tool_calls: vec![ToolCall {
