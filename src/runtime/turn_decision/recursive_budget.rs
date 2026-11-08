@@ -57,7 +57,8 @@ impl TurnDecisionService {
         if child.is_some() && funding.is_none() {
             return Err(AgentDecisionBudgetError::ChildFunding);
         }
-        let manifest_micro = child.map(|scope| u64::from(scope.gate_inputs().0.authority.max_cost_cents) * 10_000);
+        let manifest_micro =
+            child.map(|scope| u64::from(scope.gate_inputs().0.authority.max_cost_cents).saturating_mul(10_000));
         let config = &self.generation.effective;
         Ok(SpendCeiling {
             cost: config.cost.clone(),
