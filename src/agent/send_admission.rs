@@ -14,6 +14,14 @@ thread_local! {
     pub(crate) static TEST_TOKEN_CAP: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A spend ceiling in micro-USD that also prices the served model at one
+    /// micro-USD per token, so a money boundary applies at send time without
+    /// changing the already admitted decision.
+    pub(crate) static TEST_MONEY_CEILING: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Refuses the send unless it fits G6 and the remaining spend. Nothing is sent
 /// or debited here; decision-attempt token reservation and settlement are
 /// unchanged.
@@ -44,20 +52,39 @@ pub(crate) fn admit_provider_send(
     let limits = service
         .send_limits(proof)
         .context("provider send budget cannot be established")?;
+    #[cfg(test)]
+    let (cost, ceiling) = TEST_MONEY_CEILING.get().map_or_else(
+        || (limits.cost.clone(), limits.remaining_micro_usd),
+        |ceiling| {
+            let mut cost = limits.cost.clone();
+            cost.prices.insert(
+                format!("{}/{}", limits.model.provider_label(), limits.model.model()),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+            );
+            (cost, limits.remaining_micro_usd.min(ceiling))
+        },
+    );
+    #[cfg(not(test))]
+    let (cost, ceiling) = (&limits.cost, limits.remaining_micro_usd);
     let payload = measure_native_tool_payload_for(tools, dialect);
     let request = estimate_request_tokens(estimate_history_tokens_with_source(messages), payload.measurement);
     let estimate = crate::cost::estimate::estimate_request_cost(
         &limits.model,
-        &limits.cost,
+        &cost,
         u64::try_from(request).unwrap_or(u64::MAX),
         u64::try_from(limits.response_reserve).unwrap_or(u64::MAX),
     )
     .context("provider send refused: the request cost cannot be estimated")?;
     anyhow::ensure!(
-        estimate.micro_usd <= limits.remaining_micro_usd,
+        estimate.micro_usd <= ceiling,
         "provider send refused: the estimated cost of {} micro-USD exceeds the {} remaining",
         estimate.micro_usd,
-        limits.remaining_micro_usd
+        ceiling
     );
     Ok(())
 }

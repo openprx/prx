@@ -170,6 +170,8 @@ async fn collection_request_within_token_budget_sends_once() {
 /// does not, because the cleaned schema is smaller: 1 send versus 0 sends.
 #[tokio::test]
 async fn collection_cost_uses_the_provider_schema_dialect() {
+    // 1 micro-USD per token at send time: the ceiling sits between the two request sizes.
+    crate::agent::send_admission::TEST_MONEY_CEILING.set(Some(7000));
     usage::PROVIDER_DIALECT.set(crate::tools::ToolSchemaDialect::Gemini);
     Box::pin(exact_file_collection_with_budget(CollectionBudget::Dialect {
         gemini: true,
@@ -242,20 +244,7 @@ async fn exact_file_collection_with_legacy_events(
     match budget {
         CollectionBudget::Standard => {}
         CollectionBudget::Narrowed => {}
-        CollectionBudget::Dialect { .. } => {
-            // 1 micro-USD per token: the ceiling sits between the two request sizes.
-            config.cost.daily_limit_usd = 0.007;
-            // A local model with no price row is free, so the ceiling needs a real row.
-            config.cost.prices.insert(
-                "ollama/prx-local-model".to_owned(),
-                crate::config::schema::ModelPricing {
-                    input: 1.0,
-                    output: 1.0,
-                    cache_write: 0.0,
-                    cache_read: 0.0,
-                },
-            );
-        }
+        CollectionBudget::Dialect { .. } => {}
     }
     config.save().await.expect("owned fixture config");
     let generation = crate::config::new_shared(config.clone()).pin();
@@ -344,16 +333,11 @@ async fn exact_file_collection_with_legacy_events(
             .decide_agent_initial(proof.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .unwrap();
-        // A priced model is funded for a decision prediction; the unpriced default is not.
-        if matches!(budget, CollectionBudget::Dialect { .. }) {
-            // The relaxation must not hide a flow that never reaches collection.
-            assert!(
-                context.approval_collection_proof().is_some(),
-                "the priced fixture must still issue the real approval collection"
-            );
-        } else {
-            assert_eq!(predictions.load(Ordering::SeqCst), 0, "collection is code-issued, no prediction action");
-        }
+        assert_eq!(predictions.load(Ordering::SeqCst), 0, "collection is code-issued, no prediction action");
+        assert!(
+            context.approval_collection_proof().is_some(),
+            "the fixture must issue the real approval collection"
+        );
         // This is an accounting-owner regression, not a manufactured child
         // capability. The real grant publication is exercised in recursive_budget.
         let initial_recursive_budget = (recursive_budget == RecursiveBudgetCase::Allocated).then(|| {
