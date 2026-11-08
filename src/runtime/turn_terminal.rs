@@ -840,6 +840,8 @@ impl super::ingress_recovery::RecoveryScope {
         )>,
     ) -> anyhow::Result<Enqueue> {
         #[cfg(test)]
+        super::ingress_recovery::repair_spies::note_rejoin();
+        #[cfg(test)]
         let mut stage = super::turn_cleanup::diagnostic::Stage::current(
             super::turn_cleanup::diagnostic::StageName::RejoinPreconditions,
         );
@@ -1102,6 +1104,8 @@ impl super::ingress_recovery::RecoveryScope {
                 "replay is not a completed local close"
             );
             let application = VerifiedDirectiveApplication::from_replay(&replay)?;
+            #[cfg(test)]
+            super::ingress_recovery::repair_spies::note_directive_repair();
             let sink = legacy.events.as_ref().context("applied replay sink is unavailable")?;
             if let Some((_, deadline, _)) = bounded {
                 sink.repair_applied_until(application, deadline).await?;
@@ -1189,11 +1193,7 @@ impl super::ingress_recovery::RecoveryScope {
                     .skill_observation(observation.awaiting_approval, observation.verified)
             },
         );
-        if self.authority.legacy.is_none() {
-            tracing::debug!("plane-off recovery skips the child outcome link");
-        } else {
-            anyhow::bail!("child link requires legacy evidence");
-        }
+        tracing::debug!("plane-off recovery skips the child outcome link");
         Ok(Enqueue::Queued)
     }
 
@@ -1213,21 +1213,67 @@ impl super::ingress_recovery::RecoveryScope {
             source: event.source.as_str().to_owned(),
             run_id: terminal_id.to_owned(),
         };
-        let receipt = tokio::task::spawn_blocking(move || {
+        if chain.workspace_id != self.workspace.to_string_lossy() {
+            return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("workspace").into());
+        }
+        if chain.owner_id != owner_id {
+            return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("owner").into());
+        }
+        if chain.source != event.source.as_str() {
+            return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("source").into());
+        }
+        if chain.run_id != terminal_id {
+            return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("run").into());
+        }
+        let surface = self.surface.as_str().to_owned();
+        let parent = self.parent_authority_id.map(|parent| parent.to_string());
+        let terminal_id = terminal_id.to_owned();
+        tokio::task::spawn_blocking(move || {
             let Some(repository) = memory.recovery_repository() else {
                 return Ok(None);
             };
-            repository.read_recovery_receipt(&chain)
+            repository.activate_recovery_authority()?;
+            let Some(receipt) = repository.read_recovery_receipt(&chain)? else {
+                return Ok(None);
+            };
+            if receipt.state != "settled" {
+                return Ok(None);
+            }
+            let facts = super::ingress_recovery::SettledTerminalFacts::parse(&receipt.settled_facts()?)?;
+            if facts.terminal_id != terminal_id {
+                return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("terminal_id").into());
+            }
+            if facts.surface != surface {
+                return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("surface").into());
+            }
+            if facts.parent_authority_id != parent {
+                return Err(
+                    crate::memory::ingress_recovery::IngressAttestationError::Mismatch("parent_authority_id").into(),
+                );
+            }
+            if facts.key_id != receipt.key_id {
+                return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("key_id").into());
+            }
+            let claim = repository.recovery_event_evidence(&chain, &facts.claim_event_id)?;
+            if claim.event_id != facts.claim_event_id {
+                return Err(
+                    crate::memory::ingress_recovery::IngressAttestationError::Mismatch("claim_event_id").into(),
+                );
+            }
+            let terminal = repository.recovery_event_evidence(&chain, &facts.final_event_id)?;
+            if terminal.event_id != facts.final_event_id {
+                return Err(
+                    crate::memory::ingress_recovery::IngressAttestationError::Mismatch("final_event_id").into(),
+                );
+            }
+            if let Some(id) = &facts.assistant_event_id {
+                repository.recovery_event_evidence(&chain, id)?;
+            }
+            if let Some(id) = &facts.usage_event_id {
+                repository.recovery_event_evidence(&chain, id)?;
+            }
+            Ok(Some(facts))
         })
-        .await??;
-        let Some(receipt) = receipt else {
-            return Ok(None);
-        };
-        if receipt.state != "settled" {
-            return Ok(None);
-        }
-        Ok(Some(super::ingress_recovery::SettledTerminalFacts::parse(
-            &receipt.settled_facts()?,
-        )?))
+        .await?
     }
 }

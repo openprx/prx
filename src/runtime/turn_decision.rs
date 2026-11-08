@@ -35,6 +35,8 @@ pub(crate) use build_error::TurnServiceBuildError;
 mod approval;
 mod call_approval;
 mod child_recovery;
+#[cfg(test)]
+pub(crate) use child_recovery::child_recovery_gate;
 mod delegation;
 mod discovery;
 use super::child_source::recursive_allowance;

@@ -1,14 +1,16 @@
 #![cfg(test)]
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use super::{recovery_config, recovery_input, recovery_recorder};
 use crate::memory::Memory;
+use crate::memory::MessageEventSource;
+use crate::memory::ingress_recovery::{IngressAttestationError, IngressCapsule, IngressRecoveryScope};
 use crate::memory::recovery_authority::{RecoveryChain, RecoveryPublication};
 use crate::runtime::ingress_recovery::tombstone_fixture;
 use crate::runtime::ingress_recovery::{
-    IngressRecorder, LegacyUnconfirmed, RecoveryScope, SettledTerminalFacts, backend_memory,
+    IngressRecorder, LegacyUnconfirmed, RecoveryScope, SettledTerminalFacts, backend_memory, repair_spies,
 };
 use crate::runtime::turn_cleanup::CleanupTracker;
+use crate::skills::lifecycle::{TerminalKind, take_settled_skill_observations};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -103,6 +105,87 @@ fn observer() -> Arc<dyn crate::decision::telemetry::CausalEventSink> {
     )))
 }
 
+/// Literal sqlite 16-cell table: (plane, recording, k, l) → (recordable, legacy_some).
+const SQLITE_MATRIX: [((bool, bool, bool, bool), (bool, bool)); 16] = [
+    ((true, true, true, true), (true, true)),
+    ((true, true, true, false), (true, true)),
+    ((true, true, false, true), (false, true)),
+    ((true, true, false, false), (false, true)),
+    ((true, false, true, true), (false, false)),
+    ((true, false, true, false), (false, false)),
+    ((true, false, false, true), (false, false)),
+    ((true, false, false, false), (false, false)),
+    ((false, true, true, true), (true, false)),
+    ((false, true, true, false), (true, false)),
+    ((false, true, false, true), (false, false)),
+    ((false, true, false, false), (false, false)),
+    ((false, false, true, true), (false, false)),
+    ((false, false, true, false), (false, false)),
+    ((false, false, false, true), (false, false)),
+    ((false, false, false, false), (false, false)),
+];
+
+fn expected_recordable_legacy(cell: &MatrixCell) -> (bool, bool) {
+    if cell.backend == "sqlite" {
+        return SQLITE_MATRIX
+            .iter()
+            .find(|(key, _)| *key == (cell.plane, cell.recording, cell.k, cell.l))
+            .map(|(_, expected)| *expected)
+            .expect("test: sqlite matrix cell");
+    }
+    match (cell.backend, cell.plane, cell.recording, cell.k, cell.l) {
+        ("lucid", false, true, true, true) => (true, false),
+        ("encrypted", false, true, true, true) => (true, false),
+        ("lucid", true, true, true, false) => (true, true),
+        ("encrypted", true, true, true, false) => (true, true),
+        ("postgres_class", true, true, false, true) => (true, true),
+        ("postgres_class", false, true, false, true) => (false, false),
+        _ => panic!(
+            "test: extra matrix cell {} plane={} rec={} k={} l={}",
+            cell.backend, cell.plane, cell.recording, cell.k, cell.l
+        ),
+    }
+}
+
+fn decision_key_snapshot(workspace: &Path) -> (bool, Option<Vec<u8>>, Option<std::time::SystemTime>) {
+    let path = workspace.join("self/causal_tree/.decision_key");
+    (
+        path.exists(),
+        std::fs::read(&path).ok(),
+        std::fs::metadata(&path).ok().and_then(|meta| meta.modified().ok()),
+    )
+}
+
+fn plant_v2_capsule(workspace: &Path, namespace: &str, run: &str) -> crate::memory::MessageEventInput {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let capsule = IngressCapsule {
+        version: 2,
+        key_id: None,
+        backend_namespace: namespace.to_owned(),
+        scope: IngressRecoveryScope {
+            workspace_id: workspace.to_string_lossy().into_owned(),
+            owner_id: "prx_user".into(),
+            source: MessageEventSource::Agent,
+        },
+        lifetime: uuid::Uuid::nil().to_string(),
+        input_event_id: event_id.clone(),
+        input_key: format!("turn:{run}:input"),
+        run_id: run.to_owned(),
+        input_digest: "00".repeat(32),
+        authentication: "00".repeat(32),
+    };
+    let mut input = recovery_input(workspace, run);
+    input.event_id = Some(event_id);
+    input.raw_payload_json = Some(
+        serde_json::json!({
+            "prx_ingress_capsule": capsule,
+            "original_payload_json": serde_json::Value::Null
+        })
+        .to_string(),
+    );
+    input
+}
+
 async fn run_matrix_cell(cell: MatrixCell) {
     let MatrixCell {
         backend,
@@ -113,8 +196,6 @@ async fn run_matrix_cell(cell: MatrixCell) {
     } = cell;
     let (_dir, workspace) = home_workspace();
     let memory = cell_memory(backend, &workspace, k);
-    let has_repository = memory.recovery_repository().is_some();
-    let ledger = crate::memory::serves_tool_execution_ledger(memory.name());
     if l {
         let mut input = recovery_input(&workspace, "prx_legacy");
         input.idempotency_key = Some("turn:prx_legacy:final".into());
@@ -150,9 +231,13 @@ async fn run_matrix_cell(cell: MatrixCell) {
     )
     .await
     .expect("test: recovery prepare");
-    let repository_ready = has_repository && k;
-    let recordable = recording && (repository_ready || (plane && ledger && !has_repository));
-    let open_legacy = plane && recording && ledger;
+    let (recordable, open_legacy) = expected_recordable_legacy(&MatrixCell {
+        backend,
+        plane,
+        recording,
+        k,
+        l,
+    });
     assert_eq!(
         recorder_ready, recordable,
         "{backend} plane={plane} recording={recording} k={k} l={l} recorder"
@@ -193,8 +278,30 @@ async fn run_matrix_cell(cell: MatrixCell) {
         );
         assert_no_decision_files(&workspace);
     }
-    if l && recordable && plane {
-        let _ = recovery.rejoin_terminal("prx_legacy", "prx_user").await;
+    if l && open_legacy {
+        let outcomes_before = table_rows(&workspace, "decision_outcomes");
+        match recovery.rejoin_terminal("prx_legacy", "prx_user").await {
+            Ok(_) => {
+                assert!(
+                    table_rows(&workspace, "decision_outcomes") != outcomes_before
+                        || repair_spies::directive_repair() > 0
+                        || recovery.legacy_store().is_some(),
+                    "{backend} plane-on rejoin must repair or keep the writer"
+                );
+            }
+            Err(error) => {
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains("decision replay row is missing")
+                        || text.contains("terminal replay payload is missing")
+                        || text.contains("terminal replay binding is missing")
+                        || text.contains("terminal replay claim is missing")
+                        || text.contains("terminal replay claim binding is missing")
+                        || text.contains("terminal rejoin requires recording plus recovery authority"),
+                    "{backend} plane-on rejoin specific error: {text}"
+                );
+            }
+        }
         assert_eq!(table_rows(&workspace, "recovery_attestations"), 0);
         assert_eq!(table_rows(&workspace, "recovery_transport_index"), 0);
     }
@@ -273,6 +380,44 @@ pub(super) async fn recovery_plane_recording_key_legacy_matrix() {
     ] {
         run_matrix_cell(cell).await;
     }
+    seed_v2_capsule_plane_off_does_not_open_decision_key().await;
+}
+
+async fn seed_v2_capsule_plane_off_does_not_open_decision_key() {
+    let (_dir, workspace) = home_workspace();
+    let memory: Arc<dyn Memory> = backend_memory("sqlite", &workspace).expect("test: sqlite");
+    let config = Arc::new(cell_config(&workspace, false, true));
+    let (recorder, ticket) = recovery_recorder(Arc::clone(&memory), &config).await;
+    let listing_before = decision_tree(&workspace);
+    let key_before = decision_key_snapshot(&workspace);
+    assert!(!key_before.0, "plane-off prepare must not create .decision_key");
+    let planted = memory
+        .append_message_event(plant_v2_capsule(&workspace, recorder.backend_namespace(), "prx_v2"))
+        .await
+        .expect("test: plant v2 capsule");
+    let error = recorder
+        .verify_receipt(&planted)
+        .expect_err("plane-off v2 verify must not open the key");
+    assert!(
+        error.chain().any(|cause| cause.is::<LegacyUnconfirmed>()),
+        "plane-off v2 capsule is LegacyUnconfirmed: {error}"
+    );
+    assert_eq!(decision_tree(&workspace), listing_before);
+    assert_eq!(decision_key_snapshot(&workspace), key_before);
+    assert_no_decision_files(&workspace);
+
+    let key_path = workspace.join("self/causal_tree/.decision_key");
+    std::fs::create_dir_all(key_path.parent().expect("test: key dir")).expect("test: key dir");
+    std::fs::write(&key_path, [42u8; 32]).expect("test: fixture key");
+    let seeded = decision_key_snapshot(&workspace);
+    let listing_seeded = decision_tree(&workspace);
+    let error = recorder
+        .verify_receipt(&planted)
+        .expect_err("plane-off v2 verify must not open a seeded key");
+    assert!(error.chain().any(|cause| cause.is::<LegacyUnconfirmed>()));
+    assert_eq!(decision_key_snapshot(&workspace), seeded);
+    assert_eq!(decision_tree(&workspace), listing_seeded);
+    ticket.finish(true);
 }
 
 fn settled_facts(terminal_id: &str, claim: &str, final_id: &str, key_id: &str) -> SettledTerminalFacts {
@@ -301,6 +446,8 @@ fn settled_facts(terminal_id: &str, claim: &str, final_id: &str, key_id: &str) -
 }
 
 pub(super) async fn recovery_off_never_writes_outcome_or_child_link() {
+    repair_spies::reset();
+    let _ = take_settled_skill_observations();
     let (_dir, workspace) = home_workspace();
     let memory: Arc<dyn Memory> = backend_memory("sqlite", &workspace).expect("test: sqlite");
     let mut config = cell_config(&workspace, false, true);
@@ -368,6 +515,20 @@ pub(super) async fn recovery_off_never_writes_outcome_or_child_link() {
         .await
         .expect("test: settled rejoin");
     crate::skills::lifecycle::drain_background_for_test("prx_run").await;
+    let settled_obs = take_settled_skill_observations();
+    assert!(
+        settled_obs.iter().any(|(id, kind, awaiting, verified)| {
+            id == "prx_run" && *kind == TerminalKind::Completed && !*awaiting && *verified
+        }),
+        "skill settle must run from skill_observation (Completed, false, true): {settled_obs:?}"
+    );
+    assert!(repair_spies::rejoin() >= 1, "rejoin spy");
+    assert_eq!(repair_spies::directive_repair(), 0, "plane-off skips directive repair");
+    assert_eq!(
+        repair_spies::child_recovery(),
+        0,
+        "off-writes does not invoke child recovery"
+    );
     assert_eq!(decision_tree(&workspace), before);
     assert_no_decision_files(&workspace);
     assert_eq!(table_rows(&workspace, "recovery_attestations"), attestations);
@@ -378,6 +539,26 @@ pub(super) async fn recovery_off_never_writes_outcome_or_child_link() {
     assert_eq!(settled.state, "settled");
     recovery.drain(Instant::now() + Duration::from_secs(2)).await;
     assert_no_decision_files(&workspace);
+
+    let generation = crate::config::ConfigGenerationManager::new(cell_config(&workspace, true, true)).pin();
+    let tracker_on = Arc::new(CleanupTracker::default());
+    let plane_on_without_key = RecoveryScope::prepare(
+        &generation,
+        Arc::clone(&memory),
+        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        observer(),
+        None,
+        &tracker_on,
+        None,
+    )
+    .await
+    .expect("test: plane-on without key");
+    assert!(plane_on_without_key.authority.legacy.is_none());
+    assert!(
+        crate::runtime::turn_decision::child_recovery_gate(&plane_on_without_key, true, true, true).is_some(),
+        "plane-on without key skips child recovery"
+    );
+    assert!(repair_spies::child_recovery() >= 1, "child recovery spy");
 }
 
 pub(super) async fn recovery_legacy_chain_writes_no_attestation() {
@@ -412,7 +593,20 @@ pub(super) async fn recovery_legacy_chain_writes_no_attestation() {
     .await
     .expect("test: plane-on prepare");
     assert!(recovery.authority.legacy.is_some());
-    let _ = recovery.rejoin_terminal("prx_legacy", "prx_user").await;
+    match recovery.rejoin_terminal("prx_legacy", "prx_user").await {
+        Ok(_) => {}
+        Err(error) => {
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("decision replay row is missing")
+                    || text.contains("terminal replay payload is missing")
+                    || text.contains("terminal replay binding is missing")
+                    || text.contains("terminal replay claim is missing")
+                    || text.contains("terminal replay claim binding is missing"),
+                "legacy-chain plane-on rejoin specific error: {text}"
+            );
+        }
+    }
     assert_eq!(table_rows(&workspace, "recovery_attestations"), 0);
     assert_eq!(table_rows(&workspace, "recovery_transport_index"), 0);
 
@@ -469,4 +663,331 @@ pub(super) async fn recovery_legacy_chain_writes_no_attestation() {
     assert_eq!(before, after);
     assert_eq!(table_rows(&workspace, "recovery_attestations"), 1);
     assert_no_decision_files(&workspace);
+}
+
+struct SettledSetup {
+    dir: tempfile::TempDir,
+    workspace: std::path::PathBuf,
+    memory: Arc<dyn Memory>,
+    recovery: Arc<RecoveryScope>,
+    tracker: Arc<CleanupTracker>,
+    chain: RecoveryChain,
+    input_id: String,
+    final_id: String,
+    key_id: String,
+}
+
+async fn settled_setup_with(facts: SettledTerminalFacts, facts_bytes: Option<Vec<u8>>) -> SettledSetup {
+    let (dir, workspace) = home_workspace();
+    let memory: Arc<dyn Memory> = backend_memory("sqlite", &workspace).expect("test: sqlite");
+    let config = Arc::new(cell_config(&workspace, false, true));
+    let (recorder, ticket) = recovery_recorder(Arc::clone(&memory), &config).await;
+    let input = recorder
+        .append(recovery_input(&workspace, "prx_run"))
+        .await
+        .expect("test: ingress");
+    let mut final_input = recovery_input(&workspace, "prx_run");
+    final_input.idempotency_key = Some("turn:prx_run:final".into());
+    final_input.event_id = Some(uuid::Uuid::new_v4().to_string());
+    let final_event = memory.append_message_event(final_input).await.expect("test: final");
+    let repository = memory.recovery_repository().expect("test: repository");
+    let chain = RecoveryChain {
+        workspace_id: workspace.to_string_lossy().into_owned(),
+        owner_id: "prx_user".into(),
+        source: "agent".into(),
+        run_id: "prx_run".into(),
+    };
+    let pending = repository
+        .read_recovery_receipt(&chain)
+        .expect("test: pending read")
+        .expect("test: pending receipt");
+    let mut facts = facts;
+    if facts.key_id.is_empty() {
+        facts.key_id = pending.key_id.clone();
+    }
+    if facts.claim_event_id.is_empty() {
+        facts.claim_event_id = input.event_id.clone();
+    }
+    if facts.final_event_id.is_empty() {
+        facts.final_event_id = final_event.event_id.clone();
+    }
+    let bytes = if let Some(raw) = facts_bytes {
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).expect("test: facts patch");
+        let object = value.as_object_mut().expect("test: facts object");
+        object.insert("claim_event_id".into(), facts.claim_event_id.clone().into());
+        object.insert("final_event_id".into(), facts.final_event_id.clone().into());
+        object.insert("key_id".into(), facts.key_id.clone().into());
+        object.insert("terminal_id".into(), facts.terminal_id.clone().into());
+        serde_json::to_vec(&value).expect("test: patched facts")
+    } else {
+        serde_json::to_vec(&facts).expect("test: facts")
+    };
+    repository
+        .settle_recovery(&RecoveryPublication {
+            chain: chain.clone(),
+            input: Some(
+                repository
+                    .recovery_event_evidence(&chain, &input.event_id)
+                    .expect("test: input evidence"),
+            ),
+            terminal: Some(
+                repository
+                    .recovery_event_evidence(&chain, &final_event.event_id)
+                    .expect("test: terminal evidence"),
+            ),
+            facts: bytes,
+        })
+        .expect("test: settle");
+    ticket.finish(true);
+    drop(recorder);
+    let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
+    let tracker = Arc::new(CleanupTracker::default());
+    let recovery = RecoveryScope::prepare(
+        &generation,
+        Arc::clone(&memory),
+        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        observer(),
+        None,
+        &tracker,
+        None,
+    )
+    .await
+    .expect("test: plane-off prepare");
+    SettledSetup {
+        dir,
+        workspace,
+        memory,
+        recovery,
+        tracker,
+        chain,
+        input_id: input.event_id,
+        final_id: final_event.event_id,
+        key_id: pending.key_id,
+    }
+}
+
+fn default_facts() -> SettledTerminalFacts {
+    settled_facts("prx_run", "", "", "")
+}
+
+fn is_mismatch(error: &anyhow::Error, field: &'static str) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<IngressAttestationError>()
+            .is_some_and(|attestation| *attestation == IngressAttestationError::Mismatch(field))
+            || cause.to_string().contains(&format!("`{field}`"))
+    })
+}
+
+fn is_unknown_key(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<IngressAttestationError>() && cause.to_string().contains("unknown key"))
+}
+
+fn brain(workspace: &Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(workspace.join("memory/brain.db")).expect("test: brain")
+}
+
+pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
+    let workspace_cell = settled_setup_with(default_facts(), None).await;
+    let (other_dir, other_ws) = home_workspace();
+    let mut other_config = cell_config(&other_ws, false, true);
+    other_config.workspace_dir = other_ws.clone();
+    let generation = crate::config::ConfigGenerationManager::new(other_config).pin();
+    let tracker = Arc::new(CleanupTracker::default());
+    let foreign = RecoveryScope::prepare(
+        &generation,
+        Arc::clone(&workspace_cell.memory),
+        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        observer(),
+        None,
+        &tracker,
+        None,
+    )
+    .await
+    .expect("test: foreign workspace");
+    let error = foreign
+        .rejoin_terminal("prx_run", "prx_user")
+        .await
+        .expect_err("workspace");
+    assert!(
+        error.to_string().contains("committed terminal marker is missing") || is_mismatch(&error, "workspace"),
+        "workspace: {error}"
+    );
+    drop(other_dir);
+
+    let owner_cell = settled_setup_with(default_facts(), None).await;
+    let error = owner_cell
+        .recovery
+        .rejoin_terminal("prx_run", "prx_other")
+        .await
+        .expect_err("owner");
+    assert!(
+        error
+            .to_string()
+            .contains("terminal replay scope does not match its owner")
+            || is_mismatch(&error, "owner"),
+        "owner: {error}"
+    );
+
+    let source_cell = settled_setup_with(default_facts(), None).await;
+    brain(&source_cell.workspace)
+        .execute("UPDATE message_events SET source='channel' WHERE run_id='prx_run'", [])
+        .expect("test: source");
+    let error = source_cell
+        .recovery
+        .rejoin_terminal("prx_run", "prx_user")
+        .await
+        .expect_err("source");
+    assert!(
+        error.chain().any(|cause| cause.is::<LegacyUnconfirmed>())
+            || is_mismatch(&error, "source")
+            || error.to_string().contains("Query returned no rows"),
+        "source: {error}"
+    );
+
+    let run_cell = settled_setup_with(default_facts(), None).await;
+    let error = run_cell
+        .recovery
+        .rejoin_terminal("prx_other", "prx_user")
+        .await
+        .expect_err("run");
+    assert!(
+        error.to_string().contains("committed terminal marker is missing") || is_mismatch(&error, "run"),
+        "run: {error}"
+    );
+
+    let mut input_facts = default_facts();
+    input_facts.claim_event_id = uuid::Uuid::new_v4().to_string();
+    let input_cell = settled_setup_with(input_facts, None).await;
+    let error = input_cell
+        .recovery
+        .rejoin_terminal("prx_run", "prx_user")
+        .await
+        .expect_err("input event");
+    assert!(
+        is_mismatch(&error, "claim_event_id")
+            || error.to_string().contains("QueryReturnedNoRows")
+            || error.to_string().contains("no rows"),
+        "input event: {error:#}"
+    );
+
+    let mut terminal_facts = default_facts();
+    terminal_facts.final_event_id = uuid::Uuid::new_v4().to_string();
+    let terminal_cell = settled_setup_with(terminal_facts, None).await;
+    let error = terminal_cell
+        .recovery
+        .rejoin_terminal("prx_run", "prx_user")
+        .await
+        .expect_err("terminal event");
+    assert!(
+        is_mismatch(&error, "final_event_id")
+            || error.to_string().contains("QueryReturnedNoRows")
+            || error.to_string().contains("no rows"),
+        "terminal event: {error:#}"
+    );
+
+    let bytes_cell = settled_setup_with(default_facts(), None).await;
+    brain(&bytes_cell.workspace)
+        .execute(
+            "UPDATE message_events SET content='mutated' WHERE event_id=?1",
+            [&bytes_cell.final_id],
+        )
+        .expect("test: terminal bytes");
+    let error = bytes_cell
+        .recovery
+        .rejoin_terminal("prx_run", "prx_user")
+        .await
+        .expect_err("terminal bytes");
+    assert!(
+        error.to_string().contains("recovery evidence changed") || error.to_string().contains("invalid recovery"),
+        "terminal bytes: {error:#}"
+    );
+
+    let mut key_facts = default_facts();
+    key_facts.key_id = uuid::Uuid::nil().to_string();
+    let key_cell = settled_setup_with(key_facts, None).await;
+    let error = key_cell
+        .recovery
+        .rejoin_terminal("prx_run", "prx_user")
+        .await
+        .expect_err("key id");
+    assert!(is_mismatch(&error, "key_id"), "key id: {error:#}");
+
+    let relabel = settled_setup_with(default_facts(), None).await;
+    let relabel_err = brain(&relabel.workspace)
+        .execute("UPDATE recovery_attestations SET state='pending'", [])
+        .expect_err("state relabel");
+    assert!(
+        relabel_err.to_string().contains("immutable recovery receipt"),
+        "state relabel: {relabel_err}"
+    );
+
+    let mut unknown = serde_json::to_value(default_facts()).expect("test: facts value");
+    unknown
+        .as_object_mut()
+        .expect("test: facts object")
+        .insert("extra".into(), serde_json::json!(1));
+    let unknown_cell = settled_setup_with(
+        default_facts(),
+        Some(serde_json::to_vec(&unknown).expect("test: extra")),
+    )
+    .await;
+    let error = unknown_cell
+        .recovery
+        .rejoin_terminal("prx_run", "prx_user")
+        .await
+        .expect_err("facts unknown key");
+    assert!(is_unknown_key(&error), "facts unknown key: {error:#}");
+
+    let mut surface_facts = default_facts();
+    surface_facts.surface = "channel".into();
+    let surface_cell = settled_setup_with(surface_facts, None).await;
+    let error = surface_cell
+        .recovery
+        .rejoin_terminal("prx_run", "prx_user")
+        .await
+        .expect_err("surface");
+    assert!(is_mismatch(&error, "surface"), "surface: {error:#}");
+
+    let mut parent_facts = default_facts();
+    parent_facts.parent_authority_id = Some(uuid::Uuid::nil().to_string());
+    let parent_cell = settled_setup_with(parent_facts, None).await;
+    let error = parent_cell
+        .recovery
+        .rejoin_terminal("prx_run", "prx_user")
+        .await
+        .expect_err("parent_authority_id");
+    assert!(
+        is_mismatch(&error, "parent_authority_id"),
+        "parent_authority_id: {error:#}"
+    );
+
+    let mut skill = serde_json::to_value(default_facts()).expect("test: skill value");
+    skill
+        .get_mut("skill_observation")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("test: skill object")
+        .insert("extra".into(), serde_json::json!(false));
+    let skill_cell = settled_setup_with(
+        default_facts(),
+        Some(serde_json::to_vec(&skill).expect("test: skill extra")),
+    )
+    .await;
+    let error = skill_cell
+        .recovery
+        .rejoin_terminal("prx_run", "prx_user")
+        .await
+        .expect_err("skill_observation");
+    assert!(is_unknown_key(&error), "skill_observation: {error:#}");
+
+    let _keep = (
+        &workspace_cell.dir,
+        &workspace_cell.tracker,
+        workspace_cell.input_id,
+        workspace_cell.final_id,
+        workspace_cell.key_id,
+        workspace_cell.chain,
+    );
 }

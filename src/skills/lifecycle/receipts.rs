@@ -409,6 +409,16 @@ fn take_background(mut pred: impl FnMut(&BackgroundJob) -> bool) -> Vec<tokio::t
     mine
 }
 
+#[cfg(test)]
+static SETTLED_OBSERVATIONS: parking_lot::Mutex<Vec<(String, TerminalKind, bool, bool)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Drain key is the terminal id passed to [`spawn_settle_task_terminal`].
+#[cfg(test)]
+pub(crate) fn take_settled_skill_observations() -> Vec<(String, TerminalKind, bool, bool)> {
+    SETTLED_OBSERVATIONS.lock().drain(..).collect()
+}
+
 /// Waits for the background lifecycle writes started for `key` (a run or
 /// terminal id). Test hook: production never awaits them.
 #[cfg(test)]
@@ -555,6 +565,13 @@ pub fn spawn_settle_task_terminal(
     let key = terminal_id.clone();
     #[cfg(test)]
     let tracked_workspace = workspace_dir.clone();
+    #[cfg(test)]
+    SETTLED_OBSERVATIONS.lock().push((
+        terminal_id.clone(),
+        observation.kind,
+        observation.awaiting_approval,
+        observation.verified,
+    ));
     let handle = runtime.spawn(async move {
         // Recovery has no first-hand trace, so no observations: adherence is Unknown.
         settle_task_terminal_with(

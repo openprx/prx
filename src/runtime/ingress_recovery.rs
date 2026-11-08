@@ -14,9 +14,50 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Marker that repository activation succeeded for this scope. The live
-/// repository is always reached through [`RecoveryScope::memory`].
+/// handle is [`Memory::recovery_repository`] (`&dyn`), which cannot be stored
+/// as `Arc<dyn RecoveryRepository>` without changing the Memory trait. Success
+/// is re-verified on every [`RecoveryScope::ingress_recovery_enabled`] call.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ActivatedRepository;
+
+#[cfg(test)]
+pub(crate) mod repair_spies {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static REJOIN: AtomicUsize = AtomicUsize::new(0);
+    static CHILD_RECOVERY: AtomicUsize = AtomicUsize::new(0);
+    static DIRECTIVE_REPAIR: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) fn reset() {
+        REJOIN.store(0, Ordering::SeqCst);
+        CHILD_RECOVERY.store(0, Ordering::SeqCst);
+        DIRECTIVE_REPAIR.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn note_rejoin() {
+        REJOIN.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn note_child_recovery() {
+        CHILD_RECOVERY.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn note_directive_repair() {
+        DIRECTIVE_REPAIR.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn rejoin() -> usize {
+        REJOIN.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn child_recovery() -> usize {
+        CHILD_RECOVERY.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn directive_repair() -> usize {
+        DIRECTIVE_REPAIR.load(Ordering::SeqCst)
+    }
+}
 
 /// Plane-on decision evidence. Plane off never constructs this, so nothing
 /// opens `.decision_key` or `decisions.db`.
@@ -207,8 +248,13 @@ impl RecoveryScope {
         drained
     }
 
-    pub(crate) const fn ingress_recovery_enabled(&self) -> bool {
-        self.recordable
+    pub(crate) fn ingress_recovery_enabled(&self) -> bool {
+        if !self.recordable {
+            return false;
+        }
+        self.memory
+            .recovery_repository()
+            .is_none_or(|repository| repository.activate_recovery_authority().is_ok())
     }
 
     pub(crate) fn accepts_ingress_recovery(
@@ -294,6 +340,8 @@ pub(crate) struct IngressRecorder {
     warned_markers: parking_lot::Mutex<std::collections::HashSet<String>>,
     barrier: Arc<tokio::sync::Mutex<()>>,
     source: std::sync::OnceLock<(IngressRecoveryScope, crate::causal_tree::state::TurnSurfaceKind)>,
+    /// `causal_tree.enabled` at prepare. Plane off never opens `.decision_key`.
+    plane: bool,
 }
 
 impl IngressRecorder {
@@ -359,6 +407,7 @@ impl IngressRecorder {
             warned_markers: Default::default(),
             barrier,
             source: Default::default(),
+            plane,
         })))
     }
     pub(crate) fn verify_receipt(&self, event: &MessageEvent) -> anyhow::Result<()> {

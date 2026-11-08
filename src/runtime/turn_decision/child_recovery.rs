@@ -45,6 +45,21 @@ struct OwnerCursor {
     cursor: Arc<tokio::sync::Mutex<RecoveryPositions>>,
 }
 
+/// Plane off, missing legacy evidence, or an unrecordable service skips repair.
+pub(crate) fn child_recovery_gate(
+    recovery: &crate::runtime::ingress_recovery::RecoveryScope,
+    plane: bool,
+    recordable: bool,
+    durable_key: bool,
+) -> Option<ChildRecoveryReport> {
+    #[cfg(test)]
+    crate::runtime::ingress_recovery::repair_spies::note_child_recovery();
+    if recovery.authority.legacy.is_none() || !plane || !recordable || !durable_key {
+        return Some(ChildRecoveryReport::default());
+    }
+    None
+}
+
 /// Counts are evidence statuses, not an exhaustive reconciliation assertion.
 #[derive(Default, Debug)]
 pub(crate) struct ChildRecoveryReport {
@@ -71,12 +86,13 @@ impl TurnDecisionService {
         deadline: Instant,
     ) -> anyhow::Result<ChildRecoveryReport> {
         let mut report = ChildRecoveryReport::default();
-        if self.recovery.authority.legacy.is_none()
-            || !self.generation.effective.causal_tree.enabled
-            || !self.recordable
-            || !self.durable_key
-        {
-            return Ok(report);
+        if let Some(skipped) = child_recovery_gate(
+            &self.recovery,
+            self.generation.effective.causal_tree.enabled,
+            self.recordable,
+            self.durable_key,
+        ) {
+            return Ok(skipped);
         }
         anyhow::ensure!(
             self.parent_grant.is_none(),

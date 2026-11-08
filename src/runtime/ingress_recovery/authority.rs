@@ -95,7 +95,15 @@ impl SettledTerminalFacts {
 
 impl IngressRecorder {
     pub(super) fn legacy_key(&self) -> anyhow::Result<Arc<DecisionKey>> {
+        if !self.plane {
+            return Err(LegacyUnconfirmed.into());
+        }
         DecisionKey::load_existing(&self.workspace).map_err(|_| LegacyUnconfirmed.into())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backend_namespace(&self) -> &str {
+        self.lifetime.namespace()
     }
 
     pub(super) fn slot_mac(

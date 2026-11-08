@@ -792,6 +792,7 @@ async fn recovery_off_when_user_message_recording_is_disabled() {
         .unwrap();
 }
 
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #[path = "auth_02_2a_tests.rs"]
 mod auth_02_2a_tests;
 
@@ -808,4 +809,9 @@ async fn recovery_off_never_writes_outcome_or_child_link() {
 #[tokio::test]
 async fn recovery_legacy_chain_writes_no_attestation() {
     auth_02_2a_tests::recovery_legacy_chain_writes_no_attestation().await;
+}
+
+#[tokio::test]
+async fn recovery_settled_receipt_each_bound_field_is_refused() {
+    auth_02_2a_tests::recovery_settled_receipt_each_bound_field_is_refused().await;
 }
