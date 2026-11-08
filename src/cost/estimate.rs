@@ -71,15 +71,63 @@ pub(crate) fn estimate_cost_with_validity(
         });
         return None;
     }
-    // V1 token estimate: 64 prompt tokens, at most four schema bytes per
-    // token, and 64 completion tokens. Saturation remains over budget.
-    let input_tokens = 64_u64.saturating_add(u64::try_from(schema_bytes.saturating_add(3) / 4).unwrap_or(u64::MAX));
-    let total_tokens = input_tokens.saturating_add(64);
+    let input_tokens = v1_input_tokens(schema_bytes);
+    estimate_tokens_with_validity(
+        model,
+        pricing,
+        (input_tokens, 64),
+        zero_price_exempt,
+        warned_unpriced,
+        noted_subscription,
+    )
+}
+
+/// V1 token estimate: 64 prompt tokens plus at most four schema bytes per
+/// token. Saturation remains over budget.
+fn v1_input_tokens(schema_bytes: usize) -> u64 {
+    64_u64.saturating_add(u64::try_from(schema_bytes.saturating_add(3) / 4).unwrap_or(u64::MAX))
+}
+
+/// Tokens of one action estimate: the V1 input plus 64 completion tokens.
+pub(crate) fn candidate_tokens(schema_bytes: usize) -> u64 {
+    v1_input_tokens(schema_bytes).saturating_add(64)
+}
+
+/// Final-request estimate from measured token counts. It shares the pricing
+/// arithmetic and refusal rules with the candidate estimate above.
+pub(crate) fn estimate_request_cost(
+    model: &ResolvedModel,
+    pricing: &CostConfig,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Option<CostEstimate> {
+    if !pricing.prices.values().all(|price| price.is_finite_nonnegative()) {
+        return None;
+    }
+    estimate_tokens_with_validity(
+        model,
+        pricing,
+        (input_tokens, output_tokens),
+        zero_price_exempt(model),
+        &AtomicBool::new(false),
+        &AtomicBool::new(false),
+    )
+}
+
+fn estimate_tokens_with_validity(
+    model: &ResolvedModel,
+    pricing: &CostConfig,
+    (input_tokens, output_tokens): (u64, u64),
+    zero_price_exempt: bool,
+    warned_unpriced: &AtomicBool,
+    noted_subscription: &AtomicBool,
+) -> Option<CostEstimate> {
+    let total_tokens = input_tokens.saturating_add(output_tokens);
     let price = crate::llm::route_decision::usage_cost_resolution(
         model.provider_label(),
         model.model(),
         input_tokens,
-        64,
+        output_tokens,
         0,
         0,
         pricing,

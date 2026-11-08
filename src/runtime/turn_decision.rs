@@ -615,6 +615,13 @@ pub(crate) struct AgentDecisionBudget {
     pub(crate) main_compaction: crate::config::AgentCompactionConfig,
 }
 
+pub(crate) struct SendLimits {
+    pub(crate) response_reserve: usize,
+    pub(crate) remaining_micro_usd: u64,
+    pub(crate) model: ResolvedModel,
+    pub(crate) cost: crate::config::schema::CostConfig,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AgentDecisionBudgetError {
     #[error(transparent)]
@@ -1553,6 +1560,17 @@ impl DecisionTokenReservation {
             return Err(DecisionReserveUnavailable);
         }
         Ok(reserved)
+    }
+}
+
+impl TurnDecisionContext {
+    /// Remaining G6 tokens: the decision slice after every narrowing the engine
+    /// and the live decision-attempt accounting have already applied.
+    pub(crate) fn remaining_g6_tokens(&self) -> u64 {
+        let trusted = self.engine.state.trusted.parts().budgets.tokens;
+        self.accounting
+            .as_ref()
+            .map_or(trusted, |scope| trusted.min(scope.remaining_budgets().tokens))
     }
 }
 
@@ -2979,6 +2997,20 @@ impl TurnDecisionService {
                 micro_usd: remaining,
             },
             main_compaction,
+        })
+    }
+
+    /// Live spend limit and price inputs for one provider send of this turn.
+    /// The spend limit is re-read from the ledger on every call so an earlier
+    /// round's charge is visible.
+    pub(crate) fn send_limits(&self, proof: &dyn TurnSourceProof) -> Result<SendLimits, AgentDecisionBudgetError> {
+        let budget = self.agent_budget_snapshot(proof)?;
+        let effective = self.effective_compaction(proof.provider_name(), proof.model_name());
+        Ok(SendLimits {
+            response_reserve: effective.config.reserve_tokens,
+            remaining_micro_usd: budget.budgets.micro_usd,
+            model: self.resolve_agent_model(proof)?,
+            cost: self.generation.effective.cost.clone(),
         })
     }
 
