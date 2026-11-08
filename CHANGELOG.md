@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Markdown memory stores each value on one line: line breaks in a key or value
+  are replaced with spaces, so a multi-line value reads back as one entry with
+  its own key. Existing multi-line files are read as before.
+- Scoped prompt recall no longer uses Lucid service hits that carry no source
+  event: they have no owner or event provenance. Lucid hits remain available
+  to unscoped reads.
+
 - **BREAKING (gateway API):** skill discovery returns 400 `unsupported_source`,
   429 `rate_limited`, and 502 `upstream_error` for invalid sources or upstream
   failures instead of 200 with empty or partial results. `POST /api/skills/install`
