@@ -2054,7 +2054,9 @@ pub(crate) fn chat_tool_execution_context(
     if let Some(task_id) = task_id {
         envelope = envelope.with_task_id(task_id.get().to_string());
     }
-    ToolExecutionContext::new(envelope, "private").with_chat_id("terminal:user")
+    ToolExecutionContext::new(envelope, "private")
+        .with_chat_id("terminal:user")
+        .with_dispatch_origin(crate::tools::DispatchOrigin::Operator)
 }
 
 fn chat_tool_execution_service(

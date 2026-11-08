@@ -2816,4 +2816,5 @@ mod cli_admission_failure_tests {
 
 pub(crate) fn cli_tool_execution_context(envelope: RuntimeEnvelope) -> crate::tools::ToolExecutionContext {
     crate::tools::ToolExecutionContext::new(envelope, "private")
+        .with_dispatch_origin(crate::tools::DispatchOrigin::Operator)
 }

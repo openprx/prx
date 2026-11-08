@@ -413,8 +413,21 @@ async fn run_work(
                 let mut context = context;
                 context.dispatch_origin = crate::tools::DispatchOrigin::ModelTurn;
                 context.turn_surface = Some(std::sync::Arc::new(
-                    crate::tools::surface_owner::build(service.turn_surface_parts(source, &[]))
-                        .for_publication(&selected.specs),
+                    crate::tools::surface_owner::build(crate::tools::surface_owner::SurfaceParts {
+                        execution: service.execution(),
+                        catalog: service.catalog(),
+                        publication_policy: service.publication_policy(),
+                        tiering: service.tool_tiering(),
+                        security: service.security(),
+                        pinned_model: source.model_binding().pinned_model(),
+                        channel: service.channel_surface(),
+                        inherited_exclusions: &[],
+                        sender: source.policy_sender(),
+                        channel_name: source.policy_channel(),
+                        chat_type: source.policy_chat_type(),
+                        tool_calls_allowed: service.model_can_call_tools(source),
+                    })
+                    .for_publication(&selected.specs),
                 ));
                 let mut arguments = serde_json::json!({"action":"spawn", "task":input, "mode":"process"});
                 if let Some(model) = task.model_hint {

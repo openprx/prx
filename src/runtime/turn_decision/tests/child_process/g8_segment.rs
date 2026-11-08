@@ -748,12 +748,30 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
             Err(error) => error,
         };
         assert_eq!(bind_error.to_string(), "unknown runtime dependency");
-        let (executor, bound) = child_service.bind_agent_execution(
+        let (executor, mut bound) = child_service.bind_agent_execution(
             child_proof.as_ref(),
             routing.context,
             &execution_context,
             &specs.specs,
         )?;
+        use crate::runtime::turn_source::TurnSourceProof;
+        bound.dispatch_origin = crate::tools::DispatchOrigin::ModelTurn;
+        bound.turn_surface = Some(std::sync::Arc::new(crate::tools::surface_owner::build(
+            crate::tools::surface_owner::SurfaceParts {
+                execution: child_service.execution(),
+                catalog: child_service.catalog(),
+                publication_policy: child_service.publication_policy(),
+                tiering: child_service.tool_tiering(),
+                security: child_service.security(),
+                pinned_model: child_proof.model_binding().pinned_model(),
+                channel: child_service.channel_surface(),
+                inherited_exclusions: &[],
+                sender: child_proof.policy_sender(),
+                channel_name: child_proof.policy_channel(),
+                chat_type: child_proof.policy_chat_type(),
+                tool_calls_allowed: child_service.model_can_call_tools(child_proof.as_ref()),
+            },
+        )));
         let command = || {
             ToolExecutionCommand::new("file_read", serde_json::json!({"path":"prx-missing-input.txt"}))
                 .with_idempotency_key("prx_exact_read")

@@ -195,6 +195,36 @@ impl TurnDecisionService {
         &self.memory
     }
 
+    #[must_use]
+    pub(crate) fn execution(&self) -> &ToolExecutionService {
+        self.execution.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn catalog(&self) -> &CapabilityCatalog {
+        self.catalog.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) const fn publication_policy(&self) -> &SurfacePolicy {
+        &self.publication_policy
+    }
+
+    #[must_use]
+    pub(crate) fn security(&self) -> &SecurityPolicy {
+        self.security.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn tool_tiering(&self) -> &crate::config::ToolTieringConfig {
+        &self.generation.effective.tool_tiering
+    }
+
+    #[must_use]
+    pub(crate) const fn channel_surface(&self) -> bool {
+        matches!(self.surface, TurnSurfaceKind::Channel)
+    }
+
     /// Bind runtime adapter ceilings to the provider catalog pinned by this
     /// exact configuration generation.
     pub(crate) fn effective_provider_capabilities(

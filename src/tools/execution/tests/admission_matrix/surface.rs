@@ -129,25 +129,6 @@ async fn model_allowlist_excluded_tool_is_refused() {
     assert_refused(&service, &fixture, context, "config_reload").await;
 }
 
-fn channel_message() -> crate::channels::traits::ChannelMessage {
-    crate::channels::traits::ChannelMessage {
-        id: "prx-channel-surface".to_owned(),
-        sender: "prx_user".to_owned(),
-        reply_target: "prx_channel".to_owned(),
-        content: "run the project tool".to_owned(),
-        channel: "wacli".to_owned(),
-        timestamp: 0,
-        chat_kind: crate::channels::traits::ChatKind::Dm,
-        chat_title: None,
-        sender_display: None,
-        thread_ts: None,
-        mentioned_uuids: Vec::new(),
-        mentioned: false,
-        is_group_hint: false,
-        sender_is_bot: false,
-    }
-}
-
 /// `channel_exclude` is folded at publication. The excluded name is never
 /// published, so dispatch is Denied with no backend call and no decision context.
 #[tokio::test]
@@ -171,21 +152,48 @@ async fn channel_ineligible_tool_is_refused_on_channel_turn() {
 /// entries carry `channel_eligible`, not from a caller-supplied closure.
 #[tokio::test]
 async fn production_channel_surface_omits_channel_excluded_tool() {
-    let workspace = tempfile::tempdir().expect("channel workspace");
     let fixture = fixture();
-    let mut config = crate::config::Config::default();
-    config.workspace_dir = workspace.path().to_owned();
-    config.tool_tiering.channel_exclude.push("project_tool".into());
-    let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![Box::new(RecordingTool {
+    let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(RecordingTool {
         root_name: "project_tool",
         aliases: vec![],
         calls: Arc::clone(&fixture.calls),
         arguments: Arc::clone(&fixture.arguments),
         stages: Arc::clone(&fixture.stages),
-    }) as Box<dyn crate::tools::Tool>]);
-    let admitted = crate::agent::test_admission::AdmittedTurn::with_channel(config, channel_message(), registry).await;
-    let decision = admitted.decision();
-    let surface = crate::tools::surface_owner::build(decision.service.turn_surface_parts(decision.proof, &[]));
+    })];
+    let publication_policy = crate::tools::capability::catalog::SurfacePolicy {
+        channel_allowed: true,
+        ..crate::tools::capability::catalog::SurfacePolicy::default()
+    };
+    let catalog = crate::tools::capability::catalog::CapabilityCatalog::build(
+        &tools,
+        &crate::tools::capability::catalog::CatalogSources::default(),
+        &publication_policy,
+    )
+    .expect("catalog");
+    let mut tiering = crate::config::ToolTieringConfig::default();
+    tiering.channel_exclude.push("project_tool".into());
+    let security = crate::security::SecurityPolicy::default();
+    let service = crate::tools::ToolExecutionService::from_boxed(
+        tools,
+        Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::new(security.clone()))),
+        Arc::new(crate::tools::DenyApprovalStrategy),
+        Arc::new(crate::tools::AdapterOwnedPreparation),
+        Arc::new(crate::tools::TracingToolExecutionAudit),
+    );
+    let surface = crate::tools::surface_owner::build(crate::tools::surface_owner::SurfaceParts {
+        execution: &service,
+        catalog: &catalog,
+        publication_policy: &publication_policy,
+        tiering: &tiering,
+        security: &security,
+        pinned_model: "prx_model",
+        channel: true,
+        inherited_exclusions: &[],
+        sender: "prx_user",
+        channel_name: "wacli",
+        chat_type: "dm",
+        tool_calls_allowed: true,
+    });
     assert!(!surface.contains("project_tool"), "channel-excluded tool was published");
 }
 
@@ -212,6 +220,71 @@ async fn model_turn_without_surface_is_denied() {
         "unexpected diagnostic: {:?}",
         outcome.error
     );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+/// Console resume replays a model tool call: ModelTurn plus a surface built
+/// from the binding, registry, ACL, config and catalog. An excluded name is
+/// Denied with no backend call.
+#[tokio::test]
+async fn console_resume_replays_model_turn_with_surface() {
+    let fixture = fixture();
+    let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(RecordingTool {
+        root_name: "project_tool",
+        aliases: vec![],
+        calls: Arc::clone(&fixture.calls),
+        arguments: Arc::clone(&fixture.arguments),
+        stages: Arc::clone(&fixture.stages),
+    })];
+    let publication_policy = crate::tools::capability::catalog::SurfacePolicy {
+        channel_allowed: true,
+        ..crate::tools::capability::catalog::SurfacePolicy::default()
+    };
+    let catalog = crate::tools::capability::catalog::CapabilityCatalog::build(
+        &tools,
+        &crate::tools::capability::catalog::CatalogSources::default(),
+        &publication_policy,
+    )
+    .expect("catalog");
+    let mut tiering = crate::config::ToolTieringConfig::default();
+    tiering.channel_exclude.push("project_tool".into());
+    let security = crate::security::SecurityPolicy::default();
+    let service = crate::tools::ToolExecutionService::from_boxed(
+        tools,
+        Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::new(security.clone()))),
+        Arc::new(crate::tools::DenyApprovalStrategy),
+        Arc::new(crate::tools::AdapterOwnedPreparation),
+        Arc::new(crate::tools::TracingToolExecutionAudit),
+    );
+    let envelope = crate::runtime::envelope::RuntimeEnvelope::console("prx_workspace", "prx_session");
+    let context = crate::tools::surface_owner::model_turn_context(
+        envelope,
+        "private",
+        crate::tools::surface_owner::SurfaceParts {
+            execution: &service,
+            catalog: &catalog,
+            publication_policy: &publication_policy,
+            tiering: &tiering,
+            security: &security,
+            pinned_model: "prx_model",
+            channel: true,
+            inherited_exclusions: &[],
+            sender: "prx_user",
+            channel_name: "wacli",
+            chat_type: "dm",
+            tool_calls_allowed: true,
+        },
+    );
+    assert_eq!(context.dispatch_origin, crate::tools::DispatchOrigin::ModelTurn);
+    assert!(context.turn_surface.is_some());
+    let outcome = service
+        .execute(
+            ToolExecutionCommand::new("project_tool", serde_json::json!({"value": 1})),
+            context,
+            None,
+        )
+        .await;
+    assert_eq!(outcome.status, ToolExecutionStatus::Denied);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }
 

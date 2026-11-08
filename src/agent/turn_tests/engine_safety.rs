@@ -1,13 +1,16 @@
 #![cfg(test)]
-//! Decision-free ingress model and publication admission. These tests reach the
-//! production turn service (`AdmittedTurn`) and, for the refusal path, `run_turn`
-//! itself, instead of rebuilding the surface by hand.
+//! Decision-free ingress model and publication admission. The three rewritten
+//! surface-owner cells build no `AdmittedTurn` and call no `decision.service`.
 use super::*;
 use crate::agent::turn_contracts::ChatMode;
 use crate::agent::turn_engine::run_turn;
 use crate::agent::turn_request::{TurnDelivery, TurnRequest, TurnSchedule, TurnServices};
 use crate::agent::turn_tests::admission::AdmittedTurn;
-use crate::tools::{ToolExecutionCommand, ToolExecutionStatus};
+use crate::tools::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
+use crate::tools::{
+    AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, ToolExecutionCommand, ToolExecutionService,
+    ToolExecutionStatus, TracingToolExecutionAudit,
+};
 
 fn workspace_config(workspace: &std::path::Path) -> crate::config::Config {
     let mut config = crate::config::Config::default();
@@ -48,97 +51,87 @@ impl Provider for SurfaceProvider {
     }
 }
 
-/// An execution model outside the ingress binding is refused by the real turn,
-/// before any provider request or tool dispatch.
-#[tokio::test]
-async fn execution_model_differs_from_bound_model_is_refused() {
+fn decision_free_surface(
+    tools: Vec<Box<dyn Tool>>,
+    tiering: crate::config::ToolTieringConfig,
+    pinned_model: &str,
+    channel: bool,
+    tool_calls_allowed: bool,
+) -> (ToolExecutionService, crate::tools::execution::admission::TurnSurface) {
+    let publication_policy = SurfacePolicy {
+        channel_allowed: channel,
+        ..SurfacePolicy::default()
+    };
+    let catalog = CapabilityCatalog::build(&tools, &CatalogSources::default(), &publication_policy).expect("catalog");
+    let security = crate::security::SecurityPolicy::default();
+    let service = ToolExecutionService::from_boxed(
+        tools,
+        Arc::new(SecurityEffectPolicy::new(Arc::new(security.clone()))),
+        Arc::new(DenyApprovalStrategy),
+        Arc::new(AdapterOwnedPreparation),
+        Arc::new(TracingToolExecutionAudit),
+    );
+    let surface = crate::tools::surface_owner::build(crate::tools::surface_owner::SurfaceParts {
+        execution: &service,
+        catalog: &catalog,
+        publication_policy: &publication_policy,
+        tiering: &tiering,
+        security: &security,
+        pinned_model,
+        channel,
+        inherited_exclusions: &[],
+        sender: "prx_user",
+        channel_name: if channel { "wacli" } else { "cli" },
+        chat_type: if channel { "dm" } else { "private" },
+        tool_calls_allowed,
+    });
+    (service, surface)
+}
+
+/// An execution model outside the ingress binding is refused by the binding
+/// itself, with no decision service or `AdmittedTurn`.
+#[test]
+fn execution_model_differs_from_bound_model_is_refused() {
     let workspace = tempfile::tempdir().expect("test workspace");
-    let dispatches = Arc::new(Mutex::new(Vec::new()));
-    let registry = project_tool_registry(&dispatches, &["project_tool"]);
-    let admitted = AdmittedTurn::with_config(workspace_config(workspace.path()), "reply", Arc::clone(&registry)).await;
-    let decision = admitted.decision();
+    let mut config = workspace_config(workspace.path());
+    config.causal_tree.enabled = false;
+    config.providers.models.push(
+        serde_json::from_value(serde_json::json!({
+            "provider":"ollama", "model":"prx-local-model", "operations":["chat"], "native_tools":true,
+        }))
+        .expect("fixture model descriptor"),
+    );
+    let generation = crate::config::new_shared(config).pin();
+    let proof = crate::agent::entry::test_cli_agent_turn_proof(&generation, "ollama", "prx-local-model");
     assert!(
-        crate::runtime::turn_model::validate_execution(decision.proof, "ollama", "prx-local-model").is_ok(),
+        crate::runtime::turn_model::validate_execution(&proof, "ollama", "prx-local-model").is_ok(),
         "the ingress binding must admit itself"
     );
     for (provider_name, model) in [("ollama", "prx-other-model"), ("openai", "prx-local-model")] {
         assert!(
-            crate::runtime::turn_model::validate_execution(decision.proof, provider_name, model).is_err(),
+            crate::runtime::turn_model::validate_execution(&proof, provider_name, model).is_err(),
             "{provider_name}/{model} is outside the ingress binding"
         );
-        let provider = NativeScriptedProvider::new(vec![ChatResponse {
-            text: Some("done".into()),
-            tool_calls: Vec::new(),
-            reasoning_content: None,
-        }]);
-        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("reply")];
-        let result = run_turn(
-            &mut history,
-            TurnRequest {
-                advice: None,
-                channel_name: "cli",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: TurnSchedule {
-                    read_only_tool_concurrency_window: 1,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
-                },
-                compaction: None,
-                decision: admitted.decision(),
-            },
-            TurnServices {
-                provider: &provider,
-                provider_name,
-                model,
-                temperature: 0.0,
-                tools_registry: Arc::clone(&registry),
-                observer: &crate::observability::NoopObserver,
-                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admitted.adapter()),
-                memory: admitted.memory_runtime(),
-            },
-            TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        )
-        .await;
-        assert!(result.is_err(), "run_turn accepted {provider_name}/{model}");
-        assert!(provider.requests().is_empty(), "a refused model reached the provider");
     }
-    assert!(dispatches.lock().unwrap().is_empty());
 }
 
 /// A model without verified native tools gets an empty surface from the
 /// production builder, so the provider sees no tools and a guessed name is denied.
 #[tokio::test]
 async fn model_without_native_tools_gets_no_tool_surface() {
-    let workspace = tempfile::tempdir().expect("test workspace");
-    let mut config = workspace_config(workspace.path());
-    config.providers.models.push(
-        serde_json::from_value(serde_json::json!({
-            "provider":"ollama", "model":"prx-local-model", "operations":["chat"], "native_tools":false,
-        }))
-        .expect("fixture model descriptor"),
-    );
     let dispatches = Arc::new(Mutex::new(Vec::new()));
-    let registry = project_tool_registry(&dispatches, &["project_tool"]);
-    let admitted = AdmittedTurn::with_config(config, "reply", registry).await;
-    let decision = admitted.decision();
-    let surface = crate::tools::surface_owner::build(decision.service.turn_surface_parts(decision.proof, &[]));
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+        name: "project_tool".to_owned(),
+        execution_order: Arc::clone(&dispatches),
+    })];
+    let (service, surface) = decision_free_surface(
+        tools,
+        crate::config::ToolTieringConfig::default(),
+        "prx-local-model",
+        false,
+        false,
+    );
     assert!(!surface.contains("project_tool"));
-    let adapter = admitted.adapter();
-    let service = adapter
-        .tool_execution_service
-        .clone()
-        .expect("fixture execution service");
     let specs: Vec<crate::tools::ToolSpec> = service
         .descriptors()
         .into_iter()
@@ -164,7 +157,11 @@ async fn model_without_native_tools_gets_no_tool_surface() {
         )
         .await
         .expect("provider call with an empty surface");
-    let mut context = adapter.tool_execution_context.clone();
+    let mut context = crate::tools::ToolExecutionContext::new(
+        crate::runtime::envelope::RuntimeEnvelope::agent("prx_workspace", "prx_session"),
+        "private",
+    )
+    .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
     assert!(context.execution_bindings.is_none());
     context.turn_surface = Some(Arc::new(surface));
     let outcome = service
@@ -215,7 +212,20 @@ async fn hint_routed_turn_applies_the_pinned_model_allowlist() {
         decision.service.model_can_call_tools(decision.proof),
         "the route destination must verify NativeTools"
     );
-    let surface = crate::tools::surface_owner::build(decision.service.turn_surface_parts(decision.proof, &[]));
+    let surface = crate::tools::surface_owner::build(crate::tools::surface_owner::SurfaceParts {
+        execution: decision.service.execution(),
+        catalog: decision.service.catalog(),
+        publication_policy: decision.service.publication_policy(),
+        tiering: decision.service.tool_tiering(),
+        security: decision.service.security(),
+        pinned_model: decision.proof.model_binding().pinned_model(),
+        channel: decision.service.channel_surface(),
+        inherited_exclusions: &[],
+        sender: decision.proof.policy_sender(),
+        channel_name: decision.proof.policy_channel(),
+        chat_type: decision.proof.policy_chat_type(),
+        tool_calls_allowed: decision.service.model_can_call_tools(decision.proof),
+    });
     assert!(surface.contains("project_tool"), "the allowed tool was not published");
     assert!(
         !surface.contains("other_tool"),

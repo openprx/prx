@@ -79,7 +79,7 @@ pub(super) async fn execute_operation(
     service
         .execute(
             ToolExecutionCommand::new(name, args),
-            ToolExecutionContext::new(envelope, "private"),
+            ToolExecutionContext::new(envelope, "private").with_dispatch_origin(crate::tools::DispatchOrigin::Operator),
             None,
         )
         .await
