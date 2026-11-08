@@ -29,8 +29,8 @@ const UPLOADS_DIR_NAME: &str = "uploads";
 
 mod target;
 use target::{
-    AgentField, SelectedTurn, TargetError, TargetedTurn, TurnTarget, prepare_target, resolve_incarnation,
-    resolve_target,
+    AgentField, SelectedTurn, TargetError, TargetUnavailable, TargetedTurn, TurnTarget, prepare_target,
+    resolve_incarnation, resolve_target,
 };
 
 #[derive(Serialize)]
@@ -1498,7 +1498,7 @@ pub async fn post_session_message(
         Ok(selected) => selected,
         // A refused target leaves nothing behind: dropping the guard removes
         // the files this request created, and only those.
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     // The guard stays alive through admission: a missing session, a failed
     // history read, closed admission or cancellation removes the files.
@@ -1517,16 +1517,55 @@ pub async fn post_session_message(
     .await
 }
 
+/// Why `select_turn_target` refused the request. Each arm is one error type
+/// the helper already returned; `IntoResponse` delegates so status, code and
+/// body bytes stay unchanged.
+#[derive(Debug)]
+enum TargetRefusal {
+    Selector(TargetError),
+    Forbidden((StatusCode, Json<serde_json::Value>)),
+    Unavailable(TargetUnavailable),
+    RegistryMissing,
+}
+
+impl From<TargetError> for TargetRefusal {
+    fn from(error: TargetError) -> Self {
+        Self::Selector(error)
+    }
+}
+
+impl From<(StatusCode, Json<serde_json::Value>)> for TargetRefusal {
+    fn from(error: (StatusCode, Json<serde_json::Value>)) -> Self {
+        Self::Forbidden(error)
+    }
+}
+
+impl From<TargetUnavailable> for TargetRefusal {
+    fn from(error: TargetUnavailable) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl IntoResponse for TargetRefusal {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Selector(error) => error.into_response(),
+            Self::Forbidden(payload) => payload.into_response(),
+            Self::Unavailable(error) => error.into_response(),
+            Self::RegistryMissing => json_error(StatusCode::INTERNAL_SERVER_ERROR, "Agent registry is unavailable"),
+        }
+    }
+}
+
 /// Resolve the request's `agent` against the pinned runtime generation,
 /// before admission, input recording or provider access.
-#[allow(clippy::result_large_err)] // the axum `Response` is the error contract of these helpers
 fn select_turn_target(
     state: &AppState,
     turn_runtime: std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
     principal: &super::ApiPrincipal,
     agent: AgentField,
-) -> Result<SelectedTurn, Response> {
-    let target = TurnTarget::from_field(agent).map_err(IntoResponse::into_response)?;
+) -> Result<SelectedTurn, TargetRefusal> {
+    let target = TurnTarget::from_field(agent)?;
     if matches!(target, TurnTarget::Main) {
         return Ok(SelectedTurn {
             runtime: turn_runtime,
@@ -1535,11 +1574,8 @@ fn select_turn_target(
         });
     }
     // A caller who may not post messages learns nothing about which agents exist.
-    super::authorize_resource_mutation(state, "gateway_api:sessions:message", ResourceRiskLevel::Low)
-        .map_err(IntoResponse::into_response)?;
-    let Some(plan) =
-        resolve_target(&turn_runtime.config_generation.effective, &target).map_err(IntoResponse::into_response)?
-    else {
+    super::authorize_resource_mutation(state, "gateway_api:sessions:message", ResourceRiskLevel::Low)?;
+    let Some(plan) = resolve_target(&turn_runtime.config_generation.effective, &target)? else {
         return Ok(SelectedTurn {
             runtime: turn_runtime,
             targeted: None,
@@ -1547,15 +1583,11 @@ fn select_turn_target(
         });
     };
     if !state.mem.supports_agent_scope() {
-        return Err(TargetError::BackendUnsupported.into_response());
+        return Err(TargetRefusal::Selector(TargetError::BackendUnsupported));
     }
-    let (runtime, turn) = prepare_target(&turn_runtime, &plan).map_err(IntoResponse::into_response)?;
-    let registry = state
-        .mem
-        .agent_registry()
-        .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "Agent registry is unavailable"))?;
-    let incarnation = resolve_incarnation(state, registry, &turn_runtime, &principal.owner_id, &plan)
-        .map_err(|response| *response)?;
+    let (runtime, turn) = prepare_target(&turn_runtime, &plan)?;
+    let registry = state.mem.agent_registry().ok_or(TargetRefusal::RegistryMissing)?;
+    let incarnation = resolve_incarnation(state, registry, &turn_runtime, &principal.owner_id, &plan)?;
     Ok(SelectedTurn {
         runtime,
         targeted: Some(turn),

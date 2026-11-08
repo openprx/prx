@@ -326,11 +326,11 @@ pub(super) fn resolve_incarnation(
     runtime: &TurnRuntimeGeneration,
     owner_id: &str,
     plan: &TargetPlan,
-) -> Result<String, Box<Response>> {
+) -> Result<String, super::TargetRefusal> {
     use crate::memory::agent_registry::AgentRefusal;
     let key = crate::gateway::agent_lifecycle::agent_key(plan.name.as_str());
     let revision = crate::gateway::agent_lifecycle::config_revision(&plan.agent)
-        .map_err(|error| Box::new(TargetUnavailable(error.to_string()).into_response()))?;
+        .map_err(|error| super::TargetRefusal::Unavailable(TargetUnavailable(error.to_string())))?;
     let lifecycle = state.turn_runtime.as_ref().map(|owner| owner.agent_lifecycle());
     let admit = || {
         if lifecycle.is_some_and(|lifecycle| lifecycle.blocks(&key)) {
@@ -346,10 +346,10 @@ pub(super) fn resolve_incarnation(
     let workspace = runtime.config_generation.effective.workspace_dir.to_string_lossy();
     match registry.resolve_incarnation(&workspace, owner_id, &key, &revision, &admit) {
         Ok(Ok(incarnation)) => Ok(incarnation),
-        Ok(Err(AgentRefusal::Unknown)) => Err(Box::new(TargetError::Unknown.into_response())),
-        Ok(Err(AgentRefusal::Disabled)) => Err(Box::new(TargetError::Disabled.into_response())),
-        Err(error) => Err(Box::new(
-            TargetUnavailable(format!("agent registry: {error:#}")).into_response(),
-        )),
+        Ok(Err(AgentRefusal::Unknown)) => Err(super::TargetRefusal::Selector(TargetError::Unknown)),
+        Ok(Err(AgentRefusal::Disabled)) => Err(super::TargetRefusal::Selector(TargetError::Disabled)),
+        Err(error) => Err(super::TargetRefusal::Unavailable(TargetUnavailable(format!(
+            "agent registry: {error:#}"
+        )))),
     }
 }
