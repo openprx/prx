@@ -431,6 +431,14 @@ async fn run_turn_unguarded(
                 ),
             )
             .await;
+        super::send_admission::admit_provider_send(
+            service,
+            context,
+            proof,
+            &proposal_messages,
+            Some(std::slice::from_ref(&spec)),
+            crate::tools::ToolSchemaDialect::Raw,
+        )?;
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_owned(),
             model: model.to_owned(),
@@ -1219,6 +1227,15 @@ async fn run_turn_unguarded(
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = compiled_tool_context.native_tool_specs();
+        // One budget decision per provider round, before either transport.
+        super::send_admission::admit_provider_send(
+            service,
+            context,
+            proof,
+            &prepared_messages.messages,
+            request_tools,
+            runtime_adapter.tool_execution_context.schema_dialect,
+        )?;
 
         // FIX-P0-30/31: use the trace-returning provider entrypoint so this
         // turn's real serving provider/model and failover attempts flow back
