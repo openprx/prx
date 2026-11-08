@@ -387,12 +387,11 @@ async fn agent_recreation_uses_new_incarnation() {
             .map(|_| ())
     });
     let started = std::time::Instant::now();
-    loop {
-        match h.entered.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(()) => break,
-            Err(_) if reload.is_finished() => panic!("the reload ended before the commit barrier: {:?}", reload.join()),
-            Err(_) => assert!(started.elapsed() < wait, "the commit barrier was not entered in time"),
+    while h.entered.recv_timeout(std::time::Duration::from_millis(100)).is_err() {
+        if reload.is_finished() {
+            panic!("the reload ended before the commit barrier: {:?}", reload.join());
         }
+        assert!(started.elapsed() < wait, "the commit barrier was not entered in time");
     }
     body_tx
         .send(axum::body::Bytes::from(message(Some("y"))))
