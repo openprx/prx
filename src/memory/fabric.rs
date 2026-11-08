@@ -794,7 +794,7 @@ impl MemoryFabric {
         };
         if role == "user" && event_type == "message.created" {
             if let Some(ingress) = &self.ingress {
-                return ingress.append(input).await;
+                return Box::pin(ingress.append(input)).await;
             }
             if input.idempotency_key.is_some() {
                 // Without a recorder the stable input key still fences admission:
