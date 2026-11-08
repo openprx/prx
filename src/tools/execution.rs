@@ -539,6 +539,8 @@ pub struct ToolExecutionContext {
     pub(crate) child_scope: Option<Arc<super::capability::child::VerifiedChildScope>>,
     /// Pinned child provenance; dispatch refuses either half without the other.
     pub(crate) child_pin: Option<Arc<super::capability::child::ChildDispatchPin>>,
+    /// Live G6 tokens for the model turn's called tools; absent outside model turns.
+    pub(crate) call_budget: Option<admission::CallTokenBudget>,
     pub(crate) decision_resume: Option<super::capability::execution_binding::DecisionResumePort>,
     /// A call that needs approval ends denied before any ledger route or
     /// durable pending decision exists. Set for targeted agent turns, which
@@ -621,6 +623,7 @@ impl ToolExecutionContext {
             child_grant: None,
             child_scope: None,
             child_pin: None,
+            call_budget: None,
             decision_approval: None,
             decision_resume: None,
             pending_approval_denied: false,
@@ -3219,7 +3222,9 @@ impl ToolExecutionService {
 
         // Approval, preparation, reservation and claim may have awaited while the
         // live registry changed. Recheck before the backend future is polled.
-        if let Err((status, error)) = admission::admit_child(self, &context, &command.name, true) {
+        if let Err((status, error)) = admission::admit_child(self, &context, &command.name, true)
+            .and_then(|()| admission::admit_called_tokens(self, &context, &command.name))
+        {
             let abandonment = self
                 .abandon_idempotent_execution(idempotency_lease.as_ref(), &context)
                 .await;

@@ -3,6 +3,42 @@ use super::{ToolDescriptor, ToolExecutionContext, ToolExecutionService, ToolExec
 use crate::config::ToolTieringConfig;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
+/// Live G6 tokens and the candidate estimator for the called tools of one
+/// model turn. The turn engine attaches it from the pinned route and the
+/// decision context. Dispatch needs neither bindings nor a decision context.
+#[derive(Clone)]
+pub(crate) struct CallTokenBudget {
+    remaining: Arc<dyn Fn() -> u64 + Send + Sync>,
+    estimate: Arc<dyn Fn(usize) -> Option<u64> + Send + Sync>,
+}
+
+impl CallTokenBudget {
+    pub(crate) fn new(
+        remaining: impl Fn() -> u64 + Send + Sync + 'static,
+        estimate: impl Fn(usize) -> Option<u64> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            remaining: Arc::new(remaining),
+            estimate: Arc::new(estimate),
+        }
+    }
+}
+
+impl std::fmt::Debug for CallTokenBudget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CallTokenBudget")
+    }
+}
+
+impl PartialEq for CallTokenBudget {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.remaining, &other.remaining) && Arc::ptr_eq(&self.estimate, &other.estimate)
+    }
+}
+
+impl Eq for CallTokenBudget {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnSurface {
@@ -236,12 +272,53 @@ pub(super) fn child_autonomy(
     }
 }
 
+/// The called tool's own G6 action estimate against the live remaining tokens,
+/// with the same `<=` rule as the candidate predicate. It runs before the
+/// no-surface return and again before invocation, and needs no bindings or
+/// decision context. Discovery is a zero-token action. A missing estimate
+/// refuses. Grouped native-file sums stay with the decision gate: the group is
+/// a directive-era concept, and card 03 retires that predicate with directives.
+/// Refuse-kind directives never reach dispatch, so they need no exemption here.
+pub(super) fn admit_called_tokens(
+    service: &ToolExecutionService,
+    context: &ToolExecutionContext,
+    name: &str,
+) -> Result<(), (ToolExecutionStatus, String)> {
+    let Some(budget) = &context.call_budget else {
+        return Ok(());
+    };
+    // A vanished descriptor is reported by resolution or by the stale recheck.
+    let Some(descriptor) = service.current_descriptor(name) else {
+        return Ok(());
+    };
+    let tokens = if name == "capability_search" {
+        0
+    } else {
+        let schema_bytes = serde_json::to_vec(&descriptor.parameters).map_or(usize::MAX, |value| value.len());
+        (budget.estimate)(schema_bytes).ok_or_else(|| {
+            (
+                ToolExecutionStatus::Denied,
+                format!("tool '{name}' has no current token estimate"),
+            )
+        })?
+    };
+    let remaining = (budget.remaining)();
+    if tokens > remaining {
+        return Err((
+            ToolExecutionStatus::Denied,
+            format!("tool '{name}' estimates {tokens} tokens but {remaining} remain"),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn admit(
     service: &ToolExecutionService,
     context: &ToolExecutionContext,
     name: &str,
 ) -> Result<(), (ToolExecutionStatus, String)> {
     admit_child(service, context, name, false)?;
+    admit_called_tokens(service, context, name)?;
     let Some(surface) = &context.turn_surface else {
         return Ok(());
     };

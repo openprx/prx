@@ -5,7 +5,7 @@ use crate::config::schema::CostConfig;
 use crate::providers::catalog::ResolvedModel;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(test)]
+/// Candidate estimate for one schema, with the shared pricing and refusal rules.
 pub(crate) fn estimate_cost(model: &ResolvedModel, pricing: &CostConfig, schema_bytes: usize) -> Option<CostEstimate> {
     let prices_valid = pricing.prices.values().all(|price| price.is_finite_nonnegative());
     estimate_cost_with_validity(

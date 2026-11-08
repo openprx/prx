@@ -4,8 +4,10 @@ use crate::agent::turn_context::measure_native_tool_payload_for;
 use crate::providers::ChatMessage;
 use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
 use crate::runtime::turn_source::TurnSourceProof;
+use crate::tools::execution::admission::CallTokenBudget;
 use crate::tools::{ToolSchemaDialect, ToolSpec};
 use anyhow::{Context, Result};
+use std::sync::Arc;
 
 #[cfg(test)]
 thread_local! {
@@ -34,6 +36,41 @@ impl Drop for HookReset {
     }
 }
 
+/// Live remaining G6 tokens of one turn. Shared by send and dispatch admission.
+pub(crate) fn live_g6_tokens(context: &TurnDecisionContext) -> u64 {
+    context.remaining_g6_tokens().min(send_token_cap())
+}
+
+#[cfg(test)]
+fn send_token_cap() -> u64 {
+    TEST_TOKEN_CAP.get()
+}
+
+#[cfg(not(test))]
+const fn send_token_cap() -> u64 {
+    u64::MAX
+}
+
+/// The called-tool budget for one model turn: the live G6 tokens and the
+/// candidate estimator over the pinned route's model and pricing.
+pub(crate) fn call_token_budget(
+    service: &TurnDecisionService,
+    context: &Arc<TurnDecisionContext>,
+    proof: &dyn TurnSourceProof,
+) -> Result<CallTokenBudget> {
+    let limits = service
+        .send_limits(proof)
+        .context("called-tool budget cannot be established")?;
+    let context = Arc::clone(context);
+    Ok(CallTokenBudget::new(
+        move || live_g6_tokens(&context),
+        move |schema_bytes| {
+            crate::cost::estimate::estimate_cost(&limits.model, &limits.cost, schema_bytes)
+                .map(|estimate| u64::from(estimate.tokens))
+        },
+    ))
+}
+
 /// Refuses the send unless it fits G6 and the remaining spend. Nothing is sent
 /// or debited here; decision-attempt token reservation and settlement are
 /// unchanged.
@@ -53,9 +90,7 @@ pub(crate) fn admit_provider_send(
     dialect: ToolSchemaDialect,
 ) -> Result<()> {
     let tools = tools.unwrap_or_default();
-    let remaining = context.remaining_g6_tokens();
-    #[cfg(test)]
-    let remaining = remaining.min(TEST_TOKEN_CAP.get());
+    let remaining = live_g6_tokens(context);
     let answer = crate::cost::estimate::candidate_tokens(0);
     anyhow::ensure!(
         answer <= remaining,
