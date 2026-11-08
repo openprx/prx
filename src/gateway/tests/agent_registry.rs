@@ -156,6 +156,7 @@ fn harness(agents: Agents<'_>, switch: bool, seed: impl FnOnce(&rusqlite::Connec
     let mut state = authz_test_state(Config::default());
     state.config = Arc::clone(&manager);
     state.mem = memory;
+    state.turn_runtime = Some(Arc::clone(&owner));
     Harness {
         dir,
         manager,
@@ -179,32 +180,7 @@ impl Harness {
     /// answers `404 Session not found` with no error code; a refused target
     /// answers its typed code. Returns `(status, code)`.
     async fn post(&self, agent: Option<&str>) -> (u16, Option<String>) {
-        let body = agent.map_or_else(
-            || serde_json::json!({"message": "hi"}),
-            |name| serde_json::json!({"message": "hi", "agent": name}),
-        );
-        let mut request = axum::extract::Request::builder()
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(body.to_string()))
-            .expect("test: request");
-        request
-            .extensions_mut()
-            .insert(super::super::api::ApiPrincipal::of_token(TOKEN));
-        let response = super::super::api::post_session_message(
-            axum::extract::State(self.state.clone()),
-            axum::extract::Path(SESSION.to_owned()),
-            request,
-        )
-        .await
-        .into_response();
-        let status = response.status().as_u16();
-        let bytes = response.into_body().collect().await.expect("test: body").to_bytes();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("test: json body");
-        let code = value
-            .pointer("/error/code")
-            .and_then(|code| code.as_str())
-            .map(str::to_owned);
-        (status, code)
+        send(self.state.clone(), axum::body::Body::from(message(agent))).await
     }
 
     /// `(incarnation, state, config_revision)` of every row of `key`.
@@ -241,6 +217,42 @@ impl Harness {
     }
 }
 
+fn message(agent: Option<&str>) -> String {
+    agent
+        .map_or_else(
+            || serde_json::json!({"message": "hi"}),
+            |name| serde_json::json!({"message": "hi", "agent": name}),
+        )
+        .to_string()
+}
+
+/// Run one `post_session_message` over `body`. The request pins its runtime
+/// before the body is read, so a slow body holds it on the old generation.
+async fn send(state: AppState, body: axum::body::Body) -> (u16, Option<String>) {
+    let mut request = axum::extract::Request::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .expect("test: request");
+    request
+        .extensions_mut()
+        .insert(super::super::api::ApiPrincipal::of_token(TOKEN));
+    let response = super::super::api::post_session_message(
+        axum::extract::State(state),
+        axum::extract::Path(SESSION.to_owned()),
+        request,
+    )
+    .await
+    .into_response();
+    let status = response.status().as_u16();
+    let bytes = response.into_body().collect().await.expect("test: body").to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("test: json body");
+    let code = value
+        .pointer("/error/code")
+        .and_then(|code| code.as_str())
+        .map(str::to_owned);
+    (status, code)
+}
+
 const RESOLVED: (u16, Option<&str>) = (404, None);
 
 fn expect(outcome: &(u16, Option<String>), status: u16, code: Option<&str>) {
@@ -251,7 +263,7 @@ fn revision_of(temperature: f64) -> String {
     agent_lifecycle::config_revision(&agent(temperature, true)).expect("test: revision")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_recreation_uses_new_incarnation() {
     let main_revision = SqliteMemory::schema_migration_checksum("prx.ma.main.v1");
     let seed_main = {
@@ -322,14 +334,26 @@ async fn agent_recreation_uses_new_incarnation() {
         vec![(u1.clone(), "retiring".to_owned(), revision_of(0.2))]
     );
 
-    // 5b. While the commit holds the removal of Y, a resolve of Y under the
-    // still-active old generation is refused and writes no row.
+    // 5b. A request that pinned the old runtime before the commit and selects
+    // its target while the commit holds the removal of Y is refused (409) and
+    // mints nothing.
     *h.gate.mode.lock() = Mode::Block;
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(1);
+    let held = tokio::spawn(send(
+        h.state.clone(),
+        axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx)),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let manager = Arc::clone(&h.manager);
     let pending_config = config(h.dir.path(), &[("sleeper", 0.1, false)], true);
     let reload = std::thread::spawn(move || manager.apply_runtime_config(pending_config, ConfigReloadTrigger::Test));
     h.entered.recv().expect("test: the commit is blocked");
-    expect(&h.post(Some("y")).await, 409, Some("agent_disabled"));
+    body_tx
+        .send(Ok(axum::body::Bytes::from(message(Some("y")))))
+        .await
+        .expect("test: the held request is waiting");
+    drop(body_tx);
+    expect(&held.await.expect("test: held request"), 409, Some("agent_disabled"));
     assert!(h.rows("n:y").is_empty(), "the barrier writes no row");
     h.release.send(()).expect("test: release");
     reload
@@ -386,6 +410,13 @@ async fn failed_startup_sweep_latches_targeted_turns_until_reconciled() {
     assert!(h.rows("n:v").is_empty(), "a latched resolve writes no row");
     assert_eq!(h.active("n:z").len(), 1, "the failed sweep left Z active");
     assert_eq!(h.post(None).await, (404, None), "Main is unaffected by the latch");
+
+    // Another owner's successful reconcile does not clear this owner's latch.
+    let other = harness(&[("q", 0.1, true)], true, |_, _| {});
+    other
+        .reload(&[("q", 0.2, true)])
+        .expect("test: the other owner reloads");
+    expect(&h.post(Some("v")).await, 409, Some("agent_disabled"));
 
     db(h.dir.path())
         .execute_batch("DROP TRIGGER t_fail")

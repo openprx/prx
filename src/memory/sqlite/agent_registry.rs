@@ -6,7 +6,6 @@ use super::SqliteMemory;
 use crate::memory::agent_registry::{AgentRefusal, AgentRegistry, RetiredIncarnation};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::Ordering;
 
 /// The closed inventory of erase-manifest stores (design inventory enum).
 const MANIFEST_STORES: [&str; 33] = [
@@ -311,9 +310,6 @@ impl AgentRegistry for SqliteMemory {
     ) -> anyhow::Result<Result<String, AgentRefusal>> {
         let writer = self.pool.write();
         let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
-        if self.registry_unreconciled.load(Ordering::SeqCst) || self.pending_removals.lock().contains(agent_key) {
-            return Ok(Err(AgentRefusal::Disabled));
-        }
         if let Err(refusal) = admit() {
             return Ok(Err(refusal));
         }
@@ -341,12 +337,11 @@ impl AgentRegistry for SqliteMemory {
         Ok(Ok(incarnation))
     }
 
-    fn begin_removal(
+    fn retire_removed(
         &self,
         workspace_id: &str,
         agent_keys: &BTreeSet<String>,
     ) -> anyhow::Result<Vec<RetiredIncarnation>> {
-        self.pending_removals.lock().extend(agent_keys.iter().cloned());
         let writer = self.pool.write();
         let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
         let flipped = tx
@@ -369,11 +364,7 @@ impl AgentRegistry for SqliteMemory {
         Ok(flipped)
     }
 
-    fn end_removal(&self, rows: &[RetiredIncarnation]) -> anyhow::Result<()> {
-        self.pending_removals.lock().clear();
-        if rows.is_empty() {
-            return Ok(());
-        }
+    fn reactivate(&self, rows: &[RetiredIncarnation]) -> anyhow::Result<()> {
         let writer = self.pool.write();
         let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
         for row in rows {
@@ -388,22 +379,7 @@ impl AgentRegistry for SqliteMemory {
         Ok(())
     }
 
-    fn reconcile(
-        &self,
-        workspace_id: &str,
-        revisions: &BTreeMap<String, String>,
-        latch_on_failure: bool,
-    ) -> anyhow::Result<()> {
-        let result = self.reconcile_rows(workspace_id, revisions);
-        if result.is_ok() || latch_on_failure {
-            self.registry_unreconciled.store(result.is_err(), Ordering::SeqCst);
-        }
-        result
-    }
-}
-
-impl SqliteMemory {
-    fn reconcile_rows(&self, workspace_id: &str, revisions: &BTreeMap<String, String>) -> anyhow::Result<()> {
+    fn reconcile(&self, workspace_id: &str, revisions: &BTreeMap<String, String>) -> anyhow::Result<()> {
         let writer = self.pool.write();
         let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
         tx.execute(

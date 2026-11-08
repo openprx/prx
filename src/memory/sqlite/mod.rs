@@ -186,10 +186,6 @@ pub struct SqliteMemory {
     recovery_unusable: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Serializes check, load and failure publication for this handle's activation.
     recovery_activation: Arc<parking_lot::Mutex<()>>,
-    /// Agent keys whose removal is being committed: no new incarnation until it ends.
-    pending_removals: Arc<parking_lot::Mutex<std::collections::BTreeSet<String>>>,
-    /// Set when a reconcile sweep failed: every agent resolve is refused.
-    registry_unreconciled: Arc<std::sync::atomic::AtomicBool>,
     /// Fixed striped gates serializing check, load and failure publication per
     /// capsule key id. The set never grows, whatever ids stored capsules name.
     recovery_key_gates: Arc<[parking_lot::Mutex<()>; recovery_authority::RECOVERY_KEY_GATES]>,
@@ -410,8 +406,6 @@ impl SqliteMemory {
             recovery_warned: Default::default(),
             recovery_unusable: Default::default(),
             recovery_activation: Default::default(),
-            pending_removals: Default::default(),
-            registry_unreconciled: Default::default(),
             recovery_key_gates: Default::default(),
             #[cfg(test)]
             recovery_activation_attempts: Default::default(),
