@@ -838,6 +838,41 @@ fn refusal<T>(result: anyhow::Result<T>, what: &str) -> anyhow::Result<anyhow::E
     }
 }
 
+/// Every file and directory below `root` with its bytes.
+fn tree(root: &std::path::Path) -> anyhow::Result<std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        found.insert(directory.clone(), Vec::new());
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.insert(path.clone(), std::fs::read(&path)?);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// An attempt directory is refused by the key directory, the constructor and
+/// activation alike, and none of them changes its listing or any file byte.
+fn assert_refused_untouched(attempt: &std::path::Path) -> anyhow::Result<()> {
+    let before = tree(attempt)?;
+    refusal(KeyDirectory::open(attempt, false), "opening an attempt directory")?;
+    refusal(
+        SqliteMemory::new_with_path(attempt.join("target.db")),
+        "constructing in an attempt directory",
+    )?;
+    assert!(
+        tree(attempt)? == before,
+        "{}: listing and bytes unchanged",
+        attempt.display()
+    );
+    Ok(())
+}
+
 /// The tag of a persisted capsule row: its recorded key id and input digest.
 fn persisted_capsule_tag(memory: &SqliteMemory, input_event_id: &str) -> anyhow::Result<RecoveryTag> {
     let json: String = memory.pool.write().query_row(
@@ -1084,28 +1119,31 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
         );
         refusal(crashed, "simulated crash")?;
         assert!(!target.exists(), "{crash:?}: nothing was published");
-        refusal(KeyDirectory::open(&leftover, false), "opening a crash leftover")?;
-        let before = key_bytes(&leftover.join(".recovery_keys")).ok();
-        let abandoned = SqliteMemory::new_with_path(leftover.join("target.db"))?;
-        refusal(abandoned.activate_recovery_authority(), "activating a crash leftover")?;
-        assert!(
-            key_bytes(&leftover.join(".recovery_keys")).ok() == before,
-            "{crash:?}: no key was created or altered"
-        );
+        assert_refused_untouched(&leftover)?;
         assert_eq!(mode_of(&leftover)?, 0o700);
-        drop(abandoned);
         // Only a completed publication restores.
         std::fs::remove_dir_all(&leftover)?;
         memory.backup_database_to(&target).await?;
         let restored = SqliteMemory::new_with_path(target)?;
         assert_eq!(restored.activate_recovery_authority()?, k2);
     }
-    // Attempt directories refused by name alone: an empty pre-marker staging
-    // directory and a markerless keys-only remainder of an interrupted cleanup.
-    for (shape, with_keys) in [("pre-marker", false), ("keys-only", true)] {
-        let case = bundle_target(&root, &format!("shape-{shape}"))?;
-        let leftover = parent_of(&parent_of(&case)?)?.join(format!(".backup-incomplete-{shape}"));
+    // Attempt directories: refused by name (including ASCII-case aliases) when
+    // empty or markerless keys-only, and by marker when moved to a plain name.
+    let shapes = [
+        (".backup-incomplete-pre-marker", false, false),
+        (".BACKUP-INCOMPLETE-alias-empty", false, false),
+        (".backup-incomplete-keys-only", true, false),
+        (".Backup-Incomplete-alias-keys", true, false),
+        ("renamed-empty", false, true),
+        ("renamed-keys", true, true),
+    ];
+    for (name, with_keys, with_marker) in shapes {
+        let case = parent_of(&parent_of(&bundle_target(&root, &format!("shape-{name}"))?)?)?;
+        let leftover = case.join(name);
         std::fs::DirBuilder::new().mode(0o700).create(&leftover)?;
+        if with_marker {
+            std::fs::write(leftover.join(".backup-incomplete"), b"")?;
+        }
         if with_keys {
             let keys = leftover.join(".recovery_keys");
             std::fs::DirBuilder::new().mode(0o700).create(&keys)?;
@@ -1115,22 +1153,46 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
                 std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
             }
         }
-        let before = key_bytes(&leftover.join(".recovery_keys")).ok();
-        refusal(KeyDirectory::open(&leftover, false), "opening an attempt directory")?;
-        let abandoned = SqliteMemory::new_with_path(leftover.join("target.db"))?;
+        assert_refused_untouched(&leftover)?;
+    }
+    // A reserved final basename and a reserved ancestor are rejected with no side effect.
+    for (index, reserved) in [".backup-incomplete-x/target.db", ".BACKUP-INCOMPLETE-y/inner/target.db"]
+        .into_iter()
+        .enumerate()
+    {
+        let case = parent_of(&parent_of(&bundle_target(&root, &format!("reserved-{index}"))?)?)?;
         refusal(
-            abandoned.activate_recovery_authority(),
-            "activating an attempt directory",
+            memory.backup_database_to(&case.join(reserved)).await,
+            "backup to a reserved destination",
         )?;
-        assert!(
-            key_bytes(&leftover.join(".recovery_keys")).ok() == before,
-            "{shape}: no key was created or altered"
+        assert!(directory_listing(&case)?.is_empty(), "{reserved}: no side effect");
+    }
+    // The quarantine durability barrier and an interrupted cleanup keep what
+    // remains refused: intact at the barrier, keys-only after a partial delete.
+    for (index, stage) in [Step::Barrier, Step::Cleanup].into_iter().enumerate() {
+        let target = bundle_target(&root, &format!("quarantine-{index}"))?;
+        let case = parent_of(&parent_of(&target)?)?;
+        let result = with_fault(
+            move |step, at| {
+                anyhow::ensure!(step != Step::Published, "publication failed");
+                if step == stage {
+                    if stage == Step::Cleanup {
+                        std::fs::remove_file(at.join("target.db"))?;
+                    }
+                    anyhow::bail!("quarantine interrupted");
+                }
+                Ok(())
+            },
+            || backup_bundle(&memory.pool.write(), &target),
         );
-        assert_eq!(
-            leftover.join(".recovery_keys").exists(),
-            with_keys,
-            "{shape}: no key directory appeared"
-        );
+        refusal(result, "failed publication")?;
+        let names = directory_listing(&case)?;
+        assert_eq!(names.len(), 1, "{stage:?}: exactly the quarantined directory remains");
+        let quarantined = case.join(names.iter().next().context("quarantined directory")?);
+        assert!(!target.exists());
+        assert!(quarantined.join(".recovery_keys").is_dir());
+        assert_eq!(quarantined.join("target.db").exists(), stage == Step::Barrier);
+        assert_refused_untouched(&quarantined)?;
     }
     // A bundle directory that does not exist yet is created owner-only by the rename.
     let nested = root.join("nested-parent").join("deeper");

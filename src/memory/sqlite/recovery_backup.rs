@@ -2,7 +2,7 @@
 //! references. Key bytes move from the source key directory straight into the
 //! staged key directory; they are never returned, kept or logged.
 
-use super::recovery_keys::{INCOMPLETE_MARKER, INCOMPLETE_PREFIX, KeyDirectory};
+use super::recovery_keys::{INCOMPLETE_MARKER, INCOMPLETE_PREFIX, KeyDirectory, ensure_admitted};
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags, params};
 use std::collections::BTreeSet;
@@ -23,6 +23,10 @@ pub(super) enum Step {
     Renamed,
     /// The marker is gone and the directory is durable.
     Published,
+    /// A failed bundle was renamed to its quarantine name; its parent is next.
+    Barrier,
+    /// The quarantine rename is durable; deleting its contents is next.
+    Cleanup,
 }
 
 #[cfg(test)]
@@ -115,6 +119,8 @@ pub(super) fn backup_bundle(conn: &Connection, target: &Path) -> anyhow::Result<
     let bundle = target.parent().context("backup target has no parent directory")?;
     let file_name = target.file_name().context("backup target has no file name")?;
     let root = bundle.parent().context("backup directory has no parent directory")?;
+    // Reserved names and incomplete attempts are refused before any side effect.
+    ensure_admitted(bundle)?;
     std::fs::create_dir_all(root)?;
     let vacant = match std::fs::read_dir(bundle) {
         Ok(mut entries) => entries.next().is_none(),
@@ -194,18 +200,37 @@ fn finish(bundle: &Path, root: &Path) -> anyhow::Result<()> {
 }
 
 /// Remove a failed published bundle. It is first renamed to a quarantine name
-/// that is refused as a key repository, so an interrupted recursive delete can
-/// never leave a restorable or markerless remainder at the bundle location.
+/// that is refused as a key repository, and that rename is made durable before
+/// any content is deleted; if the barrier fails the intact, refused directory
+/// is kept. An interrupted delete therefore never leaves a restorable remainder.
 fn quarantine(bundle: &Path, root: &Path) {
     let quarantined = root.join(format!("{INCOMPLETE_PREFIX}q-{}", uuid::Uuid::new_v4()));
-    match std::fs::rename(bundle, &quarantined) {
-        Ok(()) => discard(std::fs::remove_dir_all(&quarantined)),
-        Err(error) => {
-            tracing::warn!(%error, "failed recovery backup was not quarantined");
-            // Best effort: the incomplete marker keeps whatever remains refused.
-            discard(std::fs::File::create(bundle.join(INCOMPLETE_MARKER)).map(drop));
+    if let Err(error) = std::fs::rename(bundle, &quarantined) {
+        tracing::warn!(%error, "failed recovery backup was not quarantined");
+        // Make the marker durable (file, then directory) before relying on it.
+        let marked = std::fs::File::create(bundle.join(INCOMPLETE_MARKER))
+            .and_then(|marker| marker.sync_all())
+            .map_err(anyhow::Error::from)
+            .and_then(|()| sync_directory(bundle));
+        if let Err(error) = marked {
+            tracing::warn!(%error, "failed recovery backup is not marked incomplete");
         }
+        return;
     }
+    let barrier = sync_directory(root).and_then(|()| {
+        #[cfg(test)]
+        fault(Step::Barrier, &quarantined)?;
+        Ok(())
+    });
+    if let Err(error) = barrier {
+        tracing::warn!(%error, "quarantine of a failed recovery backup is not durable");
+        return;
+    }
+    #[cfg(test)]
+    if fault(Step::Cleanup, &quarantined).is_err() {
+        return;
+    }
+    discard(std::fs::remove_dir_all(&quarantined));
 }
 
 fn discard(removed: std::io::Result<()>) {

@@ -20,11 +20,33 @@ const KEYS_DIRECTORY: &str = ".recovery_keys";
 /// neither restored nor turned into a fresh authority.
 pub(super) const INCOMPLETE_MARKER: &str = ".backup-incomplete";
 
-/// Name prefix of every backup attempt directory (staging and quarantine). A
-/// path with such a component is refused whatever the directory holds, so an
-/// attempt stays unrestorable even before its marker exists or after a
-/// cleanup was interrupted.
+/// Name prefix of every backup attempt directory (staging and quarantine),
+/// matched ASCII case-insensitively so an alias on a case-insensitive file
+/// system is refused too.
 pub(super) const INCOMPLETE_PREFIX: &str = ".backup-incomplete-";
+
+/// Non-mutating admission check, shared by the constructor, activation and the
+/// backup destination: refuse a path with an attempt-named component (whatever
+/// the directory holds) or whose directory carries the incomplete marker. An
+/// attempt that was moved to another name keeps its marker as evidence; moving
+/// it AND deleting that marker by hand is outside this guarantee.
+pub(super) fn ensure_admitted(path: &Path) -> anyhow::Result<()> {
+    let reserved = INCOMPLETE_PREFIX.as_bytes();
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            let head = name.as_encoded_bytes().get(..reserved.len());
+            anyhow::ensure!(
+                !head.is_some_and(|head| head.eq_ignore_ascii_case(reserved)),
+                "incomplete recovery backup"
+            );
+        }
+    }
+    match std::fs::symlink_metadata(path.join(INCOMPLETE_MARKER)) {
+        Ok(_) => anyhow::bail!("incomplete recovery backup"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
 
 pub(super) struct KeyDirectory(#[cfg(unix)] File);
 
@@ -44,6 +66,9 @@ impl KeyDirectory {
     #[cfg(unix)]
     fn open_with(memory: &Path, create: bool, staging: bool) -> anyhow::Result<Self> {
         use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, open, openat, statat};
+        if !staging {
+            ensure_admitted(memory)?;
+        }
         anyhow::ensure!(memory.is_absolute(), "recovery path must be absolute");
         let owner = rustix::process::geteuid().as_raw();
         let mut directory = File::from(open(
@@ -59,10 +84,6 @@ impl KeyDirectory {
                 Component::Normal(name) => name,
                 _ => anyhow::bail!("unsafe recovery ancestor"),
             };
-            anyhow::ensure!(
-                staging || !name.as_encoded_bytes().starts_with(INCOMPLETE_PREFIX.as_bytes()),
-                "incomplete recovery backup"
-            );
             directory = File::from(openat(
                 &directory,
                 name,
