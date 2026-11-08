@@ -5,6 +5,14 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+/// Live spend ceiling in micro-USD and the candidate money estimate, built from
+/// the same send-time inputs as the token budget.
+#[derive(Clone)]
+pub(crate) struct CallSpend {
+    ceiling: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
+    estimate: Arc<dyn Fn(usize) -> Option<u64> + Send + Sync>,
+}
+
 /// Live G6 tokens and the candidate estimator for the called tools of one
 /// model turn. The turn engine attaches it from the pinned route and the
 /// decision context. Dispatch needs neither bindings nor a decision context.
@@ -12,6 +20,7 @@ use std::sync::Arc;
 pub(crate) struct CallTokenBudget {
     remaining: Arc<dyn Fn() -> u64 + Send + Sync>,
     estimate: Arc<dyn Fn(usize) -> Option<u64> + Send + Sync>,
+    spend: Option<Arc<CallSpend>>,
 }
 
 impl CallTokenBudget {
@@ -22,7 +31,21 @@ impl CallTokenBudget {
         Self {
             remaining: Arc::new(remaining),
             estimate: Arc::new(estimate),
+            spend: None,
         }
+    }
+
+    /// Adds the money predicate: `ceiling` is re-read on every admission.
+    pub(crate) fn with_spend(
+        mut self,
+        ceiling: impl Fn() -> Option<u64> + Send + Sync + 'static,
+        estimate: impl Fn(usize) -> Option<u64> + Send + Sync + 'static,
+    ) -> Self {
+        self.spend = Some(Arc::new(CallSpend {
+            ceiling: Arc::new(ceiling),
+            estimate: Arc::new(estimate),
+        }));
+        self
     }
 }
 
@@ -46,7 +69,12 @@ impl std::fmt::Debug for CallTokenBudget {
 
 impl PartialEq for CallTokenBudget {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.remaining, &other.remaining) && Arc::ptr_eq(&self.estimate, &other.estimate)
+        let spend_eq = match (&self.spend, &other.spend) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        };
+        Arc::ptr_eq(&self.remaining, &other.remaining) && Arc::ptr_eq(&self.estimate, &other.estimate) && spend_eq
     }
 }
 
@@ -308,8 +336,7 @@ pub(super) fn admit_called_tokens(
     let tokens = if name == "capability_search" {
         0
     } else {
-        let schema_bytes = serde_json::to_vec(&descriptor.parameters).map_or(usize::MAX, |value| value.len());
-        budget.tokens_for(schema_bytes).ok_or_else(|| {
+        budget.tokens_for(schema_bytes(&descriptor)).ok_or_else(|| {
             (
                 ToolExecutionStatus::Denied,
                 format!("tool '{name}' has no current token estimate"),
@@ -326,6 +353,41 @@ pub(super) fn admit_called_tokens(
     Ok(())
 }
 
+fn schema_bytes(descriptor: &ToolDescriptor) -> usize {
+    serde_json::to_vec(&descriptor.parameters).map_or(usize::MAX, |value| value.len())
+}
+
+/// The called tool's money estimate against the live spend ceiling. It runs at
+/// admission and again after approval waits, immediately before invocation, so
+/// a charge or a funding change made in between is seen. Discovery spends
+/// nothing. A missing estimate or an unreadable ceiling refuses.
+pub(super) fn admit_called_spend(
+    service: &ToolExecutionService,
+    context: &ToolExecutionContext,
+    name: &str,
+) -> Result<(), (ToolExecutionStatus, String)> {
+    let Some(spend) = context.call_budget.as_ref().and_then(|budget| budget.spend.as_deref()) else {
+        return Ok(());
+    };
+    let Some(descriptor) = service.current_descriptor(name) else {
+        return Ok(());
+    };
+    let refused = |reason: String| (ToolExecutionStatus::Denied, reason);
+    let micro_usd = if name == "capability_search" {
+        0
+    } else {
+        (spend.estimate)(schema_bytes(&descriptor))
+            .ok_or_else(|| refused(format!("tool '{name}' has no current spend estimate")))?
+    };
+    let ceiling = (spend.ceiling)().ok_or_else(|| refused(format!("tool '{name}' has no live spend ceiling")))?;
+    if micro_usd > ceiling {
+        return Err(refused(format!(
+            "tool '{name}' estimates {micro_usd} micro-USD but {ceiling} remain"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn admit(
     service: &ToolExecutionService,
     context: &ToolExecutionContext,
@@ -333,6 +395,7 @@ pub(super) fn admit(
 ) -> Result<(), (ToolExecutionStatus, String)> {
     admit_child(service, context, name, false)?;
     admit_called_tokens(service, context, name)?;
+    admit_called_spend(service, context, name)?;
     let Some(surface) = &context.turn_surface else {
         return Ok(());
     };

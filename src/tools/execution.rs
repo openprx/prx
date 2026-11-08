@@ -3224,6 +3224,7 @@ impl ToolExecutionService {
         // live registry changed. Recheck before the backend future is polled.
         if let Err((status, error)) = admission::admit_child(self, &context, &command.name, true)
             .and_then(|()| admission::admit_called_tokens(self, &context, &command.name))
+            .and_then(|()| admission::admit_called_spend(self, &context, &command.name))
         {
             let abandonment = self
                 .abandon_idempotent_execution(idempotency_lease.as_ref(), &context)
