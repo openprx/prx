@@ -289,7 +289,20 @@ jobs:
                   shared-key: test-archive-${{ matrix.name }}
                   cache-on-failure: true
             - name: Install cargo-nextest
-              run: cargo nextest --version 2>/dev/null | grep -q "^cargo-nextest 0.9.151 " || curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
+              run: |
+                  set -euo pipefail
+                  BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+                  RETRY=(--retry 5 --retry-all-errors --retry-delay 5 -fLsS)
+                  version="$(cargo nextest --version 2>/dev/null || true)"
+                  if ! grep -q "^cargo-nextest 0.9.151 " <<<"$version"; then
+                      # get.nexte.st has returned HTTP 504 upstream; fall back to the pinned GitHub release asset.
+                      if ! curl "${RETRY[@]}" https://get.nexte.st/0.9.151/linux | tar zxf - -C "$BIN_DIR"; then
+                          echo "get.nexte.st failed; falling back to the GitHub release asset"
+                          curl "${RETRY[@]}" https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-x86_64-unknown-linux-gnu.tar.gz | tar zxf - -C "$BIN_DIR"
+                      fi
+                  fi
+                  version="$(cargo nextest --version)"
+                  grep -q "^cargo-nextest 0.9.151 " <<<"$version"
             - name: Build the test archive
               run: cargo nextest archive --locked --all-features ${{ matrix.targets }} --archive-file prx-tests-${{ matrix.name }}.tar.zst
             - name: List every test (the sharded runs must add up to this)
@@ -362,7 +375,20 @@ jobs:
               with:
                   toolchain: 1.99.0
             - name: Install cargo-nextest
-              run: cargo nextest --version 2>/dev/null | grep -q "^cargo-nextest 0.9.151 " || curl -LsSf https://get.nexte.st/0.9.151/linux | tar zxf - -C "${CARGO_HOME:-~/.cargo}/bin"
+              run: |
+                  set -euo pipefail
+                  BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+                  RETRY=(--retry 5 --retry-all-errors --retry-delay 5 -fLsS)
+                  version="$(cargo nextest --version 2>/dev/null || true)"
+                  if ! grep -q "^cargo-nextest 0.9.151 " <<<"$version"; then
+                      # get.nexte.st has returned HTTP 504 upstream; fall back to the pinned GitHub release asset.
+                      if ! curl "${RETRY[@]}" https://get.nexte.st/0.9.151/linux | tar zxf - -C "$BIN_DIR"; then
+                          echo "get.nexte.st failed; falling back to the GitHub release asset"
+                          curl "${RETRY[@]}" https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-x86_64-unknown-linux-gnu.tar.gz | tar zxf - -C "$BIN_DIR"
+                      fi
+                  fi
+                  version="$(cargo nextest --version)"
+                  grep -q "^cargo-nextest 0.9.151 " <<<"$version"
             - if: needs.changes.outputs.heavy_timeout == '45'
               uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
               with:
