@@ -243,10 +243,17 @@ fn reg_server_config(dir: &std::path::Path, temperature: f64, tag: &str) -> Conf
 /// The Gateway turn runtime as `run_gateway` wires it: built by the
 /// production builder and registered as a reload participant.
 fn gateway_turn_runtime_owner(config: Config) -> (crate::config::SharedConfig, Arc<GatewayTurnRuntimeOwner>) {
+    gateway_turn_runtime_owner_over(config, Arc::new(MockMemory))
+}
+
+/// [`gateway_turn_runtime_owner`] over a caller-chosen memory backend.
+pub(super) fn gateway_turn_runtime_owner_over(
+    config: Config,
+    memory: Arc<dyn Memory>,
+) -> (crate::config::SharedConfig, Arc<GatewayTurnRuntimeOwner>) {
     std::fs::create_dir_all(&config.workspace_dir).expect("test: workspace dir");
     let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
     let manager = crate::config::new_shared(config);
-    let memory: Arc<dyn Memory> = Arc::new(MockMemory);
     let startup = build_gateway_turn_runtime(
         manager.pin(),
         Arc::clone(&manager),
@@ -475,6 +482,7 @@ async fn a_generation_that_drops_an_mcp_server_stops_its_child() {
     };
     let previous = Arc::new(generation(Arc::clone(&old_tool)));
     let mut prepared = PreparedGatewayTurnRuntime {
+        agents: idle_agents(),
         current: Arc::new(ArcSwap::from(Arc::clone(&previous))),
         previous,
         generation: generation(tool_for(&[])),
@@ -499,7 +507,7 @@ fn app_state_is_clone() {
 
 /// Build a minimal `AppState` whose cached C and hot D both start from `config`,
 /// for exercising the gateway authorization helpers in isolation.
-fn authz_test_state(config: Config) -> AppState {
+pub(super) fn authz_test_state(config: Config) -> AppState {
     AppState {
         config: crate::config::new_shared(config),
         provider: Arc::new(MockProvider::default()),
@@ -594,6 +602,7 @@ fn turn_runtime_swap_keeps_in_flight_generation_pinned_and_is_reversible() {
         deferred_changes: Arc::from([]),
     });
     let mut prepared = PreparedGatewayTurnRuntime {
+        agents: idle_agents(),
         current: Arc::clone(&current),
         previous: current.load_full(),
         generation: TurnRuntimeGeneration {

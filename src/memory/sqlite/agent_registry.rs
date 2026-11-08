@@ -1,5 +1,12 @@
 //! Multi-agent registry and erase schema (MA-01b1a): DDL, constraints and
-//! triggers only. Minting, retirement and erase behaviour live in later parts.
+//! triggers, plus the incarnation lifecycle of MA-01b1b-2 (lazy mint,
+//! retirement, reconcile). Erase and purge behaviour live in later parts.
+
+use super::SqliteMemory;
+use crate::memory::agent_registry::{AgentRefusal, AgentRegistry, RetiredIncarnation};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::Ordering;
 
 /// The closed inventory of erase-manifest stores (design inventory enum).
 const MANIFEST_STORES: [&str; 33] = [
@@ -291,4 +298,131 @@ pub(super) fn add_schema_scope_columns(conn: &rusqlite::Connection) -> anyhow::R
         add_scope_column(conn, table)?;
     }
     Ok(())
+}
+
+impl AgentRegistry for SqliteMemory {
+    fn resolve_incarnation(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        agent_key: &str,
+        config_revision: &str,
+        admit: &dyn Fn() -> Result<(), AgentRefusal>,
+    ) -> anyhow::Result<Result<String, AgentRefusal>> {
+        let writer = self.pool.write();
+        let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
+        if self.registry_unreconciled.load(Ordering::SeqCst) || self.pending_removals.lock().contains(agent_key) {
+            return Ok(Err(AgentRefusal::Disabled));
+        }
+        if let Err(refusal) = admit() {
+            return Ok(Err(refusal));
+        }
+        let find = |state: &str| -> rusqlite::Result<Option<String>> {
+            tx.query_row(
+                "SELECT incarnation FROM agent_incarnations
+                 WHERE workspace_id = ?1 AND owner_id = ?2 AND agent_key = ?3 AND state = ?4",
+                params![workspace_id, owner_id, agent_key, state],
+                |row| row.get(0),
+            )
+            .optional()
+        };
+        if find("retiring")?.is_some() {
+            return Ok(Err(AgentRefusal::Disabled));
+        }
+        if let Some(incarnation) = find("active")? {
+            return Ok(Ok(incarnation));
+        }
+        let incarnation = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO agent_incarnations VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
+            params![workspace_id, owner_id, agent_key, incarnation, config_revision],
+        )?;
+        tx.commit()?;
+        Ok(Ok(incarnation))
+    }
+
+    fn begin_removal(
+        &self,
+        workspace_id: &str,
+        agent_keys: &BTreeSet<String>,
+    ) -> anyhow::Result<Vec<RetiredIncarnation>> {
+        self.pending_removals.lock().extend(agent_keys.iter().cloned());
+        let writer = self.pool.write();
+        let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
+        let flipped = tx
+            .prepare(
+                "UPDATE agent_incarnations SET state = 'retiring'
+                 WHERE workspace_id = ?1 AND agent_key <> 'm' AND state = 'active'
+                   AND agent_key IN (SELECT value FROM json_each(?2))
+                 RETURNING owner_id, agent_key, incarnation",
+            )?
+            .query_map(params![workspace_id, serde_json::to_string(agent_keys)?], |row| {
+                Ok(RetiredIncarnation {
+                    workspace_id: workspace_id.to_owned(),
+                    owner_id: row.get(0)?,
+                    agent_key: row.get(1)?,
+                    incarnation: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        tx.commit()?;
+        Ok(flipped)
+    }
+
+    fn end_removal(&self, rows: &[RetiredIncarnation]) -> anyhow::Result<()> {
+        self.pending_removals.lock().clear();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let writer = self.pool.write();
+        let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
+        for row in rows {
+            tx.execute(
+                "UPDATE agent_incarnations SET state = 'active'
+                 WHERE workspace_id = ?1 AND owner_id = ?2 AND agent_key = ?3 AND incarnation = ?4
+                   AND state = 'retiring'",
+                params![row.workspace_id, row.owner_id, row.agent_key, row.incarnation],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        workspace_id: &str,
+        revisions: &BTreeMap<String, String>,
+        latch_on_failure: bool,
+    ) -> anyhow::Result<()> {
+        let result = self.reconcile_rows(workspace_id, revisions);
+        if result.is_ok() || latch_on_failure {
+            self.registry_unreconciled.store(result.is_err(), Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+impl SqliteMemory {
+    fn reconcile_rows(&self, workspace_id: &str, revisions: &BTreeMap<String, String>) -> anyhow::Result<()> {
+        let writer = self.pool.write();
+        let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE agent_incarnations SET state = 'retiring'
+             WHERE workspace_id = ?1 AND agent_key <> 'm' AND state = 'active'
+               AND agent_key NOT IN (SELECT value FROM json_each(?2))",
+            params![
+                workspace_id,
+                serde_json::to_string(&revisions.keys().collect::<Vec<_>>())?
+            ],
+        )?;
+        for (agent_key, revision) in revisions {
+            tx.execute(
+                "UPDATE agent_incarnations SET config_revision = ?3
+                 WHERE workspace_id = ?1 AND agent_key = ?2 AND state = 'active' AND config_revision <> ?3",
+                params![workspace_id, agent_key, revision],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }

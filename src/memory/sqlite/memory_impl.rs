@@ -38,6 +38,10 @@ impl Memory for SqliteMemory {
         Some(self)
     }
 
+    fn agent_registry(&self) -> Option<&dyn crate::memory::agent_registry::AgentRegistry> {
+        Some(self)
+    }
+
     fn with_erasure_origin(
         &self,
         origin: crate::memory::erasure::ErasureOrigin,

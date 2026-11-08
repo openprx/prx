@@ -201,6 +201,11 @@ impl Memory for EncryptedScope {
         self.inner.recovery_repository()
     }
 
+    /// Never delegated: an incarnation belongs to the plain backend's scope.
+    fn agent_registry(&self) -> Option<&dyn crate::memory::agent_registry::AgentRegistry> {
+        None
+    }
+
     fn name(&self) -> &str {
         // The ledger and event recorder select a backend by this name. The
         // inner store is that backend; this view only seals the bytes it writes.

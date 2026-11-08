@@ -279,6 +279,11 @@ impl Memory for LucidMemory {
         self.local.recovery_repository()
     }
 
+    /// Never delegated: the mirror has no incarnation registry of its own.
+    fn agent_registry(&self) -> Option<&dyn crate::memory::agent_registry::AgentRegistry> {
+        None
+    }
+
     fn name(&self) -> &str {
         "lucid"
     }

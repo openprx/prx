@@ -1308,6 +1308,11 @@ pub trait Memory: Send + Sync {
         None
     }
 
+    /// Unavailable for backends without a transactional agent incarnation registry.
+    fn agent_registry(&self) -> Option<&dyn crate::memory::agent_registry::AgentRegistry> {
+        None
+    }
+
     /// Whether execution requires this exact in-process memory capability.
     fn requires_scoped_execution(&self) -> bool {
         false
