@@ -593,6 +593,34 @@ impl SqliteMemory {
         Ok(())
     }
 
+    /// Corrupt the ingress source while retaining the durable event identity.
+    pub(crate) fn replace_event_source_for_test(&self, run_id: &str, source: &str) -> anyhow::Result<()> {
+        let updated = self.pool.write().execute(
+            "UPDATE message_events SET source = ?1 WHERE run_id = ?2",
+            params![source, run_id],
+        )?;
+        anyhow::ensure!(updated >= 1, "source event not found");
+        Ok(())
+    }
+
+    /// Corrupt stored event bytes while retaining the durable event identity.
+    pub(crate) fn replace_event_content_for_test(&self, event_id: &str, content: &str) -> anyhow::Result<()> {
+        let updated = self.pool.write().execute(
+            "UPDATE message_events SET content = ?1 WHERE event_id = ?2",
+            params![content, event_id],
+        )?;
+        anyhow::ensure!(updated == 1, "content event not found");
+        Ok(())
+    }
+
+    /// Attempt to relabel a settled recovery receipt; the immutable trigger refuses this.
+    pub(crate) fn replace_recovery_attestation_state_for_test(&self, state: &str) -> anyhow::Result<()> {
+        self.pool
+            .write()
+            .execute("UPDATE recovery_attestations SET state = ?1", params![state])?;
+        Ok(())
+    }
+
     pub(crate) fn reject_user_events_for_test(&self) -> anyhow::Result<()> {
         self.pool.write().execute_batch(
             "CREATE TRIGGER reject_test_ingress BEFORE INSERT ON message_events

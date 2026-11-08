@@ -3,6 +3,7 @@
 use super::{recovery_config, recovery_input, recovery_recorder};
 use crate::memory::Memory;
 use crate::memory::MessageEventSource;
+use crate::memory::SqliteMemory;
 use crate::memory::ingress_recovery::{IngressAttestationError, IngressCapsule, IngressRecoveryScope};
 use crate::memory::recovery_authority::{RecoveryChain, RecoveryPublication};
 use crate::runtime::ingress_recovery::tombstone_fixture;
@@ -785,8 +786,8 @@ fn is_unknown_key(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<IngressAttestationError>() && cause.to_string().contains("unknown key"))
 }
 
-fn brain(workspace: &Path) -> rusqlite::Connection {
-    rusqlite::Connection::open(workspace.join("memory/brain.db")).expect("test: brain")
+fn sqlite(workspace: &Path) -> SqliteMemory {
+    SqliteMemory::new(workspace).expect("test: sqlite accessor")
 }
 
 pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
@@ -832,8 +833,8 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
     );
 
     let source_cell = settled_setup_with(default_facts(), None).await;
-    brain(&source_cell.workspace)
-        .execute("UPDATE message_events SET source='channel' WHERE run_id='prx_run'", [])
+    sqlite(&source_cell.workspace)
+        .replace_event_source_for_test("prx_run", "channel")
         .expect("test: source");
     let error = source_cell
         .recovery
@@ -889,11 +890,8 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
     );
 
     let bytes_cell = settled_setup_with(default_facts(), None).await;
-    brain(&bytes_cell.workspace)
-        .execute(
-            "UPDATE message_events SET content='mutated' WHERE event_id=?1",
-            [&bytes_cell.final_id],
-        )
+    sqlite(&bytes_cell.workspace)
+        .replace_event_content_for_test(&bytes_cell.final_id, "mutated")
         .expect("test: terminal bytes");
     let error = bytes_cell
         .recovery
@@ -916,8 +914,8 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
     assert!(is_mismatch(&error, "key_id"), "key id: {error:#}");
 
     let relabel = settled_setup_with(default_facts(), None).await;
-    let relabel_err = brain(&relabel.workspace)
-        .execute("UPDATE recovery_attestations SET state='pending'", [])
+    let relabel_err = sqlite(&relabel.workspace)
+        .replace_recovery_attestation_state_for_test("pending")
         .expect_err("state relabel");
     assert!(
         relabel_err.to_string().contains("immutable recovery receipt"),
