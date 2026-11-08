@@ -118,6 +118,9 @@ impl PreparedConfigGeneration for GatePrepared {
 
 struct Harness {
     dir: tempfile::TempDir,
+    /// Directory whose workspace holds the registry database.
+    db_dir: std::path::PathBuf,
+    memory: Arc<SqliteMemory>,
     manager: crate::config::SharedConfig,
     state: AppState,
     gate: Arc<Gate>,
@@ -143,6 +146,19 @@ fn harness(agents: Agents<'_>, switch: bool, seed: impl FnOnce(&rusqlite::Connec
     std::fs::create_dir_all(&config.workspace_dir).expect("test: workspace dir");
     let memory = Arc::new(SqliteMemory::new(&config.workspace_dir).expect("test: sqlite memory"));
     seed(&db(dir.path()), &config.workspace_dir.to_string_lossy());
+    let db_dir = dir.path().to_owned();
+    start(dir, db_dir, config, memory)
+}
+
+/// A second real owner over the first one's backend, in its own workspace.
+fn second_owner(first: &Harness, agents: Agents<'_>) -> Harness {
+    let dir = tempfile::TempDir::new().expect("test: temp dir");
+    let config = config(dir.path(), agents, true);
+    std::fs::create_dir_all(&config.workspace_dir).expect("test: workspace dir");
+    start(dir, first.db_dir.clone(), config, Arc::clone(&first.memory))
+}
+
+fn start(dir: tempfile::TempDir, db_dir: std::path::PathBuf, config: Config, memory: Arc<SqliteMemory>) -> Harness {
     let (manager, owner) = gateway_turn_runtime_owner_over(config, memory.clone());
     let (entered_tx, entered) = mpsc::channel();
     let (release, release_rx) = mpsc::channel();
@@ -155,10 +171,12 @@ fn harness(agents: Agents<'_>, switch: bool, seed: impl FnOnce(&rusqlite::Connec
     manager.register_participant(&participant);
     let mut state = authz_test_state(Config::default());
     state.config = Arc::clone(&manager);
-    state.mem = memory;
+    state.mem = memory.clone();
     state.turn_runtime = Some(Arc::clone(&owner));
     Harness {
         dir,
+        db_dir,
+        memory,
         manager,
         state,
         gate,
@@ -185,7 +203,7 @@ impl Harness {
 
     /// `(incarnation, state, config_revision)` of every row of `key`.
     fn rows(&self, key: &str) -> Vec<(String, String, String)> {
-        let conn = db(self.dir.path());
+        let conn = db(&self.db_dir);
         let mut stmt = conn
             .prepare(
                 "SELECT incarnation, state, config_revision FROM agent_incarnations
@@ -199,7 +217,7 @@ impl Harness {
     }
 
     fn named_rows(&self) -> i64 {
-        db(self.dir.path())
+        db(&self.db_dir)
             .query_row(
                 "SELECT count(*) FROM agent_incarnations WHERE agent_key <> 'm'",
                 [],
@@ -338,22 +356,41 @@ async fn agent_recreation_uses_new_incarnation() {
     // its target while the commit holds the removal of Y is refused (409) and
     // mints nothing.
     *h.gate.mode.lock() = Mode::Block;
-    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(1);
-    let held = tokio::spawn(send(
-        h.state.clone(),
-        axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx)),
-    ));
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let (body_tx, mut body_rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(1);
+    let (polled_tx, polled_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut polled_tx = Some(polled_tx);
+    // The first poll of the body proves the handler already pinned its runtime.
+    let stream = futures::stream::poll_fn(move |cx| {
+        if let Some(polled) = polled_tx.take() {
+            polled.send(()).ok();
+        }
+        body_rx
+            .poll_recv(cx)
+            .map(|chunk| chunk.map(Ok::<_, std::convert::Infallible>))
+    });
+    let held = tokio::spawn(send(h.state.clone(), axum::body::Body::from_stream(stream)));
+    let wait = std::time::Duration::from_secs(20);
+    tokio::time::timeout(wait, polled_rx)
+        .await
+        .expect("test: the handler polled the body in time")
+        .expect("test: the poll signal was sent");
     let manager = Arc::clone(&h.manager);
     let pending_config = config(h.dir.path(), &[("sleeper", 0.1, false)], true);
     let reload = std::thread::spawn(move || manager.apply_runtime_config(pending_config, ConfigReloadTrigger::Test));
-    h.entered.recv().expect("test: the commit is blocked");
+    h.entered.recv_timeout(wait).expect("test: the commit is blocked");
     body_tx
-        .send(Ok(axum::body::Bytes::from(message(Some("y")))))
+        .send(axum::body::Bytes::from(message(Some("y"))))
         .await
         .expect("test: the held request is waiting");
     drop(body_tx);
-    expect(&held.await.expect("test: held request"), 409, Some("agent_disabled"));
+    expect(
+        &tokio::time::timeout(wait, held)
+            .await
+            .expect("test: the held request finished")
+            .expect("test: held request"),
+        409,
+        Some("agent_disabled"),
+    );
     assert!(h.rows("n:y").is_empty(), "the barrier writes no row");
     h.release.send(()).expect("test: release");
     reload
@@ -391,8 +428,9 @@ async fn agent_recreation_uses_new_incarnation() {
     );
 }
 
-/// 5c. A failed startup sweep latches every targeted resolve until a later
-/// reconcile succeeds. The failure is injected on the real path with a trigger.
+/// 5c. A failed startup sweep latches the failed owner's targeted resolves
+/// until its own reconcile succeeds, whatever another owner on the same backend
+/// does. The failure is injected on the real path with a workspace-scoped trigger.
 #[tokio::test]
 async fn failed_startup_sweep_latches_targeted_turns_until_reconciled() {
     let h = harness(&[("v", 0.1, true), ("w", 0.1, true)], true, |conn, workspace| {
@@ -401,9 +439,10 @@ async fn failed_startup_sweep_latches_targeted_turns_until_reconciled() {
             rusqlite::params![workspace, owner_id(), revision_of(0.1)],
         )
         .expect("test: seed Z");
-        conn.execute_batch(
-            "CREATE TRIGGER t_fail BEFORE UPDATE ON agent_incarnations BEGIN SELECT RAISE(ABORT, 'injected'); END",
-        )
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER t_fail BEFORE UPDATE ON agent_incarnations WHEN OLD.workspace_id = '{workspace}'
+             BEGIN SELECT RAISE(ABORT, 'injected'); END"
+        ))
         .expect("test: inject the sweep failure");
     });
     expect(&h.post(Some("v")).await, 409, Some("agent_disabled"));
@@ -411,14 +450,17 @@ async fn failed_startup_sweep_latches_targeted_turns_until_reconciled() {
     assert_eq!(h.active("n:z").len(), 1, "the failed sweep left Z active");
     assert_eq!(h.post(None).await, (404, None), "Main is unaffected by the latch");
 
-    // Another owner's successful reconcile does not clear this owner's latch.
-    let other = harness(&[("q", 0.1, true)], true, |_, _| {});
+    // A second owner on the same backend reconciles successfully and serves.
+    let other = second_owner(&h, &[("q", 0.1, true)]);
     other
         .reload(&[("q", 0.2, true)])
         .expect("test: the other owner reloads");
+    expect(&other.post(Some("q")).await, RESOLVED.0, RESOLVED.1);
+    assert_eq!(other.active("n:q").len(), 1, "the other owner mints");
     expect(&h.post(Some("v")).await, 409, Some("agent_disabled"));
+    assert!(h.rows("n:v").is_empty(), "the first owner's latch still writes no row");
 
-    db(h.dir.path())
+    db(&h.db_dir)
         .execute_batch("DROP TRIGGER t_fail")
         .expect("test: remove the failure");
     h.reload(&[("v", 0.1, true), ("w", 0.2, true)])
