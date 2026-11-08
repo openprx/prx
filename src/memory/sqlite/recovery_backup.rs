@@ -133,8 +133,14 @@ pub(super) fn backup_bundle(conn: &Connection, target: &Path) -> anyhow::Result<
     // snapshot work, and the marker keeps it so after the rename.
     let staging = root.join(format!("{INCOMPLETE_PREFIX}{}", uuid::Uuid::new_v4()));
     create_private_dir(&staging)?;
-    sync_directory(root)?;
-    let outcome = stage_and_publish(conn, file_name, bundle, root, &staging);
+    // The marker follows the mkdir at once; then the directory and its parent
+    // are made durable, all before any snapshot work.
+    let marked = std::fs::File::create_new(staging.join(INCOMPLETE_MARKER))
+        .and_then(|marker| marker.sync_all())
+        .map_err(anyhow::Error::from)
+        .and_then(|()| sync_directory(&staging))
+        .and_then(|()| sync_directory(root));
+    let outcome = marked.and_then(|()| stage_and_publish(conn, file_name, bundle, root, &staging));
     // After a successful rename the staging path is gone; this only cleans failures.
     discard(std::fs::remove_dir_all(&staging));
     outcome
@@ -147,8 +153,6 @@ fn stage_and_publish(
     root: &Path,
     staging: &Path,
 ) -> anyhow::Result<()> {
-    std::fs::File::create_new(staging.join(INCOMPLETE_MARKER))?.sync_all()?;
-    sync_directory(staging)?;
     let staged = staging.join(file_name);
     // A coherent snapshot: a live write-ahead log is never copied byte for byte.
     conn.execute("VACUUM INTO ?1", params![staged.to_string_lossy().to_string()])?;

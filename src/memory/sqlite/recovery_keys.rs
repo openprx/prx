@@ -26,26 +26,28 @@ pub(super) const INCOMPLETE_MARKER: &str = ".backup-incomplete";
 pub(super) const INCOMPLETE_PREFIX: &str = ".backup-incomplete-";
 
 /// Non-mutating admission check, shared by the constructor, activation and the
-/// backup destination: refuse a path with an attempt-named component (whatever
-/// the directory holds) or whose directory carries the incomplete marker. An
-/// attempt that was moved to another name keeps its marker as evidence; moving
-/// it AND deleting that marker by hand is outside this guarantee.
+/// backup destination. The path is made absolute first, then the directory and
+/// every ancestor must have no attempt-named component and no incomplete
+/// marker, whatever else they hold. An attempt that was moved to another name
+/// keeps its marker as evidence; moving it AND deleting that marker by hand is
+/// outside this guarantee.
 pub(super) fn ensure_admitted(path: &Path) -> anyhow::Result<()> {
     let reserved = INCOMPLETE_PREFIX.as_bytes();
-    for component in path.components() {
-        if let std::path::Component::Normal(name) = component {
-            let head = name.as_encoded_bytes().get(..reserved.len());
-            anyhow::ensure!(
-                !head.is_some_and(|head| head.eq_ignore_ascii_case(reserved)),
-                "incomplete recovery backup"
-            );
+    for ancestor in std::path::absolute(path)?.ancestors() {
+        let head = ancestor
+            .file_name()
+            .and_then(|name| name.as_encoded_bytes().get(..reserved.len()));
+        anyhow::ensure!(
+            !head.is_some_and(|head| head.eq_ignore_ascii_case(reserved)),
+            "incomplete recovery backup"
+        );
+        match std::fs::symlink_metadata(ancestor.join(INCOMPLETE_MARKER)) {
+            Ok(_) => anyhow::bail!("incomplete recovery backup"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
-    match std::fs::symlink_metadata(path.join(INCOMPLETE_MARKER)) {
-        Ok(_) => anyhow::bail!("incomplete recovery backup"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+    Ok(())
 }
 
 pub(super) struct KeyDirectory(#[cfg(unix)] File);

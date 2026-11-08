@@ -838,6 +838,22 @@ fn refusal<T>(result: anyhow::Result<T>, what: &str) -> anyhow::Result<anyhow::E
     }
 }
 
+/// `path` as a path relative to the current directory (read only, never changed).
+fn relative_to_cwd(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let from = cwd.components().collect::<Vec<_>>();
+    let to = path.components().collect::<Vec<_>>();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut relative = std::path::PathBuf::new();
+    for _ in common..from.len() {
+        relative.push("..");
+    }
+    for component in to.iter().skip(common) {
+        relative.push(component);
+    }
+    Ok(relative)
+}
+
 /// Every file and directory below `root` with its bytes.
 fn tree(root: &std::path::Path) -> anyhow::Result<std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>> {
     let mut found = std::collections::BTreeMap::new();
@@ -1154,7 +1170,51 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
             }
         }
         assert_refused_untouched(&leftover)?;
+        // Below the attempt, absolute or relative to the working directory:
+        // constructor and backup destination refuse without creating anything.
+        let before = tree(&case)?;
+        let descendant = leftover.join("inner").join("target.db");
+        refusal(
+            SqliteMemory::new_with_path(descendant.clone()),
+            "constructing below an attempt",
+        )?;
+        refusal(
+            memory.backup_database_to(&descendant).await,
+            "backing up below an attempt",
+        )?;
+        refusal(
+            SqliteMemory::new_with_path(relative_to_cwd(&leftover.join("target.db"))?),
+            "constructing through a relative path",
+        )?;
+        refusal(
+            SqliteMemory::new_with_path(relative_to_cwd(&descendant)?),
+            "constructing below an attempt through a relative path",
+        )?;
+        assert!(tree(&case)? == before, "{name}: listing and bytes unchanged");
     }
+    // An already-open handle whose directory becomes an attempt refuses activation.
+    let (_open_dir, open) = store()?;
+    let open_memory = parent_of(&open.db_path)?;
+    std::fs::write(open_memory.join(".backup-incomplete"), b"")?;
+    let without_database = |directory: &std::path::Path| -> anyhow::Result<_> {
+        let mut found = tree(directory)?;
+        found.retain(|path, _| {
+            !path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("brain.db"))
+        });
+        Ok(found)
+    };
+    let before = without_database(&open_memory)?;
+    refusal(
+        open.activate_recovery_authority(),
+        "activating an open handle in an attempt",
+    )?;
+    assert!(
+        without_database(&open_memory)? == before,
+        "open handle: listing and bytes unchanged"
+    );
+    assert!(!open_memory.join(".recovery_keys").exists());
     // A reserved final basename and a reserved ancestor are rejected with no side effect.
     for (index, reserved) in [".backup-incomplete-x/target.db", ".BACKUP-INCOMPLETE-y/inner/target.db"]
         .into_iter()
