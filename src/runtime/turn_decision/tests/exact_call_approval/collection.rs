@@ -245,6 +245,16 @@ async fn exact_file_collection_with_legacy_events(
         CollectionBudget::Dialect { .. } => {
             // 1 micro-USD per token: the ceiling sits between the two request sizes.
             config.cost.daily_limit_usd = 0.007;
+            // A local model with no price row is free, so the ceiling needs a real row.
+            config.cost.prices.insert(
+                "ollama/prx-local-model".to_owned(),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+            );
         }
     }
     config.save().await.expect("owned fixture config");
