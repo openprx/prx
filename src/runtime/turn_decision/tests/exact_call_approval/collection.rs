@@ -176,7 +176,7 @@ async fn collection_cost_uses_the_provider_schema_dialect() {
     }))
     .await;
     usage::PROVIDER_DIALECT.set(crate::tools::ToolSchemaDialect::Raw);
-    usage::EXPECTED_REFUSAL.set(Some("exceeds the"));
+    usage::EXPECTED_REFUSAL.set(Some("provider send refused: the estimated cost of"));
     Box::pin(exact_file_collection_with_budget(CollectionBudget::Dialect {
         gemini: false,
     }))
@@ -344,7 +344,16 @@ async fn exact_file_collection_with_legacy_events(
             .decide_agent_initial(proof.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .unwrap();
-        assert_eq!(predictions.load(Ordering::SeqCst), 0, "collection is code-issued, no prediction action");
+        // A priced model is funded for a decision prediction; the unpriced default is not.
+        if matches!(budget, CollectionBudget::Dialect { .. }) {
+            // The relaxation must not hide a flow that never reaches collection.
+            assert!(
+                context.approval_collection_proof().is_some(),
+                "the priced fixture must still issue the real approval collection"
+            );
+        } else {
+            assert_eq!(predictions.load(Ordering::SeqCst), 0, "collection is code-issued, no prediction action");
+        }
         // This is an accounting-owner regression, not a manufactured child
         // capability. The real grant publication is exercised in recursive_budget.
         let initial_recursive_budget = (recursive_budget == RecursiveBudgetCase::Allocated).then(|| {
