@@ -2436,17 +2436,31 @@ async fn run_console_resume(
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<jobs::JobOutput> {
     use crate::agent::terminal::{TurnTerminalDraft, TurnTerminalStatus};
+    use crate::runtime::turn_source::TurnSourceProof;
     use crate::tools::ToolExecutionStatus;
     let envelope = decision.proof.envelope();
     let started_at = Utc::now();
+    let execution = crate::tools::surface_owner::model_turn_context(
+        envelope.clone(),
+        "private",
+        crate::tools::surface_owner::SurfaceParts {
+            execution: decision.service.execution(),
+            catalog: decision.service.catalog(),
+            publication_policy: decision.service.publication_policy(),
+            tiering: decision.service.tool_tiering(),
+            security: decision.service.security(),
+            pinned_model: decision.proof.model_binding().pinned_model(),
+            channel: decision.service.channel_surface(),
+            inherited_exclusions: &[],
+            sender: decision.proof.policy_sender(),
+            channel_name: decision.proof.policy_channel(),
+            chat_type: decision.proof.policy_chat_type(),
+            tool_calls_allowed: decision.service.model_can_call_tools(decision.proof),
+        },
+    );
     let outcome = decision
         .service
-        .execute_agent_resume(
-            decision.proof,
-            &decision.context,
-            &crate::tools::ToolExecutionContext::new(envelope.clone(), "private").with_chat_id(&envelope.session_key),
-            cancellation,
-        )
+        .execute_agent_resume(decision.proof, &decision.context, &execution, cancellation)
         .await?;
     let (status, reply) = match outcome.status {
         ToolExecutionStatus::Succeeded => (

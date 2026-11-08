@@ -986,14 +986,27 @@ impl ChatTurnBinding {
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<(String, bool)> {
         use crate::agent::terminal::{TurnTerminalDraft, TurnTerminalStatus};
+        use crate::runtime::turn_source::TurnSourceProof;
         let decided = self.decision.get().context("chat resume has no decision")?;
         anyhow::ensure!(decided.resume, "chat turn is not an explicit resume");
-        let mut execution = crate::tools::ToolExecutionContext::new(self.envelope.clone(), "private")
-            .with_chat_id(&self.envelope.session_key)
-            .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
-        execution.turn_surface = Some(std::sync::Arc::new(crate::tools::surface_owner::build(
-            decided.service.turn_surface_parts(self, &[]),
-        )));
+        let execution = crate::tools::surface_owner::model_turn_context(
+            self.envelope.clone(),
+            "private",
+            crate::tools::surface_owner::SurfaceParts {
+                execution: decided.service.execution(),
+                catalog: decided.service.catalog(),
+                publication_policy: decided.service.publication_policy(),
+                tiering: decided.service.tool_tiering(),
+                security: decided.service.security(),
+                pinned_model: self.model_binding().pinned_model(),
+                channel: decided.service.channel_surface(),
+                inherited_exclusions: &[],
+                sender: self.policy_sender(),
+                channel_name: self.policy_channel(),
+                chat_type: self.policy_chat_type(),
+                tool_calls_allowed: decided.service.model_can_call_tools(self),
+            },
+        );
         let outcome = decided
             .service
             .execute_agent_resume(self, &decided.context, &execution, cancellation)

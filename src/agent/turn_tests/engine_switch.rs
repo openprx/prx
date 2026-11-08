@@ -1,8 +1,13 @@
 #![cfg(test)]
 //! Surface ownership with the decision engine off. Card 03 adds enabled-engine cells.
 use super::*;
+use crate::agent::turn_contracts::ChatMode;
+use crate::agent::turn_engine::run_turn;
+use crate::agent::turn_request::{TurnDelivery, TurnRequest, TurnSchedule, TurnServices};
 use crate::agent::turn_tests::admission::AdmittedTurn;
-use crate::tools::{DispatchOrigin, ToolExecutionCommand, ToolExecutionStatus};
+use crate::providers::traits::ProviderCapabilities;
+use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall};
+use std::collections::VecDeque;
 
 fn channel_message() -> crate::channels::traits::ChannelMessage {
     crate::channels::traits::ChannelMessage {
@@ -23,8 +28,41 @@ fn channel_message() -> crate::channels::traits::ChannelMessage {
     }
 }
 
-/// Engine disabled: a channel turn does not publish a channel-excluded tool,
-/// and dispatch of that name is Denied with no backend call.
+struct EngineOffProvider {
+    published: Arc<Mutex<Vec<String>>>,
+    responses: Mutex<VecDeque<ChatResponse>>,
+}
+
+#[async_trait]
+impl Provider for EngineOffProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+        anyhow::bail!("fixture requires a structured request")
+    }
+    async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+        let names = request
+            .tools
+            .unwrap_or(&[])
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect();
+        *self.published.lock().expect("published tools") = names;
+        self.responses
+            .lock()
+            .expect("scripted responses")
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted"))
+    }
+}
+
+/// Engine disabled: the real `turn_engine` path publishes no channel-excluded
+/// tool and a dispatch of that name is Denied with no backend call. Origin and
+/// surface are left to production stamping.
 #[tokio::test]
 async fn tool_surface_is_built_without_decision_service() {
     let workspace = tempfile::tempdir().expect("channel workspace");
@@ -40,25 +78,85 @@ async fn tool_surface_is_built_without_decision_service() {
         name: "project_tool".to_owned(),
         execution_order: Arc::clone(&dispatches),
     }) as Box<dyn Tool>]);
-    let admitted = AdmittedTurn::with_channel(config, channel_message(), registry).await;
-    let decision = admitted.decision();
-    let surface = crate::tools::surface_owner::build(decision.service.turn_surface_parts(decision.proof, &[]));
-    assert!(!surface.contains("project_tool"), "channel-excluded tool was published");
-    let adapter = admitted.adapter();
-    let service = adapter
-        .tool_execution_service
-        .clone()
-        .expect("fixture execution service");
-    let mut context = adapter.tool_execution_context.clone();
-    context.dispatch_origin = DispatchOrigin::ModelTurn;
-    context.turn_surface = Some(Arc::new(surface));
-    let outcome = service
-        .execute(
-            ToolExecutionCommand::new("project_tool", serde_json::json!({})),
-            context,
-            None,
-        )
-        .await;
-    assert_eq!(outcome.status, ToolExecutionStatus::Denied);
+    let admitted = AdmittedTurn::with_channel(config, channel_message(), Arc::clone(&registry)).await;
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let provider = EngineOffProvider {
+        published: Arc::clone(&published),
+        responses: Mutex::new(
+            vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".into(),
+                        name: "project_tool".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+            ]
+            .into(),
+        ),
+    };
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run the project tool")];
+    let result = run_turn(
+        &mut history,
+        TurnRequest {
+            advice: None,
+            channel_name: "wacli",
+            scope: None,
+            mode: ChatMode::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: TurnSchedule {
+                read_only_tool_concurrency_window: 1,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: None,
+            decision: admitted.decision(),
+        },
+        TurnServices {
+            provider: &provider,
+            provider_name: "ollama",
+            model: "prx-local-model",
+            temperature: 0.0,
+            tools_registry: registry,
+            observer: &crate::observability::NoopObserver,
+            hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(admitted.adapter()),
+            memory: admitted.memory_runtime(),
+        },
+        TurnDelivery {
+            cancellation: None,
+            on_delta: None,
+            on_tool_call: None,
+        },
+    )
+    .await;
+    let _ = result;
+    assert!(
+        !published
+            .lock()
+            .expect("published tools")
+            .iter()
+            .any(|name| name == "project_tool"),
+        "channel-excluded tool was published: {:?}",
+        published.lock().expect("published tools")
+    );
     assert!(dispatches.lock().expect("dispatch log").is_empty());
+    let denied = history
+        .iter()
+        .any(|message| message.role == "tool" && message.content.contains("was not exposed for this turn"));
+    assert!(
+        denied,
+        "engine-off dispatch of the excluded tool was not Denied: {history:?}"
+    );
 }

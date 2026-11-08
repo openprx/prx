@@ -121,6 +121,7 @@ fn console_plugin_context(config: &crate::config::Config) -> crate::tools::ToolE
         .with_channel("console")
         .with_sender("console-operator");
     crate::tools::ToolExecutionContext::new(envelope, "private")
+        .with_dispatch_origin(crate::tools::DispatchOrigin::Operator)
 }
 
 #[cfg(feature = "wasm-plugins")]

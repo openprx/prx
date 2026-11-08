@@ -648,7 +648,20 @@ async fn run_turn_unguarded(
     // context is fixed for the lifetime of this turn.
     let inherited_exclusions = crate::tools::sessions_spawn::ambient_channel_excluded_tools();
     let safety_surface = Arc::new(crate::tools::surface_owner::build(
-        service.turn_surface_parts(proof, &inherited_exclusions),
+        crate::tools::surface_owner::SurfaceParts {
+            execution: service.execution(),
+            catalog: service.catalog(),
+            publication_policy: service.publication_policy(),
+            tiering: service.tool_tiering(),
+            security: service.security(),
+            pinned_model: proof.model_binding().pinned_model(),
+            channel: service.channel_surface(),
+            inherited_exclusions: &inherited_exclusions,
+            sender: proof.policy_sender(),
+            channel_name: proof.policy_channel(),
+            chat_type: proof.policy_chat_type(),
+            tool_calls_allowed: service.model_can_call_tools(proof),
+        },
     ));
     let mut iteration = 0usize;
     loop {
@@ -2114,20 +2127,18 @@ async fn run_turn_unguarded(
             }
         }
         if let Some(specs) = discovery_dispatch_specs {
-            {
-                let (execution, bound_context) = service.bind_agent_execution_with_runtime(
-                    proof,
-                    context,
-                    &execution_adapter.tool_execution_context,
-                    &specs,
-                    execution_adapter.tool_execution_service.clone(),
-                )?;
-                execution_adapter.allowed_tool_names = Some(std::sync::Arc::new(
-                    specs.iter().map(|spec| spec.name.clone()).collect(),
-                ));
-                execution_adapter.tool_execution_service = Some(execution);
-                execution_adapter.tool_execution_context = bound_context;
-            }
+            let (execution, bound_context) = service.bind_agent_execution_with_runtime(
+                proof,
+                context,
+                &execution_adapter.tool_execution_context,
+                &specs,
+                execution_adapter.tool_execution_service.clone(),
+            )?;
+            execution_adapter.allowed_tool_names = Some(std::sync::Arc::new(
+                specs.iter().map(|spec| spec.name.clone()).collect(),
+            ));
+            execution_adapter.tool_execution_service = Some(execution);
+            execution_adapter.tool_execution_context = bound_context;
             execution_adapter.tool_execution_context.dispatch_origin = crate::tools::DispatchOrigin::ModelTurn;
             execution_adapter.tool_execution_context.turn_surface =
                 Some(Arc::new(safety_surface.for_publication(&specs)));

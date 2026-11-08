@@ -19,29 +19,6 @@ use crate::causal_tree::gates::{GateOutcome, HardGates};
 use crate::tools::ToolSpec;
 
 impl TurnDecisionService {
-    /// Data for the decision-free surface owner. The algorithm lives in
-    /// `tools::surface_owner`; this only copies the binding's pinned inputs.
-    pub(crate) fn turn_surface_parts<'a>(
-        &'a self,
-        proof: &'a dyn TurnSourceProof,
-        inherited_exclusions: &'a [String],
-    ) -> crate::tools::surface_owner::SurfaceParts<'a> {
-        crate::tools::surface_owner::SurfaceParts {
-            execution: &self.execution,
-            catalog: &self.catalog,
-            publication_policy: &self.publication_policy,
-            tiering: &self.generation.effective.tool_tiering,
-            security: &self.security,
-            pinned_model: proof.model_binding().pinned_model(),
-            channel: self.surface == TurnSurfaceKind::Channel,
-            inherited_exclusions,
-            sender: proof.policy_sender(),
-            channel_name: proof.policy_channel(),
-            chat_type: proof.policy_chat_type(),
-            tool_calls_allowed: self.model_can_call_tools(proof),
-        }
-    }
-
     /// Local operator commands retain the actual Interactive publication.
     /// This validates source provenance without inventing a model decision.
     pub(crate) fn verify_operator_spawn_source(
