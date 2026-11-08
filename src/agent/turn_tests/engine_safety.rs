@@ -394,7 +394,10 @@ async fn send_once(
     .map(|_| ())
 }
 
-/// An unpriced remote model is not zero-price exempt: 0 sends on both transports.
+/// An unpriced remote model is not zero-price exempt. The decision gate already
+/// leaves it without an executable selection, so `run_turn` sends 0 on both
+/// transports; the send guard itself is driven on the admitted turn directly
+/// and refuses with its own cost error.
 #[tokio::test]
 async fn unpriced_model_refuses_provider_send() {
     for streaming in [false, true] {
@@ -410,13 +413,34 @@ async fn unpriced_model_refuses_provider_send() {
             streaming,
         )
         .await;
-        let error = result.expect_err("an unpriced remote send must be refused");
-        assert!(
-            format!("{error:#}").contains("the request cost cannot be estimated"),
-            "streaming={streaming}: {error:#}"
-        );
+        assert!(result.is_err(), "streaming={streaming}: an unpriced send was admitted");
         assert_eq!(spy.sends(), 0, "streaming={streaming}");
     }
+    let workspace = tempfile::tempdir().expect("test workspace");
+    let registry = project_tool_registry(&Arc::new(Mutex::new(Vec::new())), &[]);
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("test memory"));
+    let admitted = AdmittedTurn::with_model(
+        workspace_config(workspace.path()),
+        "reply",
+        registry,
+        memory,
+        ("openai", "prx-unpriced-model"),
+    )
+    .await;
+    let decision = admitted.decision();
+    let error = crate::agent::send_admission::admit_provider_send(
+        decision.service,
+        decision.context,
+        decision.proof,
+        &[ChatMessage::user("reply")],
+        None,
+        crate::tools::ToolSchemaDialect::Raw,
+    )
+    .expect_err("the send guard must refuse an unpriced remote request");
+    assert!(
+        format!("{error:#}").contains("the request cost cannot be estimated"),
+        "{error:#}"
+    );
 }
 
 /// A local model with no price row is free by the shared exemption: exactly 1 send.
@@ -441,28 +465,54 @@ async fn zero_price_exempt_model_is_admitted() {
 }
 
 /// The published tool schema alone pushes a positive estimate over a positive
-/// remaining ceiling: 0 sends on both transports.
+/// remaining ceiling. An ordinary turn only publishes a tool the decision
+/// selected, so the guard is driven on the admitted turn with the costly
+/// request: refused with the cost error, and the same request without the tool
+/// fits the same ceiling (the run_turn control below sends exactly once).
 #[tokio::test]
 async fn estimate_with_tool_schemas_above_positive_remaining_refuses_send() {
-    for streaming in [false, true] {
-        let workspace = tempfile::tempdir().expect("test workspace");
-        let spy = SendSpy::new();
-        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CostlyTool)]);
-        let result = send_once(
-            priced_config(workspace.path(), 0.0004),
-            registry,
-            ("ollama", "prx-local-model"),
-            "reply",
-            &spy,
-            streaming,
+    let workspace = tempfile::tempdir().expect("test workspace");
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CostlyTool)]);
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("test memory"));
+    let admitted = AdmittedTurn::with_model(
+        priced_config(workspace.path(), 0.0004),
+        "reply",
+        registry,
+        memory,
+        ("ollama", "prx-local-model"),
+    )
+    .await;
+    let decision = admitted.decision();
+    let specs = [crate::tools::ToolSpec {
+        name: CostlyTool.name().to_owned(),
+        description: CostlyTool.description().to_owned(),
+        parameters: CostlyTool.parameters_schema(),
+    }];
+    let messages = [ChatMessage::system("sys"), ChatMessage::user("reply")];
+    for dialect in [
+        crate::tools::ToolSchemaDialect::Raw,
+        crate::tools::ToolSchemaDialect::Gemini,
+    ] {
+        let error = crate::agent::send_admission::admit_provider_send(
+            decision.service,
+            decision.context,
+            decision.proof,
+            &messages,
+            Some(&specs),
+            dialect,
         )
-        .await;
-        assert!(
-            result.is_err(),
-            "streaming={streaming}: the costly request was admitted"
-        );
-        assert_eq!(spy.sends(), 0, "streaming={streaming}");
+        .expect_err("the costly request exceeds the remaining ceiling");
+        assert!(format!("{error:#}").contains("exceeds the"), "{dialect:?}: {error:#}");
     }
+    crate::agent::send_admission::admit_provider_send(
+        decision.service,
+        decision.context,
+        decision.proof,
+        &messages,
+        None,
+        crate::tools::ToolSchemaDialect::Raw,
+    )
+    .expect("the same request without the costly tool fits");
 }
 
 /// The same request without the costly tool fits the same ceiling: exactly 1 send.
@@ -508,27 +558,19 @@ impl Tool for TokenHeavyTool {
     }
 }
 
-/// Config whose decision slice is `available / 8` tokens: the Answer estimate is 128.
-fn window_config(workspace: &std::path::Path, available: usize) -> crate::config::Config {
-    let mut config = workspace_config(workspace);
-    config.agent.compaction.reserve_tokens = 100;
-    config.agent.compaction.max_context_tokens = available + 100;
-    config.agent.compaction.max_context_tokens_explicit = true;
-    config
-}
-
-/// Answer 128 against live remaining G6 tokens: 127 remain is refused with the
-/// specific budget error and 0 sends; 128 remains is admitted with exactly 1
-/// send, also when an oversized tool is published but unused.
+/// Answer 128 against live remaining G6 tokens, narrowed after the decision was
+/// admitted: 127 remain is refused with the specific budget error and 0 sends;
+/// 128 remain is admitted with exactly 1 send, also when an oversized tool is
+/// published but unused.
 #[tokio::test]
 async fn estimate_tokens_above_turn_budget_refuses_send() {
     for streaming in [false, true] {
-        // available / 8 = 127 and 128 respectively.
         let workspace = tempfile::tempdir().expect("test workspace");
         let spy = SendSpy::new();
         let registry = project_tool_registry(&Arc::new(Mutex::new(Vec::new())), &[]);
+        crate::agent::send_admission::TEST_TOKEN_CAP.set(127);
         let error = send_once(
-            window_config(workspace.path(), 1016),
+            workspace_config(workspace.path()),
             registry,
             ("ollama", "prx-local-model"),
             "reply",
@@ -543,11 +585,12 @@ async fn estimate_tokens_above_turn_budget_refuses_send() {
         );
         assert_eq!(spy.sends(), 0, "streaming={streaming}");
 
+        crate::agent::send_admission::TEST_TOKEN_CAP.set(128);
         for tools in [Vec::new(), vec![Box::new(TokenHeavyTool) as Box<dyn Tool>]] {
             let workspace = tempfile::tempdir().expect("test workspace");
             let spy = SendSpy::new();
             send_once(
-                window_config(workspace.path(), 1024),
+                workspace_config(workspace.path()),
                 Arc::new(tools),
                 ("ollama", "prx-local-model"),
                 "reply",
@@ -558,6 +601,7 @@ async fn estimate_tokens_above_turn_budget_refuses_send() {
             .expect("128 remaining tokens fund the answer, with or without an unused oversized tool");
             assert_eq!(spy.sends(), 1, "streaming={streaming}");
         }
+        crate::agent::send_admission::TEST_TOKEN_CAP.set(u64::MAX);
     }
 }
 
