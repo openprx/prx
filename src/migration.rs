@@ -489,6 +489,11 @@ pub(crate) fn backup_target_memory(workspace_dir: &Path) -> Result<Option<PathBu
 fn copy_notes(workspace_dir: &Path, destination: &Path) -> Result<bool> {
     let copy = |source: &Path, target: PathBuf| -> Result<()> {
         fs::copy(source, &target)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+        }
         fs::File::open(&target)?.sync_all()?;
         Ok(())
     };

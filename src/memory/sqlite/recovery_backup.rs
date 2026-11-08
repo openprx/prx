@@ -126,6 +126,12 @@ pub(super) fn backup_file_with(
     target: &Path,
     extras: &dyn Fn(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    // Refuse a reserved or incomplete destination before the source is opened.
+    ensure_admitted(
+        std::path::absolute(target)?
+            .parent()
+            .context("backup target has no parent directory")?,
+    )?;
     let conn = Connection::open_with_flags(std::path::absolute(source)?, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     backup_bundle_with(&conn, target, extras)
 }
@@ -148,7 +154,11 @@ fn backup_bundle_with(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(vacant, "backup directory is not empty: {}", bundle.display());
+    anyhow::ensure!(
+        vacant,
+        "a backup for this second already exists; retry in a second or remove the incomplete directory: {}",
+        bundle.display()
+    );
     // The attempt-unique name alone makes the directory unrestorable, so the
     // incomplete state holds from creation on; it is made durable before any
     // snapshot work, and the marker keeps it so after the rename.
