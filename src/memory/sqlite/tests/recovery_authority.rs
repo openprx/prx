@@ -790,18 +790,222 @@ fn main_attribution_rebinds_pending_and_settled_console_receipts() -> anyhow::Re
     Ok(())
 }
 
+/// A fresh owner-only directory beside the store, and a database target in it.
+fn bundle_target(root: &std::path::Path, name: &str) -> anyhow::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let directory = root.join(name);
+    std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+    Ok(directory.join("target.db"))
+}
+
+fn key_listing(keys: &std::path::Path) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(keys)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        ids.insert(name.strip_suffix(".key").unwrap_or(&name).to_owned());
+    }
+    Ok(ids)
+}
+
+fn directory_listing(directory: &std::path::Path) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(directory)? {
+        names.insert(entry?.file_name().to_string_lossy().into_owned());
+    }
+    Ok(names)
+}
+
+#[tokio::test]
+async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::Result<()> {
+    use super::super::recovery_backup::{Step, backup_bundle};
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, memory) = store()?;
+    let root = dir.path().canonicalize()?;
+    let memory_dir = memory
+        .db_path
+        .parent()
+        .expect("store has a memory directory")
+        .to_path_buf();
+    let names = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<BTreeSet<String>>();
+
+    // K0 accepts chain A, which is then erased: K0 is left referenced by its
+    // tombstone alone.
+    let k0 = memory.activate_recovery_authority()?;
+    let a = attestation::fixture_as(&memory, "_a").await;
+    attestation::append(&memory, &a, a.attestation.clone()).await?;
+    {
+        let writer = memory.pool.write();
+        writer.execute(
+            "DELETE FROM ingress_recovery WHERE input_event_id=?1",
+            [&a.capsule.input_event_id],
+        )?;
+        writer.execute(
+            "DELETE FROM recovery_transport_index WHERE run_id=?1",
+            [&a.capsule.run_id],
+        )?;
+        writer.execute("DELETE FROM recovery_attestations WHERE run_id=?1", [&a.capsule.run_id])?;
+    }
+    assert_eq!(
+        count_rows(&memory, "recovery_tombstones")?,
+        1,
+        "erasing A left its tombstone"
+    );
+    // K1 accepts chain B (attestation and capsule); K2 is only the active key.
+    let k1 = memory.rotate_recovery_authority()?;
+    let b = attestation::fixture_as(&memory, "_b").await;
+    assert_eq!(b.capsule.key_id.as_deref(), Some(k1.as_str()));
+    attestation::append(&memory, &b, b.attestation.clone()).await?;
+    let k2 = memory.rotate_recovery_authority()?;
+    // Kc is referenced only by a v3 capsule of a pre-attestation chain.
+    let kc_bytes = [7u8; 32];
+    let kc = KeyDirectory::key_id(&kc_bytes);
+    KeyDirectory::open(&memory_dir, false)?.install(&kc, &kc_bytes)?;
+    seed(&memory, "kc-event", "user")?;
+    memory.pool.write().execute(
+        "INSERT INTO ingress_recovery(cursor,input_event_id,workspace_id,owner_id,source,input_key,lifetime,capsule_json,state) \
+         SELECT id,event_id,'prx_workspace','prx_owner','cli','kc-key','kc-lifetime',?1,'reconciled' FROM message_events WHERE event_id='kc-event'",
+        [serde_json::json!({"version": 3, "key_id": kc}).to_string()],
+    )?;
+    let expected = names(&[k0.as_str(), k1.as_str(), k2.as_str(), kc.as_str()]);
+    assert_eq!(expected.len(), 4);
+    let chain_b = RecoveryChain {
+        workspace_id: b.capsule.scope.workspace_id.clone(),
+        owner_id: "prx_owner".into(),
+        source: "agent".into(),
+        run_id: b.capsule.run_id.clone(),
+    };
+
+    // (i) The published bundle carries all four generations and restores.
+    let target = bundle_target(&root, "complete")?;
+    let bundle = target.parent().expect("bundle directory").to_path_buf();
+    memory.backup_database_to(&target).await?;
+    let keys = bundle.join(".recovery_keys");
+    assert_eq!(key_listing(&keys)?, expected);
+    assert_eq!(std::fs::metadata(&keys)?.permissions().mode() & 0o777, 0o700);
+    for id in &expected {
+        let file = format!("{id}.key");
+        assert_eq!(std::fs::metadata(keys.join(&file))?.permissions().mode() & 0o777, 0o600);
+        assert!(
+            std::fs::read(keys.join(&file))? == std::fs::read(memory_dir.join(".recovery_keys").join(&file))?,
+            "key bytes differ"
+        );
+    }
+    assert_eq!(directory_listing(&bundle)?, names(&[".recovery_keys", "target.db"]));
+    let restored = SqliteMemory::new_with_path(target.clone())?;
+    assert_eq!(restored.activate_recovery_authority()?, k2);
+    assert!(restored.read_recovery_receipt(&chain_b)?.is_some());
+    assert!(matches!(
+        stable_key_fence(&restored.pool.write(), Some(bundle.as_path()), &a.input)?,
+        Fence::Tombstoned
+    ));
+    drop(restored);
+
+    // (ii) A restore missing any referenced generation fails closed and never
+    // regenerates: K1 and K0 fail activation, Kc fails its capsule verify.
+    for (index, missing) in [k1.clone(), k0.clone(), kc.clone()].into_iter().enumerate() {
+        let target = bundle_target(&root, &format!("missing-{index}"))?;
+        let bundle = target.parent().expect("bundle directory").to_path_buf();
+        memory.backup_database_to(&target).await?;
+        let keys = bundle.join(".recovery_keys");
+        std::fs::remove_file(keys.join(format!("{missing}.key")))?;
+        let mut remaining = expected.clone();
+        remaining.remove(&missing);
+        let restored = SqliteMemory::new_with_path(target)?;
+        let error = if missing == kc {
+            let tag = RecoveryTag {
+                key_id: kc.clone(),
+                tag: [0; 32],
+            };
+            restored
+                .verify_recovery_mac(&tag, RecoveryMacDomain::InputDigestV3, b"input")
+                .expect_err("a capsule key that is missing must refuse verification")
+        } else {
+            restored
+                .activate_recovery_authority()
+                .expect_err("a missing referenced key must refuse activation")
+        };
+        assert!(crate::memory::recovery_authority::is_key_unavailable(&error));
+        assert_eq!(key_listing(&keys)?, remaining, "a restore never regenerates a key");
+    }
+
+    // (iii) A source missing a referenced key refuses the backup and publishes nothing.
+    let lost = memory_dir.join(".recovery_keys").join(format!("{k1}.key"));
+    let lost_bytes = std::fs::read(&lost)?;
+    std::fs::remove_file(&lost)?;
+    let target = bundle_target(&root, "source-missing")?;
+    let bundle = target.parent().expect("bundle directory").to_path_buf();
+    assert!(memory.backup_database_to(&target).await.is_err());
+    assert!(
+        directory_listing(&bundle)?.is_empty(),
+        "nothing published, staging removed"
+    );
+    KeyDirectory::open(&memory_dir, false)?.install(&k1, &lost_bytes.as_slice().try_into()?)?;
+
+    // (iv) A never-activated database backs up with no key directory.
+    let (fresh_dir, fresh) = store()?;
+    let target = bundle_target(&fresh_dir.path().canonicalize()?, "fresh")?;
+    let bundle = target.parent().expect("bundle directory").to_path_buf();
+    fresh.backup_database_to(&target).await?;
+    assert_eq!(directory_listing(&bundle)?, names(&["target.db"]));
+
+    // (vi) An install failure publishes nothing and cleans its staging.
+    let target = bundle_target(&root, "install-fails")?;
+    let bundle = target.parent().expect("bundle directory").to_path_buf();
+    let failure = backup_bundle(&memory.pool.write(), &target, &|step, _| {
+        anyhow::ensure!(step != Step::Install, "injected install failure");
+        Ok(())
+    });
+    assert!(failure.is_err());
+    assert!(directory_listing(&bundle)?.is_empty());
+
+    // (vii) A crash before publication leaves a staging directory that is
+    // neither restorable nor a fresh authority; only a published bundle restores.
+    let target = bundle_target(&root, "crash")?;
+    let bundle = target.parent().expect("bundle directory").to_path_buf();
+    let leftover = bundle.join("leftover");
+    let crashed = backup_bundle(&memory.pool.write(), &target, &|step, staging| {
+        if step == Step::BeforePublish {
+            std::fs::rename(staging, &leftover)?;
+            anyhow::bail!("simulated crash before publication");
+        }
+        Ok(())
+    });
+    assert!(crashed.is_err());
+    assert!(!target.exists() && !bundle.join(".recovery_keys").exists());
+    assert!(KeyDirectory::open(&leftover, false).is_err());
+    let staged_keys = leftover.join(".recovery_keys");
+    assert_eq!(key_listing(&staged_keys)?, expected);
+    let abandoned = SqliteMemory::new_with_path(leftover.join("target.db"))?;
+    assert!(abandoned.activate_recovery_authority().is_err());
+    assert_eq!(key_listing(&staged_keys)?, expected, "no key was created or removed");
+    drop(abandoned);
+    memory.backup_database_to(&target).await?;
+    let restored = SqliteMemory::new_with_path(target)?;
+    assert_eq!(restored.activate_recovery_authority()?, k2);
+    Ok(())
+}
+
+fn count_rows(memory: &SqliteMemory, table: &str) -> anyhow::Result<i64> {
+    Ok(memory
+        .pool
+        .write()
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
+}
+
 mod attestation {
     use super::*;
     use crate::memory::ingress_recovery::{IngressAppendOutcome, IngressLifetime, IngressRecoveryScope};
     use crate::memory::recovery_authority::RecoveryMacDomain;
     use crate::memory::{MessageEventInput, MessageEventSource};
 
-    struct Fixture {
-        input: MessageEventInput,
-        capsule: IngressCapsule,
-        lifetime: Arc<dyn IngressLifetime>,
-        facts: PendingFacts,
-        attestation: IngressAttestation,
+    pub(super) struct Fixture {
+        pub(super) input: MessageEventInput,
+        pub(super) capsule: IngressCapsule,
+        pub(super) lifetime: Arc<dyn IngressLifetime>,
+        pub(super) facts: PendingFacts,
+        pub(super) attestation: IngressAttestation,
     }
 
     fn count(memory: &SqliteMemory, table: &str) -> i64 {
@@ -813,6 +1017,12 @@ mod attestation {
     }
 
     async fn fixture(memory: &SqliteMemory) -> Fixture {
+        fixture_as(memory, "").await
+    }
+
+    /// A fixture whose input, stable key and run carry `tag`, so several
+    /// chains can coexist in one store.
+    pub(super) async fn fixture_as(memory: &SqliteMemory, tag: &str) -> Fixture {
         let key_id = memory.activate_recovery_authority().unwrap();
         let workspace = memory
             .db_path
@@ -827,7 +1037,8 @@ mod attestation {
             .acquire_ingress_lifetime(&workspace, &uuid::Uuid::new_v4().to_string(), deadline)
             .await
             .unwrap();
-        let input_key = "prx_input_key";
+        let input_key = format!("prx_input_key{tag}");
+        let input_key = input_key.as_str();
         let digest = memory
             .recovery_mac(Some(&key_id), RecoveryMacDomain::InputDigestV3, b"input")
             .unwrap();
@@ -841,16 +1052,16 @@ mod attestation {
                 source: MessageEventSource::Agent,
             },
             lifetime: lifetime.token().to_owned(),
-            input_event_id: "prx_input_event".into(),
+            input_event_id: format!("prx_input_event{tag}"),
             input_key: input_key.into(),
-            run_id: "prx_run".into(),
+            run_id: format!("prx_run{tag}"),
             input_digest: hex::encode(digest.tag),
             authentication: "0".repeat(64),
         };
         let input: MessageEventInput = serde_json::from_value(serde_json::json!({
             "event_id": capsule.input_event_id, "workspace_id": workspace, "owner_id": "prx_owner",
             "source": "agent", "channel": "agent_api", "session_key": "prx_session",
-            "run_id": "prx_run", "idempotency_key": input_key, "role": "user",
+            "run_id": capsule.run_id, "idempotency_key": input_key, "role": "user",
             "event_type": "message.created", "content": "attested", "visibility": "session",
             "config_generation_id": 7,
             "raw_payload_json": serde_json::json!({
@@ -899,7 +1110,7 @@ mod attestation {
         }
     }
 
-    async fn append(
+    pub(super) async fn append(
         memory: &SqliteMemory,
         f: &Fixture,
         attestation: IngressAttestation,

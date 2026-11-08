@@ -12,12 +12,32 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+/// Name of the key directory inside a memory directory.
+pub(super) const KEYS_DIRECTORY: &str = ".recovery_keys";
+
+/// Marker file of an unpublished backup staging directory. A directory that
+/// carries it is never opened as a key repository, so a crash leftover can be
+/// neither restored nor turned into a fresh authority.
+pub(super) const INCOMPLETE_MARKER: &str = ".backup-incomplete";
+
 pub(super) struct KeyDirectory(#[cfg(unix)] File);
 
 impl KeyDirectory {
     #[cfg(unix)]
     pub(super) fn open(memory: &Path, create: bool) -> anyhow::Result<Self> {
-        use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+        Self::open_with(memory, create, false)
+    }
+
+    /// Open (creating when absent) the key directory of an unpublished backup
+    /// staging directory, which is the only place the incomplete marker is allowed.
+    #[cfg(unix)]
+    pub(super) fn open_staging(staging: &Path) -> anyhow::Result<Self> {
+        Self::open_with(staging, true, true)
+    }
+
+    #[cfg(unix)]
+    fn open_with(memory: &Path, create: bool, staging: bool) -> anyhow::Result<Self> {
+        use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, open, openat, statat};
         anyhow::ensure!(memory.is_absolute(), "recovery path must be absolute");
         let owner = rustix::process::geteuid().as_raw();
         let mut directory = File::from(open(
@@ -55,8 +75,15 @@ impl KeyDirectory {
             metadata.uid() == owner && metadata.mode() & 0o777 == 0o700,
             "unsafe memory directory"
         );
+        if !staging {
+            match statat(&directory, INCOMPLETE_MARKER, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(_) => anyhow::bail!("incomplete recovery backup"),
+                Err(rustix::io::Errno::NOENT) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         if create {
-            match mkdirat(&directory, ".recovery_keys", Mode::from_raw_mode(0o700)) {
+            match mkdirat(&directory, KEYS_DIRECTORY, Mode::from_raw_mode(0o700)) {
                 Ok(()) => directory.sync_all()?,
                 Err(rustix::io::Errno::EXIST) => {}
                 Err(error) => return Err(error.into()),
@@ -64,7 +91,7 @@ impl KeyDirectory {
         }
         let keys = File::from(openat(
             &directory,
-            ".recovery_keys",
+            KEYS_DIRECTORY,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?);
@@ -86,13 +113,18 @@ impl KeyDirectory {
         anyhow::bail!("secure recovery key storage unavailable on this platform")
     }
 
+    #[cfg(not(unix))]
+    pub(super) fn open_staging(_staging: &Path) -> anyhow::Result<Self> {
+        anyhow::bail!("secure recovery key storage unavailable on this platform")
+    }
+
     #[cfg(unix)]
     fn filename(id: &str) -> anyhow::Result<String> {
         anyhow::ensure!(uuid::Uuid::parse_str(id)?.to_string() == id, "invalid recovery key id");
         Ok(format!("{id}.key"))
     }
 
-    fn key_id(bytes: &[u8; 32]) -> String {
+    pub(super) fn key_id(bytes: &[u8; 32]) -> String {
         let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
         let mut prefix = [0u8; 16];
         for (destination, source) in prefix.iter_mut().zip(digest.as_ref()) {
@@ -137,6 +169,14 @@ impl KeyDirectory {
 
     #[cfg(unix)]
     pub(super) fn load(&self, id: &str) -> anyhow::Result<ring::hmac::Key> {
+        let bytes = self.read(id)?;
+        Ok(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &bytes))
+    }
+
+    /// The checked bytes of one key, for the backup path only. The caller must
+    /// hand them straight to `install` and never keep or log them.
+    #[cfg(unix)]
+    pub(super) fn read(&self, id: &str) -> anyhow::Result<[u8; 32]> {
         use rustix::fs::{Mode, OFlags, openat};
         let mut file = File::from(openat(
             &self.0,
@@ -160,11 +200,16 @@ impl KeyDirectory {
         anyhow::ensure!(Self::key_id(&bytes) == id, "corrupt established recovery key");
         file.sync_all()?;
         self.0.sync_all()?;
-        Ok(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &bytes))
+        Ok(bytes)
     }
 
     #[cfg(not(unix))]
     pub(super) fn load(&self, _id: &str) -> anyhow::Result<ring::hmac::Key> {
+        anyhow::bail!("secure recovery keys unavailable")
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn read(&self, _id: &str) -> anyhow::Result<[u8; 32]> {
         anyhow::bail!("secure recovery keys unavailable")
     }
 }

@@ -2,7 +2,6 @@
 
 use crate::memory::traits::MemoryCategory;
 use chrono::Local;
-use rusqlite::params;
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -13,18 +12,15 @@ use super::SqliteMemory;
 
 impl SqliteMemory {
     /// Create a consistent SQLite backup without stopping readers or copying a
-    /// live WAL file set byte-for-byte.
+    /// live WAL file set byte-for-byte. Every recovery key the snapshot
+    /// references is published beside it, so the backup directory restores
+    /// as a memory directory; a missing referenced key refuses the backup.
     pub async fn backup_database_to(&self, target: &Path) -> anyhow::Result<()> {
         let pool = self.pool.clone();
         let target = target.to_path_buf();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            anyhow::ensure!(!target.exists(), "backup target already exists: {}", target.display());
             let conn = pool.write();
-            conn.execute("VACUUM INTO ?1", params![target.to_string_lossy().to_string()])?;
-            Ok(())
+            super::recovery_backup::backup_bundle(&conn, &target, &|_, _| Ok(()))
         })
         .await?
     }

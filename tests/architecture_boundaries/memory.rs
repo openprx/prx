@@ -150,6 +150,7 @@ const SQLITE_SEPARATE_MODULES: &[&str] = &[
     "ingress_recovery.rs",
     // AUTH-01 repository capability; no database opens outside the backend.
     "recovery_authority.rs",
+    "recovery_backup.rs",
     "recovery_keys.rs",
     "router_history.rs",
     "router_learning.rs",
