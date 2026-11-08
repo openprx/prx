@@ -361,7 +361,17 @@ impl SqliteMemory {
         read_pool_size: Option<usize>,
     ) -> anyhow::Result<Self> {
         // Refuse a backup attempt directory before anything is created or opened.
-        recovery_keys::ensure_admitted(db_path.parent().unwrap_or(&db_path))?;
+        let db_path = match (db_path.parent(), db_path.file_name()) {
+            (Some(parent), Some(name)) => {
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                recovery_keys::ensure_admitted(parent)?.join(name)
+            }
+            _ => db_path,
+        };
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }

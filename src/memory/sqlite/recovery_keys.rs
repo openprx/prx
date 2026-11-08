@@ -26,14 +26,23 @@ pub(super) const INCOMPLETE_MARKER: &str = ".backup-incomplete";
 pub(super) const INCOMPLETE_PREFIX: &str = ".backup-incomplete-";
 
 /// Non-mutating admission check, shared by the constructor, activation and the
-/// backup destination. The path is made absolute first, then the directory and
-/// every ancestor must have no attempt-named component and no incomplete
-/// marker, whatever else they hold. An attempt that was moved to another name
-/// keeps its marker as evidence; moving it AND deleting that marker by hand is
-/// outside this guarantee.
-pub(super) fn ensure_admitted(path: &Path) -> anyhow::Result<()> {
+/// backup destination. The path is made absolute, then it must hold no `..` and
+/// no existing symlink component (as key opening requires), and the directory
+/// and every ancestor must have no attempt-named component and no incomplete
+/// marker, whatever else they hold. Callers use the returned absolute path for
+/// all later work. An attempt that was moved to another name keeps its marker
+/// as evidence; moving it AND deleting that marker by hand is outside this
+/// guarantee.
+pub(super) fn ensure_admitted(path: &Path) -> anyhow::Result<std::path::PathBuf> {
     let reserved = INCOMPLETE_PREFIX.as_bytes();
-    for ancestor in std::path::absolute(path)?.ancestors() {
+    let absolute = std::path::absolute(path)?;
+    anyhow::ensure!(
+        !absolute
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir)),
+        "unsafe recovery path"
+    );
+    for ancestor in absolute.ancestors() {
         let head = ancestor
             .file_name()
             .and_then(|name| name.as_encoded_bytes().get(..reserved.len()));
@@ -41,13 +50,18 @@ pub(super) fn ensure_admitted(path: &Path) -> anyhow::Result<()> {
             !head.is_some_and(|head| head.eq_ignore_ascii_case(reserved)),
             "incomplete recovery backup"
         );
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(found) => anyhow::ensure!(!found.file_type().is_symlink(), "unsafe recovery path"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
         match std::fs::symlink_metadata(ancestor.join(INCOMPLETE_MARKER)) {
             Ok(_) => anyhow::bail!("incomplete recovery backup"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
     }
-    Ok(())
+    Ok(absolute)
 }
 
 pub(super) struct KeyDirectory(#[cfg(unix)] File);

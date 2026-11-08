@@ -116,11 +116,12 @@ fn sync_directory(path: &Path) -> anyhow::Result<()> {
 /// or must be empty.
 pub(super) fn backup_bundle(conn: &Connection, target: &Path) -> anyhow::Result<()> {
     let target = std::path::absolute(target)?;
-    let bundle = target.parent().context("backup target has no parent directory")?;
     let file_name = target.file_name().context("backup target has no file name")?;
+    // Reserved names, symlinks and incomplete attempts are refused before any
+    // side effect; everything after uses the admitted absolute bundle path.
+    let bundle = ensure_admitted(target.parent().context("backup target has no parent directory")?)?;
+    let bundle = bundle.as_path();
     let root = bundle.parent().context("backup directory has no parent directory")?;
-    // Reserved names and incomplete attempts are refused before any side effect.
-    ensure_admitted(bundle)?;
     std::fs::create_dir_all(root)?;
     let vacant = match std::fs::read_dir(bundle) {
         Ok(mut entries) => entries.next().is_none(),

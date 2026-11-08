@@ -1215,6 +1215,38 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
         "open handle: listing and bytes unchanged"
     );
     assert!(!open_memory.join(".recovery_keys").exists());
+    // A symlink alias of a reserved or moved-with-marker attempt, and `..`, are
+    // refused by constructor and backup destination with nothing changed.
+    {
+        let case = parent_of(&parent_of(&bundle_target(&root, "symlinks")?)?)?;
+        let reserved = case.join(".backup-incomplete-sym");
+        let moved = case.join("moved");
+        for directory in [&reserved, &moved] {
+            std::fs::DirBuilder::new().mode(0o700).create(directory)?;
+        }
+        std::fs::write(moved.join(".backup-incomplete"), b"")?;
+        let alias_reserved = case.join("alias-reserved");
+        let alias_moved = case.join("alias-moved");
+        std::os::unix::fs::symlink(&reserved, &alias_reserved)?;
+        std::os::unix::fs::symlink(&moved, &alias_moved)?;
+        let before = tree(&case)?;
+        for destination in [
+            alias_reserved.join("inner").join("target.db"),
+            alias_moved.join("inner").join("target.db"),
+            alias_moved.join("..").join("moved").join("inner").join("target.db"),
+            case.join("plain").join("..").join("target.db"),
+        ] {
+            refusal(
+                SqliteMemory::new_with_path(destination.clone()),
+                "constructing through an alias",
+            )?;
+            refusal(
+                memory.backup_database_to(&destination).await,
+                "backing up through an alias",
+            )?;
+        }
+        assert!(tree(&case)? == before, "aliases: listing and bytes unchanged");
+    }
     // A reserved final basename and a reserved ancestor are rejected with no side effect.
     for (index, reserved) in [".backup-incomplete-x/target.db", ".BACKUP-INCOMPLETE-y/inner/target.db"]
         .into_iter()
