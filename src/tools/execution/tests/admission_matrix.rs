@@ -4,6 +4,7 @@ use super::*;
 mod policy;
 use crate::security::approval_ledger::{run_call::ApprovalLedgerPort, strategy::ExecutionApprovalLedger};
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
+use crate::tools::execution::admission::CallTokenBudget;
 
 pub(crate) async fn ledger_context(path: &std::path::Path) -> ToolExecutionContext {
     crate::acl::approval_grant::WitnessKeyring::global_for_tests();
@@ -1017,4 +1018,47 @@ pub(crate) async fn launcher_authority_cells(grant: Arc<crate::runtime::child_so
     }
     assert_eq!(readonly.fixture.calls.load(Ordering::SeqCst), 0);
     assert!(!readonly.fixture.stages.lock().contains(&"approval"));
+}
+
+/// The money ceiling is re-read at admission and again after the approval wait,
+/// immediately before invocation. A funded control runs once. The changed case
+/// reads funded at admission (the send-time view) and empty at the final
+/// recheck, so the call is refused with 0 further backend calls.
+#[tokio::test]
+async fn child_budget_changed_after_send_is_refused_at_dispatch() {
+    let case = child_fixture::ChildCase::new(&["config_reload"]);
+    let command = || ToolExecutionCommand::new("config_reload", serde_json::json!({"value":1}));
+    let funded = CallTokenBudget::new(|| 1000, |_| Some(500)).with_spend(|| Some(10_000), |_| Some(1000));
+    let mut control = case.context(true, true);
+    control.call_budget = Some(funded);
+    let outcome = case.service.execute(command(), control, None).await;
+    assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&reads);
+    let changed = CallTokenBudget::new(|| 1000, |_| Some(500)).with_spend(
+        move || {
+            Some(if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                10_000
+            } else {
+                0
+            })
+        },
+        |_| Some(1000),
+    );
+    let mut context = case.context(true, true);
+    context.call_budget = Some(changed);
+    let outcome = case.service.execute(command(), context, None).await;
+    assert_eq!(outcome.status, ToolExecutionStatus::Denied);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("tool 'config_reload' estimates 1000 micro-USD but 0 remain")),
+        "unexpected diagnostic: {:?}",
+        outcome.error
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
 }

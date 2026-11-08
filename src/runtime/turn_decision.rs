@@ -630,6 +630,8 @@ pub(crate) enum AgentDecisionBudgetError {
     Reserve(#[from] DecisionReserveUnavailable),
     #[error("remaining workspace spend cannot be read safely")]
     Spend(#[source] anyhow::Error),
+    #[error("child spend funding is unavailable")]
+    ChildFunding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2981,15 +2983,10 @@ impl TurnDecisionService {
         let reservation =
             DecisionTokenReservation::from_effective_compaction(&effective.config, extra_token_ratio_limit)?;
         let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;
-        let remaining = crate::cost::tracker::remaining_micro_usd_read_only_with_security_ceiling(
-            &config.cost,
-            &config.workspace_dir,
-            self.security.max_cost_per_day_cents,
-        )
-        .map_err(AgentDecisionBudgetError::Spend)?;
         let remaining = self
-            .recursive_money(proof)
-            .map_or(remaining, |money| remaining.min(money.load(Ordering::Acquire)));
+            .spend_ceiling(proof)?
+            .live()
+            .map_err(AgentDecisionBudgetError::Spend)?;
         Ok(AgentDecisionBudget {
             budgets: TurnBudgets {
                 tokens: u64::try_from(reservation.decision_tokens).unwrap_or(u64::MAX),

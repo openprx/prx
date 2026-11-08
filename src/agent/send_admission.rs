@@ -63,12 +63,29 @@ pub(crate) fn call_token_budget(
     let limits = service
         .send_limits(proof)
         .context("called-tool budget cannot be established")?;
+    let spend = service
+        .spend_ceiling(proof)
+        .context("called-tool spend ceiling cannot be established")?;
     let context = Arc::clone(context);
+    let model = Arc::new(limits.model);
+    let cost = Arc::new(limits.cost);
+    let (token_model, token_cost) = (Arc::clone(&model), Arc::clone(&cost));
     Ok(CallTokenBudget::new(
         move || live_g6_tokens(&context),
         move |schema_bytes| {
-            crate::cost::estimate::estimate_cost(&limits.model, &limits.cost, schema_bytes)
+            crate::cost::estimate::estimate_cost(&token_model, &token_cost, schema_bytes)
                 .map(|estimate| u64::from(estimate.tokens))
+        },
+    )
+    .with_spend(
+        move || {
+            spend
+                .live()
+                .inspect_err(|error| tracing::warn!(%error, "called-tool spend ceiling unavailable"))
+                .ok()
+        },
+        move |schema_bytes| {
+            crate::cost::estimate::estimate_cost(&model, &cost, schema_bytes).map(|estimate| estimate.micro_usd)
         },
     ))
 }
