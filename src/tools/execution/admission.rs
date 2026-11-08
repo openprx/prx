@@ -275,9 +275,11 @@ pub(super) fn child_autonomy(
 /// The called tool's own G6 action estimate against the live remaining tokens,
 /// with the same `<=` rule as the candidate predicate. It runs before the
 /// no-surface return and again before invocation, and needs no bindings or
-/// decision context. Discovery is a zero-token action. A missing estimate
-/// refuses. Grouped native-file sums stay with the decision gate: the group is
-/// a directive-era concept, and card 03 retires that predicate with directives.
+/// decision context. The schema comes from the current descriptor, which equals
+/// the pinned one while the generation check holds (`admit`); drift is stale.
+/// Discovery is a zero-token action. A missing estimate refuses. Grouped
+/// native-file sums stay with the decision gate: the group is a directive-era
+/// concept, and card 03 retires that predicate with directives.
 /// Refuse-kind directives never reach dispatch, so they need no exemption here.
 pub(super) fn admit_called_tokens(
     service: &ToolExecutionService,

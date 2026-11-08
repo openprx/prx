@@ -857,3 +857,121 @@ async fn plan_mode_intercepts_every_non_read_only_class() {
     }
     assert_eq!(max_active.load(Ordering::SeqCst), 0, "no backend dispatch");
 }
+
+/// A called tool whose serialized schema is large enough to estimate above the
+/// live tokens. It must never reach its backend.
+struct HeavySchemaTool {
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Tool for HeavySchemaTool {
+    fn name(&self) -> &str {
+        "heavy_schema_tool"
+    }
+    fn description(&self) -> &str {
+        "Carries a schema that estimates above the narrowed live tokens"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {"padding": {"type": "string", "description": "x".repeat(2000)}}})
+    }
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: "heavy".into(),
+            error: None,
+        })
+    }
+}
+
+/// The production turn budget reaches dispatch. With live tokens narrowed to
+/// 300, the 2000-byte schema estimates above 300 and is refused in the real turn
+/// with the specific error and 0 backend calls. The small tool in the next
+/// round is admitted and runs exactly once. 3 provider sends, no reset.
+#[tokio::test]
+async fn called_tool_schema_bytes_reach_the_turn_budget_at_dispatch() {
+    let _reset = crate::agent::send_admission::HookReset;
+    crate::agent::send_admission::TEST_TOKEN_CAP.set(300);
+    let workspace = tempfile::tempdir().expect("test workspace");
+    let dispatches = Arc::new(Mutex::new(Vec::new()));
+    let heavy_calls = Arc::new(AtomicUsize::new(0));
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+        Box::new(HeavySchemaTool {
+            calls: Arc::clone(&heavy_calls),
+        }) as Box<dyn Tool>,
+        Box::new(RecordingTool {
+            name: "project_tool".into(),
+            execution_order: Arc::clone(&dispatches),
+        }) as Box<dyn Tool>,
+    ]);
+    let admitted = AdmittedTurn::with_config(workspace_config(workspace.path()), "reply", Arc::clone(&registry)).await;
+    let call = |name: &str| ChatResponse {
+        text: None,
+        tool_calls: vec![ToolCall {
+            id: format!("call-{name}"),
+            name: name.into(),
+            arguments: "{}".into(),
+        }],
+        reasoning_content: None,
+    };
+    let done = ChatResponse {
+        text: Some("done".into()),
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+    };
+    let provider = NativeScriptedProvider::new(vec![call("heavy_schema_tool"), call("project_tool"), done]);
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("reply")];
+    let result = run_turn(
+        &mut history,
+        TurnRequest {
+            advice: None,
+            channel_name: "cli",
+            scope: None,
+            mode: ChatMode::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: TurnSchedule {
+                read_only_tool_concurrency_window: 1,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: None,
+            decision: admitted.decision(),
+        },
+        TurnServices {
+            provider: &provider,
+            provider_name: "ollama",
+            model: "prx-local-model",
+            temperature: 0.0,
+            tools_registry: Arc::clone(&registry),
+            observer: &crate::observability::NoopObserver,
+            hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(admitted.adapter()),
+            memory: admitted.memory_runtime(),
+        },
+        TurnDelivery {
+            cancellation: None,
+            on_delta: None,
+            on_tool_call: None,
+        },
+    )
+    .await;
+    result.expect("the turn completes after the refused and the admitted call");
+    assert_eq!(provider.requests().len(), 3, "3 provider sends, no extra round");
+    assert_eq!(
+        heavy_calls.load(Ordering::SeqCst),
+        0,
+        "refused call reached its backend"
+    );
+    assert_eq!(*dispatches.lock().unwrap(), vec!["project_tool".to_string()]);
+    assert!(
+        history
+            .iter()
+            .any(|message| message.content.contains("tool 'heavy_schema_tool' estimates")
+                && message.content.contains("300 remain")),
+        "the refusal did not reach the transcript"
+    );
+}

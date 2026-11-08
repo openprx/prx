@@ -58,6 +58,8 @@ pub(crate) fn call_token_budget(
     context: &Arc<TurnDecisionContext>,
     proof: &dyn TurnSourceProof,
 ) -> Result<CallTokenBudget> {
+    // Fail closed: if the route budget cannot be read, the model turn fails
+    // here instead of dispatching tool calls without a token gate.
     let limits = service
         .send_limits(proof)
         .context("called-tool budget cannot be established")?;

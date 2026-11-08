@@ -139,3 +139,61 @@ async fn budget_narrowed_before_invocation_is_refused_at_final_admission() {
     assert_eq!(reads.load(Ordering::SeqCst), 2);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }
+
+/// The estimator receives the called tool's own serialized schema bytes.
+#[tokio::test]
+async fn estimator_receives_the_called_tools_schema_bytes() {
+    let fixture = fixture();
+    let service = fixture.service(CONFIG_RELOAD, vec![], ToolExecutionDecision::Allow, approved(), true);
+    let expected = serde_json::to_vec(&service.current_descriptor(CONFIG_RELOAD).unwrap().parameters)
+        .unwrap()
+        .len();
+    let seen = Arc::new(AtomicU64::new(u64::MAX));
+    let sink = Arc::clone(&seen);
+    let budget = CallTokenBudget::new(
+        || 10_000,
+        move |bytes| {
+            sink.store(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::SeqCst);
+            Some(1)
+        },
+    );
+    let outcome = service.execute(command(), budget_context(budget), None).await;
+    assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert!(expected > 0);
+    assert_eq!(seen.load(Ordering::SeqCst), u64::try_from(expected).unwrap_or(u64::MAX));
+}
+
+/// `capability_search` is a zero-token discovery action: admitted with no estimate.
+#[tokio::test]
+async fn capability_search_is_a_zero_token_discovery_action() {
+    let fixture = fixture();
+    let service = fixture.service(
+        "capability_search",
+        vec![],
+        ToolExecutionDecision::Allow,
+        approved(),
+        true,
+    );
+    let outcome = service
+        .execute(
+            ToolExecutionCommand::new("capability_search", serde_json::json!({"value":1})),
+            budget_context(fixed(0, None)),
+            None,
+        )
+        .await;
+    assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+/// A context with no budget (non-model entry points) is not token-gated: 1 backend call.
+#[tokio::test]
+async fn absent_budget_admits_without_token_gate() {
+    let fixture = fixture();
+    let service = fixture.service(CONFIG_RELOAD, vec![], ToolExecutionDecision::Allow, approved(), true);
+    let context = context();
+    assert!(context.call_budget.is_none());
+    let outcome = service.execute(command(), context, None).await;
+    assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
