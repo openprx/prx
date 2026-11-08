@@ -20,6 +20,12 @@ const KEYS_DIRECTORY: &str = ".recovery_keys";
 /// neither restored nor turned into a fresh authority.
 pub(super) const INCOMPLETE_MARKER: &str = ".backup-incomplete";
 
+/// Name prefix of every backup attempt directory (staging and quarantine). A
+/// path with such a component is refused whatever the directory holds, so an
+/// attempt stays unrestorable even before its marker exists or after a
+/// cleanup was interrupted.
+pub(super) const INCOMPLETE_PREFIX: &str = ".backup-incomplete-";
+
 pub(super) struct KeyDirectory(#[cfg(unix)] File);
 
 impl KeyDirectory {
@@ -53,6 +59,10 @@ impl KeyDirectory {
                 Component::Normal(name) => name,
                 _ => anyhow::bail!("unsafe recovery ancestor"),
             };
+            anyhow::ensure!(
+                staging || !name.as_encoded_bytes().starts_with(INCOMPLETE_PREFIX.as_bytes()),
+                "incomplete recovery backup"
+            );
             directory = File::from(openat(
                 &directory,
                 name,

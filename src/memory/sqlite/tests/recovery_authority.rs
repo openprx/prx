@@ -838,6 +838,29 @@ fn refusal<T>(result: anyhow::Result<T>, what: &str) -> anyhow::Result<anyhow::E
     }
 }
 
+/// The tag of a persisted capsule row: its recorded key id and input digest.
+fn persisted_capsule_tag(memory: &SqliteMemory, input_event_id: &str) -> anyhow::Result<RecoveryTag> {
+    let json: String = memory.pool.write().query_row(
+        "SELECT capsule_json FROM ingress_recovery WHERE input_event_id=?1",
+        [input_event_id],
+        |r| r.get(0),
+    )?;
+    let capsule: serde_json::Value = serde_json::from_str(&json)?;
+    let text = |name: &str| -> anyhow::Result<String> {
+        capsule
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| format!("persisted capsule has no {name}"))
+    };
+    Ok(RecoveryTag {
+        key_id: text("key_id")?,
+        tag: hex::decode(text("input_digest")?)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("capsule digest is not 32 bytes"))?,
+    })
+}
+
 fn count_rows(memory: &SqliteMemory, table: &str) -> anyhow::Result<i64> {
     Ok(memory
         .pool
@@ -861,7 +884,7 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
     let k0 = memory.activate_recovery_authority()?;
     let a = attestation::fixture_as(&memory, "_a").await;
     attestation::append(&memory, &a, a.attestation.clone()).await?;
-    erase_chain(&memory, &a)?;
+    erase_chain(&memory, &a, false)?;
     assert_eq!(
         count_rows(&memory, "recovery_tombstones")?,
         1,
@@ -878,12 +901,37 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
     let c = attestation::fixture_as(&memory, "_c").await;
     assert_eq!(c.capsule.key_id.as_deref(), Some(kc.as_str()));
     attestation::append(&memory, &c, c.attestation.clone()).await?;
-    erase_chain(&memory, &c)?;
+    erase_chain(&memory, &c, true)?;
     memory
         .pool
         .write()
         .execute("DELETE FROM recovery_tombstones WHERE key_id=?1", [&kc])?;
     let k2 = memory.rotate_recovery_authority()?;
+    // Kc is referenced by C's real capsule row and by nothing else.
+    {
+        let reader = memory.pool.write();
+        let references = |sql: &str| -> anyhow::Result<i64> { Ok(reader.query_row(sql, [&kc], |r| r.get(0))?) };
+        for table in [
+            "recovery_attestations",
+            "recovery_transport_index",
+            "recovery_tombstones",
+        ] {
+            assert_eq!(
+                references(&format!("SELECT count(*) FROM {table} WHERE key_id=?1"))?,
+                0,
+                "{table}"
+            );
+        }
+        assert_eq!(
+            references("SELECT count(*) FROM recovery_authority WHERE active_key_id=?1")?,
+            0
+        );
+        assert_eq!(
+            references("SELECT count(*) FROM ingress_recovery WHERE json_extract(capsule_json,'$.key_id')=?1")?,
+            1,
+            "Kc is referenced only by the persisted capsule"
+        );
+    }
     let expected: BTreeSet<String> = [&k0, &k1, &k2, &kc].into_iter().cloned().collect();
     assert_eq!(expected.len(), 4);
     let source = key_bytes(&source_keys)?;
@@ -893,13 +941,6 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
         owner_id: "prx_owner".into(),
         source: "agent".into(),
         run_id: b.capsule.run_id.clone(),
-    };
-    // C's capsule digest tag: the restore verification path for the capsule-only key.
-    let capsule_tag = RecoveryTag {
-        key_id: kc.clone(),
-        tag: hex::decode(&c.capsule.input_digest)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("capsule digest is not 32 bytes"))?,
     };
 
     // (i) The published bundle carries all four generations, in an owner-only
@@ -926,6 +967,9 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
     let restored = SqliteMemory::new_with_path(target.clone())?;
     assert_eq!(restored.activate_recovery_authority()?, k2);
     assert!(restored.read_recovery_receipt(&chain_b)?.is_some());
+    // The persisted capsule row survives the backup and verifies under Kc.
+    let capsule_tag = persisted_capsule_tag(&restored, &c.capsule.input_event_id)?;
+    assert_eq!(capsule_tag.key_id, kc);
     restored.verify_recovery_mac(&capsule_tag, RecoveryMacDomain::InputDigestV3, b"input")?;
     assert!(matches!(
         stable_key_fence(&restored.pool.write(), Some(bundle.as_path()), &a.input)?,
@@ -945,6 +989,7 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
         remaining.remove(&missing);
         let restored = SqliteMemory::new_with_path(target)?;
         let error = if missing == kc {
+            let capsule_tag = persisted_capsule_tag(&restored, &c.capsule.input_event_id)?;
             refusal(
                 restored.verify_recovery_mac(&capsule_tag, RecoveryMacDomain::InputDigestV3, b"input"),
                 "capsule verify without its key",
@@ -1055,6 +1100,38 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
         let restored = SqliteMemory::new_with_path(target)?;
         assert_eq!(restored.activate_recovery_authority()?, k2);
     }
+    // Attempt directories refused by name alone: an empty pre-marker staging
+    // directory and a markerless keys-only remainder of an interrupted cleanup.
+    for (shape, with_keys) in [("pre-marker", false), ("keys-only", true)] {
+        let case = bundle_target(&root, &format!("shape-{shape}"))?;
+        let leftover = parent_of(&parent_of(&case)?)?.join(format!(".backup-incomplete-{shape}"));
+        std::fs::DirBuilder::new().mode(0o700).create(&leftover)?;
+        if with_keys {
+            let keys = leftover.join(".recovery_keys");
+            std::fs::DirBuilder::new().mode(0o700).create(&keys)?;
+            for (id, bytes) in &source {
+                let file = keys.join(format!("{id}.key"));
+                std::fs::write(&file, bytes)?;
+                std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+            }
+        }
+        let before = key_bytes(&leftover.join(".recovery_keys")).ok();
+        refusal(KeyDirectory::open(&leftover, false), "opening an attempt directory")?;
+        let abandoned = SqliteMemory::new_with_path(leftover.join("target.db"))?;
+        refusal(
+            abandoned.activate_recovery_authority(),
+            "activating an attempt directory",
+        )?;
+        assert!(
+            key_bytes(&leftover.join(".recovery_keys")).ok() == before,
+            "{shape}: no key was created or altered"
+        );
+        assert_eq!(
+            leftover.join(".recovery_keys").exists(),
+            with_keys,
+            "{shape}: no key directory appeared"
+        );
+    }
     // A bundle directory that does not exist yet is created owner-only by the rename.
     let nested = root.join("nested-parent").join("deeper");
     std::fs::DirBuilder::new()
@@ -1067,12 +1144,14 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
 
 /// Production-shaped erasure of one accepted chain: the transport row goes
 /// first so the tombstone trigger records the stable key under its key id.
-fn erase_chain(memory: &SqliteMemory, f: &attestation::Fixture) -> anyhow::Result<()> {
+fn erase_chain(memory: &SqliteMemory, f: &attestation::Fixture, keep_capsule: bool) -> anyhow::Result<()> {
     let writer = memory.pool.write();
-    writer.execute(
-        "DELETE FROM ingress_recovery WHERE input_event_id=?1",
-        [&f.capsule.input_event_id],
-    )?;
+    if !keep_capsule {
+        writer.execute(
+            "DELETE FROM ingress_recovery WHERE input_event_id=?1",
+            [&f.capsule.input_event_id],
+        )?;
+    }
     writer.execute(
         "DELETE FROM recovery_transport_index WHERE run_id=?1",
         [&f.capsule.run_id],

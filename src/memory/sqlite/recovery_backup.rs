@@ -2,7 +2,7 @@
 //! references. Key bytes move from the source key directory straight into the
 //! staged key directory; they are never returned, kept or logged.
 
-use super::recovery_keys::{INCOMPLETE_MARKER, KeyDirectory};
+use super::recovery_keys::{INCOMPLETE_MARKER, INCOMPLETE_PREFIX, KeyDirectory};
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags, params};
 use std::collections::BTreeSet;
@@ -122,8 +122,12 @@ pub(super) fn backup_bundle(conn: &Connection, target: &Path) -> anyhow::Result<
         Err(error) => return Err(error.into()),
     };
     anyhow::ensure!(vacant, "backup directory is not empty: {}", bundle.display());
-    let staging = root.join(format!(".backup-staging-{}", uuid::Uuid::new_v4()));
+    // The attempt-unique name alone makes the directory unrestorable, so the
+    // incomplete state holds from creation on; it is made durable before any
+    // snapshot work, and the marker keeps it so after the rename.
+    let staging = root.join(format!("{INCOMPLETE_PREFIX}{}", uuid::Uuid::new_v4()));
     create_private_dir(&staging)?;
+    sync_directory(root)?;
     let outcome = stage_and_publish(conn, file_name, bundle, root, &staging);
     // After a successful rename the staging path is gone; this only cleans failures.
     discard(std::fs::remove_dir_all(&staging));
@@ -138,6 +142,7 @@ fn stage_and_publish(
     staging: &Path,
 ) -> anyhow::Result<()> {
     std::fs::File::create_new(staging.join(INCOMPLETE_MARKER))?.sync_all()?;
+    sync_directory(staging)?;
     let staged = staging.join(file_name);
     // A coherent snapshot: a live write-ahead log is never copied byte for byte.
     conn.execute("VACUUM INTO ?1", params![staged.to_string_lossy().to_string()])?;
@@ -171,7 +176,7 @@ fn stage_and_publish(
     // The bundle location is this attempt's from here on: a failure removes it.
     let finished = finish(bundle, root);
     if finished.is_err() {
-        discard(std::fs::remove_dir_all(bundle));
+        quarantine(bundle, root);
     }
     finished
 }
@@ -186,6 +191,21 @@ fn finish(bundle: &Path, root: &Path) -> anyhow::Result<()> {
     #[cfg(test)]
     fault(Step::Published, bundle)?;
     Ok(())
+}
+
+/// Remove a failed published bundle. It is first renamed to a quarantine name
+/// that is refused as a key repository, so an interrupted recursive delete can
+/// never leave a restorable or markerless remainder at the bundle location.
+fn quarantine(bundle: &Path, root: &Path) {
+    let quarantined = root.join(format!("{INCOMPLETE_PREFIX}q-{}", uuid::Uuid::new_v4()));
+    match std::fs::rename(bundle, &quarantined) {
+        Ok(()) => discard(std::fs::remove_dir_all(&quarantined)),
+        Err(error) => {
+            tracing::warn!(%error, "failed recovery backup was not quarantined");
+            // Best effort: the incomplete marker keeps whatever remains refused.
+            discard(std::fs::File::create(bundle.join(INCOMPLETE_MARKER)).map(drop));
+        }
+    }
 }
 
 fn discard(removed: std::io::Result<()>) {
