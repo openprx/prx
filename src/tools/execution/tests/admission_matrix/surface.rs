@@ -225,7 +225,8 @@ async fn model_turn_without_surface_is_denied() {
 
 /// Console resume replays a model tool call: ModelTurn plus a surface built
 /// from the binding, registry, ACL, config and catalog. An excluded name is
-/// Denied with no backend call.
+/// Denied with no backend call. Covers the shared helper; the resume *sites*
+/// are pinned by `console_and_chat_resume_go_through_model_turn_context`.
 #[tokio::test]
 async fn console_resume_replays_model_turn_with_surface() {
     let fixture = fixture();
@@ -286,6 +287,59 @@ async fn console_resume_replays_model_turn_with_surface() {
         .await;
     assert_eq!(outcome.status, ToolExecutionStatus::Denied);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+fn production_fn_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let needle = format!("fn {name}(");
+    let start = source
+        .find(&needle)
+        .unwrap_or_else(|| panic!("missing production function {name}"));
+    let brace = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("missing body for production function {name}"));
+    let mut depth = 0usize;
+    for (offset, character) in source[brace..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth
+                    .checked_sub(1)
+                    .unwrap_or_else(|| panic!("function brace depth underflow in {name}"));
+                if depth == 0 {
+                    return &source[start..=brace + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated production function {name}");
+}
+
+/// Reverting `run_console_resume` or `execute_resume_and_finalize` to a bare
+/// `ToolExecutionContext::new` (Internal, no surface) must fail this cell.
+#[test]
+fn console_and_chat_resume_go_through_model_turn_context() {
+    for (source, name) in [
+        (
+            include_str!("../../../../gateway/api/sessions.rs"),
+            "run_console_resume",
+        ),
+        (
+            include_str!("../../../../chat/decision_source.rs"),
+            "execute_resume_and_finalize",
+        ),
+    ] {
+        let body = production_fn_body(source, name);
+        assert!(
+            body.contains("surface_owner::model_turn_context"),
+            "{name} must stamp ModelTurn+surface via model_turn_context"
+        );
+        assert!(
+            !body.contains("ToolExecutionContext::new"),
+            "{name} must not construct a bare Internal context"
+        );
+    }
 }
 
 #[tokio::test]
