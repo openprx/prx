@@ -71,7 +71,11 @@ impl TurnDecisionService {
         deadline: Instant,
     ) -> anyhow::Result<ChildRecoveryReport> {
         let mut report = ChildRecoveryReport::default();
-        if !self.generation.effective.causal_tree.enabled || !self.recordable || !self.durable_key {
+        if self.recovery.authority.legacy.is_none()
+            || !self.generation.effective.causal_tree.enabled
+            || !self.recordable
+            || !self.durable_key
+        {
             return Ok(report);
         }
         anyhow::ensure!(

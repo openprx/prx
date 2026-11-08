@@ -13,6 +13,42 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Marker that repository activation succeeded for this scope. The live
+/// repository is always reached through [`RecoveryScope::memory`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActivatedRepository;
+
+/// Plane-on decision evidence. Plane off never constructs this, so nothing
+/// opens `.decision_key` or `decisions.db`.
+#[derive(Clone)]
+pub(crate) struct LegacyEvidence {
+    pub(crate) key: Arc<DecisionKey>,
+    pub(crate) store: Arc<crate::causal_tree::store::CausalDecisionStore>,
+    pub(crate) events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
+}
+
+impl LegacyEvidence {
+    pub(crate) fn owns_prepared_queues(
+        &self,
+        store: Option<&Arc<crate::causal_tree::store::CausalDecisionStore>>,
+        events: Option<&Arc<super::causal_events::DurableCausalEventSink>>,
+    ) -> bool {
+        store.is_some_and(|store| Arc::ptr_eq(store, &self.store))
+            && match (&self.events, events) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+/// Recovery authentication plus optional plane-on legacy evidence.
+#[derive(Clone)]
+pub(crate) struct RecoveryAuthority {
+    pub(crate) repository: Option<ActivatedRepository>,
+    pub(crate) legacy: Option<LegacyEvidence>,
+}
+
 /// Pinned recovery authority. A decision store supplies historical evidence only;
 /// reception and interruption recovery do not require a decision service.
 #[derive(Clone)]
@@ -20,32 +56,36 @@ pub(crate) struct RecoveryScope {
     pub(super) memory: Arc<dyn Memory>,
     pub(super) workspace: std::path::PathBuf,
     pub(super) recordable: bool,
-    pub(super) durable_key: bool,
     pub(super) surface: crate::causal_tree::state::TurnSurfaceKind,
-    pub(super) state_key: Arc<DecisionKey>,
-    pub(super) store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
+    pub(super) authority: Arc<RecoveryAuthority>,
     pub(super) parent_authority_id: Option<crate::tools::capability::child::ParentAuthorityId>,
-    pub(super) durable_events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
 }
 
 impl RecoveryScope {
-    pub(super) const fn unrecorded(
+    pub(super) fn unrecorded(
         memory: Arc<dyn Memory>,
         workspace: std::path::PathBuf,
         surface: crate::causal_tree::state::TurnSurfaceKind,
-        state_key: Arc<DecisionKey>,
     ) -> Self {
         Self {
             memory,
             workspace,
             recordable: false,
-            durable_key: false,
             surface,
-            state_key,
-            store: None,
+            authority: Arc::new(RecoveryAuthority {
+                repository: None,
+                legacy: None,
+            }),
             parent_authority_id: None,
-            durable_events: None,
         }
+    }
+
+    pub(super) fn legacy_store(&self) -> Option<&Arc<crate::causal_tree::store::CausalDecisionStore>> {
+        self.authority.legacy.as_ref().map(|legacy| &legacy.store)
+    }
+
+    pub(super) fn legacy_events(&self) -> Option<&Arc<super::causal_events::DurableCausalEventSink>> {
+        self.authority.legacy.as_ref().and_then(|legacy| legacy.events.as_ref())
     }
 
     /// Initialize durable recovery from pinned runtime inputs, without building
@@ -62,26 +102,30 @@ impl RecoveryScope {
     ) -> anyhow::Result<Arc<Self>> {
         let config = &generation.effective;
         let recording = config.memory.event_recording_config();
-        let recordable = config.causal_tree.enabled
-            && workspace_key.is_some()
-            && crate::memory::serves_tool_execution_ledger(memory.name())
-            && recording.enabled
-            && recording.record_user_messages;
-        let mut scope = Self {
-            memory: Arc::clone(&memory),
-            workspace: config.workspace_dir.clone(),
-            recordable,
-            durable_key: false,
-            surface,
-            state_key: workspace_key.unwrap_or_else(DecisionKey::ephemeral),
-            store: None,
-            parent_authority_id: parent_grant.map(|grant| grant.scope().gate_inputs().0.parent_authority_id),
-            durable_events: None,
-        };
-        if recordable {
-            scope.durable_key = true;
+        let recording_on = recording.enabled && recording.record_user_messages;
+        let plane = config.causal_tree.enabled;
+        let ledger = crate::memory::serves_tool_execution_ledger(memory.name());
+        let prepared_memory = Arc::clone(&memory);
+        let repository_ready = owned_store_operation(owner, move || {
+            prepared_memory.recovery_repository().map_or(Ok(false), |repository| {
+                match repository.activate_recovery_authority() {
+                    Ok(_) => Ok(true),
+                    Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            })
+        })
+        .await?;
+        let has_repository = memory.recovery_repository().is_some();
+        let recordable = recording_on && (repository_ready || (plane && ledger && !has_repository));
+        // Plane-on ReadWrite open is unchanged: same inputs as today's store path.
+        let open_legacy = plane && workspace_key.is_some() && ledger && recording_on;
+        let legacy = if open_legacy {
+            let key = workspace_key.context("plane-on recovery store requires a workspace key")?;
             let events = Arc::new(super::causal_events::DurableCausalEventSink::new(
-                generation, memory, observer,
+                generation,
+                Arc::clone(&memory),
+                observer,
             )?);
             let ticket = owner.register(tokio_util::sync::CancellationToken::new())?;
             let prepared_events = Arc::clone(&events);
@@ -103,10 +147,25 @@ impl RecoveryScope {
             if let Some(namespace) = store.workspace_id() {
                 events.bind_store_namespace(namespace)?;
             }
-            scope.store = Some(store);
-            scope.durable_events = Some(events);
-        }
-        let scope = Arc::new(scope);
+            Some(LegacyEvidence {
+                key,
+                store,
+                events: Some(events),
+            })
+        } else {
+            None
+        };
+        let scope = Arc::new(Self {
+            memory,
+            workspace: config.workspace_dir.clone(),
+            recordable,
+            surface,
+            authority: Arc::new(RecoveryAuthority {
+                repository: repository_ready.then_some(ActivatedRepository),
+                legacy,
+            }),
+            parent_authority_id: parent_grant.map(|grant| grant.scope().gate_inputs().0.parent_authority_id),
+        });
         owner.retain_recovery(Arc::clone(&scope))?;
         recovery_ready(Arc::clone(&scope)).await?;
         Ok(scope)
@@ -117,17 +176,16 @@ impl RecoveryScope {
         store: Option<&Arc<crate::causal_tree::store::CausalDecisionStore>>,
         events: Option<&Arc<super::causal_events::DurableCausalEventSink>>,
     ) -> bool {
-        matches!((&self.store, store), (Some(left), Some(right)) if Arc::ptr_eq(left, right))
-            && match (&self.durable_events, events) {
-                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                (None, None) => true,
-                _ => false,
-            }
+        self.authority
+            .legacy
+            .as_ref()
+            .is_some_and(|legacy| legacy.owns_prepared_queues(store, events))
     }
 
     pub(crate) async fn drain(&self, deadline: Instant) -> bool {
         let mut drained = true;
-        if let Some(writer) = self.store.as_ref().and_then(|store| store.writer()) {
+        let legacy = self.authority.legacy.as_ref();
+        if let Some(writer) = legacy.and_then(|legacy| legacy.store.writer()) {
             #[cfg(test)]
             super::turn_cleanup::diagnostic::queue_presence("decision_writer_present", true);
             let writer_drained = writer.drain(deadline).await;
@@ -136,8 +194,11 @@ impl RecoveryScope {
             drained &= writer_drained;
         }
         #[cfg(test)]
-        super::turn_cleanup::diagnostic::queue_presence("event_queue_present", self.durable_events.is_some());
-        if let Some(events) = &self.durable_events {
+        super::turn_cleanup::diagnostic::queue_presence(
+            "event_queue_present",
+            legacy.is_some_and(|legacy| legacy.events.is_some()),
+        );
+        if let Some(events) = legacy.and_then(|legacy| legacy.events.as_ref()) {
             let events_drained = events.drain(deadline).await;
             #[cfg(test)]
             super::turn_cleanup::diagnostic::queue("event_queue_drained", events_drained);
@@ -147,7 +208,7 @@ impl RecoveryScope {
     }
 
     pub(crate) const fn ingress_recovery_enabled(&self) -> bool {
-        self.recordable && self.durable_key
+        self.recordable
     }
 
     pub(crate) fn accepts_ingress_recovery(
@@ -242,7 +303,13 @@ impl IngressRecorder {
         ticket: &super::turn_cleanup::CleanupTicket,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         let recording = config.memory.event_recording_config();
-        if !config.causal_tree.enabled || !recording.enabled || !recording.record_user_messages {
+        if !recording.enabled || !recording.record_user_messages {
+            return Ok(None);
+        }
+        let plane = config.causal_tree.enabled;
+        let ledger = crate::memory::serves_tool_execution_ledger(memory.name());
+        let has_repository = memory.recovery_repository().is_some();
+        if !(has_repository || (plane && ledger)) {
             return Ok(None);
         }
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -250,23 +317,29 @@ impl IngressRecorder {
         let prepared_memory = Arc::clone(&memory);
         let activation = owned_store_operation(&ticket.owner(), move || {
             remaining(deadline)?;
-            if let Some(repository) = prepared_memory.recovery_repository() {
-                repository.activate_recovery_authority()?;
-            } else {
+            let ready = if let Some(repository) = prepared_memory.recovery_repository() {
+                match repository.activate_recovery_authority() {
+                    Ok(_) => true,
+                    Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => {
+                        // Unusable key: recovery stays off and startup continues.
+                        // Map to Ok so this owner is not marked failed.
+                        false
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else if plane {
+                // Ledger backend without a repository: plane-on load-or-create only.
                 DecisionKey::load_or_create(&workspace_path)?;
-            }
+                true
+            } else {
+                false
+            };
             remaining(deadline)?;
-            Ok(())
+            Ok(ready)
         })
-        .await;
-        if let Err(error) = activation {
-            // Matrix "K = no": an unusable repository key leaves recovery
-            // unavailable (the shared warning was emitted by the memory layer).
-            // This recorder never records, replays or quarantines; startup goes on.
-            if crate::memory::recovery_authority::is_key_unavailable(&error) {
-                return Ok(None);
-            }
-            return Err(error);
+        .await?;
+        if !activation {
+            return Ok(None);
         }
         let workspace = config.workspace_dir.to_string_lossy().into_owned();
         let lifetime = memory
@@ -1235,9 +1308,12 @@ fn recovery_gate(lifetime: &Arc<dyn IngressLifetime>) -> anyhow::Result<Arc<toki
 mod tests;
 
 mod authority;
+pub(crate) use authority::{LegacyUnconfirmed, SettledTerminalFacts};
 
 #[cfg(test)]
 mod authority_tests;
+#[cfg(test)]
+pub(crate) use authority_tests::backend_memory;
 
 #[cfg(test)]
 pub(crate) mod tombstone_fixture;

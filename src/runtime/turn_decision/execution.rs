@@ -358,7 +358,6 @@ impl OrdinaryChildPublication {
                 Arc::clone(&parent.memory),
                 parent.generation.effective.workspace_dir.clone(),
                 TurnSurfaceKind::Worker,
-                Arc::clone(&parent.state_key),
             )),
             advisory_engine: Default::default(),
             child_recovery: Default::default(),

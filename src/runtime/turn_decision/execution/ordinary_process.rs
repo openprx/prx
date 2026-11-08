@@ -245,7 +245,6 @@ impl TurnDecisionService {
                 Arc::clone(&build.memory),
                 config.workspace_dir.clone(),
                 TurnSurfaceKind::Worker,
-                Arc::clone(&parent.key),
             )),
             advisory_engine: Default::default(),
             child_recovery: Default::default(),

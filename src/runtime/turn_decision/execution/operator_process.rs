@@ -70,7 +70,7 @@ impl TurnDecisionService {
         )
         .await?;
         let durable_events = if durable_key {
-            recovery.durable_events.clone()
+            recovery.legacy_events().cloned()
         } else {
             None
         };
@@ -80,8 +80,8 @@ impl TurnDecisionService {
         );
         let store = if durable_key {
             recovery
-                .store
-                .clone()
+                .legacy_store()
+                .cloned()
                 .ok_or_else(|| anyhow::anyhow!("operator recovery store is unavailable"))?
         } else {
             super::super::store_preparation::open_store(Arc::clone(&build.generation), Arc::clone(&events), None, false)

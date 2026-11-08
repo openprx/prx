@@ -590,14 +590,10 @@ async fn ingress_recovery_off_with_causal_tree_disabled_creates_no_key_or_store(
         IngressRecorder::prepare(Arc::clone(&memory), &config, &ticket)
             .await
             .unwrap()
-            .is_none()
+            .is_some(),
+        "plane-off recording still prepares a repository recorder"
     );
-    let event = memory
-        .append_message_event(recovery_input(dir.path(), "prx_run"))
-        .await
-        .unwrap();
-    // With recovery off, ordinary events need no authenticated ingress capsule.
-    fabric.verify_ingress_input(&event).unwrap();
+    let _ = fabric;
     let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
     let observer = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
         crate::observability::NoopObserver,
@@ -613,11 +609,16 @@ async fn ingress_recovery_off_with_causal_tree_disabled_creates_no_key_or_store(
     )
     .await
     .unwrap();
-    assert!(!recovery.ingress_recovery_enabled());
-    assert!(recovery.store.is_none());
-    assert!(recovery.durable_events.is_none());
+    assert!(recovery.ingress_recovery_enabled());
+    assert!(recovery.authority.legacy.is_none());
+    assert!(recovery.legacy_store().is_none());
+    assert!(recovery.legacy_events().is_none());
     assert!(!dir.path().join("self/causal_tree/.decision_key").exists());
     assert!(!dir.path().join("self/causal_tree/decisions.db").exists());
+    assert!(
+        dir.path().join("memory/.recovery_keys").exists(),
+        "plane-off first activation may create recovery keys"
+    );
     ticket.finish(true);
     tracker
         .drain(tokio::time::Instant::now() + Duration::from_secs(5))
@@ -645,13 +646,14 @@ async fn recovery_with_unavailable_key_stays_unrecorded_without_retry() {
         None,
     )
     .await
-    .expect("missing key degrades recovery instead of aborting publication");
-    assert!(!recovery.ingress_recovery_enabled());
-    assert!(recovery.store.is_none());
-    assert!(recovery.durable_events.is_none());
+    .expect("missing decision key does not abort repository recovery");
+    assert!(recovery.ingress_recovery_enabled());
+    assert!(recovery.authority.legacy.is_none());
+    assert!(recovery.legacy_store().is_none());
+    assert!(recovery.legacy_events().is_none());
     assert!(
         !dir.path().join("self/causal_tree/.decision_key").exists(),
-        "key preparation must not be retried"
+        "decision key must not be created without a plane-on workspace key"
     );
     assert!(!dir.path().join("self/causal_tree/decisions.db").exists());
     tracker
@@ -697,12 +699,12 @@ fn terminal_scope(memory: Arc<dyn Memory>, workspace: &Path) -> RecoveryScope {
         memory,
         workspace: workspace.to_path_buf(),
         recordable: true,
-        durable_key: true,
         surface: crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-        state_key: DecisionKey::load_or_create(workspace).unwrap(),
-        store: None,
+        authority: Arc::new(RecoveryAuthority {
+            repository: None,
+            legacy: None,
+        }),
         parent_authority_id: None,
-        durable_events: None,
     }
 }
 
@@ -779,12 +781,31 @@ async fn recovery_off_when_user_message_recording_is_disabled() {
     .await
     .unwrap();
     assert!(!recovery.ingress_recovery_enabled());
-    assert!(recovery.store.is_none());
-    assert!(recovery.durable_events.is_none());
+    assert!(recovery.authority.legacy.is_none());
+    assert!(recovery.legacy_store().is_none());
+    assert!(recovery.legacy_events().is_none());
     assert!(!dir.path().join("self/causal_tree/decisions.db").exists());
     ticket.finish(true);
     tracker
         .drain(tokio::time::Instant::now() + Duration::from_secs(5))
         .await
         .unwrap();
+}
+
+#[path = "auth_02_2a_tests.rs"]
+mod auth_02_2a_tests;
+
+#[tokio::test]
+async fn recovery_plane_recording_key_legacy_matrix() {
+    auth_02_2a_tests::recovery_plane_recording_key_legacy_matrix().await;
+}
+
+#[tokio::test]
+async fn recovery_off_never_writes_outcome_or_child_link() {
+    auth_02_2a_tests::recovery_off_never_writes_outcome_or_child_link().await;
+}
+
+#[tokio::test]
+async fn recovery_legacy_chain_writes_no_attestation() {
+    auth_02_2a_tests::recovery_legacy_chain_writes_no_attestation().await;
 }

@@ -283,11 +283,7 @@ impl MemoryFabric {
     ) -> anyhow::Result<Self> {
         self.input_accepted = Arc::default();
         let recording = config.memory.event_recording_config();
-        if self.memory.name() == "none"
-            || !config.causal_tree.enabled
-            || !recording.enabled
-            || !recording.record_user_messages
-        {
+        if self.memory.name() == "none" || !recording.enabled || !recording.record_user_messages {
             return Ok(self);
         }
         anyhow::ensure!(

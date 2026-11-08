@@ -282,7 +282,7 @@ async fn recovery_wrapped_backends_keep_duplicate_suppression() -> anyhow::Resul
 }
 
 /// Durable ledger with no repository capability, as on PostgreSQL.
-struct LegacyLedger(SqliteMemory);
+pub(super) struct LegacyLedger(SqliteMemory);
 #[async_trait::async_trait]
 impl Memory for LegacyLedger {
     fn name(&self) -> &str {
@@ -391,9 +391,21 @@ impl Memory for LegacyLedger {
     ) -> anyhow::Result<MessageEvent> {
         self.0.commit_ingress_recovery(commit).await
     }
+    async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
+        self.0.append_message_event(input).await
+    }
+    async fn find_message_event_by_idempotency_key(
+        &self,
+        workspace_id: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        self.0
+            .find_message_event_by_idempotency_key(workspace_id, idempotency_key)
+            .await
+    }
 }
 
-fn backend_memory(backend: &str, workspace: &std::path::Path) -> anyhow::Result<Arc<dyn Memory>> {
+pub(crate) fn backend_memory(backend: &str, workspace: &std::path::Path) -> anyhow::Result<Arc<dyn Memory>> {
     let local = SqliteMemory::new(workspace)?;
     let memory: Arc<dyn Memory> = match backend {
         "lucid" => Arc::new(crate::memory::lucid::LucidMemory::new(
@@ -424,7 +436,7 @@ fn backend_memory(backend: &str, workspace: &std::path::Path) -> anyhow::Result<
 struct Admission<'a> {
     key: &'a str,
     owner: &'a str,
-    /// `causal_tree.enabled`; off means no recorder exists.
+    /// `causal_tree.enabled`. Recording plus a repository still recover with the plane off.
     plane: bool,
     /// The best-effort issuer path that gateway, scheduled, CLI and channel share.
     best_effort: bool,
@@ -922,7 +934,8 @@ async fn recovery_plane_off_tombstone_fence() -> anyhow::Result<()> {
     anyhow::ensure!(dispatched.load(Ordering::SeqCst) == 1, "a fenced input dispatched");
     anyhow::ensure!(std::fs::read_dir(keys_dir(&workspace))?.count() == 0, "key dir changed");
 
-    // (iii) A database that never activated recovery: admitted, nothing created.
+    // (iii) A database that never activated recovery: plane-off recording
+    // activates repository keys and never opens decision state.
     let fresh_dir = directory()?;
     let fresh = fresh_dir.path().canonicalize()?;
     let never: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&fresh)?);
@@ -931,13 +944,14 @@ async fn recovery_plane_off_tombstone_fence() -> anyhow::Result<()> {
         admitted.is_ok_and(|event| event.is_some()),
         "a never-activated store refused"
     );
-    let tables: i64 = db(&fresh).query_row(
-        "SELECT count(*) FROM sqlite_schema WHERE name='recovery_tombstones'",
-        [],
-        |r| r.get(0),
-    )?;
-    anyhow::ensure!(tables == 0, "the fence created the tombstone table");
-    anyhow::ensure!(!keys_dir(&fresh).exists(), "the fence created .recovery_keys");
+    anyhow::ensure!(
+        keys_dir(&fresh).exists(),
+        "plane-off first activation skipped recovery keys"
+    );
+    anyhow::ensure!(
+        !fresh.join("self/causal_tree/.decision_key").exists() && !fresh.join("self/causal_tree/decisions.db").exists(),
+        "plane-off first activation opened decision state"
+    );
     Ok(())
 }
 

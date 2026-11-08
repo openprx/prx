@@ -3242,7 +3242,7 @@ pub(crate) async fn build_turn_decision_service(
     .await
     .map_err(TurnServiceBuildError::RecoveryPreparation)?;
     let durable_events = if durable_key {
-        recovery.durable_events.clone()
+        recovery.legacy_events().cloned()
     } else {
         None
     };
@@ -3251,7 +3251,7 @@ pub(crate) async fn build_turn_decision_service(
         |events| Arc::clone(events) as Arc<dyn CausalEventSink>,
     );
     let store = if durable_key {
-        recovery.store.clone().ok_or_else(|| {
+        recovery.legacy_store().cloned().ok_or_else(|| {
             TurnServiceBuildError::RecoveryPreparation(anyhow::anyhow!(
                 "enabled decision service requires a durable recovery store"
             ))

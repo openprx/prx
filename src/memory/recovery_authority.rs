@@ -61,6 +61,16 @@ impl RecoveryReceipt {
         }
         Ok(serde_json::from_slice::<Bound>(&self.facts)?.pending)
     }
+
+    /// The opaque settled facts the receipt was published with. Call only on a
+    /// settled receipt returned by `read_recovery_receipt`.
+    pub fn settled_facts(&self) -> anyhow::Result<Vec<u8>> {
+        #[derive(Deserialize)]
+        struct Bound {
+            completion: Vec<u8>,
+        }
+        Ok(serde_json::from_slice::<Bound>(&self.facts)?.completion)
+    }
 }
 
 /// Facts exceed the backend's publication or serialized receipt budget.

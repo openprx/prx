@@ -854,9 +854,8 @@ impl super::ingress_recovery::RecoveryScope {
                     | TurnSurfaceKind::Xin
                     | TurnSurfaceKind::Worker
                     | TurnSurfaceKind::Channel
-            ) && self.recordable
-                && self.durable_key,
-            "terminal rejoin requires an enabled pinned ingress store"
+            ) && self.recordable,
+            "terminal rejoin requires recording plus recovery authority"
         );
         anyhow::ensure!(
             !terminal_id.is_empty() && !owner_id.is_empty(),
@@ -889,21 +888,21 @@ impl super::ingress_recovery::RecoveryScope {
             event.workspace_id == workspace_id && event.owner_id.as_deref() == Some(owner_id),
             "terminal replay scope does not match its owner"
         );
-        let journal = crate::agent::terminal::replay_requires_journal(&self.state_key, &event, None)?;
-        let store = if journal {
-            None
-        } else {
-            Some(
-                self.store
-                    .as_ref()
-                    .context("historical terminal evidence store is unavailable")?,
-            )
-        };
+        if self.authority.legacy.is_none() {
+            return self.rejoin_without_legacy(&event, terminal_id, owner_id).await;
+        }
+        let legacy = self
+            .authority
+            .legacy
+            .as_ref()
+            .context("legacy evidence missing after plane-on gate")?;
+        let state_key = &legacy.key;
+        let journal = crate::agent::terminal::replay_requires_journal(state_key, &event, None)?;
+        let store = if journal { None } else { Some(&legacy.store) };
         let store_workspace_id: Arc<str> = match store {
             Some(store) => store.workspace_id().context("store workspace scope is missing")?,
             None => Arc::from(crate::agent::terminal::authenticated_replay_store_workspace(
-                &self.state_key,
-                &event,
+                state_key, &event,
             )?),
         };
         let replay = match (store, bounded) {
@@ -911,7 +910,7 @@ impl super::ingress_recovery::RecoveryScope {
                 crate::agent::terminal::verify_terminal_replay_until(
                     self.memory.as_ref(),
                     &store.reader(),
-                    &self.state_key,
+                    state_key,
                     &store_workspace_id,
                     &workspace_id,
                     owner_id,
@@ -926,7 +925,7 @@ impl super::ingress_recovery::RecoveryScope {
                 crate::agent::terminal::verify_terminal_replay(
                     self.memory.as_ref(),
                     &store.reader(),
-                    &self.state_key,
+                    state_key,
                     &store_workspace_id,
                     &workspace_id,
                     owner_id,
@@ -939,7 +938,7 @@ impl super::ingress_recovery::RecoveryScope {
                 crate::agent::terminal::verify_terminal_replay_journal_until(
                     self.memory.as_ref(),
                     &self.workspace,
-                    &self.state_key,
+                    state_key,
                     &store_workspace_id,
                     &workspace_id,
                     owner_id,
@@ -954,7 +953,7 @@ impl super::ingress_recovery::RecoveryScope {
                 crate::agent::terminal::verify_terminal_replay_journal(
                     self.memory.as_ref(),
                     &self.workspace,
-                    &self.state_key,
+                    state_key,
                     &store_workspace_id,
                     &workspace_id,
                     owner_id,
@@ -1004,7 +1003,7 @@ impl super::ingress_recovery::RecoveryScope {
         };
         JournalChildOutcomeHook::new(
             self.workspace.clone(),
-            Arc::clone(&self.state_key),
+            Arc::clone(state_key),
             Arc::clone(&store_workspace_id),
         )
         .persist(&replay, &event, child_owner, child_deadline)
@@ -1103,10 +1102,7 @@ impl super::ingress_recovery::RecoveryScope {
                 "replay is not a completed local close"
             );
             let application = VerifiedDirectiveApplication::from_replay(&replay)?;
-            let sink = self
-                .durable_events
-                .as_ref()
-                .context("applied replay sink is unavailable")?;
+            let sink = legacy.events.as_ref().context("applied replay sink is unavailable")?;
             if let Some((_, deadline, _)) = bounded {
                 sink.repair_applied_until(application, deadline).await?;
             } else {
@@ -1137,7 +1133,7 @@ impl super::ingress_recovery::RecoveryScope {
         if journal {
             // Non-gating store projection: the journal rows above are the authority,
             // so every failure here is logged and never refuses the rejoin.
-            match self.store.as_ref().and_then(|store| store.writer()) {
+            match legacy.store.writer() {
                 Some(writer) => {
                     if writer.record_outcome(expected.clone()) != Enqueue::Queued {
                         tracing::warn!("rejoined outcome projection could not be queued");
@@ -1161,5 +1157,77 @@ impl super::ingress_recovery::RecoveryScope {
         #[cfg(test)]
         stage.finish();
         Ok(Enqueue::Queued)
+    }
+
+    /// Plane-off rejoin: settled skill settle, zero decision writes. Unattested
+    /// legacy stays [`super::ingress_recovery::authority::LegacyUnconfirmed`].
+    async fn rejoin_without_legacy(
+        &self,
+        event: &crate::memory::MessageEvent,
+        terminal_id: &str,
+        owner_id: &str,
+    ) -> anyhow::Result<Enqueue> {
+        let facts = self
+            .load_settled_facts(event, terminal_id, owner_id)
+            .await?
+            .ok_or(super::ingress_recovery::LegacyUnconfirmed)?;
+        let observation = &facts.skill_observation;
+        crate::skills::lifecycle::spawn_settle_task_terminal(
+            self.workspace.clone(),
+            Some(owner_id.to_owned()),
+            crate::skills::lifecycle::task_key(
+                super::turn_source::subject_task_id(event.subject.as_ref()),
+                event.run_id.as_deref(),
+                event.parent_run_id.as_deref(),
+            ),
+            terminal_id.to_owned(),
+            crate::skills::lifecycle::TerminalObservation {
+                recovered: true,
+                root: event.parent_run_id.is_none(),
+                ..observation
+                    .status
+                    .skill_observation(observation.awaiting_approval, observation.verified)
+            },
+        );
+        if self.authority.legacy.is_none() {
+            tracing::debug!("plane-off recovery skips the child outcome link");
+        } else {
+            anyhow::bail!("child link requires legacy evidence");
+        }
+        Ok(Enqueue::Queued)
+    }
+
+    async fn load_settled_facts(
+        &self,
+        event: &crate::memory::MessageEvent,
+        terminal_id: &str,
+        owner_id: &str,
+    ) -> anyhow::Result<Option<super::ingress_recovery::SettledTerminalFacts>> {
+        if self.authority.repository.is_none() {
+            return Ok(None);
+        }
+        let memory = Arc::clone(&self.memory);
+        let chain = crate::memory::recovery_authority::RecoveryChain {
+            workspace_id: event.workspace_id.clone(),
+            owner_id: owner_id.to_owned(),
+            source: event.source.as_str().to_owned(),
+            run_id: terminal_id.to_owned(),
+        };
+        let receipt = tokio::task::spawn_blocking(move || {
+            let Some(repository) = memory.recovery_repository() else {
+                return Ok(None);
+            };
+            repository.read_recovery_receipt(&chain)
+        })
+        .await??;
+        let Some(receipt) = receipt else {
+            return Ok(None);
+        };
+        if receipt.state != "settled" {
+            return Ok(None);
+        }
+        Ok(Some(super::ingress_recovery::SettledTerminalFacts::parse(
+            &receipt.settled_facts()?,
+        )?))
     }
 }
