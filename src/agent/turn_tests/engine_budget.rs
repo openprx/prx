@@ -1188,7 +1188,7 @@ async fn the_inline_tool_result_budget_aims_at_the_reserved_window() {
     crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
         const INLINE_MARKER: &str = "inline-budget-probe-marker";
         /// Room left over once the published tool surface is reserved.
-        const RESERVED_SLACK_TOKENS: usize = 1600;
+        const RESERVED_SLACK_TOKENS: usize = 400;
 
         let output = format!("{INLINE_MARKER} {}", "inline budget payload ".repeat(45));
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
@@ -1200,11 +1200,6 @@ async fn the_inline_tool_result_budget_aims_at_the_reserved_window() {
         let surface_tokens = budgeted_request_tool_tokens(tool_surface);
 
         let mut history = context_budget_fixture_history(surface_tokens / 8);
-        history
-            .last_mut()
-            .expect("current fixture input")
-            .content
-            .push_str(" Use file_read.");
         let config = context_budget_fixture_config(&history, surface_tokens.saturating_add(RESERVED_SLACK_TOKENS));
         let reserved = reserve_request_tool_surface(&config, tool_surface);
         assert!(

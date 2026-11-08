@@ -26,6 +26,18 @@ impl CallTokenBudget {
     }
 }
 
+impl CallTokenBudget {
+    /// Live remaining G6 tokens, read on every call.
+    pub(crate) fn remaining(&self) -> u64 {
+        (self.remaining)()
+    }
+
+    /// The candidate estimate for a schema of `schema_bytes`; `None` refuses.
+    pub(crate) fn tokens_for(&self, schema_bytes: usize) -> Option<u64> {
+        (self.estimate)(schema_bytes)
+    }
+}
+
 impl std::fmt::Debug for CallTokenBudget {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("CallTokenBudget")
@@ -297,14 +309,14 @@ pub(super) fn admit_called_tokens(
         0
     } else {
         let schema_bytes = serde_json::to_vec(&descriptor.parameters).map_or(usize::MAX, |value| value.len());
-        (budget.estimate)(schema_bytes).ok_or_else(|| {
+        budget.tokens_for(schema_bytes).ok_or_else(|| {
             (
                 ToolExecutionStatus::Denied,
                 format!("tool '{name}' has no current token estimate"),
             )
         })?
     };
-    let remaining = (budget.remaining)();
+    let remaining = budget.remaining();
     if tokens > remaining {
         return Err((
             ToolExecutionStatus::Denied,
