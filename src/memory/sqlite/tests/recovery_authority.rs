@@ -1246,6 +1246,14 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
             )?;
         }
         assert!(tree(&case)? == before, "aliases: listing and bytes unchanged");
+        // A benign symlink to an ordinary directory is admitted, and the store
+        // lands in the physical directory.
+        let ordinary = case.join("ordinary");
+        std::fs::DirBuilder::new().mode(0o700).create(&ordinary)?;
+        std::os::unix::fs::symlink(&ordinary, case.join("alias-ordinary"))?;
+        let benign = SqliteMemory::new_with_path(case.join("alias-ordinary").join("target.db"))?;
+        assert!(ordinary.join("target.db").is_file());
+        assert_eq!(parent_of(&benign.db_path)?, ordinary.canonicalize()?);
     }
     // A reserved final basename and a reserved ancestor are rejected with no side effect.
     for (index, reserved) in [".backup-incomplete-x/target.db", ".BACKUP-INCOMPLETE-y/inner/target.db"]
