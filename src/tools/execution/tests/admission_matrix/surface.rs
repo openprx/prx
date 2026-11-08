@@ -148,10 +148,30 @@ fn channel_message() -> crate::channels::traits::ChannelMessage {
     }
 }
 
-/// The channel surface comes from the production turn service, whose catalog
-/// entries carry `channel_eligible`, not from a caller-supplied closure.
+/// `channel_exclude` is folded at publication. The excluded name is never
+/// published, so dispatch is Denied with no backend call and no decision context.
 #[tokio::test]
 async fn channel_ineligible_tool_is_refused_on_channel_turn() {
+    let fixture = fixture();
+    let service = allow_service(&fixture);
+    let mut config = crate::config::ToolTieringConfig::default();
+    config.channel_exclude.push("config_reload".into());
+    let context = surface_context(&service, &config, true, true);
+    assert!(
+        context
+            .turn_surface
+            .as_ref()
+            .is_some_and(|surface| !surface.contains("config_reload")),
+        "channel-excluded tool was published"
+    );
+    assert_refused(&service, &fixture, context, "config_reload").await;
+}
+
+/// The channel surface comes from the production turn service, whose catalog
+/// entries carry `channel_eligible`, not from a caller-supplied closure.
+// Decision-bound until 03-SWITCH moves the surface owner.
+#[tokio::test]
+async fn production_channel_surface_omits_channel_excluded_tool() {
     let workspace = tempfile::tempdir().expect("channel workspace");
     let fixture = fixture();
     let mut config = crate::config::Config::default();
@@ -168,6 +188,22 @@ async fn channel_ineligible_tool_is_refused_on_channel_turn() {
     let decision = admitted.decision();
     let surface = decision.service.turn_tool_surface(decision.proof, &[]);
     assert!(!surface.contains("project_tool"), "channel-excluded tool was published");
+}
+
+/// Control: an empty `channel_exclude` publishes the tool on a channel turn
+/// and dispatch reaches the backend without a decision context.
+#[tokio::test]
+async fn channel_turn_admits_tool_not_channel_excluded() {
+    let fixture = fixture();
+    let service = allow_service(&fixture);
+    let mut config = crate::config::ToolTieringConfig::default();
+    config.channel_exclude.clear();
+    let context = surface_context(&service, &config, true, true);
+    assert_eq!(
+        service.execute(command(1), context, None).await.status,
+        ToolExecutionStatus::Succeeded
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
