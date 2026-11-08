@@ -212,6 +212,7 @@ fn channel_turn_probe_principal(tmp: &TempDir, session_key: Option<String>, send
         sender,
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     }
 }
 

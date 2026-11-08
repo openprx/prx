@@ -1752,6 +1752,7 @@ fn memory_principal() -> crate::memory::MemoryPrincipal {
         owner_id: None,
         require_owner_match: false,
         legacy_session_key: None,
+        agent_partition: None,
     }
 }
 

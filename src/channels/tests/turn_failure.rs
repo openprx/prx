@@ -363,6 +363,7 @@ async fn failed_channel_turn_sends_classified_advice_carrying_the_turn_error_id(
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             20,

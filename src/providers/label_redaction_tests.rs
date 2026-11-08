@@ -452,6 +452,7 @@ async fn a_conversation_event_names_its_provider_without_url_userinfo() {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             10,
         )
@@ -631,6 +632,7 @@ async fn an_identity_sender_is_stored_as_given_and_its_owner_reads_it_back() {
                 sender: Some(sender.to_string()),
                 owner_id: Some("owner:webhook-caller".to_string()),
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             10,

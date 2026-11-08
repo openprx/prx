@@ -25,6 +25,7 @@ use crate::memory::traits::{
 };
 
 mod agent_migration;
+mod agent_partition;
 mod agent_registry;
 mod erasure;
 mod event_batch;
@@ -54,6 +55,7 @@ fn test_conversation_principal(session_key: &str, owner_id: Option<&str>) -> Mem
         sender: Some("tester".to_string()),
         owner_id: owner_id.map(str::to_string),
         legacy_session_key: None,
+        agent_partition: None,
     }
 }
 
@@ -158,6 +160,7 @@ fn isolated_document_principal(workspace_id: &str, owner_id: Option<&str>) -> Me
         owner_id: owner_id.map(ToString::to_string),
         require_owner_match: true,
         legacy_session_key: None,
+        agent_partition: None,
     }
 }
 
@@ -311,6 +314,7 @@ fn g1_owner_principal(owner: &str) -> MemoryPrincipal {
         sender: None,
         owner_id: Some(owner.to_string()),
         legacy_session_key: None,
+        agent_partition: None,
     }
 }
 
@@ -408,6 +412,7 @@ fn c03_principal(workspace_id: &str, owner_id: Option<&str>, isolated: bool) -> 
         owner_id: owner_id.map(str::to_string),
         require_owner_match: isolated,
         legacy_session_key: None,
+        agent_partition: None,
     }
 }
 

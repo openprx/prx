@@ -1477,6 +1477,11 @@ impl SqliteMemory {
                 "agent_scope_columns",
                 "ma_scope_id TEXT REFERENCES agent_scopes(scope_id) on conversation_turns + message_events + memories + documents + document_chunks + embedding_cache + memory_events + memory_drafts + memory_trash + memory_links + retrieval_traces + compaction_runs + topics + topic_participants + topic_aliases + chat_profiles + access_audit_log + approval_grants + approval_grant_events + approval_grant_revocations + ramflux_blobs + legacy console history migrated to Main",
             ),
+            (
+                20,
+                "idx_agent_scopes_lookup",
+                "idx_agent_scopes_lookup ON agent_scopes(workspace_id, owner_id, agent_key, incarnation)",
+            ),
         ]
     }
 }

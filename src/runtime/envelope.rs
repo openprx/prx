@@ -617,6 +617,7 @@ impl RuntimeEnvelope {
             // D4: carry the pre-cutover legacy key so `session`-visibility recall
             // read-merges canonical + legacy. `None` preserves single-key recall.
             legacy_session_key: self.legacy_session_key.clone(),
+            agent_partition: None,
         }
     }
 

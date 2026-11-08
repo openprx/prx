@@ -285,6 +285,40 @@ fn operator_history_principal(
     principal
 }
 
+fn history_partition(
+    envelope: &RuntimeEnvelope,
+    owner_id: &str,
+    targeted: Option<&TargetedTurn>,
+    incarnation: Option<&str>,
+) -> Result<crate::memory::AgentPartition, Box<Response>> {
+    let key = match targeted {
+        None => crate::memory::PartitionKey::Main,
+        Some(turn) => {
+            let Some(raw) = incarnation else {
+                return Err(Box::new(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Targeted agent incarnation is missing",
+                )));
+            };
+            let incarnation = uuid::Uuid::parse_str(raw).map_err(|_| {
+                Box::new(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Targeted agent incarnation is invalid",
+                ))
+            })?;
+            crate::memory::PartitionKey::Named {
+                name: turn.name.clone(),
+                incarnation,
+            }
+        }
+    };
+    Ok(crate::memory::AgentPartition {
+        workspace_id: envelope.workspace_id.clone(),
+        owner_id: owner_id.to_owned(),
+        key,
+    })
+}
+
 async fn recover_console_history(
     state: &AppState,
     runtime: &crate::gateway::TurnRuntimeGeneration,
@@ -1512,11 +1546,14 @@ fn select_turn_target(
             incarnation: None,
         });
     };
+    if !state.mem.supports_agent_scope() {
+        return Err(TargetError::BackendUnsupported.into_response());
+    }
+    let (runtime, turn) = prepare_target(&turn_runtime, &plan).map_err(IntoResponse::into_response)?;
     let registry = state
         .mem
         .agent_registry()
-        .ok_or_else(|| TargetError::BackendUnsupported.into_response())?;
-    let (runtime, turn) = prepare_target(&turn_runtime, &plan).map_err(IntoResponse::into_response)?;
+        .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "Agent registry is unavailable"))?;
     let incarnation = resolve_incarnation(state, registry, &turn_runtime, &principal.owner_id, &plan)
         .map_err(|response| *response)?;
     Ok(SelectedTurn {
@@ -1887,7 +1924,18 @@ async fn submit_console_message(
             "Console history recovery is incomplete",
         );
     }
-    let principal = operator_history_principal(&api_principal, &runtime_envelope);
+    let mut principal = operator_history_principal(&api_principal, &runtime_envelope);
+    principal.agent_partition = Some(
+        match history_partition(
+            &runtime_envelope,
+            &api_principal.owner_id,
+            target.as_ref(),
+            incarnation.as_deref(),
+        ) {
+            Ok(partition) => partition,
+            Err(response) => return *response,
+        },
+    );
     let turns = match state
         .mem
         .list_console_conversation_turns(&principal, &session_id, MAX_PAGE_LIMIT, 0)

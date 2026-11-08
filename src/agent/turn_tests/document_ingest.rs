@@ -109,6 +109,7 @@ fn untrusted_search_principal() -> MemoryPrincipal {
         sender: Some("local-user".to_string()),
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     }
 }
 
@@ -156,6 +157,7 @@ async fn persist_untrusted_external_copy_stamps_the_runtime_session_key() {
         // OWNER-VIS OV-E: a `private` event is readable only by its owner.
         owner_id: runtime.owner_id.clone(),
         legacy_session_key: None,
+        agent_partition: None,
     };
     let event = memory
         .list_memory_events_recent(&principal, 50)

@@ -167,6 +167,7 @@ pub(super) async fn refresh_history(inner: &Inner, account: &str, conversation: 
         owner_id: None,
         require_owner_match: false,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let loaded = scoped
         .load_recent_conversation_histories(

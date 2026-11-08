@@ -454,6 +454,7 @@ async fn webhook_records_gateway_message_events() {
         sender: Some("client-a".to_string()),
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let events = memory
         .list_message_events_since(&canonical_principal, 0, 50)

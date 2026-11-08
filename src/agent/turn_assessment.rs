@@ -248,6 +248,7 @@ mod tests {
                     legacy_session_key: None,
                     channel: Some("terminal".into()),
                     sender: Some("local-user".into()),
+                    agent_partition: None,
                 },
                 0,
                 10,

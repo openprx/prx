@@ -345,6 +345,7 @@ async fn legacy_message_events_schema_adds_typed_lineage_columns() {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             10,
@@ -779,6 +780,7 @@ async fn document_ingest_chunks_searches_and_links_sources() {
         sender: Some("alice".to_string()),
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let results = mem
         .search_document_chunks(&principal, "vector retrieval", 10)
@@ -864,6 +866,7 @@ async fn document_chunk_vector_search_uses_current_embedding_metadata() {
         sender: Some("local-user".to_string()),
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let vector_results = mem
         .search_document_chunks(&principal, "no keyword overlap", 10)
@@ -1167,6 +1170,7 @@ async fn reindex_backfills_stale_document_chunk_embeddings() {
         sender: Some("local-user".to_string()),
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let vector_results = mem
         .search_document_chunks(&principal, "no keyword overlap", 10)
@@ -1225,6 +1229,7 @@ async fn memory_draft_lifecycle_creates_merges_and_rejects_with_outbox() {
         sender: None,
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let drafts = mem
         .list_memory_drafts_for_run(&test_principal, "run-worker")

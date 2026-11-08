@@ -532,6 +532,7 @@ async fn ingest_event_visibility_unchanged_for_a_non_isolated_workspace_caller()
         owner_id: None,
         require_owner_match: false,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let event = mem
         .list_memory_events_recent(&principal, 200)
@@ -959,6 +960,7 @@ async fn evolution_proposal_crud_round_trips_through_sqlite() {
         sender: None,
         owner_id: Some("self_system".to_string()),
         legacy_session_key: None,
+        agent_partition: None,
     };
 
     let draft = EvolutionProposalDraft {
@@ -1030,6 +1032,7 @@ async fn evolution_proposal_crud_round_trips_through_sqlite() {
         sender: Some("intruder".to_string()),
         owner_id: Some("owner:intruder".to_string()),
         legacy_session_key: None,
+        agent_partition: None,
     };
     let hidden = mem
         .get_evolution_proposal(&other_principal, "evo-crud-1")
@@ -1189,6 +1192,7 @@ async fn memory_event_records_and_queries_parent_run_id() {
         sender: None,
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let events = mem
         .list_memory_events_since(&principal, 0, 50)

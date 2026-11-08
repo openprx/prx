@@ -206,6 +206,10 @@ impl Memory for EncryptedScope {
         None
     }
 
+    fn supports_agent_scope(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         // The ledger and event recorder select a backend by this name. The
         // inner store is that backend; this view only seals the bytes it writes.
@@ -407,6 +411,7 @@ impl Memory for EncryptedScope {
         after_id: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<crate::memory::MessageEvent>> {
+        principal.reject_named_scope()?;
         Ok(self
             .inner
             .list_message_events_since(principal, after_id, limit)
@@ -1262,6 +1267,7 @@ mod tests {
             owner_id: None,
             require_owner_match: false,
             legacy_session_key: None,
+            agent_partition: None,
         };
         let rows = view
             .load_recent_conversation_histories(&principal, 2, 10)

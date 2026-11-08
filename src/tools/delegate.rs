@@ -2438,6 +2438,7 @@ pub(crate) mod tests {
                     sender: Some("prx_user".to_string()),
                     owner_id: None,
                     legacy_session_key: None,
+                    agent_partition: None,
                 },
                 0,
                 100,
@@ -2488,6 +2489,7 @@ pub(crate) mod tests {
                     sender: Some("prx_user".to_owned()),
                     owner_id: None,
                     legacy_session_key: None,
+                    agent_partition: None,
                 },
                 100,
             )
@@ -2514,6 +2516,7 @@ pub(crate) mod tests {
                     sender: Some("prx_user".to_string()),
                     owner_id: None,
                     legacy_session_key: None,
+                    agent_partition: None,
                 },
                 0,
                 100,
@@ -4430,6 +4433,7 @@ mod credential_containment_tests {
                     sender: None,
                     owner_id: None,
                     legacy_session_key: None,
+                    agent_partition: None,
                 },
                 100,
             )
@@ -4462,6 +4466,7 @@ mod credential_containment_tests {
                     sender: None,
                     owner_id: None,
                     legacy_session_key: None,
+                    agent_partition: None,
                 },
                 100,
             )

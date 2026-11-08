@@ -473,6 +473,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
         sender: Some("sender-1".to_string()),
         owner_id: Some("owner-a".to_string()),
         legacy_session_key: None,
+        agent_partition: None,
     };
     let events = mem.list_message_events_since(&principal, 0, 10).await.unwrap();
     assert_eq!(events.len(), 2);
@@ -585,6 +586,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
         sender: None,
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let merged = mem
         .merge_memory_draft(&test_principal, "draft-1")
@@ -878,6 +880,7 @@ async fn postgres_embedding_vector_reindex_from_env() {
         sender: Some("local-user".to_string()),
         owner_id: Some("owner-a".to_string()),
         legacy_session_key: None,
+        agent_partition: None,
     };
     let document_results = mem
         .search_document_chunks(&principal, "semantic-neighbor", 5)

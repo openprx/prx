@@ -284,6 +284,10 @@ impl Memory for LucidMemory {
         None
     }
 
+    fn supports_agent_scope(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "lucid"
     }
@@ -679,6 +683,7 @@ impl Memory for LucidMemory {
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<Vec<crate::memory::ConversationTurn>> {
+        principal.reject_named_scope()?;
         self.local
             .list_console_conversation_turns(principal, session_key, limit, offset)
             .await
@@ -752,6 +757,7 @@ impl Memory for LucidMemory {
         after_id: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<MessageEvent>> {
+        principal.reject_named_scope()?;
         self.local.list_message_events_since(principal, after_id, limit).await
     }
 

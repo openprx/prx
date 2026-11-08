@@ -519,6 +519,7 @@ async fn chat_terminal_without_binding_rejects_before_persistence() {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             20,

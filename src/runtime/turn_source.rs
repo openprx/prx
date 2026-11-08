@@ -322,6 +322,7 @@ fn child_memory_principal(
         sender: scope.sender.clone(),
         require_owner_match,
         legacy_session_key: None,
+        agent_partition: None,
     })
 }
 
@@ -530,6 +531,7 @@ impl OwnedTurnSourceProof {
                 sender: event.sender.clone(),
                 require_owner_match: parent.owner_isolated() || parent.memory_scope().require_owner_match,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             model_binding: AgentModelBinding::from_resolved(selection.resolved, selection.route),
             config_generation_id: generation.id.0,

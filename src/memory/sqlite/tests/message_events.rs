@@ -222,6 +222,7 @@ async fn append_worker_result_message_event_emits_worker_outbox_type() {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             10,
@@ -305,6 +306,7 @@ async fn list_message_events_since_applies_visibility_policy() {
         sender: Some("alice".to_string()),
         owner_id: Some("owner:workspace-a:terminal:alice".to_string()),
         legacy_session_key: None,
+        agent_partition: None,
     };
     let visible = mem.list_message_events_since(&principal, 0, 20).await.unwrap();
     let contents = visible.iter().map(|event| event.content.as_str()).collect::<Vec<_>>();
@@ -356,6 +358,7 @@ async fn global_message_events_are_visible_across_workspaces() {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             20,
@@ -554,6 +557,7 @@ async fn load_recent_session_context_is_not_evicted_by_external_events() {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             since_event_id: None,
             limit: 10,
@@ -606,6 +610,7 @@ async fn d4_load_recent_session_context_read_merges_legacy_key() {
         sender: None,
         owner_id: None,
         legacy_session_key: Some("chat:legacy-1".to_string()),
+        agent_partition: None,
     };
     let merged = mem
         .load_recent_session_context(SessionContextQuery {
@@ -677,6 +682,7 @@ async fn d4_list_message_events_recent_read_merges_legacy_key() {
         sender: None,
         owner_id: None,
         legacy_session_key: Some("gateway:webchat:alice".to_string()),
+        agent_partition: None,
     };
     let merged = mem.list_message_events_recent(&principal, 50).await.unwrap();
     let contents: Vec<&str> = merged.iter().map(|event| event.content.as_str()).collect();
@@ -834,6 +840,7 @@ async fn list_memory_events_since_applies_cursor_and_visibility_policy() {
         sender: None,
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let visible = mem.list_memory_events_since(&principal, hidden.id, 20).await.unwrap();
     let event_types = visible
@@ -881,6 +888,7 @@ async fn global_memory_events_are_visible_across_workspaces() {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             20,
@@ -927,6 +935,7 @@ async fn load_recent_shared_context_filters_roles_and_orders_chronologically() {
                 sender: None,
                 owner_id: Some("owner-a".to_string()),
                 legacy_session_key: None,
+                agent_partition: None,
             },
             since_event_id: None,
             limit: 10,

@@ -81,6 +81,7 @@ pub(crate) fn parse_scope_principal(args: &serde_json::Value, workspace_id: Stri
         // which for MCP is the caller-chosen subject alone.
         require_owner_match: crate::tools::execution::scope_requires_owner_match(args),
         legacy_session_key: None,
+        agent_partition: None,
     }
 }
 

@@ -42,6 +42,10 @@ impl Memory for SqliteMemory {
         Some(self)
     }
 
+    fn supports_agent_scope(&self) -> bool {
+        true
+    }
+
     fn with_erasure_origin(
         &self,
         origin: crate::memory::erasure::ErasureOrigin,

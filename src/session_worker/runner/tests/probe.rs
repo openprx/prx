@@ -153,6 +153,7 @@ async fn worker_probe_event_types(tmp: &tempfile::TempDir) -> Vec<String> {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             100,
         )

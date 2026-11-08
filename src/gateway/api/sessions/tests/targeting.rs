@@ -4,6 +4,7 @@
 use super::*;
 use crate::config::DelegateAgentConfig;
 use crate::config::agent_name::{AGENT_NAME_MAX_LEN, AgentName, AgentNameError, is_targetable};
+use crate::memory::{AgentPartition, AgentScopeUnsupported, Memory, MemoryPrincipal, NoneMemory, PartitionKey};
 use crate::security::AutonomyLevel;
 use std::collections::BTreeSet;
 
@@ -1133,4 +1134,191 @@ async fn multipart_parse_error_after_a_file_leaves_no_upload() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
     assert_eq!(stored_uploads(&fixture), Vec::new(), "no upload is left behind");
     assert_untouched(&fixture).await;
+}
+
+const TARGET_U: &str = "00000000-0000-4000-8000-0000000000a1";
+const TARGET_SCOPE: &str = "00000000-0000-4000-8000-0000000000c1";
+const TARGET_MAIN_U: &str = "00000000-0000-4000-8000-0000000000b1";
+const TARGET_MAIN_SCOPE: &str = "00000000-0000-4000-8000-0000000000d1";
+const TARGET_REV: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn named_partition(workspace: &str, owner: &str, name: &str, incarnation: &str) -> AgentPartition {
+    AgentPartition {
+        workspace_id: workspace.to_owned(),
+        owner_id: owner.to_owned(),
+        key: PartitionKey::Named {
+            name: AgentName::parse(name).expect("test: agent name"),
+            incarnation: incarnation.parse().expect("test: incarnation"),
+        },
+    }
+}
+
+fn main_partition(workspace: &str, owner: &str) -> AgentPartition {
+    AgentPartition {
+        workspace_id: workspace.to_owned(),
+        owner_id: owner.to_owned(),
+        key: PartitionKey::Main,
+    }
+}
+
+fn history_reader(workspace: &str, session: &str, partition: AgentPartition) -> MemoryPrincipal {
+    MemoryPrincipal {
+        workspace_id: workspace.to_owned(),
+        agent_id: Some("system".to_owned()),
+        persona_id: None,
+        session_key: Some(session.to_owned()),
+        channel: Some("console".to_owned()),
+        sender: Some("api:local".to_owned()),
+        owner_id: Some("system:*".to_owned()),
+        require_owner_match: false,
+        legacy_session_key: None,
+        agent_partition: Some(partition),
+    }
+}
+
+fn stamp_console_rows(dir: &std::path::Path, workspace: &str, owner: &str, session: &str) {
+    let conn = rusqlite::Connection::open(dir.join("memory").join("brain.db")).expect("test: open store");
+    conn.pragma_update(None, "foreign_keys", "ON").expect("test: fk");
+    conn.execute(
+        "INSERT INTO agent_incarnations VALUES (?1, ?2, 'n:x', ?3, 'active', ?4)",
+        rusqlite::params![workspace, owner, TARGET_U, TARGET_REV],
+    )
+    .expect("test: incarnation x");
+    conn.execute(
+        "INSERT INTO agent_incarnations VALUES (?1, ?2, 'm', ?3, 'active', ?4)",
+        rusqlite::params![workspace, owner, TARGET_MAIN_U, TARGET_REV],
+    )
+    .expect("test: incarnation main");
+    conn.execute(
+        "INSERT INTO agent_scopes VALUES (?1, ?2, ?3, ?4, 'n:x', ?5, 1)",
+        rusqlite::params![TARGET_SCOPE, workspace, owner, session, TARGET_U],
+    )
+    .expect("test: scope x");
+    conn.execute(
+        "INSERT INTO agent_scopes VALUES (?1, ?2, ?3, ?4, 'm', ?5, 1)",
+        rusqlite::params![TARGET_MAIN_SCOPE, workspace, owner, session, TARGET_MAIN_U],
+    )
+    .expect("test: scope main");
+    for (label, scope) in [
+        ("x-only", Some(TARGET_SCOPE)),
+        ("main-row", Some(TARGET_MAIN_SCOPE)),
+        ("null-row", None),
+    ] {
+        conn.execute(
+            "INSERT INTO conversation_turns (session_key, owner_id, role, content, timestamp, ma_scope_id)
+             VALUES (?1, ?2, 'user', ?3, 't', ?4)",
+            rusqlite::params![session, owner, label, scope],
+        )
+        .expect("test: stamp turn");
+    }
+}
+
+#[tokio::test]
+async fn sqlite_targeted_scope_supported() {
+    let fixture = fixture(|config| {
+        config.gateway.targeted_agents = true;
+        config.autonomy.level = AutonomyLevel::Full;
+        config.api_url = Some("http://127.0.0.1:1".to_owned());
+        config.agents.insert("x".to_owned(), agent(false, &[]));
+        config.providers.models.push(
+            toml::from_str("provider = \"ollama\"\nmodel = \"test-model\"\noperations = [\"chat\"]\n")
+                .expect("test: catalog"),
+        );
+    })
+    .await;
+    assert!(fixture.memory.supports_agent_scope());
+    let workspace = fixture
+        .state
+        .config
+        .pin()
+        .effective
+        .workspace_dir
+        .to_string_lossy()
+        .into_owned();
+    let owner = super::super::super::ApiPrincipal::of_token("prx-test-token").owner_id;
+    stamp_console_rows(std::path::Path::new(&workspace), &workspace, &owner, SESSION);
+
+    let named = history_reader(&workspace, SESSION, named_partition(&workspace, &owner, "x", TARGET_U));
+    let named_turns = fixture
+        .memory
+        .list_console_conversation_turns(&named, SESSION, 50, 0)
+        .await
+        .expect("test: named turns");
+    let named_labels: Vec<&str> = named_turns.iter().map(|turn| turn.content.as_str()).collect();
+    assert_eq!(named_labels, ["x-only"], "Named X sees no Y/Main/NULL rows");
+
+    let main = history_reader(&workspace, SESSION, main_partition(&workspace, &owner));
+    let main_turns = fixture
+        .memory
+        .list_console_conversation_turns(&main, SESSION, 50, 0)
+        .await
+        .expect("test: main turns");
+    let main_labels: Vec<&str> = main_turns.iter().map(|turn| turn.content.as_str()).collect();
+    assert!(main_labels.contains(&"main-row") && main_labels.contains(&"null-row"));
+    assert!(!main_labels.contains(&"x-only"));
+
+    let api_principal = super::super::super::ApiPrincipal::of_token("prx-test-token");
+    let selected = super::super::select_turn_target(
+        &fixture.state,
+        fixture.state.pin_turn_runtime(),
+        &api_principal,
+        AgentField::Text("x".to_owned()),
+    )
+    .expect("test: named target");
+    assert_eq!(selected.incarnation.as_deref(), Some(TARGET_U));
+
+    let (status, value) = post(
+        &fixture,
+        "no-such-session",
+        serde_json::json!({"message": "hi", "agent": "x"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+    assert_ne!(error_code(&value), Some("agent_backend_unsupported"));
+    assert_eq!(selected.incarnation.as_deref(), Some(TARGET_U));
+}
+
+#[tokio::test]
+async fn none_targeted_scope_rejected() {
+    let memory = NoneMemory::new();
+    assert!(!memory.supports_agent_scope());
+    let principal = history_reader(
+        "prx_workspace",
+        "session",
+        named_partition("prx_workspace", "prx_owner", "x", TARGET_U),
+    );
+    let turns = memory
+        .list_console_conversation_turns(&principal, "session", 10, 0)
+        .await
+        .expect_err("test: named turns");
+    assert!(turns.downcast_ref::<AgentScopeUnsupported>().is_some(), "{turns:#}");
+    let events = memory
+        .list_message_events_since(&principal, 0, 10)
+        .await
+        .expect_err("test: named events");
+    assert!(events.downcast_ref::<AgentScopeUnsupported>().is_some(), "{events:#}");
+
+    let temp = tempfile::tempdir().expect("test: tempdir");
+    let mut config = Config::default();
+    config.workspace_dir = temp.path().to_owned();
+    config.gateway.targeted_agents = true;
+    config.agents.insert("x".to_owned(), agent(false, &[]));
+    let provider = Arc::new(CapturingProvider::default());
+    let mut state = test_app_state(config, provider.clone());
+    state.mem = Arc::new(NoneMemory::new());
+    let response = post_session_message(
+        State(state),
+        Path(SESSION.to_owned()),
+        http_request(serde_json::json!({"message": "hi", "agent": "x"})),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("test: body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("test: json");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(error_code(&body), Some("agent_backend_unsupported"));
+    assert!(provider.requests.lock().is_empty(), "no provider access");
 }

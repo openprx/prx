@@ -180,6 +180,7 @@ mod tests {
             sender: None,
             owner_id: None,
             legacy_session_key: None,
+            agent_partition: None,
         };
         let err = memory
             .search_document_chunks(&principal, "document", 5)

@@ -154,6 +154,7 @@ impl DocumentIngestRuntime {
             owner_id: self.owner_id.clone(),
             require_owner_match: self.require_owner_match,
             legacy_session_key: self.legacy_session_key.clone(),
+            agent_partition: None,
         }
     }
 }

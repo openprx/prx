@@ -334,6 +334,7 @@ async fn hybrid_worker_result_creates_private_draft_and_parent_merge_request() {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             "run-hybrid",
         )
@@ -362,6 +363,7 @@ async fn hybrid_worker_result_creates_private_draft_and_parent_merge_request() {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             10,
@@ -485,6 +487,7 @@ async fn hybrid_worker_draft_obeys_readonly_resource_gate() {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             "run-hybrid",
         )

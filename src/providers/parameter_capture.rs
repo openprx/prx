@@ -323,6 +323,7 @@ mod tests {
             channel: None,
             sender: None,
             legacy_session_key: None,
+            agent_partition: None,
         };
         let events = memory.list_message_events_since(&principal, 0, 10).await.unwrap();
         assert_eq!(events.len(), 2, "parameters add no separate event write");

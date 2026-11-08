@@ -73,6 +73,7 @@ async fn quoted_events_reach_the_prompt_without_live_media_markers() {
             sender: Some("prx".to_string()),
             owner_id: None,
             legacy_session_key: None,
+            agent_partition: None,
         },
         "does wacli support sending files?",
         0.0,
@@ -250,6 +251,7 @@ async fn build_context_with_shared_events_includes_external_visible_events() {
             sender: Some("local-user".to_string()),
             owner_id: Some("owner-a".to_string()),
             legacy_session_key: None,
+            agent_partition: None,
         },
         "what changed",
         0.0,
@@ -405,6 +407,7 @@ async fn build_agent_context_returns_structured_bundle() {
             sender: Some("local-user".to_string()),
             owner_id: Some("owner-a".to_string()),
             legacy_session_key: None,
+            agent_partition: None,
         },
         "operational summaries",
         0.0,
@@ -473,6 +476,7 @@ async fn d4_agent_recall_keeps_run_boundary_and_read_merges_only_with_legacy_key
             sender: Some("local-user".to_string()),
             owner_id: None,
             legacy_session_key: None,
+            agent_partition: None,
         },
         "anything",
         0.0,
@@ -499,6 +503,7 @@ async fn d4_agent_recall_keeps_run_boundary_and_read_merges_only_with_legacy_key
             sender: Some("local-user".to_string()),
             owner_id: None,
             legacy_session_key: Some("agent:run-A".to_string()),
+            agent_partition: None,
         },
         "anything",
         0.0,
@@ -550,6 +555,7 @@ async fn build_agent_context_includes_document_evidence_with_source_ids() {
             sender: Some("local-user".to_string()),
             owner_id: None,
             legacy_session_key: None,
+            agent_partition: None,
         },
         "stable source anchors",
         0.0,
@@ -662,6 +668,7 @@ async fn build_agent_context_keeps_current_session_when_shared_events_are_noisy(
             sender: Some("local-user".to_string()),
             owner_id: None,
             legacy_session_key: None,
+            agent_partition: None,
         },
         "what is current",
         0.0,
@@ -730,6 +737,7 @@ fn preamble_builders_read_merge_legacy_current_session_key() {
         sender: Some("local-user".to_string()),
         owner_id: None,
         legacy_session_key: Some("chat:legacy".to_string()),
+        agent_partition: None,
     };
 
     let events = vec![
@@ -797,6 +805,7 @@ fn a_persisted_fabricated_marker_never_reaches_the_prompt_through_a_preamble() {
         sender: Some("local-user".to_string()),
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let events = vec![
         preamble_event(

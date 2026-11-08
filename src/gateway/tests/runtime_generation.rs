@@ -40,6 +40,7 @@ async fn config_audit_sink_accepts_events_from_non_runtime_threads() {
         sender: Some("system".to_string()),
         owner_id: Some("system".to_string()),
         legacy_session_key: None,
+        agent_partition: None,
     };
     let recorded = tokio::time::timeout(Duration::from_secs(2), async {
         loop {

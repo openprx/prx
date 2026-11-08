@@ -69,6 +69,8 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/gateway/compat/tests/memory_tools.rs::mcp_memory_search_still_returns_public_rows::let conn = Connection::open(workspace.path().join(\"memory\").join(\"brain.db\"))",
     // MA-01b1b-2 fixture: reads and seeds agent_incarnations rows of the owners under test.
     "src/gateway/tests/agent_registry.rs::db::rusqlite::Connection::open(dir.join(\"workspace/memory/brain.db\")).expect(\"test: open registry database\")",
+    // MA-01b2 fixture: stamps conversation_turns under a Named/Main scope for the targeting tests.
+    "src/gateway/api/sessions/tests/targeting.rs::stamp_console_rows::let conn = rusqlite::Connection::open(dir.join(\"memory\").join(\"brain.db\")).expect(\"test: open store\");",
     "src/gateway/compat.rs::upsert_agent_identity_binding::let conn = Connection::open(db_path)?;",
     "src/main.rs::open_approval_ledger::Connection::open(&db_path).with_context(|| format!(\"Failed to open approval ledger: {}\", db_path.display()))?;",
     "src/memory/hygiene.rs::close_stale_topics::let conn = Connection::open(db_path)?;",

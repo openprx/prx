@@ -4,7 +4,39 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::config::agent_name::AgentName;
 use crate::memory::principal::MemoryWriteContext;
+
+/// Console transcript/event partition carried on [`MemoryPrincipal`].
+///
+/// Built only in gateway code from server-side workspace, owner and the
+/// incarnation 01b1b-2 resolved or minted. `None` on the principal keeps
+/// today's unpartitioned reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPartition {
+    pub workspace_id: String,
+    pub owner_id: String,
+    pub key: PartitionKey,
+}
+
+/// Main has no incarnation term; Named always carries the pinned UUID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartitionKey {
+    Main,
+    Named { name: AgentName, incarnation: uuid::Uuid },
+}
+
+/// Named-partition reads on a backend that does not keep agent scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentScopeUnsupported;
+
+impl std::fmt::Display for AgentScopeUnsupported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("agent scope is unsupported by this memory backend")
+    }
+}
+
+impl std::error::Error for AgentScopeUnsupported {}
 
 /// Where a recalled entry came from, as known to the backend that returned it.
 ///
@@ -313,6 +345,9 @@ pub struct MemoryPrincipal {
     /// single-key behaviour exactly. The legacy key is always read-only.
     #[serde(default)]
     pub legacy_session_key: Option<String>,
+    /// Agent history partition. `None` is today's unpartitioned read.
+    #[serde(default)]
+    pub agent_partition: Option<AgentPartition>,
 }
 
 impl Default for MemoryPrincipal {
@@ -327,11 +362,24 @@ impl Default for MemoryPrincipal {
             owner_id: None,
             require_owner_match: false,
             legacy_session_key: None,
+            agent_partition: None,
         }
     }
 }
 
 impl MemoryPrincipal {
+    /// Refuse a Named partition on backends that do not keep agent scopes.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentScopeUnsupported`] when `agent_partition` is Named.
+    pub fn reject_named_scope(&self) -> anyhow::Result<()> {
+        match self.agent_partition.as_ref().map(|partition| &partition.key) {
+            Some(PartitionKey::Named { .. }) => Err(AgentScopeUnsupported.into()),
+            _ => Ok(()),
+        }
+    }
+
     /// Deduplicated `session_key` candidates for `session`-visibility recall.
     ///
     /// Returns the canonical `session_key` first, followed by the optional
@@ -1313,6 +1361,11 @@ pub trait Memory: Send + Sync {
         None
     }
 
+    /// Whether this backend can serve a Named agent partition.
+    fn supports_agent_scope(&self) -> bool {
+        false
+    }
+
     /// Whether execution requires this exact in-process memory capability.
     fn requires_scoped_execution(&self) -> bool {
         false
@@ -1850,7 +1903,8 @@ pub trait Memory: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<Vec<ConversationTurn>> {
-        let _ = (principal, session_key, limit, offset);
+        principal.reject_named_scope()?;
+        let _ = (session_key, limit, offset);
         Err(crate::memory::fabric::fail_fast(
             self.name(),
             "list_console_conversation_turns",
@@ -2079,7 +2133,8 @@ pub trait Memory: Send + Sync {
         after_id: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<MessageEvent>> {
-        let _ = (principal, after_id, limit);
+        principal.reject_named_scope()?;
+        let _ = (after_id, limit);
         Err(crate::memory::fabric::fail_fast(
             self.name(),
             "list_message_events_since",

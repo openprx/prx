@@ -48,13 +48,16 @@ pub use traits::LifecycleState;
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{
-    ChatProfile, CompactionRun, CompactionRunInput, CompactionSourceEventRange, ConversationSessionSummary,
-    ConversationTurn, DocumentChunkRecord, DocumentIngestInput, DocumentRecord, DocumentSearchResult, MemoryCategory,
-    MemoryDraft, MemoryDraftInput, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput,
-    MemoryPrincipal, MemoryReadMode, MemoryStoreMetadata, MemoryVisibility, MessageEvent, MessageEventInput,
-    MessageEventSource, MessageEventSubject, RetrievalTrace, RetrievalTraceInput, RetrievedContextItem,
-    SessionContextQuery, SharedContextQuery,
+    AgentPartition, AgentScopeUnsupported, ChatProfile, CompactionRun, CompactionRunInput, CompactionSourceEventRange,
+    ConversationSessionSummary, ConversationTurn, DocumentChunkRecord, DocumentIngestInput, DocumentRecord,
+    DocumentSearchResult, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry, MemoryEvent, MemoryEventInput,
+    MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryReadMode, MemoryStoreMetadata, MemoryVisibility, MessageEvent,
+    MessageEventInput, MessageEventSource, MessageEventSubject, PartitionKey, RetrievalTrace, RetrievalTraceInput,
+    RetrievedContextItem, SessionContextQuery, SharedContextQuery,
 };
+
+#[cfg(test)]
+mod agent_scope_tests;
 
 use crate::config::{
     EmbeddingRouteConfig, IdentityBindingConfig, MemoryConfig, StorageProviderConfig, UserPolicyConfig,

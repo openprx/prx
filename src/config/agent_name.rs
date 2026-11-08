@@ -4,6 +4,8 @@
 //! normalisation, so one spelling names one agent at every ingress (config
 //! load, request body field, decoded path segment).
 
+use serde::{Deserialize, Serialize};
+
 /// The reserved name of the PRX main agent. It is a valid grammar value, but
 /// it is never a named agent: `"main"` selects Main and `[agents.main]` is
 /// kept for delegate/spawn only.
@@ -27,7 +29,8 @@ pub enum AgentNameError {
 }
 
 /// A name that satisfies the grammar.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct AgentName(String);
 
 impl AgentName {
@@ -59,6 +62,20 @@ impl AgentName {
     #[must_use]
     pub fn is_main(&self) -> bool {
         self.0 == MAIN_AGENT_NAME
+    }
+}
+
+impl TryFrom<String> for AgentName {
+    type Error = AgentNameError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl From<AgentName> for String {
+    fn from(value: AgentName) -> Self {
+        value.0
     }
 }
 

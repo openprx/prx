@@ -300,6 +300,7 @@ async fn compiled_request_payloads(memory: &Arc<dyn Memory>, tmp: &tempfile::Tem
         sender: Some("client-a".to_string()),
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let events = memory
         .list_message_events_since(&principal, 0, 50)
@@ -513,6 +514,7 @@ async fn an_over_budget_webhook_tool_round_rolls_over_on_the_default_switch_mode
         sender: Some("client-a".to_string()),
         owner_id: None,
         legacy_session_key: None,
+        agent_partition: None,
     };
     let event_types: Vec<String> = memory
         .list_message_events_since(&principal, 0, 200)

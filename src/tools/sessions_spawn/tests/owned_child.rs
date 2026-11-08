@@ -619,6 +619,7 @@ async fn process_termination_records_killed_terminal_event_once() {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             10,

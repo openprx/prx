@@ -568,6 +568,7 @@ async fn append_sender_turn_records_channel_message_event() {
                 sender: Some("sender-1".to_string()),
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             10,

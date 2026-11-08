@@ -72,6 +72,7 @@ pub(super) fn c03_principal(owner_id: Option<&str>, isolated: bool) -> MemoryPri
         owner_id: owner_id.map(str::to_string),
         require_owner_match: isolated,
         legacy_session_key: None,
+        agent_partition: None,
     }
 }
 

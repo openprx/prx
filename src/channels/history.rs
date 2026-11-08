@@ -268,6 +268,7 @@ pub(super) async fn load_persisted_histories(
         // Local history hydration under the system owner; not an external origin.
         require_owner_match: false,
         legacy_session_key: None,
+        agent_partition: None,
     };
     match memory
         .load_recent_conversation_histories(&principal, MAX_CHANNEL_HISTORY, MAX_HYDRATED_SESSIONS)

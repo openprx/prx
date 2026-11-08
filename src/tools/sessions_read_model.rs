@@ -143,6 +143,7 @@ pub(crate) fn principal_from_args(args: &Value, workspace_id: &str) -> MemoryPri
         // comes from the service-authored scope, never from caller arguments.
         require_owner_match: crate::tools::execution::scope_requires_owner_match(args),
         legacy_session_key: None,
+        agent_partition: None,
     }
 }
 

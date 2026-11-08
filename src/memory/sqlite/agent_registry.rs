@@ -130,6 +130,8 @@ fn schema_sql() -> String {
         CREATE UNIQUE INDEX IF NOT EXISTS agent_scopes_private_generation
             ON agent_scopes (workspace_id, owner_id, agent_key, incarnation, generation)
             WHERE session_key IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_agent_scopes_lookup
+            ON agent_scopes (workspace_id, owner_id, agent_key, incarnation);
 
         CREATE TABLE IF NOT EXISTS agent_erase_fences (
             scope_id TEXT NOT NULL PRIMARY KEY CHECK({u_scope}) REFERENCES agent_scopes (scope_id),

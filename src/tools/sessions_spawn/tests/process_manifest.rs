@@ -315,6 +315,7 @@ async fn hybrid_process_spawn_is_rejected_before_events_or_registry_side_effects
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             10,

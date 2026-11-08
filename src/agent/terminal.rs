@@ -1605,6 +1605,7 @@ mod tests {
             sender: None,
             owner_id: scope.owner_id.clone(),
             legacy_session_key: None,
+            agent_partition: None,
         }
     }
 
@@ -2384,6 +2385,7 @@ mod tests {
                 sender: None,
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             };
             let events = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
             assert!(events.is_empty(), "unissued {entrypoint} must not persist any event");

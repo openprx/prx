@@ -1414,6 +1414,7 @@ impl Memory for PostgresMemory {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ConversationTurn>> {
+        principal.reject_named_scope()?;
         self.list_conversation_turns_ordered(principal, session_key, limit, offset, true)
             .await
     }
@@ -1763,6 +1764,7 @@ impl Memory for PostgresMemory {
         after_id: i64,
         limit: usize,
     ) -> Result<Vec<MessageEvent>> {
+        principal.reject_named_scope()?;
         let client = self.client.clone();
         let qualified_message_events_table = self.qualified_message_events_table.clone();
         let principal = principal.clone();

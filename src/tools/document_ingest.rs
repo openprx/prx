@@ -547,6 +547,7 @@ mod tests {
             owner_id: owner_id.map(str::to_string),
             require_owner_match: owner_id.is_some(),
             legacy_session_key: None,
+            agent_partition: None,
         }
     }
 

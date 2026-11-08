@@ -545,6 +545,7 @@ async fn process_channel_message_cancels_scoped_typing_task() {
                 sender: Some("alice".to_string()),
                 owner_id: None,
                 legacy_session_key: None,
+                agent_partition: None,
             },
             0,
             10,

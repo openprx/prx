@@ -218,6 +218,7 @@ pub(super) fn resolve_target(config: &Config, target: &TurnTarget) -> Result<Opt
 
 /// What the turn needs beyond the host runtime.
 pub(super) struct TargetedTurn {
+    pub(super) name: AgentName,
     pub(super) system_prompt: String,
     pub(super) autonomy: AutonomyLevel,
 }
@@ -309,6 +310,7 @@ pub(super) fn prepare_target(
         mcp_tool: parent.mcp_tool.clone(),
     };
     let turn = TargetedTurn {
+        name: plan.name.clone(),
         system_prompt: target_system_prompt(config, &plan.agent),
         autonomy: plan.autonomy,
     };

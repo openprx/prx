@@ -365,6 +365,8 @@ max_history = 200
 # Rollout switch for targeted agent turns (`agent` on
 # POST /api/sessions/{id}/message). While false, any otherwise-valid named
 # target answers 409 `agent_disabled` and never runs as the main agent.
+# A named target on a memory backend that does not keep agent scope answers
+# 409 `agent_backend_unsupported` after the disabled and unknown checks.
 # `targeted_agents` is pre-release and test-only until MA-01h. While it is on, targeted turns share Main's history and cannot be erased. Do not enable it.
 # Default: false.
 # targeted_agents = false
