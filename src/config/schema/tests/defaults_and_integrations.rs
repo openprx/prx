@@ -982,3 +982,25 @@ async fn an_unused_tool_dialect_entry_is_warned_about_once() {
     assert_eq!(warnings, 1, "one warning per entry set: {logs}");
     assert!(logs.contains("command line"), "{logs}");
 }
+
+#[test]
+async fn targeted_agents_true_warns_prerelease() {
+    const NEEDLE: &str = "gateway.targeted_agents is pre-release";
+    let mut config = Config::default();
+    config.gateway.targeted_agents = true;
+    let (outcome, logs) = capture_logs(|| config.validate());
+    outcome.expect("test: a pre-release switch warns but still validates");
+    let warnings = logs
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains(NEEDLE))
+        .count();
+    assert_eq!(warnings, 1, "exactly one pre-release WARN line: {logs}");
+
+    config.gateway.targeted_agents = false;
+    let (outcome, logs) = capture_logs(|| config.validate());
+    outcome.expect("test: the default switch validates");
+    assert!(
+        !logs.contains(NEEDLE),
+        "no pre-release warning when the switch is off: {logs}"
+    );
+}

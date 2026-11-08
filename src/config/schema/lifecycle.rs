@@ -958,6 +958,12 @@ impl Config {
                 "mcp_server.exposed_tools lists tools that do not enforce per-owner isolation; external MCP callers are refused them"
             );
         }
+        // Targeted turns are unpartitioned until MA-01h; the switch stays a warning, not an error.
+        if self.gateway.targeted_agents {
+            tracing::warn!(
+                "gateway.targeted_agents is pre-release (MA-01h not landed); targeted history is not partitioned"
+            );
+        }
 
         Ok(())
     }
