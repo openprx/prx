@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! MA-01b1b-2: agent incarnation lifecycle through the production resolve
 //! path (`post_session_message`) and the production reload participant.
 use super::runtime_generation::{authz_test_state, gateway_turn_runtime_owner_over};
@@ -93,7 +94,7 @@ impl ConfigGenerationParticipant for Arc<Gate> {
         let mode = *self.mode.lock();
         anyhow::ensure!(mode != Mode::FailPrepare, "injected prepare failure");
         Ok(Box::new(GatePrepared {
-            gate: Arc::clone(self),
+            gate: Self::clone(self),
             mode,
         }))
     }
