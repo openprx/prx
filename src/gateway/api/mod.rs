@@ -30,6 +30,8 @@ mod plugins;
 mod providers;
 mod runtime;
 mod sessions;
+#[cfg(test)]
+pub(in crate::gateway) use sessions::post_session_message;
 mod skills;
 mod skills_h2;
 mod skills_lifecycle;

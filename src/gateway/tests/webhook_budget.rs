@@ -246,6 +246,7 @@ async fn a_webhook_turn_stays_on_one_runtime_generation_across_reload() {
     );
     replacement_slot.cleanup = Arc::clone(&owner.cleanup);
     let mut prepared = PreparedGatewayTurnRuntime {
+        agents: super::idle_agents(),
         current: Arc::clone(&owner.current),
         previous: Arc::clone(&previous),
         generation: TurnRuntimeGeneration {

@@ -372,6 +372,7 @@ async fn mcp_tool_call_rejects_schema_drift_after_async_admission() {
 
     let previous = owner.pin();
     let mut prepared = crate::gateway::PreparedGatewayTurnRuntime {
+        agents: crate::gateway::tests::idle_agents(),
         current: Arc::clone(&owner.current),
         previous: Arc::clone(&previous),
         generation: crate::gateway::TurnRuntimeGeneration {
@@ -502,6 +503,7 @@ async fn mcp_tool_call_does_not_run_a_tool_the_reload_removed() {
 
     let previous = owner.pin();
     let mut prepared = crate::gateway::PreparedGatewayTurnRuntime {
+        agents: crate::gateway::tests::idle_agents(),
         current: Arc::clone(&owner.current),
         previous: Arc::clone(&previous),
         generation: crate::gateway::TurnRuntimeGeneration {

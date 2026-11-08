@@ -23,6 +23,7 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod agent_lifecycle;
 mod api;
 mod compat;
 mod decision_cleanup;
@@ -1090,6 +1091,9 @@ impl GatewayTurnRuntimeOwner {
         hooks: Arc<HookManager>,
         #[cfg(feature = "wasm-plugins")] plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
     ) -> Self {
+        // Startup sweep, before any target is published: a failure latches
+        // every targeted resolve until a later reconcile succeeds.
+        agent_lifecycle::reconcile(memory.as_ref(), &config.pin().effective, true);
         Self {
             cleanup: Arc::clone(&current.decision_slot.cleanup),
             current: Arc::new(ArcSwap::from_pointee(current)),
@@ -1190,10 +1194,13 @@ struct PreparedGatewayTurnRuntime {
     current: Arc<ArcSwap<TurnRuntimeGeneration>>,
     previous: Arc<TurnRuntimeGeneration>,
     generation: TurnRuntimeGeneration,
+    agents: agent_lifecycle::AgentReconcile,
 }
 
 impl crate::config::PreparedConfigGeneration for PreparedGatewayTurnRuntime {
     fn commit(&mut self) -> anyhow::Result<()> {
+        // First, so a failed retire rejects the reload before it is published.
+        self.agents.commit()?;
         self.current.store(Arc::new(TurnRuntimeGeneration {
             provider_binding: self.generation.provider_binding.clone(),
             decision_slot: Arc::clone(&self.generation.decision_slot),
@@ -1210,6 +1217,11 @@ impl crate::config::PreparedConfigGeneration for PreparedGatewayTurnRuntime {
 
     fn rollback(&mut self) {
         self.current.store(Arc::clone(&self.previous));
+        self.agents.rollback();
+    }
+
+    fn finalize(&mut self) {
+        self.agents.finalize();
     }
 }
 
@@ -1271,11 +1283,18 @@ impl crate::config::ConfigGenerationParticipant for GatewayTurnRuntimeOwner {
         generation: Arc<crate::config::ConfigGeneration>,
         _changed_fields: &[String],
     ) -> anyhow::Result<Box<dyn crate::config::PreparedConfigGeneration>> {
+        let previous = self.current.load_full();
+        let agents = agent_lifecycle::AgentReconcile::prepare(
+            &self.memory,
+            &previous.config_generation.effective,
+            &generation.effective,
+        );
         let runtime = self.build(generation)?;
         Ok(Box::new(PreparedGatewayTurnRuntime {
             current: Arc::clone(&self.current),
-            previous: self.current.load_full(),
+            previous,
             generation: runtime,
+            agents,
         }))
     }
 }

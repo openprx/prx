@@ -83,6 +83,8 @@ pub(super) enum TargetError {
     Disabled,
     /// 400: the agentic allowlist is empty or mixes `*` with names.
     ToolsInvalid,
+    /// 409: the memory backend keeps no agent incarnation registry.
+    BackendUnsupported,
 }
 
 impl TargetError {
@@ -90,7 +92,7 @@ impl TargetError {
         match self {
             Self::Invalid | Self::ToolsInvalid => StatusCode::BAD_REQUEST,
             Self::Unknown => StatusCode::NOT_FOUND,
-            Self::Disabled => StatusCode::CONFLICT,
+            Self::Disabled | Self::BackendUnsupported => StatusCode::CONFLICT,
         }
     }
 
@@ -100,6 +102,7 @@ impl TargetError {
             Self::Unknown => "agent_unknown",
             Self::Disabled => "agent_disabled",
             Self::ToolsInvalid => "agent_tools_invalid",
+            Self::BackendUnsupported => "agent_backend_unsupported",
         }
     }
 }
@@ -224,6 +227,8 @@ pub(super) struct TargetedTurn {
 pub(super) struct SelectedTurn {
     pub(super) runtime: Arc<TurnRuntimeGeneration>,
     pub(super) targeted: Option<TargetedTurn>,
+    /// The named agent's incarnation for this owner; `None` for Main.
+    pub(super) incarnation: Option<String>,
 }
 
 /// A target that resolved but cannot be served right now.
@@ -308,4 +313,37 @@ pub(super) fn prepare_target(
         autonomy: plan.autonomy,
     };
     Ok((Arc::new(runtime), turn))
+}
+
+/// Resolve the target's incarnation for (workspace, owner, agent), minting it
+/// at the first authorized resolve. This is the last step of selection: the
+/// admission re-reads the active generation inside the registry transaction.
+pub(super) fn resolve_incarnation(
+    state: &crate::gateway::AppState,
+    registry: &dyn crate::memory::agent_registry::AgentRegistry,
+    runtime: &TurnRuntimeGeneration,
+    owner_id: &str,
+    plan: &TargetPlan,
+) -> Result<String, Box<Response>> {
+    use crate::memory::agent_registry::AgentRefusal;
+    let key = crate::gateway::agent_lifecycle::agent_key(plan.name.as_str());
+    let revision = crate::gateway::agent_lifecycle::config_revision(&plan.agent)
+        .map_err(|error| Box::new(TargetUnavailable(error.to_string()).into_response()))?;
+    let admit = || {
+        let active = state.config.pin();
+        match active.effective.agents.get(plan.name.as_str()) {
+            None => Err(AgentRefusal::Unknown),
+            Some(agent) if !agent.enabled || !active.effective.gateway.targeted_agents => Err(AgentRefusal::Disabled),
+            Some(_) => Ok(()),
+        }
+    };
+    let workspace = runtime.config_generation.effective.workspace_dir.to_string_lossy();
+    match registry.resolve_incarnation(&workspace, owner_id, &key, &revision, &admit) {
+        Ok(Ok(incarnation)) => Ok(incarnation),
+        Ok(Err(AgentRefusal::Unknown)) => Err(Box::new(TargetError::Unknown.into_response())),
+        Ok(Err(AgentRefusal::Disabled)) => Err(Box::new(TargetError::Disabled.into_response())),
+        Err(error) => Err(Box::new(
+            TargetUnavailable(format!("agent registry: {error:#}")).into_response(),
+        )),
+    }
 }

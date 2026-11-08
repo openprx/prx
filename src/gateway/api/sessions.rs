@@ -28,7 +28,10 @@ const MAX_UPLOAD_FILE_SIZE_BYTES: usize = 20 * 1024 * 1024;
 const UPLOADS_DIR_NAME: &str = "uploads";
 
 mod target;
-use target::{AgentField, SelectedTurn, TargetedTurn, TurnTarget, prepare_target, resolve_target};
+use target::{
+    AgentField, SelectedTurn, TargetError, TargetedTurn, TurnTarget, prepare_target, resolve_incarnation,
+    resolve_target,
+};
 
 #[derive(Serialize)]
 pub(super) struct SessionSummary {
@@ -1457,7 +1460,7 @@ pub async fn post_session_message(
         uploads,
     } = parsed;
 
-    let selected = match select_turn_target(&state, turn_runtime, agent) {
+    let selected = match select_turn_target(&state, turn_runtime, &api_principal, agent) {
         Ok(selected) => selected,
         // A refused target leaves nothing behind: dropping the guard removes
         // the files this request created, and only those.
@@ -1486,6 +1489,7 @@ pub async fn post_session_message(
 fn select_turn_target(
     state: &AppState,
     turn_runtime: std::sync::Arc<crate::gateway::TurnRuntimeGeneration>,
+    principal: &super::ApiPrincipal,
     agent: AgentField,
 ) -> Result<SelectedTurn, Response> {
     let target = TurnTarget::from_field(agent).map_err(IntoResponse::into_response)?;
@@ -1493,6 +1497,7 @@ fn select_turn_target(
         return Ok(SelectedTurn {
             runtime: turn_runtime,
             targeted: None,
+            incarnation: None,
         });
     }
     // A caller who may not post messages learns nothing about which agents exist.
@@ -1504,12 +1509,20 @@ fn select_turn_target(
         return Ok(SelectedTurn {
             runtime: turn_runtime,
             targeted: None,
+            incarnation: None,
         });
     };
+    let registry = state
+        .mem
+        .agent_registry()
+        .ok_or_else(|| TargetError::BackendUnsupported.into_response())?;
     let (runtime, turn) = prepare_target(&turn_runtime, &plan).map_err(IntoResponse::into_response)?;
+    let incarnation = resolve_incarnation(state, registry, &turn_runtime, &principal.owner_id, &plan)
+        .map_err(|response| *response)?;
     Ok(SelectedTurn {
         runtime,
         targeted: Some(turn),
+        incarnation: Some(incarnation),
     })
 }
 
@@ -1791,6 +1804,7 @@ pub(super) async fn post_decision_resume(
             selected: SelectedTurn {
                 runtime,
                 targeted: None,
+                incarnation: None,
             },
             message,
             async_mode,
@@ -1827,7 +1841,12 @@ async fn submit_console_message(
     let SelectedTurn {
         runtime: turn_runtime,
         targeted: target,
+        incarnation,
     } = selected;
+    tracing::debug!(
+        agent_incarnation = incarnation.as_deref(),
+        "console turn target resolved"
+    );
     let Some(session) = (match state.mem.get_conversation_session(&session_id).await {
         Ok(session) => session,
         Err(error) => {
