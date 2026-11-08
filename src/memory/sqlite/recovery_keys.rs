@@ -13,7 +13,7 @@ use std::{
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 /// Name of the key directory inside a memory directory.
-pub(super) const KEYS_DIRECTORY: &str = ".recovery_keys";
+const KEYS_DIRECTORY: &str = ".recovery_keys";
 
 /// Marker file of an unpublished backup staging directory. A directory that
 /// carries it is never opened as a key repository, so a crash leftover can be

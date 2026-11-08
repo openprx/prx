@@ -790,21 +790,32 @@ fn main_attribution_rebinds_pending_and_settled_console_receipts() -> anyhow::Re
     Ok(())
 }
 
-/// A fresh owner-only directory beside the store, and a database target in it.
+/// A fresh owner-only case directory; the bundle inside it does not exist yet.
 fn bundle_target(root: &std::path::Path, name: &str) -> anyhow::Result<std::path::PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
-    let directory = root.join(name);
-    std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
-    Ok(directory.join("target.db"))
+    let case = root.join(name);
+    std::fs::DirBuilder::new().mode(0o700).create(&case)?;
+    Ok(case.join("bundle").join("target.db"))
 }
 
-fn key_listing(keys: &std::path::Path) -> anyhow::Result<std::collections::BTreeSet<String>> {
-    let mut ids = std::collections::BTreeSet::new();
+fn parent_of(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    Ok(path
+        .parent()
+        .context("fixture path has no parent directory")?
+        .to_path_buf())
+}
+
+fn key_bytes(keys: &std::path::Path) -> anyhow::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    let mut found = std::collections::BTreeMap::new();
     for entry in std::fs::read_dir(keys)? {
-        let name = entry?.file_name().to_string_lossy().into_owned();
-        ids.insert(name.strip_suffix(".key").unwrap_or(&name).to_owned());
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        found.insert(
+            name.strip_suffix(".key").unwrap_or(&name).to_owned(),
+            std::fs::read(entry.path())?,
+        );
     }
-    Ok(ids)
+    Ok(found)
 }
 
 fn directory_listing(directory: &std::path::Path) -> anyhow::Result<std::collections::BTreeSet<String>> {
@@ -815,176 +826,16 @@ fn directory_listing(directory: &std::path::Path) -> anyhow::Result<std::collect
     Ok(names)
 }
 
-#[tokio::test]
-async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::Result<()> {
-    use super::super::recovery_backup::{Step, backup_bundle};
-    use std::collections::BTreeSet;
+fn mode_of(path: &std::path::Path) -> anyhow::Result<u32> {
     use std::os::unix::fs::PermissionsExt;
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+}
 
-    let (dir, memory) = store()?;
-    let root = dir.path().canonicalize()?;
-    let memory_dir = memory
-        .db_path
-        .parent()
-        .expect("store has a memory directory")
-        .to_path_buf();
-    let names = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<BTreeSet<String>>();
-
-    // K0 accepts chain A, which is then erased: K0 is left referenced by its
-    // tombstone alone.
-    let k0 = memory.activate_recovery_authority()?;
-    let a = attestation::fixture_as(&memory, "_a").await;
-    attestation::append(&memory, &a, a.attestation.clone()).await?;
-    {
-        let writer = memory.pool.write();
-        writer.execute(
-            "DELETE FROM ingress_recovery WHERE input_event_id=?1",
-            [&a.capsule.input_event_id],
-        )?;
-        writer.execute(
-            "DELETE FROM recovery_transport_index WHERE run_id=?1",
-            [&a.capsule.run_id],
-        )?;
-        writer.execute("DELETE FROM recovery_attestations WHERE run_id=?1", [&a.capsule.run_id])?;
+fn refusal<T>(result: anyhow::Result<T>, what: &str) -> anyhow::Result<anyhow::Error> {
+    match result {
+        Ok(_) => anyhow::bail!("{what}: expected a refusal"),
+        Err(error) => Ok(error),
     }
-    assert_eq!(
-        count_rows(&memory, "recovery_tombstones")?,
-        1,
-        "erasing A left its tombstone"
-    );
-    // K1 accepts chain B (attestation and capsule); K2 is only the active key.
-    let k1 = memory.rotate_recovery_authority()?;
-    let b = attestation::fixture_as(&memory, "_b").await;
-    assert_eq!(b.capsule.key_id.as_deref(), Some(k1.as_str()));
-    attestation::append(&memory, &b, b.attestation.clone()).await?;
-    let k2 = memory.rotate_recovery_authority()?;
-    // Kc is referenced only by a v3 capsule of a pre-attestation chain.
-    let kc_bytes = [7u8; 32];
-    let kc = KeyDirectory::key_id(&kc_bytes);
-    KeyDirectory::open(&memory_dir, false)?.install(&kc, &kc_bytes)?;
-    seed(&memory, "kc-event", "user")?;
-    memory.pool.write().execute(
-        "INSERT INTO ingress_recovery(cursor,input_event_id,workspace_id,owner_id,source,input_key,lifetime,capsule_json,state) \
-         SELECT id,event_id,'prx_workspace','prx_owner','cli','kc-key','kc-lifetime',?1,'reconciled' FROM message_events WHERE event_id='kc-event'",
-        [serde_json::json!({"version": 3, "key_id": kc}).to_string()],
-    )?;
-    let expected = names(&[k0.as_str(), k1.as_str(), k2.as_str(), kc.as_str()]);
-    assert_eq!(expected.len(), 4);
-    let chain_b = RecoveryChain {
-        workspace_id: b.capsule.scope.workspace_id.clone(),
-        owner_id: "prx_owner".into(),
-        source: "agent".into(),
-        run_id: b.capsule.run_id.clone(),
-    };
-
-    // (i) The published bundle carries all four generations and restores.
-    let target = bundle_target(&root, "complete")?;
-    let bundle = target.parent().expect("bundle directory").to_path_buf();
-    memory.backup_database_to(&target).await?;
-    let keys = bundle.join(".recovery_keys");
-    assert_eq!(key_listing(&keys)?, expected);
-    assert_eq!(std::fs::metadata(&keys)?.permissions().mode() & 0o777, 0o700);
-    for id in &expected {
-        let file = format!("{id}.key");
-        assert_eq!(std::fs::metadata(keys.join(&file))?.permissions().mode() & 0o777, 0o600);
-        assert!(
-            std::fs::read(keys.join(&file))? == std::fs::read(memory_dir.join(".recovery_keys").join(&file))?,
-            "key bytes differ"
-        );
-    }
-    assert_eq!(directory_listing(&bundle)?, names(&[".recovery_keys", "target.db"]));
-    let restored = SqliteMemory::new_with_path(target.clone())?;
-    assert_eq!(restored.activate_recovery_authority()?, k2);
-    assert!(restored.read_recovery_receipt(&chain_b)?.is_some());
-    assert!(matches!(
-        stable_key_fence(&restored.pool.write(), Some(bundle.as_path()), &a.input)?,
-        Fence::Tombstoned
-    ));
-    drop(restored);
-
-    // (ii) A restore missing any referenced generation fails closed and never
-    // regenerates: K1 and K0 fail activation, Kc fails its capsule verify.
-    for (index, missing) in [k1.clone(), k0.clone(), kc.clone()].into_iter().enumerate() {
-        let target = bundle_target(&root, &format!("missing-{index}"))?;
-        let bundle = target.parent().expect("bundle directory").to_path_buf();
-        memory.backup_database_to(&target).await?;
-        let keys = bundle.join(".recovery_keys");
-        std::fs::remove_file(keys.join(format!("{missing}.key")))?;
-        let mut remaining = expected.clone();
-        remaining.remove(&missing);
-        let restored = SqliteMemory::new_with_path(target)?;
-        let error = if missing == kc {
-            let tag = RecoveryTag {
-                key_id: kc.clone(),
-                tag: [0; 32],
-            };
-            restored
-                .verify_recovery_mac(&tag, RecoveryMacDomain::InputDigestV3, b"input")
-                .expect_err("a capsule key that is missing must refuse verification")
-        } else {
-            restored
-                .activate_recovery_authority()
-                .expect_err("a missing referenced key must refuse activation")
-        };
-        assert!(crate::memory::recovery_authority::is_key_unavailable(&error));
-        assert_eq!(key_listing(&keys)?, remaining, "a restore never regenerates a key");
-    }
-
-    // (iii) A source missing a referenced key refuses the backup and publishes nothing.
-    let lost = memory_dir.join(".recovery_keys").join(format!("{k1}.key"));
-    let lost_bytes = std::fs::read(&lost)?;
-    std::fs::remove_file(&lost)?;
-    let target = bundle_target(&root, "source-missing")?;
-    let bundle = target.parent().expect("bundle directory").to_path_buf();
-    assert!(memory.backup_database_to(&target).await.is_err());
-    assert!(
-        directory_listing(&bundle)?.is_empty(),
-        "nothing published, staging removed"
-    );
-    KeyDirectory::open(&memory_dir, false)?.install(&k1, &lost_bytes.as_slice().try_into()?)?;
-
-    // (iv) A never-activated database backs up with no key directory.
-    let (fresh_dir, fresh) = store()?;
-    let target = bundle_target(&fresh_dir.path().canonicalize()?, "fresh")?;
-    let bundle = target.parent().expect("bundle directory").to_path_buf();
-    fresh.backup_database_to(&target).await?;
-    assert_eq!(directory_listing(&bundle)?, names(&["target.db"]));
-
-    // (vi) An install failure publishes nothing and cleans its staging.
-    let target = bundle_target(&root, "install-fails")?;
-    let bundle = target.parent().expect("bundle directory").to_path_buf();
-    let failure = backup_bundle(&memory.pool.write(), &target, &|step, _| {
-        anyhow::ensure!(step != Step::Install, "injected install failure");
-        Ok(())
-    });
-    assert!(failure.is_err());
-    assert!(directory_listing(&bundle)?.is_empty());
-
-    // (vii) A crash before publication leaves a staging directory that is
-    // neither restorable nor a fresh authority; only a published bundle restores.
-    let target = bundle_target(&root, "crash")?;
-    let bundle = target.parent().expect("bundle directory").to_path_buf();
-    let leftover = bundle.join("leftover");
-    let crashed = backup_bundle(&memory.pool.write(), &target, &|step, staging| {
-        if step == Step::BeforePublish {
-            std::fs::rename(staging, &leftover)?;
-            anyhow::bail!("simulated crash before publication");
-        }
-        Ok(())
-    });
-    assert!(crashed.is_err());
-    assert!(!target.exists() && !bundle.join(".recovery_keys").exists());
-    assert!(KeyDirectory::open(&leftover, false).is_err());
-    let staged_keys = leftover.join(".recovery_keys");
-    assert_eq!(key_listing(&staged_keys)?, expected);
-    let abandoned = SqliteMemory::new_with_path(leftover.join("target.db"))?;
-    assert!(abandoned.activate_recovery_authority().is_err());
-    assert_eq!(key_listing(&staged_keys)?, expected, "no key was created or removed");
-    drop(abandoned);
-    memory.backup_database_to(&target).await?;
-    let restored = SqliteMemory::new_with_path(target)?;
-    assert_eq!(restored.activate_recovery_authority()?, k2);
-    Ok(())
 }
 
 fn count_rows(memory: &SqliteMemory, table: &str) -> anyhow::Result<i64> {
@@ -992,6 +843,242 @@ fn count_rows(memory: &SqliteMemory, table: &str) -> anyhow::Result<i64> {
         .pool
         .write()
         .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
+}
+
+#[tokio::test]
+async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::Result<()> {
+    use super::super::recovery_backup::{Step, backup_bundle, with_fault};
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::DirBuilderExt;
+
+    let (dir, memory) = store()?;
+    let root = dir.path().canonicalize()?;
+    let memory_dir = parent_of(&memory.db_path)?;
+    let source_keys = memory_dir.join(".recovery_keys");
+
+    // K0 accepts chain A, which is then erased: K0 is left referenced by its
+    // tombstone alone.
+    let k0 = memory.activate_recovery_authority()?;
+    let a = attestation::fixture_as(&memory, "_a").await;
+    attestation::append(&memory, &a, a.attestation.clone()).await?;
+    erase_chain(&memory, &a)?;
+    assert_eq!(
+        count_rows(&memory, "recovery_tombstones")?,
+        1,
+        "erasing A left its tombstone"
+    );
+    // K1 accepts chain B (attestation and capsule).
+    let k1 = memory.rotate_recovery_authority()?;
+    let b = attestation::fixture_as(&memory, "_b").await;
+    assert_eq!(b.capsule.key_id.as_deref(), Some(k1.as_str()));
+    attestation::append(&memory, &b, b.attestation.clone()).await?;
+    // Kc accepts chain C; erasing it and its tombstone leaves Kc referenced by
+    // C's valid v3 capsule alone. K2 is only the active key.
+    let kc = memory.rotate_recovery_authority()?;
+    let c = attestation::fixture_as(&memory, "_c").await;
+    assert_eq!(c.capsule.key_id.as_deref(), Some(kc.as_str()));
+    attestation::append(&memory, &c, c.attestation.clone()).await?;
+    erase_chain(&memory, &c)?;
+    memory
+        .pool
+        .write()
+        .execute("DELETE FROM recovery_tombstones WHERE key_id=?1", [&kc])?;
+    let k2 = memory.rotate_recovery_authority()?;
+    let expected: BTreeSet<String> = [&k0, &k1, &k2, &kc].into_iter().cloned().collect();
+    assert_eq!(expected.len(), 4);
+    let source = key_bytes(&source_keys)?;
+    assert_eq!(source.keys().cloned().collect::<BTreeSet<_>>(), expected);
+    let chain_b = RecoveryChain {
+        workspace_id: b.capsule.scope.workspace_id.clone(),
+        owner_id: "prx_owner".into(),
+        source: "agent".into(),
+        run_id: b.capsule.run_id.clone(),
+    };
+    // C's capsule digest tag: the restore verification path for the capsule-only key.
+    let capsule_tag = RecoveryTag {
+        key_id: kc.clone(),
+        tag: hex::decode(&c.capsule.input_digest)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("capsule digest is not 32 bytes"))?,
+    };
+
+    // (i) The published bundle carries all four generations, in an owner-only
+    // directory even when the destination was pre-created with default
+    // permissions, and restores.
+    let target = bundle_target(&root, "complete")?;
+    let bundle = parent_of(&target)?;
+    std::fs::create_dir(&bundle)?;
+    std::fs::set_permissions(&bundle, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    memory.backup_database_to(&target).await?;
+    assert_eq!(mode_of(&bundle)?, 0o700, "published directory itself is owner-only");
+    let keys = bundle.join(".recovery_keys");
+    assert_eq!(mode_of(&keys)?, 0o700);
+    for id in &expected {
+        assert_eq!(mode_of(&keys.join(format!("{id}.key")))?, 0o600);
+    }
+    assert!(key_bytes(&keys)? == source, "key listing and bytes equal the source");
+    assert_eq!(
+        directory_listing(&bundle)?,
+        [".recovery_keys".to_owned(), "target.db".to_owned()]
+            .into_iter()
+            .collect()
+    );
+    let restored = SqliteMemory::new_with_path(target.clone())?;
+    assert_eq!(restored.activate_recovery_authority()?, k2);
+    assert!(restored.read_recovery_receipt(&chain_b)?.is_some());
+    restored.verify_recovery_mac(&capsule_tag, RecoveryMacDomain::InputDigestV3, b"input")?;
+    assert!(matches!(
+        stable_key_fence(&restored.pool.write(), Some(bundle.as_path()), &a.input)?,
+        Fence::Tombstoned
+    ));
+    drop(restored);
+
+    // (ii) A restore missing any referenced generation fails closed, never
+    // regenerates, and leaves the bundle mode and every remaining key byte alone.
+    for (index, missing) in [k1.clone(), k0.clone(), kc.clone()].into_iter().enumerate() {
+        let target = bundle_target(&root, &format!("missing-{index}"))?;
+        let bundle = parent_of(&target)?;
+        memory.backup_database_to(&target).await?;
+        let keys = bundle.join(".recovery_keys");
+        std::fs::remove_file(keys.join(format!("{missing}.key")))?;
+        let mut remaining = source.clone();
+        remaining.remove(&missing);
+        let restored = SqliteMemory::new_with_path(target)?;
+        let error = if missing == kc {
+            refusal(
+                restored.verify_recovery_mac(&capsule_tag, RecoveryMacDomain::InputDigestV3, b"input"),
+                "capsule verify without its key",
+            )?
+        } else {
+            refusal(
+                restored.activate_recovery_authority(),
+                "activation without a referenced key",
+            )?
+        };
+        assert!(crate::memory::recovery_authority::is_key_unavailable(&error));
+        assert!(
+            key_bytes(&keys)? == remaining,
+            "a restore never regenerates or alters a key"
+        );
+        assert_eq!(mode_of(&bundle)?, 0o700);
+        assert_eq!(mode_of(&keys)?, 0o700);
+    }
+
+    // (iii) A source missing a referenced key refuses the backup and publishes nothing.
+    let lost = source_keys.join(format!("{k1}.key"));
+    std::fs::remove_file(&lost)?;
+    let target = bundle_target(&root, "source-missing")?;
+    let case = parent_of(&parent_of(&target)?)?;
+    refusal(
+        memory.backup_database_to(&target).await,
+        "backup without a referenced key",
+    )?;
+    assert!(
+        directory_listing(&case)?.is_empty(),
+        "nothing published, staging removed"
+    );
+    let lost_bytes: [u8; 32] = source.get(&k1).context("source bytes of K1")?.as_slice().try_into()?;
+    KeyDirectory::open(&memory_dir, false)?.install(&k1, &lost_bytes)?;
+    assert!(key_bytes(&source_keys)? == source);
+
+    // (iv) A never-activated database backs up with no key directory.
+    let (fresh_dir, fresh) = store()?;
+    let target = bundle_target(&fresh_dir.path().canonicalize()?, "fresh")?;
+    fresh.backup_database_to(&target).await?;
+    assert_eq!(
+        directory_listing(&parent_of(&target)?)?,
+        ["target.db".to_owned()].into_iter().collect()
+    );
+    assert_eq!(mode_of(&parent_of(&target)?)?, 0o700);
+
+    // (vi) A failure after each side effect, including after publication began,
+    // publishes nothing and removes only this attempt's files.
+    for (index, failing) in [
+        Step::Install,
+        Step::AfterInstall,
+        Step::Staged,
+        Step::Renamed,
+        Step::Published,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let target = bundle_target(&root, &format!("fails-{index}"))?;
+        let case = parent_of(&parent_of(&target)?)?;
+        let result = with_fault(
+            move |step, _| {
+                anyhow::ensure!(step != failing, "injected failure");
+                Ok(())
+            },
+            || backup_bundle(&memory.pool.write(), &target),
+        );
+        refusal(result, "injected backup failure")?;
+        assert!(directory_listing(&case)?.is_empty(), "{failing:?}: nothing left behind");
+        assert!(key_bytes(&source_keys)? == source, "{failing:?}: source keys untouched");
+    }
+
+    // (vii) A crash at each step leaves a directory that is neither restorable
+    // nor a fresh authority, and no key is created or altered.
+    for (index, crash) in [Step::AfterInstall, Step::Staged, Step::Renamed]
+        .into_iter()
+        .enumerate()
+    {
+        let target = bundle_target(&root, &format!("crash-{index}"))?;
+        let case = parent_of(&parent_of(&target)?)?;
+        let leftover = case.join("leftover");
+        let moved = leftover.clone();
+        let crashed = with_fault(
+            move |step, at| {
+                if step == crash {
+                    std::fs::rename(at, &moved)?;
+                    anyhow::bail!("simulated crash");
+                }
+                Ok(())
+            },
+            || backup_bundle(&memory.pool.write(), &target),
+        );
+        refusal(crashed, "simulated crash")?;
+        assert!(!target.exists(), "{crash:?}: nothing was published");
+        refusal(KeyDirectory::open(&leftover, false), "opening a crash leftover")?;
+        let before = key_bytes(&leftover.join(".recovery_keys")).ok();
+        let abandoned = SqliteMemory::new_with_path(leftover.join("target.db"))?;
+        refusal(abandoned.activate_recovery_authority(), "activating a crash leftover")?;
+        assert!(
+            key_bytes(&leftover.join(".recovery_keys")).ok() == before,
+            "{crash:?}: no key was created or altered"
+        );
+        assert_eq!(mode_of(&leftover)?, 0o700);
+        drop(abandoned);
+        // Only a completed publication restores.
+        std::fs::remove_dir_all(&leftover)?;
+        memory.backup_database_to(&target).await?;
+        let restored = SqliteMemory::new_with_path(target)?;
+        assert_eq!(restored.activate_recovery_authority()?, k2);
+    }
+    // A bundle directory that does not exist yet is created owner-only by the rename.
+    let nested = root.join("nested-parent").join("deeper");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.join("nested-parent"))?;
+    memory.backup_database_to(&nested.join("target.db")).await?;
+    assert_eq!(mode_of(&nested)?, 0o700);
+    Ok(())
+}
+
+/// Production-shaped erasure of one accepted chain: the transport row goes
+/// first so the tombstone trigger records the stable key under its key id.
+fn erase_chain(memory: &SqliteMemory, f: &attestation::Fixture) -> anyhow::Result<()> {
+    let writer = memory.pool.write();
+    writer.execute(
+        "DELETE FROM ingress_recovery WHERE input_event_id=?1",
+        [&f.capsule.input_event_id],
+    )?;
+    writer.execute(
+        "DELETE FROM recovery_transport_index WHERE run_id=?1",
+        [&f.capsule.run_id],
+    )?;
+    writer.execute("DELETE FROM recovery_attestations WHERE run_id=?1", [&f.capsule.run_id])?;
+    Ok(())
 }
 
 mod attestation {

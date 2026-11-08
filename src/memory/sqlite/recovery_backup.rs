@@ -2,20 +2,49 @@
 //! references. Key bytes move from the source key directory straight into the
 //! staged key directory; they are never returned, kept or logged.
 
-use super::recovery_keys::{INCOMPLETE_MARKER, KEYS_DIRECTORY, KeyDirectory};
+use super::recovery_keys::{INCOMPLETE_MARKER, KeyDirectory};
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags, params};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Points at which an attempt can fail or be interrupted. Production passes a
-/// hook that always succeeds; tests inject failures and simulated crashes.
+/// Points at which a test can fail or interrupt an attempt, after the side
+/// effects of the preceding step.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
     /// Before each key is installed into the staged key directory.
     Install,
-    /// After everything is staged and durable, before anything is published.
-    BeforePublish,
+    /// After each key is installed.
+    AfterInstall,
+    /// Everything is staged and durable; nothing is published.
+    Staged,
+    /// The directory is renamed into place; the incomplete marker is still there.
+    Renamed,
+    /// The marker is gone and the directory is durable.
+    Published,
+}
+
+#[cfg(test)]
+type Hook = Box<dyn Fn(Step, &Path) -> anyhow::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    static FAULT: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn fault(step: Step, at: &Path) -> anyhow::Result<()> {
+    FAULT.with(|slot| slot.borrow().as_ref().map_or(Ok(()), |hook| hook(step, at)))
+}
+
+/// Run `run` on this thread with `hook` observing every step.
+#[cfg(test)]
+pub(super) fn with_fault<R>(hook: impl Fn(Step, &Path) -> anyhow::Result<()> + 'static, run: impl FnOnce() -> R) -> R {
+    FAULT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let out = run();
+    FAULT.with(|slot| *slot.borrow_mut() = None);
+    out
 }
 
 /// Every persisted column that names a recovery key generation. A later
@@ -73,37 +102,43 @@ fn sync_directory(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write a snapshot of `conn` to `target`, plus the `.recovery_keys` directory
-/// next to it holding every key generation the snapshot references. Both are
-/// staged in a private sibling directory and published only when complete: on
-/// any error nothing is left at the target, and only this attempt's staging
-/// directory is removed. A staging directory abandoned by a crash carries the
-/// incomplete marker and is refused as a key repository.
-pub(super) fn backup_bundle(
-    conn: &Connection,
-    target: &Path,
-    fault: &dyn Fn(Step, &Path) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+/// Write a snapshot of `conn` as `target`, inside a new owner-only bundle
+/// directory (`target`'s parent) that also holds `.recovery_keys` with every
+/// key generation the snapshot references. The whole bundle is staged in a
+/// private sibling directory and published by one atomic rename; the incomplete
+/// marker is removed only after that rename, so every state before it is
+/// refused as a key repository and cannot start a fresh authority. On any error
+/// only this attempt's files are removed. The bundle directory must not exist
+/// or must be empty.
+pub(super) fn backup_bundle(conn: &Connection, target: &Path) -> anyhow::Result<()> {
     let target = std::path::absolute(target)?;
-    let parent = target.parent().context("backup target has no parent directory")?;
-    std::fs::create_dir_all(parent)?;
-    anyhow::ensure!(!target.exists(), "backup target already exists: {}", target.display());
-    let staging = parent.join(format!(".backup-staging-{}", uuid::Uuid::new_v4()));
+    let bundle = target.parent().context("backup target has no parent directory")?;
+    let file_name = target.file_name().context("backup target has no file name")?;
+    let root = bundle.parent().context("backup directory has no parent directory")?;
+    std::fs::create_dir_all(root)?;
+    let vacant = match std::fs::read_dir(bundle) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(vacant, "backup directory is not empty: {}", bundle.display());
+    let staging = root.join(format!(".backup-staging-{}", uuid::Uuid::new_v4()));
     create_private_dir(&staging)?;
-    let outcome = stage_and_publish(conn, &target, parent, &staging, fault);
+    let outcome = stage_and_publish(conn, file_name, bundle, root, &staging);
+    // After a successful rename the staging path is gone; this only cleans failures.
     discard(std::fs::remove_dir_all(&staging));
     outcome
 }
 
 fn stage_and_publish(
     conn: &Connection,
-    target: &Path,
-    parent: &Path,
+    file_name: &std::ffi::OsStr,
+    bundle: &Path,
+    root: &Path,
     staging: &Path,
-    fault: &dyn Fn(Step, &Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     std::fs::File::create_new(staging.join(INCOMPLETE_MARKER))?.sync_all()?;
-    let staged = staging.join(target.file_name().context("backup target has no file name")?);
+    let staged = staging.join(file_name);
     // A coherent snapshot: a live write-ahead log is never copied byte for byte.
     conn.execute("VACUUM INTO ?1", params![staged.to_string_lossy().to_string()])?;
     std::fs::File::open(&staged)?.sync_all()?;
@@ -111,12 +146,7 @@ fn stage_and_publish(
         let snapshot = Connection::open_with_flags(&staged, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         referenced_key_ids(&snapshot)?
     };
-    let keys_destination = parent.join(KEYS_DIRECTORY);
     if !ids.is_empty() {
-        anyhow::ensure!(
-            std::fs::symlink_metadata(&keys_destination).is_err(),
-            "a recovery key directory already exists next to the backup target"
-        );
         let memory = conn
             .path()
             .filter(|path| !path.is_empty())
@@ -126,28 +156,35 @@ fn stage_and_publish(
         for id in &ids {
             // A referenced key that cannot be read refuses the whole backup.
             let bytes = source.read(id)?;
+            #[cfg(test)]
             fault(Step::Install, staging)?;
             installed.install(id, &bytes)?;
+            #[cfg(test)]
+            fault(Step::AfterInstall, staging)?;
         }
     }
     sync_directory(staging)?;
-    fault(Step::BeforePublish, staging)?;
-    // Keys first: a database is never visible without the keys it needs.
-    if !ids.is_empty() {
-        std::fs::rename(staging.join(KEYS_DIRECTORY), &keys_destination)?;
-        sync_directory(parent)?;
+    #[cfg(test)]
+    fault(Step::Staged, staging)?;
+    // Keys and database become visible together, or not at all.
+    std::fs::rename(staging, bundle)?;
+    // The bundle location is this attempt's from here on: a failure removes it.
+    let finished = finish(bundle, root);
+    if finished.is_err() {
+        discard(std::fs::remove_dir_all(bundle));
     }
-    let published = std::fs::rename(&staged, target)
-        .map_err(anyhow::Error::from)
-        .and_then(|()| sync_directory(parent));
-    if let Err(error) = published {
-        // Both paths were absent before this attempt, so removing them is safe.
-        discard(std::fs::remove_file(target));
-        if !ids.is_empty() {
-            discard(std::fs::remove_dir_all(&keys_destination));
-        }
-        return Err(error);
-    }
+    finished
+}
+
+fn finish(bundle: &Path, root: &Path) -> anyhow::Result<()> {
+    sync_directory(root)?;
+    #[cfg(test)]
+    fault(Step::Renamed, bundle)?;
+    std::fs::remove_file(bundle.join(INCOMPLETE_MARKER))?;
+    sync_directory(bundle)?;
+    sync_directory(root)?;
+    #[cfg(test)]
+    fault(Step::Published, bundle)?;
     Ok(())
 }
 

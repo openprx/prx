@@ -101,13 +101,14 @@ async fn migrate_legacy(config: &Config, apply: bool, json: bool) -> Result<()> 
         Utc::now().format("%Y%m%dT%H%M%SZ"),
         Uuid::new_v4()
     ));
-    fs::create_dir_all(&backup_dir)?;
     if matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid) {
+        // The backup publishes the owner-only directory itself, so it must not exist yet.
         SqliteMemory::new(&config.workspace_dir)?
             .backup_database_to(&backup_dir.join("brain.db"))
             .await
             .context("failed to create online SQLite backup")?;
     }
+    fs::create_dir_all(&backup_dir)?;
     atomic_write_json(&backup_dir.join("legacy-memory-rows.json"), &rows)?;
     copy_if_exists(&memory_path, &backup_dir.join("MEMORY.md"))?;
     copy_if_exists(&snapshot_path, &backup_dir.join("MEMORY_SNAPSHOT.md"))?;

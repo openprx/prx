@@ -12,15 +12,17 @@ use super::SqliteMemory;
 
 impl SqliteMemory {
     /// Create a consistent SQLite backup without stopping readers or copying a
-    /// live WAL file set byte-for-byte. Every recovery key the snapshot
-    /// references is published beside it, so the backup directory restores
-    /// as a memory directory; a missing referenced key refuses the backup.
+    /// live WAL file set byte-for-byte. The target's parent must not exist or
+    /// must be empty; it is published atomically as an owner-only directory
+    /// holding the database and every recovery key the snapshot references, so
+    /// it restores as a memory directory. A missing referenced key refuses the
+    /// backup.
     pub async fn backup_database_to(&self, target: &Path) -> anyhow::Result<()> {
         let pool = self.pool.clone();
         let target = target.to_path_buf();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = pool.write();
-            super::recovery_backup::backup_bundle(&conn, &target, &|_, _| Ok(()))
+            super::recovery_backup::backup_bundle(&conn, &target)
         })
         .await?
     }
