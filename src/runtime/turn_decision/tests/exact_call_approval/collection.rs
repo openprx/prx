@@ -147,9 +147,28 @@ impl Tool for HugeExamplesSchema {
     }
 }
 
+/// Resets every collection-cell hook when dropped, including on a panic.
+struct CollectionHooks {
+    _send: crate::agent::send_admission::HookReset,
+}
+impl CollectionHooks {
+    const fn new() -> Self {
+        Self {
+            _send: crate::agent::send_admission::HookReset,
+        }
+    }
+}
+impl Drop for CollectionHooks {
+    fn drop(&mut self) {
+        usage::PROVIDER_DIALECT.set(crate::tools::ToolSchemaDialect::Raw);
+        usage::EXPECTED_REFUSAL.set(None);
+    }
+}
+
 /// Answer 127 of 128 tokens through the real CollectApprovalArguments branch.
 #[tokio::test]
 async fn collection_request_over_token_budget_is_refused_without_a_send() {
+    let _hooks = CollectionHooks::new();
     usage::EXPECTED_REFUSAL.set(Some("answer estimates 128 tokens but 127 remain"));
     crate::agent::send_admission::TEST_TOKEN_CAP.set(127);
     Box::pin(exact_file_collection_with_budget(CollectionBudget::Narrowed)).await;
@@ -162,6 +181,7 @@ async fn collection_request_over_token_budget_is_refused_without_a_send() {
 /// Answer 128 of 128 tokens: the same branch sends exactly once.
 #[tokio::test]
 async fn collection_request_within_token_budget_sends_once() {
+    let _hooks = CollectionHooks::new();
     crate::agent::send_admission::TEST_TOKEN_CAP.set(128);
     Box::pin(exact_file_collection_with_budget(CollectionBudget::Narrowed)).await;
 }
@@ -170,6 +190,7 @@ async fn collection_request_within_token_budget_sends_once() {
 /// does not, because the cleaned schema is smaller: 1 send versus 0 sends.
 #[tokio::test]
 async fn collection_cost_uses_the_provider_schema_dialect() {
+    let _hooks = CollectionHooks::new();
     // 1 micro-USD per token at send time: the ceiling sits between the two request sizes.
     crate::agent::send_admission::TEST_MONEY_CEILING.set(Some(7000));
     usage::PROVIDER_DIALECT.set(crate::tools::ToolSchemaDialect::Gemini);

@@ -22,6 +22,18 @@ thread_local! {
     pub(crate) static TEST_MONEY_CEILING: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
+/// Restores every send-admission test hook when dropped, including on a panic.
+#[cfg(test)]
+pub(crate) struct HookReset;
+
+#[cfg(test)]
+impl Drop for HookReset {
+    fn drop(&mut self) {
+        TEST_TOKEN_CAP.set(u64::MAX);
+        TEST_MONEY_CEILING.set(None);
+    }
+}
+
 /// Refuses the send unless it fits G6 and the remaining spend. Nothing is sent
 /// or debited here; decision-attempt token reservation and settlement are
 /// unchanged.
