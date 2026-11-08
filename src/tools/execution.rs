@@ -519,6 +519,17 @@ impl ToolExecutionCommand {
     }
 }
 
+/// Who constructed this execution context. Model turns fail closed without a
+/// surface; every other origin keeps today's no-surface admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DispatchOrigin {
+    ModelTurn,
+    Operator,
+    Job,
+    #[default]
+    Internal,
+}
+
 /// Authenticated runtime facade available to every execution stage.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct H2ExecutionMetadata {
@@ -529,6 +540,7 @@ struct H2ExecutionMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionContext {
     h2_metadata: Option<Box<H2ExecutionMetadata>>,
+    pub(crate) dispatch_origin: DispatchOrigin,
     pub(crate) turn_surface: Option<Arc<admission::TurnSurface>>,
     pub(crate) approval_ledger: Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger>,
     pub(crate) owner_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
@@ -615,6 +627,7 @@ impl ToolExecutionContext {
             .unwrap_or_else(|| envelope.session_key.clone());
         Self {
             h2_metadata: None,
+            dispatch_origin: DispatchOrigin::Internal,
             turn_surface: None,
             approval_ledger: None,
             owner_filesystem: None,
@@ -650,6 +663,13 @@ impl ToolExecutionContext {
         self.child_scope = proof.child_scope().cloned();
         self.child_pin = proof.child_pin().cloned();
         Ok(self)
+    }
+
+    /// Stamp the caller kind. Model-turn constructors set [`DispatchOrigin::ModelTurn`].
+    #[must_use]
+    pub(crate) const fn with_dispatch_origin(mut self, dispatch_origin: DispatchOrigin) -> Self {
+        self.dispatch_origin = dispatch_origin;
+        self
     }
 
     /// Deny every call that would otherwise wait for approval.
@@ -1000,7 +1020,9 @@ impl JobOrigin {
         };
         match self {
             Self::LocalOperator => None,
-            Self::Unattributed => Some(ToolExecutionContext::new(run_envelope, JOB_ORIGIN_UNKNOWN)),
+            Self::Unattributed => Some(
+                ToolExecutionContext::new(run_envelope, JOB_ORIGIN_UNKNOWN).with_dispatch_origin(DispatchOrigin::Job),
+            ),
             Self::Principal {
                 channel,
                 sender,
@@ -1015,7 +1037,7 @@ impl JobOrigin {
                 if *owner_isolated {
                     envelope = envelope.with_owner_isolation();
                 }
-                Some(ToolExecutionContext::new(envelope, chat_type.as_str()))
+                Some(ToolExecutionContext::new(envelope, chat_type.as_str()).with_dispatch_origin(DispatchOrigin::Job))
             }
         }
     }

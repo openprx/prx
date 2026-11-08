@@ -108,6 +108,7 @@ impl OperatorProcessSegments {
         envelope.config_generation_id = scope.config_generation_id;
         envelope.config_source_revision = scope.config_source_revision;
         let execution = ToolExecutionContext::new(envelope, proof.policy_chat_type())
+            .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn)
             .with_approval_ledger(service.execution_approval_ledger());
         self.authority.verify_source(proof.as_ref())?;
         self.next = following;

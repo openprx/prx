@@ -12,6 +12,7 @@
 
 pub(crate) mod admission;
 mod engine_safety;
+pub(crate) mod engine_switch;
 mod parameters;
 
 use crate::agent::compaction::is_tool_roundtrip_companion;

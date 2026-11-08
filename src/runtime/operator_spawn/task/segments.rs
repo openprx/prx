@@ -86,7 +86,8 @@ impl OperatorTaskSegments {
         envelope.lease_epoch = scope.lease_epoch;
         envelope.config_generation_id = scope.config_generation_id;
         envelope.config_source_revision = scope.config_source_revision;
-        let execution = ToolExecutionContext::new(envelope, proof.policy_chat_type());
+        let execution = ToolExecutionContext::new(envelope, proof.policy_chat_type())
+            .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
         self.next = following;
         self.previous_input = next_previous;
         Ok((proof, execution))

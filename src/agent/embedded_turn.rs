@@ -406,9 +406,16 @@ async fn run_work(
                     "configured delegation did not select sessions_spawn"
                 );
                 let context = crate::tools::ToolExecutionContext::new(source.envelope().clone(), "private")
-                    .with_chat_id(&source.envelope().session_key);
+                    .with_chat_id(&source.envelope().session_key)
+                    .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
                 let (execution, context) =
                     service.bind_agent_execution(source, &decision, &context, &selected.specs)?;
+                let mut context = context;
+                context.dispatch_origin = crate::tools::DispatchOrigin::ModelTurn;
+                context.turn_surface = Some(std::sync::Arc::new(
+                    crate::tools::surface_owner::build(service.turn_surface_parts(source, &[]))
+                        .for_publication(&selected.specs),
+                ));
                 let mut arguments = serde_json::json!({"action":"spawn", "task":input, "mode":"process"});
                 if let Some(model) = task.model_hint {
                     arguments
@@ -600,7 +607,8 @@ async fn run_work(
                     tool_execution_context: crate::tools::ToolExecutionContext::new(
                         source.envelope().clone(),
                         "private",
-                    ),
+                    )
+                    .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn),
                     allowed_tool_names: None,
                 }),
                 memory,

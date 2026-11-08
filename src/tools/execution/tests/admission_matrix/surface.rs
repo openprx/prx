@@ -167,9 +167,8 @@ async fn channel_ineligible_tool_is_refused_on_channel_turn() {
     assert_refused(&service, &fixture, context, "config_reload").await;
 }
 
-/// The channel surface comes from the production turn service, whose catalog
+/// The channel surface comes from the production surface owner, whose catalog
 /// entries carry `channel_eligible`, not from a caller-supplied closure.
-// Decision-bound until 03-SWITCH moves the surface owner.
 #[tokio::test]
 async fn production_channel_surface_omits_channel_excluded_tool() {
     let workspace = tempfile::tempdir().expect("channel workspace");
@@ -186,8 +185,48 @@ async fn production_channel_surface_omits_channel_excluded_tool() {
     }) as Box<dyn crate::tools::Tool>]);
     let admitted = crate::agent::test_admission::AdmittedTurn::with_channel(config, channel_message(), registry).await;
     let decision = admitted.decision();
-    let surface = decision.service.turn_tool_surface(decision.proof, &[]);
+    let surface = crate::tools::surface_owner::build(decision.service.turn_surface_parts(decision.proof, &[]));
     assert!(!surface.contains("project_tool"), "channel-excluded tool was published");
+}
+
+#[tokio::test]
+async fn model_turn_without_surface_is_denied() {
+    let fixture = fixture();
+    let service = allow_service(&fixture);
+    let mut context = context();
+    context.dispatch_origin = crate::tools::DispatchOrigin::ModelTurn;
+    assert!(context.turn_surface.is_none());
+    let outcome = service
+        .execute(
+            ToolExecutionCommand::new("config_reload", serde_json::json!({"value":1})),
+            context,
+            None,
+        )
+        .await;
+    assert_eq!(outcome.status, ToolExecutionStatus::Denied);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("no turn surface")),
+        "unexpected diagnostic: {:?}",
+        outcome.error
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn operator_dispatch_without_surface_is_unchanged() {
+    let fixture = fixture();
+    let service = allow_service(&fixture);
+    let mut context = context();
+    context.dispatch_origin = crate::tools::DispatchOrigin::Operator;
+    assert!(context.turn_surface.is_none());
+    assert_eq!(
+        service.execute(command(1), context, None).await.status,
+        ToolExecutionStatus::Succeeded
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
 }
 
 /// Control: an empty `channel_exclude` publishes the tool on a channel turn

@@ -660,7 +660,8 @@ async fn run_console_runtime_turn(
                 stream_provider: false,
                 tool_execution_service: None,
                 tool_execution_context: {
-                    let context = crate::tools::ToolExecutionContext::new(turn_envelope.clone(), "private");
+                    let context = crate::tools::ToolExecutionContext::new(turn_envelope.clone(), "private")
+                        .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
                     if target.is_some() {
                         // Until MA-04 a targeted call that needs approval ends
                         // denied: no durable ledger route, no pending decision.
