@@ -1188,11 +1188,11 @@ async fn the_inline_tool_result_budget_aims_at_the_reserved_window() {
     crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
         const INLINE_MARKER: &str = "inline-budget-probe-marker";
         /// Room left over once the published tool surface is reserved.
-        const RESERVED_SLACK_TOKENS: usize = 400;
+        const RESERVED_SLACK_TOKENS: usize = 1600;
 
         let output = format!("{INLINE_MARKER} {}", "inline budget payload ".repeat(45));
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
-            WideSchemaTool::with_fields("file_read", 1).with_output(output.clone()),
+            WideSchemaTool::with_wide_description("file_read").with_output(output.clone()),
         )];
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
         let tool_specs = business_tool_specs_of(&tools_registry);

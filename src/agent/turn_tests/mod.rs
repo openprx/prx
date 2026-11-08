@@ -86,6 +86,14 @@ impl WideSchemaTool {
         Self::with_fields(name, 4)
     }
 
+    /// The large published description with an empty parameter schema, so the
+    /// surface is large but a native call estimates within a small decision slice.
+    pub(super) fn with_wide_description(name: &'static str) -> Self {
+        let mut tool = Self::with_fields(name, 0);
+        tool.schema = serde_json::json!({"type": "object", "properties": {}});
+        tool
+    }
+
     pub(super) fn with_output(mut self, output: String) -> Self {
         self.output = output;
         self
