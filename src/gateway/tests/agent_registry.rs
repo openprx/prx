@@ -377,8 +377,23 @@ async fn agent_recreation_uses_new_incarnation() {
         .expect("test: the poll signal was sent");
     let manager = Arc::clone(&h.manager);
     let pending_config = config(h.dir.path(), &[("sleeper", 0.1, false)], true);
-    let reload = std::thread::spawn(move || manager.apply_runtime_config(pending_config, ConfigReloadTrigger::Test));
-    h.entered.recv_timeout(wait).expect("test: the commit is blocked");
+    // The reload runs on its own thread inside the test's runtime context, as
+    // a production reload runs under the daemon's runtime.
+    let runtime = tokio::runtime::Handle::current();
+    let reload = std::thread::spawn(move || {
+        let _entered = runtime.enter();
+        manager
+            .apply_runtime_config(pending_config, ConfigReloadTrigger::Test)
+            .map(|_| ())
+    });
+    let started = std::time::Instant::now();
+    loop {
+        match h.entered.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(()) => break,
+            Err(_) if reload.is_finished() => panic!("the reload ended before the commit barrier: {:?}", reload.join()),
+            Err(_) => assert!(started.elapsed() < wait, "the commit barrier was not entered in time"),
+        }
+    }
     body_tx
         .send(axum::body::Bytes::from(message(Some("y"))))
         .await
