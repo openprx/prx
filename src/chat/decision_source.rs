@@ -988,15 +988,15 @@ impl ChatTurnBinding {
         use crate::agent::terminal::{TurnTerminalDraft, TurnTerminalStatus};
         let decided = self.decision.get().context("chat resume has no decision")?;
         anyhow::ensure!(decided.resume, "chat turn is not an explicit resume");
+        let mut execution = crate::tools::ToolExecutionContext::new(self.envelope.clone(), "private")
+            .with_chat_id(&self.envelope.session_key)
+            .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
+        execution.turn_surface = Some(std::sync::Arc::new(crate::tools::surface_owner::build(
+            decided.service.turn_surface_parts(self, &[]),
+        )));
         let outcome = decided
             .service
-            .execute_agent_resume(
-                self,
-                &decided.context,
-                &crate::tools::ToolExecutionContext::new(self.envelope.clone(), "private")
-                    .with_chat_id(&self.envelope.session_key),
-                cancellation,
-            )
+            .execute_agent_resume(self, &decided.context, &execution, cancellation)
             .await?;
         let (status, reply) = match outcome.status {
             crate::tools::ToolExecutionStatus::Succeeded => (

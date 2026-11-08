@@ -397,7 +397,14 @@ pub(super) fn admit(
     admit_called_tokens(service, context, name)?;
     admit_called_spend(service, context, name)?;
     let Some(surface) = &context.turn_surface else {
-        return Ok(());
+        return if context.dispatch_origin == super::DispatchOrigin::ModelTurn {
+            Err((
+                ToolExecutionStatus::Denied,
+                format!("tool '{name}' has no turn surface"),
+            ))
+        } else {
+            Ok(())
+        };
     };
     if !surface.contains(name) {
         // A name that is not in the live registry and was never published has

@@ -647,7 +647,9 @@ async fn run_turn_unguarded(
     // surface simply by asking for a spawn or a delegate. Read once: the spawn
     // context is fixed for the lifetime of this turn.
     let inherited_exclusions = crate::tools::sessions_spawn::ambient_channel_excluded_tools();
-    let safety_surface = Arc::new(service.turn_tool_surface(proof, &inherited_exclusions));
+    let safety_surface = Arc::new(crate::tools::surface_owner::build(
+        service.turn_surface_parts(proof, &inherited_exclusions),
+    ));
     let mut iteration = 0usize;
     loop {
         iteration = iteration.saturating_add(1);
@@ -1020,12 +1022,13 @@ async fn run_turn_unguarded(
             )?;
             execution_adapter.tool_execution_service = Some(execution);
             execution_adapter.tool_execution_context = bound_context;
-            execution_adapter.tool_execution_context.turn_surface = Some(Arc::new(
-                safety_surface.for_publication(compiled_tool_context.tool_specs()),
-            ));
             execution_adapter.tool_execution_context.call_budget =
                 Some(super::send_admission::call_token_budget(service, context, proof)?);
         }
+        execution_adapter.tool_execution_context.dispatch_origin = crate::tools::DispatchOrigin::ModelTurn;
+        execution_adapter.tool_execution_context.turn_surface = Some(Arc::new(
+            safety_surface.for_publication(compiled_tool_context.tool_specs()),
+        ));
         // Argument validation enforces the contract the model was shown, and
         // what it was shown depends on which provider and model serve the
         // turn: Gemini strips `additionalProperties` / `minLength` / `minimum`
@@ -2111,18 +2114,21 @@ async fn run_turn_unguarded(
             }
         }
         if let Some(specs) = discovery_dispatch_specs {
-            let (execution, bound_context) = service.bind_agent_execution_with_runtime(
-                proof,
-                context,
-                &execution_adapter.tool_execution_context,
-                &specs,
-                execution_adapter.tool_execution_service.clone(),
-            )?;
-            execution_adapter.allowed_tool_names = Some(std::sync::Arc::new(
-                specs.iter().map(|spec| spec.name.clone()).collect(),
-            ));
-            execution_adapter.tool_execution_service = Some(execution);
-            execution_adapter.tool_execution_context = bound_context;
+            {
+                let (execution, bound_context) = service.bind_agent_execution_with_runtime(
+                    proof,
+                    context,
+                    &execution_adapter.tool_execution_context,
+                    &specs,
+                    execution_adapter.tool_execution_service.clone(),
+                )?;
+                execution_adapter.allowed_tool_names = Some(std::sync::Arc::new(
+                    specs.iter().map(|spec| spec.name.clone()).collect(),
+                ));
+                execution_adapter.tool_execution_service = Some(execution);
+                execution_adapter.tool_execution_context = bound_context;
+            }
+            execution_adapter.tool_execution_context.dispatch_origin = crate::tools::DispatchOrigin::ModelTurn;
             execution_adapter.tool_execution_context.turn_surface =
                 Some(Arc::new(safety_surface.for_publication(&specs)));
         }

@@ -43,6 +43,7 @@ pub mod image_info;
 mod limits;
 pub(crate) mod owner_filesystem;
 mod owner_filesystem_dispatch;
+pub(crate) mod surface_owner;
 // Historical selectors remain test-only until their positive coverage has
 // migrated to decision-scoped discovery. Production must not expose them.
 #[cfg(test)]
@@ -91,7 +92,7 @@ pub use document_get_chunk::DocumentGetChunkTool;
 pub use document_ingest::{DocumentIngestTool, DocumentSyncTool};
 pub use document_search::DocumentSearchTool;
 pub use execution::{
-    AdapterOwnedPreparation, ApprovalStrategy, DenyApprovalStrategy, EffectPolicy, LegacyToolAdapter,
+    AdapterOwnedPreparation, ApprovalStrategy, DenyApprovalStrategy, DispatchOrigin, EffectPolicy, LegacyToolAdapter,
     SecurityEffectPolicy, ToolAdapterKind, ToolApprovalDecision, ToolApprovalRequest, ToolBackend, ToolCatalog,
     ToolDescriptor, ToolEffect, ToolExecutionAuditRecord, ToolExecutionAuditSink, ToolExecutionCommand,
     ToolExecutionContext, ToolExecutionDecision, ToolExecutionOutcome, ToolExecutionPermit, ToolExecutionPreparation,

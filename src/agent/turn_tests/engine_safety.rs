@@ -58,18 +58,12 @@ async fn execution_model_differs_from_bound_model_is_refused() {
     let admitted = AdmittedTurn::with_config(workspace_config(workspace.path()), "reply", Arc::clone(&registry)).await;
     let decision = admitted.decision();
     assert!(
-        decision
-            .service
-            .validate_agent_execution_model(decision.proof, "ollama", "prx-local-model")
-            .is_ok(),
+        crate::runtime::turn_model::validate_execution(decision.proof, "ollama", "prx-local-model").is_ok(),
         "the ingress binding must admit itself"
     );
     for (provider_name, model) in [("ollama", "prx-other-model"), ("openai", "prx-local-model")] {
         assert!(
-            decision
-                .service
-                .validate_agent_execution_model(decision.proof, provider_name, model)
-                .is_err(),
+            crate::runtime::turn_model::validate_execution(decision.proof, provider_name, model).is_err(),
             "{provider_name}/{model} is outside the ingress binding"
         );
         let provider = NativeScriptedProvider::new(vec![ChatResponse {
@@ -138,7 +132,7 @@ async fn model_without_native_tools_gets_no_tool_surface() {
     let registry = project_tool_registry(&dispatches, &["project_tool"]);
     let admitted = AdmittedTurn::with_config(config, "reply", registry).await;
     let decision = admitted.decision();
-    let surface = decision.service.turn_tool_surface(decision.proof, &[]);
+    let surface = crate::tools::surface_owner::build(decision.service.turn_surface_parts(decision.proof, &[]));
     assert!(!surface.contains("project_tool"));
     let adapter = admitted.adapter();
     let service = adapter
@@ -221,7 +215,7 @@ async fn hint_routed_turn_applies_the_pinned_model_allowlist() {
         decision.service.model_can_call_tools(decision.proof),
         "the route destination must verify NativeTools"
     );
-    let surface = decision.service.turn_tool_surface(decision.proof, &[]);
+    let surface = crate::tools::surface_owner::build(decision.service.turn_surface_parts(decision.proof, &[]));
     assert!(surface.contains("project_tool"), "the allowed tool was not published");
     assert!(
         !surface.contains("other_tool"),

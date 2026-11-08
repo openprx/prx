@@ -19,58 +19,27 @@ use crate::causal_tree::gates::{GateOutcome, HardGates};
 use crate::tools::ToolSpec;
 
 impl TurnDecisionService {
-    /// Build the safety ceiling once, independently of decision selection.
-    pub(crate) fn turn_tool_surface(
-        &self,
-        proof: &dyn TurnSourceProof,
-        inherited_exclusions: &[String],
-    ) -> crate::tools::execution::admission::TurnSurface {
-        let mut config = self.generation.effective.tool_tiering.clone();
-        config.always_exclude.extend(inherited_exclusions.iter().cloned());
-        let channel = self.surface == TurnSurfaceKind::Channel;
-        let view = self.catalog_view();
-        // Key the operator allowlist on the pinned model, never on a route spelling.
-        let pinned = proof.model_binding().pinned_model();
-        // Candidates are the backend inventory plus every pinned catalog name
-        // (per-skill `skill_read_<digest>` entries are published from the catalog
-        // and are absent from the backend list). Each name must resolve live;
-        // an unresolved name is not a candidate, so it stays unpublished.
-        let mut candidates = self.execution.current_descriptors();
-        let unlisted: Vec<_> = {
-            let listed: BTreeSet<&str> = candidates
-                .iter()
-                .map(|descriptor| descriptor.public_name.as_str())
-                .collect();
-            self.catalog
-                .public_names()
-                .filter(|name| !listed.contains(name))
-                .filter_map(|name| self.execution.current_descriptor(name))
-                .collect()
-        };
-        candidates.extend(unlisted);
-        crate::tools::execution::admission::TurnSurface::build_from(
-            &self.execution,
-            candidates,
-            &config,
-            pinned,
-            channel,
-            |descriptor| {
-                self.catalog
-                    .entry_for_public_name(&descriptor.public_name)
-                    .is_some_and(|entry| {
-                        !view.surface_excludes(entry)
-                            && (!channel || entry.channel_eligible)
-                            && crate::tools::execution::decide_tool_execution(
-                                &self.security,
-                                entry.policy_tool_name(),
-                                proof.policy_sender(),
-                                proof.policy_channel(),
-                                proof.policy_chat_type(),
-                            ) != crate::tools::execution::ToolExecutionDecision::Deny
-                    })
-            },
-        )
-        .with_tool_calls(self.model_can_call_tools(proof))
+    /// Data for the decision-free surface owner. The algorithm lives in
+    /// `tools::surface_owner`; this only copies the binding's pinned inputs.
+    pub(crate) fn turn_surface_parts<'a>(
+        &'a self,
+        proof: &'a dyn TurnSourceProof,
+        inherited_exclusions: &'a [String],
+    ) -> crate::tools::surface_owner::SurfaceParts<'a> {
+        crate::tools::surface_owner::SurfaceParts {
+            execution: &self.execution,
+            catalog: &self.catalog,
+            publication_policy: &self.publication_policy,
+            tiering: &self.generation.effective.tool_tiering,
+            security: &self.security,
+            pinned_model: proof.model_binding().pinned_model(),
+            channel: self.surface == TurnSurfaceKind::Channel,
+            inherited_exclusions,
+            sender: proof.policy_sender(),
+            channel_name: proof.policy_channel(),
+            chat_type: proof.policy_chat_type(),
+            tool_calls_allowed: self.model_can_call_tools(proof),
+        }
     }
 
     /// Local operator commands retain the actual Interactive publication.

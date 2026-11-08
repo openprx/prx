@@ -300,7 +300,8 @@ impl ChannelDecisionTurn {
     }
     pub(super) fn adapter(&self) -> crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
         let mut execution =
-            crate::tools::ToolExecutionContext::new(self.envelope.clone(), self.proof.policy_chat_type());
+            crate::tools::ToolExecutionContext::new(self.envelope.clone(), self.proof.policy_chat_type())
+                .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
         execution.chat_id = self.envelope.recipient.clone().unwrap_or_default();
         crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
             verify_chat_completion: false,
