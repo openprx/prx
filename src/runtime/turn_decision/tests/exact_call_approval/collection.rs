@@ -72,7 +72,14 @@ async fn exact_file_collection_with_recursive_budget(
     approved: bool,
     recursive_budget: RecursiveBudgetCase,
 ) {
-    exact_file_collection_with_legacy_events(edit, approved, recursive_budget, LegacyEvents::None).await;
+    exact_file_collection_with_legacy_events(
+        edit,
+        approved,
+        recursive_budget,
+        LegacyEvents::None,
+        CollectionBudget::Standard,
+    )
+    .await;
 }
 
 pub(crate) async fn historical_approval_events() {
@@ -82,6 +89,7 @@ pub(crate) async fn historical_approval_events() {
             true,
             RecursiveBudgetCase::Disabled,
             legacy,
+            CollectionBudget::Standard,
         ))
         .await;
     }
@@ -94,11 +102,108 @@ enum LegacyEvents {
     Revoked,
 }
 
+/// Budget the real collection request runs under. `Standard` is the default
+/// fixture; the others stop right after the collection request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollectionBudget {
+    Standard,
+    /// A route window whose decision slice is `available / 8` tokens; the answer needs 128.
+    Window {
+        available: usize,
+    },
+    /// A money ceiling between a request carrying the raw and the Gemini-cleaned schema.
+    Dialect {
+        gemini: bool,
+    },
+}
+
+/// Published schema whose raw document carries `examples` that the Gemini dialect strips.
+struct HugeExamplesSchema(Box<dyn Tool>);
+#[async_trait::async_trait]
+impl Tool for HugeExamplesSchema {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        let mut schema = self.0.parameters_schema();
+        if let Some(properties) = schema.get_mut("properties").and_then(serde_json::Value::as_object_mut) {
+            let examples: Vec<String> = (0..4000).map(|index| format!("word{index} ")).collect();
+            properties.insert(
+                "prx_budget_probe".into(),
+                serde_json::json!({"type": "string", "examples": examples}),
+            );
+        }
+        schema
+    }
+    fn tier(&self) -> crate::tools::traits::ToolTier {
+        self.0.tier()
+    }
+    fn categories(&self) -> &'static [crate::tools::traits::ToolCategory] {
+        self.0.categories()
+    }
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.0.execute(args).await
+    }
+}
+
+/// Answer 127 of 128 tokens through the real CollectApprovalArguments branch.
+#[tokio::test]
+async fn collection_request_over_token_budget_is_refused_without_a_send() {
+    usage::EXPECTED_REFUSAL.set(Some("answer estimates 128 tokens but 127 remain"));
+    Box::pin(exact_file_collection_with_budget(CollectionBudget::Window {
+        available: 1016,
+    }))
+    .await;
+    assert!(
+        usage::EXPECTED_REFUSAL.take().is_none(),
+        "the refusal expectation was consumed"
+    );
+}
+
+/// Answer 128 of 128 tokens: the same branch sends exactly once.
+#[tokio::test]
+async fn collection_request_within_token_budget_sends_once() {
+    Box::pin(exact_file_collection_with_budget(CollectionBudget::Window {
+        available: 1024,
+    }))
+    .await;
+}
+
+/// At one money ceiling, the Gemini provider dialect fits and the Raw dialect
+/// does not, because the cleaned schema is smaller: 1 send versus 0 sends.
+#[tokio::test]
+async fn collection_cost_uses_the_provider_schema_dialect() {
+    usage::PROVIDER_DIALECT.set(crate::tools::ToolSchemaDialect::Gemini);
+    Box::pin(exact_file_collection_with_budget(CollectionBudget::Dialect {
+        gemini: true,
+    }))
+    .await;
+    usage::PROVIDER_DIALECT.set(crate::tools::ToolSchemaDialect::Raw);
+    usage::EXPECTED_REFUSAL.set(Some("exceeds the"));
+    Box::pin(exact_file_collection_with_budget(CollectionBudget::Dialect {
+        gemini: false,
+    }))
+    .await;
+    assert!(
+        usage::EXPECTED_REFUSAL.take().is_none(),
+        "the refusal expectation was consumed"
+    );
+}
+
+async fn exact_file_collection_with_budget(budget: CollectionBudget) {
+    exact_file_collection_with_legacy_events(false, true, RecursiveBudgetCase::Disabled, LegacyEvents::None, budget)
+        .await;
+}
+
 async fn exact_file_collection_with_legacy_events(
     edit: bool,
     approved: bool,
     recursive_budget: RecursiveBudgetCase,
     legacy_events: LegacyEvents,
+    budget: CollectionBudget,
 ) {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().unwrap();
@@ -140,6 +245,21 @@ async fn exact_file_collection_with_legacy_events(
         )
         .unwrap(),
     );
+    match budget {
+        CollectionBudget::Standard => {}
+        CollectionBudget::Window { available } => {
+            config.agent.compaction.reserve_tokens = 100;
+            config.agent.compaction.max_context_tokens = available + 100;
+            config.agent.compaction.max_context_tokens_explicit = true;
+        }
+        CollectionBudget::Dialect { .. } => {
+            // 1 micro-USD per token: the ceiling sits between the two request sizes.
+            config.cost.daily_limit_usd = 0.003;
+            config.agent.compaction.reserve_tokens = 100;
+            config.agent.compaction.max_context_tokens = 100_000;
+            config.agent.compaction.max_context_tokens_explicit = true;
+        }
+    }
     config.save().await.expect("owned fixture config");
     let generation = crate::config::new_shared(config.clone()).pin();
     let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
@@ -147,6 +267,8 @@ async fn exact_file_collection_with_legacy_events(
     let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountedFileMutation {
         inner: if edit {
             Box::new(crate::tools::file_edit::FileEditTool::new(Arc::clone(&security)))
+        } else if matches!(budget, CollectionBudget::Dialect { .. }) {
+            Box::new(HugeExamplesSchema(Box::new(FileWriteTool::new(Arc::clone(&security)))))
         } else {
             Box::new(FileWriteTool::new(Arc::clone(&security)))
         },
@@ -313,6 +435,10 @@ async fn exact_file_collection_with_legacy_events(
             cleanup_confirmed: &owned_cleanup_confirmed,
             store_stalled: false,
         })).await;
+        if budget != CollectionBudget::Standard {
+            assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+            return;
+        }
         assert!(service.begin_approval_collection(proof.as_ref(), &context).is_err(), "lease cannot be reissued");
         assert_eq!(dispatches.load(Ordering::SeqCst), 0);
         assert_unmodified();

@@ -410,7 +410,11 @@ async fn unpriced_model_refuses_provider_send() {
             streaming,
         )
         .await;
-        assert!(result.is_err(), "streaming={streaming}: an unpriced send was admitted");
+        let error = result.expect_err("an unpriced remote send must be refused");
+        assert!(
+            format!("{error:#}").contains("the request cost cannot be estimated"),
+            "streaming={streaming}: {error:#}"
+        );
         assert_eq!(spy.sends(), 0, "streaming={streaming}");
     }
 }
@@ -504,43 +508,88 @@ impl Tool for TokenHeavyTool {
     }
 }
 
-/// A published tool whose action estimate exceeds the remaining G6 tokens is
-/// refused with 0 sends; the same request without it is admitted with exactly 1.
+/// Config whose decision slice is `available / 8` tokens: the Answer estimate is 128.
+fn window_config(workspace: &std::path::Path, available: usize) -> crate::config::Config {
+    let mut config = workspace_config(workspace);
+    config.agent.compaction.reserve_tokens = 100;
+    config.agent.compaction.max_context_tokens = available + 100;
+    config.agent.compaction.max_context_tokens_explicit = true;
+    config
+}
+
+/// Answer 128 against live remaining G6 tokens: 127 remain is refused with the
+/// specific budget error and 0 sends; 128 remains is admitted with exactly 1
+/// send, also when an oversized tool is published but unused.
 #[tokio::test]
 async fn estimate_tokens_above_turn_budget_refuses_send() {
     for streaming in [false, true] {
+        // available / 8 = 127 and 128 respectively.
         let workspace = tempfile::tempdir().expect("test workspace");
         let spy = SendSpy::new();
-        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(TokenHeavyTool)]);
-        let result = send_once(
-            priced_config(workspace.path(), 5.0),
+        let registry = project_tool_registry(&Arc::new(Mutex::new(Vec::new())), &[]);
+        let error = send_once(
+            window_config(workspace.path(), 1016),
             registry,
             ("ollama", "prx-local-model"),
             "reply",
             &spy,
             streaming,
         )
-        .await;
+        .await
+        .expect_err("127 remaining tokens cannot fund a 128 token answer");
         assert!(
-            result.is_err(),
-            "streaming={streaming}: the oversized estimate was admitted"
+            format!("{error:#}").contains("answer estimates 128 tokens but 127 remain"),
+            "streaming={streaming}: {error:#}"
         );
         assert_eq!(spy.sends(), 0, "streaming={streaming}");
 
+        for tools in [Vec::new(), vec![Box::new(TokenHeavyTool) as Box<dyn Tool>]] {
+            let workspace = tempfile::tempdir().expect("test workspace");
+            let spy = SendSpy::new();
+            send_once(
+                window_config(workspace.path(), 1024),
+                Arc::new(tools),
+                ("ollama", "prx-local-model"),
+                "reply",
+                &spy,
+                streaming,
+            )
+            .await
+            .expect("128 remaining tokens fund the answer, with or without an unused oversized tool");
+            assert_eq!(spy.sends(), 1, "streaming={streaming}");
+        }
+    }
+}
+
+/// A remote model with a configured price override is not exempt and is
+/// admitted by its priced estimate: exactly 1 send.
+#[tokio::test]
+async fn priced_remote_model_is_admitted() {
+    for streaming in [false, true] {
         let workspace = tempfile::tempdir().expect("test workspace");
-        let control = SendSpy::new();
+        let mut config = workspace_config(workspace.path());
+        config.cost.prices.insert(
+            "openai/prx-priced-model".into(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+        let spy = SendSpy::new();
         let registry = project_tool_registry(&Arc::new(Mutex::new(Vec::new())), &[]);
         send_once(
-            priced_config(workspace.path(), 5.0),
+            config,
             registry,
-            ("ollama", "prx-local-model"),
+            ("openai", "prx-priced-model"),
             "reply",
-            &control,
+            &spy,
             streaming,
         )
         .await
-        .expect("the same request without the heavy tool is admitted");
-        assert_eq!(control.sends(), 1, "streaming={streaming}");
+        .expect("a priced remote model is admitted");
+        assert_eq!(spy.sends(), 1, "streaming={streaming}");
     }
 }
 

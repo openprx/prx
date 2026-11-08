@@ -437,7 +437,7 @@ async fn run_turn_unguarded(
             proof,
             &proposal_messages,
             Some(std::slice::from_ref(&spec)),
-            crate::tools::ToolSchemaDialect::Raw,
+            provider.tool_schema_dialect_for(model),
         )?;
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_owned(),

@@ -23,6 +23,14 @@ pub(super) struct Fixture<'a> {
     pub store_stalled: bool,
 }
 
+thread_local! {
+    /// The schema dialect the collection provider reports. Each test runs on one thread.
+    pub(super) static PROVIDER_DIALECT: std::cell::Cell<crate::tools::ToolSchemaDialect> =
+        const { std::cell::Cell::new(crate::tools::ToolSchemaDialect::Raw) };
+    /// When set, the run must be refused with this budget error and no provider send.
+    pub(super) static EXPECTED_REFUSAL: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
 struct ReportedApprovalProvider<'a> {
     tool_name: &'a str,
     arguments: &'a serde_json::Value,
@@ -33,6 +41,10 @@ struct ReportedApprovalProvider<'a> {
 impl Provider for ReportedApprovalProvider<'_> {
     async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
         anyhow::bail!("the approval regression requires the traced provider entry")
+    }
+
+    fn tool_schema_dialect_for(&self, _: &str) -> crate::tools::ToolSchemaDialect {
+        PROVIDER_DIALECT.with(std::cell::Cell::get)
     }
 
     async fn chat_traced(&self, request: ChatRequest<'_>, model: &str, _: f64) -> anyhow::Result<ChatTrace> {
@@ -139,7 +151,7 @@ async fn exercise_owned(f: &Fixture<'_>) {
         ChatMessage::user(f.proof.routing_input()),
     ];
     let started_at = chrono::Utc::now();
-    let (outcome, trace) = Box::pin(crate::agent::turn_engine::run_turn(
+    let result = Box::pin(crate::agent::turn_engine::run_turn(
         &mut history,
         TurnRequest {
             advice: Some(crate::decision_engine::IntentAnalysis {
@@ -193,8 +205,18 @@ async fn exercise_owned(f: &Fixture<'_>) {
             on_tool_call: None,
         },
     ))
-    .await
-    .unwrap();
+    .await;
+    if let Some(expected) = EXPECTED_REFUSAL.with(std::cell::Cell::take) {
+        let error = result.expect_err("the over-budget collection request must be refused");
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "a refused request sends nothing"
+        );
+        return;
+    }
+    let (outcome, trace) = result.unwrap();
     assert!(matches!(outcome, ToolLoopOutcome::AwaitingApproval { .. }));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert!(trace.decision_brief_sha256.is_none());

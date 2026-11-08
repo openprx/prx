@@ -11,11 +11,12 @@ use anyhow::{Context, Result};
 /// or debited here; decision-attempt token reservation and settlement are
 /// unchanged.
 ///
-/// Tokens reproduce the G6 predicate: the answer estimate and every published
-/// tool's action estimate (`cost::estimate::candidate_tokens`) must each be at
-/// most the remaining decision-slice tokens. The request size and the response
-/// reserve feed only the priced estimate, so an unknown price, measurement or
-/// ledger also refuses.
+/// Tokens reproduce the G6 predicate for the answer this round can produce:
+/// its estimate (`cost::estimate::candidate_tokens(0)`) must be at most the
+/// live remaining decision-slice tokens. A published tool does not veto the
+/// answer; the called tool's own estimate is the dispatch predicate (R2a-2).
+/// The request size and the response reserve feed only the priced estimate, so
+/// an unknown price, measurement or ledger also refuses.
 pub(crate) fn admit_provider_send(
     service: &TurnDecisionService,
     context: &TurnDecisionContext,
@@ -26,17 +27,11 @@ pub(crate) fn admit_provider_send(
 ) -> Result<()> {
     let tools = tools.unwrap_or_default();
     let remaining = context.remaining_g6_tokens();
-    for tokens in std::iter::once(crate::cost::estimate::candidate_tokens(0)).chain(tools.iter().map(|spec| {
-        // Serialization failure saturates, so it can only over-refuse.
-        crate::cost::estimate::candidate_tokens(
-            serde_json::to_vec(&spec.parameters).map_or(usize::MAX, |encoded| encoded.len()),
-        )
-    })) {
-        anyhow::ensure!(
-            tokens <= remaining,
-            "provider send refused: an action estimates {tokens} tokens but {remaining} remain"
-        );
-    }
+    let answer = crate::cost::estimate::candidate_tokens(0);
+    anyhow::ensure!(
+        answer <= remaining,
+        "provider send refused: answer estimates {answer} tokens but {remaining} remain"
+    );
     let limits = service
         .send_limits(proof)
         .context("provider send budget cannot be established")?;
