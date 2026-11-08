@@ -158,15 +158,35 @@ impl DecisionBackend for ReadBackend {
 
 #[tokio::test]
 async fn actual_failed_ledger_terminal_replay_preserves_facts_into_next_segment() -> anyhow::Result<()> {
-    child_source_gate_and_ledger_case().await
+    child_source_gate_and_ledger_case(None).await
 }
 
 #[tokio::test]
 async fn non_agentic_delegate_child_does_not_publish_or_bind_an_always_include_tool() -> anyhow::Result<()> {
-    child_source_gate_and_ledger_case().await
+    child_source_gate_and_ledger_case(None).await
 }
 
-async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
+/// Child money cells. Each runs a budgeted child (carved manifest) and expects
+/// the send guard to refuse before any provider call.
+#[derive(Clone, Copy)]
+enum BudgetCell {
+    /// Incoming recursive money is drained to zero.
+    Exhausted,
+    /// Incoming funding is ample, so only the manifest ceiling can refuse.
+    OverManifest,
+}
+
+#[tokio::test]
+async fn child_recursive_money_exhausted_refuses_provider_send() -> anyhow::Result<()> {
+    child_source_gate_and_ledger_case(Some(BudgetCell::Exhausted)).await
+}
+
+#[tokio::test]
+async fn child_send_over_manifest_cost_is_refused() -> anyhow::Result<()> {
+    child_source_gate_and_ledger_case(Some(BudgetCell::OverManifest)).await
+}
+
+async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow::Result<()> {
     let scratch = tempfile::tempdir()?;
     let owned_runs = Arc::new(tokio::sync::RwLock::new(Vec::<SubAgentRun>::new()));
     let workspace = scratch.path().join("logical");
@@ -222,6 +242,18 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
         resolved.verification(),
         &crate::providers::catalog::Verification::Verified
     );
+    if budget.is_some() {
+        // A positive price so the budgeted send has a non-zero estimate.
+        config.cost.prices.insert(
+            "ollama/prx-local-model".into(),
+            crate::config::schema::ModelPricing {
+                input: 100.0,
+                output: 100.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+    }
     std::fs::write(&config.config_path, toml::to_string(&config)?)?;
     let generation = crate::config::new_shared(config.clone()).pin();
     let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &workspace));
@@ -411,8 +443,8 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
         TurnServiceBuild {
             parent_grant: Some(Arc::clone(&grant)),
             generation: Arc::clone(&generation),
-            registry,
-            execution,
+            registry: Arc::clone(&registry),
+            execution: Arc::clone(&execution),
             catalog_sources: sources(&generation, &config),
             surface_policy: SurfacePolicy {
                 direct_names: BTreeSet::from(["file_read".into(), HIDDEN_CHILD_CAPABILITY.into()]),
@@ -439,6 +471,104 @@ async fn child_source_gate_and_ledger_case() -> anyhow::Result<()> {
         OutboundSecrets::default(),
         SlotLimits::default(),
     );
+    if let Some(cell) = budget {
+        // Carve a budgeted child: the owner keeps 60_000 micro-USD, so the
+        // carved share is 3 cents (manifest ceiling 30_000) while the security
+        // cap stays at its 500-cent default.
+        grant
+            .recursive_child_allowance()
+            .ok_or_else(|| anyhow::anyhow!("parent grant has no child allowance"))?
+            .money()
+            .store(60_000, Ordering::Release);
+        let budgeted = grant.for_spawn_request(false, "ollama", "prx-local-model")?;
+        let mut budget_child = build_turn_decision_service(
+            TurnSurfaceKind::Worker,
+            TurnServiceBuild {
+                parent_grant: Some(Arc::clone(&budgeted)),
+                generation: Arc::clone(&generation),
+                registry: Arc::clone(&registry),
+                execution: Arc::clone(&execution),
+                catalog_sources: sources(&generation, &config),
+                surface_policy: SurfacePolicy {
+                    direct_names: BTreeSet::from(["file_read".into()]),
+                    ..SurfacePolicy::default()
+                },
+                provider_catalog: &catalog,
+                transports: &transports,
+                events: Arc::new(SilentEvents),
+                memory: Arc::clone(&memory),
+                security: Arc::clone(grant.security()),
+            },
+        )
+        .await?;
+        let owning = Arc::get_mut(&mut budget_child).ok_or_else(|| anyhow::anyhow!("unshared budgeted child"))?;
+        owning.factory = DecisionBackendFactory::from_slots(
+            vec![Box::new(ReadBackend {
+                identity: BackendIdentity {
+                    kind: BackendKind::Mock,
+                    provider: None,
+                    configured_model: Arc::from("prx-local-model"),
+                },
+            })],
+            Arc::clone(&owning.state_key),
+            OutboundSecrets::default(),
+            SlotLimits::default(),
+        );
+        let budget_binding = ChildProviderBinding::build(
+            Arc::clone(&budgeted),
+            "ollama",
+            "prx-local-model",
+            service.credential_for_proof(&proof),
+        )?;
+        let budget_provider = budget_binding.provider();
+        let mut budget_scope =
+            crate::memory::MessageEventScope::new("sessions_spawn", crate::memory::MemoryVisibility::Workspace)
+                .with_session_key("prx_budget_child_session")
+                .with_run_id("prx_budget_child_task");
+        budgeted.bind_event_scope(&mut budget_scope)?;
+        let budget_input = crate::runtime::child_source::record_child_input(
+            &fabric,
+            budget_scope,
+            "Read file_read project metadata",
+            Some("prx_budget_child_task:input".into()),
+            None,
+            Some(&budgeted),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("budgeted child input receipt"))?;
+        let budget_proof = budget_binding.source_proof(&budgeted, &budget_input, &budget_provider)?;
+        let budget_context = budget_child
+            .decide_agent_initial(&budget_proof, AgentTurnKind::Repl, &cancellation)
+            .await?;
+        let funding = budgeted
+            .recursive_child_allowance()
+            .and_then(|owner| owner.funded_money())
+            .ok_or_else(|| anyhow::anyhow!("budgeted child has no funding"))?;
+        match cell {
+            BudgetCell::Exhausted => funding.store(0, Ordering::Release),
+            BudgetCell::OverManifest => funding.store(1 << 50, Ordering::Release),
+        }
+        let message = [crate::providers::ChatMessage::user("x".repeat(8_000))];
+        let sends_before = transports.0.load(Ordering::SeqCst);
+        let refused = crate::agent::send_admission::admit_provider_send(
+            &budget_child,
+            &budget_context,
+            &budget_proof,
+            &message,
+            None,
+            crate::tools::ToolSchemaDialect::Raw,
+        )
+        .expect_err("the send guard must refuse before any provider call");
+        anyhow::ensure!(
+            format!("{refused:#}").contains("remaining"),
+            "unexpected refusal: {refused:#}"
+        );
+        anyhow::ensure!(
+            transports.0.load(Ordering::SeqCst) == sends_before,
+            "a refused budgeted send reached a provider transport"
+        );
+        return Ok(());
+    }
     let mut restricted_scope =
         crate::memory::MessageEventScope::new("delegate", crate::memory::MemoryVisibility::Workspace)
             .with_session_key("prx_non_agentic_session")
