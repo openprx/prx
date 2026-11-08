@@ -26,8 +26,8 @@ pub struct RetiredIncarnation {
 
 pub trait AgentRegistry: Send + Sync {
     /// The active incarnation of (workspace, owner, key), minted if absent.
-    /// The backend's removal barrier, a retiring row and `admit` are all
-    /// checked inside the write transaction, so a refusal writes nothing.
+    /// A retiring row and `admit` are checked inside the write transaction, so
+    /// a refusal writes nothing. `admit` carries the caller's own barriers.
     fn resolve_incarnation(
         &self,
         workspace_id: &str,
@@ -37,27 +37,19 @@ pub trait AgentRegistry: Send + Sync {
         admit: &dyn Fn() -> Result<(), AgentRefusal>,
     ) -> anyhow::Result<Result<String, AgentRefusal>>;
 
-    /// Refuse new incarnations of `agent_keys` until [`Self::end_removal`], then
-    /// set `retiring` on their active rows (every owner, one workspace) in one
-    /// transaction and return the rows it flipped.
-    fn begin_removal(
+    /// Set `retiring` on every active row of `agent_keys` in one workspace, for
+    /// every owner, in one transaction, and return the rows it flipped.
+    fn retire_removed(
         &self,
         workspace_id: &str,
         agent_keys: &BTreeSet<String>,
     ) -> anyhow::Result<Vec<RetiredIncarnation>>;
 
-    /// Lift the removal barrier. `restore` sets back to `active` exactly those
-    /// rows that are still `retiring`; if that fails they stay `retiring`.
-    fn end_removal(&self, restore: &[RetiredIncarnation]) -> anyhow::Result<()>;
+    /// Set back to `active` exactly those of `rows` that are still `retiring`.
+    fn reactivate(&self, rows: &[RetiredIncarnation]) -> anyhow::Result<()>;
 
     /// In one transaction: retire every active named row of the workspace whose
     /// key is absent from `revisions`, and refresh the config revision of the
-    /// others. Success clears the unreconciled latch; a failure sets it when
-    /// `latch_on_failure`. While the latch is set every resolve is refused.
-    fn reconcile(
-        &self,
-        workspace_id: &str,
-        revisions: &BTreeMap<String, String>,
-        latch_on_failure: bool,
-    ) -> anyhow::Result<()>;
+    /// others.
+    fn reconcile(&self, workspace_id: &str, revisions: &BTreeMap<String, String>) -> anyhow::Result<()>;
 }

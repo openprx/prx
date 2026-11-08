@@ -5,9 +5,11 @@
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::memory::agent_registry::RetiredIncarnation;
+use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Registry key of a named agent.
 pub(crate) fn agent_key(name: &str) -> String {
@@ -62,22 +64,45 @@ fn revisions(config: &Config) -> anyhow::Result<BTreeMap<String, String>> {
         .collect()
 }
 
-/// Retire every active row whose agent left the config and refresh the
-/// revisions of the rest. At startup a failure latches every targeted resolve.
-pub(crate) fn reconcile(memory: &dyn Memory, config: &Config, latch_on_failure: bool) {
-    let Some(registry) = memory.agent_registry() else {
-        return;
-    };
-    let workspace = config.workspace_dir.to_string_lossy();
-    if let Err(error) =
-        revisions(config).and_then(|revisions| registry.reconcile(&workspace, &revisions, latch_on_failure))
-    {
-        tracing::error!(%error, "agent registry reconcile failed");
+/// Barrier and latch of one gateway owner. Clones share the state, so the
+/// owner, its prepared reloads and every targeted resolve see the same one.
+#[derive(Clone, Default)]
+pub(crate) struct AgentLifecycle {
+    /// Keys whose removal is being committed: no new incarnation until finalize.
+    pending_removals: Arc<Mutex<BTreeSet<String>>>,
+    /// Set when a startup sweep failed: every targeted resolve is refused.
+    registry_unreconciled: Arc<AtomicBool>,
+}
+
+impl AgentLifecycle {
+    /// Whether a resolve of `agent_key` must be refused right now.
+    pub(crate) fn blocks(&self, agent_key: &str) -> bool {
+        self.registry_unreconciled.load(Ordering::SeqCst) || self.pending_removals.lock().contains(agent_key)
+    }
+
+    /// Retire every active row whose agent left the config and refresh the
+    /// revisions of the rest. Only success clears this owner's latch; a failure
+    /// sets it when `latch_on_failure` (startup) and otherwise keeps it as is.
+    pub(crate) fn reconcile(&self, memory: &dyn Memory, config: &Config, latch_on_failure: bool) {
+        let Some(registry) = memory.agent_registry() else {
+            return;
+        };
+        let workspace = config.workspace_dir.to_string_lossy();
+        match revisions(config).and_then(|revisions| registry.reconcile(&workspace, &revisions)) {
+            Ok(()) => self.registry_unreconciled.store(false, Ordering::SeqCst),
+            Err(error) => {
+                tracing::error!(%error, "agent registry reconcile failed");
+                if latch_on_failure {
+                    self.registry_unreconciled.store(true, Ordering::SeqCst);
+                }
+            }
+        }
     }
 }
 
 /// One reload's agent steps, carried by the prepared gateway runtime.
 pub(crate) struct AgentReconcile {
+    lifecycle: AgentLifecycle,
     memory: Arc<dyn Memory>,
     next: Arc<Config>,
     removed: BTreeSet<String>,
@@ -85,8 +110,14 @@ pub(crate) struct AgentReconcile {
 }
 
 impl AgentReconcile {
-    pub(crate) fn prepare(memory: &Arc<dyn Memory>, previous: &Config, next: &Arc<Config>) -> Self {
+    pub(crate) fn prepare(
+        lifecycle: &AgentLifecycle,
+        memory: &Arc<dyn Memory>,
+        previous: &Config,
+        next: &Arc<Config>,
+    ) -> Self {
         Self {
+            lifecycle: lifecycle.clone(),
             memory: Arc::clone(memory),
             removed: previous
                 .agents
@@ -103,32 +134,42 @@ impl AgentReconcile {
     /// failure rejects the reload, so the removal is never published.
     pub(crate) fn commit(&mut self) -> anyhow::Result<()> {
         if let Some(registry) = self.memory.agent_registry().filter(|_| !self.removed.is_empty()) {
-            self.retired = registry.begin_removal(&self.next.workspace_dir.to_string_lossy(), &self.removed)?;
+            self.lifecycle
+                .pending_removals
+                .lock()
+                .extend(self.removed.iter().cloned());
+            self.retired = registry.retire_removed(&self.next.workspace_dir.to_string_lossy(), &self.removed)?;
         }
         Ok(())
     }
 
-    /// Lift the block, re-activating `restore`. If that fails the rows stay
-    /// `retiring`, which only costs availability.
-    fn end_removal(&self, restore: &[RetiredIncarnation]) {
+    /// Lift this reload's block only.
+    fn lift(&self) {
+        self.lifecycle
+            .pending_removals
+            .lock()
+            .retain(|key| !self.removed.contains(key));
+    }
+
+    /// Re-activate exactly the rows this commit retired. If that fails they
+    /// stay `retiring`, which only costs availability.
+    pub(crate) fn rollback(&mut self) {
+        self.lift();
+        let retired = std::mem::take(&mut self.retired);
         if let Some(Err(error)) = self
             .memory
             .agent_registry()
-            .map(|registry| registry.end_removal(restore))
+            .filter(|_| !retired.is_empty())
+            .map(|registry| registry.reactivate(&retired))
         {
-            tracing::error!(%error, "agent registry removal barrier could not be lifted cleanly");
+            tracing::error!(%error, "agent registry rollback compensation failed; rows stay retiring");
         }
     }
 
-    pub(crate) fn rollback(&mut self) {
-        let retired = std::mem::take(&mut self.retired);
-        self.end_removal(&retired);
-    }
-
     /// The new config is published: lift the block and refresh. While the
-    /// startup latch is set, this is also the sweep that can clear it.
+    /// latch is set, this is also the sweep that can clear it.
     pub(crate) fn finalize(&self) {
-        self.end_removal(&[]);
-        reconcile(self.memory.as_ref(), &self.next, false);
+        self.lift();
+        self.lifecycle.reconcile(self.memory.as_ref(), &self.next, false);
     }
 }

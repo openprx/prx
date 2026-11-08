@@ -26,7 +26,12 @@ mod agent_registry;
 /// Agent reload steps over a backend without a registry: every step is a no-op.
 pub(crate) fn idle_agents() -> agent_lifecycle::AgentReconcile {
     let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-    agent_lifecycle::AgentReconcile::prepare(&memory, &Config::default(), &Arc::new(Config::default()))
+    agent_lifecycle::AgentReconcile::prepare(
+        &agent_lifecycle::AgentLifecycle::default(),
+        &memory,
+        &Config::default(),
+        &Arc::new(Config::default()),
+    )
 }
 
 mod idempotency;

@@ -329,7 +329,11 @@ pub(super) fn resolve_incarnation(
     let key = crate::gateway::agent_lifecycle::agent_key(plan.name.as_str());
     let revision = crate::gateway::agent_lifecycle::config_revision(&plan.agent)
         .map_err(|error| Box::new(TargetUnavailable(error.to_string()).into_response()))?;
+    let lifecycle = state.turn_runtime.as_ref().map(|owner| owner.agent_lifecycle());
     let admit = || {
+        if lifecycle.is_some_and(|lifecycle| lifecycle.blocks(&key)) {
+            return Err(AgentRefusal::Disabled);
+        }
         let active = state.config.pin();
         match active.effective.agents.get(plan.name.as_str()) {
             None => Err(AgentRefusal::Unknown),

@@ -1075,6 +1075,7 @@ pub struct GatewayTurnRuntimeOwner {
     linq: Option<Arc<LinqChannel>>,
     nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     hooks: Arc<HookManager>,
+    agents: agent_lifecycle::AgentLifecycle,
     #[cfg(feature = "wasm-plugins")]
     plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
 }
@@ -1093,7 +1094,8 @@ impl GatewayTurnRuntimeOwner {
     ) -> Self {
         // Startup sweep, before any target is published: a failure latches
         // every targeted resolve until a later reconcile succeeds.
-        agent_lifecycle::reconcile(memory.as_ref(), &config.pin().effective, true);
+        let agents = agent_lifecycle::AgentLifecycle::default();
+        agents.reconcile(memory.as_ref(), &config.pin().effective, true);
         Self {
             cleanup: Arc::clone(&current.decision_slot.cleanup),
             current: Arc::new(ArcSwap::from_pointee(current)),
@@ -1104,6 +1106,7 @@ impl GatewayTurnRuntimeOwner {
             linq,
             nextcloud_talk,
             hooks,
+            agents,
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime,
         }
@@ -1111,6 +1114,10 @@ impl GatewayTurnRuntimeOwner {
 
     fn pin(&self) -> Arc<TurnRuntimeGeneration> {
         self.current.load_full()
+    }
+
+    const fn agent_lifecycle(&self) -> &agent_lifecycle::AgentLifecycle {
+        &self.agents
     }
 
     /// Whether the active generation was launched with a controlled H2 profile.
@@ -1285,6 +1292,7 @@ impl crate::config::ConfigGenerationParticipant for GatewayTurnRuntimeOwner {
     ) -> anyhow::Result<Box<dyn crate::config::PreparedConfigGeneration>> {
         let previous = self.current.load_full();
         let agents = agent_lifecycle::AgentReconcile::prepare(
+            &self.agents,
             &self.memory,
             &previous.config_generation.effective,
             &generation.effective,
