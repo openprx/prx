@@ -397,7 +397,10 @@ async fn send_once(
 /// An unpriced remote model is not zero-price exempt. The decision gate already
 /// leaves it without an executable selection, so `run_turn` sends 0 on both
 /// transports; the send guard itself is driven on the admitted turn directly
-/// and refuses with its own cost error.
+/// and refuses with its own cost error. The gate's refusal carries a different
+/// error, so this run_turn cell cannot assert the guard's message; the guard's
+/// wiring into the ordinary round is covered by
+/// `send_time_money_ceiling_refuses_ordinary_round_send`.
 #[tokio::test]
 async fn unpriced_model_refuses_provider_send() {
     for streaming in [false, true] {
@@ -564,6 +567,7 @@ impl Tool for TokenHeavyTool {
 /// published but unused.
 #[tokio::test]
 async fn estimate_tokens_above_turn_budget_refuses_send() {
+    let _reset = crate::agent::send_admission::HookReset;
     for streaming in [false, true] {
         let workspace = tempfile::tempdir().expect("test workspace");
         let spy = SendSpy::new();
@@ -601,7 +605,50 @@ async fn estimate_tokens_above_turn_budget_refuses_send() {
             .expect("128 remaining tokens fund the answer, with or without an unused oversized tool");
             assert_eq!(spy.sends(), 1, "streaming={streaming}");
         }
-        crate::agent::send_admission::TEST_TOKEN_CAP.set(u64::MAX);
+    }
+}
+
+/// The send-time money boundary is wired into the ordinary round: a ceiling the
+/// admitted decision already passed refuses the real send on both transports
+/// with the specific cost error and 0 sends; without it the same turn sends once.
+#[tokio::test]
+async fn send_time_money_ceiling_refuses_ordinary_round_send() {
+    let _reset = crate::agent::send_admission::HookReset;
+    for streaming in [false, true] {
+        let workspace = tempfile::tempdir().expect("test workspace");
+        let spy = SendSpy::new();
+        let registry = project_tool_registry(&Arc::new(Mutex::new(Vec::new())), &[]);
+        crate::agent::send_admission::TEST_MONEY_CEILING.set(Some(1));
+        let error = send_once(
+            workspace_config(workspace.path()),
+            registry,
+            ("ollama", "prx-local-model"),
+            "reply",
+            &spy,
+            streaming,
+        )
+        .await
+        .expect_err("a 1 micro-USD send-time ceiling cannot fund the request");
+        assert!(
+            format!("{error:#}").contains("provider send refused: the estimated cost of"),
+            "streaming={streaming}: {error:#}"
+        );
+        assert_eq!(spy.sends(), 0, "streaming={streaming}");
+
+        crate::agent::send_admission::TEST_MONEY_CEILING.set(None);
+        let workspace = tempfile::tempdir().expect("test workspace");
+        let spy = SendSpy::new();
+        send_once(
+            workspace_config(workspace.path()),
+            project_tool_registry(&Arc::new(Mutex::new(Vec::new())), &[]),
+            ("ollama", "prx-local-model"),
+            "reply",
+            &spy,
+            streaming,
+        )
+        .await
+        .expect("without the send-time ceiling the same turn is admitted");
+        assert_eq!(spy.sends(), 1, "streaming={streaming}");
     }
 }
 
